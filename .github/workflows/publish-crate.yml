@@ -599,7 +599,7 @@ jobs:
       - name: Transport this platform's verified executable within the same run
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: bamboo-executable-${{ matrix.target }}
+          name: bamboo-executable-${{ matrix.target }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/bamboo-executable-output/*
           if-no-files-found: error
           retention-days: 3
@@ -627,24 +627,25 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
+      # Per-attempt names preserve prior transports on a full rerun. Selecting
+      # the independent job-output attempt also supports rerunning failed jobs
+      # while successful platforms retain their earlier native-job outputs.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          pattern: bamboo-executable-*
-          path: ${{ runner.temp }}/bamboo-executable-transports
-      - name: Require precisely the four same-run platform transports
-        run: |
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-          root = Path(os.environ['RUNNER_TEMP'])
-          source = root / 'bamboo-executable-transports'
-          targets = ('aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu')
-          assert sorted(item.name for item in source.iterdir()) == sorted('bamboo-executable-' + target for target in targets)
-          destination = root / 'bamboo-executable-inputs'
-          destination.mkdir()
-          for target in targets:
-              (source / ('bamboo-executable-' + target)).rename(destination / target)
-          PY
+          name: bamboo-executable-aarch64-apple-darwin-attempt-${{ fromJSON(needs.executables.outputs.aarch64_apple_darwin).runAttempt }}
+          path: ${{ runner.temp }}/bamboo-executable-inputs/aarch64-apple-darwin
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: bamboo-executable-x86_64-apple-darwin-attempt-${{ fromJSON(needs.executables.outputs.x86_64_apple_darwin).runAttempt }}
+          path: ${{ runner.temp }}/bamboo-executable-inputs/x86_64-apple-darwin
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: bamboo-executable-x86_64-pc-windows-msvc-attempt-${{ fromJSON(needs.executables.outputs.x86_64_pc_windows_msvc).runAttempt }}
+          path: ${{ runner.temp }}/bamboo-executable-inputs/x86_64-pc-windows-msvc
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: bamboo-executable-x86_64-unknown-linux-gnu-attempt-${{ fromJSON(needs.executables.outputs.x86_64_unknown_linux_gnu).runAttempt }}
+          path: ${{ runner.temp }}/bamboo-executable-inputs/x86_64-unknown-linux-gnu
       - name: Verify official provenance and publish immutable shared assets
         # Same publisher queue, Environment and credentials; no new allocator,
         # tag, registry publication, credential scope or replacement uploads.

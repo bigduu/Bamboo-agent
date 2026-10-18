@@ -14,6 +14,7 @@ const identity = { repository: release.REPOSITORY, version: '2026.10.123', sourc
   sourceTree: '2'.repeat(40), workflowRevision: '3'.repeat(40), runId: '100', runAttempt: 2,
   ciRun: 'https://github.com/bigduu/Bamboo-agent/actions/runs/90' }
 const frontendBytes = { manifestSha256: '4'.repeat(64), archiveSha256: '5'.repeat(64) }
+const signingKey = 'a'.repeat(64) // Synthetic test authority only.
 
 function temporary(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-executables-test-'))
@@ -63,10 +64,10 @@ function inputs(t) {
     const receiptBytes = Buffer.from(JSON.stringify(proof))
     fs.writeFileSync(path.join(dir, 'build-receipt.json'), receiptBytes)
     expectedBuilds[release.targetOutputKey(target)] = JSON.stringify({ sha256: proof.sha256,
-      sizeBytes: proof.sizeBytes, receiptSha256: release.sha256(receiptBytes) })
+      sizeBytes: proof.sizeBytes, receiptSha256: release.sha256(receiptBytes), runAttempt: proof.runAttempt })
     receipts.push(proof)
   }
-  return { root, sourceRoot, inputDirectory, outputDirectory, receipts, identity, frontendBytes, expectedBuilds }
+  return { root, sourceRoot, inputDirectory, outputDirectory, receipts, identity, frontendBytes, expectedBuilds, signingKey }
 }
 
 test('actual producer writes a deterministic three-regular-file USTAR host and complete embedded manifest', (t) => {
@@ -198,6 +199,11 @@ test('substituting a binary and matching forged receipt cannot bypass the indepe
   const missing = clone(value.expectedBuilds); delete missing[release.targetOutputKey(release.TARGETS[0])]
   assert.throws(() => release.expectedBuildBindings(missing), /four unique/)
   assert.throws(() => release.expectedBuildBindings(null), /independent build-job outputs/)
+  const wrongAttempt = inputs(t)
+  const key = release.targetOutputKey(release.TARGETS[0])
+  const binding = JSON.parse(wrongAttempt.expectedBuilds[key]); binding.runAttempt = 2
+  wrongAttempt.expectedBuilds[key] = JSON.stringify(binding)
+  assert.throws(() => release.assembleRelease(wrongAttempt), /bound native-job attempt/)
 })
 
 test('Cargo unit evidence must bind both real embedded outputs and the exact resulting binary', (t) => {
@@ -278,6 +284,66 @@ test('rerunning only a failed final publisher preserves immutable provenance fro
   }
 })
 
+test('a full workflow rerun recovers the authenticated original bytes and uploads only the missing manifest', async (t) => {
+  const value = publishingFixture(t)
+  value.context.upload = (file) => {
+    const name = path.basename(file)
+    if (name === release.MANIFEST) throw new Error('manifest transport failed')
+    value.uploads.push(name); value.stored.set(name, fs.readFileSync(file))
+  }
+  await assert.rejects(() => release.publishAssets(value.context), /manifest transport failed/)
+  assert.ok(value.stored.has(release.PROVENANCE)); assert.ok(!value.stored.has(release.MANIFEST))
+  // The supported full rerun really rebuilds: attempts and executable bytes
+  // differ. They must not replace the first authenticated published identity.
+  const retryIdentity = { ...identity, runAttempt: 3 }
+  const rebuilt = path.join(value.root, 'rebuilt'); fs.mkdirSync(rebuilt)
+  for (const target of release.TARGETS) {
+    const binary = path.join(value.inputDirectory, target, release.artifactName(target))
+    const bytes = fs.readFileSync(binary); bytes[4096] = 42; fs.writeFileSync(binary, bytes)
+    const next = { ...receipt(target, bytes), runAttempt: 3 }
+    const proof = Buffer.from(JSON.stringify(next))
+    fs.writeFileSync(path.join(value.inputDirectory, target, 'build-receipt.json'), proof)
+    value.expectedBuilds[release.targetOutputKey(target)] = JSON.stringify({ sha256: next.sha256,
+      sizeBytes: next.sizeBytes, receiptSha256: release.sha256(proof), runAttempt: next.runAttempt })
+  }
+  release.assembleRelease({ ...value, identity: retryIdentity, outputDirectory: rebuilt })
+  assert.notDeepEqual(fs.readFileSync(path.join(rebuilt, release.PROVENANCE)), value.stored.get(release.PROVENANCE))
+  const recovered = path.join(value.root, 'recovered'); fs.mkdirSync(recovered)
+  const assets = () => [...value.stored.keys()].map((name) => ({ name }))
+  await release.recoverPublishedRelease({ ...value, identity: retryIdentity, outputDirectory: recovered,
+    release: { assets: assets() }, readAsset: (asset) => value.stored.get(asset.name) })
+  for (const name of fs.readdirSync(value.outputDirectory)) {
+    assert.deepEqual(fs.readFileSync(path.join(recovered, name)), fs.readFileSync(path.join(value.outputDirectory, name)))
+  }
+  const uploads = []
+  await release.publishAssets({ directory: recovered, release: { assets: assets() },
+    readAsset: (asset) => value.stored.get(asset.name), listAssets: assets,
+    upload: (file) => { uploads.push(path.basename(file)); value.stored.set(path.basename(file), fs.readFileSync(file)) } })
+  assert.deepEqual(uploads, [release.MANIFEST])
+})
+
+test('recovery rejects unsigned/tampered/foreign checkpoints, missing assets and corrupt bytes without any release writes', async (t) => {
+  const value = publishingFixture(t); await release.publishAssets(value.context)
+  const original = value.stored.get(release.PROVENANCE)
+  const target = release.artifactName(release.TARGETS[0])
+  const variants = [
+    (stored) => { const p = JSON.parse(original); delete p.authentication; stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
+    (stored) => { const p = JSON.parse(original); p.builds[0].sha256 = '8'.repeat(64); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
+    (stored) => { const p = JSON.parse(original); p.runId = '999'; signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
+    (stored) => { const p = JSON.parse(original); p.sourceRevision = '8'.repeat(40); signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
+    (stored) => { const p = JSON.parse(original); p.kind = 'another-protocol'; signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
+    (stored) => { stored.delete(target) },
+    (stored) => { stored.set(target, Buffer.from('corrupt executable')) },
+    (stored) => { stored.set(release.HOST_ASSET, Buffer.from('corrupt host')) },
+  ]
+  for (const [index, mutate] of variants.entries()) {
+    const stored = new Map(value.stored); mutate(stored)
+    const outputDirectory = path.join(value.root, `bad-recovery-${index}`); fs.mkdirSync(outputDirectory)
+    await assert.rejects(() => release.recoverPublishedRelease({ ...value, outputDirectory,
+      release: { assets: [...stored.keys()].map((name) => ({ name })) }, readAsset: (asset) => stored.get(asset.name) }))
+  }
+})
+
 test('partial uploads resume without replacement, while conflicts or a committed manifest with missing assets fail closed', async (t) => {
   const value = publishingFixture(t), name = release.artifactName(release.TARGETS[0])
   value.stored.set(name, fs.readFileSync(path.join(value.outputDirectory, name)))
@@ -315,7 +381,11 @@ test('workflow retains the original successful-CI authority, one allocator/queue
   for (const target of release.TARGETS) {
     const key = release.targetOutputKey(target)
     assert.ok(matrix.includes(key + ': ${{ steps.build.outputs.' + key + ' }}'))
+    assert.ok(final.includes('name: bamboo-executable-' + target + '-attempt-${{ fromJSON(needs.executables.outputs.' + key + ').runAttempt }}'))
+    assert.ok(final.includes('path: ${{ runner.temp }}/bamboo-executable-inputs/' + target))
   }
+  assert.ok(matrix.includes('name: bamboo-executable-${{ matrix.target }}-attempt-${{ github.run_attempt }}'))
+  assert.doesNotMatch(matrix, /overwrite: true/)
   for (const match of source.matchAll(/uses: ([^\s]+)@([^\s]+)/g)) assert.match(match[2], /^[0-9a-f]{40}$/, 'Release actions must use immutable reviewed commits')
   assert.ok(final.includes('EXPECTED_BUILDS: ${{ toJSON(needs.executables.outputs) }}'))
   assert.match(final, /needs: \[automatic, executables\]/)

@@ -6,11 +6,13 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
 const { assertVersion, validateSource, readBodyReceipt, validateReceipt,
-  readAuthenticatedReceipt, assertSigningConfiguration, spawnCommand } = require('./crate-release.cjs')
+  readAuthenticatedReceipt, assertSigningConfiguration, signReceipt, authenticateReceipt, spawnCommand } = require('./crate-release.cjs')
 
 const REPOSITORY = 'bigduu/Bamboo-agent'
 const MANIFEST = 'bamboo-sidecars-v1.json'
 const HOST_ASSET = 'bamboo-browser-host-v1.tar.gz'
+const PROVENANCE = 'bamboo-executables-provenance-v1.json'
+const PROVENANCE_KIND = 'bamboo-complete-executables/v1'
 const TARGETS = Object.freeze(['aarch64-apple-darwin', 'x86_64-apple-darwin',
   'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu'])
 const HOST_FILES = Object.freeze(['browser-runtime/host.cjs', 'browser-runtime/package-lock.json',
@@ -230,11 +232,12 @@ function expectedBuildBindings(outputs) {
     const value = JSON.parse(outputs[targetOutputKey(target)])
     requireDigest(value, MAX_BINARY, 65536)
     assert.match(value.receiptSha256, DIGEST)
+    assert.ok(Number.isSafeInteger(value.runAttempt) && value.runAttempt >= 1, 'Invalid native-job attempt binding')
     return [target, value]
   }))
 }
 
-function assembleRelease({ identity, inputDirectory, outputDirectory, sourceRoot, frontendBytes, expectedBuilds }) {
+function assembleRelease({ identity, inputDirectory, outputDirectory, sourceRoot, frontendBytes, expectedBuilds, signingKey }) {
   const bindings = expectedBuildBindings(expectedBuilds)
   assert.deepEqual(fs.readdirSync(inputDirectory).sort(), [...TARGETS].sort(), 'Missing or unexpected platform transport directory')
   const receipts = TARGETS.map((target) => {
@@ -245,6 +248,7 @@ function assembleRelease({ identity, inputDirectory, outputDirectory, sourceRoot
     assert.equal(fileIdentity(receiptPath, 1024 * 1024).sha256, bindings.get(target).receiptSha256,
       'Transported receipt differs from the independent build-job output')
     const receipt = validateBuildReceipt(JSON.parse(fs.readFileSync(receiptPath)), identity, target)
+    assert.equal(receipt.runAttempt, bindings.get(target).runAttempt, 'Transport differs from the bound native-job attempt')
     assert.equal(receipt.sha256, bindings.get(target).sha256, 'Executable digest differs from the independent build job')
     assert.equal(receipt.sizeBytes, bindings.get(target).sizeBytes)
     assert.deepEqual(receipt.frontendBytes, frontendBytes, 'Platform binary embedded different release frontend bytes')
@@ -260,17 +264,63 @@ function assembleRelease({ identity, inputDirectory, outputDirectory, sourceRoot
   // A failed final upload can rerun without changing immutable provenance.
   // Record the attempts that actually built these bytes, not the uploader's
   // later retry number (the complete per-target attempts remain in builds).
-  const provenance = { schemaVersion: 1, ...identity, runAttempt: Math.max(...receipts.map((item) => item.runAttempt)),
-    manifestSha256: sha256(manifestBytes(manifest)), builds: receipts }
-  fs.writeFileSync(path.join(outputDirectory, 'bamboo-executables-provenance-v1.json'),
+  const provenance = signReceipt({ schemaVersion: 1, kind: PROVENANCE_KIND, ...identity,
+    runAttempt: Math.max(...receipts.map((item) => item.runAttempt)),
+    manifestSha256: sha256(manifestBytes(manifest)), builds: receipts }, signingKey)
+  fs.writeFileSync(path.join(outputDirectory, PROVENANCE),
     `${JSON.stringify(provenance, null, 2)}\n`, { flag: 'wx' })
+  return manifest
+}
+
+// All binaries and the deterministic host precede provenance in the upload
+// order. Once that signed checkpoint exists, a later full workflow rerun can
+// finish the original manifest even if its new builds have different bytes.
+// Never adopt an unsigned receipt, a different run/source, or incomplete assets.
+async function recoverPublishedRelease({ identity, release, outputDirectory, sourceRoot,
+  frontendBytes, signingKey, readAsset }) {
+  const checkpoint = release.assets.find((asset) => asset.name === PROVENANCE)
+  if (!checkpoint) return null
+  const bytes = await readAsset(checkpoint, 1024 * 1024)
+  assert.ok(bytes.length <= 1024 * 1024)
+  const proof = authenticateReceipt(JSON.parse(bytes), signingKey)
+  assert.equal(proof.schemaVersion, 1)
+  assert.equal(proof.kind, PROVENANCE_KIND)
+  for (const key of ['repository', 'version', 'sourceRevision', 'sourceTree', 'workflowRevision', 'runId', 'ciRun']) {
+    assert.equal(proof[key], identity[key], `Recovery provenance mismatch: ${key}`)
+  }
+  assert.deepEqual(proof.builds?.map((item) => item.target), TARGETS)
+  for (const item of proof.builds) {
+    validateBuildReceipt(item, identity, item.target)
+    assert.deepEqual(item.frontendBytes, frontendBytes)
+  }
+  assert.equal(proof.runAttempt, Math.max(...proof.builds.map((item) => item.runAttempt)))
+  const browserHost = createBrowserHost({ sourceRoot, outputDirectory })
+  const manifest = createManifest({ ...identity, artifacts: proof.builds, browserHost })
+  assert.equal(sha256(manifestBytes(manifest)), proof.manifestSha256,
+    'Recovery manifest does not match the authenticated checkpoint')
+  const required = [...proof.builds, browserHost]
+  assert.ok(required.every((item) => release.assets.some((asset) => asset.name === item.assetName)),
+    'Authenticated checkpoint has missing release assets')
+  for (const item of required) {
+    const asset = release.assets.find((asset) => asset.name === item.assetName)
+    const data = await readAsset(asset, item.sizeBytes)
+    assert.deepEqual({ sha256: sha256(data), sizeBytes: data.length },
+      { sha256: item.sha256, sizeBytes: item.sizeBytes }, 'Recovery asset differs from authenticated provenance')
+    if (item.target) {
+      const file = path.join(outputDirectory, item.assetName)
+      fs.writeFileSync(file, data, { flag: 'wx' })
+      binaryArchitecture(file, item.target)
+    }
+  }
+  fs.writeFileSync(path.join(outputDirectory, PROVENANCE), bytes, { flag: 'wx' })
+  fs.writeFileSync(path.join(outputDirectory, MANIFEST), manifestBytes(manifest), { flag: 'wx' })
   return manifest
 }
 
 // Never clobber release assets. An interrupted upload can resume only when the
 // server still has these exact bytes. The manifest is the final commit marker.
 async function publishAssets({ directory, release, readAsset, upload, listAssets }) {
-  const names = [...TARGETS.map(artifactName), HOST_ASSET, 'bamboo-executables-provenance-v1.json', MANIFEST]
+  const names = [...TARGETS.map(artifactName), HOST_ASSET, PROVENANCE, MANIFEST]
   assert.deepEqual(fs.readdirSync(directory).sort(), [...names].sort())
   const expected = new Map(names.map((name) => [name, fileIdentity(path.join(directory, name),
     name.startsWith('bamboo-') && TARGETS.some((target) => artifactName(target) === name) ? MAX_BINARY : MAX_HOST)]))
@@ -311,7 +361,10 @@ async function main() {
   assert.ok(process.env.BAMBOO_RELEASE_SIGNING_KEY, 'Final asset publication requires the existing protected signing authority')
   const directory = path.join(process.env.RUNNER_TEMP, 'bamboo-executable-release')
   fs.mkdirSync(directory) // Fresh output; never adopt unexplained runner files.
-  const manifest = assembleRelease({ identity, inputDirectory: path.join(process.env.RUNNER_TEMP, 'bamboo-executable-inputs'),
+  const recovery = { identity, release, outputDirectory: directory, sourceRoot: process.cwd(),
+    frontendBytes: receipt.frontendBytes, signingKey: process.env.BAMBOO_RELEASE_SIGNING_KEY, readAsset: assetBytes }
+  const manifest = await recoverPublishedRelease(recovery) || assembleRelease({ ...recovery,
+    inputDirectory: path.join(process.env.RUNNER_TEMP, 'bamboo-executable-inputs'),
     outputDirectory: directory, sourceRoot: process.cwd(), frontendBytes: receipt.frontendBytes,
     expectedBuilds: JSON.parse(process.env.EXPECTED_BUILDS) })
   assert.equal(git(['rev-parse', 'HEAD']), identity.sourceRevision)
@@ -325,8 +378,8 @@ async function main() {
     sourceRevision: identity.sourceRevision, manifestSha256: sha256(manifestBytes(manifest)), targets: TARGETS }))
 }
 
-module.exports = { REPOSITORY, MANIFEST, HOST_ASSET, TARGETS, HOST_FILES, MAX_BINARY, MAX_HOST,
+module.exports = { REPOSITORY, MANIFEST, HOST_ASSET, PROVENANCE, TARGETS, HOST_FILES, MAX_BINARY, MAX_HOST,
   artifactName, targetOutputKey, sha256, fileIdentity, createBrowserHost, createManifest, manifestBytes,
   binaryArchitecture, execute, git, workflowIdentity, publishedRelease, assetBytes,
-  validateBuildReceipt, expectedBuildBindings, assembleRelease, publishAssets }
+  validateBuildReceipt, expectedBuildBindings, assembleRelease, recoverPublishedRelease, publishAssets }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })

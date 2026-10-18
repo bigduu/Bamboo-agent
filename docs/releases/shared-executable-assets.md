@@ -47,6 +47,16 @@ replacement uploads. An interrupted final upload can reuse identical assets;
 a conflicting asset blocks publication. The manifest uploads last. A public
 crate Release without this manifest is not a complete desktop binary release.
 
+The final publisher authenticates its executable provenance with the existing
+protected signing key before uploading that checkpoint. If a full workflow
+rerun rebuilds different bytes after the checkpoint was published, it verifies
+the original same-run/source/version checkpoint, its four native receipts and
+all original executable/host bytes, regenerates the identical source-derived
+manifest, and uploads only the missing manifest. It never re-signs or adopts an
+unsigned, foreign or incomplete checkpoint. Native transports have per-attempt
+names selected through the independent job outputs; earlier transports remain
+intact rather than being overwritten by a later attempt.
+
 Release actions use reviewed immutable commit references. Each native build
 also sends the executable hash/size and receipt hash through its uniquely
 named GitHub job output. The final job verifies downloaded bytes against those

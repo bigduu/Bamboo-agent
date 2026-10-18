@@ -124,7 +124,8 @@ async function main() {
   // A substituted binary plus a forged receipt cannot change this binding.
   assert.ok(process.env.GITHUB_OUTPUT)
   fs.appendFileSync(process.env.GITHUB_OUTPUT, `${targetOutputKey(target)}=${JSON.stringify({
-    sha256: provenance.sha256, sizeBytes: provenance.sizeBytes, receiptSha256: sha256(receiptBytes) })}\n`)
+    sha256: provenance.sha256, sizeBytes: provenance.sizeBytes, receiptSha256: sha256(receiptBytes),
+    runAttempt: identity.runAttempt })}\n`)
   console.log(JSON.stringify({ status: 'standard-executable-built-and-version-verified', target,
     version: identity.version, sourceRevision: identity.sourceRevision, sha256: provenance.sha256 }))
 }
