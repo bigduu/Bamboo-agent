@@ -769,10 +769,20 @@ async fn queued_child_keeps_host_round_ceiling_after_global_budget_is_relaxed() 
         .expect("three exact Start receipts survive concurrent runtime ACKs");
         let first = fixture.next_request().await;
         let second = fixture.next_request().await;
-        let first_index = (0..2).find(|index| first.is_work(*index)).unwrap();
-        let second_index = (0..2).find(|index| second.is_work(*index)).unwrap();
+        // A scope-CAS loss can defer an earlier Work while another eligible
+        // grant starts. Identify actual owners from the controlled native
+        // requests instead of treating grant order as a runtime receipt.
+        let first_index = (0..fixture.works.len())
+            .find(|index| first.is_work(*index))
+            .unwrap();
+        let second_index = (0..fixture.works.len())
+            .find(|index| second.is_work(*index))
+            .unwrap();
         assert_ne!(first_index, second_index);
-        let queued_work = fixture.works[2].id.clone();
+        let queued_index = (0..fixture.works.len())
+            .find(|index| *index != first_index && *index != second_index)
+            .unwrap();
+        let queued_work = fixture.works[queued_index].id.clone();
         let queued_child = tokio::time::timeout(WAIT, async {
             loop {
                 let snapshot = fixture.snapshot();
@@ -816,7 +826,10 @@ async fn queued_child_keeps_host_round_ceiling_after_global_budget_is_relaxed() 
         first.complete();
         for round in 0..=MAX_ROUNDS {
             let request = fixture.next_request().await;
-            assert!(request.is_work(2), "only the queued third Work may advance");
+            assert!(
+                request.is_work(queued_index),
+                "only the actual queued Work may advance"
+            );
             let summary = request.messages.iter().any(|message| {
                 message
                     .metadata
