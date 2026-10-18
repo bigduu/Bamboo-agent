@@ -638,3 +638,8 @@ mod local_task_assembly_tests;
 
 #[cfg(test)]
 mod local_task_conversation_tests;
+
+#[cfg(test)]
+mod supervised_root_create_tests;
+
+pub(super) mod supervised_root_create;

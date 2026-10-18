@@ -28,6 +28,7 @@ pub(crate) struct DefaultWriterPhysicalGuards {
     _session: Option<SessionWriteGuard>,
     _root_session: Option<SessionWriteGuard>,
     _supervisor: Option<Arc<super::supervisor_management::SupervisorFollowupGuard>>,
+    _supervised_creation: Option<Arc<super::supervisor_management::SupervisorManagementGuards>>,
     _task: Option<TaskGuard>,
     _lifecycle: Option<LifecycleGuard>,
 }
@@ -76,6 +77,7 @@ impl DefaultWriterGuards {
                 _session: Some(session),
                 _root_session: None,
                 _supervisor: None,
+                _supervised_creation: None,
                 _task: Some(TaskGuard::Shared { _guard: task }),
                 _lifecycle: Some(LifecycleGuard::Shared { _guard: lifecycle }),
             }),
@@ -103,6 +105,7 @@ impl DefaultWriterGuards {
                 _session: Some(session),
                 _root_session: None,
                 _supervisor: None,
+                _supervised_creation: None,
                 _task: Some(TaskGuard::Exclusive { _guard: task }),
                 _lifecycle: Some(LifecycleGuard::Exclusive { _guard: lifecycle }),
             }),
@@ -130,6 +133,33 @@ impl DefaultWriterGuards {
                 _session: None,
                 _root_session: None,
                 _supervisor: Some(Arc::new(authority)),
+                _supervised_creation: None,
+                _task: None,
+                _lifecycle: None,
+            }),
+        })
+    }
+
+    pub(super) fn supervised_creation(
+        authority: Arc<super::supervisor_management::SupervisorManagementGuards>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            root_mode_context: None,
+            root_actor: None,
+            child_actor: None,
+            child_input: None,
+            root_origin: None,
+            parent_question_answer: None,
+            input: None,
+            _input_filesystem: None,
+            scoped_loop: None,
+            scoped_input: None,
+            physical: Arc::new(DefaultWriterPhysicalGuards {
+                tree: std::sync::Mutex::new(None),
+                _session: None,
+                _root_session: None,
+                _supervisor: None,
+                _supervised_creation: Some(authority),
                 _task: None,
                 _lifecycle: None,
             }),
