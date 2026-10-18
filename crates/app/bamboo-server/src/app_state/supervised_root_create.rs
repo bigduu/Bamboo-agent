@@ -47,6 +47,18 @@ fn blocked(
     }).to_string())
 }
 
+fn workspace_code(error: &crate::project_context::SessionWorkspaceValidationError) -> &'static str {
+    use crate::project_context::SessionWorkspaceValidationError;
+    match error {
+        SessionWorkspaceValidationError::Invalid { .. } => "workspace_invalid",
+        SessionWorkspaceValidationError::Conflict { .. } => "project_workspace_conflict",
+        SessionWorkspaceValidationError::Unbound { .. } => "project_workspace_unbound",
+        SessionWorkspaceValidationError::ProjectArchived { .. } => "project_archived",
+        SessionWorkspaceValidationError::ProjectUnavailable { .. } => "project_unavailable",
+        SessionWorkspaceValidationError::Store(_) => "project_store_unavailable",
+    }
+}
+
 fn io_code(error: &std::io::Error) -> &'static str {
     match error.kind() {
         std::io::ErrorKind::PermissionDenied => "scope_denied",
@@ -67,8 +79,8 @@ impl SupervisedRootCreatePort for SupervisedRootCreator {
         Ok(ToolResult::text(true, json!({
             "action":"scope", "supervisor":scope.supervisor,
             "state_revision":scope.state_revision, "allowed_projects":scope.allowed_projects,
-            "create_available":!scope.allowed_projects.is_empty(),
-            "code":if scope.allowed_projects.is_empty() {"project_scope_uninitialized"} else {"ready"},
+            "create_route_exposed":true, "project_scope_configured":!scope.allowed_projects.is_empty(),
+            "code":if scope.allowed_projects.is_empty() {"project_scope_uninitialized"} else {"project_scope_configured"},
             "note":"Only these existing Host-authorized Projects may receive a new Ordinary Root. The workspace must already be bound to the explicit Project. This observation is not a grant and never initializes Work, changes permissions or attaches historical Sessions."
         }).to_string()))
     }

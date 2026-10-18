@@ -522,3 +522,55 @@ async fn damaged_receipt_cannot_attach_a_historical_root_and_expiry_cannot_alloc
         .is_some());
     assert_eq!(fresh.activation.calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn scope_observation_reports_uninitialized_scope_without_granting_or_creating() {
+    let f = Fixture::new().await;
+    let scoped = value(f.creator.scope(&f.supervisor).await.unwrap());
+    assert_eq!(scoped["allowed_projects"], json!([f.request.project_id]));
+    assert_eq!(scoped["code"], "project_scope_configured");
+    SupervisorSessionService::new(f.creator.store.clone())
+        .configure_project_scope(&f.supervisor, 1, Default::default())
+        .await
+        .unwrap();
+    let uninitialized = value(f.creator.scope(&f.supervisor).await.unwrap());
+    assert_eq!(uninitialized["project_scope_configured"], false);
+    assert_eq!(uninitialized["code"], "project_scope_uninitialized");
+    assert_eq!(uninitialized["allowed_projects"], json!([]));
+    assert_eq!(f.count().await, 1);
+    assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn canonical_creation_rechecks_revocation_and_scope_cas_before_root_publication() {
+    for regrant in [false, true] {
+        let f = Fixture::new().await;
+        let (_, candidate) = f.reserve().await;
+        let service = SupervisorSessionService::new(f.creator.store.clone());
+        service
+            .configure_project_scope(&f.supervisor, 1, Default::default())
+            .await
+            .unwrap();
+        if regrant {
+            service
+                .configure_project_scope(&f.supervisor, 2, [f.request.project_id.clone()].into())
+                .await
+                .unwrap();
+        }
+        assert!(f
+            .creator
+            .store
+            .create_and_attach_supervised_root(&f.supervisor, 1, &candidate)
+            .await
+            .is_err());
+        assert!(f
+            .creator
+            .store
+            .load_root_authority(&candidate.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(f.count().await, 1);
+        assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
+    }
+}

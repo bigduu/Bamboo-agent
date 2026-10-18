@@ -6,8 +6,9 @@ its existing followup/loop catalog. Trusted Supervisor identity is required in
 both Standard and Ultra; ordinary Roots and Children receive no new authority.
 
 `scope` returns the current management `state_revision`, existing
-`allowed_projects` and an actionable `project_scope_uninitialized` or `ready`
-code. It observes authority and never grants it. No unrelated session directory
+`allowed_projects` and an actionable `project_scope_uninitialized` or
+`project_scope_configured` code. Route exposure is distinct from Project scope
+and does not claim a particular worker is ready. It observes authority and never grants it. No unrelated session directory
 is returned.
 
 `create` takes `request` with `operation_id` (non-nil UUID),

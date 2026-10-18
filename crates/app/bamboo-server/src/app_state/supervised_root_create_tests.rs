@@ -9,7 +9,7 @@ use bamboo_domain::{
     RootModeOperationAction, RootModeOperationRequest, SessionKind, SupervisorReference,
 };
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
-use bamboo_tools::permission::{PermissionRule, PermissionType};
+use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
 use serde_json::{json, Value};
 
 use super::AppState;
@@ -80,17 +80,22 @@ impl Fixture {
             .unwrap()
             .unwrap();
         assert_eq!(original.root_orchestration_only_enabled(), ultra);
-        // A real native permission rule for the fixture operation. No bypass,
+        // An exact native session grant for the fixture operation. No bypass,
         // auto-approve, identity override, or permissions on a worker are used.
         state
             .permission_checker
             .permission_config()
             .unwrap()
-            .add_rule(PermissionRule::new(
+            .grant_typed_scoped_session_permission(
+                &supervisor.session_id,
                 PermissionType::ExecuteCommand,
-                "session_control create*",
-                true,
-            ));
+                PermissionMatcher {
+                    id: "explicit-worker-creation".into(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: format!("session_control create {} {workspace}", project.id),
+                },
+            )
+            .unwrap();
         Self {
             home,
             state,
@@ -156,6 +161,10 @@ async fn assert_create_is_independent_and_exact_retry(ultra: bool) {
         .await
         .unwrap()
         .unwrap();
+    let scope = f.invoke(json!({"action":"scope"})).await;
+    assert_eq!(scope["state_revision"], 1);
+    assert_eq!(scope["allowed_projects"], json!([f.project_id]));
+    assert_eq!(scope["project_scope_configured"], true);
     let operation_id = uuid::Uuid::new_v4();
     let response = f.invoke(f.request(operation_id)).await;
     assert_eq!(response["action"], "create");
