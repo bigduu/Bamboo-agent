@@ -2,7 +2,8 @@ import {verify} from './verify.mjs';
 import {search} from './search.mjs';
 const el = id => document.getElementById(id);
 try {
-  if (!['https:','http:'].includes(location.protocol)) throw new Error('Serve over HTTPS or localhost');
+  const loopback = ['localhost','127.0.0.1','[::1]'].includes(location.hostname);
+  if (location.protocol !== 'https:' && !(location.protocol === 'http:' && loopback)) throw new Error('Serve over HTTPS or localhost');
   const fetchLocal = async path => {
     const response = await fetch(new URL(path, location.href), {credentials:'omit', redirect:'error'});
     if (!response.ok) throw new Error('Missing manual resource');
