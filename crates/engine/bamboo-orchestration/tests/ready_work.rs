@@ -890,7 +890,7 @@ async fn pending_metadata_candidate_keeps_original_grant_and_ensures_original_in
     assert_eq!(fixture.host.dispatches.lock().unwrap().len(), 1);
     assert_eq!(
         fixture.host.ensures.lock().unwrap().as_slice(),
-        &[key.clone()]
+        std::slice::from_ref(&key)
     );
     assert_eq!(
         fixture.host.preflights.lock().unwrap().len(),
