@@ -370,6 +370,8 @@ async fn started_operation_keeps_plugin_lock_after_request_cancellation() {
     let dir = tempfile::tempdir().unwrap();
     let state = state(dir.path()).await;
     let installer = ServerPluginInstaller::new(state.clone());
+    // Force the first poll to queue on the real operation lock.
+    let held = installer.begin_operation().await;
     let (started, start) = tokio::sync::oneshot::channel();
     let (finish, completion) = tokio::sync::oneshot::channel::<()>();
     let mut request = Box::pin(run_owned_operation(state, async move {
@@ -377,9 +379,16 @@ async fn started_operation_keeps_plugin_lock_after_request_cancellation() {
         completion.await.unwrap();
     }));
     assert!(futures::poll!(request.as_mut()).is_pending());
-    tokio::time::timeout(Duration::from_secs(2), start)
+    drop(held);
+    // A queued request must keep being polled until its operation starts;
+    // waiting only on `start` would leave it suspended at lock acquisition.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            started = start => started.unwrap(),
+            result = request.as_mut() => panic!("operation completed before its start handshake: {result:?}"),
+        }
+    })
         .await
-        .unwrap()
         .unwrap();
     drop(request);
     assert!(

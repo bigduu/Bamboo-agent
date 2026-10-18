@@ -198,6 +198,12 @@ bamboo/
 
 ## Release Process
 
+The automatic publisher also provides the standard complete Bamboo executables
+for standalone and desktop reuse. See [Shared Bamboo executables](docs/releases/shared-executable-assets.md)
+for the four-platform assets, source/version provenance, browser host archive,
+and consumer hash verification contract. These assets retain all release gates
+described below.
+
 Follow [Parallel Development](./gitflow.md) for branch ownership, bounded batches
 and evidence. Batch integration and standalone PRs target `dev`. Its required
 `Test` gate runs `cargo build --locked` in compile-only mode; `Quick Checks`
