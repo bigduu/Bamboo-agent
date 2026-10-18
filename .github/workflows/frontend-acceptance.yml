@@ -261,7 +261,7 @@ jobs:
 
       - name: Test locked Rust workspace
         timeout-minutes: 45
-        run: cargo test --locked
+        run: cargo test --locked --no-fail-fast
         env:
           RUST_MIN_STACK: "8388608"
 

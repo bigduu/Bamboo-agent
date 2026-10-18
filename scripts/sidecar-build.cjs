@@ -124,7 +124,7 @@ async function main() {
   // package actually managed by the existing stamper, including CLI and server.
   const server = verifyStampedVersions(metadata, identity.version, { manifestPaths })
   const stamped = sourceState(allowed)
-  const args = ['build', '--locked', '--release', '--bin', 'bamboo', '--target', target,
+  const args = ['build', '--locked', '--release', '--verbose', '--bin', 'bamboo', '--target', target,
     '--message-format=json-render-diagnostics']
   const log = path.join(temporary, 'bamboo-executable-cargo.jsonl')
   const fd = fs.openSync(log, 'wx')

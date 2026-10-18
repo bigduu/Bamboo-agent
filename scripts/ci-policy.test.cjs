@@ -44,13 +44,77 @@ const job = (id) => {
 const comprehensiveOnly =
   "if: github.event_name != 'pull_request' || github.base_ref == 'main'"
 
+function assertCargoFailureCollection(source) {
+  const commands = [...source.matchAll(/(?:run: )?cargo test --locked([^\n]*)/gu)]
+    .map((match) => match[1].trim().split(/\s+/u))
+    .filter((args) => !args.includes("--no-run"))
+  assert.ok(commands.length > 0, "runtime Cargo commands are present")
+  for (const args of commands) {
+    const separator = args.indexOf("--")
+    const cargoArgs = separator < 0 ? args : args.slice(0, separator)
+    assert.ok(cargoArgs.includes("--no-fail-fast"), "collect failures across test executables")
+  }
+  assert.doesNotMatch(source, /continue-on-error:\s*true|\|\|\s*(?:true|exit 0)/u)
+}
+
+test("runtime Cargo gates collect failures without masking their nonzero exit", () => {
+  const frontend = readFileSync(".github/workflows/frontend-acceptance.yml", "utf8")
+  const macHelper = readFileSync("scripts/run-macos-server-lib-tests.sh", "utf8")
+  for (const source of [workflow, frontend, macHelper]) {
+    assertCargoFailureCollection(source)
+    for (const match of source.matchAll(/cargo test --locked[^\n]*/gu)) {
+      if (match[0].includes("--no-run")) continue
+      const mutation = source.slice(0, match.index) +
+        source.slice(match.index).replace(" --no-fail-fast", "")
+      assert.throws(() => assertCargoFailureCollection(mutation))
+    }
+    for (const suffix of [" || true", " || exit 0"]) {
+      assert.throws(() => assertCargoFailureCollection(`${source}\ntrue${suffix}\n`))
+    }
+  }
+  // The macOS wrapper still propagates Cargo's recorded nonzero exit; the
+  // existing executable wrapper fixture also verifies its exit-23 path.
+  assert.match(macHelper, /cargo_status=\$\{pipeline_status\[0\]\}/u)
+  assert.match(macHelper, /^exit "\$cargo_status"$/mu)
+})
+
+test("platform matrices retain results after another platform fails", () => {
+  for (const id of ["tls-fixture-test", "tool-event-recorder-e2e", "build"]) {
+    const source = job(id)
+    assert.match(source, /^    strategy:\n      fail-fast: false\n/mu)
+    assert.doesNotMatch(source, /continue-on-error:/u)
+  }
+})
+
+test("standard release disables LTO without reducing optimization or accepting profile overrides", () => {
+  const manifest = readFileSync("Cargo.toml", "utf8")
+  const profile = manifest.match(/^\[profile\.release\]\n([\s\S]*?)(?=^\[|$(?![\s\S]))/mu)?.[1]
+  assert.ok(profile)
+  assert.match(profile, /^opt-level = 3$/mu)
+  assert.match(profile, /^lto = "off"$/mu)
+  const config = readFileSync(".cargo/config.toml", "utf8")
+  assert.doesNotMatch(config, /^\[profile\.release(?:\.|\])|CARGO_PROFILE_RELEASE_|(?:^|\s)lto\s*=/mu)
+  for (const source of [workflow, readFileSync(".github/workflows/publish-crate.yml", "utf8")]) {
+    assert.doesNotMatch(source, /CARGO_PROFILE_RELEASE_|CARGO_ENCODED_RUSTFLAGS|(?:^|\s)RUSTFLAGS:/mu)
+  }
+  const builder = readFileSync("scripts/sidecar-build.cjs", "utf8")
+  assert.ok(builder.includes("const args = ['build', '--locked', '--release', '--verbose', '--bin', 'bamboo', '--target', target,"))
+  const { buildEnvironment } = require("./sidecar-build.cjs")
+  for (const value of ["true", "false", "thin", "fat", "off"]) {
+    assert.throws(() => buildEnvironment({ CARGO_PROFILE_RELEASE_LTO: value }, "/own/target"))
+  }
+  for (const overrides of [{ RUSTFLAGS: "-C lto=fat" }, { CARGO_ENCODED_RUSTFLAGS: "-Clto=thin" }]) {
+    assert.throws(() => buildEnvironment(overrides, "/own/target"))
+  }
+})
+
 test("macOS link guard preserves Cargo failures and rejects lost or oversized diagnostics", {
   skip: process.platform === "win32" && "the macOS helper requires a POSIX shell",
 }, () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-macos-link-guard-"))
   const helper = path.resolve(__dirname, "run-macos-server-lib-tests.sh")
   const expectedArgs = [
-    "test", "--locked", "--profile", "dev", "-p", "bamboo-server",
+    "test", "--locked", "--no-fail-fast", "--profile", "dev", "-p", "bamboo-server",
     "--all-features", "--lib", "server::tls::tests", "--", "--nocapture",
   ]
   const stub = (name, body) => writeFileSync(path.join(directory, name), `#!/bin/bash\n${body}\n`, { mode: 0o755 })
@@ -113,7 +177,7 @@ test("full snapshot and main gates preserve locked Rust, formatting, and policy 
   assert.match(testJob, /run: cargo build --locked\n/u)
   assert.match(
     testJob,
-    /- name: Test locked Rust workspace\n        if: needs\.validation-source\.outputs\.full == 'true'\n        timeout-minutes: 45\n        run: cargo test --locked\n/u,
+    /- name: Test locked Rust workspace\n        if: needs\.validation-source\.outputs\.full == 'true'\n        timeout-minutes: 45\n        run: cargo test --locked --no-fail-fast\n/u,
   )
   assert.match(
     testJob,
@@ -142,7 +206,7 @@ test("full snapshot and main gates preserve locked Rust, formatting, and policy 
     )
   }
 
-  assert.doesNotMatch(testJob, /run: cargo test --locked --all-features/u)
+  assert.doesNotMatch(testJob, /run: cargo test --locked --no-fail-fast --all-features/u)
   assert.match(testJob, /run: cargo build --locked --examples\n/u)
 
   assert.match(
@@ -163,7 +227,7 @@ test("locked Rust test compilation has a separate budget before the complete sui
   const requiredSteps = [
     ["Build locked Rust workspace", "cargo build --locked", undefined],
     ["Compile locked Rust test targets", "cargo test --locked --no-run", "15"],
-    ["Test locked Rust workspace", "cargo test --locked", "45"],
+    ["Test locked Rust workspace", "cargo test --locked --no-fail-fast", "45"],
   ]
   let previousIndex = -1
   for (const [name, command, timeout] of requiredSteps) {
@@ -205,9 +269,9 @@ test("promotion retains required checks without repeating platform coverage", ()
 
   const e2e = job("e2e-test")
   assert.match(e2e, /name: E2E Tests\n/u)
-  assert.match(e2e, /run: cargo test --locked --all-features --lib --tests\n/u)
+  assert.match(e2e, /run: cargo test --locked --no-fail-fast --all-features --lib --tests\n/u)
   assert.equal(
-    [...workflow.matchAll(/run: cargo test --locked --all-features --lib --tests\n/gu)]
+    [...workflow.matchAll(/run: cargo test --locked --no-fail-fast --all-features --lib --tests\n/gu)]
       .length,
     1,
   )
@@ -216,7 +280,7 @@ test("promotion retains required checks without repeating platform coverage", ()
   const tls = job("tls-fixture-test")
   assert.match(tls, /os: \[macos-latest, windows-latest\]/u)
   assert.match(tls, /if: runner\.os == 'macOS'\n        run: scripts\/run-macos-server-lib-tests\.sh/u)
-  assert.match(tls, /if: runner\.os == 'Windows'\n        run: cargo test --locked -p bamboo-server --lib server::tls::tests/u)
+  assert.match(tls, /if: runner\.os == 'Windows'\n        run: cargo test --locked --no-fail-fast -p bamboo-server --lib server::tls::tests/u)
 
   const build = job("build")
   assert.match(build, /name: Build \(\$\{\{ matrix\.os \}\}\)\n/u)
@@ -227,10 +291,10 @@ test("promotion retains required checks without repeating platform coverage", ()
   const readToolStep = build.indexOf("- name: Verify portable Skill read Tool")
   const releaseStep = build.indexOf("- name: Build\n")
   assert.ok(sourceStep >= 0 && selectedStep > sourceStep && releaseStep > selectedStep)
-  assert.match(build, /run: cargo test --locked -p bamboo-skills progressive::read_tests -- --test-threads=1\n/u)
+  assert.match(build, /run: cargo test --locked --no-fail-fast -p bamboo-skills progressive::read_tests -- --test-threads=1\n/u)
   assert.equal((workflow.match(/progressive::read_tests/gu) || []).length, 1)
   assert.ok(readToolStep > selectedStep && readToolStep < releaseStep)
-  assert.match(build, /run: cargo test --locked -p bamboo-server-tools skill_runtime::catalog_tests -- --test-threads=1\n/u)
+  assert.match(build, /run: cargo test --locked --no-fail-fast -p bamboo-server-tools skill_runtime::catalog_tests -- --test-threads=1\n/u)
   assert.equal((workflow.match(/skill_runtime::catalog_tests/gu) || []).length, 1)
   assert.doesNotMatch(job("test"), /Verify portable Skill read Tool/u)
 
@@ -253,7 +317,7 @@ test("all-feature E2E tests retain the workspace test thread stack contract", ()
   const [step] = matches
   assert.deepEqual(
     [...step.matchAll(/^        run: (.*)$/gmu)].map((match) => match[1]),
-    ["cargo test --locked --all-features --lib --tests"],
+    ["cargo test --locked --no-fail-fast --all-features --lib --tests"],
   )
   assert.match(step, /^        env:\n          RUST_MIN_STACK: "8388608"$/mu)
   assert.doesNotMatch(step, /^        (?:if|continue-on-error):/mu)
@@ -822,7 +886,7 @@ function assertFrontendPolicy(source) {
       ["Check formatting", "cargo fmt --all -- --check"],
       ...(index === 0 ? [["Build locked Rust workspace", "cargo build --locked"]] : [
         ["Compile locked Rust test targets", "cargo test --locked --no-run", 15],
-        ["Test locked Rust workspace", "cargo test --locked", 45],
+        ["Test locked Rust workspace", "cargo test --locked --no-fail-fast", 45],
       ]),
       ["Require source files to remain unchanged", "git diff --exit-code"],
     ]) {
@@ -891,7 +955,7 @@ test("frontend acceptance preserves both original command gates and actual-head 
     ["package-manager-cache: false", "package-manager-cache: true"],
     ["components: rustfmt\n", "toolchain: 1.99.0\n          components: rustfmt\n"],
     ["run: cargo build --locked", "run: true"],
-    ["run: cargo test --locked\n", "run: cargo test --locked -- --skip slow\n"],
+    ["run: cargo test --locked --no-fail-fast\n", "run: cargo test --locked --no-fail-fast -- --skip slow\n"],
     ['RUST_MIN_STACK: "8388608"', 'RUST_MIN_STACK: "16777216"'],
     ["run: git diff --exit-code", "run: true"],
     ["        if: always()\n", ""],
@@ -1136,7 +1200,7 @@ test("native Windows retains the exact 41-case selection and original runtime bu
     "timeout-minutes: 5\n", "timeout-minutes: 15\n")), "the runtime budget must not expand")
   assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
     "$nativeContext = Read-ActorNativeManifest $evidence",
-    "$nativeContext = Read-ActorNativeManifest $evidence\n          & cargo test --locked")),
+    "$nativeContext = Read-ActorNativeManifest $evidence\n          & cargo test --locked --no-fail-fast")),
   "runtime must not re-enter Cargo")
 })
 

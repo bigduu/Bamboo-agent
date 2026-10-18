@@ -211,7 +211,7 @@ function validateBuildReceipt(receipt, identity, target) {
   assert.equal(receipt.format, 'raw')
   assert.equal(receipt.assetName, artifactName(target))
   requireDigest(receipt, MAX_BINARY, 65536)
-  assert.deepEqual(receipt.command, ['cargo', 'build', '--locked', '--release', '--bin', 'bamboo',
+  assert.deepEqual(receipt.command, ['cargo', 'build', '--locked', '--release', '--verbose', '--bin', 'bamboo',
     '--target', target, '--message-format=json-render-diagnostics'])
   assert.equal(receipt.runtime?.version, `bamboo ${identity.version}`)
   assert.equal(receipt.runtime?.status, 'passed')

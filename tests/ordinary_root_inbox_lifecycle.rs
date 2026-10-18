@@ -247,6 +247,187 @@ impl Drop for Fixture {
     }
 }
 
+fn fixture_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        // Canonical/provider waits can outlive the Host's idle keep-alive.
+        // Each control request gets a fresh connection, with no transport retry.
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap()
+}
+
+mod fixture_transport_regression {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::mpsc;
+
+    fn listener() -> TcpListener {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        listener
+    }
+
+    fn accept(listener: &TcpListener) -> std::io::Result<TcpStream> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match listener.accept() {
+                Ok((peer, _)) => {
+                    // Darwin inherits O_NONBLOCK from the listener.
+                    peer.set_nonblocking(false)?;
+                    return Ok(peer);
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn request(peer: &mut TcpStream, line: &str) -> std::io::Result<()> {
+        peer.set_read_timeout(Some(Duration::from_secs(3)))?;
+        let mut head = Vec::new();
+        let mut byte = [0];
+        while !head.ends_with(b"\r\n\r\n") {
+            peer.read_exact(&mut byte)?;
+            head.push(byte[0]);
+            assert!(head.len() < 8192, "bounded request head");
+        }
+        assert!(head.starts_with(line.as_bytes()), "unexpected request line");
+        Ok(())
+    }
+
+    fn reply(peer: &mut TcpStream, body: &str) -> std::io::Result<()> {
+        peer.set_write_timeout(Some(Duration::from_secs(3)))?;
+        write!(
+            peer,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+            body.len()
+        )?;
+        peer.flush()
+    }
+
+    #[actix_web::test]
+    async fn control_post_uses_new_connection_after_idle_peer_close() {
+        let listener = listener();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = calls.clone();
+        let (close, close_requested) = mpsc::channel();
+        let (closed, idle_closed) = mpsc::channel();
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            let mut first = accept(&listener)?;
+            request(&mut first, "GET /api/v1/health HTTP/1.1\r\n")?;
+            reply(&mut first, r#"{"ready":true}"#)?;
+            close_requested
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            let _ = first.shutdown(Shutdown::Both);
+            closed.send(()).unwrap();
+            // The Host remains alive; only its idle connection has closed.
+            let mut second = accept(&listener)?;
+            request(
+                &mut second,
+                &format!("POST /api/v1/stop/{ROOT_ID} HTTP/1.1\r\n"),
+            )?;
+            server_calls.fetch_add(1, Ordering::SeqCst);
+            reply(&mut second, r#"{"success":true}"#)
+        });
+        let client = fixture_http_client();
+        let first = client
+            .get(format!("{base}/api/v1/health"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(first, r#"{"ready":true}"#);
+        close.send(()).unwrap();
+        // Block this current-thread reactor until the old peer is closed,
+        // deterministically exposing an idle pooled connection's stale EOF.
+        idle_closed.recv_timeout(Duration::from_secs(3)).unwrap();
+        let response = client
+            .post(format!("{base}/api/v1/stop/{ROOT_ID}"))
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response.text().await,
+            Err(error) => Err(error),
+        };
+        let served = server.join().unwrap();
+        assert!(
+            response.is_ok(),
+            "control POST after idle close: {response:?}"
+        );
+        assert_eq!(response.unwrap(), r#"{"success":true}"#);
+        served.expect("live Host accepted the new control connection");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one control POST");
+    }
+
+    #[actix_web::test]
+    async fn control_transport_failure_is_returned_without_post_retry() {
+        let listener = listener();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let server_calls = calls.clone();
+        let client_done = done.clone();
+        let server = std::thread::spawn(move || -> std::io::Result<()> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                match listener.accept() {
+                    Ok((mut peer, _)) => {
+                        peer.set_nonblocking(false)?;
+                        request(
+                            &mut peer,
+                            &format!("POST /api/v1/stop/{ROOT_ID} HTTP/1.1\r\n"),
+                        )?;
+                        server_calls.fetch_add(1, Ordering::SeqCst);
+                        // A failure on the fresh request must remain a failure.
+                        let _ = peer.shutdown(Shutdown::Both);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if client_done.load(Ordering::SeqCst) {
+                            return Ok(());
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "bounded control-error observation",
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        });
+        let response = fixture_http_client()
+            .post(format!("{base}/api/v1/stop/{ROOT_ID}"))
+            .send()
+            .await;
+        done.store(true, Ordering::SeqCst);
+        let served = server.join().unwrap();
+        assert!(
+            response.is_err(),
+            "transport failure must not become success"
+        );
+        served.expect("control-error fixture exits cleanly");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "failed POST is not replayed"
+        );
+    }
+}
+
 impl Fixture {
     async fn new(case: Case) -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -326,11 +507,7 @@ impl Fixture {
             .local_addr()
             .unwrap()
             .port();
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .unwrap();
+        let client = fixture_http_client();
         let mut fixture = Self {
             _temp: temp,
             data: data.clone(),
