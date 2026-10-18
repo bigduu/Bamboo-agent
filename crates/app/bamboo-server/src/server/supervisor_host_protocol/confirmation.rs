@@ -323,4 +323,29 @@ pub(super) mod tests {
             ));
         }
     }
+    #[test]
+    fn preview_escapes_bidi_and_unicode_line_controls_without_losing_the_intent() {
+        let mut request = request();
+        *request.selected_project_names.values_mut().next().unwrap() =
+            "项目\u{202e}hidden\u{2028}line\u{0085}next\u{2066}text".into();
+        let preview = request.preview().unwrap();
+        for (character, escaped) in [
+            ('\u{202e}', "\\u202e"),
+            ('\u{2028}', "\\u2028"),
+            ('\u{0085}', "\\u0085"),
+            ('\u{2066}', "\\u2066"),
+        ] {
+            assert!(
+                !preview.contains(character),
+                "untrusted display control must be escaped"
+            );
+            assert!(preview.contains(escaped));
+        }
+        assert!(preview.contains("项目"));
+        let json = &preview[preview.find("{\n").unwrap()..];
+        assert_eq!(
+            serde_json::from_str::<ConfirmationRequest>(json).unwrap(),
+            request
+        );
+    }
 }
