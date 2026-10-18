@@ -4,6 +4,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const zlib = require('node:zlib')
+const { spawnSync } = require('node:child_process')
 const release = require('./sidecar-release.cjs')
 const { nativeTarget, buildEnvironment, verifyBuildMessages } = require('./sidecar-build.cjs')
 const { signReceipt, receiptBody } = require('./crate-release.cjs')
@@ -321,4 +322,37 @@ test('workflow retains the original successful-CI authority, one allocator/queue
   assert.match(final, /environment: bamboo-release\n    permissions:\n      contents: write/)
   assert.match(final, /run: node scripts\/sidecar-release.cjs publish/)
   assert.doesNotMatch(final, /--clobber|cargo build|cargo publish|inputs\./)
+})
+
+test('the actual source preflight rejects every missing or incompatible producer before reservation or crate publication', (t) => {
+  const root = temporary(t)
+  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+  const automatic = workflow.split('  automatic:\n')[1].split('  executables:\n')[0]
+  const name = 'Require the complete executable policy before reserving a version'
+  const preflight = automatic.split(`      - name: ${name}\n`)[1].split('\n      - ')[0]
+  const script = preflight.split("          python3 - <<'PY'\n")[1].split('\n          PY')[0]
+    .split('\n').map((line) => line.slice(10)).join('\n')
+  assert.ok(automatic.indexOf(name) < automatic.indexOf('Reserve or resume the exact release identity'))
+  assert.ok(automatic.indexOf(name) < automatic.indexOf('Publish verified crates'))
+  assert.doesNotMatch(preflight, /GH_TOKEN|CARGO_REGISTRY_TOKEN|crate-release.cjs (?:plan|publish)/)
+  const files = { 'scripts/crate-release.cjs': '', 'scripts/sidecar-build.cjs': '// BAMBOO_SHARED_EXECUTABLES_V1',
+    'scripts/sidecar-release.cjs': '// BAMBOO_SHARED_EXECUTABLES_V1',
+    'scripts/sidecar-browser-host.py': '# BAMBOO_SHARED_EXECUTABLES_V1',
+    '.github/workflows/publish-crate.yml': '# BAMBOO_SHARED_EXECUTABLES_V1' }
+  for (const [file, marker] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true })
+    fs.writeFileSync(path.join(root, file), marker + '\n')
+  }
+  const run = () => spawnSync(process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3'),
+    ['-c', script], { cwd: root, encoding: 'utf8', env: { PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: '1' } })
+  assert.equal(run().status, 0)
+  for (const [file, marker] of Object.entries(files)) {
+    const target = path.join(root, file); fs.rmSync(target)
+    assert.notEqual(run().status, 0, `Missing source producer must stop before publication: ${file}`)
+    if (marker) {
+      fs.writeFileSync(target, 'legacy producer without this ABI\n')
+      assert.notEqual(run().status, 0, `An earlier incomplete producer must stop: ${file}`)
+    }
+    fs.writeFileSync(target, marker + '\n')
+  }
 })

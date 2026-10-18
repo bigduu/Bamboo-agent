@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# BAMBOO_SHARED_EXECUTABLES_V1
 """Package the three existing browser host sources; no Cargo or network work."""
 import gzip
 import hashlib

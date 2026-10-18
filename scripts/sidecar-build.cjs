@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// BAMBOO_SHARED_EXECUTABLES_V1
 // Build the standard release executable once per native target. The output is
 // shared by Bamboo users and Bodhi; no desktop-specific Cargo variant exists.
 const assert = require('node:assert/strict')

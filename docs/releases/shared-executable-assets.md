@@ -31,6 +31,12 @@ architecture, the stamped source diff, and real `bamboo --version` output.
 Commit-derived generated metadata remains bound to that actual source. An
 embedded CI build of another source or version is not substituted as an asset.
 
+Before any version reservation or crate upload, source preflight requires the
+complete producer files and shared executable ABI marker. A delayed or rerun
+successful main CI event from an older source therefore fails before creating
+a release identity, rather than publishing crates and later discovering that
+its source cannot build the required executable assets.
+
 All public assets belong to `bigduu/Bamboo-agent` and tag `v<version>`. Four
 raw executables, `bamboo-browser-host-v1.tar.gz`,
 `bamboo-executables-provenance-v1.json`, and `bamboo-sidecars-v1.json` are added

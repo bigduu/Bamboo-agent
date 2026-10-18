@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// BAMBOO_SHARED_EXECUTABLES_V1
 // One standard, complete Bamboo executable is shared by CLI and desktop users.
 const assert = require('node:assert/strict')
 const crypto = require('node:crypto')

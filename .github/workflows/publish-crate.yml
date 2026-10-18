@@ -1,5 +1,6 @@
 name: Publish Crate
 # BAMBOO_TRUSTED_PUBLICATION_POLICY_V1
+# BAMBOO_SHARED_EXECUTABLES_V1
 
 on:
   workflow_run:
@@ -449,9 +450,25 @@ jobs:
           test "$(git rev-parse HEAD)" = "${SOURCE_REVISION}"
           test -z "$(git status --porcelain --untracked-files=all)"
 
-      - name: Require the release policy in this source commit
-        # Pre-policy main CI cannot acquire the automatic publication authority.
-        run: test -f scripts/crate-release.cjs
+      - name: Require the complete executable policy before reserving a version
+        # Historical successful CI may be delivered after this workflow ships.
+        # Reject an older producer ABI before any reservation or crate upload.
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          required = {
+              'scripts/crate-release.cjs': None,
+              'scripts/sidecar-build.cjs': '// BAMBOO_SHARED_EXECUTABLES_V1',
+              'scripts/sidecar-release.cjs': '// BAMBOO_SHARED_EXECUTABLES_V1',
+              'scripts/sidecar-browser-host.py': '# BAMBOO_SHARED_EXECUTABLES_V1',
+              '.github/workflows/publish-crate.yml': '# BAMBOO_SHARED_EXECUTABLES_V1',
+          }
+          for name, marker in required.items():
+              file = Path(name)
+              assert file.is_file() and not file.is_symlink(), f'Source lacks complete executable publication policy: {name}'
+              if marker:
+                  assert marker in file.read_text().splitlines(), f'Source has an incompatible executable publication ABI: {name}'
+          PY
 
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
