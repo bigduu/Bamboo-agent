@@ -174,7 +174,10 @@ fn modal_decision(response: isize) -> HelperDecision {
     match response {
         1001 => HelperDecision::Approve,
         1000 => HelperDecision::Cancel,
-        _ => HelperDecision::WindowClosed,
+        -1000 | -1001 => HelperDecision::WindowClosed,
+        _ => HelperDecision::Unavailable {
+            code: Unavailable::UiUnavailable,
+        },
     }
 }
 
@@ -185,7 +188,15 @@ mod tests {
     fn only_explicit_second_button_allows_default_cancel_and_unknown_deny() {
         assert!(matches!(modal_decision(1001), HelperDecision::Approve));
         assert!(matches!(modal_decision(1000), HelperDecision::Cancel));
-        for response in [-1001, -1000, -1, 0, 1, 1002, isize::MAX] {
+        for response in [-1, 0, 1, 1002, isize::MAX] {
+            assert!(matches!(
+                modal_decision(response),
+                HelperDecision::Unavailable {
+                    code: Unavailable::UiUnavailable
+                }
+            ));
+        }
+        for response in [-1001, -1000] {
             assert!(matches!(
                 modal_decision(response),
                 HelperDecision::WindowClosed

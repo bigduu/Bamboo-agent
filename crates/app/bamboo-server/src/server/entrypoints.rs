@@ -430,6 +430,16 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[tokio::test]
+    async fn native_confirmation_routable_bind_is_rejected_before_appstate_or_stdio() {
+        let home = tempdir().unwrap();
+        let absent = home.path().join("must-not-be-created");
+        let result =
+            run_with_native_scope_confirmation(absent.clone(), 0, "0.0.0.0", None, None).await;
+        assert!(result.is_err());
+        assert!(!absent.exists());
+    }
+
     #[test]
     fn resolve_runtime_static_dir_uses_configured_dir_when_present() {
         let bamboo_home = tempdir().unwrap();

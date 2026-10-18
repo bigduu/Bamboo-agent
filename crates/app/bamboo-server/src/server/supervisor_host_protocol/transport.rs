@@ -119,12 +119,12 @@ fn reader<R: Read + Send + 'static>(
     Ok(receiver)
 }
 
-pub(super) struct NativeChannel {
+pub(in crate::server) struct NativeChannel {
     connection: Connection,
     task: tokio::task::JoinHandle<()>,
 }
 impl NativeChannel {
-    pub(super) fn start(state: web::Data<AppState>) -> io::Result<Self> {
+    pub(in crate::server) fn start(state: web::Data<AppState>) -> io::Result<Self> {
         let connection = Connection::new();
         let link = connection.clone();
         let task = tokio::spawn(async move {
@@ -140,7 +140,7 @@ impl NativeChannel {
         });
         Ok(Self { connection, task })
     }
-    pub(super) async fn shutdown(self) {
+    pub(in crate::server) async fn shutdown(self) {
         self.connection.close();
         let _ = self.task.await;
     }

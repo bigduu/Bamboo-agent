@@ -35,11 +35,19 @@ impl ConfirmationProvider for NativeConfirmation {
         if request.preview().is_err() {
             return Decision::Refused("native_confirmation_unavailable");
         }
-        match tokio::time::timeout(Duration::from_secs(120), owned_helper(request)).await {
-            Ok(Ok(bytes)) => confirmation::owned_helper_response(request, &bytes),
-            Ok(Err(_)) => Decision::Refused("native_confirmation_unavailable"),
-            Err(_) => Decision::Cancelled("native_confirmation_timed_out"),
-        }
+        helper_with_deadline(request, Duration::from_secs(120), owned_helper(request)).await
+    }
+}
+
+async fn helper_with_deadline(
+    request: &ConfirmationRequest,
+    deadline: Duration,
+    helper: impl std::future::Future<Output = std::io::Result<Vec<u8>>>,
+) -> Decision {
+    match tokio::time::timeout(deadline, helper).await {
+        Ok(Ok(bytes)) => confirmation::owned_helper_response(request, &bytes),
+        Ok(Err(_)) => Decision::Refused("native_confirmation_unavailable"),
+        Err(_) => Decision::Cancelled("native_confirmation_timed_out"),
     }
 }
 
@@ -146,6 +154,55 @@ mod tests {
             vec!["--confirmed", HELPER_ARG],
         ] {
             assert!(!is_helper_args(args(&items)));
+        }
+    }
+    #[tokio::test]
+    async fn timeout_drops_only_the_pending_helper_and_cannot_produce_approval() {
+        use std::{
+            future::Future,
+            pin::Pin,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+            task::{Context, Poll},
+        };
+        struct Pending(Arc<AtomicBool>);
+        impl Future for Pending {
+            type Output = std::io::Result<Vec<u8>>;
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+        impl Drop for Pending {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let request = super::super::confirmation::tests::request();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let result =
+            helper_with_deadline(&request, Duration::from_millis(1), Pending(dropped.clone()))
+                .await;
+        assert!(matches!(
+            result,
+            Decision::Cancelled("native_confirmation_timed_out")
+        ));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+    #[tokio::test]
+    async fn failed_or_malformed_owned_helper_default_denies() {
+        let request = super::super::confirmation::tests::request();
+        for value in [
+            Err(std::io::Error::other("fixture helper failure")),
+            Ok(b"true".to_vec()),
+        ] {
+            let result =
+                helper_with_deadline(&request, Duration::from_secs(1), async { value }).await;
+            assert!(matches!(
+                result,
+                Decision::Refused("native_confirmation_unavailable")
+            ));
         }
     }
 }

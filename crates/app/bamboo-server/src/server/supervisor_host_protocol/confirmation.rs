@@ -158,11 +158,11 @@ pub(super) fn mock_approval(request: &ConfirmationRequest) -> Decision {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use bamboo_domain::SupervisorReference;
 
-    pub(super) fn request() -> ConfirmationRequest {
+    pub(in crate::server::supervisor_host_protocol) fn request() -> ConfirmationRequest {
         let project = ProjectId::parse("p-a").unwrap();
         ConfirmationRequest {
             version: 1,

@@ -131,25 +131,65 @@ impl ScopeStore for CanonicalScope {
                 status_code: 400,
             };
         };
-        match SupervisorSessionService::new(self.0.storage.clone())
-            .configure_project_scope(
-                &intent.supervisor,
-                intent.expected_state_revision,
-                allowed_projects.clone(),
-            )
-            .await
+        publication_result(
+            SupervisorSessionService::new(self.0.storage.clone())
+                .configure_project_scope(
+                    &intent.supervisor,
+                    intent.expected_state_revision,
+                    allowed_projects.clone(),
+                )
+                .await,
+        )
+    }
+}
+
+fn publication_result(result: io::Result<bamboo_domain::SupervisorManagementReceipt>) -> Outcome {
+    match result {
+        Ok(receipt) => Outcome::Committed { receipt },
+        Err(error)
+            if error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<bamboo_domain::SessionAuthorityConflict>()) =>
         {
-            Ok(receipt) => Outcome::Committed { receipt },
-            // Storage checks revision under its physical guards before publishing.
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Outcome::Refused {
+            Outcome::Refused {
                 code: "scope_revision_conflict",
                 status_code: 409,
-            },
-            // Once issued, a generic I/O failure cannot prove publication absent.
-            Err(_) => Outcome::Unconfirmed {
-                code: "scope_outcome_unconfirmed",
-                status_code: 503,
-            },
+            }
+        }
+        // A generic I/O failure after issuance cannot prove publication absent,
+        // including WouldBlock without the storage's typed authority conflict.
+        Err(_) => Outcome::Unconfirmed {
+            code: "scope_outcome_unconfirmed",
+            status_code: 503,
+        },
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_typed_authority_conflict_is_known_unpublished_after_issuance() {
+        let conflict = io::Error::new(
+            io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict("fixture conflict".into()),
+        );
+        assert_eq!(
+            serde_json::to_value(publication_result(Err(conflict))).unwrap()["code"],
+            "scope_revision_conflict"
+        );
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::WouldBlock,
+        ] {
+            let value = serde_json::to_value(publication_result(Err(io::Error::new(
+                kind,
+                "fixture failure",
+            ))))
+            .unwrap();
+            assert_eq!(value["kind"], "outcome_unconfirmed");
+            assert!(value.get("not_submitted").is_none());
         }
     }
 }
