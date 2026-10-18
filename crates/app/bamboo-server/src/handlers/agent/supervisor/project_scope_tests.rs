@@ -93,16 +93,24 @@ async fn owner_scope_cas_is_explicit_restartable_and_does_not_initialize_work() 
     assert_eq!(status, StatusCode::OK, "{noop}");
     assert_eq!(noop["receipt"]["changed"], false);
     assert_eq!(noop["receipt"]["state_revision"], 1);
-    let recovered = Box::pin(AppState::new(f.home.path().into())).await.unwrap();
+    let Fixture {
+        home,
+        state,
+        reference,
+        project,
+    } = f;
+    state.shutdown().await;
+    drop(state);
+    let recovered = Box::pin(AppState::new(home.path().into())).await.unwrap();
     let scope = SupervisorSessionService::new(recovered.storage.clone())
-        .inspect_scope(&f.reference)
+        .inspect_scope(&reference)
         .await
         .unwrap();
     assert_eq!(scope.state_revision, 1);
-    assert_eq!(scope.allowed_projects, [f.project.clone()].into());
+    assert_eq!(scope.allowed_projects, [project].into());
     let authority = recovered
         .storage
-        .load_root_authority(&f.reference.session_id)
+        .load_root_authority(&reference.session_id)
         .await
         .unwrap()
         .unwrap();
@@ -110,9 +118,8 @@ async fn owner_scope_cas_is_explicit_restartable_and_does_not_initialize_work() 
     assert!(authority.messages.is_empty());
     assert!(!recovered.config.read().await.features.ticket_mutation);
     assert!(!recovered.config.read().await.features.ticket_dispatch);
-    assert!(!f.home.path().join("tickets").exists());
+    assert!(!home.path().join("tickets").exists());
     recovered.shutdown().await;
-    f.state.shutdown().await;
 }
 
 #[actix_web::test]
@@ -480,4 +487,30 @@ async fn ultra_owner_scope_and_model_observation_use_management_revision_not_wor
     assert_eq!(canonical.root_tool_authority_revision, 1);
     assert!(!f.home.path().join("tickets").exists());
     f.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn owner_scope_damaged_authority_fails_closed_without_repair() {
+    let f = Fixture::new().await;
+    let runtime = f
+        .state
+        .session_store
+        .sessions_root_dir()
+        .join(&f.reference.session_id)
+        .join("runtime.json");
+    assert!(runtime.is_file());
+    let damaged = b"{intentionally-invalid-fixture-runtime";
+    std::fs::write(&runtime, damaged).unwrap();
+    for (method, body) in [
+        (Method::GET, None),
+        (Method::PUT, Some(f.update(0, vec![f.project.clone()]))),
+    ] {
+        let (status, error) = f.call(method, body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
+        assert_eq!(error["code"], "scope_authority_invalid");
+        assert_eq!(std::fs::read(&runtime).unwrap(), damaged);
+    }
+    assert!(!f.home.path().join("tickets").exists());
+    f.state.shutdown().await;
+    assert_eq!(std::fs::read(&runtime).unwrap(), damaged);
 }
