@@ -6,6 +6,7 @@
 mod entrypoints;
 mod h1;
 mod listeners;
+mod supervisor_host_protocol;
 mod tls;
 mod web_service;
 
