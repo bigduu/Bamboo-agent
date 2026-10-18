@@ -855,7 +855,7 @@ test('trusted manual publication and automatic receipts share a queue while dry 
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
   const manual = workflow.split('  manual:\n')[1].split('  dry-run:\n')[0]
   const dry = workflow.split('  dry-run:\n')[1].split('  automatic:\n')[0]
-  const automatic = workflow.split('  automatic:\n')[1]
+  const automatic = workflow.split('  automatic:\n')[1].split('  executables:\n')[0]
   assert.match(workflow, /workflow_run:\n    workflows: \[CI\]\n    types: \[completed\]\n    branches: \[main\]/)
   assert.match(workflow, /group: bamboo-crate-publication\n  queue: max\n  cancel-in-progress: false/)
   assert.match(workflow, /permissions:\n  contents: read/)

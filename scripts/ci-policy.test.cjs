@@ -117,7 +117,7 @@ test("full snapshot and main gates preserve locked Rust, formatting, and policy 
   )
   assert.match(
     testJob,
-    /- name: Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs\n/u,
+    /- name: Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs scripts\/sidecar-release\.test\.cjs\n/u,
   )
   assert.match(
     testJob,
