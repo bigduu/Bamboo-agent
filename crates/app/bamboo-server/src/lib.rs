@@ -159,6 +159,6 @@ pub use routes::{
 };
 pub use server::{
     native_scope_confirmation_helper_entry, run, run_with_bind, run_with_bind_and_static,
-    run_with_bind_and_static_tls, run_with_bind_tls, run_with_native_scope_confirmation, run_with_tls,
-    WebService,
+    run_with_bind_and_static_tls, run_with_bind_tls, run_with_native_scope_confirmation,
+    run_with_tls, WebService,
 };
