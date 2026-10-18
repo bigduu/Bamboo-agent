@@ -31,6 +31,8 @@ pub struct TicketApplication {
 
 mod initialization;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
+mod patrol_adapter;
+pub use patrol_adapter::PatrolCheckpointStore;
 mod resolution;
 mod scheduling;
 pub use bamboo_orchestration::{ReadyBlockKind, ReadyReconcile, ReadyWorkGrant, ReadyWorkPolicy};

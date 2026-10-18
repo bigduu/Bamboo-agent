@@ -6,6 +6,9 @@
 //! tool execution, acceptance, credential lookup or fallback to a Supervisor model.
 //! All port calls happen outside Ticket locks. Concrete I/O adapters live in the Host.
 
+pub mod checkpoint;
+pub mod host;
+
 use serde::{Deserialize, Serialize};
 
 /// Epoch milliseconds from the Host's clock, including across process restarts.

@@ -1316,6 +1316,8 @@ dependencies = [
  "async-trait",
  "bamboo-domain",
  "bamboo-tickets",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
