@@ -1,4 +1,8 @@
-//! Narrow model control over already attached independent Roots.
+//! Narrow model control over explicitly scoped independent Roots.
+
+pub mod root_creation;
+
+use root_creation::{SupervisedRootCreatePort, SupervisedRootCreateRequest};
 
 use std::sync::Arc;
 
@@ -12,6 +16,10 @@ use serde_json::{json, Value};
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum SessionControlArgs {
+    Scope,
+    Create {
+        request: SupervisedRootCreateRequest,
+    },
     Followup {
         target_session_id: String,
         operation_id: String,
@@ -29,11 +37,20 @@ enum SessionControlArgs {
 
 pub struct SessionControlTool {
     messenger: Arc<SessionMessenger>,
+    root_creator: Option<Arc<dyn SupervisedRootCreatePort>>,
 }
 
 impl SessionControlTool {
     pub fn new(messenger: Arc<SessionMessenger>) -> Self {
-        Self { messenger }
+        Self {
+            messenger,
+            root_creator: None,
+        }
+    }
+
+    pub fn with_root_creator(mut self, creator: Arc<dyn SupervisedRootCreatePort>) -> Self {
+        self.root_creator = Some(creator);
+        self
     }
 }
 
@@ -44,11 +61,14 @@ impl Tool for SessionControlTool {
     }
 
     fn description(&self) -> &str {
+        if self.root_creator.is_some() {
+            return "Supervisor-only control of independent Ordinary Roots in explicitly Host-authorized Projects. scope reads current allowed_projects/state_revision. create requires that revision, an explicit Project and existing Host-bound workspace, a stable operation UUID and first instruction; creates a new Standard Ordinary Root, attaches only that new lifetime and durably submits the instruction. Reuse the complete request on uncertain results; receipts report creation/link/admission/activation, never completion. No Supervisor history, prompt, model, permissions or Project grants are inherited. It does not create a Ticket/Work or isolated worktree. SubAgent creates a bounded Child instead. Existing followup continues an explicitly attached Root using stable operation_id/message. loop retains its separate live-owner Host grant and finite loop opt-in; mutations need exact link/generation/control CAS. No arbitrary attach, permission change, approval answer, successor or cadence. Report actual blocked stage/reason; never substitute shell execution or create another overlapping worker.";
+        }
         "Supervisor-only control of an already attached independent Root, preserving its original context and authority. followup: use a stable operation_id per target and exactly the same message on retry; returns durable admission/activation status, not task completion. loop: requires a separate explicit host grant for the target's current active execution and its existing finite loop opt-in. command is status/start/update/stop; only status may omit expected_link_revision or query receipt_operation_id. Mutations require the exact nonzero link revision and command generation/control CAS. A target-owner receipt distinguishes queued delivery, committed control and any objective still pending its next iteration. No new session, attachment, successor, cadence, approval answer or permission is created. Plan and approval replay cannot issue loop commands. Pending human questions remain unanswered; use session_history.read_messages for bounded history."
     }
 
     fn parameters_schema(&self) -> Value {
-        json!({
+        let mut schema = json!({
             "type": "object", "additionalProperties": false,
             "properties": {
                 "action": {"type": "string", "enum": ["followup", "loop"],
@@ -99,15 +119,51 @@ impl Tool for SessionControlTool {
                     ]
                 }
             ]
-        })
+        });
+        if self.root_creator.is_some() {
+            schema["properties"]["action"]["enum"] = json!(["followup", "loop", "scope", "create"]);
+            schema["properties"]["action"]["description"] = json!("scope needs only action; create needs request; followup/loop need the existing target_session_id and action-specific fields.");
+            schema["properties"]["request"] = root_creation::request_schema();
+            schema["required"] = json!(["action"]);
+            let variants = schema["oneOf"].as_array_mut().unwrap();
+            for variant in variants.iter_mut() {
+                variant["properties"]["request"] = Value::Bool(false);
+                variant["required"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("target_session_id"));
+            }
+            let forbidden = [
+                "target_session_id",
+                "operation_id",
+                "message",
+                "expected_link_revision",
+                "command",
+                "receipt_operation_id",
+            ];
+            let mut scope = json!({"properties":{"action":{"const":"scope"},"request":false}});
+            let mut create =
+                json!({"properties":{"action":{"const":"create"}},"required":["request"]});
+            for field in forbidden {
+                scope["properties"][field] = Value::Bool(false);
+                create["properties"][field] = Value::Bool(false);
+            }
+            variants.push(scope);
+            variants.push(create);
+        }
+        schema
     }
 
-    fn classify(&self, _args: &Value) -> ToolClass {
-        ToolClass::MUTATING_SERIAL
+    fn classify(&self, args: &Value) -> ToolClass {
+        if args["action"] == "scope" {
+            ToolClass::READONLY_PARALLEL
+        } else {
+            ToolClass::MUTATING_SERIAL
+        }
     }
 
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
-        if ctx.plan_read_only {
+        if ctx.plan_read_only && args["action"] != "scope" {
             return Err(ToolError::Execution(
                 "session_control is unavailable in Plan mode".into(),
             ));
@@ -127,6 +183,22 @@ impl Tool for SessionControlTool {
             .map_err(|error| {
                 ToolError::InvalidArguments(format!("invalid session_control arguments: {error}"))
             })? {
+            SessionControlArgs::Scope => {
+                let creator = self.root_creator.as_ref().ok_or_else(|| ToolError::Execution(
+                    "supervised_root_create_unavailable: this Host has no scoped Root creation port".into(),
+                ))?;
+                return creator.scope(&supervisor).await.map(ToolOutcome::Completed);
+            }
+            SessionControlArgs::Create { request } => {
+                request.validate()?;
+                let creator = self.root_creator.as_ref().ok_or_else(|| ToolError::Execution(
+                    "supervised_root_create_unavailable: this Host has no scoped Root creation port".into(),
+                ))?;
+                return creator
+                    .create(&supervisor, request)
+                    .await
+                    .map(ToolOutcome::Completed);
+            }
             SessionControlArgs::Followup {
                 target_session_id,
                 operation_id,
