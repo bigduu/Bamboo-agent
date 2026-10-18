@@ -100,7 +100,7 @@ pub(super) enum HelperDecision {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Unavailable {
+pub(super) enum UnavailableReason {
     #[serde(rename = "native_confirmation_unsupported_platform")]
     UnsupportedPlatform,
     #[serde(rename = "native_confirmation_no_gui")]
@@ -110,7 +110,7 @@ pub(super) enum Unavailable {
     #[serde(rename = "native_confirmation_unavailable")]
     UiUnavailable,
 }
-impl Unavailable {
+impl UnavailableReason {
     pub(super) fn code(self) -> &'static str {
         match self {
             Self::UnsupportedPlatform => "native_confirmation_unsupported_platform",
@@ -321,10 +321,10 @@ pub(super) mod tests {
             ));
         }
         for code in [
-            Unavailable::UnsupportedPlatform,
-            Unavailable::NoGui,
-            Unavailable::ThreadUnavailable,
-            Unavailable::UiUnavailable,
+            UnavailableReason::UnsupportedPlatform,
+            UnavailableReason::NoGui,
+            UnavailableReason::ThreadUnavailable,
+            UnavailableReason::UiUnavailable,
         ] {
             let bytes = serde_json::to_vec(&HelperResponse {
                 request: request.clone(),

@@ -1,6 +1,6 @@
 //! AppKit is confined to the initial thread of Bamboo's own UI-only helper.
 //! A local process identity, parent PID or IPC handshake is not user consent.
-use super::confirmation::{HelperDecision, Unavailable};
+use super::confirmation::{HelperDecision, UnavailableReason};
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -33,7 +33,7 @@ mod platform {
         fn CFRelease(value: *const c_void);
     }
 
-    pub(super) fn readiness() -> Result<(), Unavailable> {
+    pub(super) fn readiness() -> Result<(), UnavailableReason> {
         // Graphic-session membership plus the active console user's uid prevent
         // SSH, loginwindow and a background/root session from claiming readiness.
         // These checks permit asking once; they are never an approval decision.
@@ -46,15 +46,15 @@ mod platform {
             if SessionGetInfo(u32::MAX, ptr::null_mut(), &mut attributes) != 0
                 || attributes & 0x10 == 0
             {
-                return Err(Unavailable::NoGui);
+                return Err(UnavailableReason::NoGui);
             }
             let user = SCDynamicStoreCopyConsoleUser(ptr::null(), &mut uid, &mut gid);
             if user.is_null() {
-                return Err(Unavailable::NoGui);
+                return Err(UnavailableReason::NoGui);
             }
             CFRelease(user);
             if uid == 0 || uid != libc::geteuid() {
-                return Err(Unavailable::NoGui);
+                return Err(UnavailableReason::NoGui);
             }
         }
         Ok(())
@@ -63,7 +63,7 @@ mod platform {
     pub(super) fn show(preview: &str) -> HelperDecision {
         if MainThreadMarker::new().is_none() {
             return HelperDecision::Unavailable {
-                code: Unavailable::ThreadUnavailable,
+                code: UnavailableReason::ThreadUnavailable,
             };
         }
         if let Err(code) = readiness() {
@@ -140,19 +140,19 @@ mod platform {
     }
     fn unavailable() -> HelperDecision {
         HelperDecision::Unavailable {
-            code: Unavailable::UiUnavailable,
+            code: UnavailableReason::UiUnavailable,
         }
     }
 }
 
-pub(super) fn readiness() -> Result<(), Unavailable> {
+pub(super) fn readiness() -> Result<(), UnavailableReason> {
     #[cfg(target_os = "macos")]
     {
         platform::readiness()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Err(Unavailable::UnsupportedPlatform)
+        Err(UnavailableReason::UnsupportedPlatform)
     }
 }
 
@@ -165,7 +165,7 @@ pub(super) fn show(preview: &str) -> HelperDecision {
     {
         let _ = preview;
         HelperDecision::Unavailable {
-            code: Unavailable::UnsupportedPlatform,
+            code: UnavailableReason::UnsupportedPlatform,
         }
     }
 }
@@ -177,7 +177,7 @@ fn modal_decision(response: isize) -> HelperDecision {
         1000 => HelperDecision::Cancel,
         -1000 | -1001 => HelperDecision::WindowClosed,
         _ => HelperDecision::Unavailable {
-            code: Unavailable::UiUnavailable,
+            code: UnavailableReason::UiUnavailable,
         },
     }
 }
@@ -193,7 +193,7 @@ mod tests {
             assert!(matches!(
                 modal_decision(response),
                 HelperDecision::Unavailable {
-                    code: Unavailable::UiUnavailable
+                    code: UnavailableReason::UiUnavailable
                 }
             ));
         }
@@ -210,7 +210,7 @@ mod tests {
         assert!(matches!(
             show("must not be displayed"),
             HelperDecision::Unavailable {
-                code: Unavailable::ThreadUnavailable
+                code: UnavailableReason::ThreadUnavailable
             }
         ));
     }

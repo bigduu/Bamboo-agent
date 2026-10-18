@@ -123,7 +123,7 @@ fn helper_stdio() -> std::io::Result<()> {
     let decision = match request.preview() {
         Ok(preview) => native_macos::show(&preview),
         Err(_) => HelperDecision::Unavailable {
-            code: confirmation::Unavailable::UiUnavailable,
+            code: confirmation::UnavailableReason::UiUnavailable,
         },
     };
     let response = serde_json::to_vec(&HelperResponse { request, decision })?;
