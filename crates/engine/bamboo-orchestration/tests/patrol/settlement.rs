@@ -170,6 +170,7 @@ fn seed_failed_known_settlement() -> (SettlementProbe, ControlledProvider, Reser
     );
     assert_eq!(provider.submits.len(), 1);
     assert!(provider.polls.is_empty());
+    assert!(probe.settlements.is_empty());
     let reservation = match probe.incident().phase {
         Phase::Diagnosing { reservation, .. } => reservation,
         other => panic!("expected the real reserved request: {other:?}"),
@@ -181,6 +182,10 @@ fn seed_failed_known_settlement() -> (SettlementProbe, ControlledProvider, Reser
     provider.finish(Advice::Observe);
     settlement_pass(&mut probe, &mut provider, 101);
     assert_eq!(provider.polls, vec![reservation.operation.clone()]);
+    assert_eq!(
+        probe.settlements,
+        vec![(reservation.clone(), known_settlement_usage())]
+    );
     assert_eq!(
         probe.incident().phase,
         Phase::Blocked(Block::Budget(BudgetBlock::Unavailable))
@@ -247,16 +252,18 @@ fn assert_unpaid_checkpoint_cannot_replace_receipt_usage_or_incident(probe: &Set
         checkpoint::validate_update(&old, &changed_receipt),
         Err(PortError::Conflict)
     );
-    let mut downgraded_usage = old.clone();
-    downgraded_usage
-        .incident
-        .as_mut()
-        .unwrap()
-        .pending_settlement_usage = Some(Usage::Unknown);
-    assert_eq!(
-        checkpoint::validate_update(&old, &downgraded_usage),
-        Err(PortError::Conflict)
-    );
+    for usage in [Some(Usage::Unknown), None] {
+        let mut downgraded_usage = old.clone();
+        downgraded_usage
+            .incident
+            .as_mut()
+            .unwrap()
+            .pending_settlement_usage = usage;
+        assert_eq!(
+            checkpoint::validate_update(&old, &downgraded_usage),
+            Err(PortError::Conflict)
+        );
+    }
     let mut orphan_usage = old.clone();
     orphan_usage.incident.as_mut().unwrap().pending_settlement = None;
     assert_eq!(
@@ -287,8 +294,48 @@ fn assert_unpaid_checkpoint_cannot_replace_receipt_usage_or_incident(probe: &Set
     );
 }
 
+fn assert_original_escalation_delivered(probe: &SettlementProbe, original: &Reservation) {
+    let durable = probe.host.durable.borrow();
+    let operation = OperationId {
+        incident: original.operation.incident.clone(),
+        kind: OperationKind::Escalation,
+    };
+    assert_eq!(durable.queue.len(), 1);
+    assert_eq!(durable.queue[&operation].operation, operation);
+    assert_eq!(
+        durable
+            .calls
+            .iter()
+            .filter(|call| **call == "queue")
+            .count(),
+        2
+    );
+}
+
 #[test]
 fn known_settlement_retries_the_original_receipt_and_usage_live_and_after_codec_restart() {
+    for denied in [false, true] {
+        let (mut probe, mut provider, original) = seed_failed_known_settlement();
+        let settlements = probe.settlements.len();
+        let effects = settlement_effect_counts(&probe, &provider);
+        if denied {
+            probe.host.denied = true;
+            assert_eq!(
+                configured().tick(&scope(), &FakeClock(111), &mut probe, &mut provider),
+                Err(Error::Port(PortError::Denied))
+            );
+        } else {
+            probe.host.observation.cursor += 1;
+            probe.host.observation.kind = ObservationKind::Delta { previous_cursor: 1 };
+            assert_eq!(
+                settlement_pass(&mut probe, &mut provider, 111).status,
+                Status::ResyncRequired
+            );
+        }
+        assert_eq!(probe.settlements.len(), settlements);
+        assert_pending_known_settlement(&probe, &original);
+        assert_eq!(settlement_effect_counts(&probe, &provider), effects);
+    }
     for restart in [false, true] {
         for unknown in [
             None,
@@ -311,6 +358,7 @@ fn known_settlement_retries_the_original_receipt_and_usage_live_and_after_codec_
             let escalation = probe.incident().escalation.unwrap();
             assert!(escalation.queued);
             assert_eq!(escalation.deliveries, 2);
+            assert_original_escalation_delivered(&probe, &original);
             if restart {
                 drop(provider);
                 probe = probe.reopen();
@@ -357,6 +405,7 @@ fn known_settlement_retries_the_original_receipt_and_usage_live_and_after_codec_
             assert_eq!(settlement_effect_counts(&probe, &provider), effects);
             settlement_pass(&mut probe, &mut provider, 144);
             assert_known_settled(&probe, &original);
+            assert_original_escalation_delivered(&probe, &original);
             assert_eq!(probe.settlements.len(), settlements + expected_calls);
             assert_eq!(settlement_effect_counts(&probe, &provider), effects);
         }
