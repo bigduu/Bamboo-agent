@@ -888,9 +888,12 @@ test('trusted manual publication and automatic receipts share a queue while dry 
   assert.match(automatic, /ref: \$\{\{ steps.source.outputs.revision \}\}\n          fetch-depth: 0\n          persist-credentials: false/)
   assert.ok(automatic.indexOf('Authorize the exact source') < automatic.indexOf('uses: actions/checkout'))
   assert.ok(automatic.indexOf('Verify checkout matches') < automatic.indexOf('node scripts/'))
-  assert.doesNotMatch(automatic, /expected_source_sha|inputs\.dry_run|inputs\.version/)
+  assert.doesNotMatch(automatic, /inputs\.version/)
+  assert.match(automatic, /inputs\.complete_release/)
+  assert.match(automatic, /accepted_ci_run/)
+  assert.match(automatic, /SOURCE_VALIDATION/)
   for (const name of ['BAMBOO_RELEASE_TOKEN', 'BAMBOO_RELEASE_SIGNING_KEY']) {
-    assert.equal(automatic.split(`secrets.${name}`).length - 1, 2)
+    assert.equal(automatic.split(`secrets.${name}`).length - 1, name === 'BAMBOO_RELEASE_TOKEN' ? 3 : 2)
   }
   assert.doesNotMatch(workflow, /VERSION="\$\{\{ github.event.inputs.version/)
   const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8')

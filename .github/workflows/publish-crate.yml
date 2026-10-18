@@ -9,6 +9,16 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      complete_release:
+        description: "Publish the complete frozen release using an already successful CI snapshot; never reruns Test/E2E"
+        required: false
+        default: false
+        type: boolean
+      accepted_ci_run:
+        description: "Successful release PR CI run whose exact product tree is being published"
+        required: false
+        default: ""
+        type: string
       expected_source_sha:
         description: "Exact accepted source commit selected by the release train"
         required: true
@@ -51,7 +61,7 @@ env:
 
 jobs:
   manual:
-    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
+    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && !inputs.complete_release
     runs-on: ubuntu-latest
     environment: bamboo-release
     steps:
@@ -326,7 +336,7 @@ jobs:
           echo "Published Bamboo crates for version ${TARGET_VERSION}"
 
   dry-run:
-    if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run && !inputs.complete_release
     runs-on: ubuntu-latest
     # No Environment or publication credentials, including on feature refs.
     env:
@@ -372,12 +382,13 @@ jobs:
 
   automatic:
     if: >-
-      github.event_name == 'workflow_run' &&
+      (github.event_name == 'workflow_dispatch' && inputs.complete_release && !inputs.dry_run) ||
+      (github.event_name == 'workflow_run' &&
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
-      github.event.workflow_run.repository.full_name == github.repository
+      github.event.workflow_run.repository.full_name == github.repository)
     runs-on: ubuntu-latest
     environment: bamboo-release
     permissions:
@@ -385,11 +396,12 @@ jobs:
     outputs:
       source: ${{ steps.source.outputs.revision }}
       version: ${{ steps.version.outputs.version }}
+      validation: ${{ steps.source.outputs.validation }}
     steps:
       - name: Authorize the exact source before checkout
         id: source
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
         run: |
           python3 - <<'PY'
           import json
@@ -402,6 +414,76 @@ jobs:
           event_name = os.environ["GITHUB_EVENT_NAME"]
           with open(os.environ["GITHUB_EVENT_PATH"]) as stream:
               event = json.load(stream)
+          if event_name == "workflow_dispatch":
+              owner = repository.split("/")[0]
+              assert os.environ["GITHUB_ACTOR"] == owner and os.environ["GITHUB_TRIGGERING_ACTOR"] == owner
+              assert event["sender"]["login"] == owner
+              inputs = event["inputs"]
+              assert inputs["complete_release"] in (True, "true") and inputs["dry_run"] in (False, "false")
+              source = inputs["expected_source_sha"]
+              assert re.fullmatch(r"[0-9a-f]{40}", source)
+              assert source == os.environ["GITHUB_SHA"] == os.environ["GITHUB_WORKFLOW_SHA"]
+              ref = os.environ["GITHUB_REF"]
+              assert ref == "refs/heads/main"
+              assert os.environ["GITHUB_WORKFLOW_REF"] == f"{repository}/.github/workflows/publish-crate.yml@{ref}"
+              def api(route):
+                  return json.loads(subprocess.check_output(["gh", "api", f"repos/{repository}/{route}"], text=True))
+              assert api("branches/main")["commit"]["sha"] == source
+              run_id = inputs["accepted_ci_run"]
+              assert re.fullmatch(r"[1-9][0-9]*", run_id)
+              ci = api("actions/runs/" + run_id)
+              assert ci["name"] == "CI" and ci["path"] == ".github/workflows/ci.yml"
+              assert ci["status"] == "completed" and ci["conclusion"] == "success" and ci["event"] == "pull_request"
+              assert ci["repository"]["full_name"] == ci["head_repository"]["full_name"] == repository
+              assert re.fullmatch(r"release/[0-9a-f]{40}", ci["head_branch"])
+              reference = api("git/ref/heads/" + ci["head_branch"])["object"]
+              assert reference["sha"] == source and reference["type"] == "commit"
+              cut = ci["head_branch"].removeprefix("release/")
+              assert re.fullmatch(r"[0-9a-f]{40}", cut)
+              dev = api("branches/dev")
+              assert dev["protected"] is True
+              def ancestor(earlier, later):
+                  comparison = api(f"compare/{earlier}...{later}")
+                  assert comparison["status"] in ("ahead", "identical") and comparison["merge_base_commit"]["sha"] == earlier
+                  return comparison
+              ancestor(cut, ci["head_sha"])
+              ancestor(ci["head_sha"], dev["commit"]["sha"])
+              delta = ancestor(ci["head_sha"], source)
+              assert delta["total_commits"] <= 10 and len(delta["files"]) <= 20
+              allowed = {".github/workflows/ci.yml", ".github/workflows/publish-crate.yml",
+                         "scripts/ci-policy.test.cjs", "scripts/crate-release.cjs", "scripts/crate-release.test.cjs",
+                         "scripts/sidecar-release.cjs", "scripts/sidecar-release.test.cjs",
+                         "scripts/release-source.cjs", "scripts/release-source.test.cjs"}
+              paths = sorted(item["filename"] for item in delta["files"])
+              assert all(item["filename"] in allowed and item["status"] in ("added", "modified") for item in delta["files"])
+              required = ["Validation Source", "Promotion Source", "Test", "E2E Tests", "Lint",
+                          "Build (ubuntu-latest)", "Build (macos-latest)", "Build (windows-latest)"]
+              jobs = api(f"actions/runs/{run_id}/jobs?per_page=100")["jobs"]
+              for name in required:
+                  matches = [job for job in jobs if job["name"] == name]
+                  assert len(matches) == 1 and matches[0]["status"] == "completed" and matches[0]["conclusion"] == "success"
+              test = next(job for job in jobs if job["name"] == "Test")
+              assert any(step["name"] == "Require the exact clean source after full validation" and step["conclusion"] == "success" for step in test["steps"])
+              log = subprocess.check_output(["gh", "api", f"repos/{repository}/actions/jobs/{test['id']}/logs"], text=True)
+              matches = re.findall(r"Source: ([0-9a-f]{40}) tree: ([0-9a-f]{40})", log)
+              assert len(set(matches)) == 1
+              revision, tree = matches[0]
+              assert api("git/commits/" + revision)["tree"]["sha"] == tree
+              assert api("git/commits/" + ci["head_sha"])["tree"]["sha"] == tree
+              source_tree = api("git/commits/" + source)["tree"]["sha"]
+              ci_identity = {key: ci[key] for key in ("id", "name", "path", "status", "conclusion", "event", "head_sha", "head_branch", "html_url")}
+              ci_identity["repository"] = {"full_name": repository}
+              ci_identity["head_repository"] = {"full_name": repository}
+              validation = {"kind": "bamboo-release-ci-reuse/v1", "sourceRevision": source, "sourceTree": source_tree,
+                            "validatedRevision": revision, "validatedTree": tree, "ciRun": ci_identity,
+                            "requiredChecks": required, "policyOnlyPaths": paths, "productTreeVerified": True}
+              value = json.dumps(validation, separators=(",", ":"))
+              with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+                  stream.write(f"revision={source}\nvalidation={value}\n")
+              with open(os.environ["GITHUB_ENV"], "a") as stream:
+                  stream.write(f"SOURCE_VALIDATION={value}\n")
+              print(f"Accepted actual CI {run_id}; source={source} tree={source_tree}; validated={revision} tree={tree}; policy-only paths={paths}")
+              raise SystemExit(0)
           assert event_name == "workflow_run"
           run = event["workflow_run"]
           assert run["name"] == "CI"
@@ -573,6 +655,7 @@ jobs:
             os: windows-latest
     env:
       SOURCE_REVISION: ${{ needs.automatic.outputs.source }}
+      SOURCE_VALIDATION: ${{ needs.automatic.outputs.validation }}
       TARGET_VERSION: ${{ needs.automatic.outputs.version }}
       BAMBOO_RELEASE_TARGET: ${{ matrix.target }}
     steps:
@@ -613,6 +696,7 @@ jobs:
       contents: write
     env:
       SOURCE_REVISION: ${{ needs.automatic.outputs.source }}
+      SOURCE_VALIDATION: ${{ needs.automatic.outputs.validation }}
       TARGET_VERSION: ${{ needs.automatic.outputs.version }}
       EXPECTED_BUILDS: ${{ toJSON(needs.executables.outputs) }}
     steps:
