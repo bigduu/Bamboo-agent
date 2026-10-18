@@ -4,19 +4,23 @@
 //! authorize every read and provider admission, and persist the checkpoint with CAS.
 //! These references confer no grant. There is no Ticket mutation, worker dispatch,
 //! tool execution, acceptance, credential lookup or fallback to a Supervisor model.
-//! All port calls happen outside Ticket locks. This slice supplies no live adapter.
+//! All port calls happen outside Ticket locks. Concrete I/O adapters live in the Host.
+
+use serde::{Deserialize, Serialize};
 
 /// Epoch milliseconds from the Host's clock, including across process restarts.
 pub trait Clock {
     fn now_ms(&self) -> u64;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
 pub struct Scope {
     pub project_id: String,
     pub work_id: String,
     pub assignment_id: String,
     pub generation: u64,
+    /// Original immutable DispatchSpec epoch: a recovery identity, never a grant.
     pub authority_epoch: u64,
 }
 
@@ -49,7 +53,8 @@ impl Default for Policy {
 
 /// Independent model selection. None disables semantic diagnostics; no fallback.
 /// Protocol-specific adaptation belongs to the outer provider adapter.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Model {
     pub provider: String,
     pub model: String,
@@ -100,7 +105,9 @@ pub struct Observation {
     pub cursor: u64,
     /// Changes relevant to diagnosis, excluding mere heartbeat/poll/ACK updates.
     pub evidence_revision: u64,
-    pub started_at_ms: u64,
+    /// A canonical start timestamp, never an observation time or Ticket sequence.
+    /// None means that production measurement is currently unavailable.
+    pub started_at_ms: Option<u64>,
     pub heartbeat_at_ms: Option<u64>,
     pub progress: Option<Progress>,
     pub expected_wait: Option<ExpectedWait>,
@@ -110,7 +117,8 @@ pub struct Observation {
     pub terminal: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Reason {
     NoProgress,
     RepeatedErrors,
@@ -120,33 +128,38 @@ pub enum Reason {
     EvidenceUnknown,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
 pub struct IncidentId {
     pub scope: Scope,
     /// One incident per meaningful-progress boundary, across repeated events/restarts.
     pub progress_sequence: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
 pub enum OperationKind {
     Diagnostic(u16),
     Escalation,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
 pub struct OperationId {
     pub incident: IncidentId,
     pub kind: OperationKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EvidenceRef {
     /// Opaque, Host-authorized reference, not a path or retrieval capability.
     pub id: String,
     pub revision: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DiagnosticInput {
     pub scope: Scope,
     pub source_revision: u64,
@@ -158,7 +171,8 @@ pub struct DiagnosticInput {
     pub input_tokens: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DiagnosticRequest {
     pub operation: OperationId,
     pub model: Model,
@@ -166,7 +180,8 @@ pub struct DiagnosticRequest {
     pub deadline_ms: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum BudgetBlock {
     Work,
     Daily,
@@ -174,7 +189,8 @@ pub enum BudgetBlock {
     Unavailable,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Reservation {
     pub operation: OperationId,
     /// Exact immutable request authorized by the ledger. A CAS failure followed
@@ -205,7 +221,8 @@ pub trait BudgetPort {
     fn settle(&mut self, reservation: &Reservation, usage: Usage) -> Result<(), PortError>;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum SupervisorReason {
     ReconcileReceipt,
     DeterministicAnomaly,
@@ -222,13 +239,15 @@ pub enum SupervisorReason {
 }
 
 /// Suggestions only. Deliberately no Done, repair, dispatch, tool or grant variant.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Advice {
     Observe,
     Escalate(SupervisorReason),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Diagnosis {
     pub advice: Advice,
     pub evidence: Vec<String>,
@@ -236,7 +255,8 @@ pub struct Diagnosis {
     pub note: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DiagnosticRecord {
     pub operation: OperationId,
     pub source_revision: u64,
@@ -270,7 +290,8 @@ pub trait ReadOnlyDiagnosticProvider {
     fn status(&mut self, operation: &OperationId) -> Result<DiagnosticStatus, PortError>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Escalation {
     pub operation: OperationId,
     pub reason: SupervisorReason,
@@ -288,7 +309,8 @@ pub trait EscalationPort {
     fn queue_escalation(&mut self, escalation: &Escalation) -> Result<(), PortError>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Block {
     Budget(BudgetBlock),
     Provider,
@@ -298,7 +320,8 @@ pub enum Block {
     AttemptLimit,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Phase {
     Open,
     /// Saved before submit. Recovery calls status, never re-submits this operation.
@@ -316,7 +339,8 @@ pub enum Phase {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Incident {
     pub id: IncidentId,
     pub reason: Reason,
@@ -337,7 +361,8 @@ pub struct Incident {
 /// Patrol bookkeeping only. Does not copy Ticket state, owner/lease or balance.
 /// Persist this alongside the existing Host checkpoint/incident contract, not in
 /// a new database. No recovered checkpoint is authority to execute or read.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Checkpoint {
     pub scope: Scope,
     pub cursor: u64,
@@ -347,7 +372,8 @@ pub struct Checkpoint {
     pub incident: Option<Incident>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct StoredCheckpoint {
     pub version: u64,
     pub checkpoint: Checkpoint,
@@ -704,12 +730,15 @@ impl Patrol {
         if o.repeated_errors {
             return Some(Reason::RepeatedErrors);
         }
-        if now.saturating_sub(o.heartbeat_at_ms.unwrap_or(o.started_at_ms))
+        let Some(started_at_ms) = o.started_at_ms else {
+            return Some(Reason::EvidenceUnknown);
+        };
+        if now.saturating_sub(o.heartbeat_at_ms.unwrap_or(started_at_ms))
             >= self.policy.heartbeat_timeout_ms
         {
             return Some(Reason::MissingHeartbeat);
         }
-        let progress_at = o.progress.map_or(o.started_at_ms, |p| p.at_ms);
+        let progress_at = o.progress.map_or(started_at_ms, |p| p.at_ms);
         if now.saturating_sub(progress_at) >= self.policy.progress_timeout_ms {
             return Some(Reason::NoProgress);
         }
@@ -987,10 +1016,11 @@ fn validate_observation(o: &Observation, scope: &Scope, now: u64) -> Result<(), 
         || o.cursor == 0
         || o.source_revision == 0
         || o.evidence_revision > o.source_revision
-        || o.started_at_ms > now
+        || o.started_at_ms.is_some_and(|at| at > now)
         || o.heartbeat_at_ms.is_some_and(|at| at > now)
-        || o.progress
-            .is_some_and(|p| p.sequence == 0 || p.at_ms > now || p.at_ms < o.started_at_ms)
+        || o.progress.is_some_and(|p| {
+            p.sequence == 0 || p.at_ms > now || o.started_at_ms.is_some_and(|start| p.at_ms < start)
+        })
     {
         return Err(Error::InvalidObservation);
     }

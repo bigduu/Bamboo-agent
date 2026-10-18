@@ -50,7 +50,7 @@ fn observation() -> Observation {
         source_revision: 10,
         cursor: 10,
         evidence_revision: 2,
-        started_at_ms: 0,
+        started_at_ms: Some(0),
         heartbeat_at_ms: Some(100),
         progress: Some(Progress {
             sequence: 1,
@@ -1209,4 +1209,26 @@ fn orphan_reservation_cannot_authorize_changed_caps_model_input_or_deadline() {
         assert_eq!(host.usage(), 120);
         assert_eq!(host.durable.borrow().charges.len(), 1);
     }
+}
+
+#[test]
+fn unavailable_start_measurement_is_unknown_without_semantic_calls_or_invented_progress() {
+    let patrol = configured();
+    let mut host = FakeHost::new();
+    let mut provider = ControlledProvider::new(&host);
+    host.observation.started_at_ms = None;
+    host.observation.heartbeat_at_ms = None;
+    host.observation.progress = None;
+    tick(&patrol, &mut host, &mut provider, 100);
+    assert_eq!(host.incident().reason, Reason::EvidenceUnknown);
+    for now in [101, 200, 1000] {
+        tick(&patrol, &mut host, &mut provider, now);
+    }
+    assert_eq!(
+        host.incident().escalation.unwrap().reason,
+        SupervisorReason::DeterministicAnomaly
+    );
+    assert!(provider.submits.is_empty());
+    assert!(provider.polls.is_empty());
+    assert_eq!(host.durable.borrow().queue.len(), 1);
 }
