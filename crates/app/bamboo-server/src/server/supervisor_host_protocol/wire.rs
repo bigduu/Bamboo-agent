@@ -73,6 +73,29 @@ pub(super) enum InvalidFrame {
     Size,
 }
 
+/// Readiness is only permission to ask Bamboo to display its own native prompt.
+/// It never represents previously granted user consent or an HTTP authorizer.
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct AuthorityProfile {
+    kind: &'static str,
+    confirmation_available: bool,
+    confirmation_required_per_request: bool,
+    unavailable_code: Option<&'static str>,
+}
+impl AuthorityProfile {
+    pub(super) fn new(unavailable_code: Option<&'static str>) -> Self {
+        Self {
+            kind: "bamboo_native_confirmation_v1",
+            confirmation_available: unavailable_code.is_none(),
+            confirmation_required_per_request: true,
+            unavailable_code,
+        }
+    }
+    pub(super) fn unavailable_code(&self) -> Option<&'static str> {
+        self.unavailable_code
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum Response {
@@ -82,12 +105,14 @@ pub(super) enum Response {
         max_frame_bytes: usize,
         max_requests_per_launch: usize,
         owner_authorization_available: bool,
+        authority_profile: AuthorityProfile,
     },
     Ready {
         version: u8,
         launch_id: Uuid,
         transport_ready: bool,
         owner_authorization_available: bool,
+        authority_profile: AuthorityProfile,
     },
     Result {
         version: u8,
@@ -97,9 +122,14 @@ pub(super) enum Response {
     },
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum Outcome {
+    Cancelled {
+        code: &'static str,
+        status_code: u16,
+        not_submitted: bool,
+    },
     Refused {
         code: &'static str,
         status_code: u16,
@@ -114,14 +144,16 @@ pub(super) enum Outcome {
     },
 }
 
-/// The currently implementable channel. Transport negotiation never becomes
+/// The explicitly disabled channel used by compatibility tests. Transport negotiation never becomes
 /// authorization, and no method accepts an authority from a caller or frame.
 /// This is a pure component, not a CLI startup mode or a production pipe loop.
+#[cfg(test)]
 pub(super) struct UnadmittedChannel {
     launch_id: Uuid,
     session: state::Session<SupervisorManagementRequest>,
 }
 
+#[cfg(test)]
 impl UnadmittedChannel {
     pub(super) fn new(launch_id: Uuid) -> Result<Self, InvalidFrame> {
         Ok(Self {
@@ -138,6 +170,7 @@ impl UnadmittedChannel {
             max_frame_bytes: MAX_FRAME_BYTES,
             max_requests_per_launch: MAX_REQUESTS_PER_LAUNCH,
             owner_authorization_available: false,
+            authority_profile: AuthorityProfile::new(Some("native_confirmation_not_enabled")),
         }
     }
 
@@ -160,6 +193,9 @@ impl UnadmittedChannel {
                     launch_id: self.launch_id,
                     transport_ready: self.session.transport_ready(),
                     owner_authorization_available: false,
+                    authority_profile: AuthorityProfile::new(Some(
+                        "native_confirmation_not_enabled",
+                    )),
                 })
             }
             Request::Apply {
@@ -316,10 +352,19 @@ mod tests {
     fn disabled_profile_is_explicit_and_never_claims_prior_owner_consent() {
         let channel = UnadmittedChannel::new(Uuid::new_v4()).unwrap();
         let hello = serde_json::to_value(channel.hello()).unwrap();
-        assert_eq!(hello["authority_profile"]["kind"], "bamboo_native_confirmation_v1");
+        assert_eq!(
+            hello["authority_profile"]["kind"],
+            "bamboo_native_confirmation_v1"
+        );
         assert_eq!(hello["authority_profile"]["confirmation_available"], false);
-        assert_eq!(hello["authority_profile"]["confirmation_required_per_request"], true);
-        assert_eq!(hello["authority_profile"]["unavailable_code"], "native_confirmation_not_enabled");
+        assert_eq!(
+            hello["authority_profile"]["confirmation_required_per_request"],
+            true
+        );
+        assert_eq!(
+            hello["authority_profile"]["unavailable_code"],
+            "native_confirmation_not_enabled"
+        );
         assert_eq!(hello["owner_authorization_available"], false);
     }
 
@@ -463,5 +508,20 @@ mod tests {
             decode(&vec![b' '; MAX_FRAME_BYTES]).unwrap_err(),
             InvalidFrame::Size
         );
+    }
+    #[test]
+    fn cancellation_wire_contract_cannot_claim_a_commit() {
+        assert_eq!(
+            serde_json::to_value(Outcome::Cancelled {
+                code: "native_confirmation_cancelled",
+                status_code: 409,
+                not_submitted: true,
+            })
+            .unwrap(),
+            json!({"kind":"cancelled","code":"native_confirmation_cancelled","status_code":409,"not_submitted":true})
+        );
+        let profile = serde_json::to_value(AuthorityProfile::new(None)).unwrap();
+        assert_eq!(profile["confirmation_available"], true);
+        assert!(profile["unavailable_code"].is_null());
     }
 }

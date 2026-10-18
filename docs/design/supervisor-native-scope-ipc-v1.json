@@ -165,5 +165,71 @@
     "initial_state_unit": "10P on first prototype; framing/codec additions await their own execution",
     "required": "strict decode/default-deny and lifecycle unit checks, then current-source integration after authority source decision and explicit serial Rust handoff",
     "actual_bodhi_native_and_ui": "UNRUN"
+  },
+  "bamboo_native_confirmation_v1": {
+    "protocol": "BAMBOO_SUPERVISOR_HOST_V1",
+    "version": 1,
+    "change": "additive Bamboo-owned per-intent native confirmation profile; framing and full intent unchanged",
+    "authority_profile": {
+      "kind": "bamboo_native_confirmation_v1",
+      "confirmation_available": "boolean; readiness to ask Bamboo once, never existing consent",
+      "confirmation_required_per_request": true,
+      "unavailable_code": "null when available, otherwise one stable refusal code"
+    },
+    "hello_ready": {
+      "authority_profile": "required for this new profile, absence means legacy unavailable",
+      "owner_authorization_available": false,
+      "transport_ready": "still transport only; both ready and exact profile required"
+    },
+    "apply": "same existing full intent frame; asks Bamboo itself to display and verify this exact request; no caller proof/confirmed/secret/new credential",
+    "outcomes": {
+      "cancelled": {
+        "example": {
+          "kind": "cancelled",
+          "code": "native_confirmation_cancelled",
+          "status_code": 409,
+          "not_submitted": true
+        },
+        "codes": [
+          "native_confirmation_cancelled",
+          "native_confirmation_window_closed",
+          "native_confirmation_timed_out"
+        ],
+        "guarantee": "Bamboo never submitted this request to management CAS; no receipt and no automatic retry"
+      },
+      "refused": {
+        "schema": "existing kind/code/status_code",
+        "default_deny_codes": [
+          "native_confirmation_not_enabled",
+          "native_confirmation_unsupported_platform",
+          "native_confirmation_no_gui",
+          "native_confirmation_thread_unavailable",
+          "native_confirmation_unavailable"
+        ],
+        "guarantee": "no management CAS submitted; readiness can change between inspect and request"
+      },
+      "committed": "existing canonical receipt only after fresh canonical validation and exact CAS",
+      "outcome_unconfirmed": "existing schema for issued CAS/storage ambiguity or lost in-flight response; never relabel as cancelled/committed from matching GET"
+    },
+    "binding": [
+      "entire immutable SupervisorManagementRequest",
+      "fresh child launch_id",
+      "unique request_id spent before any prompt",
+      "same bound confirmation request through the provider and CAS"
+    ],
+    "lifecycle": {
+      "native_cancel": "only Cancel/close/timeout before submission; consume request ID",
+      "javascript_cancel_before_send": "send no apply",
+      "disconnect_before_cas": "Bamboo cancels native helper and forbids submission; client without cancellation response remains conservatively unknown",
+      "disconnect_after_cas_or_reply_pending": "unconfirmed; refresh canonical state, never replay",
+      "conflict_after_confirmation": "fresh identity, Project status and expected management revision checks; 409 scope_revision_conflict, no new automatic prompt/retry",
+      "restart": "new launch, no restored consent or request replay",
+      "single_inflight": true,
+      "no_client_cancel_frame_in_this_delta": true
+    },
+    "http": "existing HTTP owner_authorization.available=false remains truthful: no HTTP owner verifier installed. New native adapter readiness is independent and must not be inferred from or blocked only by that HTTP boolean.",
+    "production_native": "macOS Bamboo-owned same-executable UI helper on initial main thread, NSAlert + read-only scrolling complete intent/before-after preview; Cancel is default. Other platforms default-deny until implemented. No auto click or persistent approval.",
+    "limits": "existing 16KiB request framing /64 spent IDs per launch retained; full preview is bounded and never truncated; preview failure default-denies",
+    "validation": "mock consent is cfg(test) only; positive actual UI approval must be by user after Root presents isolated one-time full preview"
   }
 }

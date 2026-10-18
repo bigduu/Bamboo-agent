@@ -1,10 +1,9 @@
-//! Pure lifecycle gate for the proposed native Project-scope channel.
+//! Pure lifecycle gate for the native Project-scope channel.
 //!
-//! A pipe, PID, handshake or launch identifier is not owner consent. Production
-//! has no native admission source yet and must pass `None` to `begin`.
-//! This module performs no I/O, starts no server, changes no AppState and grants
-//! no permission. Only an independently admitted trusted Rust Host may supply a
-//! verifier. A wire frame must never construct that verifier.
+//! A pipe, PID, handshake or launch identifier is not owner consent. A request
+//! first reserves a cancellable confirmation slot. Only the Bamboo-owned native
+//! provider can supply exact consent; submission is a separate, one-way boundary.
+//! This module itself performs no I/O or persistence.
 
 use std::collections::BTreeSet;
 
@@ -95,12 +94,15 @@ pub(super) enum Refusal {
 pub(super) enum Disconnect {
     /// No operation was in flight. This says nothing about historical writes.
     Idle,
+    /// Confirmation was pending; the canonical mutation was never submitted.
+    NotSubmitted { request_id: u128 },
     /// An apply was issued; loss of transport does not prove it was cancelled.
     OutcomeUnconfirmed { request_id: u128 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
+    Confirming,
     Applying,
     ReplyPending,
 }
@@ -124,6 +126,16 @@ pub(super) struct Submission<I> {
 impl<I> Submission<I> {
     pub(super) fn intent(&self) -> &I {
         &self.intent
+    }
+}
+
+/// One request's immutable, non-cloneable confirmation reservation.
+#[derive(Debug)]
+pub(super) struct Confirmation<I>(Submission<I>);
+
+impl<I> Confirmation<I> {
+    pub(super) fn intent(&self) -> &I {
+        &self.0.intent
     }
 }
 
@@ -176,13 +188,7 @@ impl<I: Clone + Eq> Session<I> {
         self.acknowledged && self.closed.is_none()
     }
 
-    pub(super) fn begin(
-        &mut self,
-        launch_id: u128,
-        request_id: u128,
-        intent: I,
-        authority: Option<&dyn ExactOwnerConsent<I>>,
-    ) -> Result<Submission<I>, Refusal> {
+    fn spend(&mut self, launch_id: u128, request_id: u128) -> Result<(), Refusal> {
         self.check_launch(launch_id)?;
         if !self.acknowledged {
             return Err(Refusal::HandshakeRequired);
@@ -196,28 +202,93 @@ impl<I: Clone + Eq> Session<I> {
         if self.seen.len() == MAX_REQUESTS_PER_LAUNCH {
             return Err(Refusal::Capacity);
         }
-        // Every structurally valid request is spent before verification or any
-        // future await/CAS. Refusal never permits automatic replay of its ID.
         self.seen.insert(request_id);
+        Ok(())
+    }
+
+    pub(super) fn refuse_busy(&mut self, launch_id: u128, request_id: u128) -> Refusal {
+        self.spend(launch_id, request_id)
+            .err()
+            .unwrap_or(Refusal::Busy)
+    }
+
+    pub(super) fn reserve_confirmation(
+        &mut self,
+        launch_id: u128,
+        request_id: u128,
+        intent: I,
+    ) -> Result<Confirmation<I>, Refusal> {
+        self.spend(launch_id, request_id)?;
         if self.pending.is_some() {
             return Err(Refusal::Busy);
-        }
-        let Some(authority) = authority else {
-            return Err(Refusal::OwnerChannelUnavailable);
-        };
-        if !authority.verify_exact(launch_id, request_id, &intent) {
-            return Err(Refusal::ConsentDenied);
         }
         self.pending = Some(Pending {
             request_id,
             intent: intent.clone(),
-            phase: Phase::Applying,
+            phase: Phase::Confirming,
         });
-        Ok(Submission {
+        Ok(Confirmation(Submission {
             launch_id,
             request_id,
             intent,
-        })
+        }))
+    }
+
+    fn check_confirmation(&self, confirmation: &Confirmation<I>) -> Result<(), Refusal> {
+        self.check_launch(confirmation.0.launch_id)?;
+        if !self.pending.as_ref().is_some_and(|p| {
+            p.request_id == confirmation.0.request_id
+                && p.intent == confirmation.0.intent
+                && p.phase == Phase::Confirming
+        }) {
+            return Err(Refusal::ReplyMismatch);
+        }
+        Ok(())
+    }
+
+    pub(super) fn cancel_confirmation(
+        &mut self,
+        confirmation: Confirmation<I>,
+    ) -> Result<(), Refusal> {
+        self.check_confirmation(&confirmation)?;
+        self.pending = None;
+        Ok(())
+    }
+
+    /// The adapter calls this inside its transport-close gate immediately before
+    /// issuing the canonical CAS. Consent never survives this one use or restart.
+    pub(super) fn submit_confirmation(
+        &mut self,
+        confirmation: Confirmation<I>,
+        authority: &dyn ExactOwnerConsent<I>,
+    ) -> Result<Submission<I>, Refusal> {
+        self.check_confirmation(&confirmation)?;
+        if !authority.verify_exact(
+            confirmation.0.launch_id,
+            confirmation.0.request_id,
+            &confirmation.0.intent,
+        ) {
+            self.pending = None;
+            return Err(Refusal::ConsentDenied);
+        }
+        self.pending.as_mut().expect("checked pending").phase = Phase::Applying;
+        Ok(confirmation.0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn begin(
+        &mut self,
+        launch_id: u128,
+        request_id: u128,
+        intent: I,
+        authority: Option<&dyn ExactOwnerConsent<I>>,
+    ) -> Result<Submission<I>, Refusal> {
+        let confirmation = self.reserve_confirmation(launch_id, request_id, intent)?;
+        let Some(authority) = authority else {
+            self.cancel_confirmation(confirmation)?;
+            return Err(Refusal::OwnerChannelUnavailable);
+        };
+        self.submit_confirmation(confirmation, authority)
     }
 
     /// Called only after the canonical use case returns. The operation stays
@@ -260,6 +331,9 @@ impl<I: Clone + Eq> Session<I> {
             return outcome;
         }
         let outcome = match self.pending.take() {
+            Some(pending) if pending.phase == Phase::Confirming => Disconnect::NotSubmitted {
+                request_id: pending.request_id,
+            },
             Some(pending) => Disconnect::OutcomeUnconfirmed {
                 request_id: pending.request_id,
             },
@@ -599,6 +673,58 @@ mod tests {
         assert_eq!(
             session
                 .begin(11, 1, intent(), Some(&consent(1)))
+                .unwrap_err(),
+            Refusal::Replay
+        );
+    }
+    #[test]
+    fn cancellation_spends_id_without_entering_submission() {
+        let mut session = ready();
+        let token = session.reserve_confirmation(11, 1, intent()).unwrap();
+        assert_eq!(token.intent(), &intent());
+        session.cancel_confirmation(token).unwrap();
+        assert_eq!(
+            session
+                .begin(11, 1, intent(), Some(&consent(1)))
+                .unwrap_err(),
+            Refusal::Replay
+        );
+        assert_eq!(session.disconnect(), Disconnect::Idle);
+    }
+
+    #[test]
+    fn close_while_confirming_is_sticky_not_submitted() {
+        let mut session = ready();
+        let token = session.reserve_confirmation(11, 1, intent()).unwrap();
+        let expected = Disconnect::NotSubmitted { request_id: 1 };
+        assert_eq!(session.disconnect(), expected);
+        assert_eq!(session.disconnect(), expected);
+        assert_eq!(
+            session.submit_confirmation(token, &consent(1)).unwrap_err(),
+            Refusal::Closed
+        );
+    }
+
+    #[test]
+    fn confirmed_intent_cannot_be_replaced_at_submission() {
+        let mut session = ready();
+        let token = session.reserve_confirmation(11, 1, intent()).unwrap();
+        let mut wrong = consent(1);
+        wrong.exact.projects.clear();
+        assert_eq!(
+            session.submit_confirmation(token, &wrong).unwrap_err(),
+            Refusal::ConsentDenied
+        );
+        assert_eq!(session.disconnect(), Disconnect::Idle);
+    }
+
+    #[test]
+    fn busy_arrival_is_spent_even_if_processed_after_the_active_reply() {
+        let mut session = ready();
+        assert_eq!(session.refuse_busy(11, 2), Refusal::Busy);
+        assert_eq!(
+            session
+                .begin(11, 2, intent(), Some(&consent(2)))
                 .unwrap_err(),
             Refusal::Replay
         );

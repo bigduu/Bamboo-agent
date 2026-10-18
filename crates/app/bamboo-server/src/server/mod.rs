@@ -12,8 +12,9 @@ mod web_service;
 
 pub use entrypoints::{
     run, run_with_bind, run_with_bind_and_static, run_with_bind_and_static_tls, run_with_bind_tls,
-    run_with_tls,
+    run_with_native_scope_confirmation, run_with_tls,
 };
+pub use supervisor_host_protocol::native_scope_confirmation_helper_entry;
 pub use web_service::WebService;
 
 #[cfg(test)]
