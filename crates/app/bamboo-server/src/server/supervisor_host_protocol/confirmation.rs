@@ -95,7 +95,7 @@ pub(super) enum HelperDecision {
     Approve,
     Cancel,
     WindowClosed,
-    Unavailable { code: Unavailable },
+    Unavailable { code: UnavailableReason },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
