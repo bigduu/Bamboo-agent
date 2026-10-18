@@ -2,9 +2,7 @@
 //! no model, worker wait, or second placement policy runs in this adapter.
 use std::sync::Arc;
 
-use bamboo_engine::session_app::child_session::{
-    create_ticket_child_action, ChildSessionPort, CreateChildInput,
-};
+use bamboo_engine::session_app::child_session::{create_ticket_child_action, CreateChildInput};
 use bamboo_engine::ticket_runtime::{self, DispatchObservation, TICKET_DISPATCH_KEY};
 use bamboo_engine::ticket_worker_plan::tickets::{
     Authority, DispatchSpec, Error, Principal, Result, TicketService,
@@ -162,7 +160,13 @@ impl ChildSessionAdapter {
         if let Some(fence) = &policy.admission_fence {
             fence.check()?;
         }
-        self.admit_child_run(&parent, &child, None)
+        let live_fence = policy.admission_fence.clone();
+        let admission_check = move || {
+            live_fence
+                .as_ref()
+                .map_or(Ok(()), |fence| fence.check().map_err(|e| e.to_string()))
+        };
+        self.admit_child_run_checked(&parent, &child, None, Some(&admission_check))
             .await
             .map_err(|e| Error::AuthorityUnavailable(e.to_string()))?;
         self.query_ticket_dispatch(&service, key, spec).await

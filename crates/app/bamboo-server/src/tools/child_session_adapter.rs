@@ -109,6 +109,28 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 }
 
 impl ChildSessionAdapter {
+    /// Carry a live Host check through durable launch preparation and scheduler
+    /// capacity waits. The scheduler checks it inside the actual queue commit.
+    pub(crate) async fn admit_child_run_checked(
+        &self,
+        parent: &Session,
+        child: &Session,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+        admission_check: Option<&bamboo_engine::execution::spawn::QueueAdmissionCheck>,
+    ) -> Result<bamboo_domain::AdmissionCommit<()>, ChildSessionError> {
+        let child = self.ensure_child_launch_intent(child).await?;
+        self.scheduler
+            .enqueue_announced_for_generation_checked(
+                Self::child_spawn_job(parent, &child)?,
+                Some(child.title.clone()),
+                gate,
+                Some(child.child_launch_generation()),
+                admission_check,
+            )
+            .await
+            .map_err(ChildSessionError::Execution)
+    }
+
     fn validate_configured_child_model(
         config: &Config,
         child: &Session,
@@ -1859,16 +1881,7 @@ impl ChildSessionPort for ChildSessionAdapter {
         child: &Session,
         gate: Option<&bamboo_domain::AdmissionGate>,
     ) -> Result<bamboo_domain::AdmissionCommit<()>, ChildSessionError> {
-        let child = self.ensure_child_launch_intent(child).await?;
-        self.scheduler
-            .enqueue_announced_for_generation(
-                Self::child_spawn_job(parent, &child)?,
-                Some(child.title.clone()),
-                gate,
-                Some(child.child_launch_generation()),
-            )
-            .await
-            .map_err(ChildSessionError::Execution)
+        self.admit_child_run_checked(parent, child, gate, None).await
     }
 
     async fn cancel_child_run_and_wait(

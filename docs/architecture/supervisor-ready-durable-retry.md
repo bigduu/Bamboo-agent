@@ -39,8 +39,11 @@ times, not an exact wake-up SLA or a cumulative monetary budget.
 
 The Host carries a nonserialized `ReadyAdmissionFence` through its internal
 awaits, checking again before canonical Start, prepared-Child creation and the
-existing Child admission call. Already admitted execution keeps the existing
-round cap, shutdown, stop/ACK and resource protocol; the retry deadline does not
+existing Child admission call. The queue adapter also carries a synchronous
+Host callback across capacity waits and checks it inside the cancellation gate
+immediately before the actual queue send. A rejection leaves that gate pending
+and creates no queue entry or start announcement. Already admitted execution
+keeps the existing round cap, shutdown, stop/ACK and resource protocol; the retry deadline does not
 assert that an admitted worker has stopped.
 
 ## Crash and failure decisions

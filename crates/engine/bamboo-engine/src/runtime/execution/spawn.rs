@@ -27,6 +27,11 @@ use super::agent_spawn::SessionExecutionReservation;
 use super::child_completion::{ChildCompletion, ChildCompletionHandler};
 use super::runner_state::AgentRunner;
 
+/// A process-local Host admission check, evaluated at the synchronous queue
+/// commit after capacity waits. It must not block or perform I/O and cannot
+/// reconstruct authority from a persisted job.
+pub type QueueAdmissionCheck = dyn Fn() -> Result<(), String> + Send + Sync;
+
 #[derive(Debug, Clone)]
 pub struct SpawnJob {
     pub parent_session_id: String,
@@ -515,8 +520,31 @@ impl SpawnScheduler {
         gate: Option<&AdmissionGate>,
         launch_generation: Option<u64>,
     ) -> Result<AdmissionCommit<()>, String> {
+        self.enqueue_announced_for_generation_checked(job, title, gate, launch_generation, None)
+            .await
+    }
+
+    /// Preserve the caller's live Host deadline/revocation check across queue
+    /// backpressure. Existing callers retain the unchecked compatibility path.
+    pub async fn enqueue_announced_for_generation_checked(
+        &self,
+        job: SpawnJob,
+        title: Option<String>,
+        gate: Option<&AdmissionGate>,
+        launch_generation: Option<u64>,
+        admission_check: Option<&QueueAdmissionCheck>,
+    ) -> Result<AdmissionCommit<()>, String> {
         let preparation_job = job.clone();
-        match reserve_and_send(&self.tx, job, title.clone(), gate, launch_generation).await? {
+        match reserve_and_send(
+            &self.tx,
+            job,
+            title.clone(),
+            gate,
+            launch_generation,
+            admission_check,
+        )
+        .await?
+        {
             AdmissionCommit::Committed((announce_ready, start_published)) => {
                 let launch_guard = if launch_generation.is_some() {
                     Some(
@@ -666,6 +694,7 @@ async fn reserve_and_send(
     title: Option<String>,
     gate: Option<&AdmissionGate>,
     launch_generation: Option<u64>,
+    admission_check: Option<&QueueAdmissionCheck>,
 ) -> Result<AdmissionCommit<(oneshot::Sender<()>, Arc<AtomicBool>)>, String> {
     if let Some(gate) = gate {
         if gate.is_committed() {
@@ -693,18 +722,16 @@ async fn reserve_and_send(
         announcement_ready,
         start_published: start_published.clone(),
     };
-    match gate {
-        Some(gate) => gate.commit(|| {
-            permit.send(queued);
-            Ok((announce_ready, start_published))
-        }),
-        None => {
-            permit.send(queued);
-            Ok(AdmissionCommit::Committed((
-                announce_ready,
-                start_published,
-            )))
+    let commit = || {
+        if let Some(check) = admission_check {
+            check()?;
         }
+        permit.send(queued);
+        Ok((announce_ready, start_published))
+    };
+    match gate {
+        Some(gate) => gate.commit(commit),
+        None => commit().map(AdmissionCommit::Committed),
     }
 }
 
@@ -994,7 +1021,7 @@ mod launch_hook_tests {
     async fn closed_scheduler_does_not_prepare_phantom_launch() {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
-        let result = reserve_and_send(&tx, job(), None, None, None).await;
+        let result = reserve_and_send(&tx, job(), None, None, None, None).await;
 
         assert_eq!(result.unwrap_err(), "spawn scheduler is not running");
     }
@@ -1016,7 +1043,9 @@ mod launch_hook_tests {
         let waiting = {
             let tx = tx.clone();
             let gate = gate.clone();
-            tokio::spawn(async move { reserve_and_send(&tx, job(), None, Some(&gate), None).await })
+            tokio::spawn(async move {
+                reserve_and_send(&tx, job(), None, Some(&gate), None, None).await
+            })
         };
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
@@ -1041,17 +1070,99 @@ mod launch_hook_tests {
         let (tx, mut rx) = mpsc::channel(1);
         let gate = AdmissionGate::default();
         assert!(matches!(
-            reserve_and_send(&tx, job(), None, Some(&gate), None)
+            reserve_and_send(&tx, job(), None, Some(&gate), None, None)
                 .await
                 .unwrap(),
             AdmissionCommit::Committed(_)
         ));
         assert!(matches!(
-            reserve_and_send(&tx, job(), None, Some(&gate), None)
+            reserve_and_send(&tx, job(), None, Some(&gate), None, None)
                 .await
                 .unwrap(),
             AdmissionCommit::AlreadyCommitted
         ));
+        rx.recv().await.unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    async fn assert_expired_queue_check(gate: Option<&AdmissionGate>) {
+        let (tx, mut rx) = mpsc::channel(1);
+        let _first = reserve_and_send(&tx, job(), None, None, None, None)
+            .await
+            .unwrap();
+        let expired = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let check = {
+            let expired = expired.clone();
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if expired.load(Ordering::SeqCst) {
+                    Err("Host admission expired".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        let waiting = reserve_and_send(&tx, job(), None, gate, None, Some(&check));
+        tokio::pin!(waiting);
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // The Host expires while capacity is unavailable. Freeing capacity
+        // must not turn that old permission into a new queue admission.
+        expired.store(true, Ordering::SeqCst);
+        rx.recv().await.unwrap();
+        assert_eq!(waiting.await.unwrap_err(), "Host admission expired");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn queue_admission_check_rejects_expiry_after_capacity_wait() {
+        assert_expired_queue_check(None).await;
+    }
+
+    #[tokio::test]
+    async fn queue_admission_check_rejection_preserves_cancellation_gate() {
+        let gate = AdmissionGate::default();
+        assert_expired_queue_check(Some(&gate)).await;
+        assert!(!gate.is_committed());
+        gate.cancel_if_pending();
+        assert!(gate.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn queue_admission_check_runs_once_for_successful_send() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let gate = AdmissionGate::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let check = {
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            reserve_and_send(&tx, job(), None, Some(&gate), None, Some(&check))
+                .await
+                .unwrap(),
+            AdmissionCommit::Committed(_)
+        ));
+        assert!(matches!(
+            reserve_and_send(&tx, job(), None, Some(&gate), None, Some(&check))
+                .await
+                .unwrap(),
+            AdmissionCommit::AlreadyCommitted
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         rx.recv().await.unwrap();
         assert!(matches!(
             rx.try_recv(),
