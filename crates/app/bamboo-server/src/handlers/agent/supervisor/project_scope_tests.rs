@@ -7,7 +7,11 @@ use bamboo_domain::{ProjectId, Session, SupervisorReference};
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use serde_json::{json, Value};
 
+use crate::app_state::supervisor_owner_authorization::test_support::{
+    intent as approved_intent, ApprovedHostIntent,
+};
 use crate::{app_state::AppState, routes::configure_routes};
+use std::sync::Arc;
 
 const URI: &str = "/api/v1/supervisor/default/scope";
 
@@ -21,7 +25,12 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let home = tempfile::tempdir().unwrap();
-        let state = web::Data::new(Box::pin(AppState::new(home.path().into())).await.unwrap());
+        let state = web::Data::new(
+            Box::pin(AppState::new(home.path().into()))
+                .await
+                .unwrap()
+                .with_supervisor_project_scope_authorizer(Arc::new(ApprovedHostIntent)),
+        );
         let reference = SupervisorReference::from(
             &SupervisorSessionService::new(state.storage.clone())
                 .get_or_create_default("unconfigured-fixture-model")
@@ -47,12 +56,11 @@ impl Fixture {
     }
 
     async fn call(&self, method: Method, body: Option<Value>) -> (StatusCode, Value) {
-        let app = test::init_service(
-            App::new()
-                .app_data(self.state.clone())
-                .configure(configure_routes),
-        )
-        .await;
+        let mut factory = App::new().app_data(self.state.clone());
+        if let Some(intent) = body.as_ref().and_then(approved_intent) {
+            factory = factory.app_data(web::Data::new(intent));
+        }
+        let app = test::init_service(factory.configure(configure_routes)).await;
         let request = test::TestRequest::default()
             .method(method)
             .uri(URI)
@@ -429,7 +437,10 @@ async fn model_scope_reports_owner_action_without_grant_or_work_readiness() {
     assert_eq!(scope["code"], "project_scope_uninitialized");
     assert_eq!(scope["owner_action"]["model_callable"], false);
     assert_eq!(scope["owner_action"]["path"], URI);
-    assert_eq!(scope["owner_action"]["requires"], "verified_host_owner");
+    assert_eq!(
+        scope["owner_action"]["requires"],
+        "trusted_host_owner_channel"
+    );
     assert_eq!(scope["work_scope"]["availability"], "not_observed");
     assert_eq!(scope["work_scope"]["status_path"], "/api/v1/tickets/scope");
     let observed = SupervisorSessionService::new(f.state.storage.clone())
@@ -586,4 +597,89 @@ async fn review_put_before_bootstrap_reports_missing_without_creating_identity()
         .unwrap()
         .is_none());
     state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn default_host_without_owner_verifier_never_accepts_scope_grant() {
+    let home = tempfile::tempdir().unwrap();
+    let state = web::Data::new(Box::pin(AppState::new(home.path().into())).await.unwrap());
+    let service = SupervisorSessionService::new(state.storage.clone());
+    let reference =
+        SupervisorReference::from(&service.get_or_create_default("no-model").await.unwrap());
+    let project = state
+        .project_store
+        .create("Unapproved Project", None)
+        .unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(URI)
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let observed: Value = test::read_body_json(response).await;
+    assert_eq!(observed["owner_authorization"]["available"], false);
+    assert_eq!(observed["owner_authorization"]["http_registration"], false);
+    let response=test::call_service(&app,test::TestRequest::put().uri(URI).peer_addr("127.0.0.1:12345".parse().unwrap())
+        .insert_header(("X-Bamboo-Owner","true"))
+        .set_json(json!({"incarnation_id":reference.incarnation_id,"expected_state_revision":0,"allowed_projects":[project.id]})).to_request()).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let error: Value = test::read_body_json(response).await;
+    assert_eq!(error["code"], "host_owner_authorization_unavailable");
+    let scope = service.inspect_scope(&reference).await.unwrap();
+    assert_eq!(scope.state_revision, 0);
+    assert!(scope.allowed_projects.is_empty());
+    assert!(!state.config.read().await.features.ticket_mutation);
+    state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn host_consent_is_bound_to_the_exact_scope_intent() {
+    let f = Fixture::new().await;
+    let other = f
+        .state
+        .project_store
+        .create("Different Project", None)
+        .unwrap()
+        .id;
+    let approved = f.update(0, vec![f.project.clone()]);
+    for changed in [
+        f.update(0, vec![other]),
+        f.update(1, vec![f.project.clone()]),
+    ] {
+        let app = test::init_service(
+            App::new()
+                .app_data(f.state.clone())
+                .app_data(web::Data::new(approved_intent(&approved).unwrap()))
+                .configure(configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::put()
+                .uri(URI)
+                .peer_addr("127.0.0.1:12345".parse().unwrap())
+                .set_json(changed)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let error: Value = test::read_body_json(response).await;
+        assert_eq!(error["code"], "host_owner_authorization_required");
+        let scope = SupervisorSessionService::new(f.state.storage.clone())
+            .inspect_scope(&f.reference)
+            .await
+            .unwrap();
+        assert_eq!(scope.state_revision, 0);
+        assert!(scope.allowed_projects.is_empty());
+    }
+    f.state.shutdown().await;
 }

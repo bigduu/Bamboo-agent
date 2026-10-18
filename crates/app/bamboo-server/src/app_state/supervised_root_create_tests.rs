@@ -36,7 +36,10 @@ impl Fixture {
                 }),
             ))
             .await
-            .unwrap(),
+            .unwrap()
+            .with_supervisor_project_scope_authorizer(Arc::new(
+                super::supervisor_owner_authorization::test_support::ApprovedHostIntent,
+            )),
         );
         let workspace = home.path().join("workspaces").join("explicit-worker");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -56,6 +59,9 @@ impl Fixture {
         let app = test::init_service(
             App::new()
                 .app_data(state.clone())
+                .app_data(web::Data::new(super::supervisor_owner_authorization::test_support::intent(&json!({
+                    "incarnation_id":supervisor.incarnation_id,"expected_state_revision":0,"allowed_projects":[project.id.clone()]
+                })).unwrap()))
                 .configure(crate::routes::configure_routes),
         )
         .await;

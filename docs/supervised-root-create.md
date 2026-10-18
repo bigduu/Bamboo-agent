@@ -66,17 +66,45 @@ Ticket/UI responsibilities; this feature does not remove their gates.
 ## Explicit Server owner Project authorization
 
 The Server provides `GET /api/v1/supervisor/default/scope` and
-`PUT /api/v1/supervisor/default/scope`. Both reuse the verified Host owner
-boundary: run-scoped Worker credentials and unauthenticated remote requests
-are rejected. They are not model tools. GET does not open, promote or repair a
-Supervisor. An absent identity requires the existing explicit open action.
+`PUT /api/v1/supervisor/default/scope`. The existing owner-read transport
+boundary rejects run-scoped Worker credentials and unauthenticated remote
+requests; locality may still bypass that read gate. **This is not permission
+to update scope.** PUT additionally requires exact owner consent verified by
+the trusted embedding Host. Neither endpoint is a model tool. GET does not
+open, promote or repair a Supervisor; an absent identity requires the existing
+explicit open action.
+
+The default Server has no mutation authorizer and returns 503
+`host_owner_authorization_unavailable`. GET reports
+`owner_authorization: {available, required: true, kind: "trusted_host_intent",
+http_registration: false}`. Contract-version capabilities advertise the API
+shape, not an available owner channel or worker readiness.
+
+Rust embedding code can call
+`AppState::with_supervisor_project_scope_authorizer` before serving requests.
+Its `SupervisorProjectScopeOwnerAuthorizer` verifies owner consent for the
+entire typed `SupervisorManagementRequest`: current Supervisor incarnation,
+expected revision and complete desired Project set. The Host must obtain this
+proof outside the HTTP control plane and must not approve by locality,
+run/device token or ordinary access cookie alone. Existing pairing/password
+administration has local-bypass behavior, so accepting its credentials alone
+would permit a downgrade. Bamboo registers no HTTP/config/model mechanism to
+install the verifier or mint its proof, and adds no credential/grant registry.
+An installed verifier refusing a request returns 403
+`host_owner_authorization_required` without mutating scope.
+
+The trusted in-process `SupervisorSessionService::configure_project_scope`
+remains available to an embedding Host. Wiring an actual Bodhi native owner
+consent channel is a separately required consumer step; this backend does not
+silently create credentials, change security settings or treat a test-native
+approval as a production authentication implementation.
 
 GET returns `scope: {supervisor, state_revision, allowed_projects}`, a
 `project_scope_uninitialized` or `project_scope_configured` code, and
 `capabilities.project_scope_v1` / `supervised_root_create_v1`. The observation
 contains no target directory, history, credentials or permission configuration.
 
-After an explicit owner selection, PUT accepts exactly:
+After explicit consent through the installed Host channel, PUT accepts exactly:
 
 ```json
 {
@@ -102,7 +130,8 @@ the client must not silently replay a stale write or add Projects. This scope
 CAS retry rule is separate from the unchanged-request replay of an uncertain
 Root creation operation.
 
-Other refusals include 403 `supervisor_identity_mismatch`, 400
+GET and PUT both return 404 `supervisor_missing` before bootstrap without
+creating an identity. Other refusals include 403 `supervisor_identity_mismatch`, 400
 `project_scope_invalid`, 404 `supervisor_missing` / `project_unavailable`, 409
 `project_archived`, and 503 `project_store_unavailable`,
 `scope_authority_invalid` or `scope_unavailable`. Existing owner authentication
@@ -137,12 +166,15 @@ directory, isolated existing workspace, loopback server and a deterministic
 in-process provider; never use the user's Project grants, configuration,
 history or a paid model. Keep the installed app untouched.
 
-1. Reproduce empty management scope and show the explicit owner selection
-   route. Querying scope, opening Supervisor and initializing Work must leave
+1. Record whether the actual Host has installed its native owner-consent
+   verifier. An unavailable channel must stay explicitly blocked; no cookie,
+   device setup or anonymous loopback call may substitute for it. Reproduce
+   empty management scope and show the explicit owner selection route. Querying scope, opening Supervisor and initializing Work must leave
    the management set unchanged. Cover missing/ordinary identity and
    authenticated versus refused owner access.
-2. Explicitly select one existing active Project through the owner PUT, using
-   its observed incarnation and management revision. In Standard and Ultra,
+2. Explicitly select one existing active Project through the actual Host owner
+   channel and PUT, binding consent to its observed incarnation, management
+   revision and entire Project set. In Standard and Ultra,
    issue the actual Host-wired `session_control create` under its separate
    native approval. Verify a visible independent Ordinary Root, exact Project
    and workspace, one managed link and one initial Inbox receipt. Retry and
@@ -163,5 +195,5 @@ history or a paid model. Keep the installed app untouched.
 
 Native HTTP/model contract tests prove the backend composition in temporary
 fixtures. They do not prove the installed Bodhi UI, real model routing,
-publication or a completed implementation task. The owner selection UI,
-actual consumer integration and any release remain separately pending.
+publication or a completed implementation task. The owner selection UI, actual native Host consent verifier,
+consumer integration and any release remain separately pending.
