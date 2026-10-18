@@ -31,9 +31,12 @@ impl TicketApplication {
     /// receipt or balance. Only one live owner may open a scope's journal.
     pub async fn open_patrol_checkpoints(&self, scope: &Scope) -> Result<PatrolCheckpointStore> {
         let (service, authority) = self.authority(Principal::Runtime).await?;
+        let (commit, snapshot) = service.published()?;
         let _authorized =
             host::read_observation(&service, &authority, scope).map_err(patrol_error)?;
-        let snapshot = service.published()?.1;
+        if service.published()?.0 != commit {
+            return Err(Error::RevisionConflict);
+        }
         let binding =
             bamboo_tickets::content_hash(&bamboo_tickets::canonical_bytes(&snapshot.binding)?);
         // Resolve the already configured Host root, not a client-selected path.
