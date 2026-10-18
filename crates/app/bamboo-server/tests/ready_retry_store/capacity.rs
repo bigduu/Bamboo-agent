@@ -162,7 +162,7 @@ async fn full_mixed_schema1_preserves_every_legacy_budget_while_new_work_grows_i
     );
     let marker = capacity_json(&capacity_marker(root.path()));
     capacity_assert_checksum(&marker);
-    assert_eq!(marker["state"]["schema"], 2);
+    assert_eq!(marker["state"]["schema"], 3);
     assert_eq!(marker["state"]["revision"], before["state"]["revision"]);
     assert_eq!(marker["state"]["entries"], before["state"]["entries"], "all 1024 entries, revisions, requests and old windows survive without deletion or migration");
     assert_ne!(
@@ -374,7 +374,7 @@ async fn initialized_sharded_layout_loss_or_legacy_collision_is_never_an_empty_b
         if matches!(case, "marker" | "entries-root") {
             assert!(
                 reopened.load(&key("never-seen")).await.is_err(),
-                "missing schema2 authority must not return None: {case}"
+                "missing schema3 authority must not return None: {case}"
             );
         }
     }
@@ -501,7 +501,7 @@ async fn sharded_entries_directory_key_directory_and_leaf_symlinks_are_rejected(
 async fn marker_and_first_leaf_faults_preserve_legacy_charges_and_publication_order() {
     for (phase, occurrence, expected) in [
         (ReadyRetryFilePhase::BeforeReplace, 1, "old-marker"),
-        (ReadyRetryFilePhase::AfterDirectorySync, 1, "schema2-only"),
+        (ReadyRetryFilePhase::AfterDirectorySync, 1, "schema3-only"),
         (ReadyRetryFilePhase::BeforeReplace, 2, "missing-leaf"),
         (ReadyRetryFilePhase::AfterReplace, 2, "charged-leaf"),
     ] {
@@ -522,7 +522,7 @@ async fn marker_and_first_leaf_faults_preserve_legacy_charges_and_publication_or
                     if occurrence == 2 {
                         let marker = capacity_json(&capacity_marker(&observed_root));
                         capacity_assert_checksum(&marker);
-                        marker_seen.store(marker["state"]["schema"] == 2, Ordering::SeqCst);
+                        marker_seen.store(marker["state"]["schema"] == 3, Ordering::SeqCst);
                     }
                     return Err(io::Error::other("controlled marker/leaf publication fault"));
                 }
@@ -549,7 +549,7 @@ async fn marker_and_first_leaf_faults_preserve_legacy_charges_and_publication_or
         if occurrence == 2 {
             assert!(
                 marker_seen_before_leaf.load(Ordering::SeqCst),
-                "schema2 marker was published before leaf contents"
+                "schema3 marker was published before leaf contents"
             );
             assert_eq!(
                 std::fs::metadata(capacity_membership(root.path(), &new_key))
@@ -572,8 +572,8 @@ async fn marker_and_first_leaf_faults_preserve_legacy_charges_and_publication_or
                 assert_eq!(marker["state"]["schema"], 1);
                 assert!(reopened.load(&new_key).await.unwrap().is_none());
             }
-            "schema2-only" => {
-                assert_eq!(marker["state"]["schema"], 2);
+            "schema3-only" => {
+                assert_eq!(marker["state"]["schema"], 3);
                 assert!(reopened.load(&new_key).await.unwrap().is_none());
             }
             "missing-leaf" => {
@@ -629,7 +629,7 @@ async fn uncertain_format_activation_must_be_resynced_before_any_leaf_can_be_wri
             .is_err());
         assert_eq!(
             capacity_json(&capacity_marker(root.path()))["state"]["schema"],
-            2
+            3
         );
         assert!(!capacity_membership(root.path(), &new_key).exists());
 
@@ -736,7 +736,7 @@ async fn cancelling_first_leaf_creation_retains_the_stable_writer_until_its_char
         .unwrap();
     assert_eq!(
         capacity_json(&capacity_marker(root.path()))["state"]["schema"],
-        2
+        3
     );
     assert_eq!(
         std::fs::metadata(capacity_membership(root.path(), &new_key))

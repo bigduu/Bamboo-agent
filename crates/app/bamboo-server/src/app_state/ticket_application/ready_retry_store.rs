@@ -25,6 +25,7 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 const STATE: &str = "state.json";
 const LOCK: &str = "ready-retry-v1.lock";
 const RECORDS: &str = "entries";
+const MEMBERSHIP: &str = "membership";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadyRetryFilePhase {
@@ -35,6 +36,8 @@ pub enum ReadyRetryFilePhase {
     AfterDirectorySync,
     BeforeFormatSync,
     AfterFormatSync,
+    BeforeMembershipSync,
+    AfterMembershipSync,
 }
 
 /// Trusted-host/test injection only; no Worker, JSON command or HTTP setter.
@@ -204,7 +207,7 @@ impl FileReadyRetryStore {
             return Err(unavailable("retry metadata exceeds its byte limit"));
         }
         let envelope: Envelope = serde_json::from_slice(&bytes)?;
-        if !matches!(envelope.state.schema, 1 | 2)
+        if !matches!(envelope.state.schema, 1 | 2 | 3)
             || envelope.state.entries.len() > MAX_LEGACY_ENTRIES
             || content_hash(&canonical_bytes(&envelope.state)?) != envelope.sha256
         {
@@ -221,8 +224,23 @@ impl FileReadyRetryStore {
             }
             validate_ready_retry_record(&entry.value.record)?;
         }
-        if envelope.state.schema == 2 {
+        if envelope.state.schema >= 2 {
             Self::plain_directory(&self.directory.join(RECORDS))?;
+        }
+        if envelope.state.schema == 3 {
+            Self::plain_directory(&self.directory.join(MEMBERSHIP))?;
+        } else if envelope.state.schema == 2 {
+            // Format 2 has no independent proof that an absent key is new.
+            // Do not scan surviving records and silently bless that absence.
+            match fs::symlink_metadata(self.directory.join(MEMBERSHIP)) {
+                Ok(_) => {
+                    return Err(unavailable(
+                        "schema-2 store has unexpected membership; explicit repair required",
+                    ))
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
         Ok(envelope.state)
     }
@@ -243,6 +261,30 @@ impl FileReadyRetryStore {
 
     fn key_marker(&self, hash: &str) -> PathBuf {
         self.directory.join(RECORDS).join(format!("{hash}.key"))
+    }
+
+    fn membership(&self, hash: &str) -> PathBuf {
+        self.directory.join(MEMBERSHIP).join(hash)
+    }
+
+    fn membership_exists(&self, hash: &str) -> Result<bool> {
+        match fs::symlink_metadata(self.directory.join(MEMBERSHIP)) {
+            Ok(_) => Self::plain_directory(&self.directory.join(MEMBERSHIP))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+        match fs::symlink_metadata(self.membership(hash)) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != 0 {
+                    return Err(unavailable(
+                        "protected membership is not an empty plain file",
+                    ));
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn key_marker_exists(&self, hash: &str) -> Result<bool> {
@@ -274,8 +316,9 @@ impl FileReadyRetryStore {
     ) -> Result<Option<VersionedReadyRetry>> {
         let directory_exists = self.record_directory_exists(hash)?;
         let marker_exists = self.key_marker_exists(hash)?;
+        let membership_exists = self.membership_exists(hash)?;
         if let Some(entry) = state.entries.get(hash) {
-            if directory_exists || marker_exists {
+            if directory_exists || marker_exists || membership_exists {
                 return Err(unavailable(
                     "duplicate legacy and individual retry identity",
                 ));
@@ -283,19 +326,26 @@ impl FileReadyRetryStore {
             return Ok(Some(entry.value.clone()));
         }
         if state.schema == 1 {
-            if directory_exists || marker_exists {
+            if directory_exists || marker_exists || membership_exists {
                 return Err(unavailable(
                     "individual retry record without schema-2 activation",
                 ));
             }
             return Ok(None);
         }
-        if directory_exists != marker_exists {
+        if directory_exists != marker_exists
+            || (state.schema == 3 && directory_exists != membership_exists)
+        {
             return Err(unavailable(
-                "initialized retry key marker or directory is missing",
+                "initialized retry membership, marker or directory is missing",
             ));
         }
         if !directory_exists {
+            if state.schema == 2 {
+                return Err(unavailable(
+                    "schema-2 key absence is unproven; explicit trusted repair required",
+                ));
+            }
             return Ok(None);
         }
         let directory = self.record_directory(hash);
@@ -320,7 +370,7 @@ impl FileReadyRetryStore {
             ));
         }
         let envelope: RecordEnvelope = serde_json::from_slice(&bytes)?;
-        if envelope.state.schema != 2
+        if envelope.state.schema != state.schema
             || envelope.state.key != *key
             || key_hash(&envelope.state.key)? != hash
             || envelope.state.value.revision == 0
@@ -335,9 +385,9 @@ impl FileReadyRetryStore {
     }
 
     fn activate_individual_records(&self, state: &mut State) -> Result<()> {
-        if state.schema == 2 {
+        if matches!(state.schema, 2 | 3) {
             // A previous activation can have returned an uncertain error after
-            // rename but before directory sync. Observing format 2 alone is
+            // rename but before directory sync. Observing the format alone is
             // not proof that its old-reader rejection is durable. Re-establish
             // that barrier before any individual record may be published.
             self.phase(ReadyRetryFilePhase::BeforeFormatSync)?;
@@ -345,18 +395,20 @@ impl FileReadyRetryStore {
             File::open(&self.directory)?.sync_all()?;
             return self.phase(ReadyRetryFilePhase::AfterFormatSync);
         }
-        let records = self.directory.join(RECORDS);
-        match fs::create_dir(&records) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
+        for name in [RECORDS, MEMBERSHIP] {
+            let directory = self.directory.join(name);
+            match fs::create_dir(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            Self::plain_directory(&directory)?;
         }
-        Self::plain_directory(&records)?;
         // Also sync an existing directory from an interrupted activation.
         File::open(&self.directory)?.sync_all()?;
-        // Original readers reject schema 2 in this same state.json. A separate
-        // marker could be ignored by an old writer and refund a stored budget.
-        state.schema = 2;
+        // Both earlier readers reject schema 3 in this same state.json. A
+        // separate marker alone could be ignored and refund a stored budget.
+        state.schema = 3;
         self.publish(state)
     }
 
@@ -440,6 +492,21 @@ impl FileReadyRetryStore {
             self.activate_individual_records(&mut state)?;
             let directory = self.record_directory(&hash);
             if previous.is_none() {
+                if state.schema != 3 {
+                    return Err(unavailable("new retry keys require protected membership"));
+                }
+                // This index is outside both per-key artifacts in entries/.
+                // It is durable before either artifact or the charge appears;
+                // cancellation/error never removes an initialized membership.
+                let membership = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(self.membership(&hash))?;
+                self.phase(ReadyRetryFilePhase::BeforeMembershipSync)?;
+                membership.sync_all()?;
+                drop(membership);
+                File::open(self.directory.join(MEMBERSHIP))?.sync_all()?;
+                self.phase(ReadyRetryFilePhase::AfterMembershipSync)?;
                 // The permanent sibling marker also detects loss of the whole
                 // key directory. Neither marker nor directory is ever cleaned
                 // up after an error; a partial initialization must fail closed.
@@ -453,7 +520,7 @@ impl FileReadyRetryStore {
                 File::open(self.directory.join(RECORDS))?.sync_all()?;
             }
             let record = RecordState {
-                schema: 2,
+                schema: state.schema,
                 key: key.clone(),
                 value: value.clone(),
             };

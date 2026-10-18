@@ -124,30 +124,40 @@ DispatchSpec/context and runtime receipt remain the execution references.
 ## Durable Ready retry capacity
 
 Retry metadata remains one `ReadyRetryStore` under its original stable file
-lock. Format 1 stays readable with its existing bounded legacy map. Before a
-new stable Work key is written, the adapter durably publishes format 2 in the
-original `state.json` and syncs its directory. Original readers reject that
-version rather than treating the new records as absent budgets.
-A writer that observes format 2 again re-syncs its marker file and directory
-before publishing an individual record: a prior rename may have returned an
-uncertain error before its directory sync completed.
+lock. Format 1 stays readable with its bounded legacy map. Before the first new
+stable key, the adapter publishes format 3 in the original `state.json` and
+syncs that file and its directory. Both previous readers reject format 3 rather
+than treating the new layout as absent budgets. A writer that observes an
+individual-record format again re-syncs its state file and directory before
+publishing another record, preserving the uncertain-publication barrier.
 
-The legacy map keeps every original key, revision, attempt, deadline, request
-and quarantine; existing keys continue their original CAS there. New keys use
-individual checksummed records of at most 64 KiB, addressed by the existing
-scope/Work hash, without adding another authority or scanning all new records.
-The old 1,024-entry and 8 MiB limits still bound legacy-file reads, but no longer
-limit the installation's lifetime number of new Work keys.
+Every original legacy key, revision, attempt, deadline, request and quarantine
+stays in its original map and CAS path. New format-3 keys use checksummed records
+of at most 64 KiB without growing that map. The old 1,024-entry and 8 MiB limits
+bound legacy reads, not the installation lifetime. Lookup checks only the
+requested scope/Work hash; it never scans all new records or evicts a budget.
 
-Each individual key has a permanent empty sibling marker. Its file and parent
-are synced before creating and syncing the key directory and publishing its
-record. Missing/corrupt markers, key directories, records or the format-2 record
-root fail closed; they never become a new retry window. Errors and cancellation
-never remove initialized markers/directories or refund a published reservation.
-Both the legacy and individual paths retain the original lock until blocking
-file and directory synchronization ends. No expired or quarantined budget is
-automatically deleted. Restoration of deliberately erased/rolled-back store data
-still requires explicit Host repair; these bytes are not an execution grant.
+A format-3 key first gets a permanent empty tombstone in `membership/`, outside
+the `entries/` subtree containing its sibling `.key` marker and record directory.
+The tombstone file and parent directory are synced before those two artifacts
+or the charge can be published. All three must agree. Pair deletion or replay
+of an entries snapshot that predates a key therefore fails closed for that
+known key rather than creating revision 1. A genuinely new key remains independently usable. A missing
+or linked membership root is an error and is never rebuilt. Errors/cancellation
+never remove initialized membership or refund a published reservation; the
+blocking transaction retains the same lock through synchronization.
+
+Format 2 cannot prove that a missing pair was never initialized. The reader
+retains complete, valid known records and permits their monotonic CAS in place,
+but absent keys fail closed and no membership is inferred by scanning surviving
+records. Such a store needs explicit trusted Host repair/cutover evidence before
+accepting new keys; there is no automatic format-2 migration or deadline reset.
+Existing bytes and charged budgets are not rewritten merely by reading them.
+
+This independent index protects entries-only loss/replay, not deletion or
+rollback of every trusted copy including the index and format state. Proving
+that history requires an external anchor; these bytes never restore execution
+authority, and missing evidence cannot be treated as a new retry window.
 
 ## Admission conditions
 
