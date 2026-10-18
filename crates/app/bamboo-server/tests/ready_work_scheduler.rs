@@ -896,6 +896,36 @@ async fn queued_child_keeps_host_round_ceiling_after_global_budget_is_relaxed() 
 }
 
 #[tokio::test]
+async fn corrupt_durable_retry_metadata_never_starts_a_child_or_supervisor() {
+    let mut fixture = Fixture::new(1).await;
+    let authority = fixture.assert_supervisor_tool_boundary().await;
+    let directory = fixture._root.path().join("ready-retry-v1");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(directory.join("state.json"), b"{truncated retry metadata").unwrap();
+    let before = serde_json::to_value(fixture.snapshot()).unwrap();
+    fixture
+        .state
+        .tickets
+        .install_ready_work_policy(fixture.policy(1))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        assert!(
+            matches!(fixture.state.tickets.reconcile_ready_work().await.unwrap(),
+            ReadyReconcile::Blocked { work_id, reason, .. }
+                if work_id == fixture.works[0].id && reason.contains("durable retry metadata unavailable"))
+        );
+    }
+    fixture.state.tickets.wake_ready_work();
+    fixture.assert_quiet(0).await;
+    assert_eq!(serde_json::to_value(fixture.snapshot()).unwrap(), before);
+    assert_eq!(fixture.assert_supervisor_tool_boundary().await, authority);
+    assert!(fixture.snapshot().assignments.is_empty());
+    fixture.state.tickets.revoke_ready_work_policy().await;
+    fixture.state.shutdown().await;
+}
+
+#[tokio::test]
 async fn missing_workspace_stays_fail_closed_across_repeated_reconcile() {
     let mut fixture = Fixture::new(1).await;
     let supervisor_authority = fixture.assert_supervisor_tool_boundary().await;

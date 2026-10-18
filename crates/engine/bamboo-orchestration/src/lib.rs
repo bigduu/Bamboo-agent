@@ -2,8 +2,8 @@
 //!
 //! A process-local Host policy grants one initial attempt per Work. This crate
 //! owns selection and wake/retry state only; the Host checks current eligibility
-//! and dispatches through its existing worker runtime. No model, broker, lease,
-//! persistence store or recovered execution grant is introduced here.
+//! and dispatches through its existing worker runtime. Durable retry metadata
+//! uses a narrow Host storage port, never a second Task/lease or recovered grant.
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
@@ -19,6 +19,9 @@ use bamboo_tickets::{
 };
 use tokio::{sync::Notify, task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
+
+pub mod ready_recovery;
+use ready_recovery::{ReadyRecovery, RetryContext, RetryGate, RetryPermit};
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_WAKE_INTERVAL: Duration = Duration::from_millis(100);
@@ -46,7 +49,8 @@ pub struct ReadyWorkPolicy {
     pub lifetime: Duration,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReadyBlockKind {
     Configuration,
     Permission,
@@ -59,6 +63,12 @@ pub enum ReadyBlockKind {
 pub enum ReadyReconcile {
     Disabled,
     Idle,
+    Deferred {
+        work_id: String,
+        next_check_at_ms: u64,
+        attempts: u8,
+        reason: String,
+    },
     CapacityBlocked {
         occupied: usize,
         capacity: usize,
@@ -86,6 +96,36 @@ pub enum ReadyDispatch {
     },
 }
 
+/// A process-local tighten-only check carried to the outer Host's real commit
+/// and Child-admission points. It is never serialized or recovered as a grant.
+#[derive(Clone)]
+pub struct ReadyAdmissionFence {
+    expires: Instant,
+    retry: Option<ready_recovery::RetryDeadline>,
+}
+
+impl std::fmt::Debug for ReadyAdmissionFence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadyAdmissionFence")
+            .field("expires", &self.expires)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReadyAdmissionFence {
+    pub fn check(&self) -> Result<()> {
+        if Instant::now() >= self.expires {
+            return Err(Error::ResourceBlocked(
+                "Host policy expired before admission".into(),
+            ));
+        }
+        if let Some(retry) = &self.retry {
+            retry.check()?;
+        }
+        Ok(())
+    }
+}
+
 /// Trusted Host seam; implementations re-read live authority/resources and use
 /// the canonical Start receipt and worker runtime, never a second Task or lease.
 #[async_trait]
@@ -100,6 +140,27 @@ pub trait ReadyWorkHost: Send + Sync {
         max_rounds: u32,
     ) -> Result<ReadyDispatch>;
     async fn dispatch(&self, command: &Command, max_rounds: u32) -> Result<ReadyDispatch>;
+    /// Concrete Hosts check this again after internal awaits, before a new
+    /// Start and before admitting a prepared canonical Child.
+    async fn dispatch_fenced(
+        &self,
+        command: &Command,
+        max_rounds: u32,
+        fence: &ReadyAdmissionFence,
+    ) -> Result<ReadyDispatch> {
+        fence.check()?;
+        self.dispatch(command, max_rounds).await
+    }
+    async fn ensure_fenced(
+        &self,
+        key: &str,
+        spec: &DispatchSpec,
+        max_rounds: u32,
+        fence: &ReadyAdmissionFence,
+    ) -> Result<ReadyDispatch> {
+        fence.check()?;
+        self.ensure(key, spec, max_rounds).await
+    }
 }
 
 struct InstalledPolicy {
@@ -122,9 +183,21 @@ pub struct ReadyWorkScheduler {
     state: tokio::sync::Mutex<Option<InstalledPolicy>>,
     wake: Arc<Notify>,
     worker: Mutex<Option<Worker>>,
+    recovery: Option<ReadyRecovery>,
 }
 
 impl ReadyWorkScheduler {
+    /// Host-only retry metadata; installing this store does not install a policy.
+    pub fn with_recovery(
+        store: Arc<dyn ready_recovery::ReadyRetryStore>,
+        clock: Arc<dyn ready_recovery::ReadyRetryClock>,
+    ) -> Self {
+        Self {
+            recovery: Some(ReadyRecovery::new(store, clock)),
+            ..Self::default()
+        }
+    }
+
     pub async fn install(&self, host: &dyn ReadyWorkHost, policy: ReadyWorkPolicy) -> Result<()> {
         if !(1..=3).contains(&policy.capacity)
             || policy.grants.is_empty()
@@ -206,7 +279,9 @@ impl ReadyWorkScheduler {
             return Ok(ReadyReconcile::Disabled);
         }
         let mut candidates = Vec::new();
+        let mut retry_permits = BTreeMap::new();
         let mut blocked = None;
+        let mut pending_wait = None;
         for grant in &policy.grants {
             if let Some(report) = installed.stopped.get(&grant.work_id) {
                 blocked.get_or_insert(report.clone());
@@ -232,8 +307,59 @@ impl ReadyWorkScheduler {
                     || work.archived
                     || work.active_assignment.is_some())
             {
+                if self.recovery.is_some()
+                    && work
+                        .active_assignment
+                        .as_ref()
+                        .and_then(|id| snapshot.assignments.get(id))
+                        .is_some_and(|assignment| {
+                            assignment.state == AssignmentState::OutcomeUnknown
+                        })
+                {
+                    blocked.get_or_insert(ReadyReconcile::Blocked {
+                        work_id: work.id.clone(), kind: ReadyBlockKind::OutcomeUnknown,
+                        reason: "canonical execution outcome is unknown; original receipt reconciliation required".into(),
+                    });
+                }
                 continue;
             }
+            let permit = if let Some(recovery) = &self.recovery {
+                match recovery
+                    .check(RetryContext {
+                        binding: &installed.binding,
+                        project_id: &policy.project_id,
+                        grant,
+                        max_rounds: policy.max_rounds,
+                        remaining: installed.expires.saturating_duration_since(Instant::now()),
+                        snapshot: &snapshot,
+                        pending_key: pending.map(|assignment| assignment.dispatch_key.as_str()),
+                    })
+                    .await
+                {
+                    Ok(RetryGate::Permit(permit)) => Some(permit),
+                    Ok(RetryGate::Report(report)) => {
+                        if pending.is_some() {
+                            pending_wait.get_or_insert(report.clone());
+                        }
+                        blocked.get_or_insert(report);
+                        continue;
+                    }
+                    Err(error) => {
+                        let report = ReadyReconcile::Blocked {
+                            work_id: work.id.clone(),
+                            kind: ReadyBlockKind::Resource,
+                            reason: format!("durable retry metadata unavailable: {error}"),
+                        };
+                        if pending.is_some() {
+                            pending_wait.get_or_insert(report.clone());
+                        }
+                        blocked.get_or_insert(report);
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             let eligible = async {
                 if snapshot.project.links.get(&work.id) != Some(&policy.project_id)
                     || snapshot.project.work_contexts.get(&work.id) != Some(&grant.context_hash)
@@ -291,44 +417,89 @@ impl ReadyWorkScheduler {
                             "pending intent differs from Host decision".into(),
                         ));
                     }
-                    return host
-                        .ensure(
-                            &assignment.dispatch_key,
-                            &intent.immutable_spec,
-                            policy.max_rounds,
-                        )
-                        .await
-                        .map(Some);
                 }
-                Ok(None)
+                Ok(())
             }
             .await;
-            match eligible {
-                Ok(Some(ReadyDispatch::Blocked { kind, reason })) => {
-                    return Ok(remember_failure(installed, &work.id, kind, reason));
-                }
-                Ok(Some(ReadyDispatch::Observed { dispatch_key })) => {
-                    return Ok(ReadyReconcile::Dispatched {
-                        work_id: work.id.clone(),
-                        dispatch_key,
-                    });
-                }
-                Ok(None) => candidates.push(ClaimCandidate {
-                    work_id: work.id.clone(),
-                    workspace: Some(grant.workspace.clone()),
-                }),
-                Err(error) => {
-                    let report = remember_failure(
+            if let Err(error) = eligible {
+                let report = self
+                    .failure_report(
                         installed,
                         &work.id,
-                        classify_block(&error),
-                        error.to_string(),
-                    );
-                    if pending.is_some() {
-                        return Ok(report);
-                    }
-                    blocked.get_or_insert(report);
+                        permit,
+                        (classify_block(&error), error.to_string()),
+                        &service,
+                    )
+                    .await?;
+                if pending.is_some() {
+                    return Ok(report);
                 }
+                blocked.get_or_insert(report);
+                continue;
+            }
+            if let Some(assignment) = pending {
+                let intent = &snapshot.intents[&assignment.dispatch_key];
+                let permit = if let (Some(recovery), Some(permit)) = (&self.recovery, permit) {
+                    Some(
+                        recovery
+                            .reserve_intent(
+                                permit,
+                                &assignment.dispatch_key,
+                                &intent.immutable_spec,
+                            )
+                            .await?,
+                    )
+                } else {
+                    None
+                };
+                self.check_admission_time(installed, permit.as_ref())?;
+                host.check_budget(policy.max_rounds).await?;
+                self.check_admission_time(installed, permit.as_ref())?;
+                let fence = self.admission_fence(installed, permit.as_ref());
+                match host
+                    .ensure_fenced(
+                        &assignment.dispatch_key,
+                        &intent.immutable_spec,
+                        policy.max_rounds,
+                        &fence,
+                    )
+                    .await
+                {
+                    Ok(ReadyDispatch::Observed { dispatch_key }) => {
+                        if let (Some(recovery), Some(permit)) = (&self.recovery, permit) {
+                            recovery
+                                .observed(permit, &dispatch_key, &service.published()?.1)
+                                .await?;
+                        }
+                        return Ok(ReadyReconcile::Dispatched {
+                            work_id: work.id.clone(),
+                            dispatch_key,
+                        });
+                    }
+                    Ok(ReadyDispatch::Blocked { kind, reason }) => {
+                        return self
+                            .failure_report(installed, &work.id, permit, (kind, reason), &service)
+                            .await;
+                    }
+                    Err(error) => {
+                        return self
+                            .failure_report(
+                                installed,
+                                &work.id,
+                                permit,
+                                (classify_block(&error), error.to_string()),
+                                &service,
+                            )
+                            .await;
+                    }
+                }
+            }
+            candidates.push(ClaimCandidate {
+                work_id: work.id.clone(),
+                workspace: Some(grant.workspace.clone()),
+            });
+            if let Some(permit) = permit {
+                retry_permits.insert(work.id.clone(), permit);
             }
         }
         let observed = SnapshotRef {
@@ -345,7 +516,7 @@ impl ReadyWorkScheduler {
             policy.capacity,
         )? {
             ClaimDecision::CapacityBlocked { occupied, capacity } => {
-                Ok(ReadyReconcile::CapacityBlocked { occupied, capacity })
+                Ok(pending_wait.unwrap_or(ReadyReconcile::CapacityBlocked { occupied, capacity }))
             }
             ClaimDecision::NoEligibleWork => Ok(blocked.unwrap_or(ReadyReconcile::Idle)),
             ClaimDecision::Prepared(command) => {
@@ -357,27 +528,106 @@ impl ReadyWorkScheduler {
                     return Ok(ReadyReconcile::Disabled);
                 }
                 host.check_budget(policy.max_rounds).await?;
-                match host.dispatch(&command, policy.max_rounds).await {
+                let permit = if let Some(recovery) = &self.recovery {
+                    let permit = retry_permits.remove(&work_id).ok_or_else(|| {
+                        Error::AuthorityUnavailable(
+                            "selected Work has no durable retry check".into(),
+                        )
+                    })?;
+                    Some(recovery.reserve_start(permit, &command).await?)
+                } else {
+                    None
+                };
+                self.check_admission_time(installed, permit.as_ref())?;
+                let fence = self.admission_fence(installed, permit.as_ref());
+                match host
+                    .dispatch_fenced(&command, policy.max_rounds, &fence)
+                    .await
+                {
                     Ok(ReadyDispatch::Observed { dispatch_key }) => {
+                        if let (Some(recovery), Some(permit)) = (&self.recovery, permit) {
+                            recovery
+                                .observed(permit, &dispatch_key, &service.published()?.1)
+                                .await?;
+                        }
                         Ok(ReadyReconcile::Dispatched {
                             work_id,
                             dispatch_key,
                         })
                     }
                     Ok(ReadyDispatch::Blocked { kind, reason }) => {
-                        Ok(remember_failure(installed, &work_id, kind, reason))
+                        self.failure_report(installed, &work_id, permit, (kind, reason), &service)
+                            .await
                     }
                     // A scope conflict fences this observed selection; retry
                     // only after another full read and eligibility check.
-                    Err(Error::RevisionConflict) => Err(Error::RevisionConflict),
-                    Err(error) => Ok(remember_failure(
-                        installed,
-                        &work_id,
-                        classify_block(&error),
-                        error.to_string(),
-                    )),
+                    Err(Error::RevisionConflict) => {
+                        if let (Some(recovery), Some(permit)) = (&self.recovery, permit) {
+                            recovery.conflict(permit).await?;
+                        }
+                        Err(Error::RevisionConflict)
+                    }
+                    Err(error) => {
+                        self.failure_report(
+                            installed,
+                            &work_id,
+                            permit,
+                            (classify_block(&error), error.to_string()),
+                            &service,
+                        )
+                        .await
+                    }
                 }
             }
+        }
+    }
+
+    fn check_admission_time(
+        &self,
+        installed: &InstalledPolicy,
+        permit: Option<&RetryPermit>,
+    ) -> Result<()> {
+        if Instant::now() >= installed.expires {
+            return Err(Error::ResourceBlocked(
+                "Host policy expired before admission".into(),
+            ));
+        }
+        if let (Some(recovery), Some(permit)) = (&self.recovery, permit) {
+            recovery.check_time(permit)?;
+        }
+        Ok(())
+    }
+
+    fn admission_fence(
+        &self,
+        installed: &InstalledPolicy,
+        permit: Option<&RetryPermit>,
+    ) -> ReadyAdmissionFence {
+        ReadyAdmissionFence {
+            expires: installed.expires,
+            retry: self
+                .recovery
+                .as_ref()
+                .zip(permit)
+                .map(|(recovery, permit)| recovery.deadline(permit)),
+        }
+    }
+
+    async fn failure_report(
+        &self,
+        installed: &mut InstalledPolicy,
+        work_id: &str,
+        permit: Option<RetryPermit>,
+        failure: (ReadyBlockKind, String),
+        service: &TicketService,
+    ) -> Result<ReadyReconcile> {
+        let (kind, reason) = failure;
+        if let (Some(recovery), Some(permit)) = (&self.recovery, permit) {
+            recovery
+                .failure(permit, kind, reason, &service.published()?.1)
+                .await
+        } else {
+            Ok(remember_failure(installed, work_id, kind, reason))
         }
     }
 

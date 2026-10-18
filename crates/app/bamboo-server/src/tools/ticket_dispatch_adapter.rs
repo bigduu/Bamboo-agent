@@ -20,6 +20,7 @@ pub struct TicketDispatchPolicy {
     pub worker_role: String,
     pub workspace: String,
     pub max_rounds: Option<u32>,
+    pub admission_fence: Option<bamboo_orchestration::ReadyAdmissionFence>,
 }
 
 impl ChildSessionAdapter {
@@ -109,6 +110,9 @@ impl ChildSessionAdapter {
                     TICKET_DISPATCH_KEY.into(),
                     serde_json::to_string(&dispatch)?,
                 );
+                if let Some(fence) = &policy.admission_fence {
+                    fence.check()?;
+                }
                 create_ticket_child_action(
                     self,
                     CreateChildInput {
@@ -155,6 +159,9 @@ impl ChildSessionAdapter {
         // The scheduler obtains this same guard for its exact-generation
         // reservation. Release before enqueue and retain the durable generation.
         drop(guard);
+        if let Some(fence) = &policy.admission_fence {
+            fence.check()?;
+        }
         self.admit_child_run(&parent, &child, None)
             .await
             .map_err(|e| Error::AuthorityUnavailable(e.to_string()))?;

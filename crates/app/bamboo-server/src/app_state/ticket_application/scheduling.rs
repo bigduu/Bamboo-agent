@@ -97,8 +97,45 @@ impl ReadyWorkHost for TicketApplication {
         spec: &DispatchSpec,
         max_rounds: u32,
     ) -> Result<ReadyDispatch> {
+        self.ensure_ready_dispatch(key, spec, max_rounds, None)
+            .await
+    }
+    async fn dispatch(&self, command: &Command, max_rounds: u32) -> Result<ReadyDispatch> {
+        self.dispatch_ready_command(command, max_rounds, None).await
+    }
+    async fn ensure_fenced(
+        &self,
+        key: &str,
+        spec: &DispatchSpec,
+        max_rounds: u32,
+        fence: &bamboo_orchestration::ReadyAdmissionFence,
+    ) -> Result<ReadyDispatch> {
+        fence.check()?;
+        self.ensure_ready_dispatch(key, spec, max_rounds, Some(fence))
+            .await
+    }
+    async fn dispatch_fenced(
+        &self,
+        command: &Command,
+        max_rounds: u32,
+        fence: &bamboo_orchestration::ReadyAdmissionFence,
+    ) -> Result<ReadyDispatch> {
+        fence.check()?;
+        self.dispatch_ready_command(command, max_rounds, Some(fence))
+            .await
+    }
+}
+
+impl TicketApplication {
+    async fn ensure_ready_dispatch(
+        &self,
+        key: &str,
+        spec: &DispatchSpec,
+        max_rounds: u32,
+        fence: Option<&bamboo_orchestration::ReadyAdmissionFence>,
+    ) -> Result<ReadyDispatch> {
         match self
-            .ensure_with_round_ceiling(key, spec, Some(max_rounds))
+            .ensure_with_round_ceiling(key, spec, Some(max_rounds), fence)
             .await?
         {
             ticket_runtime::DispatchObservation::OutcomeUnknown { reason, .. } => {
@@ -113,7 +150,12 @@ impl ReadyWorkHost for TicketApplication {
         }
     }
 
-    async fn dispatch(&self, command: &Command, max_rounds: u32) -> Result<ReadyDispatch> {
+    async fn dispatch_ready_command(
+        &self,
+        command: &Command,
+        max_rounds: u32,
+        fence: Option<&bamboo_orchestration::ReadyAdmissionFence>,
+    ) -> Result<ReadyDispatch> {
         let response = self
             .dispatch_with_round_ceiling(
                 Principal::Supervisor {
@@ -121,6 +163,7 @@ impl ReadyWorkHost for TicketApplication {
                 },
                 command,
                 Some(max_rounds),
+                fence,
             )
             .await?;
         if response["errors"]

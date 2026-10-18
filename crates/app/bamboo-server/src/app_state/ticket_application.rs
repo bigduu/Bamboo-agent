@@ -31,9 +31,11 @@ pub struct TicketApplication {
 
 mod initialization;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
+mod ready_retry_store;
 mod resolution;
 mod scheduling;
 pub use bamboo_orchestration::{ReadyBlockKind, ReadyReconcile, ReadyWorkGrant, ReadyWorkPolicy};
+pub use ready_retry_store::{FileReadyRetryStore, ReadyRetryFilePhase, ReadyRetryPublicationFault};
 #[cfg(test)]
 mod tests;
 
@@ -59,7 +61,10 @@ impl TicketApplication {
                 .join(DEFAULT_SUPERVISOR_SESSION_ID)
                 .to_string_lossy()
                 .into_owned(),
-            ready_scheduler: Arc::new(bamboo_orchestration::ReadyWorkScheduler::default()),
+            ready_scheduler: Arc::new(bamboo_orchestration::ReadyWorkScheduler::with_recovery(
+                Arc::new(FileReadyRetryStore::new(root)),
+                Arc::new(bamboo_orchestration::ready_recovery::SystemReadyRetryClock),
+            )),
         }
     }
 
@@ -470,7 +475,7 @@ impl TicketApplication {
     /// Commit before enqueue, return admission observations without waiting for
     /// the Worker. Errors after commit are reported alongside its receipt.
     pub async fn dispatch(&self, principal: Principal, command: &Command) -> Result<Value> {
-        self.dispatch_with_round_ceiling(principal, command, None)
+        self.dispatch_with_round_ceiling(principal, command, None, None)
             .await
     }
 
@@ -479,6 +484,7 @@ impl TicketApplication {
         principal: Principal,
         command: &Command,
         max_rounds: Option<u32>,
+        fence: Option<&bamboo_orchestration::ReadyAdmissionFence>,
     ) -> Result<Value> {
         let flags = self.config.read().await.features.clone();
         if !flags.ticket_mutation {
@@ -508,8 +514,11 @@ impl TicketApplication {
             .await?;
         }
         self.validate_project_operations(&service, command)?;
+        if let Some(fence) = fence {
+            fence.check()?;
+        }
         let receipt = service.work_dispatch(&authority, command)?;
-        self.enqueue_receipt_with_round_ceiling(&service, command, receipt, max_rounds)
+        self.enqueue_receipt_with_round_ceiling(&service, command, receipt, max_rounds, fence)
             .await
     }
 
@@ -554,7 +563,7 @@ impl TicketApplication {
         command: &Command,
         receipt: OperationReceipt,
     ) -> Result<Value> {
-        self.enqueue_receipt_with_round_ceiling(service, command, receipt, None)
+        self.enqueue_receipt_with_round_ceiling(service, command, receipt, None, None)
             .await
     }
 
@@ -564,6 +573,7 @@ impl TicketApplication {
         command: &Command,
         receipt: OperationReceipt,
         max_rounds: Option<u32>,
+        fence: Option<&bamboo_orchestration::ReadyAdmissionFence>,
     ) -> Result<Value> {
         self.cancel_after_commit(service, command);
         let snapshot = service.published()?.1;
@@ -580,6 +590,7 @@ impl TicketApplication {
                     &assignment.dispatch_key,
                     &intent.immutable_spec,
                     max_rounds,
+                    fence,
                 )
                 .await
             } else {
@@ -720,7 +731,7 @@ impl TicketApplication {
         key: &str,
         spec: &DispatchSpec,
     ) -> Result<ticket_runtime::DispatchObservation> {
-        self.ensure_with_round_ceiling(key, spec, None).await
+        self.ensure_with_round_ceiling(key, spec, None, None).await
     }
 
     async fn ensure_with_round_ceiling(
@@ -728,6 +739,7 @@ impl TicketApplication {
         key: &str,
         spec: &DispatchSpec,
         max_rounds: Option<u32>,
+        fence: Option<&bamboo_orchestration::ReadyAdmissionFence>,
     ) -> Result<ticket_runtime::DispatchObservation> {
         let service = self.service()?;
         let enabled = self.config.read().await.features.ticket_dispatch;
@@ -775,6 +787,7 @@ impl TicketApplication {
                     worker_role: "worker".into(),
                     workspace: self.workspace.clone(),
                     max_rounds,
+                    admission_fence: fence.cloned(),
                 },
             )
             .await

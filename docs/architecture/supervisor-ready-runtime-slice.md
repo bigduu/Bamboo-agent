@@ -49,10 +49,11 @@ remains testing/Submitted until the existing explicit acceptance protocol runs.
 `ReadyReconcile` is the program inspection seam: disabled, idle, capacity blocked,
 typed blocked diagnostic, or committed/enqueued dispatch identity. `Dispatched`
 does not claim the provider is running. Configuration/permission/unknown-outcome
-failures stop automatic retries for that policy. Transient admission failures
-receive at most three attempts including the initial post-commit failure.
-Resource waits are rechecked within the policy lifetime. Reinstalling a policy
-does not reset Ticket generation, reclaim resources, or authorize another run.
+failures stop automatic retries. The outer server supplies durable retry metadata
+through `ReadyRetryStore`; see [durable retry boundaries](supervisor-ready-durable-retry.md).
+No scheduling policy is recovered from that metadata. Reinstalling a policy does
+not reset Ticket generation, retry counts or the original retry deadline,
+reclaim resources, or authorize another run.
 
 The actual assembled backend must advertise native Ticket-budget support. Mixed
 process/remote routers conservatively reject this automatic path; their existing
@@ -70,7 +71,7 @@ Submission. The same logical run must finish delivery before activation is relea
 ## Boundaries still open
 
 This slice does not implement cross-run cumulative Work budgets, background aging
-or foreground fairness, durable next-check/backoff/queue diagnostics, automatic
+or foreground fairness, a health HTTP projection, automatic
 workspace repair or replacement workers, dormant grant recovery, safe preemption,
 or semantic/model-based patrol. There is no automatic continuation/retry from
 generation one to a new Assignment. Provider retries and user-authorized input
