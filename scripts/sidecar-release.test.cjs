@@ -150,7 +150,7 @@ function header(target) {
 function receipt(target, bytes) {
   return { schemaVersion: 1, ...identity, runAttempt: 1, target, buildMode: 'embedded', embeddedFrontend: true,
     format: 'raw', assetName: release.artifactName(target), sha256: release.sha256(bytes), sizeBytes: bytes.length,
-    command: ['cargo', 'build', '--locked', '--release', '--bin', 'bamboo', '--target', target,
+    command: ['cargo', 'build', '--locked', '--release', '--verbose', '--bin', 'bamboo', '--target', target,
       '--message-format=json-render-diagnostics'], runtime: { version: `bamboo ${identity.version}`, status: 'passed' },
     rustc: 'rustc fixture (not executed)', cargo: 'cargo fixture (not executed)',
     cargoMessagesSha256: '6'.repeat(64), stampedDiffSha256: '7'.repeat(64), frontendBytes }

@@ -35,7 +35,7 @@ function assertRouting(source) {
   assert.match(full, /- name: Require validation admission\n        env:\n          SOURCE_RESULT: \$\{\{ needs.validation-source.result \}\}\n          FULL_VALIDATION: \$\{\{ needs.validation-source.outputs.full \}\}/);
   assert.match(full, /test "\$SOURCE_RESULT" = success/);
   assert.match(full, /\*\) exit 1 ;;/);
-  for (const command of ["cargo build --locked", "cargo test --locked --no-run", "cargo test --locked"]) assert.ok(full.includes(`        run: ${command}\n`));
+  for (const command of ["cargo build --locked", "cargo test --locked --no-run", "cargo test --locked --no-fail-fast"]) assert.ok(full.includes(`        run: ${command}\n`));
   for (const id of ["msrv", "tls-fixture-test", "tool-event-recorder-e2e", "e2e-test", "lint", "build", "docs", "security", "deny"]) {
     const block = job(source, id);
     assert.match(block, /^    needs: validation-source$/m);
@@ -54,11 +54,11 @@ test("required Test compiles dev while only snapshots/main run full validation",
   assertRouting(ci);
   for (const [from, to] of [
     ["name: Quick Checks", "name: Test"],
-    ["run: cargo fmt --all -- --check", "run: cargo test --locked"],
+    ["run: cargo fmt --all -- --check", "run: cargo test --locked --no-fail-fast"],
     ["if: always() && !cancelled()", "if: needs.validation-source.outputs.full == 'true'"],
     ['test "$SOURCE_RESULT" = success', 'true # ignored source result'],
     ["if: needs.validation-source.outputs.full == 'true'", "if: true"],
-    ["        run: cargo test --locked\n", "        continue-on-error: true\n        run: cargo test --locked\n"],
+    ["        run: cargo test --locked --no-fail-fast\n", "        continue-on-error: true\n        run: cargo test --locked --no-fail-fast\n"],
   ]) assert.throws(() => assertRouting(ci.replace(from, to)), `reject ${to}`);
 });
 
@@ -112,7 +112,7 @@ test("frontend source acceptance leaves ordinary dev admission but retains exact
     assert.doesNotMatch(block, /continue-on-error:/);
   }
   assert.ok(job(frontend, "build").includes("        run: cargo build --locked\n"));
-  for (const command of ["cargo test --locked --no-run", "cargo test --locked"]) assert.ok(job(frontend, "test").includes(`        run: ${command}\n`));
+  for (const command of ["cargo test --locked --no-run", "cargo test --locked --no-fail-fast"]) assert.ok(job(frontend, "test").includes(`        run: ${command}\n`));
   assert.match(job(frontend, "lint"), /cargo clippy --all-features --/);
 });
 
@@ -189,7 +189,7 @@ test("one required Test honestly compiles dev without imposing auxiliary checks 
   for (const [from, to] of [
     ["name: Test\n", "name: Dev Build\n"],
     ["run: cargo build --locked", "run: cargo check --locked"],
-    ["run: cargo build --locked", "run: cargo test --locked"],
+    ["run: cargo build --locked", "run: cargo test --locked --no-fail-fast"],
     ["run: cargo build --locked", "run: cargo build --locked || true"],
     ["run: cargo build --locked", "continue-on-error: true\n        run: cargo build --locked"],
     ["run: cargo build --locked", "if: false\n        run: cargo build --locked"],
