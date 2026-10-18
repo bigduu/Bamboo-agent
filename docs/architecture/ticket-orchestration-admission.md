@@ -42,6 +42,11 @@ submission, the actual Patrol observation/open APIs and same-root restart.
 It must prove retained retry/incident identity without a new grant, Assignment,
 acceptance or provider call after restart. Written cases are not passing evidence.
 
+The assembly fixture's restart boundary is a controlled child process followed
+by a successful natural exit and same-root reopen in its parent. It does not
+certify same-process application teardown. No lock deletion, replacement root
+or fabricated epoch is allowed.
+
 The earlier component results remain bound to their original sources: Ready's
 33 orchestration and 19 file/native tests, and Patrol's 74 selected tests. They
 are not summed as unique tests or relabeled as combined-source acceptance.
