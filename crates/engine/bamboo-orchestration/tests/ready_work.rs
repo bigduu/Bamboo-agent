@@ -935,21 +935,27 @@ async fn candidate_grant_cannot_replace_the_adopted_grant_for_a_pending_assignme
         pending.project.assignment_contexts[&assignment.id],
         candidate_hash
     );
-    scheduler.revoke().await;
     let mut candidate_policy = fixture.policy(1);
     candidate_policy.grants[0].context_hash = candidate_hash;
-    scheduler
-        .install(fixture.host.as_ref(), candidate_policy)
-        .await
-        .unwrap();
+    // Reinstall explicitly so each pass tests the new grant itself, rather
+    // than the presentation of a previous latched failure at a full slot.
     for _ in 0..2 {
-        assert!(matches!(
-            scheduler.reconcile(fixture.host.as_ref()).await.unwrap(),
-            ReadyReconcile::Blocked {
-                kind: ReadyBlockKind::Permission,
-                ..
-            }
-        ));
+        scheduler.revoke().await;
+        scheduler
+            .install(fixture.host.as_ref(), candidate_policy.clone())
+            .await
+            .unwrap();
+        let result = scheduler.reconcile(fixture.host.as_ref()).await.unwrap();
+        assert!(
+            matches!(
+                &result,
+                ReadyReconcile::Blocked {
+                    kind: ReadyBlockKind::Permission,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
     }
     assert_eq!(fixture.host.dispatches.lock().unwrap().len(), 1);
     assert!(fixture.host.ensures.lock().unwrap().is_empty());
