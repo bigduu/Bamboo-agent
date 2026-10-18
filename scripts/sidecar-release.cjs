@@ -23,6 +23,10 @@ const artifactName = (target) => {
   assert.ok(TARGETS.includes(target), 'Unsupported sidecar target')
   return `bamboo-${target}${target.includes('windows') ? '.exe' : ''}`
 }
+const targetOutputKey = (target) => {
+  assert.ok(TARGETS.includes(target))
+  return target.replaceAll('-', '_')
+}
 
 function fileIdentity(file, maximum = MAX_BINARY, minimum = 1) {
   const before = fs.lstatSync(file)
@@ -217,13 +221,31 @@ function validateBuildReceipt(receipt, identity, target) {
   return receipt
 }
 
-function assembleRelease({ identity, inputDirectory, outputDirectory, sourceRoot, frontendBytes }) {
+function expectedBuildBindings(outputs) {
+  assert.ok(outputs && typeof outputs === 'object' && !Array.isArray(outputs), 'Require independent build-job outputs')
+  assert.deepEqual(Object.keys(outputs).sort(), TARGETS.map(targetOutputKey).sort(), 'Require four unique build-job output bindings')
+  return new Map(TARGETS.map((target) => {
+    assert.equal(typeof outputs[targetOutputKey(target)], 'string')
+    const value = JSON.parse(outputs[targetOutputKey(target)])
+    requireDigest(value, MAX_BINARY, 65536)
+    assert.match(value.receiptSha256, DIGEST)
+    return [target, value]
+  }))
+}
+
+function assembleRelease({ identity, inputDirectory, outputDirectory, sourceRoot, frontendBytes, expectedBuilds }) {
+  const bindings = expectedBuildBindings(expectedBuilds)
   assert.deepEqual(fs.readdirSync(inputDirectory).sort(), [...TARGETS].sort(), 'Missing or unexpected platform transport directory')
   const receipts = TARGETS.map((target) => {
     const directory = path.join(inputDirectory, target)
     assert.ok(fs.lstatSync(directory).isDirectory() && !fs.lstatSync(directory).isSymbolicLink())
     assert.deepEqual(fs.readdirSync(directory).sort(), [artifactName(target), 'build-receipt.json'].sort())
-    const receipt = validateBuildReceipt(JSON.parse(fs.readFileSync(path.join(directory, 'build-receipt.json'))), identity, target)
+    const receiptPath = path.join(directory, 'build-receipt.json')
+    assert.equal(fileIdentity(receiptPath, 1024 * 1024).sha256, bindings.get(target).receiptSha256,
+      'Transported receipt differs from the independent build-job output')
+    const receipt = validateBuildReceipt(JSON.parse(fs.readFileSync(receiptPath)), identity, target)
+    assert.equal(receipt.sha256, bindings.get(target).sha256, 'Executable digest differs from the independent build job')
+    assert.equal(receipt.sizeBytes, bindings.get(target).sizeBytes)
     assert.deepEqual(receipt.frontendBytes, frontendBytes, 'Platform binary embedded different release frontend bytes')
     const binary = path.join(directory, artifactName(target))
     assert.deepEqual(fileIdentity(binary, MAX_BINARY, 65536), { sha256: receipt.sha256, sizeBytes: receipt.sizeBytes })
@@ -289,7 +311,8 @@ async function main() {
   const directory = path.join(process.env.RUNNER_TEMP, 'bamboo-executable-release')
   fs.mkdirSync(directory) // Fresh output; never adopt unexplained runner files.
   const manifest = assembleRelease({ identity, inputDirectory: path.join(process.env.RUNNER_TEMP, 'bamboo-executable-inputs'),
-    outputDirectory: directory, sourceRoot: process.cwd(), frontendBytes: receipt.frontendBytes })
+    outputDirectory: directory, sourceRoot: process.cwd(), frontendBytes: receipt.frontendBytes,
+    expectedBuilds: JSON.parse(process.env.EXPECTED_BUILDS) })
   assert.equal(git(['rev-parse', 'HEAD']), identity.sourceRevision)
   assert.equal(git(['status', '--porcelain', '--untracked-files=all']), '', 'Source drift blocks asset uploads')
   await publishAssets({ directory, release, readAsset: assetBytes,
@@ -302,7 +325,7 @@ async function main() {
 }
 
 module.exports = { REPOSITORY, MANIFEST, HOST_ASSET, TARGETS, HOST_FILES, MAX_BINARY, MAX_HOST,
-  artifactName, sha256, fileIdentity, createBrowserHost, createManifest, manifestBytes,
+  artifactName, targetOutputKey, sha256, fileIdentity, createBrowserHost, createManifest, manifestBytes,
   binaryArchitecture, execute, git, workflowIdentity, publishedRelease, assetBytes,
-  validateBuildReceipt, assembleRelease, publishAssets }
+  validateBuildReceipt, expectedBuildBindings, assembleRelease, publishAssets }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })

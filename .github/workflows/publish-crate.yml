@@ -109,7 +109,7 @@ jobs:
           PY
 
       - &manual-checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -126,7 +126,7 @@ jobs:
 
       - &manual-node
         name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: lts/*
 
@@ -436,7 +436,7 @@ jobs:
               stream.write(f"revision={source}\n")
           PY
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ steps.source.outputs.revision }}
           fetch-depth: 0
@@ -454,7 +454,7 @@ jobs:
         run: test -f scripts/crate-release.cjs
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: lts/*
 
@@ -537,6 +537,11 @@ jobs:
     # Desktop and standalone users consume these same complete executables.
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    outputs:
+      aarch64_apple_darwin: ${{ steps.build.outputs.aarch64_apple_darwin }}
+      x86_64_apple_darwin: ${{ steps.build.outputs.x86_64_apple_darwin }}
+      x86_64_pc_windows_msvc: ${{ steps.build.outputs.x86_64_pc_windows_msvc }}
+      x86_64_unknown_linux_gnu: ${{ steps.build.outputs.x86_64_unknown_linux_gnu }}
     strategy:
       fail-fast: false
       matrix:
@@ -554,27 +559,28 @@ jobs:
       TARGET_VERSION: ${{ needs.automatic.outputs.version }}
       BAMBOO_RELEASE_TARGET: ${{ matrix.target }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.automatic.outputs.source }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: lts/*
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
       - name: Build and verify the standard versioned Bamboo executable
+        id: build
         env:
           # Read-only release access. Cargo never receives this token.
           GH_TOKEN: ${{ github.token }}
         run: node scripts/sidecar-build.cjs
       - name: Transport this platform's verified executable within the same run
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: bamboo-executable-${{ matrix.target }}
           path: ${{ runner.temp }}/bamboo-executable-output/*
@@ -591,19 +597,20 @@ jobs:
     env:
       SOURCE_REVISION: ${{ needs.automatic.outputs.source }}
       TARGET_VERSION: ${{ needs.automatic.outputs.version }}
+      EXPECTED_BUILDS: ${{ toJSON(needs.executables.outputs) }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ needs.automatic.outputs.source }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: lts/*
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.12'
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           pattern: bamboo-executable-*
           path: ${{ runner.temp }}/bamboo-executable-transports

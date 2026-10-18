@@ -41,6 +41,13 @@ replacement uploads. An interrupted final upload can reuse identical assets;
 a conflicting asset blocks publication. The manifest uploads last. A public
 crate Release without this manifest is not a complete desktop binary release.
 
+Release actions use reviewed immutable commit references. Each native build
+also sends the executable hash/size and receipt hash through its uniquely
+named GitHub job output. The final job verifies downloaded bytes against those
+independent outputs, so replacing both a transported binary and its receipt
+cannot supply a new accepted identity. Missing platform output bindings fail
+closed. This uses the existing job-output channel and publisher permissions.
+
 The manifest schema is version 1. `version` is the allocated version without
 `v`, and `sourceRevision` is the complete accepted Git SHA. `artifacts` contains
 exactly the four targets above. Each entry contains `target`,

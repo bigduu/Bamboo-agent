@@ -5,7 +5,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
-const { TARGETS, artifactName, fileIdentity, sha256, binaryArchitecture,
+const { TARGETS, artifactName, targetOutputKey, fileIdentity, sha256, binaryArchitecture,
   execute, git, workflowIdentity, publishedRelease, assetBytes } = require('./sidecar-release.cjs')
 
 function nativeTarget(platform = process.platform, arch = process.arch) {
@@ -117,7 +117,13 @@ async function main() {
     cargo: execute('cargo', ['-V'], { env: buildEnv }).trim(), runtime: { status: 'passed', version },
     frontendBytes: receipt.frontendBytes, cargoMessagesSha256: fileIdentity(log).sha256,
     stampedDiffSha256: stamped.diffSha256, stampedPaths: stamped.paths }
-  fs.writeFileSync(path.join(output, 'build-receipt.json'), `${JSON.stringify(provenance, null, 2)}\n`, { flag: 'wx' })
+  const receiptBytes = Buffer.from(`${JSON.stringify(provenance, null, 2)}\n`)
+  fs.writeFileSync(path.join(output, 'build-receipt.json'), receiptBytes, { flag: 'wx' })
+  // The runner's job-output channel is independent of the transport archive.
+  // A substituted binary plus a forged receipt cannot change this binding.
+  assert.ok(process.env.GITHUB_OUTPUT)
+  fs.appendFileSync(process.env.GITHUB_OUTPUT, `${targetOutputKey(target)}=${JSON.stringify({
+    sha256: provenance.sha256, sizeBytes: provenance.sizeBytes, receiptSha256: sha256(receiptBytes) })}\n`)
   console.log(JSON.stringify({ status: 'standard-executable-built-and-version-verified', target,
     version: identity.version, sourceRevision: identity.sourceRevision, sha256: provenance.sha256 }))
 }

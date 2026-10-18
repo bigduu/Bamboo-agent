@@ -53,16 +53,19 @@ function inputs(t) {
   const sourceRoot = path.join(root, 'source'), inputDirectory = path.join(root, 'inputs'), outputDirectory = path.join(root, 'output')
   for (const dir of [sourceRoot, inputDirectory, outputDirectory, path.join(sourceRoot, 'browser-runtime')]) fs.mkdirSync(dir)
   for (const file of release.HOST_FILES) fs.writeFileSync(path.join(sourceRoot, file), `fixture-only ${file}\n`)
-  const receipts = []
+  const receipts = [], expectedBuilds = {}
   for (const target of release.TARGETS) {
     const dir = path.join(inputDirectory, target), bytes = header(target)
     fs.mkdirSync(dir)
     fs.writeFileSync(path.join(dir, release.artifactName(target)), bytes)
     const proof = receipt(target, bytes)
-    fs.writeFileSync(path.join(dir, 'build-receipt.json'), JSON.stringify(proof))
+    const receiptBytes = Buffer.from(JSON.stringify(proof))
+    fs.writeFileSync(path.join(dir, 'build-receipt.json'), receiptBytes)
+    expectedBuilds[release.targetOutputKey(target)] = JSON.stringify({ sha256: proof.sha256,
+      sizeBytes: proof.sizeBytes, receiptSha256: release.sha256(receiptBytes) })
     receipts.push(proof)
   }
-  return { root, sourceRoot, inputDirectory, outputDirectory, receipts, identity, frontendBytes }
+  return { root, sourceRoot, inputDirectory, outputDirectory, receipts, identity, frontendBytes, expectedBuilds }
 }
 
 test('actual producer writes a deterministic three-regular-file USTAR host and complete embedded manifest', (t) => {
@@ -175,9 +178,25 @@ test('assembly rejects additional transports, foreign frontend bytes and missing
   const value = inputs(t)
   const file = path.join(value.inputDirectory, value.receipts[0].target, 'build-receipt.json')
   const changed = clone(value.receipts[0]); changed.frontendBytes.archiveSha256 = '8'.repeat(64)
-  fs.writeFileSync(file, JSON.stringify(changed)); assert.throws(() => release.assembleRelease(value), /frontend bytes/)
+  const receiptBytes = Buffer.from(JSON.stringify(changed)); fs.writeFileSync(file, receiptBytes)
+  const binding = JSON.parse(value.expectedBuilds[release.targetOutputKey(changed.target)])
+  binding.receiptSha256 = release.sha256(receiptBytes)
+  value.expectedBuilds[release.targetOutputKey(changed.target)] = JSON.stringify(binding)
+  assert.throws(() => release.assembleRelease(value), /frontend bytes/)
   fs.mkdirSync(path.join(value.inputDirectory, 'foreign'))
   assert.throws(() => release.assembleRelease(value), /transport directory/)
+})
+
+test('substituting a binary and matching forged receipt cannot bypass the independent native-job output digest', (t) => {
+  const value = inputs(t), original = clone(value.receipts[0])
+  const file = path.join(value.inputDirectory, original.target, original.assetName)
+  const bytes = fs.readFileSync(file); bytes[4096] = 9; fs.writeFileSync(file, bytes)
+  original.sha256 = release.sha256(bytes)
+  fs.writeFileSync(path.join(value.inputDirectory, original.target, 'build-receipt.json'), JSON.stringify(original))
+  assert.throws(() => release.assembleRelease(value), /independent build-job output/)
+  const missing = clone(value.expectedBuilds); delete missing[release.targetOutputKey(release.TARGETS[0])]
+  assert.throws(() => release.expectedBuildBindings(missing), /four unique/)
+  assert.throws(() => release.expectedBuildBindings(null), /independent build-job outputs/)
 })
 
 test('Cargo unit evidence must bind both real embedded outputs and the exact resulting binary', (t) => {
@@ -292,6 +311,12 @@ test('workflow retains the original successful-CI authority, one allocator/queue
   for (const target of release.TARGETS) assert.ok(matrix.includes(`target: ${target}\n`))
   for (const runner of ['macos-latest', 'macos-15-intel', 'ubuntu-22.04', 'windows-latest']) assert.ok(matrix.includes(`os: ${runner}\n`))
   assert.match(matrix, /persist-credentials: false/)
+  for (const target of release.TARGETS) {
+    const key = release.targetOutputKey(target)
+    assert.ok(matrix.includes(key + ': ${{ steps.build.outputs.' + key + ' }}'))
+  }
+  for (const match of source.matchAll(/uses: ([^\s]+)@([^\s]+)/g)) assert.match(match[2], /^[0-9a-f]{40}$/, 'Release actions must use immutable reviewed commits')
+  assert.ok(final.includes('EXPECTED_BUILDS: ${{ toJSON(needs.executables.outputs) }}'))
   assert.match(final, /needs: \[automatic, executables\]/)
   assert.match(final, /environment: bamboo-release\n    permissions:\n      contents: write/)
   assert.match(final, /run: node scripts\/sidecar-release.cjs publish/)
