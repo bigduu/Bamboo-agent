@@ -31,6 +31,8 @@ pub struct TicketApplication {
 
 mod initialization;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
+mod patrol_adapter;
+pub use patrol_adapter::PatrolCheckpointStore;
 mod ready_retry_store;
 mod resolution;
 mod scheduling;
