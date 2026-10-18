@@ -107,7 +107,8 @@ pub(super) enum Outcome {
     Committed {
         receipt: SupervisorManagementReceipt,
     },
-    OutcomeUnconfirmed {
+    #[serde(rename = "outcome_unconfirmed")]
+    Unconfirmed {
         code: &'static str,
         status_code: u16,
     },
@@ -431,6 +432,18 @@ mod tests {
         assert_eq!(parse(value.clone()).unwrap_err(), InvalidFrame::Json);
         value["intent"]["expected_state_revision"] = json!(4.5);
         assert_eq!(parse(value).unwrap_err(), InvalidFrame::Json);
+    }
+
+    #[test]
+    fn unconfirmed_result_preserves_the_frozen_wire_tag() {
+        assert_eq!(
+            serde_json::to_value(Outcome::Unconfirmed {
+                code: "scope_unavailable",
+                status_code: 503
+            })
+            .unwrap(),
+            json!({"kind":"outcome_unconfirmed","code":"scope_unavailable","status_code":503})
+        );
     }
 
     #[test]
