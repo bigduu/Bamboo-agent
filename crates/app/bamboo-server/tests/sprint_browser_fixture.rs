@@ -476,6 +476,15 @@ async fn seed_state(
             )]),
         },
     )?;
+    // A later Work change must not rewrite the closed Sprint's frozen member version.
+    ticket_command(
+        &service,
+        &owner,
+        "fixture-cancel-after-closure",
+        vec![Operation::Cancel {
+            work_id: work_ids["carried_backlog"].clone(),
+        }],
+    )?;
     let active = &sprint_ids["active"];
     sprint_command(
         &service,
@@ -713,6 +722,21 @@ async fn verify_identities(state: &AppState, marker: &SeedMarker) -> FixtureResu
             "Sprint identity changed"
         );
     }
+    let changed_work = &snapshot.tickets[&marker.work_ids["carried_backlog"]];
+    let closure = snapshot.sprint.sprints[&marker.sprint_ids["closed"]]
+        .closure
+        .as_ref()
+        .context("closed Sprint lost its closure")?;
+    let frozen = closure
+        .members
+        .get(&changed_work.id)
+        .context("closing member disappeared")?;
+    ensure!(
+        changed_work.state == WorkState::Cancelled
+            && frozen.version.state == WorkState::Ready
+            && changed_work.record_revision > frozen.version.record_revision,
+        "current cancelled Work must differ from its immutable closing version"
+    );
     for (id, expected) in &marker.seed_receipt_hashes {
         let receipt = snapshot
             .receipts
@@ -1179,6 +1203,7 @@ async fn run_fixture(mode: &str) -> FixtureResult<()> {
             "mode":mode,"base_url":base,"root":root,"source":source,
             "source_contract":"caller-supplied expected SHA is evidence only; launcher verifies binary provenance separately",
             "project_id":marker.project_id,"work_id":marker.work_ids["active"],"work_ids":marker.work_ids,"works":marker.work_ids,
+            "cancelled_work_ids":[marker.work_ids["carried_backlog"]],
             "sprint_ids":marker.sprint_ids,"supervisor_id":marker.supervisor_id,"child_id":marker.child_id,
             "root_session_id":marker.supervisor_id,"target_session_id":marker.child_id,"start_session_id":marker.start_session_id,
             "assignment_id":marker.assignment_id,"runtime_receipt":marker.runtime_receipt,
