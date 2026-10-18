@@ -617,3 +617,42 @@ async fn terminal_failed_creation_receipt_cannot_start_a_root() {
     assert_eq!(f.count().await, 1);
     assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn incomplete_or_corrupt_canonical_creation_requires_host_repair_without_overwrite() {
+    for damaged in ["missing", "corrupt"] {
+        let f = Fixture::new().await;
+        let (record, candidate) = f.reserve().await;
+        f.creator.store.save_session(&candidate).await.unwrap();
+        let directory = f.creator.store.sessions_root_dir().join(&record.session_id);
+        let runtime = directory.join("runtime.json");
+        let original_runtime = std::fs::read(&runtime).unwrap();
+        let original_main = std::fs::read(directory.join("session.json")).unwrap();
+        if damaged == "missing" {
+            std::fs::remove_file(&runtime).unwrap();
+        } else {
+            std::fs::write(&runtime, b"invalid runtime authority").unwrap();
+        }
+        let blocked = f.create(f.request.clone()).await;
+        assert!(!blocked.success, "{damaged}");
+        assert_eq!(f.count().await, 2);
+        assert_eq!(
+            std::fs::read(directory.join("session.json")).unwrap(),
+            original_main
+        );
+        assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
+        assert!(!SupervisorSessionService::new(f.creator.store.clone())
+            .inspect_scope(&f.supervisor)
+            .await
+            .unwrap()
+            .allowed_projects
+            .is_empty());
+        // Only the fixture's Host restores its known exact canonical bytes.
+        // The model creation path neither guesses authority nor repairs it.
+        std::fs::write(&runtime, original_runtime).unwrap();
+        let repaired = accepted(f.create(f.request.clone()).await);
+        assert_eq!(repaired["target_session_id"], record.session_id);
+        assert_eq!(repaired["generation"], 1);
+        assert_eq!(f.count().await, 2);
+    }
+}
