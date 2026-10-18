@@ -33,6 +33,8 @@ pub enum ReadyRetryFilePhase {
     AfterReplace,
     BeforeDirectorySync,
     AfterDirectorySync,
+    BeforeFormatSync,
+    AfterFormatSync,
 }
 
 /// Trusted-host/test injection only; no Worker, JSON command or HTTP setter.
@@ -334,7 +336,14 @@ impl FileReadyRetryStore {
 
     fn activate_individual_records(&self, state: &mut State) -> Result<()> {
         if state.schema == 2 {
-            return Ok(());
+            // A previous activation can have returned an uncertain error after
+            // rename but before directory sync. Observing format 2 alone is
+            // not proof that its old-reader rejection is durable. Re-establish
+            // that barrier before any individual record may be published.
+            self.phase(ReadyRetryFilePhase::BeforeFormatSync)?;
+            File::open(self.directory.join(STATE))?.sync_all()?;
+            File::open(&self.directory)?.sync_all()?;
+            return self.phase(ReadyRetryFilePhase::AfterFormatSync);
         }
         let records = self.directory.join(RECORDS);
         match fs::create_dir(&records) {

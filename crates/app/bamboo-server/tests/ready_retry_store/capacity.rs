@@ -604,6 +604,90 @@ async fn marker_and_first_leaf_faults_preserve_legacy_charges_and_publication_or
     }
 }
 
+#[tokio::test]
+async fn uncertain_format_activation_must_be_resynced_before_any_leaf_can_be_written() {
+    for barrier_fault in [
+        ReadyRetryFilePhase::BeforeFormatSync,
+        ReadyRetryFilePhase::AfterFormatSync,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = capacity_seed_legacy(root.path(), 4).await;
+        let before = capacity_json(&capacity_marker(root.path()))["state"]["entries"].clone();
+        let new_key = key("uncertain-format-work");
+        let activation = FileReadyRetryStore::with_publication_fault(
+            root.path(),
+            Arc::new(|phase| {
+                if phase == ReadyRetryFilePhase::AfterReplace {
+                    return Err(io::Error::other("format rename result is uncertain"));
+                }
+                Ok(())
+            }),
+        );
+        assert!(activation
+            .compare_exchange(&new_key, None, reserved())
+            .await
+            .is_err());
+        assert_eq!(
+            capacity_json(&capacity_marker(root.path()))["state"]["schema"],
+            2
+        );
+        assert!(!capacity_membership(root.path(), &new_key).exists());
+
+        // Even though the format is already visible, a failed durability
+        // barrier must prevent both permanent membership and record creation.
+        let blocked = FileReadyRetryStore::with_publication_fault(
+            root.path(),
+            Arc::new(move |phase| {
+                if phase == barrier_fault {
+                    return Err(io::Error::other("controlled format resync failure"));
+                }
+                Ok(())
+            }),
+        );
+        assert!(blocked
+            .compare_exchange(&new_key, None, reserved())
+            .await
+            .is_err());
+        assert!(!capacity_membership(root.path(), &new_key).exists());
+        assert!(!capacity_leaf(root.path(), &new_key)
+            .parent()
+            .unwrap()
+            .exists());
+
+        let synced = Arc::new(AtomicBool::new(false));
+        let observed = synced.clone();
+        let recovered = FileReadyRetryStore::with_publication_fault(
+            root.path(),
+            Arc::new(move |phase| {
+                if phase == ReadyRetryFilePhase::AfterFormatSync {
+                    observed.store(true, Ordering::SeqCst);
+                }
+                if phase == ReadyRetryFilePhase::BeforeFileSync {
+                    assert!(
+                        observed.load(Ordering::SeqCst),
+                        "leaf before format durability"
+                    );
+                }
+                Ok(())
+            }),
+        );
+        let charged = recovered
+            .compare_exchange(&new_key, None, reserved())
+            .await
+            .unwrap();
+        assert!(synced.load(Ordering::SeqCst));
+        let reopened = FileReadyRetryStore::new(root.path());
+        assert_eq!(reopened.load(&new_key).await.unwrap(), Some(charged));
+        for (stable_key, original) in legacy {
+            assert_eq!(reopened.load(&stable_key).await.unwrap(), Some(original));
+        }
+        assert_eq!(
+            capacity_json(&capacity_marker(root.path()))["state"]["entries"],
+            before
+        );
+    }
+}
+
 struct CapacityRelease(Option<std::sync::mpsc::Sender<()>>);
 impl CapacityRelease {
     fn release(&mut self) {

@@ -103,6 +103,9 @@ lock. Format 1 stays readable with its existing bounded legacy map. Before a
 new stable Work key is written, the adapter durably publishes format 2 in the
 original `state.json` and syncs its directory. Original readers reject that
 version rather than treating the new records as absent budgets.
+A writer that observes format 2 again re-syncs its marker file and directory
+before publishing an individual record: a prior rename may have returned an
+uncertain error before its directory sync completed.
 
 The legacy map keeps every original key, revision, attempt, deadline, request
 and quarantine; existing keys continue their original CAS there. New keys use
