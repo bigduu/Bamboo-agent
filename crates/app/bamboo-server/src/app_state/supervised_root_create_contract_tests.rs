@@ -262,6 +262,7 @@ async fn invalid_project_workspace_and_stale_scope_have_no_root_or_link_side_eff
     let service = SupervisorSessionService::new(f.creator.store.clone());
     for case in [
         "foreign_project",
+        "foreign_workspace",
         "missing_directory",
         "unbound_directory",
         "stale_scope",
@@ -269,6 +270,20 @@ async fn invalid_project_workspace_and_stale_scope_have_no_root_or_link_side_eff
         let mut request = f.request.clone();
         match case {
             "foreign_project" => request.project_id = "outside-scope".parse().unwrap(),
+            "foreign_workspace" => {
+                let path = f.home.path().join("workspaces/foreign");
+                std::fs::create_dir_all(&path).unwrap();
+                f.creator
+                    .projects
+                    .create_with_project_path(
+                        "Foreign owner",
+                        None,
+                        path.to_string_lossy(),
+                        Vec::new(),
+                    )
+                    .unwrap();
+                request.workspace_path = path.to_string_lossy().into_owned();
+            }
             "missing_directory" => request.workspace_path.push_str("/missing"),
             "unbound_directory" => {
                 let path = f.home.path().join("workspaces/unbound");
@@ -280,6 +295,15 @@ async fn invalid_project_workspace_and_stale_scope_have_no_root_or_link_side_eff
         }
         let result = f.create(request).await;
         assert!(!result.success, "{case}: {}", result.result);
+        let expected = match case {
+            "foreign_project" => "scope_denied",
+            "foreign_workspace" => "project_workspace_conflict",
+            "missing_directory" => "workspace_invalid",
+            "unbound_directory" => "project_workspace_unbound",
+            "stale_scope" => "scope_revision_conflict",
+            _ => unreachable!(),
+        };
+        assert_eq!(value(result)["code"], expected, "{case}");
         assert_eq!(f.count().await, before, "{case}");
         assert_eq!(
             service
@@ -573,4 +597,23 @@ async fn canonical_creation_rechecks_revocation_and_scope_cas_before_root_public
         assert_eq!(f.count().await, 1);
         assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
     }
+}
+
+#[tokio::test]
+async fn terminal_failed_creation_receipt_cannot_start_a_root() {
+    let f = Fixture::new().await;
+    let (mut record, _) = f.reserve().await;
+    record.mark_failed(
+        super::super::session_create_operations::StoredOperationError {
+            code: "fixture_terminal".into(),
+            message: "Host-recorded terminal failure".into(),
+            http_status: 409,
+        },
+    );
+    f.creator.operations.save(&record).await.unwrap();
+    let result = f.create(f.request.clone()).await;
+    assert!(!result.success);
+    assert_eq!(value(result)["code"], "creation_failed");
+    assert_eq!(f.count().await, 1);
+    assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
 }

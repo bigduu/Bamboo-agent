@@ -175,6 +175,13 @@ impl SupervisedRootCreator {
                 ));
             }
         }
+        if let Some(operation) = existing
+            .as_ref()
+            .filter(|operation| operation.status == StoredOperationStatus::Failed)
+        {
+            return Ok(blocked(operation_id, Some(&operation.session_id), "receipt", "creation_failed",
+                "This creation has a terminal failure receipt; inspect it before starting a distinct operation"));
+        }
         let replayed = existing.is_some();
         if !replayed && scope.state_revision != request.expected_state_revision {
             return Ok(blocked(
@@ -202,7 +209,7 @@ impl SupervisedRootCreator {
                         operation_id,
                         replayed.then_some(id.as_str()),
                         "workspace",
-                        "project_workspace_unavailable",
+                        workspace_code(&error),
                         error,
                     ))
                 }
