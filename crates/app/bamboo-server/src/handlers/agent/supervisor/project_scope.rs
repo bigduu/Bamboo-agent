@@ -41,7 +41,7 @@ fn storage_error(error_value: io::Error) -> HttpResponse {
     error(status, code, error_value)
 }
 
-async fn canonical_reference(state: &AppState) -> Result<SupervisorReference, HttpResponse> {
+async fn canonical_reference(state: &AppState) -> Result<SupervisorReference, Box<HttpResponse>> {
     let canonical =
         match state
             .storage
@@ -49,19 +49,19 @@ async fn canonical_reference(state: &AppState) -> Result<SupervisorReference, Ht
             .await
         {
             Ok(Some(session)) => session,
-            Ok(None) => return Err(error(
+            Ok(None) => return Err(Box::new(error(
                 StatusCode::NOT_FOUND,
                 "supervisor_missing",
                 "Open the default Supervisor explicitly before inspecting or updating its scope",
-            )),
-            Err(failure) => return Err(storage_error(failure)),
+            ))),
+            Err(failure) => return Err(Box::new(storage_error(failure))),
         };
     let Some(incarnation_id) = canonical.supervisor_incarnation_id() else {
-        return Err(error(
+        return Err(Box::new(error(
             StatusCode::FORBIDDEN,
             "supervisor_identity_mismatch",
             "Canonical Supervisor identity required",
-        ));
+        )));
     };
     Ok(SupervisorReference {
         session_id: canonical.id,
@@ -80,7 +80,7 @@ pub async fn inspect_project_scope(
         .map_err(tickets::TicketHttpError::from)?;
     let reference = match canonical_reference(&state).await {
         Ok(reference) => reference,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     match SupervisorSessionService::new(state.storage.clone()).inspect_scope(&reference).await {
         Ok(scope) => Ok(HttpResponse::Ok().json(json!({
@@ -114,7 +114,7 @@ pub async fn configure_project_scope(
     }
     let reference = match canonical_reference(&state).await {
         Ok(reference) => reference,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     if body.incarnation_id != reference.incarnation_id {
         return Ok(error(
