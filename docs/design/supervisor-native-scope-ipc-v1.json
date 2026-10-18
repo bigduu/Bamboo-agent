@@ -168,8 +168,8 @@
     ],
     "bodhi": [
       "owned-child lifecycle and strict counterpart codec",
-      "window/origin/full-intent native policy",
-      "no JS proof or direct PUT; remain unavailable without verified authority"
+      "main-window/native origin/full-intent request policy",
+      "no JS proof or direct PUT; request only exact ready Bamboo native confirmation profile"
     ],
     "frontend": [
       "read-only scope decoder and complete-set review",

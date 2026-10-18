@@ -10,7 +10,9 @@ use bamboo_domain::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::state::{self, FRAME_PREFIX, MAX_FRAME_BYTES, MAX_REQUESTS_PER_LAUNCH};
+#[cfg(test)]
+use super::state::{self, MAX_REQUESTS_PER_LAUNCH};
+use super::state::{FRAME_PREFIX, MAX_FRAME_BYTES};
 
 pub(super) const VERSION: u8 = 1;
 
