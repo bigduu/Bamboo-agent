@@ -361,6 +361,9 @@ pub(super) fn build_root_tools(
     storage: Arc<dyn Storage>,
     persistence: Arc<LockedSessionStore>,
     session_messenger: Arc<bamboo_engine::SessionMessenger>,
+    root_creator: Arc<
+        dyn bamboo_server_tools::session_control::root_creation::SupervisedRootCreatePort,
+    >,
     spawn_scheduler: Arc<SpawnScheduler>,
     sessions: bamboo_engine::SessionCache,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
@@ -452,9 +455,10 @@ pub(super) fn build_root_tools(
     let tools_with_control: Arc<dyn ToolExecutor> =
         Arc::new(crate::tools::OverlayToolExecutor::new(
             tools_with_inspector,
-            Arc::new(bamboo_server_tools::SessionControlTool::new(
-                session_messenger.clone(),
-            )),
+            Arc::new(
+                bamboo_server_tools::SessionControlTool::new(session_messenger.clone())
+                    .with_root_creator(root_creator),
+            ),
         ));
 
     // Keep these exact-name compatibility calls registered. The per-session

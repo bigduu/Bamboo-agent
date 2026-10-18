@@ -6,7 +6,7 @@ use bamboo_agent_core::tools::{
     ExecutingSupervisorObservation, FunctionCall, ToolCall, ToolExecutionContext, ToolOutcome,
 };
 use bamboo_domain::{
-    RootModeOperationAction, RootModeOperationRequest, SessionKind, Storage, SupervisorReference,
+    RootModeOperationAction, RootModeOperationRequest, SessionKind, SupervisorReference,
 };
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use bamboo_tools::permission::{PermissionRule, PermissionType};
