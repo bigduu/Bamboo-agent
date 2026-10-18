@@ -1,5 +1,6 @@
 name: Publish Crate
 # BAMBOO_TRUSTED_PUBLICATION_POLICY_V1
+# BAMBOO_SHARED_EXECUTABLES_V1
 
 on:
   workflow_run:
@@ -109,7 +110,7 @@ jobs:
           PY
 
       - &manual-checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -126,7 +127,7 @@ jobs:
 
       - &manual-node
         name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: lts/*
 
@@ -381,6 +382,9 @@ jobs:
     environment: bamboo-release
     permissions:
       contents: write
+    outputs:
+      source: ${{ steps.source.outputs.revision }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Authorize the exact source before checkout
         id: source
@@ -433,7 +437,7 @@ jobs:
               stream.write(f"revision={source}\n")
           PY
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ steps.source.outputs.revision }}
           fetch-depth: 0
@@ -446,12 +450,28 @@ jobs:
           test "$(git rev-parse HEAD)" = "${SOURCE_REVISION}"
           test -z "$(git status --porcelain --untracked-files=all)"
 
-      - name: Require the release policy in this source commit
-        # Pre-policy main CI cannot acquire the automatic publication authority.
-        run: test -f scripts/crate-release.cjs
+      - name: Require the complete executable policy before reserving a version
+        # Historical successful CI may be delivered after this workflow ships.
+        # Reject an older producer ABI before any reservation or crate upload.
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          required = {
+              'scripts/crate-release.cjs': None,
+              'scripts/sidecar-build.cjs': '// BAMBOO_SHARED_EXECUTABLES_V1',
+              'scripts/sidecar-release.cjs': '// BAMBOO_SHARED_EXECUTABLES_V1',
+              'scripts/sidecar-browser-host.py': '# BAMBOO_SHARED_EXECUTABLES_V1',
+              '.github/workflows/publish-crate.yml': '# BAMBOO_SHARED_EXECUTABLES_V1',
+          }
+          for name, marker in required.items():
+              file = Path(name)
+              assert file.is_file() and not file.is_symlink(), f'Source lacks complete executable publication policy: {name}'
+              if marker:
+                  assert marker in file.read_text().splitlines(), f'Source has an incompatible executable publication ABI: {name}'
+          PY
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: lts/*
 
@@ -526,3 +546,111 @@ jobs:
           FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
           FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
         run: node scripts/crate-release.cjs publish
+
+  executables:
+    name: Complete executable (${{ matrix.target }})
+    needs: automatic
+    # The existing publisher alone allocates the version and authenticates main.
+    # Desktop and standalone users consume these same complete executables.
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    outputs:
+      aarch64_apple_darwin: ${{ steps.build.outputs.aarch64_apple_darwin }}
+      x86_64_apple_darwin: ${{ steps.build.outputs.x86_64_apple_darwin }}
+      x86_64_pc_windows_msvc: ${{ steps.build.outputs.x86_64_pc_windows_msvc }}
+      x86_64_unknown_linux_gnu: ${{ steps.build.outputs.x86_64_unknown_linux_gnu }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    env:
+      SOURCE_REVISION: ${{ needs.automatic.outputs.source }}
+      TARGET_VERSION: ${{ needs.automatic.outputs.version }}
+      BAMBOO_RELEASE_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.automatic.outputs.source }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: lts/*
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build and verify the standard versioned Bamboo executable
+        id: build
+        env:
+          # Read-only release access. Cargo never receives this token.
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/sidecar-build.cjs
+      - name: Transport this platform's verified executable within the same run
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: bamboo-executable-${{ matrix.target }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bamboo-executable-output/*
+          if-no-files-found: error
+          retention-days: 3
+
+  publish-executables:
+    name: Publish and verify complete executable assets
+    needs: [automatic, executables]
+    runs-on: ubuntu-latest
+    environment: bamboo-release
+    permissions:
+      contents: write
+    env:
+      SOURCE_REVISION: ${{ needs.automatic.outputs.source }}
+      TARGET_VERSION: ${{ needs.automatic.outputs.version }}
+      EXPECTED_BUILDS: ${{ toJSON(needs.executables.outputs) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.automatic.outputs.source }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: lts/*
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      # Per-attempt names preserve prior transports on a full rerun. Selecting
+      # the independent job-output attempt also supports rerunning failed jobs
+      # while successful platforms retain their earlier native-job outputs.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: bamboo-executable-aarch64-apple-darwin-attempt-${{ fromJSON(needs.executables.outputs.aarch64_apple_darwin).runAttempt }}
+          path: ${{ runner.temp }}/bamboo-executable-inputs/aarch64-apple-darwin
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: bamboo-executable-x86_64-apple-darwin-attempt-${{ fromJSON(needs.executables.outputs.x86_64_apple_darwin).runAttempt }}
+          path: ${{ runner.temp }}/bamboo-executable-inputs/x86_64-apple-darwin
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: bamboo-executable-x86_64-pc-windows-msvc-attempt-${{ fromJSON(needs.executables.outputs.x86_64_pc_windows_msvc).runAttempt }}
+          path: ${{ runner.temp }}/bamboo-executable-inputs/x86_64-pc-windows-msvc
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: bamboo-executable-x86_64-unknown-linux-gnu-attempt-${{ fromJSON(needs.executables.outputs.x86_64_unknown_linux_gnu).runAttempt }}
+          path: ${{ runner.temp }}/bamboo-executable-inputs/x86_64-unknown-linux-gnu
+      - name: Verify official provenance and publish immutable shared assets
+        # Same publisher queue, Environment and credentials; no new allocator,
+        # tag, registry publication, credential scope or replacement uploads.
+        env:
+          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
+          BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
+        run: node scripts/sidecar-release.cjs publish
