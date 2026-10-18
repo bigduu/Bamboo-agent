@@ -17,10 +17,14 @@ use bamboo_tickets::{canonical_bytes, content_hash, Error, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-const MAX_ENTRIES: usize = 1024;
+// Only the historical schema-1 map is bounded by this count. New stable keys
+// use individual bounded records and never evict another Work's retry budget.
+const MAX_LEGACY_ENTRIES: usize = 1024;
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
 const STATE: &str = "state.json";
 const LOCK: &str = "ready-retry-v1.lock";
+const RECORDS: &str = "entries";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadyRetryFilePhase {
@@ -60,6 +64,27 @@ struct State {
 #[serde(deny_unknown_fields)]
 struct Envelope {
     state: State,
+    sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordState {
+    schema: u32,
+    key: ReadyRetryKey,
+    value: VersionedReadyRetry,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordEnvelope {
+    state: RecordState,
+    sha256: String,
+}
+
+#[derive(Serialize)]
+struct Publication<'a, T> {
+    state: &'a T,
     sha256: String,
 }
 
@@ -177,8 +202,8 @@ impl FileReadyRetryStore {
             return Err(unavailable("retry metadata exceeds its byte limit"));
         }
         let envelope: Envelope = serde_json::from_slice(&bytes)?;
-        if envelope.state.schema != 1
-            || envelope.state.entries.len() > MAX_ENTRIES
+        if !matches!(envelope.state.schema, 1 | 2)
+            || envelope.state.entries.len() > MAX_LEGACY_ENTRIES
             || content_hash(&canonical_bytes(&envelope.state)?) != envelope.sha256
         {
             return Err(unavailable(
@@ -194,7 +219,136 @@ impl FileReadyRetryStore {
             }
             validate_ready_retry_record(&entry.value.record)?;
         }
+        if envelope.state.schema == 2 {
+            Self::plain_directory(&self.directory.join(RECORDS))?;
+        }
         Ok(envelope.state)
+    }
+
+    fn plain_directory(path: &Path) -> Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(unavailable(
+                "retry record directory is not a plain directory",
+            ));
+        }
+        Ok(())
+    }
+
+    fn record_directory(&self, hash: &str) -> PathBuf {
+        self.directory.join(RECORDS).join(hash)
+    }
+
+    fn key_marker(&self, hash: &str) -> PathBuf {
+        self.directory.join(RECORDS).join(format!("{hash}.key"))
+    }
+
+    fn key_marker_exists(&self, hash: &str) -> Result<bool> {
+        match fs::symlink_metadata(self.key_marker(hash)) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != 0 {
+                    return Err(unavailable("retry key marker is not an empty plain file"));
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn record_directory_exists(&self, hash: &str) -> Result<bool> {
+        match fs::symlink_metadata(self.record_directory(hash)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn value(
+        &self,
+        state: &State,
+        key: &ReadyRetryKey,
+        hash: &str,
+    ) -> Result<Option<VersionedReadyRetry>> {
+        let directory_exists = self.record_directory_exists(hash)?;
+        let marker_exists = self.key_marker_exists(hash)?;
+        if let Some(entry) = state.entries.get(hash) {
+            if directory_exists || marker_exists {
+                return Err(unavailable(
+                    "duplicate legacy and individual retry identity",
+                ));
+            }
+            return Ok(Some(entry.value.clone()));
+        }
+        if state.schema == 1 {
+            if directory_exists || marker_exists {
+                return Err(unavailable(
+                    "individual retry record without schema-2 activation",
+                ));
+            }
+            return Ok(None);
+        }
+        if directory_exists != marker_exists {
+            return Err(unavailable(
+                "initialized retry key marker or directory is missing",
+            ));
+        }
+        if !directory_exists {
+            return Ok(None);
+        }
+        let directory = self.record_directory(hash);
+        Self::plain_directory(&directory)?;
+        let path = directory.join(STATE);
+        // An existing key directory is a durable initialization boundary. A
+        // missing/corrupt file is never an absent key or a fresh retry budget.
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_RECORD_BYTES
+        {
+            return Err(unavailable("invalid or oversized individual retry record"));
+        }
+        let mut bytes = Vec::new();
+        File::open(path)?
+            .take(MAX_RECORD_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_RECORD_BYTES {
+            return Err(unavailable(
+                "individual retry record exceeds its byte limit",
+            ));
+        }
+        let envelope: RecordEnvelope = serde_json::from_slice(&bytes)?;
+        if envelope.state.schema != 2
+            || envelope.state.key != *key
+            || key_hash(&envelope.state.key)? != hash
+            || envelope.state.value.revision == 0
+            || content_hash(&canonical_bytes(&envelope.state)?) != envelope.sha256
+        {
+            return Err(unavailable(
+                "individual retry identity/revision/checksum mismatch",
+            ));
+        }
+        validate_ready_retry_record(&envelope.state.value.record)?;
+        Ok(Some(envelope.state.value))
+    }
+
+    fn activate_individual_records(&self, state: &mut State) -> Result<()> {
+        if state.schema == 2 {
+            return Ok(());
+        }
+        let records = self.directory.join(RECORDS);
+        match fs::create_dir(&records) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        Self::plain_directory(&records)?;
+        // Also sync an existing directory from an interrupted activation.
+        File::open(&self.directory)?.sync_all()?;
+        // Original readers reject schema 2 in this same state.json. A separate
+        // marker could be ignored by an old writer and refund a stored budget.
+        state.schema = 2;
+        self.publish(state)
     }
 
     fn phase(&self, phase: ReadyRetryFilePhase) -> Result<()> {
@@ -205,33 +359,18 @@ impl FileReadyRetryStore {
     }
 
     fn publish(&self, state: &State) -> Result<()> {
-        let sha256 = content_hash(&canonical_bytes(state)?);
-        let bytes = serde_json::to_vec(&Envelope {
-            state: State {
-                schema: state.schema,
-                revision: state.revision,
-                entries: state
-                    .entries
-                    .iter()
-                    .map(|(key, entry)| {
-                        (
-                            key.clone(),
-                            Entry {
-                                key: entry.key.clone(),
-                                value: entry.value.clone(),
-                            },
-                        )
-                    })
-                    .collect(),
-            },
-            sha256,
+        self.publish_state(&self.directory, state, MAX_BYTES)
+    }
+
+    fn publish_state<T: Serialize>(&self, directory: &Path, state: &T, limit: u64) -> Result<()> {
+        let bytes = serde_json::to_vec(&Publication {
+            state,
+            sha256: content_hash(&canonical_bytes(state)?),
         })?;
-        if bytes.len() as u64 > MAX_BYTES {
+        if bytes.len() as u64 > limit {
             return Err(unavailable("retry metadata byte capacity exhausted"));
         }
-        let temporary = self
-            .directory
-            .join(format!("pending-{}.json", uuid::Uuid::new_v4()));
+        let temporary = directory.join(format!("pending-{}.json", uuid::Uuid::new_v4()));
         let result = (|| {
             let mut file = OpenOptions::new()
                 .create_new(true)
@@ -242,10 +381,10 @@ impl FileReadyRetryStore {
             file.sync_all()?;
             drop(file);
             self.phase(ReadyRetryFilePhase::BeforeReplace)?;
-            fs::rename(&temporary, self.directory.join(STATE))?;
+            fs::rename(&temporary, directory.join(STATE))?;
             self.phase(ReadyRetryFilePhase::AfterReplace)?;
             self.phase(ReadyRetryFilePhase::BeforeDirectorySync)?;
-            File::open(&self.directory)?.sync_all()?;
+            File::open(directory)?.sync_all()?;
             self.phase(ReadyRetryFilePhase::AfterDirectorySync)?;
             Ok(())
         })();
@@ -261,7 +400,7 @@ impl FileReadyRetryStore {
         let hash = key_hash(key)?;
         let (_lock, created) = self.lock()?;
         let state = self.read(created)?;
-        Ok(state.entries.get(&hash).map(|entry| entry.value.clone()))
+        self.value(&state, key, &hash)
     }
 
     fn exchange_blocking(
@@ -274,17 +413,12 @@ impl FileReadyRetryStore {
         let hash = key_hash(key)?;
         let (_lock, created) = self.lock()?;
         let mut state = self.read(created)?;
-        let previous = state.entries.get(&hash);
-        if previous.map(|entry| entry.value.revision) != expected {
+        let previous = self.value(&state, key, &hash)?;
+        if previous.as_ref().map(|value| value.revision) != expected {
             return Err(Error::RevisionConflict);
         }
-        if let Some(previous) = previous {
-            validate_ready_retry_transition(&previous.value.record, &next)?;
-        }
-        if previous.is_none() && state.entries.len() >= MAX_ENTRIES {
-            return Err(unavailable(
-                "retry metadata entry capacity exhausted; no live record evicted",
-            ));
+        if let Some(previous) = previous.as_ref() {
+            validate_ready_retry_transition(&previous.record, &next)?;
         }
         let value = VersionedReadyRetry {
             revision: expected
@@ -293,6 +427,30 @@ impl FileReadyRetryStore {
                 .ok_or_else(|| unavailable("retry revision overflow"))?,
             record: next,
         };
+        if !state.entries.contains_key(&hash) {
+            self.activate_individual_records(&mut state)?;
+            let directory = self.record_directory(&hash);
+            if previous.is_none() {
+                // The permanent sibling marker also detects loss of the whole
+                // key directory. Neither marker nor directory is ever cleaned
+                // up after an error; a partial initialization must fail closed.
+                OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(self.key_marker(&hash))?
+                    .sync_all()?;
+                File::open(self.directory.join(RECORDS))?.sync_all()?;
+                fs::create_dir(&directory)?;
+                File::open(self.directory.join(RECORDS))?.sync_all()?;
+            }
+            let record = RecordState {
+                schema: 2,
+                key: key.clone(),
+                value: value.clone(),
+            };
+            self.publish_state(&directory, &record, MAX_RECORD_BYTES)?;
+            return Ok(value);
+        }
         state.revision = state
             .revision
             .checked_add(1)

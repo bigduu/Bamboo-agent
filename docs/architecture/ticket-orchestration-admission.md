@@ -96,6 +96,31 @@ remains unassembled: no copied persistence, fallback to Global memory, automatic
 adoption of an observed version, or new grant from memory. Ticket's immutable
 DispatchSpec/context and runtime receipt remain the execution references.
 
+## Durable Ready retry capacity
+
+Retry metadata remains one `ReadyRetryStore` under its original stable file
+lock. Format 1 stays readable with its existing bounded legacy map. Before a
+new stable Work key is written, the adapter durably publishes format 2 in the
+original `state.json` and syncs its directory. Original readers reject that
+version rather than treating the new records as absent budgets.
+
+The legacy map keeps every original key, revision, attempt, deadline, request
+and quarantine; existing keys continue their original CAS there. New keys use
+individual checksummed records of at most 64 KiB, addressed by the existing
+scope/Work hash, without adding another authority or scanning all new records.
+The old 1,024-entry and 8 MiB limits still bound legacy-file reads, but no longer
+limit the installation's lifetime number of new Work keys.
+
+Each individual key has a permanent empty sibling marker. Its file and parent
+are synced before creating and syncing the key directory and publishing its
+record. Missing/corrupt markers, key directories, records or the format-2 record
+root fail closed; they never become a new retry window. Errors and cancellation
+never remove initialized markers/directories or refund a published reservation.
+Both the legacy and individual paths retain the original lock until blocking
+file and directory synchronization ends. No expired or quarantined budget is
+automatically deleted. Restoration of deliberately erased/rolled-back store data
+still requires explicit Host repair; these bytes are not an execution grant.
+
 ## Admission conditions
 
 Keep the candidate Draft until new local affected cases pass, the actual

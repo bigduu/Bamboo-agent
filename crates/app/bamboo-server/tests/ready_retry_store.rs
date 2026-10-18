@@ -385,3 +385,6 @@ async fn symlink_directory_lock_and_record_are_rejected() {
         assert!(store.load(&key("work")).await.is_err(), "{target}");
     }
 }
+
+#[path = "ready_retry_store/capacity.rs"]
+mod capacity;
