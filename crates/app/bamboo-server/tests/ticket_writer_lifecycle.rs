@@ -569,7 +569,7 @@ async fn stopped_native_child_shutdown_drop_reopens_the_same_writer_and_preserve
     let scope = host
         .state()
         .tickets
-        .patrol_scope(&project, &work_id, &assignment_id)
+        .patrol_scope(project.as_str(), &work_id, &assignment_id)
         .await
         .unwrap();
     assert_eq!(
@@ -719,7 +719,7 @@ async fn stopped_native_child_shutdown_drop_reopens_the_same_writer_and_preserve
     let recovered_scope = reopened
         .state()
         .tickets
-        .patrol_scope(&project, &work_id, &assignment_id)
+        .patrol_scope(project.as_str(), &work_id, &assignment_id)
         .await
         .unwrap();
     assert_eq!(recovered_scope, scope);
