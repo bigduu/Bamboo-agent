@@ -316,10 +316,12 @@ impl ReadyWorkScheduler {
                             assignment.state == AssignmentState::OutcomeUnknown
                         })
                 {
-                    blocked.get_or_insert(ReadyReconcile::Blocked {
+                    let report = ReadyReconcile::Blocked {
                         work_id: work.id.clone(), kind: ReadyBlockKind::OutcomeUnknown,
                         reason: "canonical execution outcome is unknown; original receipt reconciliation required".into(),
-                    });
+                    };
+                    pending_wait.get_or_insert(report.clone());
+                    blocked.get_or_insert(report);
                 }
                 continue;
             }

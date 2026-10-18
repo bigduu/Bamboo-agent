@@ -1826,10 +1826,11 @@ async fn sequenced_rollback_during_reservation_never_lowers_the_durable_clock_fl
     );
     clock.advance(1_000).await;
     let floor = START_MS + 1_000;
-    // Read 1 establishes the new floor, read 2 validates reservation, and
-    // read 3 rolls back. An extra read while constructing the reservation
-    // used to persist floor-1, making the subsequent forward read look safe.
-    clock.observe_sequence([floor, floor, floor - 1, floor]);
+    // Reads 1 and 2 bracket store.load; the fresh second read establishes the
+    // persisted floor. Read 3 validates reservation, and read 4 rolls back
+    // immediately after its CAS. An extra construction read used to persist
+    // floor-1, making the following forward read look safe for admission.
+    clock.observe_sequence([floor, floor, floor, floor - 1, floor]);
     assert!(matches!(
         scheduler.reconcile(fixture.host.as_ref()).await,
         Err(Error::ResourceBlocked(_))
