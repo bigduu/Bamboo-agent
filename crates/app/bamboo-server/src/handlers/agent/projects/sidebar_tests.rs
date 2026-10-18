@@ -97,13 +97,7 @@ async fn patch(
             .unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_secs(8), feed.recv())
             .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "project PATCH did not reach durable/live publication: {error}; latest_seq={}, dropped={}",
-                    state.account_sink.latest_seq(),
-                    state.account_sink.dropped_count()
-                )
-            })
+            .expect("project PATCH did not reach durable/live publication")
             .expect("project account tail stays open and unlagged");
         let matches_update = |event: &AgentEvent| {
             matches!(event, AgentEvent::ProjectUpdated { project_id, revision }
