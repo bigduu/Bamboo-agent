@@ -388,3 +388,6 @@ async fn symlink_directory_lock_and_record_are_rejected() {
 
 #[path = "ready_retry_store/capacity.rs"]
 mod capacity;
+
+#[path = "ready_retry_store/membership.rs"]
+mod membership;
