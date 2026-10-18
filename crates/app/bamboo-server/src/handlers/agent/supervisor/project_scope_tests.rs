@@ -457,7 +457,11 @@ async fn ultra_owner_scope_and_model_observation_use_management_revision_not_wor
         .storage
         .root_mode_operation(&RootModeOperationRequest {
             session_id: canonical.id.clone(),
-            operation_id: uuid::Uuid::new_v4().to_string(),
+            operation_id: format!(
+                "{}:{}",
+                canonical.root_mode_transition_epoch,
+                uuid::Uuid::new_v4()
+            ),
             birth_token: canonical.root_mode_birth_token(),
             expected_epoch: canonical.root_mode_transition_epoch,
             requested_enabled: true,
@@ -469,12 +473,17 @@ async fn ultra_owner_scope_and_model_observation_use_management_revision_not_wor
         .call(Method::PUT, Some(f.update(0, vec![f.project.clone()])))
         .await;
     assert_eq!(status, StatusCode::OK, "{configured}");
+    // Management revision advances independently of the unchanged Work binding.
+    assert_eq!(
+        f.call(Method::PUT, Some(f.update(1, vec![]))).await.0,
+        StatusCode::OK
+    );
     let (_, http) = f.call(Method::GET, None).await;
     let model = model_scope(&f).await;
     assert_eq!(http["scope"]["supervisor"], model["supervisor"]);
     assert_eq!(http["scope"]["state_revision"], model["state_revision"]);
     assert_eq!(http["scope"]["allowed_projects"], model["allowed_projects"]);
-    assert_eq!(model["state_revision"], 1);
+    assert_eq!(model["state_revision"], 2);
     assert_eq!(model["work_scope"]["availability"], "not_observed");
     let canonical = f
         .state

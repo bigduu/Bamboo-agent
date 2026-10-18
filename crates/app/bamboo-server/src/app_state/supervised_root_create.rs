@@ -81,6 +81,17 @@ impl SupervisedRootCreatePort for SupervisedRootCreator {
             "state_revision":scope.state_revision, "allowed_projects":scope.allowed_projects,
             "create_route_exposed":true, "project_scope_configured":!scope.allowed_projects.is_empty(),
             "code":if scope.allowed_projects.is_empty() {"project_scope_uninitialized"} else {"project_scope_configured"},
+            "owner_action":{
+                "method":"PUT", "path":"/api/v1/supervisor/default/scope",
+                "requires":"verified_host_owner", "model_callable":false,
+                "required_fields":["incarnation_id","expected_state_revision","allowed_projects"],
+                "next_step":"After explicit owner authorization, read scope again and use the owner-selected Project and existing bound workspace with create under its separate native tool approval.",
+                "note":"The owner must explicitly select the complete existing active Project set using the current incarnation and management revision. Project scope is independent of workspace binding, native tool approval and Work initialization. Never issue this owner action through another tool or auto-grant Projects."
+            },
+            "work_scope":{
+                "availability":"not_observed", "status_path":"/api/v1/tickets/scope",
+                "note":"Formal Work has its own identity/mode, feature, binding and health checks. Its owner initialization is permitted only when that endpoint returns can_initialize=true with the current initialization payload. It grants no Project scope or shell/build permission. If an independent implementation route is blocked, report its specific blocker; a read-only Child is not that implementation."
+            },
             "note":"Only these existing Host-authorized Projects may receive a new Ordinary Root. The workspace must already be bound to the explicit Project. This observation is not a grant and never initializes Work, changes permissions or attaches historical Sessions."
         }).to_string()))
     }
