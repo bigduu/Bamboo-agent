@@ -1232,3 +1232,6 @@ fn unavailable_start_measurement_is_unknown_without_semantic_calls_or_invented_p
     assert!(provider.polls.is_empty());
     assert_eq!(host.durable.borrow().queue.len(), 1);
 }
+
+#[path = "patrol/settlement.rs"]
+mod settlement;

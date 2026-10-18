@@ -202,7 +202,8 @@ pub struct Reservation {
     pub receipt: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Usage {
     Known {
         input_tokens: u32,
@@ -357,6 +358,10 @@ pub struct Incident {
     /// A receipt to reconcile, never a second balance. An unavailable ledger
     /// cannot prevent the program from surfacing a timeout or retaining a charge.
     pub pending_settlement: Option<Reservation>,
+    /// Completed usage paired with that exact receipt. Legacy checkpoints
+    /// without usage retain their full charge and reconcile as Unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_settlement_usage: Option<Usage>,
     pub phase: Phase,
     pub escalation: Option<Escalation>,
 }
@@ -596,6 +601,7 @@ impl Patrol {
                 last_diagnostic_evidence_revision: None,
                 last_diagnosis: None,
                 pending_settlement: None,
+                pending_settlement_usage: None,
                 phase: Phase::Open,
                 escalation: None,
             });
@@ -936,6 +942,7 @@ fn settle_usage(
 ) -> bool {
     let settled = host.settle(reservation, usage).is_ok();
     incident.pending_settlement = (!settled).then(|| reservation.clone());
+    incident.pending_settlement_usage = (!settled).then_some(usage);
     settled
 }
 fn valid_scope(scope: &Scope) -> bool {

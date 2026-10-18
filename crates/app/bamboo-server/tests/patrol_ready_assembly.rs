@@ -592,6 +592,7 @@ async fn seed(root: &Path, token: String) -> SeedReceipt {
             last_diagnostic_evidence_revision: None,
             last_diagnosis: None,
             pending_settlement: None,
+            pending_settlement_usage: None,
             phase: Phase::Open,
             escalation: None,
         }),
