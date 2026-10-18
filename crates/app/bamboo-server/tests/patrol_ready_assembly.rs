@@ -20,7 +20,10 @@ use bamboo_orchestration::{
 use bamboo_server::app_state::ticket_application::{FileReadyRetryStore, ReadyReconcile};
 use bamboo_tickets::{RuntimeReceipt, ScopeBinding, WorkState};
 use serde::{Deserialize, Serialize};
-use std::{path::{Path, PathBuf}, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 mod support {
     use async_trait::async_trait;
@@ -136,7 +139,11 @@ mod support {
             .args(args)
             .output()
             .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         String::from_utf8(output.stdout).unwrap().trim().into()
     }
 
@@ -147,11 +154,30 @@ mod support {
         git(&repo, &["init", "-b", "fixture"]);
         std::fs::write(repo.join("result.txt"), "fixture\n").unwrap();
         git(&repo, &["add", "result.txt"]);
-        git(&repo, &["-c", "user.name=Assembly Fixture", "-c",
-            "user.email=fixture@example.invalid", "commit", "-m", "fixture"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Assembly Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        );
         let base_commit = git(&repo, &["rev-parse", "HEAD"]);
-        git(&repo, &["worktree", "add", "-b", "assembly-work", tree.to_str().unwrap(),
-            &base_commit]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "assembly-work",
+                tree.to_str().unwrap(),
+                &base_commit,
+            ],
+        );
         let worktree = tree.canonicalize().unwrap().to_string_lossy().into_owned();
         ExecutionWorkspace {
             repo: repo.canonicalize().unwrap().to_string_lossy().into_owned(),
@@ -165,9 +191,13 @@ mod support {
 
     async fn open(root: &Path, config: Config, provider: Arc<ControlledProvider>) -> AppState {
         let state = AppState::new_with_provider_and_memory_store(
-            root.to_path_buf(), config, provider.clone(),
+            root.to_path_buf(),
+            config,
+            provider.clone(),
             bamboo_memory::memory_store::MemoryStore::new(root.join("jiandu")),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         state.provider_registry.replace_with(ProviderRegistry::new(
             HashMap::from([("openai".into(), provider as Arc<dyn LLMProvider>)]),
             "openai".into(),
@@ -186,7 +216,9 @@ mod support {
     }
 
     impl Host {
-        pub(super) fn state(&self) -> &AppState { &self.state }
+        pub(super) fn state(&self) -> &AppState {
+            &self.state
+        }
 
         pub(super) fn snapshot(&self) -> Snapshot {
             self.state.tickets.service().unwrap().published().unwrap().1
@@ -201,15 +233,19 @@ mod support {
             grant: ReadyWorkGrant,
         ) -> ReadyWorkPolicy {
             ReadyWorkPolicy {
-                project_id: project, grants: vec![grant], capacity: 1,
-                max_rounds: MAX_ROUNDS, lifetime: Duration::from_secs(60),
+                project_id: project,
+                grants: vec![grant],
+                capacity: 1,
+                max_rounds: MAX_ROUNDS,
+                lifetime: Duration::from_secs(60),
             }
         }
 
         pub(super) async fn new(root: &Path) -> Self {
             let (send, requests) = mpsc::unbounded_channel();
             let provider = Arc::new(ControlledProvider {
-                requests: send, calls: AtomicUsize::new(0),
+                requests: send,
+                calls: AtomicUsize::new(0),
             });
             let mut config: Config = serde_json::from_value(json!({
                 "provider":"openai",
@@ -217,71 +253,133 @@ mod support {
                 "providers":{"openai":{"api_key":"fixture","model":MODEL}},
                 "run_budget":{"max_rounds":MAX_ROUNDS},
                 "subagents":{"max_concurrent":2}
-            })).unwrap();
-            config.memory_mut().get_or_insert_with(Default::default).auto_dream_enabled = false;
+            }))
+            .unwrap();
+            config
+                .memory_mut()
+                .get_or_insert_with(Default::default)
+                .auto_dream_enabled = false;
             let state = open(root, config.clone(), provider.clone()).await;
-            Self { state, provider, requests }
+            Self {
+                state,
+                provider,
+                requests,
+            }
         }
 
         pub(super) async fn seed_work(
-            &self, root: &Path,
+            &self,
+            root: &Path,
         ) -> (bamboo_domain::ProjectId, ReadyWorkGrant) {
             let state = &self.state;
             let workspace = workspace(root);
-            let manifest = state.project_store.create("Patrol/Ready assembly", None).unwrap();
-            let manifest = state.project_store.bind_workspace(
-                &manifest.id, manifest.revision,
-                WorkspaceBinding { path: workspace.repo.clone(), label: None, git_common_dir: None },
-            ).unwrap();
-            let owner = Principal::User { user_id: "assembly-host-owner".into() };
-            let (service, authority) = state.tickets.authority(owner.clone()).await.unwrap();
-            let create = service.prepare_command(&authority, "assembly-create", vec![
-                Operation::Create {
-                    temp_id: "work".into(), kind: TicketKind::Work, parent: None,
-                    contract: Contract {
-                        title: "Patrol/Ready assembly".into(), objective: OBJECTIVE.into(),
-                        constraints: vec!["Use the controlled local provider".into()],
-                        acceptance: vec!["Human checks the submitted result".into()],
-                        user_acceptance_required: true,
-                        allowed_tools: BTreeSet::from(["Task".into()]),
+            let manifest = state
+                .project_store
+                .create("Patrol/Ready assembly", None)
+                .unwrap();
+            let manifest = state
+                .project_store
+                .bind_workspace(
+                    &manifest.id,
+                    manifest.revision,
+                    WorkspaceBinding {
+                        path: workspace.repo.clone(),
+                        label: None,
+                        git_common_dir: None,
                     },
-                    depends_on: BTreeSet::new(),
-                },
-                Operation::AssociateProject { ticket_id: "work".into(), project_id: manifest.id.clone() },
-            ]).unwrap();
-            let work_id = state.tickets.update(owner.clone(), &create).await.unwrap().ids["work"].clone();
+                )
+                .unwrap();
+            let owner = Principal::User {
+                user_id: "assembly-host-owner".into(),
+            };
+            let (service, authority) = state.tickets.authority(owner.clone()).await.unwrap();
+            let create = service
+                .prepare_command(
+                    &authority,
+                    "assembly-create",
+                    vec![
+                        Operation::Create {
+                            temp_id: "work".into(),
+                            kind: TicketKind::Work,
+                            parent: None,
+                            contract: Contract {
+                                title: "Patrol/Ready assembly".into(),
+                                objective: OBJECTIVE.into(),
+                                constraints: vec!["Use the controlled local provider".into()],
+                                acceptance: vec!["Human checks the submitted result".into()],
+                                user_acceptance_required: true,
+                                allowed_tools: BTreeSet::from(["Task".into()]),
+                            },
+                            depends_on: BTreeSet::new(),
+                        },
+                        Operation::AssociateProject {
+                            ticket_id: "work".into(),
+                            project_id: manifest.id.clone(),
+                        },
+                    ],
+                )
+                .unwrap();
+            let work_id = state
+                .tickets
+                .update(owner.clone(), &create)
+                .await
+                .unwrap()
+                .ids["work"]
+                .clone();
             let snapshot = service.published().unwrap().1;
             let work = &snapshot.tickets[&work_id];
-            let ready = service.prepare_command(&authority, "assembly-ready", vec![
-                Operation::SetProjectContext {
-                    work_id: work_id.clone(),
-                    context: ProjectContextSnapshot {
-                        project_id: manifest.id.clone(), project_revision: manifest.revision,
-                        resource_revision: manifest.resource_revision,
-                        workspace_binding: manifest.workspace_bindings.iter()
-                            .find(|binding| binding.path == workspace.repo).unwrap().clone(),
-                        contract_revision: work.contract_revision, contract: work.contract.clone(),
-                        sources: BTreeMap::from([("assembly-spec".into(), "v1".into())]),
-                    },
-                },
-                Operation::Ready { work_id: work_id.clone() },
-            ]).unwrap();
+            let ready = service
+                .prepare_command(
+                    &authority,
+                    "assembly-ready",
+                    vec![
+                        Operation::SetProjectContext {
+                            work_id: work_id.clone(),
+                            context: ProjectContextSnapshot {
+                                project_id: manifest.id.clone(),
+                                project_revision: manifest.revision,
+                                resource_revision: manifest.resource_revision,
+                                workspace_binding: manifest
+                                    .workspace_bindings
+                                    .iter()
+                                    .find(|binding| binding.path == workspace.repo)
+                                    .unwrap()
+                                    .clone(),
+                                contract_revision: work.contract_revision,
+                                contract: work.contract.clone(),
+                                sources: BTreeMap::from([("assembly-spec".into(), "v1".into())]),
+                            },
+                        },
+                        Operation::Ready {
+                            work_id: work_id.clone(),
+                        },
+                    ],
+                )
+                .unwrap();
             state.tickets.update(owner, &ready).await.unwrap();
             let snapshot = service.published().unwrap().1;
             let grant = ReadyWorkGrant {
-                work_id: work_id.clone(), contract_revision: snapshot.tickets[&work_id].contract_revision,
-                context_hash: snapshot.project.work_contexts[&work_id].clone(), workspace,
+                work_id: work_id.clone(),
+                contract_revision: snapshot.tickets[&work_id].contract_revision,
+                context_hash: snapshot.project.work_contexts[&work_id].clone(),
+                workspace,
             };
             (manifest.id, grant)
         }
 
         pub(super) async fn next_request(&mut self) -> Gate {
-            tokio::time::timeout(WAIT, self.requests.recv()).await
-                .expect("native Worker reaches controlled provider").unwrap()
+            tokio::time::timeout(WAIT, self.requests.recv())
+                .await
+                .expect("native Worker reaches controlled provider")
+                .unwrap()
         }
 
         pub(super) async fn assert_quiet(&mut self, calls: usize) {
-            assert!(tokio::time::timeout(Duration::from_millis(30), self.requests.recv()).await.is_err());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(30), self.requests.recv())
+                    .await
+                    .is_err()
+            );
             assert_eq!(self.provider.calls.load(Ordering::SeqCst), calls);
         }
 
@@ -291,24 +389,51 @@ mod support {
                     let snapshot = self.snapshot();
                     let work = &snapshot.tickets[work_id];
                     assert_ne!(work.state, WorkState::Accepted);
-                    if let Some(submission) = work.current_submission.as_ref()
-                        .and_then(|id| snapshot.submissions.get(id)) {
+                    if let Some(submission) = work
+                        .current_submission
+                        .as_ref()
+                        .and_then(|id| snapshot.submissions.get(id))
+                    {
                         let assignment = &snapshot.assignments[&submission.assignment_id];
                         let child_id = &submission.runtime.session_id;
-                        let child = self.state().storage.load_session(child_id).await.unwrap().unwrap();
-                        let stopped = child.metadata.get("runtime.local_task.state")
-                            .map(String::as_str) == Some("stopped");
-                        let runner_done = self.state().agent_runners.read().await.get(child_id)
+                        let child = self
+                            .state()
+                            .storage
+                            .load_session(child_id)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let stopped = child
+                            .metadata
+                            .get("runtime.local_task.state")
+                            .map(String::as_str)
+                            == Some("stopped");
+                        let runner_done = self
+                            .state()
+                            .agent_runners
+                            .read()
+                            .await
+                            .get(child_id)
                             .is_none_or(|r| !matches!(r.status, AgentStatus::Running));
-                        if work.state == WorkState::Submitted && assignment.process_stopped
-                            && stopped && runner_done
-                            && self.state().session_activation_router.current_run_id(child_id).await.is_none() {
+                        if work.state == WorkState::Submitted
+                            && assignment.process_stopped
+                            && stopped
+                            && runner_done
+                            && self
+                                .state()
+                                .session_activation_router
+                                .current_run_id(child_id)
+                                .await
+                                .is_none()
+                        {
                             return snapshot;
                         }
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-            }).await.expect("canonical submission and physical/logical runtime stop")
+            })
+            .await
+            .expect("canonical submission and physical/logical runtime stop")
         }
 
         pub(super) async fn close(self) {
@@ -326,8 +451,11 @@ fn assert_unknown(observation: &Observation) {
     assert!(!observation.terminal, "Submitted is not human acceptance");
 }
 
-async fn observe(app: &bamboo_server::app_state::ticket_application::TicketApplication,
-    scope: &Scope, cursor: u64) -> Observation {
+async fn observe(
+    app: &bamboo_server::app_state::ticket_application::TicketApplication,
+    scope: &Scope,
+    cursor: u64,
+) -> Observation {
     let mut port = app.patrol_observation(scope).await.unwrap();
     let observation = port.observation(scope, cursor).unwrap();
     assert_unknown(&observation);
@@ -336,8 +464,12 @@ async fn observe(app: &bamboo_server::app_state::ticket_application::TicketAppli
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap()
-        .as_millis().try_into().unwrap()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .try_into()
+        .unwrap()
 }
 
 async fn ready_admission(
@@ -348,17 +480,23 @@ async fn ready_admission(
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         loop {
             match store.load(key).await {
-                Ok(Some(value)) if value.record.phase == ReadyRetryPhase::Deferred
-                    && matches!(&value.record.request,
+                Ok(Some(value))
+                    if value.record.phase == ReadyRetryPhase::Deferred
+                        && matches!(&value.record.request,
                         Some(ReadyRetryRequest::Intent { dispatch_key, spec_hash })
                             if dispatch_key == &runtime.dispatch_key
-                                && spec_hash == &runtime.spec_hash) => return value,
+                                && spec_hash == &runtime.spec_hash) =>
+                {
+                    return value
+                }
                 Ok(_) | Err(bamboo_tickets::Error::ResourceBlocked(_)) => {}
                 Err(error) => panic!("Ready admission journal unavailable: {error}"),
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-    }).await.expect("the Ready admission's canonical receipt is durable")
+    })
+    .await
+    .expect("the Ready admission's canonical receipt is durable")
 }
 
 const CHILD_TOKEN_ENV: &str = "BAMBOO_PATROL_READY_ASSEMBLY_CHILD_TOKEN";
@@ -392,11 +530,17 @@ async fn seed(root: &Path, token: String) -> SeedReceipt {
     let mut host = support::Host::new(root).await;
     let (project, grant) = host.seed_work(root).await;
     let work_id = grant.work_id.clone();
-    assert!(matches!(host.state().tickets.reconcile_ready_work().await.unwrap(),
-        ReadyReconcile::Disabled));
+    assert!(matches!(
+        host.state().tickets.reconcile_ready_work().await.unwrap(),
+        ReadyReconcile::Disabled
+    ));
     assert!(host.snapshot().assignments.is_empty());
     host.assert_quiet(0).await;
-    host.state().tickets.install_ready_work_policy(support::Host::policy(project, grant)).await.unwrap();
+    host.state()
+        .tickets
+        .install_ready_work_policy(support::Host::policy(project, grant))
+        .await
+        .unwrap();
     host.state().tickets.wake_ready_work();
     host.next_request().await.finish_task();
     host.next_request().await.finish_result();
@@ -411,46 +555,80 @@ async fn seed(root: &Path, token: String) -> SeedReceipt {
     assert!(assignment.process_stopped);
     host.assert_quiet(2).await;
 
-    let key = ReadyRetryKey { scope_id: before.binding.scope_id.clone(), work_id: work_id.clone() };
+    let key = ReadyRetryKey {
+        scope_id: before.binding.scope_id.clone(),
+        work_id: work_id.clone(),
+    };
     let ready_store = FileReadyRetryStore::new(root);
     let ready = ready_admission(&ready_store, &key, &runtime).await;
     assert_eq!(ready.record.attempts, 1);
     assert!(ready.record.expires_at_ms > ready.record.created_at_ms);
-    let scope = host.state().tickets.patrol_scope(
-        project_id(&before, &work_id), &work_id, &assignment.id,
-    ).await.unwrap();
+    let scope = host
+        .state()
+        .tickets
+        .patrol_scope(project_id(&before, &work_id), &work_id, &assignment.id)
+        .await
+        .unwrap();
     assert_eq!(scope.authority_epoch, spec.authority_epoch);
     let observation = observe(host.state().tickets.as_ref(), &scope, 0).await;
     let checked_at = now_ms(); // Host check time, never start or effective progress.
     let cp = Checkpoint {
-        scope: scope.clone(), cursor: observation.cursor,
-        source_revision: observation.source_revision, last_check_ms: checked_at,
+        scope: scope.clone(),
+        cursor: observation.cursor,
+        source_revision: observation.source_revision,
+        last_check_ms: checked_at,
         next_check_ms: checked_at + 1000,
         incident: Some(Incident {
-            id: IncidentId { scope: scope.clone(), progress_sequence: 0 },
-            reason: Reason::EvidenceUnknown, opened_at_ms: checked_at,
-            opened_cursor: observation.cursor, source_revision: observation.source_revision,
-            attempts: 0, last_diagnostic_cursor: observation.cursor,
-            last_diagnostic_evidence_revision: None, last_diagnosis: None,
-            pending_settlement: None, phase: Phase::Open, escalation: None,
+            id: IncidentId {
+                scope: scope.clone(),
+                progress_sequence: 0,
+            },
+            reason: Reason::EvidenceUnknown,
+            opened_at_ms: checked_at,
+            opened_cursor: observation.cursor,
+            source_revision: observation.source_revision,
+            attempts: 0,
+            last_diagnostic_cursor: observation.cursor,
+            last_diagnostic_evidence_revision: None,
+            last_diagnosis: None,
+            pending_settlement: None,
+            phase: Phase::Open,
+            escalation: None,
         }),
     };
-    let mut journal = host.state().tickets.open_patrol_checkpoints(&scope).await.unwrap();
+    let mut journal = host
+        .state()
+        .tickets
+        .open_patrol_checkpoints(&scope)
+        .await
+        .unwrap();
     assert_eq!(journal.save(None, &cp), Ok(1));
     assert_eq!(journal.save(None, &cp), Err(PortError::Conflict));
     let checkpoint = journal.load(&scope).unwrap().unwrap();
     assert_eq!(checkpoint.checkpoint, cp);
     drop(journal);
     host.assert_quiet(2).await;
-    assert_eq!(ready_store.load(&key).await.unwrap().unwrap(), ready,
-        "Patrol cannot overwrite Ready's admission journal");
+    assert_eq!(
+        ready_store.load(&key).await.unwrap().unwrap(),
+        ready,
+        "Patrol cannot overwrite Ready's admission journal"
+    );
     let receipt = SeedReceipt {
-        token, child_pid: std::process::id(), provider_calls: host.calls(),
-        binding: before.binding, writer_epoch: before.authority_epoch,
-        scope, runtime, ready, checkpoint,
+        token,
+        child_pid: std::process::id(),
+        provider_calls: host.calls(),
+        binding: before.binding,
+        writer_epoch: before.authority_epoch,
+        scope,
+        runtime,
+        ready,
+        checkpoint,
     };
     host.close().await;
-    assert_eq!(ready_store.load(&key).await.unwrap().unwrap(), receipt.ready);
+    assert_eq!(
+        ready_store.load(&key).await.unwrap().unwrap(),
+        receipt.ready
+    );
     receipt
 }
 
@@ -468,11 +646,18 @@ async fn run_seed_process(root: &Path, token: &str) -> SeedReceipt {
     let stderr = root.join("seed.stderr.log");
     std::fs::create_dir(root.join("tmp")).unwrap();
     let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
-    command.arg("--exact").arg(TEST_NAME).arg("--nocapture").arg("--test-threads=1")
+    command
+        .arg("--exact")
+        .arg(TEST_NAME)
+        .arg("--nocapture")
+        .arg("--test-threads=1")
         .env_clear()
         .env(CHILD_TOKEN_ENV, token)
         .env(CHILD_ROOT_ENV, root)
-        .env("PATH", std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()))
+        .env(
+            "PATH",
+            std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+        )
         .env("TMPDIR", root.join("tmp"))
         .env("BAMBOO_DATA_DIR", root)
         .env("BAMBOO_JIANDU_DATA_DIR", root.join("jiandu"))
@@ -484,8 +669,14 @@ async fn run_seed_process(root: &Path, token: &str) -> SeedReceipt {
         .kill_on_drop(true);
     // Preserve only executable/loader paths required by Cargo's test binary;
     // provider keys, Host configuration and parent phase markers are not inherited.
-    for name in ["LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"] {
-        if let Some(value) = std::env::var_os(name) { command.env(name, value); }
+    for name in [
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
     }
     let mut child = command.spawn().unwrap();
     let child_pid = child.id().unwrap();
@@ -496,15 +687,21 @@ async fn run_seed_process(root: &Path, token: &str) -> SeedReceipt {
             // cache cleanup. kill_on_drop remains a final cancellation guard.
             let _ = child.start_kill();
             let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-            panic!("seed process timed out\nstdout:{}\nstderr:{}",
-                child_log(&stdout), child_log(&stderr));
+            panic!(
+                "seed process timed out\nstdout:{}\nstderr:{}",
+                child_log(&stdout),
+                child_log(&stderr)
+            );
         }
     };
-    assert!(status.success(), "seed process {status}\nstdout:{}\nstderr:{}",
-        child_log(&stdout), child_log(&stderr));
-    let receipt: SeedReceipt = serde_json::from_slice(
-        &std::fs::read(root.join(SEED_RECEIPT)).unwrap(),
-    ).unwrap();
+    assert!(
+        status.success(),
+        "seed process {status}\nstdout:{}\nstderr:{}",
+        child_log(&stdout),
+        child_log(&stderr)
+    );
+    let receipt: SeedReceipt =
+        serde_json::from_slice(&std::fs::read(root.join(SEED_RECEIPT)).unwrap()).unwrap();
     assert_eq!(receipt.token, token);
     assert_eq!(receipt.child_pid, child_pid);
     assert_ne!(receipt.child_pid, std::process::id());
@@ -520,14 +717,17 @@ async fn ready_submission_and_patrol_checkpoint_reopen_under_the_same_canonical_
         assert_eq!(root.canonicalize().unwrap(), root);
         let metadata = std::fs::symlink_metadata(root.join(PARENT_MARKER)).unwrap();
         assert!(metadata.is_file() && !metadata.file_type().is_symlink());
-        let marker: ParentMarker = serde_json::from_slice(
-            &std::fs::read(root.join(PARENT_MARKER)).unwrap(),
-        ).unwrap();
+        let marker: ParentMarker =
+            serde_json::from_slice(&std::fs::read(root.join(PARENT_MARKER)).unwrap()).unwrap();
         let token = token.into_string().unwrap();
         assert_eq!(marker.token, token);
         assert_ne!(marker.parent_pid, std::process::id());
         let receipt = seed(&root, token).await;
-        std::fs::write(root.join(SEED_RECEIPT), serde_json::to_vec(&receipt).unwrap()).unwrap();
+        std::fs::write(
+            root.join(SEED_RECEIPT),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
         // No TempDir owner exists in this branch. Return through libtest and
         // exit normally; only the parent owns and eventually removes the root.
         return;
@@ -536,8 +736,15 @@ async fn ready_submission_and_patrol_checkpoint_reopen_under_the_same_canonical_
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let token = uuid::Uuid::new_v4().to_string();
-    let marker = ParentMarker { token: token.clone(), parent_pid: std::process::id() };
-    std::fs::write(root.join(PARENT_MARKER), serde_json::to_vec(&marker).unwrap()).unwrap();
+    let marker = ParentMarker {
+        token: token.clone(),
+        parent_pid: std::process::id(),
+    };
+    std::fs::write(
+        root.join(PARENT_MARKER),
+        serde_json::to_vec(&marker).unwrap(),
+    )
+    .unwrap();
     let seed = run_seed_process(&root, &token).await;
     // Successful wait above is the real OS ownership boundary. Never reopen
     // before it, delete a writer lock or substitute another root/epoch.
@@ -550,47 +757,91 @@ async fn ready_submission_and_patrol_checkpoint_reopen_under_the_same_canonical_
     assert_eq!(after.submissions.len(), 1);
     let work_id = &seed.scope.work_id;
     let assignment_id = &seed.scope.assignment_id;
-    assert_eq!(after.assignments[assignment_id].runtime.as_ref(), Some(&seed.runtime));
+    assert_eq!(
+        after.assignments[assignment_id].runtime.as_ref(),
+        Some(&seed.runtime)
+    );
     assert!(after.assignments[assignment_id].process_stopped);
     assert_eq!(after.tickets[work_id].state, WorkState::Submitted);
     assert!(after.tickets[work_id].accepted_submission.is_none());
-    assert_eq!(after.intents[&seed.runtime.dispatch_key].immutable_spec.authority_epoch,
-        seed.scope.authority_epoch);
+    assert_eq!(
+        after.intents[&seed.runtime.dispatch_key]
+            .immutable_spec
+            .authority_epoch,
+        seed.scope.authority_epoch
+    );
     for _ in 0..3 {
         host.state().tickets.wake_ready_work();
-        assert!(matches!(host.state().tickets.reconcile_ready_work().await.unwrap(),
-            ReadyReconcile::Disabled));
+        assert!(matches!(
+            host.state().tickets.reconcile_ready_work().await.unwrap(),
+            ReadyReconcile::Disabled
+        ));
     }
     host.assert_quiet(0).await;
-    let key = ReadyRetryKey { scope_id: seed.binding.scope_id.clone(), work_id: work_id.clone() };
+    let key = ReadyRetryKey {
+        scope_id: seed.binding.scope_id.clone(),
+        work_id: work_id.clone(),
+    };
     let ready_store = FileReadyRetryStore::new(&root);
-    assert_eq!(ready_store.load(&key).await.unwrap().unwrap(), seed.ready,
-        "restart retains the consumed attempt, original request, deadline and revision");
-    let recovered_scope = host.state().tickets.patrol_scope(
-        &seed.scope.project_id, work_id, assignment_id,
-    ).await.unwrap();
+    assert_eq!(
+        ready_store.load(&key).await.unwrap().unwrap(),
+        seed.ready,
+        "restart retains the consumed attempt, original request, deadline and revision"
+    );
+    let recovered_scope = host
+        .state()
+        .tickets
+        .patrol_scope(&seed.scope.project_id, work_id, assignment_id)
+        .await
+        .unwrap();
     assert_eq!(recovered_scope, seed.scope);
     assert!(recovered_scope.authority_epoch < after.authority_epoch);
-    let fresh = observe(host.state().tickets.as_ref(), &seed.scope, seed.checkpoint.checkpoint.cursor).await;
-    let mut journal = host.state().tickets.open_patrol_checkpoints(&seed.scope).await.unwrap();
+    let fresh = observe(
+        host.state().tickets.as_ref(),
+        &seed.scope,
+        seed.checkpoint.checkpoint.cursor,
+    )
+    .await;
+    let mut journal = host
+        .state()
+        .tickets
+        .open_patrol_checkpoints(&seed.scope)
+        .await
+        .unwrap();
     let recovered = journal.load(&seed.scope).unwrap().unwrap();
     assert_eq!(recovered, seed.checkpoint);
-    assert_eq!(journal.save(None, &recovered.checkpoint), Err(PortError::Conflict));
+    assert_eq!(
+        journal.save(None, &recovered.checkpoint),
+        Err(PortError::Conflict)
+    );
     let mut next = recovered.checkpoint.clone();
     next.cursor = fresh.cursor;
     next.source_revision = fresh.source_revision;
     next.last_check_ms = now_ms().max(next.last_check_ms);
     next.next_check_ms = next.last_check_ms + 1000;
     assert_eq!(journal.save(Some(recovered.version), &next), Ok(2));
-    assert_eq!(journal.save(Some(recovered.version), &next), Err(PortError::Conflict));
-    assert_eq!(journal.load(&seed.scope).unwrap().unwrap().checkpoint.incident,
-        seed.checkpoint.checkpoint.incident, "reopen/CAS retain the original incident");
+    assert_eq!(
+        journal.save(Some(recovered.version), &next),
+        Err(PortError::Conflict)
+    );
+    assert_eq!(
+        journal
+            .load(&seed.scope)
+            .unwrap()
+            .unwrap()
+            .checkpoint
+            .incident,
+        seed.checkpoint.checkpoint.incident,
+        "reopen/CAS retain the original incident"
+    );
     drop(journal);
     host.assert_quiet(0).await;
     let final_snapshot = host.snapshot();
     assert_eq!(final_snapshot.assignments.len(), 1);
     assert_eq!(final_snapshot.submissions.len(), 1);
     assert_eq!(final_snapshot.tickets[work_id].state, WorkState::Submitted);
-    assert!(final_snapshot.tickets[work_id].accepted_submission.is_none());
+    assert!(final_snapshot.tickets[work_id]
+        .accepted_submission
+        .is_none());
     host.close().await;
 }

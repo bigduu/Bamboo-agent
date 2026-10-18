@@ -1881,7 +1881,8 @@ impl ChildSessionPort for ChildSessionAdapter {
         child: &Session,
         gate: Option<&bamboo_domain::AdmissionGate>,
     ) -> Result<bamboo_domain::AdmissionCommit<()>, ChildSessionError> {
-        self.admit_child_run_checked(parent, child, gate, None).await
+        self.admit_child_run_checked(parent, child, gate, None)
+            .await
     }
 
     async fn cancel_child_run_and_wait(
