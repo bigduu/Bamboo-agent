@@ -385,7 +385,7 @@ impl SessionStoreV2 {
         // and the complete lock set remain live through atomic publication.
         // Do not call an ordinary save (which must reject relation changes),
         // update a target, or publish a history-free snapshot into a cache.
-        let bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(&current))
+        let bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(current))
             .map_err(|error| other_io_error(error.to_string()))?;
         self.prepare_supervisor_management_proof(current, guards)
             .await?;
