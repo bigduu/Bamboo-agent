@@ -114,6 +114,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 .route("/initialize", web::post().to(agent::tickets::initialize))
                 .route("/overview", web::get().to(agent::tickets::overview))
                 .route("/search", web::post().to(agent::tickets::search))
+                .route(
+                    "/project-board",
+                    web::post().to(agent::tickets::project_board),
+                )
                 .route("/inspect", web::post().to(agent::tickets::inspect))
                 .route("/changes", web::post().to(agent::tickets::changes))
                 .route("/update", web::post().to(agent::tickets::update))

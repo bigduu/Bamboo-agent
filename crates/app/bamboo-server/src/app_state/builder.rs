@@ -235,6 +235,17 @@ impl AppState {
         provider: Arc<dyn LLMProvider>,
     ) -> Result<Self, AppError> {
         let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
+        Self::new_with_provider_and_memory_store(bamboo_home_dir, config, provider, memory_store)
+            .await
+    }
+
+    /// Inject both provider and memory explicitly for isolated Host embeddings.
+    pub async fn new_with_provider_and_memory_store(
+        bamboo_home_dir: PathBuf,
+        config: Config,
+        provider: Arc<dyn LLMProvider>,
+        memory_store: bamboo_memory::memory_store::MemoryStore,
+    ) -> Result<Self, AppError> {
         Self::new_with_provider_and_facade(
             bamboo_home_dir,
             config,
@@ -1316,6 +1327,7 @@ impl AppState {
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
         tickets.bind_adapter(child_adapter.clone());
         tickets.bind_messenger(session_messenger.clone());
+        tickets.spawn_ready_worker(mcp_proxy_shutdown.clone());
         // Wire the spawner into the completion coordinator too, so a resumed run
         // can re-spawn a guardian to re-review a fix after a reject verdict.
         child_completion_coordinator
