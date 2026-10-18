@@ -5,8 +5,9 @@ const os = require('node:os')
 const path = require('node:path')
 const zlib = require('node:zlib')
 const { spawnSync } = require('node:child_process')
+const { pathToFileURL } = require('node:url')
 const release = require('./sidecar-release.cjs')
-const { nativeTarget, buildEnvironment, verifyBuildMessages } = require('./sidecar-build.cjs')
+const { nativeTarget, buildEnvironment, verifyBuildMessages, verifyStampedVersions } = require('./sidecar-build.cjs')
 const { signReceipt, receiptBody } = require('./crate-release.cjs')
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
@@ -21,6 +22,111 @@ function temporary(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   return root
 }
+
+test('native version verification accepts the real stamped workspace with its independent example version', (t) => {
+  const root = temporary(t)
+  // Exercise the production stamper against copies of the real manifests.
+  // Reading their effective versions models metadata only; this invokes no Cargo.
+  const script = String.raw`
+import json, pathlib, shutil, subprocess, sys, tomllib
+source, root, version = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
+workspace = tomllib.loads((source / 'Cargo.toml').read_text())['workspace']
+for member in workspace['members']:
+    relative = pathlib.Path(member) / 'Cargo.toml'
+    destination = root / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source / relative, destination)
+subprocess.run([sys.executable, str(source / 'scripts/crate-release-lock.py'), 'stamp', version], cwd=root, check=True)
+inherited = tomllib.loads((root / 'Cargo.toml').read_text())['workspace']['package']['version']
+packages = []
+for member in workspace['members']:
+    manifest = root / member / 'Cargo.toml'
+    package = tomllib.loads(manifest.read_text())['package']
+    value = package['version']
+    packages.append({'id': package['name'], 'name': package['name'],
+                     'version': inherited if isinstance(value, dict) and value.get('workspace') else value,
+                     'manifest_path': str(manifest.resolve())})
+managed = [root / 'Cargo.toml', *sorted((root / 'crates').glob('*/*/Cargo.toml'))]
+print(json.dumps({'packages': packages, 'workspace_members': [p['id'] for p in packages],
+                  'managedManifests': [p.relative_to(root).as_posix() for p in managed]}))
+`
+  const result = spawnSync(process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3'),
+    ['-c', script, process.cwd(), root, identity.version], { encoding: 'utf8', env: {
+      PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: '1' } })
+  assert.equal(result.status, 0, result.stderr)
+  const metadata = JSON.parse(result.stdout)
+  const managed = spawnSync(process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3'),
+    [path.resolve('scripts/crate-release-lock.py'), 'manifests'], { cwd: root, encoding: 'utf8', env: {
+      PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: '1' } })
+  assert.equal(managed.status, 0, managed.stderr)
+  assert.deepEqual(JSON.parse(managed.stdout), metadata.managedManifests, 'Use exactly the existing stamper package set')
+  const example = metadata.packages.find((p) => p.name === 'bamboo-tool-event-recorder-example')
+  assert.equal(example.version, '0.1.0')
+  const options = { root, manifestPaths: metadata.managedManifests }
+  const server = verifyStampedVersions(metadata, identity.version, options)
+  assert.equal(server.name, 'bamboo-server')
+  assert.equal(server.version, identity.version)
+  assert.equal(metadata.packages.find((p) => p.name === 'bamboo-agent').version, identity.version)
+  assert.equal(example.version, '0.1.0', 'Do not stamp the independent example just to satisfy a release guard')
+  for (const manifest of metadata.managedManifests) {
+    const index = metadata.packages.findIndex((p) => p.manifest_path === path.resolve(fs.realpathSync(root), manifest))
+    assert.ok(index >= 0)
+    const wrong = clone(metadata); wrong.packages[index].version = '0.0.0'
+    assert.throws(() => verifyStampedVersions(wrong, identity.version, options))
+    const missing = clone(metadata); missing.packages.splice(index, 1)
+    assert.throws(() => verifyStampedVersions(missing, identity.version, options))
+    const repeated = clone(metadata); repeated.packages.push(clone(metadata.packages[index]))
+    assert.throws(() => verifyStampedVersions(repeated, identity.version, options))
+  }
+  for (const required of ['Cargo.toml', 'crates/app/bamboo-server/Cargo.toml']) {
+    assert.throws(() => verifyStampedVersions(metadata, identity.version, {
+      ...options, manifestPaths: options.manifestPaths.filter((p) => p !== required) }))
+  }
+  for (const extra of ['../Cargo.toml', metadata.managedManifests[0]]) {
+    assert.throws(() => verifyStampedVersions(metadata, identity.version, {
+      ...options, manifestPaths: [...options.manifestPaths, extra] }))
+  }
+})
+
+test('the shipped manual page allows HTTPS or loopback HTTP and rejects other origins before fetching', async () => {
+  const page = pathToFileURL(path.resolve('crates/infra/bamboo-skills/manual/site/app.mjs'))
+  const descriptors = new Map(['location', 'document', 'fetch'].map((name) =>
+    [name, Object.getOwnPropertyDescriptor(globalThis, name)]))
+  const cases = [
+    ['https://docs.example.test/manual/', true],
+    ['http://localhost:4173/manual/', true],
+    ['http://127.0.0.1:4173/manual/', true],
+    ['http://[::1]:4173/manual/', true],
+    ['http://example.test/manual/', false],
+    ['http://localhost.example.test/manual/', false],
+    ['http://127.0.0.1.example.test/manual/', false],
+    ['http://localhost@example.test/manual/', false],
+    ['http://0.0.0.0:4173/manual/', false],
+    ['file:///manual/index.html', false],
+    ['data:text/html,manual', false],
+    ['ftp://localhost/manual/', false],
+  ]
+  try {
+    for (const [index, [url, allowed]] of cases.entries()) {
+      let requests = 0
+      const identity = { textContent: '' }
+      Object.assign(globalThis, {
+        location: new URL(url),
+        document: { getElementById: (id) => { assert.equal(id, 'identity'); return identity } },
+        // Stop at the resource boundary. Never make a real HTTP/model request.
+        fetch: async () => { requests++; throw new Error('manual-origin fixture stops before any network') },
+      })
+      await import(`${page.href}?manual-origin-case=${index}`)
+      assert.equal(requests, allowed ? 2 : 0, url)
+      assert.match(identity.textContent, /Manual unavailable or failed integrity verification/)
+    }
+  } finally {
+    for (const [name, descriptor] of descriptors) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor)
+      else delete globalThis[name]
+    }
+  }
+})
 
 // Synthetic format fixtures only. They are never executed, installed as a real
 // product, or offered to the CLI publication entrypoint.
