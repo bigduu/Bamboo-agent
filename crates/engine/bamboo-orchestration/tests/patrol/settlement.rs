@@ -177,6 +177,7 @@ fn seed_failed_known_settlement() -> (SettlementProbe, ControlledProvider, Reser
     assert_eq!(reservation.request.deadline_ms, 150);
     assert_eq!(probe.host.usage(), 120);
     probe.host.fail_settle = true;
+    probe.host.fail_queue = true;
     provider.finish(Advice::Observe);
     settlement_pass(&mut probe, &mut provider, 101);
     assert_eq!(provider.polls, vec![reservation.operation.clone()]);
@@ -256,6 +257,21 @@ fn assert_unpaid_checkpoint_cannot_replace_receipt_usage_or_incident(probe: &Set
         checkpoint::validate_update(&old, &downgraded_usage),
         Err(PortError::Conflict)
     );
+    let mut orphan_usage = old.clone();
+    orphan_usage.incident.as_mut().unwrap().pending_settlement = None;
+    assert_eq!(
+        checkpoint::encode(10, &orphan_usage),
+        Err(PortError::Unavailable)
+    );
+    let mut over_cap = old.clone();
+    over_cap.incident.as_mut().unwrap().pending_settlement_usage = Some(Usage::Known {
+        input_tokens: model().max_input_tokens + 1,
+        output_tokens: 0,
+    });
+    assert_eq!(
+        checkpoint::encode(10, &over_cap),
+        Err(PortError::Unavailable)
+    );
     let mut next_incident = old.clone();
     let next = next_incident.incident.as_mut().unwrap();
     next.id.progress_sequence += 1;
@@ -280,6 +296,21 @@ fn known_settlement_retries_the_original_receipt_and_usage_live_and_after_codec_
             Some(SettlementSaveUnknown::AfterCommit),
         ] {
             let (mut probe, mut provider, original) = seed_failed_known_settlement();
+            // A ledger outage must not prevent the independent outbox retry.
+            probe.host.fresh_heartbeat(141);
+            probe.host.fail_queue = false;
+            let effects = settlement_effect_counts(&probe, &provider);
+            let settlements = probe.settlements.len();
+            settlement_pass(&mut probe, &mut provider, 141);
+            assert_pending_known_settlement(&probe, &original);
+            assert_eq!(settlement_effect_counts(&probe, &provider), effects);
+            assert_eq!(
+                &probe.settlements[settlements..],
+                &[(original.clone(), known_settlement_usage())]
+            );
+            let escalation = probe.incident().escalation.unwrap();
+            assert!(escalation.queued);
+            assert_eq!(escalation.deliveries, 2);
             if restart {
                 drop(provider);
                 probe = probe.reopen();
@@ -289,7 +320,7 @@ fn known_settlement_retries_the_original_receipt_and_usage_live_and_after_codec_
             let settlements = probe.settlements.len();
             probe.host.fail_settle = false;
             probe.next_save_unknown = unknown;
-            let result = configured().tick(&scope(), &FakeClock(111), &mut probe, &mut provider);
+            let result = configured().tick(&scope(), &FakeClock(142), &mut probe, &mut provider);
             if unknown.is_some() {
                 assert_eq!(result, Err(Error::Port(PortError::OutcomeUnknown)));
             } else {
@@ -312,7 +343,7 @@ fn known_settlement_retries_the_original_receipt_and_usage_live_and_after_codec_
                     Some(known_settlement_usage())
                 );
             }
-            settlement_pass(&mut probe, &mut provider, 112);
+            settlement_pass(&mut probe, &mut provider, 143);
             assert_known_settled(&probe, &original);
             let expected_calls = if matches!(unknown, Some(SettlementSaveUnknown::BeforeCommit)) {
                 2
@@ -324,7 +355,7 @@ fn known_settlement_retries_the_original_receipt_and_usage_live_and_after_codec_
                 .iter()
                 .all(|entry| entry == &(original.clone(), known_settlement_usage())));
             assert_eq!(settlement_effect_counts(&probe, &provider), effects);
-            settlement_pass(&mut probe, &mut provider, 113);
+            settlement_pass(&mut probe, &mut provider, 144);
             assert_known_settled(&probe, &original);
             assert_eq!(probe.settlements.len(), settlements + expected_calls);
             assert_eq!(settlement_effect_counts(&probe, &provider), effects);

@@ -536,6 +536,24 @@ impl Patrol {
         }
         cp.cursor = observation.cursor;
         cp.source_revision = observation.source_revision;
+        // An active diagnosis has a reservation but no completed usage yet.
+        // Only drain completed/legacy debt here, once per pass and with the
+        // original receipt. A retry never authorizes another provider call.
+        let retried_settlement = if let Some(incident) = cp.incident.as_mut() {
+            if !matches!(incident.phase, Phase::Diagnosing { .. }) {
+                if let Some(reservation) = incident.pending_settlement.clone() {
+                    let usage = incident.pending_settlement_usage.unwrap_or(Usage::Unknown);
+                    settle_usage(incident, &reservation, usage, host);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let sequence = observation.progress.map_or(0, |p| p.sequence);
         if let Some(incident) = cp.incident.as_mut() {
             let resumed = observation.progress.is_some_and(|p| {
@@ -563,6 +581,24 @@ impl Patrol {
                 cp.next_check_ms = cp.next_check_ms.min(wait.until_ms);
             }
         }
+        if retried_settlement
+            && cp
+                .incident
+                .as_ref()
+                .is_some_and(|i| matches!(i.phase, Phase::Resolved { .. }))
+        {
+            // Persist clearing the old receipt before a later pass may open a
+            // new incident. Failed or ambiguous CAS will retry the same pair.
+            save(host, &mut version, &mut cp)?;
+            return Ok(report(
+                &cp,
+                if detected.is_some() {
+                    Status::Blocked
+                } else {
+                    Status::Resolved
+                },
+            ));
+        }
         if detected.is_none()
             && cp
                 .incident
@@ -582,10 +618,11 @@ impl Patrol {
         let reason = detected
             .or_else(|| cp.incident.as_ref().map(|i| i.reason))
             .ok_or(Error::InvalidCheckpoint)?;
-        if cp.incident.is_none()
-            || cp.incident.as_ref().is_some_and(|i| {
-                matches!(i.phase, Phase::Resolved { .. }) && sequence > i.id.progress_sequence
-            })
+        if !retried_settlement
+            && (cp.incident.is_none()
+                || cp.incident.as_ref().is_some_and(|i| {
+                    matches!(i.phase, Phase::Resolved { .. }) && sequence > i.id.progress_sequence
+                }))
         {
             cp.incident = Some(Incident {
                 id: IncidentId {
@@ -629,7 +666,7 @@ impl Patrol {
                 now,
             );
         }
-        if incident.escalation.is_none() {
+        if !retried_settlement && incident.escalation.is_none() {
             match incident.phase.clone() {
                 Phase::Diagnosing { .. } => {
                     self.reconcile_diagnostic(&mut incident, &observation, now, host, provider)?;
@@ -975,8 +1012,17 @@ fn validate_checkpoint(cp: &Checkpoint, scope: &Scope) -> Result<(), Error> {
         || i.pending_settlement.as_ref().is_some_and(|r| {
             !diagnostic_operation(&r.operation)
                 || r.request.operation != r.operation
+                || r.request.input.scope != *scope
                 || !valid_id(&r.receipt)
         })
+        || i.pending_settlement_usage.is_some_and(|usage| {
+            i.pending_settlement.as_ref().is_none_or(|reservation| {
+                matches!(usage, Usage::Known { input_tokens, output_tokens }
+                    if input_tokens > reservation.request.model.max_input_tokens
+                        || output_tokens > reservation.request.model.max_output_tokens)
+            })
+        })
+        || (i.pending_settlement_usage.is_some() && matches!(i.phase, Phase::Diagnosing { .. }))
         || i.last_diagnosis.as_ref().is_some_and(|r| {
             !diagnostic_operation(&r.operation)
                 || r.source_revision > cp.source_revision

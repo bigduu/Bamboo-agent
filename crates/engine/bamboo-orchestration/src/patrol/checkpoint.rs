@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{Checkpoint, Phase, PortError, Scope, StoredCheckpoint};
+use super::{Checkpoint, Phase, PortError, Scope, StoredCheckpoint, Usage};
 
 pub const MAX_CHECKPOINT_BYTES: usize = 512 * 1024;
 const FORMAT: &str = "bamboo/patrol-checkpoint";
@@ -94,7 +94,8 @@ pub fn validate_update(previous: &Checkpoint, next: &Checkpoint) -> Result<(), P
             return Err(PortError::Conflict);
         };
         if old.id != new.id {
-            if !matches!(old.phase, Phase::Resolved { .. })
+            if old.pending_settlement.is_some()
+                || !matches!(old.phase, Phase::Resolved { .. })
                 || new.id.progress_sequence <= old.id.progress_sequence
             {
                 return Err(PortError::Conflict);
@@ -109,6 +110,24 @@ pub fn validate_update(previous: &Checkpoint, next: &Checkpoint) -> Result<(), P
                     && !matches!(new.phase, Phase::Resolved { .. }))
             {
                 return Err(PortError::Conflict);
+            }
+            if new.pending_settlement.is_none() && new.pending_settlement_usage.is_some() {
+                return Err(PortError::Conflict);
+            }
+            if let (Some(before), Some(after)) = (&old.pending_settlement, &new.pending_settlement)
+            {
+                if before != after
+                    || old
+                        .pending_settlement_usage
+                        .is_some_and(|usage| new.pending_settlement_usage != Some(usage))
+                    || (old.pending_settlement_usage.is_none()
+                        && !matches!(old.phase, Phase::Diagnosing { .. })
+                        && new
+                            .pending_settlement_usage
+                            .is_some_and(|usage| usage != Usage::Unknown))
+                {
+                    return Err(PortError::Conflict);
+                }
             }
             if let Some(prior) = &old.escalation {
                 let Some(current) = &new.escalation else {
