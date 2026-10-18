@@ -2,6 +2,7 @@ use super::*;
 
 use actix_web::{body::to_bytes, http::header, test, App};
 use bamboo_domain::{ProjectSidebarSection, Session, Storage};
+use fs2::FileExt;
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -10,6 +11,30 @@ use std::sync::{
 
 const SECTION: &str = "section:2d567c47-a081-4a8d-9c9e-246bce470c9f";
 const EMPTY_SECTION: &str = "section:28f595c0-21dc-4a86-8b83-5f8b258386fa";
+
+/// Hold the production account writer's actual cross-process journal claim.
+/// Unlock on unwind too, so a failed assertion cannot strand its blocking job.
+struct HeldAccountJournalClaim(std::fs::File);
+
+impl HeldAccountJournalClaim {
+    fn acquire(events_dir: &std::path::Path) -> Self {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(events_dir.join(".account-journal.lock"))
+            .unwrap();
+        FileExt::lock_exclusive(&file).unwrap();
+        Self(file)
+    }
+}
+
+impl Drop for HeldAccountJournalClaim {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
+}
 
 async fn fixture() -> (tempfile::TempDir, web::Data<AppState>, ProjectManifest) {
     let dir = tempfile::tempdir().unwrap();
@@ -242,6 +267,68 @@ async fn stored_over_limit_sidebar_remains_readable_and_metadata_edits_preserve_
         reopened.index().unwrap().projects[&project.id].sidebar,
         saved.sidebar
     );
+}
+
+#[actix_web::test]
+async fn metadata_patch_waits_for_durable_event_behind_real_journal_claim() {
+    let (_dir, state, project) = fixture().await;
+    let mut feed = state.account_sink.subscribe();
+    let cursor = state.account_sink.latest_seq();
+    let claim = HeldAccountJournalClaim::acquire(state.account_sink.events_dir());
+    let mut pending = Box::pin(patch(
+        &state,
+        &project.id,
+        Some(1),
+        json!({"name": "Renamed after durable publication"}),
+    ));
+
+    // Drive the metadata-only handler through its synchronous write and queue
+    // admission before starting the controlled delay. Neither is publication.
+    assert!(futures::poll!(pending.as_mut()).is_pending());
+    let saved = state.project_store.get(&project.id).unwrap();
+    assert_eq!(saved.revision, 2);
+    assert_eq!(saved.name, "Renamed after durable publication");
+    assert_eq!(state.account_sink.dropped_count(), 0);
+
+    // The actual writer remains behind its OS claim for longer than the old
+    // one-second fixture deadline. The PATCH helper must still be pending.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(1_100), pending.as_mut())
+            .await
+            .is_err()
+    );
+    assert_eq!(state.account_sink.latest_seq(), cursor);
+    assert!(matches!(
+        feed.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert!(
+        bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), cursor)
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(claim);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(8), pending)
+        .await
+        .expect("the real journal writer completes after its claim is released");
+    assert_eq!(response.status(), StatusCode::OK);
+    let returned: ProjectManifest = serde_json::from_value(body(response).await).unwrap();
+    assert_eq!(returned, saved);
+    let event = feed
+        .try_recv()
+        .expect("the helper returns only after the actual broadcast");
+    assert!(
+        matches!(&event.event, AgentEvent::ProjectUpdated { project_id, revision: 2 } if project_id == project.id.as_str())
+    );
+    let replay =
+        bamboo_engine::events::journal::read_since(state.account_sink.events_dir(), cursor)
+            .unwrap();
+    assert!(replay.iter().any(|durable| {
+        durable.seq == event.seq
+            && matches!(&durable.event, AgentEvent::ProjectUpdated { project_id, revision: 2 } if project_id == project.id.as_str())
+    }));
+    assert_eq!(state.account_sink.dropped_count(), 0);
 }
 
 #[actix_web::test]
