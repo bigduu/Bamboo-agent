@@ -523,3 +523,67 @@ async fn owner_scope_damaged_authority_fails_closed_without_repair() {
     f.state.shutdown().await;
     assert_eq!(std::fs::read(&runtime).unwrap(), damaged);
 }
+
+#[actix_web::test]
+async fn review_loopback_token_omission_cannot_self_grant_project_scope() {
+    let f = Fixture::new().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(f.state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    for forged in [false, true] {
+        let request = test::TestRequest::put()
+            .uri(URI)
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .set_json(f.update(0, vec![f.project.clone()]));
+        let request = if forged {
+            request
+                .insert_header(("X-Bamboo-Owner", "true"))
+                .insert_header(("Authorization", "Bearer bd1_worker_selected_value"))
+        } else {
+            request
+        };
+        let response = test::call_service(&app, request.to_request()).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "an omitted run token or caller-selected header is not owner approval"
+        );
+        let error: Value = test::read_body_json(response).await;
+        assert_eq!(error["code"], "host_owner_authorization_required");
+        let observed = SupervisorSessionService::new(f.state.storage.clone())
+            .inspect_scope(&f.reference)
+            .await
+            .unwrap();
+        assert_eq!(observed.state_revision, 0);
+        assert!(observed.allowed_projects.is_empty());
+    }
+    f.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn review_put_before_bootstrap_reports_missing_without_creating_identity() {
+    let home = tempfile::tempdir().unwrap();
+    let state = web::Data::new(Box::pin(AppState::new(home.path().into())).await.unwrap());
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let response=test::call_service(&app,test::TestRequest::put().uri(URI)
+        .peer_addr("127.0.0.1:12345".parse().unwrap())
+        .set_json(json!({"incarnation_id":uuid::Uuid::new_v4(),"expected_state_revision":0,"allowed_projects":[]})).to_request()).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let error: Value = test::read_body_json(response).await;
+    assert_eq!(error["code"], "supervisor_missing");
+    assert!(state
+        .storage
+        .load_root_authority(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .is_none());
+    state.shutdown().await;
+}
