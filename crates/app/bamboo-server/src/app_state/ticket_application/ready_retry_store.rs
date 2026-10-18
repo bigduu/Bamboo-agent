@@ -207,7 +207,7 @@ impl FileReadyRetryStore {
             return Err(unavailable("retry metadata exceeds its byte limit"));
         }
         let envelope: Envelope = serde_json::from_slice(&bytes)?;
-        if !matches!(envelope.state.schema, 1 | 2 | 3)
+        if !matches!(envelope.state.schema, 1..=3)
             || envelope.state.entries.len() > MAX_LEGACY_ENTRIES
             || content_hash(&canonical_bytes(&envelope.state)?) != envelope.sha256
         {
