@@ -8,7 +8,7 @@ on:
       - '.github/workflows/actor-snapshot-windows.yml'
       - 'scripts/actor-windows-native.ps1'
       - 'scripts/actor-windows-native.test.ps1'
-      - 'scripts/ci-policy.test.cjs'
+      # Generic CI policy assertions run in CI's Node checks, without a native build.
       # Shared build inputs can change the native reader or its test binaries.
       - '.cargo/config.toml'
       - 'Cargo.toml'
