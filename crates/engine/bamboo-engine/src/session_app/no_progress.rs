@@ -1,4 +1,4 @@
-//! Human control for a Root run paused after repeated unchanged observations.
+//! Compatibility for a Root already paused by the former progress detector.
 //!
 //! Uses the existing pending-question and response transaction. The question is
 //! an ordinary runtime-authored assistant message, never a fabricated tool call.
@@ -10,7 +10,9 @@ pub const QUESTION_TOOL_NAME: &str = "observation_progress";
 pub const CONTINUE_OPTION: &str = "Continue";
 pub const STOP_OPTION: &str = "Stop";
 const QUESTION_KIND: &str = "observation_progress_pause";
+#[cfg(test)]
 pub(crate) const QUESTION_TEXT: &str = "The same successful file observations stayed unchanged for six consecutive rounds, including three rounds after the progress reminder. The run is paused. Continue, stop, or provide a different approach.";
+#[cfg(test)]
 pub(crate) const QUIET_POLL_QUESTION_TEXT: &str = "Repeated command polls produced no new output after the quiet-command reminder. Polling is paused for diagnosis; the command remains pending. Continue waiting, stop this run, or provide a different approach. The handle belongs to this Host; an unread terminal result expires five minutes after completion. Silence does not prove completion or failure.";
 
 /// Match our own persisted runtime question, not another tool with a similar name.
@@ -29,10 +31,12 @@ pub fn is_no_progress_question(session: &Session, pending: &PendingQuestion) -> 
         })
 }
 
+#[cfg(test)]
 pub(crate) fn create_question(session: &mut Session, runtime_state: &mut AgentRuntimeState) {
     create_question_with_text(session, runtime_state, QUESTION_TEXT);
 }
 
+#[cfg(test)]
 pub(crate) fn create_question_with_text(
     session: &mut Session,
     runtime_state: &mut AgentRuntimeState,

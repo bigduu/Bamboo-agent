@@ -2668,23 +2668,138 @@ mod execution_input_http {
             model: &str,
         ) -> Result<LLMStream, LLMError> {
             assert_eq!(model, "test-model");
-            assert!(
-                messages
-                    .iter()
-                    .any(
-                        |message| message.content_parts.as_ref().is_some_and(|parts| parts
-                            .iter()
-                            .any(|part| matches!(
-                                part,
-                                bamboo_domain::MessagePart::ImageUrl { .. }
-                            )))
-                    ),
-                "explicit Vision support reaches the real provider with images"
-            );
+            let has_images = messages.iter().any(|message| {
+                message.content_parts.as_ref().is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
+                })
+            });
+            if self.support == Some(false) {
+                assert!(!has_images, "non-Vision main gets no image payload");
+                assert!(messages.iter().any(|message| {
+                    message.content.contains("bamboo-image://")
+                        && message.content.contains("not inspected")
+                }));
+            } else {
+                assert!(has_images, "explicit Vision support receives native images");
+            }
             self.received_image.store(true, Ordering::SeqCst);
             LocalProvider.chat_stream(messages, tools, max, model).await
         }
     }
+    async fn assert_vision_startup(
+        support: Option<bool>,
+        model: &str,
+        configured_vision: bool,
+        followup: bool,
+        expected: StatusCode,
+    ) {
+        let received = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(VisionStartupProvider {
+            support,
+            received_image: received.clone(),
+        });
+        let (_home, state, _fault) = state_with_provider(None, provider).await;
+        let id = format!("vision-startup-{support:?}-{model}-{configured_vision}-{followup}");
+        bootstrap(&state, &id).await;
+        let mut session = state.storage.load_session(&id).await.unwrap().unwrap();
+        session.model = model.into();
+        session.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", model));
+        let message = session
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|message| matches!(message.role, bamboo_agent_core::Role::User))
+            .unwrap();
+        message.content_parts = Some(vec![bamboo_domain::MessagePart::ImageUrl {
+            image_url: bamboo_domain::ImageUrlRef {
+                url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                detail: None,
+            },
+        }]);
+        let image_id = message.id.clone();
+        let image_before = serde_json::to_vec(&*message).unwrap();
+        if followup {
+            session.add_message(bamboo_agent_core::Message::assistant("earlier turn", None));
+            session.add_message(bamboo_agent_core::Message::user(
+                "inspect the earlier retained image",
+            ));
+        }
+        state.save_and_cache_session(&mut session).await;
+        {
+            let mut config = state.config.write().await;
+            config.hooks.image_fallback.enabled = true;
+            config.hooks.image_fallback.mode = "error".into();
+            if configured_vision {
+                config.features.provider_model_ref = true;
+                config.defaults = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "chat": {"provider": "openai", "model": "test-model"},
+                        "fast": {"provider": "openai", "model": "test-model"},
+                        "vision": {"provider": "unconstructed-vision", "model": "vision-fixture"}
+                    }))
+                    .unwrap(),
+                );
+                config.provider_instances.insert(
+                    "unconstructed-vision".into(),
+                    serde_json::from_value(serde_json::json!({
+                        "provider_type": "not-a-provider", "enabled": true,
+                        "model": "vision-fixture", "runtime_models": ["vision-fixture"],
+                        "model_capabilities": {"vision-fixture": {"supports_vision": true}}
+                    }))
+                    .unwrap(),
+                );
+            }
+        }
+        let mut events = state.get_session_event_sender(&id).await.subscribe();
+        let (status, body) = execute(&state, &id, None).await;
+        assert_eq!(status, expected, "{support:?} {model}: {body}");
+        if expected == StatusCode::ACCEPTED {
+            let run = body["run_id"].as_str().expect("accepted owned Root run");
+            wait_for_owned_terminal(&state, &id, run, &mut events).await;
+            assert!(
+                received.load(Ordering::SeqCst),
+                "completed main provider received native image or retained reference"
+            );
+        } else {
+            assert!(
+                !received.load(Ordering::SeqCst),
+                "rejected images are not dispatched"
+            );
+        }
+        let saved = state.storage.load_session(&id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_vec(
+                saved
+                    .messages
+                    .iter()
+                    .find(|message| message.id == image_id)
+                    .unwrap()
+            )
+            .unwrap(),
+            image_before,
+            "original durable image message is byte-identical",
+        );
+        if support == Some(false) && !configured_vision {
+            let error = body["error"]["message"]
+                .as_str()
+                .expect("canonical error.message");
+            assert!(error.contains("Original images"));
+            assert!(error.contains("preserved"));
+            assert!(error.contains("defaults.vision"));
+            assert!(error.contains("vision_model"));
+            assert!(error.contains("genuinely Vision-capable main"));
+        }
+        if expected == StatusCode::ACCEPTED {
+            tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+                .await
+                .expect("Vision HTTP fixture infrastructure shutdown");
+        } else {
+            shutdown_rejected_race(&state, &[&id]).await;
+        }
+    }
+
     #[actix_web::test]
     async fn vision_actual_execute_startup_uses_routed_model_before_legacy_error_fallback() {
         for (support, model, expected) in [
@@ -2693,59 +2808,25 @@ mod execution_input_http {
             (None, "test-model", StatusCode::BAD_REQUEST),
             (Some(true), "other-model", StatusCode::BAD_REQUEST),
         ] {
-            let received = Arc::new(AtomicBool::new(false));
-            let provider = Arc::new(VisionStartupProvider {
-                support,
-                received_image: received.clone(),
-            });
-            let (_home, state, _fault) = state_with_provider(None, provider).await;
-            let id = format!("vision-startup-{support:?}-{model}");
-            bootstrap(&state, &id).await;
-            let mut session = state.storage.load_session(&id).await.unwrap().unwrap();
-            session.model = model.into();
-            session.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", model));
-            let message = session
-                .messages
-                .iter_mut()
-                .rev()
-                .find(|message| matches!(message.role, bamboo_agent_core::Role::User))
-                .unwrap();
-            message.content_parts = Some(vec![bamboo_domain::MessagePart::ImageUrl {
-                image_url: bamboo_domain::ImageUrlRef {
-                    url: "data:image/png;base64,iVBORw0KGgo=".into(),
-                    detail: None,
-                },
-            }]);
-            state.save_and_cache_session(&mut session).await;
-            {
-                let mut config = state.config.write().await;
-                config.hooks.image_fallback.enabled = true;
-                config.hooks.image_fallback.mode = "error".into();
-            }
-            let (status, body) = execute(&state, &id, None).await;
-            assert_eq!(status, expected, "{support:?} {model}: {body}");
-            if expected == StatusCode::ACCEPTED {
-                tokio::time::timeout(std::time::Duration::from_secs(20), async {
-                    while !received.load(Ordering::SeqCst) {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .expect("real provider receives the supported image");
-            } else {
-                assert!(
-                    !received.load(Ordering::SeqCst),
-                    "rejected images are not dispatched"
-                );
-            }
-            let saved = state.storage.load_session(&id).await.unwrap().unwrap();
-            assert!(
-                saved
-                    .messages
-                    .iter()
-                    .any(|message| message.content_parts.is_some()),
-                "image history preserved"
-            );
+            assert_vision_startup(support, model, false, false, expected).await;
         }
+    }
+
+    #[actix_web::test]
+    async fn vision_nonvision_new_upload_reaches_main_with_references() {
+        assert_vision_startup(Some(false), "test-model", true, false, StatusCode::ACCEPTED).await;
+    }
+
+    #[actix_web::test]
+    async fn vision_nonvision_history_followup_reaches_main_with_references() {
+        assert_vision_startup(Some(false), "test-model", true, true, StatusCode::ACCEPTED).await;
+        assert_vision_startup(
+            Some(false),
+            "test-model",
+            false,
+            true,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
     }
 }

@@ -119,6 +119,20 @@ async fn submit_response_inner(
         .or(acquired_response_guard.as_ref())
         .expect("a response guard is supplied or acquired");
 
+    // A warm cache must not hide a future canonical contract or translate its
+    // explicit refusal into a generic storage failure. This read grants no
+    // reservation; the existing response CAS still owns consumption.
+    match state.storage.load_session(&session_id).await {
+        Ok(Some(session)) => {
+            if let Some(response) = crate::handlers::agent::sessions::SessionSummary::execution_conflict(&session) {
+                return Ok(response);
+            }
+        }
+        Ok(None) => {},
+        Err(error) => return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": crate::error::error_value(format!("Failed to inspect Session compatibility: {error}")),
+        }))),
+    }
     // Reload using the same durable-consumption rules as the response CAS
     // before creating a long-lived sender or reserving a successor runner.
     let preflight = match bamboo_engine::session_app::respond::inspect_pending_response_guarded(
@@ -142,6 +156,11 @@ async fn submit_response_inner(
             })));
         }
     };
+    if let Some(response) =
+        crate::handlers::agent::sessions::SessionSummary::execution_conflict(&preflight)
+    {
+        return Ok(response);
+    }
     let Some(pending) = preflight.pending_question.as_ref() else {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
             "error": crate::error::error_value("No pending question waiting for response")
