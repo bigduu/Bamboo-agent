@@ -101,6 +101,45 @@ function createManifest({ version, sourceRevision, artifacts, browserHost }) {
 
 function manifestBytes(value) { return Buffer.from(`${JSON.stringify(createManifest(value), null, 2)}\n`) }
 
+// Frozen recovery contract for already-signed schemaVersion 1 bytes. Future
+// constructors/serializers must not redefine this historical asset schema.
+function validateManifestV1(value, identity, builds) {
+  const keys = (object, expected) => assert.deepEqual(Object.keys(object).sort(), [...expected].sort())
+  keys(value, ['schemaVersion', 'version', 'sourceRevision', 'artifacts', 'browserHost'])
+  assert.equal(value.schemaVersion, 1)
+  assert.match(value.version, /^[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/)
+  assert.equal(value.version, identity.version)
+  assert.match(value.sourceRevision, /^[0-9a-f]{40}$/)
+  assert.equal(value.sourceRevision, identity.sourceRevision)
+  const targets = ['aarch64-apple-darwin', 'x86_64-apple-darwin',
+    'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu']
+  assert.ok(Array.isArray(value.artifacts))
+  assert.deepEqual(value.artifacts.map(item => item.target).sort(), targets)
+  for (const item of value.artifacts) {
+    keys(item, ['target', 'buildMode', 'embeddedFrontend', 'format', 'assetName', 'sha256', 'sizeBytes'])
+    const receipt = builds.find(build => build.target === item.target)
+    assert.ok(receipt)
+    for (const key of ['target', 'assetName', 'sha256', 'sizeBytes']) assert.equal(item[key], receipt[key])
+    assert.equal(item.buildMode, 'embedded')
+    assert.equal(item.embeddedFrontend, true)
+    assert.equal(item.format, 'raw')
+    requireDigest(item, 1024 * 1024 * 1024, 65536)
+  }
+  const host = value.browserHost
+  keys(host, ['assetName', 'sha256', 'sizeBytes', 'files'])
+  assert.equal(host.assetName, 'bamboo-browser-host-v1.tar.gz')
+  requireDigest(host, 8 * 1024 * 1024)
+  assert.ok(Array.isArray(host.files))
+  assert.deepEqual(host.files.map(file => file.path).sort(),
+    ['browser-runtime/host.cjs', 'browser-runtime/package-lock.json', 'browser-runtime/package.json'])
+  for (const file of host.files) {
+    keys(file, ['path', 'sha256', 'sizeBytes'])
+    requireDigest(file, 8 * 1024 * 1024)
+  }
+  assert.ok(host.files.reduce((sum, file) => sum + file.sizeBytes, 0) <= 8 * 1024 * 1024)
+  return value
+}
+
 function binaryArchitecture(file, target) {
   assert.ok(TARGETS.includes(target))
   const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
@@ -150,7 +189,9 @@ function workflowIdentity(env = process.env) {
   assert.match(version, /^[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/)
   assert.match(sourceRevision, SHA)
   const event = JSON.parse(fs.readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))
-  validateSource({ eventName: env.GITHUB_EVENT_NAME, event, repository: REPOSITORY, sourceRevision })
+  const validation = env.SOURCE_VALIDATION ? JSON.parse(env.SOURCE_VALIDATION) : undefined
+  validateSource({ eventName: env.GITHUB_EVENT_NAME, event, repository: REPOSITORY, sourceRevision,
+    sourceTree: git(['rev-parse', 'HEAD^{tree}']), validation })
   assert.match(env.GITHUB_RUN_ID, /^[1-9][0-9]*$/)
   assert.match(env.GITHUB_RUN_ATTEMPT, /^[1-9][0-9]*$/)
   assert.match(env.GITHUB_WORKFLOW_SHA, SHA)
@@ -158,7 +199,8 @@ function workflowIdentity(env = process.env) {
   assert.equal(git(['status', '--porcelain', '--untracked-files=all']), '', 'Release checkout must start clean')
   return { repository: REPOSITORY, version, sourceRevision, sourceTree: git(['rev-parse', 'HEAD^{tree}']),
     workflowRevision: env.GITHUB_WORKFLOW_SHA, runId: env.GITHUB_RUN_ID,
-    runAttempt: Number(env.GITHUB_RUN_ATTEMPT), ciRun: event.workflow_run.html_url }
+    runAttempt: Number(env.GITHUB_RUN_ATTEMPT), ciRun: (validation?.ciRun || event.workflow_run).html_url,
+    ...(validation ? { validation } : {}) }
 }
 
 function gh(route, options = {}) {
@@ -184,6 +226,7 @@ function publishedRelease(identity, { signingKey, signingKeyDigest, request = gh
   assert.equal(receipt.automatic, true)
   assert.equal(receipt.completed, true)
   assert.equal(receipt.ciRun, identity.ciRun)
+  if (identity.validation) assert.deepEqual(receipt.validation, identity.validation)
   assert.ok(receipt.crates.includes('bamboo-agent'))
   assert.ok(Array.isArray(release.assets))
   assert.equal(new Set(release.assets.map((asset) => asset.name)).size, release.assets.length)
@@ -201,6 +244,7 @@ function assetBytes(asset, maximum) {
 
 function validateBuildReceipt(receipt, identity, target) {
   assert.equal(receipt?.schemaVersion, 1)
+  if (identity.validation) assert.deepEqual(receipt.validation, identity.validation)
   for (const key of ['repository', 'version', 'sourceRevision', 'sourceTree', 'workflowRevision', 'runId', 'ciRun']) {
     assert.equal(receipt[key], identity[key], `Executable build provenance mismatch: ${key}`)
   }
@@ -260,13 +304,15 @@ function assembleRelease({ identity, inputDirectory, outputDirectory, sourceRoot
   })
   const browserHost = createBrowserHost({ sourceRoot, outputDirectory })
   const manifest = createManifest({ ...identity, artifacts: receipts, browserHost })
-  fs.writeFileSync(path.join(outputDirectory, MANIFEST), manifestBytes(manifest), { flag: 'wx' })
+  const originalManifestBytes = manifestBytes(manifest)
+  fs.writeFileSync(path.join(outputDirectory, MANIFEST), originalManifestBytes, { flag: 'wx' })
   // A failed final upload can rerun without changing immutable provenance.
   // Record the attempts that actually built these bytes, not the uploader's
   // later retry number (the complete per-target attempts remain in builds).
   const provenance = signReceipt({ schemaVersion: 1, kind: PROVENANCE_KIND, ...identity,
     runAttempt: Math.max(...receipts.map((item) => item.runAttempt)),
-    manifestSha256: sha256(manifestBytes(manifest)), builds: receipts }, signingKey)
+    manifestSha256: sha256(originalManifestBytes),
+    manifestBytesBase64: originalManifestBytes.toString('base64'), builds: receipts }, signingKey)
   fs.writeFileSync(path.join(outputDirectory, PROVENANCE),
     `${JSON.stringify(provenance, null, 2)}\n`, { flag: 'wx' })
   return manifest
@@ -275,7 +321,8 @@ function assembleRelease({ identity, inputDirectory, outputDirectory, sourceRoot
 // All binaries and the deterministic host precede provenance in the upload
 // order. Once that signed checkpoint exists, a later full workflow rerun can
 // finish the original manifest even if its new builds have different bytes.
-// Never adopt an unsigned receipt, a different run/source, or incomplete assets.
+// Preserve the authenticated original build run/controller even across a new
+// recovery dispatch. Never adopt unsigned, foreign-source/CI or incomplete assets.
 async function recoverPublishedRelease({ identity, release, outputDirectory, sourceRoot,
   frontendBytes, signingKey, readAsset }) {
   const checkpoint = release.assets.find((asset) => asset.name === PROVENANCE)
@@ -283,22 +330,50 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
   const bytes = await readAsset(checkpoint, 1024 * 1024)
   assert.ok(bytes.length <= 1024 * 1024)
   const proof = authenticateReceipt(JSON.parse(bytes), signingKey)
+  if (identity.validation) assert.deepEqual(proof.validation, identity.validation)
   assert.equal(proof.schemaVersion, 1)
   assert.equal(proof.kind, PROVENANCE_KIND)
-  for (const key of ['repository', 'version', 'sourceRevision', 'sourceTree', 'workflowRevision', 'runId', 'ciRun']) {
+  for (const key of ['repository', 'version', 'sourceRevision', 'sourceTree', 'ciRun']) {
     assert.equal(proof[key], identity[key], `Recovery provenance mismatch: ${key}`)
   }
+  assert.match(proof.workflowRevision, SHA)
+  assert.match(proof.runId, /^[1-9][0-9]*$/)
+  assert.ok(Number.isSafeInteger(proof.runAttempt) && proof.runAttempt >= 1)
+  // Authentication binds the original controller/run and each platform receipt.
+  // The caller already revalidates current protected-main promotion; a later
+  // dispatch must not relabel the immutable checkpoint as its own fresh build.
+  const originalBuildIdentity = { ...identity, workflowRevision: proof.workflowRevision,
+    runId: proof.runId, runAttempt: proof.runAttempt }
   assert.deepEqual(proof.builds?.map((item) => item.target), TARGETS)
   for (const item of proof.builds) {
-    validateBuildReceipt(item, identity, item.target)
+    validateBuildReceipt(item, originalBuildIdentity, item.target)
     assert.deepEqual(item.frontendBytes, frontendBytes)
   }
   assert.equal(proof.runAttempt, Math.max(...proof.builds.map((item) => item.runAttempt)))
-  const browserHost = createBrowserHost({ sourceRoot, outputDirectory })
-  const manifest = createManifest({ ...identity, artifacts: proof.builds, browserHost })
-  assert.equal(sha256(manifestBytes(manifest)), proof.manifestSha256,
+  let originalManifestBytes, legacyHostCreated = false
+  if (proof.manifestBytesBase64 !== undefined) {
+    assert.equal(typeof proof.manifestBytesBase64, 'string')
+    originalManifestBytes = Buffer.from(proof.manifestBytesBase64, 'base64')
+    assert.equal(originalManifestBytes.toString('base64'), proof.manifestBytesBase64)
+  } else {
+    const committed = release.assets.find((asset) => asset.name === MANIFEST)
+    if (committed) originalManifestBytes = await readAsset(committed, 1024 * 1024)
+    else {
+      // Legacy checkpoints lack the original serialized manifest. Keep their
+      // existing deterministic compatibility route; new checkpoints never use it.
+      const browserHost = createBrowserHost({ sourceRoot, outputDirectory })
+      originalManifestBytes = manifestBytes(createManifest({ ...identity, artifacts: proof.builds, browserHost }))
+      legacyHostCreated = true
+    }
+  }
+  assert.ok(originalManifestBytes.length > 0 && originalManifestBytes.length <= 1024 * 1024)
+  assert.equal(sha256(originalManifestBytes), proof.manifestSha256,
     'Recovery manifest does not match the authenticated checkpoint')
-  const required = [...proof.builds, browserHost]
+  const manifest = JSON.parse(originalManifestBytes.toString('utf8'))
+  // Validate the v1 contract and signed build identities without reserializing
+  // the original bytes or running the current controller's archive builder.
+  validateManifestV1(manifest, identity, proof.builds)
+  const required = [...proof.builds, manifest.browserHost]
   assert.ok(required.every((item) => release.assets.some((asset) => asset.name === item.assetName)),
     'Authenticated checkpoint has missing release assets')
   for (const item of required) {
@@ -306,14 +381,14 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
     const data = await readAsset(asset, item.sizeBytes)
     assert.deepEqual({ sha256: sha256(data), sizeBytes: data.length },
       { sha256: item.sha256, sizeBytes: item.sizeBytes }, 'Recovery asset differs from authenticated provenance')
-    if (item.target) {
-      const file = path.join(outputDirectory, item.assetName)
-      fs.writeFileSync(file, data, { flag: 'wx' })
-      binaryArchitecture(file, item.target)
-    }
+    const file = path.join(outputDirectory, item.assetName)
+    if (item.assetName === HOST_ASSET && legacyHostCreated) {
+      assert.deepEqual(fs.readFileSync(file), data)
+    } else fs.writeFileSync(file, data, { flag: 'wx' })
+    if (item.target) binaryArchitecture(file, item.target)
   }
   fs.writeFileSync(path.join(outputDirectory, PROVENANCE), bytes, { flag: 'wx' })
-  fs.writeFileSync(path.join(outputDirectory, MANIFEST), manifestBytes(manifest), { flag: 'wx' })
+  fs.writeFileSync(path.join(outputDirectory, MANIFEST), originalManifestBytes, { flag: 'wx' })
   return manifest
 }
 
@@ -375,11 +450,11 @@ async function main() {
   assert.equal(git(['rev-parse', 'HEAD']), identity.sourceRevision)
   assert.equal(git(['status', '--porcelain', '--untracked-files=all']), '')
   console.log(JSON.stringify({ status: 'published-and-verified', version: identity.version,
-    sourceRevision: identity.sourceRevision, manifestSha256: sha256(manifestBytes(manifest)), targets: TARGETS }))
+    sourceRevision: identity.sourceRevision, manifestSha256: fileIdentity(path.join(directory, MANIFEST), 1024 * 1024).sha256, targets: TARGETS }))
 }
 
 module.exports = { REPOSITORY, MANIFEST, HOST_ASSET, PROVENANCE, TARGETS, HOST_FILES, MAX_BINARY, MAX_HOST,
-  artifactName, targetOutputKey, sha256, fileIdentity, createBrowserHost, createManifest, manifestBytes,
+  artifactName, targetOutputKey, sha256, fileIdentity, createBrowserHost, createManifest, manifestBytes, validateManifestV1,
   binaryArchitecture, execute, git, workflowIdentity, publishedRelease, assetBytes,
   validateBuildReceipt, expectedBuildBindings, assembleRelease, recoverPublishedRelease, publishAssets }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })

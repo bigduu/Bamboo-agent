@@ -1,16 +1,15 @@
 name: CI
 
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
     inputs:
       snapshot_sha:
         description: Exact 40-character SHA of the selected ref to validate as one frozen batch
         required: true
         type: string
-  # Dev admission requires a real compile; related tests run in the executor
-  # before merge. Full CI tests belong to snapshots, promotions and main pushes.
-  push:
-    branches: [ main ]
+  # Protected main-push CI supplies the existing automatic publication authority.
   pull_request:
     branches: [ dev, main ]
 

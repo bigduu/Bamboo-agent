@@ -94,8 +94,9 @@ function assertManualVersion(version, now = new Date()) {
   return version
 }
 
-function validateSource({ eventName, event, repository, sourceRevision }) {
+function validateSource({ eventName, event, repository, sourceRevision, sourceTree, validation }) {
   assert.match(sourceRevision, SHA)
+  // A caller-supplied historical dispatch proof is not new publication authority.
   assert.equal(eventName, 'workflow_run', 'Unsupported release trigger')
   const run = event.workflow_run
   assert.equal(run?.name, 'CI')
@@ -185,7 +186,8 @@ async function plan(context) {
   }
   const receipt = { schemaVersion: 1, version, identity, crates,
     frontendBytes: context.frontendBytes, automatic: true, completed: false,
-    ciRun: context.ciRun || null, packageChecksums: {} }
+    ciRun: context.ciRun || null, packageChecksums: {},
+    ...(context.validation ? { validation: context.validation } : {}) }
   // Reserve before uploading any crate. An uncertain GitHub write is recovered
   // by reading this exact tag on a rerun, never by allocating another version.
   const reserved = await context.reserve(receipt)
@@ -399,7 +401,7 @@ function receiptBody(receipt) {
   return `${receipt.completed ? 'Published' : 'Reserved'} Bamboo ${receipt.version}.\n\n` +
     `Source: [${sourceRevision}](https://github.com/${repository}/commit/${sourceRevision})\n\n` +
     `Frontend: ${frontend.packageName}@${frontend.packageVersion}\n\n` +
-    (receipt.ciRun ? `Validated main CI: ${receipt.ciRun}\n\n` : '') +
+    (receipt.ciRun ? `Validated release CI: ${receipt.ciRun}\n\n` : '') +
     'Provenance binds the source, preserved frontend bytes and each crate checksum.\n\n' +
     `<!-- bamboo-release-provenance\n${JSON.stringify(receipt)}\n-->`
 }
@@ -493,8 +495,12 @@ function makeContext(env = process.env) {
   assert.equal(repository, 'bigduu/Bamboo-agent')
   const sourceRevision = command(['git', 'rev-parse', 'HEAD']).trim()
   const event = JSON.parse(fs.readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))
-  const automatic = validateSource({ eventName: env.GITHUB_EVENT_NAME, event, repository, sourceRevision })
-  return makeVerifiedContext(env, repository, sourceRevision, event.workflow_run, automatic)
+  const validation = env.SOURCE_VALIDATION ? JSON.parse(env.SOURCE_VALIDATION) : undefined
+  const automatic = validateSource({ eventName: env.GITHUB_EVENT_NAME, event, repository, sourceRevision,
+    sourceTree: command(['git', 'rev-parse', 'HEAD^{tree}']).trim(), validation })
+  const context = makeVerifiedContext(env, repository, sourceRevision, validation?.ciRun || event.workflow_run, automatic)
+  if (validation) context.validation = validation
+  return context
 }
 
 function makeRecoveryContext(env = process.env) {
