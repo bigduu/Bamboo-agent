@@ -939,7 +939,12 @@ async fn source_change_requires_explicit_adoption_and_a_new_native_start() {
         let owner = Principal::User {
             user_id: "fixture-host-owner".into(),
         };
-        let (service, authority) = fixture.state.tickets.authority(owner.clone()).await.unwrap();
+        let (service, authority) = fixture
+            .state
+            .tickets
+            .authority(owner.clone())
+            .await
+            .unwrap();
         let command = service
             .prepare_command(&authority, operation_id, operations)
             .unwrap();
@@ -954,10 +959,16 @@ async fn source_change_requires_explicit_adoption_and_a_new_native_start() {
     let owner = Principal::User {
         user_id: "fixture-host-owner".into(),
     };
-    let (service, authority) = fixture.state.tickets.authority(owner.clone()).await.unwrap();
+    let (service, authority) = fixture
+        .state
+        .tickets
+        .authority(owner.clone())
+        .await
+        .unwrap();
     let original = fixture.snapshot().project.contexts[&old_hash].clone();
     let mut next = original.clone();
-    next.sources.insert("fixture-spec".into(), NEXT_SOURCE.into());
+    next.sources
+        .insert("fixture-spec".into(), NEXT_SOURCE.into());
     fixture
         .state
         .tickets
@@ -966,10 +977,19 @@ async fn source_change_requires_explicit_adoption_and_a_new_native_start() {
         .unwrap();
     let first_request = fixture.next_request().await;
     assert!(first_request.is_work(0));
-    assert!(!first_request.messages.iter().any(|m| m.content.contains(NEXT_SOURCE)));
+    assert!(!first_request
+        .messages
+        .iter()
+        .any(|m| m.content.contains(NEXT_SOURCE)));
     let first_running = fixture.snapshot();
-    let first_id = first_running.tickets[&work_id].active_assignment.as_ref().unwrap().clone();
-    let packet = service.child_context_packet(&authority, &first_id, 65536).unwrap();
+    let first_id = first_running.tickets[&work_id]
+        .active_assignment
+        .as_ref()
+        .unwrap()
+        .clone();
+    let packet = service
+        .child_context_packet(&authority, &first_id, 65536)
+        .unwrap();
     assert_eq!(packet.project_context, Some(original.clone()));
 
     // A source pin is an execution input: a live run cannot adopt it, even
@@ -979,35 +999,67 @@ async fn source_change_requires_explicit_adoption_and_a_new_native_start() {
         .prepare_command(
             &authority,
             "source-change-while-running",
-            vec![Operation::SetProjectContext { work_id: work_id.clone(), context: next.clone() }],
+            vec![Operation::SetProjectContext {
+                work_id: work_id.clone(),
+                context: next.clone(),
+            }],
         )
         .unwrap();
-    assert!(matches!(fixture.state.tickets.update(owner.clone(), &premature).await,
-        Err(Error::InvalidTransition(_))));
+    assert!(matches!(
+        fixture
+            .state
+            .tickets
+            .update(owner.clone(), &premature)
+            .await,
+        Err(Error::InvalidTransition(_))
+    ));
     assert_eq!(service.published().unwrap().0, live_commit);
     fixture.state.tickets.revoke_ready_work_policy().await;
     first_request.task();
     let first_result = fixture.next_request().await;
     assert!(first_result.messages.iter().any(|m| m.role == Role::Tool
-        && m.tool_call_id.as_deref() == Some(TASK_CALL) && m.tool_success == Some(true)));
+        && m.tool_call_id.as_deref() == Some(TASK_CALL)
+        && m.tool_success == Some(true)));
     first_result.complete();
     fixture.wait_submitted(&work_id).await;
-    let first_receipt = fixture.snapshot().assignments[&first_id].runtime.as_ref().unwrap().clone();
+    let first_receipt = fixture.snapshot().assignments[&first_id]
+        .runtime
+        .as_ref()
+        .unwrap()
+        .clone();
     let first_child = wait_native_terminal(&fixture.state, &first_receipt.session_id).await;
     let first_done = fixture.snapshot();
     let first = first_done.assignments[&first_id].clone();
-    let first_dispatch = ticket_runtime::read_dispatch(&first_child).unwrap().unwrap();
+    let first_dispatch = ticket_runtime::read_dispatch(&first_child)
+        .unwrap()
+        .unwrap();
     let first_intent = first_done.intents[&first.dispatch_key].clone();
-    let first_submission_id = first_done.tickets[&work_id].current_submission.as_ref().unwrap().clone();
+    let first_submission_id = first_done.tickets[&work_id]
+        .current_submission
+        .as_ref()
+        .unwrap()
+        .clone();
     let first_submission = first_done.submissions[&first_submission_id].clone();
     assert!(first.process_stopped);
     assert_eq!(first_done.project.assignment_contexts[&first_id], old_hash);
-    assert_eq!(first_intent.immutable_spec.project_context_hash.as_ref(), Some(&old_hash));
+    assert_eq!(
+        first_intent.immutable_spec.project_context_hash.as_ref(),
+        Some(&old_hash)
+    );
     assert!(first_done.tickets[&work_id].accepted_submission.is_none());
     let assert_history = |snapshot: &Snapshot| {
-        assert_eq!(serde_json::to_value(&snapshot.assignments[&first_id]).unwrap(), serde_json::to_value(&first).unwrap());
-        assert_eq!(serde_json::to_value(&snapshot.intents[&first.dispatch_key]).unwrap(), serde_json::to_value(&first_intent).unwrap());
-        assert_eq!(serde_json::to_value(&snapshot.submissions[&first_submission_id]).unwrap(), serde_json::to_value(&first_submission).unwrap());
+        assert_eq!(
+            serde_json::to_value(&snapshot.assignments[&first_id]).unwrap(),
+            serde_json::to_value(&first).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&snapshot.intents[&first.dispatch_key]).unwrap(),
+            serde_json::to_value(&first_intent).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&snapshot.submissions[&first_submission_id]).unwrap(),
+            serde_json::to_value(&first_submission).unwrap()
+        );
         assert_eq!(snapshot.project.assignment_contexts[&first_id], old_hash);
         assert_eq!(snapshot.project.contexts[&old_hash], original);
     };
@@ -1019,23 +1071,54 @@ async fn source_change_requires_explicit_adoption_and_a_new_native_start() {
         .prepare_command(
             &authority,
             "source-change-before-reject",
-            vec![Operation::SetProjectContext { work_id: work_id.clone(), context: next.clone() }],
+            vec![Operation::SetProjectContext {
+                work_id: work_id.clone(),
+                context: next.clone(),
+            }],
         )
         .unwrap();
-    assert!(matches!(fixture.state.tickets.update(owner.clone(), &premature).await,
-        Err(Error::InvalidTransition(_))));
+    assert!(matches!(
+        fixture
+            .state
+            .tickets
+            .update(owner.clone(), &premature)
+            .await,
+        Err(Error::InvalidTransition(_))
+    ));
     assert_eq!(service.published().unwrap().0, submitted_commit);
-    let (adopt, receipt) = commit(&fixture, "explicit-source-v2", vec![
-        Operation::Reject { work_id: work_id.clone(), submission_id: first_submission_id.clone(), reason: "Repeat against the explicitly selected source v2".into() },
-        Operation::SetProjectContext { work_id: work_id.clone(), context: next.clone() },
-    ]).await;
+    let (adopt, receipt) = commit(
+        &fixture,
+        "explicit-source-v2",
+        vec![
+            Operation::Reject {
+                work_id: work_id.clone(),
+                submission_id: first_submission_id.clone(),
+                reason: "Repeat against the explicitly selected source v2".into(),
+            },
+            Operation::SetProjectContext {
+                work_id: work_id.clone(),
+                context: next.clone(),
+            },
+        ],
+    )
+    .await;
     let adopted_commit = service.published().unwrap().0;
-    assert_eq!(fixture.state.tickets.update(owner.clone(), &adopt).await.unwrap(), receipt);
+    assert_eq!(
+        fixture
+            .state
+            .tickets
+            .update(owner.clone(), &adopt)
+            .await
+            .unwrap(),
+        receipt
+    );
     assert_eq!(service.published().unwrap().0, adopted_commit);
     let mut stale = adopt.clone();
     stale.operation_id = "stale-source-adoption".into();
-    assert!(matches!(fixture.state.tickets.update(owner.clone(), &stale).await,
-        Err(Error::RevisionConflict)));
+    assert!(matches!(
+        fixture.state.tickets.update(owner.clone(), &stale).await,
+        Err(Error::RevisionConflict)
+    ));
     assert_eq!(service.published().unwrap().0, adopted_commit);
 
     let adopted = fixture.snapshot();
@@ -1046,8 +1129,13 @@ async fn source_change_requires_explicit_adoption_and_a_new_native_start() {
     assert!(adopted.tickets[&work_id].current_submission.is_none());
     assert_history(&adopted);
     let board_request = ProjectBoardRequest {
-        project_id: fixture.project.clone(), include_cancelled: false, include_archived: false,
-        sprint_filter: None, limit: 10, cursor: None, fixed_commit: None,
+        project_id: fixture.project.clone(),
+        include_cancelled: false,
+        include_archived: false,
+        sprint_filter: None,
+        limit: 10,
+        cursor: None,
+        fixed_commit: None,
     };
     let board = service.project_board(&authority, &board_request).unwrap();
     assert_eq!(board.data.rows[0].adopted_context, Some(original.clone()));
@@ -1055,9 +1143,16 @@ async fn source_change_requires_explicit_adoption_and_a_new_native_start() {
 
     // Neither source adoption nor a wake turns the original first-generation
     // Ready grant into a repeated execution or a cross-run budget grant.
-    fixture.state.tickets.install_ready_work_policy(fixture.policy(1)).await.unwrap();
-    assert!(matches!(fixture.state.tickets.reconcile_ready_work().await.unwrap(),
-        ReadyReconcile::Idle));
+    fixture
+        .state
+        .tickets
+        .install_ready_work_policy(fixture.policy(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture.state.tickets.reconcile_ready_work().await.unwrap(),
+        ReadyReconcile::Idle
+    ));
     fixture.state.tickets.wake_ready_work();
     fixture.assert_quiet(2).await;
     let blocked = fixture.snapshot();
@@ -1069,23 +1164,50 @@ async fn source_change_requires_explicit_adoption_and_a_new_native_start() {
 
     // The existing explicit Host dispatch endpoint owns this second Start;
     // this test does not widen the Ready MVP's generation-zero selection.
-    let start = service.prepare_command(&authority, "explicit-source-v2-start", vec![
-        Operation::Start { work_id: work_id.clone(), temp_id: "next".into(), workspace: Some(fixture.works[0].workspace.clone()) },
-    ]).unwrap();
-    let dispatched = fixture.state.tickets.dispatch(owner.clone(), &start).await.unwrap();
+    let start = service
+        .prepare_command(
+            &authority,
+            "explicit-source-v2-start",
+            vec![Operation::Start {
+                work_id: work_id.clone(),
+                temp_id: "next".into(),
+                workspace: Some(fixture.works[0].workspace.clone()),
+            }],
+        )
+        .unwrap();
+    let dispatched = fixture
+        .state
+        .tickets
+        .dispatch(owner.clone(), &start)
+        .await
+        .unwrap();
     assert_eq!(dispatched["status"], "accepted_for_dispatch");
     assert!(dispatched["errors"].as_array().unwrap().is_empty());
-    let replay = fixture.state.tickets.dispatch(owner.clone(), &start).await.unwrap();
+    let replay = fixture
+        .state
+        .tickets
+        .dispatch(owner.clone(), &start)
+        .await
+        .unwrap();
     assert_eq!(replay["receipt"], dispatched["receipt"]);
     assert!(replay["errors"].as_array().unwrap().is_empty());
     let second_request = fixture.next_request().await;
     assert!(second_request.is_work(0));
-    assert!(second_request.messages.iter().any(|m| m.content.contains(NEXT_SOURCE)),
-        "the actual new Worker prompt carries its explicitly adopted source pin");
+    assert!(
+        second_request
+            .messages
+            .iter()
+            .any(|m| m.content.contains(NEXT_SOURCE)),
+        "the actual new Worker prompt carries its explicitly adopted source pin"
+    );
     let second_running = fixture.snapshot();
     assert_eq!(second_running.tickets.len(), 1);
     assert_eq!(second_running.assignments.len(), 2);
-    let second_id = second_running.tickets[&work_id].active_assignment.as_ref().unwrap().clone();
+    let second_id = second_running.tickets[&work_id]
+        .active_assignment
+        .as_ref()
+        .unwrap()
+        .clone();
     assert_ne!(second_id, first_id);
     let second = second_running.assignments[&second_id].clone();
     let second_receipt = second.runtime.as_ref().unwrap().clone();
@@ -1094,9 +1216,24 @@ async fn source_change_requires_explicit_adoption_and_a_new_native_start() {
     assert_eq!(second.allowed_tools, first.allowed_tools);
     assert_ne!(second_receipt.session_id, first_receipt.session_id);
     assert_ne!(second_receipt.run_id, first_receipt.run_id);
-    assert_eq!(second_running.project.assignment_contexts[&second_id], next_hash);
-    assert_eq!(second_running.intents[&second.dispatch_key].immutable_spec.project_context_hash.as_ref(), Some(&next_hash));
-    assert_eq!(service.child_context_packet(&authority, &second_id, 65536).unwrap().project_context, Some(next.clone()));
+    assert_eq!(
+        second_running.project.assignment_contexts[&second_id],
+        next_hash
+    );
+    assert_eq!(
+        second_running.intents[&second.dispatch_key]
+            .immutable_spec
+            .project_context_hash
+            .as_ref(),
+        Some(&next_hash)
+    );
+    assert_eq!(
+        service
+            .child_context_packet(&authority, &second_id, 65536)
+            .unwrap()
+            .project_context,
+        Some(next.clone())
+    );
     assert_history(&second_running);
     let board = service.project_board(&authority, &board_request).unwrap();
     assert_eq!(board.data.rows[0].adopted_context, Some(next.clone()));
@@ -1105,37 +1242,69 @@ async fn source_change_requires_explicit_adoption_and_a_new_native_start() {
     second_request.task();
     let second_result = fixture.next_request().await;
     assert!(second_result.messages.iter().any(|m| m.role == Role::Tool
-        && m.tool_call_id.as_deref() == Some(TASK_CALL) && m.tool_success == Some(true)));
+        && m.tool_call_id.as_deref() == Some(TASK_CALL)
+        && m.tool_success == Some(true)));
     second_result.complete();
     fixture.wait_submitted(&work_id).await;
     let second_child = wait_native_terminal(&fixture.state, &second_receipt.session_id).await;
     let final_snapshot = fixture.snapshot();
     assert_eq!(final_snapshot.tickets[&work_id].state, WorkState::Submitted);
-    assert!(final_snapshot.tickets[&work_id].accepted_submission.is_none());
+    assert!(final_snapshot.tickets[&work_id]
+        .accepted_submission
+        .is_none());
     assert_eq!(final_snapshot.assignments.len(), 2);
     assert_eq!(final_snapshot.intents.len(), 2);
     assert_eq!(final_snapshot.submissions.len(), 2);
     assert!(final_snapshot.assignments[&second_id].process_stopped);
-    let current = &final_snapshot.submissions[final_snapshot.tickets[&work_id].current_submission.as_ref().unwrap()];
+    let current = &final_snapshot.submissions[final_snapshot.tickets[&work_id]
+        .current_submission
+        .as_ref()
+        .unwrap()];
     assert_eq!(current.assignment_id, second_id);
     assert_eq!(current.runtime, second_receipt);
     assert_history(&final_snapshot);
-    assert_eq!(second_child.agent_runtime_state.as_ref().unwrap().round.max_rounds, Some(MAX_ROUNDS));
-    let old_child = fixture.state.storage.load_session(&first_receipt.session_id).await.unwrap().unwrap();
-    assert_eq!(ticket_runtime::read_dispatch(&old_child).unwrap().unwrap(), first_dispatch);
+    assert_eq!(
+        second_child
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .round
+            .max_rounds,
+        Some(MAX_ROUNDS)
+    );
+    let old_child = fixture
+        .state
+        .storage
+        .load_session(&first_receipt.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ticket_runtime::read_dispatch(&old_child).unwrap().unwrap(),
+        first_dispatch
+    );
 
     let final_commit = service.published().unwrap().0;
-    let obsolete = service.prepare_command(&authority, "cannot-accept-old-source-result", vec![
-        Operation::Accept { work_id: work_id.clone(), submission_id: first_submission_id, evidence: vec!["Old result is not the new current submission".into()] },
-    ]).unwrap();
-    assert!(matches!(fixture.state.tickets.update(owner, &obsolete).await,
-        Err(Error::InvalidTransition(_))));
+    let obsolete = service
+        .prepare_command(
+            &authority,
+            "cannot-accept-old-source-result",
+            vec![Operation::Accept {
+                work_id: work_id.clone(),
+                submission_id: first_submission_id,
+                evidence: vec!["Old result is not the new current submission".into()],
+            }],
+        )
+        .unwrap();
+    assert!(matches!(
+        fixture.state.tickets.update(owner, &obsolete).await,
+        Err(Error::InvalidTransition(_))
+    ));
     assert_eq!(service.published().unwrap().0, final_commit);
     fixture.assert_quiet(4).await;
     fixture.state.tickets.revoke_ready_work_policy().await;
     fixture.state.shutdown().await;
 }
-
 
 #[tokio::test]
 async fn pending_metadata_preserves_original_native_admission_and_resource_guard() {
