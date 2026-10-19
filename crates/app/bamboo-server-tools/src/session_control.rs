@@ -25,6 +25,7 @@ pub mod versioned {
         creator: Arc<dyn SupervisedRootCreatePort>,
         storage: Arc<dyn Storage>,
         config: Arc<RwLock<bamboo_llm::Config>>,
+        installed: Arc<dyn ToolExecutor>,
     }
 
     impl SpawnSessionTool {
@@ -32,11 +33,13 @@ pub mod versioned {
             creator: Arc<dyn SupervisedRootCreatePort>,
             storage: Arc<dyn Storage>,
             config: Arc<RwLock<bamboo_llm::Config>>,
+            installed: Arc<dyn ToolExecutor>,
         ) -> Self {
             Self {
                 creator,
                 storage,
                 config,
+                installed,
             }
         }
 
@@ -72,7 +75,7 @@ pub mod versioned {
                 bamboo_domain::resolve_session_tool_reference(
                     canonical.session_version,
                     reference,
-                    |name| name == "spawn_session" || name == "SubAgent",
+                    |name| name == "spawn_session" || self.installed.owns_exact_tool(name),
                 )
                 .as_deref()
                     == Some("spawn_session")

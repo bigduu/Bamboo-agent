@@ -114,7 +114,12 @@ const STRICT_ARGUMENT_TOOL_NAMES: [&str; 11] = [
 ];
 
 fn normalize_tool_for_policy(raw_tool_name: &str, admitted_execution_name: Option<&str>) -> String {
-    let selected = admitted_execution_name.unwrap_or(raw_tool_name).trim();
+    if let Some(execution_name) = admitted_execution_name {
+        // Admission already selected an exact registered owner. Legacy alias
+        // normalization here would charge a Root/custom failure to SubAgent.
+        return execution_name.to_owned();
+    }
+    let selected = raw_tool_name.trim();
     let name = bamboo_tools::normalize_tool_ref(selected)
         .unwrap_or_else(|| normalize_tool_name(selected).trim().to_string());
     if matches!(name.as_str(), "exec_command" | "write_stdin") {

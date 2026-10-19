@@ -728,6 +728,7 @@ async fn versioned_spawn_uses_an_explicit_independent_checkout_and_recovers_firs
         Arc::new(f.creator.clone()),
         f.creator.store.clone(),
         f.creator.config.clone(),
+        Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(bamboo_tools::ToolRegistry::new())),
     );
     f.activation.fail.store(true, Ordering::SeqCst);
     let ToolOutcome::Completed(result) = tool
@@ -777,6 +778,7 @@ async fn versioned_spawn_uses_an_explicit_independent_checkout_and_recovers_firs
         Arc::new(reopened.clone()),
         reopened.store.clone(),
         reopened.config.clone(),
+        Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(bamboo_tools::ToolRegistry::new())),
     );
     let ToolOutcome::Completed(result) = replay_tool
         .invoke(
@@ -812,6 +814,7 @@ async fn versioned_spawn_disabled_stale_and_invalid_scope_refusals_have_no_side_
         Arc::new(f.creator.clone()),
         f.creator.store.clone(),
         f.creator.config.clone(),
+        Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(bamboo_tools::ToolRegistry::new())),
     );
     for case in [
         "ordinary",
@@ -903,7 +906,7 @@ async fn versioned_spawn_disabled_exact_shadow_does_not_block_framework_creation
     let registry = bamboo_tools::ToolRegistry::new();
     registry.register(ExactShadow(shadow_calls.clone())).unwrap();
     let legacy: Arc<dyn ToolExecutor> = Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(registry));
-    let spawn = Arc::new(SpawnSessionTool::new(Arc::new(f.creator.clone()), f.creator.store.clone(), f.creator.config.clone()));
+    let spawn = Arc::new(SpawnSessionTool::new(Arc::new(f.creator.clone()), f.creator.store.clone(), f.creator.config.clone(), legacy.clone()));
     let installed = VersionedRootTools::new(legacy, spawn, f.creator.store.clone());
     let tools = installed.for_session(&session).unwrap();
     let context = || ToolExecutionContext {
