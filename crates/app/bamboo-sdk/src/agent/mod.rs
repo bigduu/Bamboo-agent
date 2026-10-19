@@ -272,6 +272,7 @@ impl Agent {
                 "typed Skills require the complete defaults-backed built-in SDK host".into(),
             )
         })?;
+        let preappend_snapshot = session.clone();
         let (guard, inputs, lease) = skills
             .prepare_typed_run(self, session, input, cancel_token.clone())
             .await?;
@@ -285,6 +286,7 @@ impl Agent {
                 Some(inputs),
                 Some(guard),
                 Some(lease),
+                Some(preappend_snapshot),
             )
             .await;
         drain.abort();
@@ -352,9 +354,7 @@ impl Agent {
         session: &mut Session,
         input: impl Into<String>,
     ) -> Result<(), AgentError> {
-        self.check_retained_execution_compatibility(session).await?;
-        let inputs = self.append_local_user_input(session, input);
-        self.run_session_with_cancel_and_inputs(session, CancellationToken::new(), inputs)
+        self.run_with_cancel(session, input, CancellationToken::new())
             .await
     }
 
@@ -393,9 +393,15 @@ impl Agent {
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
         self.check_retained_execution_compatibility(session).await?;
+        let preappend_snapshot = session.clone();
         let inputs = self.append_local_user_input(session, input);
-        self.run_session_with_cancel_and_inputs(session, cancel_token, inputs)
-            .await
+        self.run_session_with_cancel_and_inputs(
+            session,
+            cancel_token,
+            inputs,
+            Some(preappend_snapshot),
+        )
+        .await
     }
 
     /// Run the agent loop on `session` exactly as it stands — i.e. on a
@@ -429,7 +435,7 @@ impl Agent {
         session: &mut Session,
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
-        self.run_session_with_cancel_and_inputs(session, cancel_token, None)
+        self.run_session_with_cancel_and_inputs(session, cancel_token, None, None)
             .await
     }
 
@@ -438,6 +444,7 @@ impl Agent {
         session: &mut Session,
         cancel_token: CancellationToken,
         inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
+        preappend_snapshot: Option<Session>,
     ) -> Result<(), AgentError> {
         let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(EVENT_CHANNEL_CAPACITY);
 
@@ -445,7 +452,15 @@ impl Agent {
         let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
 
         let result = self
-            .execute_internal(session, event_tx, cancel_token, inputs)
+            .execute_internal_prepared(
+                session,
+                event_tx,
+                cancel_token,
+                inputs,
+                None,
+                None,
+                preappend_snapshot,
+            )
             .await;
 
         // Stop draining once execution returns. Detached engine tasks (e.g.
@@ -589,7 +604,7 @@ impl Agent {
         inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + Send + 'a>>
     {
-        self.execute_internal_prepared(session, event_tx, cancel_token, inputs, None, None)
+        self.execute_internal_prepared(session, event_tx, cancel_token, inputs, None, None, None)
     }
 
     fn execute_internal_prepared<'a>(
@@ -600,6 +615,7 @@ impl Agent {
         inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
         supplied_guard: Option<skill_runtime::SdkSkillRunGuard>,
         supplied_lease: Option<bamboo_engine::DirectExecutionLease>,
+        preappend_snapshot: Option<Session>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + Send + 'a>>
     {
         // Keep the existing execution and String append/lease order. The guard
@@ -630,10 +646,24 @@ impl Agent {
                 Some(lease) => lease,
                 None => execution.inner.begin_direct_execution(&session.id).await?,
             };
-            execution
+            if let Err(error) = execution
                 .inner
                 .check_direct_execution_admission(session, &direct_lease)
-                .await?;
+                .await
+            {
+                // This admission refuses before Project preparation, replay or
+                // persistence. Restore borrowed producer input only for the
+                // compatibility refusal; retain other legacy error semantics.
+                if matches!(&error, AgentError::Tool(message)
+                    if message.starts_with("session_execution_incompatible:"))
+                {
+                    if let Some(snapshot) = preappend_snapshot {
+                        *session = snapshot;
+                    }
+                }
+                return Err(error);
+            }
+            drop(preappend_snapshot);
             let sdk_guard = match (supplied_guard, execution.sdk_skills.as_ref()) {
                 (Some(guard), _) => Some(guard),
                 (None, Some(skills)) => {
