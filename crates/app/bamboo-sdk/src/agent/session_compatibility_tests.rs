@@ -145,6 +145,11 @@ async fn future_durable(fixture: &Fixture, id: &str, conflict: &str) -> [Vec<u8>
     }
     match conflict {
         "main" | "runtime" => raw["session_version"] = json!(99),
+        "agent" => {
+            let mut runtime = AgentRuntimeState::new(id);
+            runtime.version = 99;
+            raw["agent_runtime_state"] = serde_json::to_value(runtime).unwrap();
+        }
         "context" => {
             raw["model_context_state"] = serde_json::to_value(bamboo_domain::ModelContextState {
                 schema_version: 99,
@@ -388,5 +393,318 @@ async fn session_version_sdk_stream_reports_refusal_instead_of_an_empty_close() 
             assert_eq!(fixture.probe.provider_calls.load(Ordering::SeqCst), 0);
             assert!(fixture.probe.calls.lock().unwrap().is_empty());
         }
+    }
+}
+
+/// Publish a real retained pair at the second admission read: the first read
+/// has already returned compatible, and the public SDK producer has appended.
+/// No sleeps, fabricated admission result or private Engine bypass is used.
+struct RacedSdkPersistence {
+    inner: Arc<dyn RuntimeSessionPersistence>,
+    directory: std::path::PathBuf,
+    publication: [Vec<u8>; 2],
+    fail_read: bool,
+    reads: AtomicUsize,
+    saves: AtomicUsize,
+}
+
+#[async_trait]
+impl RuntimeSessionPersistence for RacedSdkPersistence {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.saves.fetch_add(1, Ordering::SeqCst);
+        self.inner.save_runtime_session(session).await
+    }
+
+    async fn load_runtime_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+        self.inner.load_runtime_session(id).await
+    }
+
+    async fn load_runtime_admission_snapshot(&self, id: &str) -> std::io::Result<Option<Session>> {
+        if self.reads.fetch_add(1, Ordering::SeqCst) == 1 {
+            if self.fail_read {
+                return Err(std::io::Error::other(
+                    "injected non-compatibility admission read failure",
+                ));
+            }
+            for (name, bytes) in ["session.json", "runtime.json"]
+                .into_iter()
+                .zip(&self.publication)
+            {
+                tokio::fs::write(self.directory.join(name), bytes).await?;
+            }
+        }
+        self.inner.load_runtime_admission_snapshot(id).await
+    }
+}
+
+fn sdk_contract_files(
+    directory: &std::path::Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(
+        root: &std::path::Path,
+        current: &std::path::Path,
+        out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for entry in std::fs::read_dir(current).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, out);
+            } else {
+                out.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    visit(directory, directory, &mut out);
+    out
+}
+
+async fn defaults_race_agent(fixture: &Fixture) -> Agent {
+    std::fs::write(fixture.directory.path().join("config.json"), r#"{"provider":"anthropic","providers":{"anthropic":{"api_key":"fixture","model":"test-model"}}}"#).unwrap();
+    Agent::builder()
+        .provider(fixture.probe.clone())
+        .model("test-model")
+        .with_defaults_for_data_dir(fixture.directory.path().into())
+        .await
+        .unwrap()
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn session_version_sdk_race_rejects_without_borrowed_input_or_checkpoint_side_effects() {
+    let mut failures = Vec::new();
+    for (flavor, replay) in [
+        ("plain", false),
+        ("defaults", false),
+        ("typed", false),
+        ("plain", true),
+    ] {
+        for cancellable in [false, true] {
+            for conflict in ["main", "runtime", "agent", "context"] {
+                let fixture = Fixture::new().await;
+                let id = format!("sdk-race-{flavor}-{replay}-{cancellable}-{conflict}");
+                let mut session = if replay {
+                    let (mut pending, request) = parked(&id, true);
+                    fixture.repo.save(&mut pending).await.unwrap();
+                    fixture.approve(&request).await
+                } else {
+                    let mut fresh = Session::new(&id, "test-model");
+                    fresh.add_message(Message::user("retained caller history"));
+                    fixture.repo.save(&mut fresh).await.unwrap();
+                    fresh
+                };
+                let config = Arc::new(PermissionConfig::new());
+                let mut agent = if flavor == "plain" {
+                    fixture.agent(Some(config.clone()), replay, false, None)
+                } else {
+                    defaults_race_agent(&fixture).await
+                };
+                session = agent.storage().load_session(&id).await.unwrap().unwrap();
+                let before_memory = serde_json::to_value(&session).unwrap();
+                let before_pair = durable_pair(&fixture, &id).await;
+                let publication = future_durable(&fixture, &id, conflict).await;
+                let directory = fixture.directory.path().join("sessions").join(&id);
+                let future_files = sdk_contract_files(&directory);
+                let index = tokio::fs::read(fixture.store.index_path()).await.unwrap();
+                for (name, bytes) in ["session.json", "runtime.json"]
+                    .into_iter()
+                    .zip(before_pair)
+                {
+                    tokio::fs::write(directory.join(name), bytes).await.unwrap();
+                }
+                assert!(
+                    agent
+                        .persistence()
+                        .load_runtime_admission_snapshot(&id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .execution_compatibility()
+                        .execution_allowed
+                );
+                let race = Arc::new(RacedSdkPersistence {
+                    inner: agent.persistence().clone(),
+                    directory: directory.clone(),
+                    publication,
+                    fail_read: false,
+                    reads: AtomicUsize::new(0),
+                    saves: AtomicUsize::new(0),
+                });
+                agent.inner = agent.inner.with_execution_persistence(race.clone());
+                let error = if flavor == "typed" {
+                    let input =
+                        SdkSkillInput::new("new SDK input must not survive refusal", vec![]);
+                    if cancellable {
+                        agent
+                            .run_with_skills_and_cancel(
+                                &mut session,
+                                input,
+                                CancellationToken::new(),
+                            )
+                            .await
+                            .map_err(|error| error.to_string())
+                    } else {
+                        agent
+                            .run_with_skills(&mut session, input)
+                            .await
+                            .map_err(|error| error.to_string())
+                    }
+                } else if cancellable {
+                    agent
+                        .run_with_cancel(
+                            &mut session,
+                            "new SDK input must not survive refusal",
+                            CancellationToken::new(),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                } else {
+                    agent
+                        .run(&mut session, "new SDK input must not survive refusal")
+                        .await
+                        .map_err(|error| error.to_string())
+                }
+                .expect_err("the real second canonical read observes the raced future writer");
+                assert!(
+                    error.contains("session_execution_incompatible"),
+                    "{flavor}/{conflict}: {error}"
+                );
+                assert_eq!(race.reads.load(Ordering::SeqCst), 2);
+                assert_eq!(race.saves.load(Ordering::SeqCst), 0);
+                assert_eq!(sdk_contract_files(&directory), future_files);
+                assert_eq!(
+                    tokio::fs::read(fixture.store.index_path()).await.unwrap(),
+                    index
+                );
+                assert_eq!(fixture.probe.provider_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+                assert!(fixture.probe.calls.lock().unwrap().is_empty());
+                assert!(config.temporary_grants().is_empty());
+                assert!(!fixture.directory.path().join("actions.log").exists());
+                let cached = fixture
+                    .repo
+                    .cache()
+                    .get(&id)
+                    .expect("seeded repository cache");
+                assert!(!cached.read().messages.iter().any(|message| message
+                    .content
+                    .contains("new SDK input must not survive refusal")));
+                let memory_retained = serde_json::to_value(&session).unwrap() == before_memory;
+                eprintln!("SDK race {flavor}/replay={replay}/cancel={cancellable}/{conflict}: memory_retained={memory_retained}; source_files_retained=true; provider=0; saves=0");
+                if !memory_retained {
+                    failures.push(format!("{flavor}/replay={replay}/cancel={cancellable}/{conflict}: borrowed Session changed despite admission refusal"));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn session_version_sdk_race_compatible_input_still_appends_and_runs_once() {
+    for cancellable in [false, true] {
+        let fixture = Fixture::new().await;
+        let mut session = Session::new(format!("sdk-race-compatible-{cancellable}"), "test-model");
+        session.add_message(Message::user("retained history"));
+        fixture.repo.save(&mut session).await.unwrap();
+        let race = Arc::new(RacedSdkPersistence {
+            inner: fixture.persistence.clone(),
+            directory: fixture.directory.path().join("sessions").join(&session.id),
+            publication: durable_pair(&fixture, &session.id).await,
+            fail_read: false,
+            reads: AtomicUsize::new(0),
+            saves: AtomicUsize::new(0),
+        });
+        let agent = fixture.agent(None, false, false, Some(race));
+        if cancellable {
+            agent
+                .run_with_cancel(
+                    &mut session,
+                    "accepted raced compatible input",
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+        } else {
+            agent
+                .run(&mut session, "accepted raced compatible input")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| message.content == "accepted raced compatible input")
+                .count(),
+            1
+        );
+        let durable = fixture
+            .store
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable
+                .messages
+                .iter()
+                .filter(|message| message.content == "accepted raced compatible input")
+                .count(),
+            1
+        );
+        assert_eq!(fixture.probe.provider_calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn session_version_sdk_race_other_admission_errors_keep_original_append_semantics() {
+    for cancellable in [false, true] {
+        let fixture = Fixture::new().await;
+        let mut session = Session::new(format!("sdk-race-other-error-{cancellable}"), "test-model");
+        session.add_message(Message::user("retained history"));
+        fixture.repo.save(&mut session).await.unwrap();
+        let before_disk = durable_pair(&fixture, &session.id).await;
+        let race = Arc::new(RacedSdkPersistence {
+            inner: fixture.persistence.clone(),
+            directory: fixture.directory.path().join("sessions").join(&session.id),
+            publication: before_disk.clone(),
+            fail_read: true,
+            reads: AtomicUsize::new(0),
+            saves: AtomicUsize::new(0),
+        });
+        let agent = fixture.agent(None, false, false, Some(race));
+        let error = if cancellable {
+            agent
+                .run_with_cancel(
+                    &mut session,
+                    "legacy append on other admission error",
+                    CancellationToken::new(),
+                )
+                .await
+        } else {
+            agent
+                .run(&mut session, "legacy append on other admission error")
+                .await
+        }
+        .unwrap_err();
+        assert!(
+            !error.to_string().contains("session_execution_incompatible"),
+            "{error}"
+        );
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| message.content == "legacy append on other admission error")
+                .count(),
+            1
+        );
+        assert_eq!(durable_pair(&fixture, &session.id).await, before_disk);
+        assert_eq!(fixture.probe.provider_calls.load(Ordering::SeqCst), 0);
     }
 }
