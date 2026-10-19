@@ -656,6 +656,278 @@ async fn policy_wake_runs_real_child_task_and_submits_once_without_auto_acceptan
 }
 
 #[tokio::test]
+async fn sprint_carry_over_preserves_real_worker_identity_and_dispatch_budget() {
+    use bamboo_tickets::{
+        SprintAction, SprintCommand, SprintDefinition, SprintDestination, SprintId, SprintReceipt,
+        SprintStatus,
+    };
+
+    async fn plan(
+        fixture: &Fixture,
+        sprint_id: &SprintId,
+        action: SprintAction,
+    ) -> (SprintCommand, SprintReceipt) {
+        let snapshot = fixture.snapshot();
+        let command = SprintCommand {
+            operation_id: format!("native-sprint-{}", snapshot.seq),
+            binding: snapshot.binding,
+            expected_seq: snapshot.seq,
+            expected_epoch: snapshot.authority_epoch,
+            project_id: fixture.project.clone(),
+            sprint_id: sprint_id.clone(),
+            source: "controlled native Sprint carry-over".into(),
+            action,
+        };
+        let receipt = fixture
+            .state
+            .tickets
+            .sprint_command(
+                Principal::User {
+                    user_id: "fixture-host-owner".into(),
+                },
+                &command,
+            )
+            .await
+            .unwrap();
+        (command, receipt)
+    }
+
+    let mut fixture = Fixture::new(1).await;
+    let work_id = fixture.works[0].id.clone();
+    let sprint_id = SprintId::parse("native-sprint-running").unwrap();
+    let next_id = SprintId::parse("native-sprint-next").unwrap();
+    for (id, name) in [(&sprint_id, "Running Sprint"), (&next_id, "Next Sprint")] {
+        plan(
+            &fixture,
+            id,
+            SprintAction::Create {
+                definition: SprintDefinition {
+                    name: name.into(),
+                    goal: "Carry the same Work without changing execution".into(),
+                    starts_at: None,
+                    ends_at: None,
+                },
+            },
+        )
+        .await;
+    }
+    plan(
+        &fixture,
+        &sprint_id,
+        SprintAction::Add {
+            expected_revision: fixture.snapshot().sprint.sprints[&sprint_id].revision,
+            work_id: work_id.clone(),
+        },
+    )
+    .await;
+    plan(
+        &fixture,
+        &sprint_id,
+        SprintAction::Start {
+            expected_revision: fixture.snapshot().sprint.sprints[&sprint_id].revision,
+        },
+    )
+    .await;
+    fixture
+        .state
+        .tickets
+        .install_ready_work_policy(fixture.policy(1))
+        .await
+        .unwrap();
+    fixture.state.tickets.wake_ready_work();
+    let first = fixture.next_request().await;
+    assert!(first.is_work(0));
+    first.task();
+    let final_request = fixture.next_request().await;
+    assert!(final_request.messages.iter().any(|message| {
+        message.role == Role::Tool
+            && message.tool_call_id.as_deref() == Some(TASK_CALL)
+            && message.tool_success == Some(true)
+    }));
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 2);
+
+    // Hold the second real model request: the first Task round has completed,
+    // but this actual Child still owns its execution and has not submitted.
+    let before = fixture.snapshot();
+    let assignment = before.assignments.values().next().unwrap().clone();
+    assert_eq!(assignment.state, AssignmentState::Running);
+    assert!(!assignment.process_stopped);
+    assert_eq!(assignment.plan.plan_revision, 1);
+    assert_eq!(assignment.plan.steps[0].status, Some(StepStatus::Completed));
+    assert_eq!(
+        assignment.workspace.as_ref().unwrap(),
+        &fixture.works[0].workspace
+    );
+    assert!(!assignment.workspace.as_ref().unwrap().claims.is_empty());
+    let receipt = assignment.runtime.as_ref().unwrap().clone();
+    let child_id = receipt.session_id.clone();
+    let logical_run = fixture
+        .state
+        .session_activation_router
+        .current_run_id(&child_id)
+        .await
+        .expect("the held provider request still has its real run owner");
+    let child = fixture
+        .state
+        .storage
+        .load_session(&child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let dispatch = ticket_runtime::read_dispatch(&child).unwrap().unwrap();
+    assert_eq!(dispatch.max_rounds, Some(MAX_ROUNDS));
+    let spent_round = child.agent_runtime_state.as_ref().unwrap().round.clone();
+    assert!(
+        spent_round.total_tool_calls > 0,
+        "compare consumed counters, not an unstarted run"
+    );
+    assert_eq!(spent_round.max_rounds, Some(MAX_ROUNDS));
+
+    let (close, closed) = plan(
+        &fixture,
+        &sprint_id,
+        SprintAction::Close {
+            expected_revision: before.sprint.sprints[&sprint_id].revision,
+            dispositions: BTreeMap::from([(
+                work_id.clone(),
+                SprintDestination::Sprint {
+                    sprint_id: next_id.clone(),
+                },
+            )]),
+            target_revisions: BTreeMap::from([(
+                next_id.clone(),
+                before.sprint.sprints[&next_id].revision,
+            )]),
+        },
+    )
+    .await;
+    let replay = fixture
+        .state
+        .tickets
+        .sprint_command(
+            Principal::User {
+                user_id: "fixture-host-owner".into(),
+            },
+            &close,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&closed).unwrap(),
+        serde_json::to_value(replay).unwrap()
+    );
+    let closure = closed.closure.unwrap();
+    assert_eq!(closure.counts.accepted, 0);
+    assert_eq!(closure.counts.unfinished, 1);
+
+    let after = fixture.snapshot();
+    assert_eq!(
+        after.sprint.sprints[&sprint_id].status,
+        SprintStatus::Closed
+    );
+    assert_eq!(after.sprint.sprints[&next_id].status, SprintStatus::Planned);
+    assert_eq!(
+        after.sprint.sprints[&next_id].members,
+        BTreeSet::from([work_id.clone()])
+    );
+    assert_eq!(
+        serde_json::to_value(&after.tickets).unwrap(),
+        serde_json::to_value(&before.tickets).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&after.assignments).unwrap(),
+        serde_json::to_value(&before.assignments).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&after.intents).unwrap(),
+        serde_json::to_value(&before.intents).unwrap()
+    );
+    assert_eq!(
+        fixture
+            .state
+            .session_activation_router
+            .current_run_id(&child_id)
+            .await,
+        Some(logical_run)
+    );
+    let live_child = fixture
+        .state
+        .storage
+        .load_session(&child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ticket_runtime::read_dispatch(&live_child).unwrap().unwrap(),
+        dispatch
+    );
+    assert_eq!(
+        live_child.agent_runtime_state.as_ref().unwrap().round,
+        spent_round
+    );
+    assert!(!matches!(
+        fixture.state.tickets.reconcile_ready_work().await.unwrap(),
+        ReadyReconcile::Dispatched { .. }
+    ));
+    fixture.assert_quiet(2).await;
+
+    final_request.complete();
+    fixture.wait_submitted(&work_id).await;
+    let stopped = wait_native_terminal(&fixture.state, &child_id).await;
+    let final_snapshot = fixture.snapshot();
+    assert_eq!(final_snapshot.tickets.len(), before.tickets.len());
+    assert_eq!(final_snapshot.assignments.len(), 1);
+    assert_eq!(final_snapshot.intents.len(), 1);
+    assert_eq!(final_snapshot.submissions.len(), 1);
+    let final_assignment = &final_snapshot.assignments[&assignment.id];
+    assert_eq!(final_assignment.dispatch_key, assignment.dispatch_key);
+    assert_eq!(final_assignment.generation, assignment.generation);
+    assert_eq!(final_assignment.runtime.as_ref(), Some(&receipt));
+    assert_eq!(final_assignment.workspace, assignment.workspace);
+    assert!(final_assignment.process_stopped);
+    let work = &final_snapshot.tickets[&work_id];
+    assert_eq!(work.state, WorkState::Submitted);
+    assert!(work.accepted_submission.is_none());
+    assert_eq!(
+        final_snapshot.submissions[work.current_submission.as_ref().unwrap()].runtime,
+        receipt
+    );
+    assert_eq!(
+        final_snapshot.sprint.sprints[&sprint_id].closure.as_ref(),
+        Some(&closure)
+    );
+    assert_eq!(
+        final_snapshot.sprint.sprints[&next_id].members,
+        BTreeSet::from([work_id])
+    );
+    assert_eq!(
+        ticket_runtime::read_dispatch(&stopped).unwrap().unwrap(),
+        dispatch
+    );
+    assert!(
+        stopped
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .round
+            .total_tool_calls
+            >= spent_round.total_tool_calls
+    );
+    assert_eq!(
+        stopped
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .round
+            .max_rounds,
+        Some(MAX_ROUNDS)
+    );
+    fixture.assert_quiet(2).await;
+    fixture.state.tickets.revoke_ready_work_policy().await;
+    fixture.state.shutdown().await;
+}
+
+#[tokio::test]
 async fn pending_metadata_preserves_original_native_admission_and_resource_guard() {
     for invalidate_resource in [false, true] {
         let mut fixture = Fixture::new(1).await;
