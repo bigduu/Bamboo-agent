@@ -217,10 +217,12 @@ fn assert_namespaced_spawn_keeps_unqualified_owner(framework_installed: bool) {
             "the fully qualified exact owner still wins before the unqualified owner"
         );
     }
-    assert!(resolve_session_tool_reference(Some(99), "default::spawnSession", |name| {
-        catalog.contains(&name)
-    })
-    .is_none());
+    assert!(
+        resolve_session_tool_reference(Some(99), "default::spawnSession", |name| {
+            catalog.contains(&name)
+        })
+        .is_none()
+    );
     let unshadowed = resolve_session_tool_reference(Some(2), "default::spawnSession", |name| {
         name == "SubAgent" || (framework_installed && name == "spawn_session")
     });
