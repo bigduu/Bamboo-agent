@@ -461,7 +461,7 @@ jobs:
                   assert len(matches) == 1 and matches[0]["status"] == "completed" and matches[0]["conclusion"] == "success"
               test = next(job for job in jobs if job["name"] == "Test")
               assert any(step["name"] == "Require the exact clean source after full validation" and step["conclusion"] == "success" for step in test["steps"])
-              log = subprocess.check_output(["gh", "api", f"repos/{repository}/actions/jobs/{test['id']}/logs", "--allow-escape-sequences"], text=True)
+              log = subprocess.check_output(["gh", "api", f"repos/{repository}/actions/jobs/{test['id']}/logs"], text=True)
               matches = re.findall(r"Source: ([0-9a-f]{40}) tree: ([0-9a-f]{40})", log)
               assert len(set(matches)) == 1
               revision, tree = matches[0]
