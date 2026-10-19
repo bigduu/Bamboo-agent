@@ -10,15 +10,24 @@ async fn change_stamp(home: &Path, id: &str, main: Option<u32>, runtime: Option<
         let path = home.join("sessions").join(id).join(name);
         let mut raw: Value =
             serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        if name == "session.json" {
+            // Flat legacy Main keeps the original identity/proof fields while
+            // avoiding a stale compact header after this fixture-only rewrite.
+            raw.as_object_mut().unwrap().remove("_bamboo_main_authority");
+        }
         match version {
             Some(version) => raw["session_version"] = json!(version),
             None => {
                 raw.as_object_mut().unwrap().remove("session_version");
             }
         }
-        tokio::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap())
-            .await
-            .unwrap();
+        let encoded = serde_json::to_vec_pretty(&raw).unwrap();
+        if name == "session.json" {
+            assert!(super::compact_main::validate_full_main(&encoded)
+                .expect("fixture is valid flat legacy Main")
+                .is_none());
+        }
+        tokio::fs::write(path, encoded).await.unwrap();
     }
 }
 

@@ -750,11 +750,21 @@ mod tests {
             let path = directory.join(name);
             let mut raw: serde_json::Value =
                 serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+            if name == "session.json" {
+                // Keep this future producer fixture valid as flat legacy Main.
+                raw.as_object_mut().unwrap().remove("_bamboo_main_authority");
+            }
             raw["session_version"] = serde_json::json!(99);
             tokio::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap())
                 .await
                 .unwrap();
         }
+        assert!(state
+            .storage
+            .load_execution_admission_snapshot(&session.id)
+            .await
+            .expect("future fixture retains valid canonical storage framing")
+            .is_some());
         let before_disk = [
             tokio::fs::read(directory.join("session.json"))
                 .await

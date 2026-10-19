@@ -136,6 +136,11 @@ async fn future_durable(fixture: &Fixture, id: &str, conflict: &str) -> [Vec<u8>
     };
     let path = directory.join(name);
     let mut raw: Value = serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+    if name == "session.json" {
+        // Re-encode this owned fixture as valid flat legacy Main. A retained
+        // compact header would no longer match its framing after JSON rewrite.
+        raw.as_object_mut().unwrap().remove("_bamboo_main_authority");
+    }
     match conflict {
         "main" | "runtime" => raw["session_version"] = json!(99),
         "context" => {
@@ -151,6 +156,12 @@ async fn future_durable(fixture: &Fixture, id: &str, conflict: &str) -> [Vec<u8>
     tokio::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap())
         .await
         .unwrap();
+    assert!(fixture
+        .store
+        .load_execution_admission_snapshot(id)
+        .await
+        .expect("future fixture retains valid canonical storage framing")
+        .is_some());
     [
         tokio::fs::read(directory.join("session.json"))
             .await
