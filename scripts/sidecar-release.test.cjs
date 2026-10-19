@@ -630,3 +630,56 @@ test('legacy checkpoint compatibility retains hash verification with and without
     assert.deepEqual(fs.readFileSync(path.join(outputDirectory, release.MANIFEST)), fs.readFileSync(path.join(value.outputDirectory, release.MANIFEST)))
   }
 })
+
+test('checkpoint v1 recovery remains valid when the current manifest constructor changes', async (t) => {
+  const value = publishingFixture(t)
+  value.context.upload = file => {
+    if (path.basename(file) === release.MANIFEST) throw new Error('manifest interrupted')
+    value.stored.set(path.basename(file), fs.readFileSync(file))
+  }
+  await assert.rejects(() => release.publishAssets(value.context), /manifest interrupted/)
+  // Load the real controller with only its moving constructor changed. All
+  // recovery, authentication, schema and transport code remains production code.
+  const filename = require.resolve('./sidecar-release.cjs')
+  const source = fs.readFileSync(filename, 'utf8')
+  const marker = 'function createManifest({ version, sourceRevision, artifacts, browserHost }) {'
+  assert.equal(source.split(marker).length, 2)
+  const Module = require('node:module')
+  const changed = new Module(filename, module)
+  changed.filename = filename
+  changed.paths = module.paths
+  changed._compile(source.replace(marker, `${marker}\n  throw new Error('new controller manifest constructor invoked')`), filename)
+  const outputDirectory = path.join(value.root, 'frozen-v1-recovery'); fs.mkdirSync(outputDirectory)
+  await changed.exports.recoverPublishedRelease({ ...value, outputDirectory,
+    identity: { ...identity, workflowRevision: '8'.repeat(40), runId: '101', runAttempt: 1 },
+    release: { assets: [...value.stored.keys()].map(name => ({ name })) },
+    readAsset: asset => value.stored.get(asset.name) })
+  for (const name of [release.MANIFEST, release.PROVENANCE]) {
+    assert.deepEqual(fs.readFileSync(path.join(outputDirectory, name)), fs.readFileSync(path.join(value.outputDirectory, name)))
+  }
+})
+
+test('frozen v1 recovery validation rejects foreign identities, targets and unsafe asset shapes', (t) => {
+  const value = publishingFixture(t)
+  const manifest = JSON.parse(fs.readFileSync(path.join(value.outputDirectory, release.MANIFEST)))
+  const proof = JSON.parse(fs.readFileSync(path.join(value.outputDirectory, release.PROVENANCE)))
+  assert.equal(release.validateManifestV1(manifest, identity, proof.builds), manifest)
+  for (const mutate of [
+    x => { x.schemaVersion = 2 },
+    x => { x.version = '2026.10.124' },
+    x => { x.sourceRevision = '8'.repeat(40) },
+    x => { x.unrecognized = true },
+    x => { x.artifacts.pop() },
+    x => { x.artifacts[1] = clone(x.artifacts[0]) },
+    x => { x.artifacts[0].assetName = '../bamboo' },
+    x => { x.artifacts[0].sha256 = 'f'.repeat(64) },
+    x => { x.artifacts[0].buildMode = 'api-only' },
+    x => { x.browserHost.files[0].path = '../escape' },
+    x => { x.browserHost.files.push(clone(x.browserHost.files[0])) },
+    x => { x.browserHost.files[0].sizeBytes = 8 * 1024 * 1024 },
+    x => { x.browserHost.sha256 = 'not-a-digest' },
+  ]) {
+    const changed = clone(manifest); mutate(changed)
+    assert.throws(() => release.validateManifestV1(changed, identity, proof.builds))
+  }
+})

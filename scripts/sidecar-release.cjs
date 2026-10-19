@@ -101,6 +101,45 @@ function createManifest({ version, sourceRevision, artifacts, browserHost }) {
 
 function manifestBytes(value) { return Buffer.from(`${JSON.stringify(createManifest(value), null, 2)}\n`) }
 
+// Frozen recovery contract for already-signed schemaVersion 1 bytes. Future
+// constructors/serializers must not redefine this historical asset schema.
+function validateManifestV1(value, identity, builds) {
+  const keys = (object, expected) => assert.deepEqual(Object.keys(object).sort(), [...expected].sort())
+  keys(value, ['schemaVersion', 'version', 'sourceRevision', 'artifacts', 'browserHost'])
+  assert.equal(value.schemaVersion, 1)
+  assert.match(value.version, /^[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/)
+  assert.equal(value.version, identity.version)
+  assert.match(value.sourceRevision, /^[0-9a-f]{40}$/)
+  assert.equal(value.sourceRevision, identity.sourceRevision)
+  const targets = ['aarch64-apple-darwin', 'x86_64-apple-darwin',
+    'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu']
+  assert.ok(Array.isArray(value.artifacts))
+  assert.deepEqual(value.artifacts.map(item => item.target).sort(), targets)
+  for (const item of value.artifacts) {
+    keys(item, ['target', 'buildMode', 'embeddedFrontend', 'format', 'assetName', 'sha256', 'sizeBytes'])
+    const receipt = builds.find(build => build.target === item.target)
+    assert.ok(receipt)
+    for (const key of ['target', 'assetName', 'sha256', 'sizeBytes']) assert.equal(item[key], receipt[key])
+    assert.equal(item.buildMode, 'embedded')
+    assert.equal(item.embeddedFrontend, true)
+    assert.equal(item.format, 'raw')
+    requireDigest(item, 1024 * 1024 * 1024, 65536)
+  }
+  const host = value.browserHost
+  keys(host, ['assetName', 'sha256', 'sizeBytes', 'files'])
+  assert.equal(host.assetName, 'bamboo-browser-host-v1.tar.gz')
+  requireDigest(host, 8 * 1024 * 1024)
+  assert.ok(Array.isArray(host.files))
+  assert.deepEqual(host.files.map(file => file.path).sort(),
+    ['browser-runtime/host.cjs', 'browser-runtime/package-lock.json', 'browser-runtime/package.json'])
+  for (const file of host.files) {
+    keys(file, ['path', 'sha256', 'sizeBytes'])
+    requireDigest(file, 8 * 1024 * 1024)
+  }
+  assert.ok(host.files.reduce((sum, file) => sum + file.sizeBytes, 0) <= 8 * 1024 * 1024)
+  return value
+}
+
 function binaryArchitecture(file, target) {
   assert.ok(TARGETS.includes(target))
   const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
@@ -333,8 +372,7 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
   const manifest = JSON.parse(originalManifestBytes.toString('utf8'))
   // Validate the v1 contract and signed build identities without reserializing
   // the original bytes or running the current controller's archive builder.
-  assert.deepEqual(manifest, createManifest({ ...identity, artifacts: proof.builds,
-    browserHost: manifest.browserHost }))
+  validateManifestV1(manifest, identity, proof.builds)
   const required = [...proof.builds, manifest.browserHost]
   assert.ok(required.every((item) => release.assets.some((asset) => asset.name === item.assetName)),
     'Authenticated checkpoint has missing release assets')
@@ -416,7 +454,7 @@ async function main() {
 }
 
 module.exports = { REPOSITORY, MANIFEST, HOST_ASSET, PROVENANCE, TARGETS, HOST_FILES, MAX_BINARY, MAX_HOST,
-  artifactName, targetOutputKey, sha256, fileIdentity, createBrowserHost, createManifest, manifestBytes,
+  artifactName, targetOutputKey, sha256, fileIdentity, createBrowserHost, createManifest, manifestBytes, validateManifestV1,
   binaryArchitecture, execute, git, workflowIdentity, publishedRelease, assetBytes,
   validateBuildReceipt, expectedBuildBindings, assembleRelease, recoverPublishedRelease, publishAssets }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })
