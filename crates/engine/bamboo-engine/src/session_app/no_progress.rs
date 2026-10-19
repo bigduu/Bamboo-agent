@@ -3,9 +3,7 @@
 //! Uses the existing pending-question and response transaction. The question is
 //! an ordinary runtime-authored assistant message, never a fabricated tool call.
 
-use bamboo_agent_core::{PendingQuestion, PendingQuestionSource, Role, Session};
-#[cfg(test)]
-use bamboo_agent_core::Message;
+use bamboo_agent_core::{Message, PendingQuestion, PendingQuestionSource, Role, Session};
 use bamboo_domain::{AgentRuntimeState, AgentStatusState, SessionKind};
 
 pub const QUESTION_TOOL_NAME: &str = "observation_progress";
