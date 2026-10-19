@@ -263,7 +263,7 @@ async fn compact_refuses_confinement_relocation_instead_of_creating_another_chec
 }
 
 #[tokio::test]
-async fn compact_shared_workspace_supports_real_supervisor_nested_child_and_legacy_parent() {
+async fn compact_workspace_preserves_supervisor_legacy_and_direct_child_boundaries() {
     for (kind, ultra) in [
         ("supervisor", false),
         ("supervisor", true),
@@ -331,7 +331,16 @@ async fn compact_shared_workspace_supports_real_supervisor_nested_child_and_lega
         }
         parent.metadata_version += 1;
         h.storage.save_session(&parent).await.unwrap();
-        let (tool, _) = recording_tool(&h);
+        let (tool, port) = recording_tool(&h);
+        if kind == "child" {
+            // Direct Server-tool calls have an existing Root-only gate.
+            // Nested Child execution requires its separately owned Host route;
+            // a workspace policy change must not grant that route implicitly.
+            let before = h.adapter.session_store.list_index_entries().await.len();
+            assert!(compact_create(&tool, &parent.id).await.is_err());
+            assert_no_creation(&h, &port, &parent, before).await;
+            continue;
+        }
         let result = compact_create(&tool, &parent.id)
             .await
             .unwrap_or_else(|error| panic!("{kind}/{ultra}: {error}"));
