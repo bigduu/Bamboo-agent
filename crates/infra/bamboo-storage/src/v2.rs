@@ -6490,6 +6490,20 @@ impl SessionStoreV2 {
                     current_main.parent().expect("session.json has a parent"),
                 )
                 .await?;
+                // Repairing an interrupted Main creation may reuse this exact
+                // Root context, but cannot reset a future contract retained in
+                // the runtime sidecar just because Main is absent.
+                if let Some(previous_runtime) = Self::read_runtime_sidecar_at(
+                    &current_main
+                        .parent()
+                        .expect("session.json has a parent")
+                        .join(RUNTIME_SIDECAR_FILE),
+                    &session.id,
+                )
+                .await?
+                {
+                    reject_incompatible_session_write(&previous_runtime)?;
+                }
                 None
             }
             Err(error) => return Err(error),
