@@ -1,3 +1,6 @@
+#[path = "compact_shared_workspace_tests.rs"]
+mod compact_shared_workspace_tests;
+
 #[path = "tagged_wait_registration_regression_tests.rs"]
 mod tagged_wait_registration_regression_tests;
 
