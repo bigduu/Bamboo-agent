@@ -109,6 +109,11 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::post().to(agent::supervisor::open_default),
         )
         .service(
+            web::resource("/supervisor/default/scope")
+                .route(web::get().to(agent::supervisor::inspect_project_scope))
+                .route(web::put().to(agent::supervisor::configure_project_scope)),
+        )
+        .service(
             web::scope("/tickets")
                 .route("/scope", web::get().to(agent::tickets::scope))
                 .route("/initialize", web::post().to(agent::tickets::initialize))

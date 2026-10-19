@@ -193,6 +193,11 @@ notify-rust = { version = "4.18", default-features = false }
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 zbus = { version = "6", default-features = false, features = ["default-rt"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Existing locked objc2 versions; AppKit UI is confined to the own-executable helper.
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSGeometry"] }
+
 # Exercise the same XDG wire contract on macOS without creating a D-Bus
 # connection or changing its production notification implementation.
 [target.'cfg(target_os = "macos")'.dev-dependencies]

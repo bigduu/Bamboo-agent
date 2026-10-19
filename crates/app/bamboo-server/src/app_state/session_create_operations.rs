@@ -40,6 +40,15 @@ pub(crate) struct StoredOperationError {
     pub http_status: u16,
 }
 
+/// Rebuildable outer receipt for the canonical Inbox's first instruction.
+/// It contains no input text, permission, prompt or authority grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SupervisedRootDelivery {
+    pub receipt_id: String,
+    pub generation: u64,
+    pub activation: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SessionCreateOperationRecord {
     version: u8,
@@ -49,6 +58,8 @@ pub(crate) struct SessionCreateOperationRecord {
     pub payload_fingerprint: String,
     pub session_id: String,
     pub status: StoredOperationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervised_delivery: Option<SupervisedRootDelivery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<StoredOperationError>,
     pub created_at: DateTime<Utc>,
@@ -73,6 +84,7 @@ impl SessionCreateOperationRecord {
             payload_fingerprint,
             session_id,
             status: StoredOperationStatus::Pending,
+            supervised_delivery: None,
             error: None,
             created_at: now,
             updated_at: now,
