@@ -3803,13 +3803,10 @@ impl SessionStoreV2 {
             .map_err(RuntimeTaskJournalFinalizeError::RecoveryRequired)
     }
 
-    async fn restore_runtime_task_undo(
+    async fn prepare_runtime_task_undo(
         &self,
         undo: &TaskControlPlaneUndo,
-        fault: RuntimeTaskTransactionFault,
-        guard: &RuntimeTaskTransactionWriteGuard,
-    ) -> io::Result<()> {
-        self.maybe_fail_runtime_task_transaction(fault)?;
+    ) -> io::Result<(PathBuf, Session)> {
         let Some((abs_dir, mut current)) = self
             .load_runtime_task_recovery_control_plane(&undo.session_id)
             .await?
@@ -3819,8 +3816,22 @@ impl SessionStoreV2 {
                 format!("cannot recover missing session {}", undo.session_id),
             ));
         };
+        reject_incompatible_session_write(&current)?;
         current.task_list = undo.task_list.clone();
         current.set_task_list_version_meta(undo.task_list_version.clone());
+        self.validate_runtime_task_recovery_write_target(&abs_dir, &current)
+            .await?;
+        Ok((abs_dir, current))
+    }
+
+    async fn restore_runtime_task_undo(
+        &self,
+        prepared: &(PathBuf, Session),
+        fault: RuntimeTaskTransactionFault,
+        guard: &RuntimeTaskTransactionWriteGuard,
+    ) -> io::Result<()> {
+        self.maybe_fail_runtime_task_transaction(fault)?;
+        let (abs_dir, current) = prepared;
         let event = match fault {
             RuntimeTaskTransactionFault::FirstRollbackWrite => {
                 RuntimeTaskDurabilityEvent::FirstRollbackSidecarPublished
@@ -3830,9 +3841,9 @@ impl SessionStoreV2 {
             }
             _ => unreachable!("rollback helper only accepts rollback write faults"),
         };
-        self.validate_runtime_task_recovery_write_target(&abs_dir, &current)
+        self.validate_runtime_task_recovery_write_target(abs_dir, current)
             .await?;
-        self.write_runtime_sidecar_durable(&abs_dir, &current, guard)
+        self.write_runtime_sidecar_durable(abs_dir, current, guard)
             .await?;
         self.record_runtime_task_durability_event(event);
         Ok(())
@@ -3843,10 +3854,14 @@ impl SessionStoreV2 {
         journal: &RuntimeTaskTransactionJournal,
         guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
+        // Preflight the entire undo before either publication. A guard only
+        // inside each physical write would still permit a partial rollback.
+        let first = self.prepare_runtime_task_undo(&journal.first).await?;
+        let second = self.prepare_runtime_task_undo(&journal.second).await?;
         let mut errors = Vec::new();
         if let Err(error) = self
             .restore_runtime_task_undo(
-                &journal.first,
+                &first,
                 RuntimeTaskTransactionFault::FirstRollbackWrite,
                 guard,
             )
@@ -3856,7 +3871,7 @@ impl SessionStoreV2 {
         }
         if let Err(error) = self
             .restore_runtime_task_undo(
-                &journal.second,
+                &second,
                 RuntimeTaskTransactionFault::SecondRollbackWrite,
                 guard,
             )
@@ -4228,6 +4243,31 @@ impl SessionStoreV2 {
         }
     }
 
+    /// Assess canonical Main and retained runtime under the caller's existing
+    /// exclusive Task guard. Keep the side-only snapshot as the narrow commit
+    /// source: reading history for this fence must not copy it into Task state
+    /// or change a compatible legacy sidecar's behavior-stamp encoding.
+    async fn validate_runtime_task_execution_contract(&self, current: &Session) -> io::Result<()> {
+        reject_incompatible_session_write(current)?;
+        let rel = self.resolve_rel_path(&current.id).await.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Task target has no canonical path")
+        })?;
+        let (kind, root_id) = Self::copy_source_identity_from_rel(&current.id, &rel)?;
+        // The public admission reader would reenter the Task shared lock.
+        let durable = self
+            .load_session_from_dir_strict(
+                &self.abs_path_from_rel(&rel),
+                &current.id,
+                kind,
+                &root_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Task target has no live Main")
+            })?;
+        reject_incompatible_session_write(&durable)
+    }
+
     async fn save_runtime_task_control_plane_if_matches(
         &self,
         original: &Session,
@@ -4242,6 +4282,8 @@ impl SessionStoreV2 {
                 "single Task snapshots must preserve the session id",
             ));
         }
+        reject_incompatible_session_write(original)?;
+        reject_incompatible_session_write(updated)?;
         if Self::runtime_task_non_task_snapshot(original)?
             != Self::runtime_task_non_task_snapshot(updated)?
         {
@@ -4262,6 +4304,8 @@ impl SessionStoreV2 {
         else {
             return Ok(false);
         };
+        self.validate_runtime_task_execution_contract(&current)
+            .await?;
         self.validate_root_context_for_save(&current).await?;
         if current.authority_identity != original.authority_identity
             || current.supervisor_management != original.supervisor_management
@@ -4300,6 +4344,7 @@ impl SessionStoreV2 {
             second_updated,
         ] {
             validate_session_id(&session.id)?;
+            reject_incompatible_session_write(session)?;
         }
         if first_original.id != first_updated.id
             || second_original.id != second_updated.id
@@ -4356,6 +4401,11 @@ impl SessionStoreV2 {
         else {
             return Ok(false);
         };
+        // Both members must pass before the journal or first sidecar exists.
+        self.validate_runtime_task_execution_contract(&current_first)
+            .await?;
+        self.validate_runtime_task_execution_contract(&current_second)
+            .await?;
         self.validate_root_context_for_save(&current_first).await?;
         self.validate_root_context_for_save(&current_second).await?;
         if current_first.authority_identity != first_original.authority_identity
@@ -4599,6 +4649,7 @@ impl SessionStoreV2 {
         session: &Session,
         guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
+        reject_incompatible_session_write(session)?;
         self.validate_root_context_for_save(session).await?;
         let path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let snapshot = runtime_sidecar_snapshot(session);
