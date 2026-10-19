@@ -371,6 +371,88 @@ mod physical {
             assert!(PatrolCheckpointStore::open(&path).is_ok());
         }
 
+        fn assert_named_lock_change_cannot_admit_writer(replacement: bool) {
+            let root = root();
+            let path = canonical(&root);
+            let first = PatrolCheckpointStore::open(&path).unwrap();
+            let lock = path.join("patrol-writer.lock");
+            std::fs::remove_file(&lock).unwrap();
+            if replacement {
+                std::fs::write(&lock, b"").unwrap();
+            }
+            assert!(matches!(
+                PatrolCheckpointStore::open(&path),
+                Err(PortError::Conflict)
+            ));
+            drop(first);
+            assert!(PatrolCheckpointStore::open(&path).is_ok());
+        }
+
+        #[test]
+        fn lock_identity_deleted_name_does_not_admit_a_second_writer() {
+            assert_named_lock_change_cannot_admit_writer(false);
+        }
+
+        #[test]
+        fn lock_identity_replaced_name_does_not_admit_a_second_writer() {
+            assert_named_lock_change_cannot_admit_writer(true);
+        }
+
+        #[test]
+        fn lock_identity_restored_inode_cannot_hide_a_competing_cas() {
+            let root = root();
+            let path = canonical(&root);
+            let mut first = PatrolCheckpointStore::open(&path).unwrap();
+            assert_eq!(first.save(None, &checkpoint()), Ok(1));
+            let blocked = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let observed = blocked.clone();
+            let fault_path = path.clone();
+            let mut competing = checkpoint();
+            competing.last_check_ms = 102;
+            competing.next_check_ms = 112;
+            first.fault = Some(Box::new(move |boundary| {
+                if boundary != Boundary::BeforeRename {
+                    return Ok(());
+                }
+                let named = fault_path.join("patrol-writer.lock");
+                let retained = fault_path.join("retained-patrol-writer.lock");
+                std::fs::rename(&named, &retained)?;
+                let prevented = match PatrolCheckpointStore::open(&fault_path) {
+                    Err(PortError::Conflict) => true,
+                    Err(error) => panic!("unexpected competing-open error: {error:?}"),
+                    Ok(mut second) => {
+                        // A real second store interleaves a CAS after the first
+                        // read/validation but before its final rename.
+                        assert_eq!(second.save(Some(1), &competing), Ok(2));
+                        false
+                    }
+                };
+                if named.exists() {
+                    std::fs::remove_file(&named)?;
+                }
+                std::fs::rename(&retained, &named)?;
+                *observed.lock().unwrap() = Some(prevented);
+                Ok(())
+            }));
+            let mut next = checkpoint();
+            next.last_check_ms = 101;
+            next.next_check_ms = 111;
+            assert_eq!(first.save(Some(1), &next), Ok(2));
+            assert_eq!(
+                *blocked.lock().unwrap(),
+                Some(true),
+                "restoring the named inode admitted two successful revision-2 CAS writes"
+            );
+            assert_eq!(
+                first.load(&scope()).unwrap().unwrap(),
+                StoredCheckpoint {
+                    version: 2,
+                    checkpoint: next
+                }
+            );
+        }
+
+
         #[test]
         fn publication_failure_before_rename_retains_the_old_record() {
             let root = root();
