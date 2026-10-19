@@ -33,6 +33,36 @@ function validateDispatch(event, validation, sourceRevision, sourceTree) {
   assert.ok(Array.isArray(validation.policyOnlyPaths))
   assert.deepEqual(validation.policyOnlyPaths, [], 'No changed product source may reuse earlier CI')
   assert.equal(sourceTree, validation.validatedTree, 'Require the exact accepted CI tree')
+  const promotion = validation.mainPromotion
+  assert.equal(promotion?.mainProtected, true, 'Require protected main promotion before publication')
+  assert.equal(promotion.sourceInMain, true)
+  assert.match(promotion.mainRevision, SHA)
+  assert.match(promotion.mergeRevision, SHA)
+  assert.equal(promotion.mergeTree, sourceTree)
+  assert.equal(promotion.mergeParents?.length, 2)
+  for (const parent of promotion.mergeParents) assert.match(parent, SHA)
+  assert.ok(promotion.mergeParents.includes(sourceRevision))
+  const pr = promotion.pullRequest
+  assert.ok(Number.isSafeInteger(pr?.number) && pr.number > 0)
+  assert.equal(pr.html_url, `https://github.com/bigduu/Bamboo-agent/pull/${pr.number}`)
+  assert.equal(pr.state, 'closed')
+  assert.equal(pr.merged, true)
+  assert.equal(pr.draft, false)
+  assert.equal(pr.baseRef, 'main')
+  assert.equal(pr.headRef, run.head_branch)
+  assert.equal(pr.headRevision, sourceRevision)
+  assert.ok(typeof pr.mergedAt === 'string' && Number.isFinite(Date.parse(pr.mergedAt)))
+  const summary = promotion.reviewSummary
+  assert.match(summary?.url, new RegExp(`^${pr.html_url.replaceAll('.', '\\.')}#issuecomment-[1-9][0-9]*$`))
+  assert.equal(summary.actor?.type, 'Bot')
+  assert.ok(['chatgpt-codex-connector[bot]', 'chatgpt-codex-connector'].includes(summary.actor.login))
+  for (const kind of ['code_review', 'security_review']) {
+    const review = summary.state[kind]
+    assert.equal(review?.commit_sha, sourceRevision)
+    assert.equal(review.status, 'completed')
+    assert.equal(review.has_any_findings, false)
+    assert.equal(review.has_unresolved_findings, false)
+  }
   // Distinct HEAD-derived metadata is recorded, never claimed byte-identical.
   assert.equal(validation.productTreeVerified, true)
   return run

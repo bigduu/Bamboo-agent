@@ -430,7 +430,8 @@ jobs:
               assert os.environ["GITHUB_WORKFLOW_REF"] == f"{repository}/.github/workflows/publish-crate.yml@{ref}"
               def api(route):
                   return json.loads(subprocess.check_output(["gh", "api", f"repos/{repository}/{route}"], text=True))
-              assert api("branches/main")["commit"]["sha"] == workflow_source
+              main = api("branches/main")
+              assert main["protected"] is True and main["commit"]["sha"] == workflow_source
               run_id = inputs["accepted_ci_run"]
               assert re.fullmatch(r"[1-9][0-9]*", run_id)
               ci = api("actions/runs/" + run_id)
@@ -452,6 +453,48 @@ jobs:
               ancestor(cut, ci["head_sha"])
               ancestor(ci["head_sha"], dev["commit"]["sha"])
               ancestor(source, reference["sha"])
+              # Successful release-PR CI is validation, never main-promotion authority.
+              ancestor(source, workflow_source)
+              promotions = api(f"pulls?state=closed&base=main&head={owner}:{ci['head_branch']}&per_page=100")
+              assert len(promotions) < 100, "Incomplete promotion PR inventory"
+              promotions = [pr for pr in promotions if pr["head"]["sha"] == source and pr.get("merged_at")]
+              assert len(promotions) == 1, "Require the exact normally merged main promotion PR"
+              promotion = api(f"pulls/{promotions[0]['number']}")
+              assert promotion["state"] == "closed" and promotion["merged"] is True and promotion["draft"] is False
+              assert promotion["head"]["sha"] == source and promotion["head"]["ref"] == ci["head_branch"]
+              assert promotion["head"]["repo"]["full_name"] == promotion["base"]["repo"]["full_name"] == repository
+              assert promotion["base"]["ref"] == "main" and promotion["merged_at"]
+              merge_revision = promotion["merge_commit_sha"]
+              assert re.fullmatch(r"[0-9a-f]{40}", merge_revision)
+              ancestor(merge_revision, workflow_source)
+              merge_commit = api("git/commits/" + merge_revision)
+              merge_parents = [parent["sha"] for parent in merge_commit["parents"]]
+              assert len(merge_parents) == 2 and source in merge_parents
+              assert merge_commit["tree"]["sha"] == api("git/commits/" + source)["tree"]["sha"]
+              comments = api(f"issues/{promotion['number']}/comments?per_page=100")
+              assert len(comments) < 100, "Incomplete promotion review inventory"
+              summaries = []
+              for comment in comments:
+                  actor = comment.get("user", {})
+                  if actor.get("type") != "Bot" or actor.get("login") not in ("chatgpt-codex-connector[bot]", "chatgpt-codex-connector"):
+                      continue
+                  match = re.search(r"<!-- codex-review-state:v1 (.*?) -->", comment.get("body", ""))
+                  if match:
+                      summaries.append((comment["html_url"], json.loads(match.group(1)), actor))
+              assert summaries, "Require the promotion PR's actual Codex review summary"
+              review_url, reviews, review_actor = summaries[-1]
+              for kind in ("code_review", "security_review"):
+                  review = reviews[kind]
+                  assert review["commit_sha"] == source and review["status"] == "completed"
+                  assert review["has_any_findings"] is False and review["has_unresolved_findings"] is False
+              main_promotion = {"mainRevision": workflow_source, "mainProtected": main["protected"],
+                                "sourceInMain": True, "mergeRevision": merge_revision,
+                                "mergeTree": merge_commit["tree"]["sha"], "mergeParents": merge_parents,
+                                "pullRequest": {"number": promotion["number"], "html_url": promotion["html_url"],
+                                                "state": promotion["state"], "merged": promotion["merged"], "draft": promotion["draft"],
+                                                "headRevision": promotion["head"]["sha"], "headRef": promotion["head"]["ref"],
+                                                "baseRef": promotion["base"]["ref"], "mergedAt": promotion["merged_at"]},
+                                "reviewSummary": {"url": review_url, "state": reviews, "actor": review_actor}}
               paths = []
               required = ["Validation Source", "Promotion Source", "Test", "E2E Tests", "Lint",
                           "Build (ubuntu-latest)", "Build (macos-latest)", "Build (windows-latest)"]
@@ -474,7 +517,8 @@ jobs:
               ci_identity["head_repository"] = {"full_name": repository}
               validation = {"kind": "bamboo-release-ci-reuse/v1", "sourceRevision": source, "sourceTree": source_tree,
                             "validatedRevision": revision, "validatedTree": tree, "ciRun": ci_identity,
-                            "requiredChecks": required, "policyOnlyPaths": paths, "productTreeVerified": True}
+                            "requiredChecks": required, "policyOnlyPaths": paths, "productTreeVerified": True,
+                            "mainPromotion": main_promotion}
               value = json.dumps(validation, separators=(",", ":"))
               with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
                   stream.write(f"revision={source}\nvalidation={value}\n")
