@@ -664,3 +664,80 @@ async fn supervisor_management_capacity_and_overflow_fail_before_publication() {
     );
     assert_eq!(files(&store, &reference.session_id).await, before);
 }
+
+
+#[tokio::test]
+async fn session_version_writer_management_scope_rejects_future_main_and_side_without_publication() {
+    use super::session_compatibility_tests::{writer_contract_bytes, writer_future_contract};
+    let mut failures = Vec::new();
+    for conflict in ["main", "session", "runtime", "context"] {
+        let (_home, store, reference) = fixture().await;
+        let directory = store.sessions_root_dir().join(&reference.session_id);
+        writer_future_contract(&directory, conflict).await;
+        let before = writer_contract_bytes(&store, &directory);
+        let result = change(&store, &reference, 0, scope(&["project-a"])).await;
+        let refused = result.as_ref().is_err_and(|error| error.to_string().contains("session_execution_incompatible"));
+        let retained = writer_contract_bytes(&store, &directory) == before;
+        let observation = store.inspect_supervisor_scope(&reference).await.unwrap();
+        let unchanged = observation.state_revision == 0 && observation.allowed_projects.is_empty();
+        eprintln!("management contract {conflict}: refused={refused} retained={retained} unchanged={unchanged}");
+        if !refused || !retained || !unchanged {
+            failures.push(format!("{conflict}: {result:?}, retained={retained}, unchanged={unchanged}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn session_version_writer_management_create_rejects_before_publishing_target() {
+    use super::session_compatibility_tests::{writer_contract_bytes, writer_future_contract};
+    let mut failures = Vec::new();
+    for conflict in ["main", "session", "runtime", "context"] {
+        let (_home, store, reference) = fixture().await;
+        change(&store, &reference, 0, scope(&["project-a"])).await.unwrap();
+        let directory = store.sessions_root_dir().join(&reference.session_id);
+        writer_future_contract(&directory, conflict).await;
+        let before = writer_contract_bytes(&store, &directory);
+        let mut candidate = Session::new("future-management-target", "model");
+        candidate.set_project_id_meta("project-a");
+        candidate.set_workspace_path_meta("/fixture/future-management-target");
+        candidate.metadata_version = 0;
+        let result = store.create_and_attach_supervised_root(&reference, 1, &candidate).await;
+        let refused = result.as_ref().is_err_and(|error| error.to_string().contains("session_execution_incompatible"));
+        let retained = writer_contract_bytes(&store, &directory) == before;
+        let absent = !store.sessions_root_dir().join(&candidate.id).exists()
+            && store.get_index_entry(&candidate.id).await.is_none();
+        eprintln!("management create contract {conflict}: refused={refused} retained={retained} target_absent={absent}");
+        if !refused || !retained || !absent {
+            failures.push(format!("{conflict}: {result:?}, retained={retained}, absent={absent}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn session_version_writer_management_compatible_legacy_scope_and_creation_remain_valid() {
+    for (main, side) in [(None, Some(1)), (Some(1), None)] {
+        let (_home, store, reference) = fixture().await;
+        let directory = store.sessions_root_dir().join(&reference.session_id);
+        for (name, version) in [("session.json", main), ("runtime.json", side)] {
+            let path = directory.join(name);
+            let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).await.unwrap()).unwrap();
+            raw.as_object_mut().unwrap().remove("_bamboo_main_authority");
+            if let Some(version) = version { raw["session_version"] = serde_json::json!(version); }
+            else { raw.as_object_mut().unwrap().remove("session_version"); }
+            fs::write(path, serde_json::to_vec_pretty(&raw).unwrap()).await.unwrap();
+        }
+        assert_eq!(change(&store, &reference, 0, scope(&["project-a"])).await.unwrap().state_revision, 1);
+        let mut candidate = Session::new("legacy-management-target", "model");
+        candidate.set_project_id_meta("project-a");
+        candidate.set_workspace_path_meta("/fixture/legacy-management-target");
+        candidate.metadata_version = 0;
+        let receipt = store.create_and_attach_supervised_root(&reference, 1, &candidate).await.unwrap();
+        assert!(receipt.changed);
+        assert!(linked(&store, &reference, &candidate.id).await);
+        let loaded = store.load_session(&reference.session_id).await.unwrap().unwrap();
+        assert_eq!(loaded.session_version, main);
+        assert!(loaded.execution_compatibility().execution_allowed);
+    }
+}
