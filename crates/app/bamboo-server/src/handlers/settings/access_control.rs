@@ -648,8 +648,18 @@ pub(crate) fn request_is_run_scoped(req: &HttpRequest) -> bool {
     req.extensions()
         .get::<crate::codex_run_tokens::CodexRunAuthContext>()
         .is_some()
-        || presented_bearer_token(req)
-            .is_some_and(|token| token.starts_with(crate::codex_run_tokens::CODEX_RUN_TOKEN_PREFIX))
+        || req.headers().get_all(header::AUTHORIZATION).any(|value| {
+            let Ok(value) = value.to_str() else {
+                return false;
+            };
+            let mut parts = value.split_ascii_whitespace();
+            parts
+                .next()
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer"))
+                && parts.next().is_some_and(|token| {
+                    token.starts_with(crate::codex_run_tokens::CODEX_RUN_TOKEN_PREFIX)
+                })
+        })
 }
 
 /// Reuse existing cookie/device verification without upgrading LocalBypass or Open.
@@ -3259,9 +3269,25 @@ mod owner_credential_tests {
     fn run_scoped_bearer_or_worker_context_cannot_upgrade_even_a_valid_cookie() {
         let config = configured();
         let cookie = build_access_verified_cookie(&config, false).unwrap();
+        for bearer in [
+            "Bearer bcx1_run_only",
+            "bearer bcx1_run_only",
+            "BeArEr bcx1_run_only",
+            "  BeArEr   bcx1_run_only",
+        ] {
+            let request = TestRequest::get()
+                .cookie(cookie.clone())
+                .insert_header((header::AUTHORIZATION, bearer))
+                .to_http_request();
+            assert_eq!(
+                owner_credential_status(&request, &config),
+                OwnerCredentialStatus::Required
+            );
+        }
         let request = TestRequest::get()
             .cookie(cookie.clone())
-            .insert_header((header::AUTHORIZATION, "Bearer bcx1_run_only"))
+            .append_header((header::AUTHORIZATION, "Bearer unrelated"))
+            .append_header((header::AUTHORIZATION, "BeArEr bcx1_run_only"))
             .to_http_request();
         assert_eq!(
             owner_credential_status(&request, &config),

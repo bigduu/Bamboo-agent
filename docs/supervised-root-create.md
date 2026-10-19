@@ -127,7 +127,9 @@ A success returns `receipt` with the exact Supervisor reference,
 `state_revision`, `changed` and `link_revision`. A fresh already-satisfied
 desired set is a no-op. A stale revision returns 409
 `scope_revision_conflict`, including when the desired set has since been
-achieved. The owner must read again and explicitly confirm the complete set;
+achieved. After CAS issuance, only the storage's typed authority conflict is
+known rejected; generic I/O errors return 503 `scope_outcome_unconfirmed` with
+no receipt or not-submitted guarantee. The owner must read again and explicitly confirm the complete set;
 the client must not silently replay a stale write or add Projects. This scope
 CAS retry rule is separate from the unchanged-request replay of an uncertain
 Root creation operation.

@@ -437,10 +437,7 @@ async fn model_scope_reports_owner_action_without_grant_or_work_readiness() {
     assert_eq!(scope["code"], "project_scope_uninitialized");
     assert_eq!(scope["owner_action"]["model_callable"], false);
     assert_eq!(scope["owner_action"]["path"], URI);
-    assert_eq!(
-        scope["owner_action"]["requires"],
-        "trusted_host_owner_channel"
-    );
+    assert_eq!(scope["owner_action"]["requires"], "authenticated_owner");
     assert_eq!(scope["work_scope"]["availability"], "not_observed");
     assert_eq!(scope["work_scope"]["status_path"], "/api/v1/tickets/scope");
     let observed = SupervisorSessionService::new(f.state.storage.clone())

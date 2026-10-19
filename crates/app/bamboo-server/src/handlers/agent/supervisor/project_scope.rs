@@ -46,6 +46,19 @@ fn owner_error(status: OwnerCredentialStatus) -> Option<HttpResponse> {
         else { StatusCode::SERVICE_UNAVAILABLE },code,"Verified existing owner credentials are required; local/open access is not an authenticated owner. No credential or security setting was changed."))
 }
 
+// Once canonical publication is issued, an untyped I/O error cannot prove
+// no commit occurred. Match the existing native adapter's conservative boundary.
+fn publication_error(failure: io::Error) -> HttpResponse {
+    if failure
+        .get_ref()
+        .is_some_and(|inner| inner.is::<bamboo_domain::SessionAuthorityConflict>())
+    {
+        error(StatusCode::CONFLICT, "scope_revision_conflict", failure)
+    } else {
+        error(StatusCode::SERVICE_UNAVAILABLE, "scope_outcome_unconfirmed", "The scope publication outcome is unknown. Read canonical scope; do not automatically replay the PUT or infer a successful receipt.")
+    }
+}
+
 fn storage_error(error_value: io::Error) -> HttpResponse {
     let (status, code) = match error_value.kind() {
         io::ErrorKind::WouldBlock => (StatusCode::CONFLICT, "scope_revision_conflict"),
@@ -249,6 +262,41 @@ pub async fn configure_project_scope(
         .await
     {
         Ok(receipt) => Ok(HttpResponse::Ok().json(json!({"receipt":receipt}))),
-        Err(failure) => Ok(storage_error(failure)),
+        Err(failure) => Ok(publication_error(failure)),
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    #[actix_web::test]
+    async fn only_typed_conflict_is_known_rejected_after_cas_issuance() {
+        let typed = publication_error(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict("stale scope".into()),
+        ));
+        assert_eq!(typed.status(), StatusCode::CONFLICT);
+        let value: serde_json::Value =
+            serde_json::from_slice(&actix_web::body::to_bytes(typed.into_body()).await.unwrap())
+                .unwrap();
+        assert_eq!(value["code"], "scope_revision_conflict");
+        for kind in [
+            io::ErrorKind::Other,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidData,
+        ] {
+            let response = publication_error(io::Error::new(kind, "injected publication I/O"));
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let value: serde_json::Value = serde_json::from_slice(
+                &actix_web::body::to_bytes(response.into_body())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(value["code"], "scope_outcome_unconfirmed");
+            assert!(value.get("receipt").is_none());
+            assert!(value.get("not_submitted").is_none());
+        }
     }
 }
