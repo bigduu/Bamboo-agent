@@ -404,3 +404,31 @@ async fn compact_shared_workspace_rechecks_policy_before_child_publication() {
     assert_no_creation(&h, &port, &parent, before).await;
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
+
+
+#[cfg(unix)]
+#[tokio::test]
+async fn compact_rejects_significant_parent_path_whitespace_redirection() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    let directory = tempfile::tempdir().unwrap();
+    let selected = directory.path().join("selected ");
+    let trimmed = directory.path().join("selected");
+    std::fs::create_dir(&selected).unwrap();
+    std::fs::create_dir(&trimmed).unwrap();
+    let selected = selected.canonicalize().unwrap();
+    let trimmed = trimmed.canonicalize().unwrap();
+    assert_ne!(selected, trimmed);
+    let mut parent = h.storage.load_session(&h.parent_session_id).await.unwrap().unwrap();
+    parent.set_workspace_path_meta(selected.to_string_lossy());
+    parent.metadata_version += 1;
+    h.storage.save_session(&parent).await.unwrap();
+    let parent = h.storage.load_session(&parent.id).await.unwrap().unwrap();
+    assert_eq!(parent.workspace_path_meta().as_deref(), selected.to_str());
+    let before = h.adapter.session_store.list_index_entries().await.len();
+    let (tool, port) = recording_tool(&h);
+    // The existing Host path validator trims input. Sharing must detect its
+    // redirection, rather than first trimming away the parent's identity too.
+    let result = compact_create(&tool, &parent.id).await;
+    assert!(result.is_err(), "significant path whitespace changed checkout: {result:?}");
+    assert_no_creation(&h, &port, &parent, before).await;
+}
