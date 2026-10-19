@@ -161,3 +161,67 @@ async fn cloned_store_cannot_reopen_a_changed_or_aliased_lock_between_transactio
         assert_eq!(fs::read(record_path(root.path(), &stable)).unwrap(), before);
     }
 }
+
+#[tokio::test]
+async fn restored_lock_inode_cannot_hide_a_competing_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let active = Arc::new(AtomicBool::new(false));
+    let flag = active.clone();
+    let (entered, receive) = tokio::sync::oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    let (release, wait) = std::sync::mpsc::channel();
+    let release = ReleaseWriter(Some(release));
+    let wait = Mutex::new(wait);
+    let store = FileReadyRetryStore::with_publication_fault(
+        root.path(),
+        Arc::new(move |phase| {
+            if flag.load(Ordering::SeqCst) && phase == ReadyRetryFilePhase::BeforeReplace {
+                entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                wait.lock().unwrap().recv().unwrap();
+            }
+            Ok(())
+        }),
+    );
+    let stable = key("restored-lock");
+    store
+        .compare_exchange(&stable, None, initial())
+        .await
+        .unwrap();
+    active.store(true, Ordering::SeqCst);
+    let first_key = stable.clone();
+    let writer = tokio::spawn(async move {
+        store
+            .compare_exchange(&first_key, Some(1), reserved())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), receive)
+        .await
+        .unwrap()
+        .unwrap();
+    let canonical = root.path().join("ready-retry-v1.lock");
+    let retired = root.path().join("retired.lock");
+    fs::rename(&canonical, &retired).unwrap();
+    fs::write(&canonical, b"").unwrap();
+    let competing_store = FileReadyRetryStore::new(root.path());
+    let competing = tokio::time::timeout(
+        Duration::from_secs(5),
+        competing_store.compare_exchange(&stable, Some(1), second_charge()),
+    )
+    .await;
+    fs::remove_file(&canonical).unwrap();
+    fs::rename(&retired, &canonical).unwrap();
+    drop(release);
+    let first = tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .unwrap()
+        .unwrap();
+    let competing = competing.expect("the contender must finish while the writer is held");
+    let persisted = FileReadyRetryStore::new(root.path()).load(&stable).await;
+    assert!(
+        matches!(competing, Err(Error::ResourceBlocked(_))),
+        "restoring the original inode hid a competing CAS: first={first:?}; contender={competing:?}; persisted={persisted:?}"
+    );
+    let charged = first.unwrap();
+    assert_eq!(charged.record, reserved());
+    assert_eq!(persisted.unwrap(), Some(charged));
+}
