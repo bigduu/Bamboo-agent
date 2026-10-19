@@ -64,3 +64,38 @@ async fn session_version_compatible_legacy_without_stamp_still_continues() {
     let loaded = fixture.store.load_session(&session.id).await.unwrap().unwrap();
     assert!(serde_json::to_value(loaded).unwrap().get("session_version").is_none());
 }
+
+#[tokio::test]
+async fn session_version_unsupported_retained_state_is_not_reset_before_dispatch() {
+    for context_conflict in [false, true] {
+        let fixture = Fixture::new().await;
+        let mut session = with_version(Session::new("future-retained-state", "test-model"), None);
+        session.add_message(Message::user("Existing preserved history"));
+        fixture.repo.save(&mut session).await.unwrap();
+        if context_conflict {
+            session.model_context_state = Some(bamboo_domain::ModelContextState {
+                schema_version: 99,
+                state_revision: 7,
+                ..Default::default()
+            });
+        } else {
+            let mut runtime = AgentRuntimeState::new("retained-generation");
+            runtime.version = 99;
+            session.agent_runtime_state = Some(runtime);
+        }
+        let before = serde_json::to_value(&session).unwrap();
+        let agent = fixture.agent(None, false, false, None);
+        let error = agent.run(&mut session, "must not reset this retained schema").await
+            .expect_err("unknown retained schema is a concrete conflict");
+        let expected = if context_conflict {
+            "unsupported_model_context_version"
+        } else {
+            "unsupported_runtime_state_version"
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert_eq!(fixture.probe.provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+        assert!(fixture.probe.calls.lock().unwrap().is_empty());
+    }
+}

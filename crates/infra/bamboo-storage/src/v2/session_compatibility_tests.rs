@@ -110,3 +110,51 @@ async fn session_version_store_ordinary_save_cannot_upgrade_an_existing_stamp() 
     assert!(error.to_string().contains("session_version_change_requires_new_session"), "{error}");
     assert_eq!(pair(home.path(), "legacy").await, before);
 }
+
+#[tokio::test]
+async fn session_version_store_compatible_main_and_side_preserve_legacy_execution() {
+    for (main, runtime) in [(None, Some(1)), (Some(1), None)] {
+        let home = tempfile::tempdir().unwrap();
+        let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+        storage.save_session(&Session::new("compatible-pair", "model")).await.unwrap();
+        change_stamp(home.path(), "compatible-pair", main, runtime).await;
+        let mut loaded = storage.load_session("compatible-pair").await.unwrap().unwrap();
+        assert_eq!(loaded.session_version, main);
+        assert!(loaded.execution_compatibility().execution_allowed);
+        loaded.title = "compatible checkpoint".into();
+        storage.save_runtime_state(&loaded).await.unwrap();
+        let loaded = storage.load_session("compatible-pair").await.unwrap().unwrap();
+        assert_eq!(loaded.session_version, main);
+        assert!(loaded.execution_compatibility().execution_allowed);
+    }
+}
+
+#[tokio::test]
+async fn session_version_store_rejected_checkpoint_does_not_publish_cache_snapshot() {
+    use crate::session_merge::LockedSessionStore;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    for runtime_only in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let storage = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+        storage.save_session(&Session::new("future-cache", "model")).await.unwrap();
+        change_stamp(home.path(), "future-cache", Some(99), Some(99)).await;
+        let mut loaded = storage.load_session("future-cache").await.unwrap().unwrap();
+        loaded.title = "must not publish into cache".into();
+        let before = pair(home.path(), "future-cache").await;
+        let locked = LockedSessionStore::new(storage);
+        let published = AtomicBool::new(false);
+        let result = if runtime_only {
+            locked.save_runtime_only_and_publish(&mut loaded, |_| {
+                published.store(true, Ordering::SeqCst);
+            }).await
+        } else {
+            locked.merge_save_runtime_and_publish(&mut loaded, |_, _| {
+                published.store(true, Ordering::SeqCst);
+            }).await
+        };
+        assert!(result.is_err());
+        assert!(!published.load(Ordering::SeqCst));
+        assert_eq!(pair(home.path(), "future-cache").await, before);
+    }
+}
