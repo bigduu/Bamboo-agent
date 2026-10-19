@@ -49,6 +49,10 @@ pub fn resolve_session_tool_reference(
         if contains(exact) {
             return Some(exact.to_string());
         }
+        let unqualified = exact.rsplit("::").next().unwrap_or(exact).trim();
+        if unqualified != exact && contains(unqualified) {
+            return Some(unqualified.to_string());
+        }
         return contains("spawn_session").then(|| "spawn_session".to_string());
     }
     crate::resolve_tool_reference_name(reference, contains)
