@@ -633,7 +633,7 @@ async fn default_host_without_owner_verifier_never_accepts_scope_grant() {
         .set_json(json!({"incarnation_id":reference.incarnation_id,"expected_state_revision":0,"allowed_projects":[project.id]})).to_request()).await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let error: Value = test::read_body_json(response).await;
-    assert_eq!(error["code"], "host_owner_authorization_unavailable");
+    assert_eq!(error["code"], "owner_authentication_unconfigured");
     let scope = service.inspect_scope(&reference).await.unwrap();
     assert_eq!(scope.state_revision, 0);
     assert!(scope.allowed_projects.is_empty());

@@ -12,7 +12,11 @@ use bamboo_projects::ProjectStoreError;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{app_state::AppState, handlers::agent::tickets};
+use super::project_scope_owner;
+use crate::{
+    app_state::AppState,
+    handlers::{agent::tickets, settings::OwnerCredentialStatus},
+};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,8 +29,21 @@ pub struct ProjectScopeUpdate {
 fn error(status: StatusCode, code: &str, message: impl ToString) -> HttpResponse {
     HttpResponse::build(status).json(json!({
         "error":crate::error::error_value(message.to_string()), "code":code,
-        "recovery":"The verified Host owner must read the current scope and explicitly choose the complete Project set. Refresh incarnation/revision after a conflict; never auto-grant, attach historical Sessions or change Work/security settings."
+        "recovery":"Sign in with existing owner credentials, read the current scope and explicitly choose the complete Project set. Refresh incarnation/revision after a conflict; never auto-grant, attach historical Sessions or change Work/security settings."
     }))
+}
+
+fn owner_code(status: OwnerCredentialStatus) -> Option<&'static str> {
+    match status {
+        OwnerCredentialStatus::Authenticated => None,
+        OwnerCredentialStatus::Required => Some("owner_authentication_required"),
+        OwnerCredentialStatus::Unconfigured => Some("owner_authentication_unconfigured"),
+        OwnerCredentialStatus::Unavailable => Some("owner_authentication_unavailable"),
+    }
+}
+fn owner_error(status: OwnerCredentialStatus) -> Option<HttpResponse> {
+    owner_code(status).map(|code|error(if status==OwnerCredentialStatus::Required { StatusCode::UNAUTHORIZED }
+        else { StatusCode::SERVICE_UNAVAILABLE },code,"Verified existing owner credentials are required; local/open access is not an authenticated owner. No credential or security setting was changed."))
 }
 
 fn storage_error(error_value: io::Error) -> HttpResponse {
@@ -82,12 +99,17 @@ pub async fn inspect_project_scope(
         Ok(reference) => reference,
         Err(response) => return Ok(*response),
     };
+    let owner = if state.supervisor_project_scope_owner_authorizer.is_some() {
+        OwnerCredentialStatus::Authenticated
+    } else {
+        project_scope_owner::credential_status(&state, &request).await
+    };
     match SupervisorSessionService::new(state.storage.clone()).inspect_scope(&reference).await {
-        Ok(scope) => Ok(HttpResponse::Ok().json(json!({
+        Ok(scope) => Ok(HttpResponse::Ok().insert_header((actix_web::http::header::CACHE_CONTROL,"no-store")).insert_header((actix_web::http::header::VARY,"Origin, Cookie, Authorization")).json(json!({
             "code":if scope.allowed_projects.is_empty() {"project_scope_uninitialized"} else {"project_scope_configured"},
-            "capabilities":{"project_scope_v1":true,"supervised_root_create_v1":true},
+            "capabilities":{"project_scope_v1":true,"supervised_root_create_v1":true,"project_scope_http_write_v1":true},
             "scope":scope,
-            "owner_authorization":{"available":state.supervisor_project_scope_owner_authorizer.is_some(),"required":true,"kind":"trusted_host_intent","http_registration":false},
+            "owner_authorization":{"available":owner==OwnerCredentialStatus::Authenticated,"required":true,"kind":"authenticated_owner","http_registration":false,"code":owner_code(owner)},
             "note":"This management scope enables only subsequent authorized Root operations. It does not initialize Work, bind a workspace, attach an existing Session or grant shell/build permissions."
         }))),
         Err(failure) => Ok(storage_error(failure)),
@@ -123,10 +145,7 @@ pub async fn configure_project_scope(
             "Supervisor incarnation changed; read its current scope",
         ));
     }
-    let Some(authorizer) = state.supervisor_project_scope_owner_authorizer.as_ref() else {
-        return Ok(error(StatusCode::SERVICE_UNAVAILABLE,"host_owner_authorization_unavailable",
-            "The Host has not installed a trusted owner authorization channel. Use the existing trusted Rust Host service; do not enable settings, mint HTTP credentials or infer consent from loopback access."));
-    };
+
     let intent = SupervisorManagementRequest {
         supervisor: reference.clone(),
         expected_state_revision: body.expected_state_revision,
@@ -134,10 +153,30 @@ pub async fn configure_project_scope(
             allowed_projects: body.allowed_projects.clone(),
         },
     };
-    if !authorizer.authorize(&request, &intent) {
-        return Ok(error(StatusCode::FORBIDDEN,"host_owner_authorization_required",
-            "Explicit Host owner consent for this exact Supervisor, revision and complete Project set is required. Local bypass and run/device/access credentials alone do not authorize it."));
-    }
+    let web_owner = if let Some(authorizer) =
+        state.supervisor_project_scope_owner_authorizer.as_ref()
+    {
+        // Preserve the existing explicit Rust embedding verifier. Desktop and
+        // ordinary browser clients use the same credential-authenticated API below.
+        if !authorizer.authorize(&request, &intent) {
+            return Ok(error(
+                StatusCode::FORBIDDEN,
+                "host_owner_authorization_required",
+                "The explicit Host verifier rejected this exact scope intent.",
+            ));
+        }
+        false
+    } else {
+        if let Some(response) =
+            owner_error(project_scope_owner::credential_status(&state, &request).await)
+        {
+            return Ok(response);
+        }
+        if !project_scope_owner::same_origin_json(&request) {
+            return Ok(error(StatusCode::FORBIDDEN,"owner_request_origin_invalid","This owner mutation requires application/json and the exact same or explicitly configured browser Origin."));
+        }
+        true
+    };
     let service = SupervisorSessionService::new(state.storage.clone());
     let observed = match service.inspect_scope(&reference).await {
         Ok(scope) => scope,
@@ -190,6 +229,15 @@ pub async fn configure_project_scope(
                 "project_store_unavailable",
                 failure,
             ))
+        }
+    }
+    if web_owner {
+        // Re-read canonical credentials at mutation admission, including rotation,
+        // revocation and repair. The earlier observation never confers a grant.
+        if let Some(response) =
+            owner_error(project_scope_owner::credential_status(&state, &request).await)
+        {
+            return Ok(response);
         }
     }
     match service

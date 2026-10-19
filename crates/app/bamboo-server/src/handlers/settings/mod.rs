@@ -20,8 +20,9 @@ mod workflows;
 #[cfg(test)]
 pub(crate) use access_control::issue_device_token;
 pub(crate) use access_control::{
-    bootstrap_access_snapshot, request_is_authorized, verify_device_token, BootstrapAccessSnapshot,
-    BootstrapRequestState,
+    bootstrap_access_snapshot, owner_credential_status, request_is_authorized,
+    request_is_run_scoped, verify_device_token, BootstrapAccessSnapshot, BootstrapRequestState,
+    OwnerCredentialStatus,
 };
 pub use access_control::{
     create_pairing_code, enforce_access_password_middleware, get_access_status, list_devices,
