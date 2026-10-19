@@ -436,6 +436,9 @@ test('recovery rejects unsigned/tampered/foreign checkpoints, missing assets and
     (stored) => { const p = JSON.parse(original); delete p.authentication; stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
     (stored) => { const p = JSON.parse(original); p.builds[0].sha256 = '8'.repeat(64); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
     (stored) => { const p = JSON.parse(original); p.runId = '999'; signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
+    (stored) => { const p = JSON.parse(original); p.workflowRevision = '9'.repeat(40); signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
+    (stored) => { const p = JSON.parse(original); p.runAttempt = 0; signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
+    (stored) => { const p = JSON.parse(original); p.ciRun += '/foreign'; signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
     (stored) => { const p = JSON.parse(original); p.sourceRevision = '8'.repeat(40); signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
     (stored) => { const p = JSON.parse(original); p.kind = 'another-protocol'; signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
     (stored) => { stored.delete(target) },
@@ -531,4 +534,33 @@ test('the actual source preflight rejects every missing or incompatible producer
     }
     fs.writeFileSync(target, marker + '\n')
   }
+})
+
+test('a fresh dispatch after main advances completes the original signed checkpoint without expired job artifacts', async (t) => {
+  const value = publishingFixture(t)
+  value.context.upload = (file) => {
+    const name = path.basename(file)
+    if (name === release.MANIFEST) throw new Error('manifest upload interrupted')
+    value.stored.set(name, fs.readFileSync(file))
+  }
+  await assert.rejects(() => release.publishAssets(value.context), /manifest upload interrupted/)
+  assert.ok(value.stored.has(release.PROVENANCE)); assert.ok(!value.stored.has(release.MANIFEST))
+  const freshDispatch = { ...identity, workflowRevision: '8'.repeat(40), runId: '101', runAttempt: 1 }
+  const outputDirectory = path.join(value.root, 'fresh-dispatch-recovery'); fs.mkdirSync(outputDirectory)
+  const assets = () => [...value.stored.keys()].map(name => ({ name }))
+  // No artifact input/bindings are supplied: only authenticated public checkpoint assets survive.
+  await release.recoverPublishedRelease({ identity: freshDispatch, sourceRoot: value.sourceRoot,
+    outputDirectory, frontendBytes, signingKey, release: { assets: assets() },
+    readAsset: asset => value.stored.get(asset.name) })
+  for (const name of fs.readdirSync(value.outputDirectory)) {
+    assert.deepEqual(fs.readFileSync(path.join(outputDirectory, name)), fs.readFileSync(path.join(value.outputDirectory, name)))
+  }
+  const uploads = []
+  await release.publishAssets({ directory: outputDirectory, release: { assets: assets() },
+    readAsset: asset => value.stored.get(asset.name), listAssets: assets,
+    upload: file => { uploads.push(path.basename(file)); value.stored.set(path.basename(file), fs.readFileSync(file)) } })
+  assert.deepEqual(uploads, [release.MANIFEST])
+  const original = JSON.parse(value.stored.get(release.PROVENANCE))
+  assert.equal(original.runId, identity.runId)
+  assert.equal(original.workflowRevision, identity.workflowRevision)
 })

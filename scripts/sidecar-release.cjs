@@ -280,7 +280,8 @@ function assembleRelease({ identity, inputDirectory, outputDirectory, sourceRoot
 // All binaries and the deterministic host precede provenance in the upload
 // order. Once that signed checkpoint exists, a later full workflow rerun can
 // finish the original manifest even if its new builds have different bytes.
-// Never adopt an unsigned receipt, a different run/source, or incomplete assets.
+// Preserve the authenticated original build run/controller even across a new
+// recovery dispatch. Never adopt unsigned, foreign-source/CI or incomplete assets.
 async function recoverPublishedRelease({ identity, release, outputDirectory, sourceRoot,
   frontendBytes, signingKey, readAsset }) {
   const checkpoint = release.assets.find((asset) => asset.name === PROVENANCE)
@@ -291,12 +292,20 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
   if (identity.validation) assert.deepEqual(proof.validation, identity.validation)
   assert.equal(proof.schemaVersion, 1)
   assert.equal(proof.kind, PROVENANCE_KIND)
-  for (const key of ['repository', 'version', 'sourceRevision', 'sourceTree', 'workflowRevision', 'runId', 'ciRun']) {
+  for (const key of ['repository', 'version', 'sourceRevision', 'sourceTree', 'ciRun']) {
     assert.equal(proof[key], identity[key], `Recovery provenance mismatch: ${key}`)
   }
+  assert.match(proof.workflowRevision, SHA)
+  assert.match(proof.runId, /^[1-9][0-9]*$/)
+  assert.ok(Number.isSafeInteger(proof.runAttempt) && proof.runAttempt >= 1)
+  // Authentication binds the original controller/run and each platform receipt.
+  // The caller already revalidates current protected-main promotion; a later
+  // dispatch must not relabel the immutable checkpoint as its own fresh build.
+  const originalBuildIdentity = { ...identity, workflowRevision: proof.workflowRevision,
+    runId: proof.runId, runAttempt: proof.runAttempt }
   assert.deepEqual(proof.builds?.map((item) => item.target), TARGETS)
   for (const item of proof.builds) {
-    validateBuildReceipt(item, identity, item.target)
+    validateBuildReceipt(item, originalBuildIdentity, item.target)
     assert.deepEqual(item.frontendBytes, frontendBytes)
   }
   assert.equal(proof.runAttempt, Math.max(...proof.builds.map((item) => item.runAttempt)))
