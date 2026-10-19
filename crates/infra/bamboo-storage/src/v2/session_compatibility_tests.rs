@@ -970,9 +970,22 @@ async fn session_version_task_legacy_stamps_keep_cas_and_undo_usable() {
                     .unwrap(),
                 )
                 .unwrap();
+                // Narrow CAS preserves the side encoding. Existing undo uses
+                // the canonical Main stamp; both None and v1 remain compatible.
+                let side_stamp = if operation == "single" || operation == "pair" {
+                    if missing_main {
+                        Some(1)
+                    } else {
+                        None
+                    }
+                } else if missing_main {
+                    None
+                } else {
+                    Some(1)
+                };
                 assert_eq!(
                     side.get("session_version").and_then(Value::as_u64),
-                    if missing_main { Some(1) } else { None }
+                    side_stamp
                 );
                 let generation =
                     if operation == "pair" || (operation == "single" && id == "tx-child") {
@@ -982,6 +995,7 @@ async fn session_version_task_legacy_stamps_keep_cas_and_undo_usable() {
                     };
                 assert_eq!(loaded.task_list_version_meta().as_deref(), Some(generation));
             }
+            eprintln!("Task compatible missing_main={missing_main}/{operation}: passed");
         }
     }
 }
