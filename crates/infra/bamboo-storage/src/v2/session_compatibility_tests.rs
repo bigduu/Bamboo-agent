@@ -522,3 +522,530 @@ async fn session_version_missing_main_preserves_unknown_context_schema() {
 async fn session_version_missing_main_compatible_repair_remains_usable() {
     missing_main_repair_retains_contract(None).await;
 }
+
+// Task's dedicated CAS and undo paths must obey the same retained contract as
+// ordinary checkpoints. These fixtures only alter API-created TempDir data.
+const TASK_CONTRACT_CONFLICTS: [&str; 4] = ["session", "runtime", "context", "main"];
+
+async fn task_member_directory(storage: &SessionStoreV2, id: &str) -> std::path::PathBuf {
+    storage.abs_path_from_rel(&storage.resolve_rel_path(id).await.unwrap())
+}
+
+async fn task_contract_bytes(
+    home: &Path,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut bytes = std::collections::BTreeMap::new();
+    for directory in ["sessions/tx-root", "sessions/tx-root/children/tx-child"] {
+        for name in [
+            "session.json",
+            "runtime.json",
+            super::root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE,
+        ] {
+            let path = home.join(directory).join(name);
+            match tokio::fs::read(&path).await {
+                Ok(raw) => {
+                    bytes.insert(path, raw);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("read Task fixture: {error}"),
+            }
+        }
+    }
+    let mut journals =
+        match tokio::fs::read_dir(home.join(super::RUNTIME_TASK_TRANSACTION_DIR)).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return bytes,
+            Err(error) => panic!("read Task journals: {error}"),
+        };
+    while let Some(entry) = journals.next_entry().await.unwrap() {
+        if entry.file_type().await.unwrap().is_file() {
+            bytes.insert(entry.path(), tokio::fs::read(entry.path()).await.unwrap());
+        }
+    }
+    bytes
+}
+
+async fn task_set_stamp(storage: &SessionStoreV2, id: &str, main: bool, stamp: Option<u32>) {
+    let path = task_member_directory(storage, id).await.join(if main {
+        "session.json"
+    } else {
+        "runtime.json"
+    });
+    let mut raw: Value = serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+    if main {
+        raw.as_object_mut()
+            .unwrap()
+            .remove("_bamboo_main_authority");
+    }
+    match stamp {
+        Some(stamp) => raw["session_version"] = json!(stamp),
+        None => {
+            raw.as_object_mut().unwrap().remove("session_version");
+        }
+    }
+    let encoded = serde_json::to_vec_pretty(&raw).unwrap();
+    if main {
+        assert!(super::compact_main::validate_full_main(&encoded)
+            .unwrap()
+            .is_none());
+    }
+    tokio::fs::write(path, encoded).await.unwrap();
+}
+
+fn task_future_caller(session: &mut Session, conflict: &str) {
+    match conflict {
+        "session" => session.session_version = Some(99),
+        "runtime" => {
+            let mut state = bamboo_domain::AgentRuntimeState::new("retained-task-run");
+            state.version = 99;
+            session.agent_runtime_state = Some(state);
+        }
+        "context" => {
+            session.model_context_state = Some(bamboo_domain::ModelContextState {
+                schema_version: 99,
+                ..Default::default()
+            })
+        }
+        _ => unreachable!(),
+    }
+    assert!(!session.execution_compatibility().execution_allowed);
+}
+
+async fn task_future_contract(storage: &SessionStoreV2, id: &str, conflict: &str) {
+    if conflict == "main" || conflict == "session" {
+        task_set_stamp(storage, id, conflict == "main", Some(99)).await;
+    } else {
+        let path = task_member_directory(storage, id)
+            .await
+            .join("runtime.json");
+        let mut session: Session =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        task_future_caller(&mut session, conflict);
+        tokio::fs::write(path, serde_json::to_vec_pretty(&session).unwrap())
+            .await
+            .unwrap();
+    }
+    // Check the edited document is parseable future state, preserving the
+    // existing identity/proof; pending undo intentionally blocks public reads.
+    let path = task_member_directory(storage, id)
+        .await
+        .join(if conflict == "main" {
+            "session.json"
+        } else {
+            "runtime.json"
+        });
+    let parsed: Session = serde_json::from_slice(&tokio::fs::read(path).await.unwrap()).unwrap();
+    assert!(!parsed.execution_compatibility().execution_allowed);
+}
+
+fn record_task_refusal(
+    label: &str,
+    result: std::io::Result<()>,
+    unchanged: bool,
+    unpublished: bool,
+    failures: &mut Vec<String>,
+) {
+    let refused = result
+        .as_ref()
+        .is_err_and(|error| error.to_string().contains("session_execution_incompatible"));
+    eprintln!("Task contract {label}: compatibility_refused={refused} bytes_retained={unchanged} no_publication={unpublished}");
+    if !refused || !unchanged || !unpublished {
+        failures.push(format!(
+            "{label}: result={result:?}, retained={unchanged}, unpublished={unpublished}"
+        ));
+    }
+}
+
+#[tokio::test]
+async fn session_version_task_single_cas_preflights_retained_main_and_side() {
+    let mut failures = Vec::new();
+    for id in ["tx-child", "tx-root"] {
+        for conflict in TASK_CONTRACT_CONFLICTS {
+            let home = tempfile::tempdir().unwrap();
+            let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+            let (child, child_updated, root, root_updated) =
+                super::tests::seed_runtime_task_transaction_pair(&storage)
+                    .await
+                    .unwrap();
+            task_future_contract(&storage, id, conflict).await;
+            let readable = storage.load_session(id).await.unwrap().unwrap();
+            assert!(!readable.execution_compatibility().execution_allowed);
+            assert_eq!(readable.messages.len(), 1);
+            let before = task_contract_bytes(home.path()).await;
+            storage.take_runtime_task_durability_events();
+            let (original, updated) = if id == "tx-child" {
+                (&child, &child_updated)
+            } else {
+                (&root, &root_updated)
+            };
+            let result = storage
+                .save_task_control_plane_if_matches(original, updated)
+                .await
+                .map(|_| ());
+            record_task_refusal(
+                &format!("single/{id}/{conflict}"),
+                result,
+                before == task_contract_bytes(home.path()).await,
+                storage.take_runtime_task_durability_events().is_empty(),
+                &mut failures,
+            );
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn session_version_task_pair_preflights_both_members_before_journal() {
+    let mut failures = Vec::new();
+    for id in ["tx-child", "tx-root"] {
+        for conflict in TASK_CONTRACT_CONFLICTS {
+            let home = tempfile::tempdir().unwrap();
+            let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+            let (child, child_updated, root, root_updated) =
+                super::tests::seed_runtime_task_transaction_pair(&storage)
+                    .await
+                    .unwrap();
+            task_future_contract(&storage, id, conflict).await;
+            let before = task_contract_bytes(home.path()).await;
+            storage.take_runtime_task_durability_events();
+            let result = storage
+                .save_task_control_planes_atomically(&child, &child_updated, &root, &root_updated)
+                .await
+                .map(|_| ());
+            record_task_refusal(
+                &format!("pair/{id}/{conflict}"),
+                result,
+                before == task_contract_bytes(home.path()).await,
+                storage.take_runtime_task_durability_events().is_empty(),
+                &mut failures,
+            );
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn session_version_task_cas_refuses_future_incoming_snapshots() {
+    let mut failures = Vec::new();
+    for paired in [false, true] {
+        for conflict in ["session", "runtime", "context"] {
+            let home = tempfile::tempdir().unwrap();
+            let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+            let (child, child_updated, mut root, mut root_updated) =
+                super::tests::seed_runtime_task_transaction_pair(&storage)
+                    .await
+                    .unwrap();
+            task_future_caller(&mut root, conflict);
+            task_future_caller(&mut root_updated, conflict);
+            let before = task_contract_bytes(home.path()).await;
+            storage.take_runtime_task_durability_events();
+            let result = if paired {
+                storage
+                    .save_task_control_planes_atomically(
+                        &child,
+                        &child_updated,
+                        &root,
+                        &root_updated,
+                    )
+                    .await
+            } else {
+                storage
+                    .save_task_control_plane_if_matches(&root, &root_updated)
+                    .await
+            };
+            record_task_refusal(
+                &format!("incoming/paired={paired}/{conflict}"),
+                result.map(|_| ()),
+                before == task_contract_bytes(home.path()).await,
+                storage.take_runtime_task_durability_events().is_empty(),
+                &mut failures,
+            );
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+async fn seed_task_undo(
+    storage: &SessionStoreV2,
+    marker: super::RuntimeTaskJournalMarkerState,
+) -> std::path::PathBuf {
+    use super::{
+        RuntimeTaskDurabilityEvent as Event, RuntimeTaskTransactionJournal, TaskControlPlaneUndo,
+    };
+    let (child, child_updated, root, root_updated) =
+        super::tests::seed_runtime_task_transaction_pair(storage)
+            .await
+            .unwrap();
+    let journal = RuntimeTaskTransactionJournal {
+        version: super::RUNTIME_TASK_TRANSACTION_VERSION,
+        transaction_id: uuid::Uuid::new_v4().to_string(),
+        first: TaskControlPlaneUndo {
+            session_id: child.id,
+            task_list: child.task_list,
+            task_list_version: "1".into(),
+        },
+        second: TaskControlPlaneUndo {
+            session_id: root.id,
+            task_list: root.task_list,
+            task_list_version: "1".into(),
+        },
+    };
+    let guard = storage
+        .lock_runtime_task_transaction_exclusive()
+        .await
+        .unwrap();
+    let prepared = storage.write_runtime_task_journal(&journal).await.unwrap();
+    storage
+        .write_existing_runtime_sidecar_durable_unchecked(
+            &child_updated,
+            Event::FirstUpdatedSidecarPublished,
+            &guard,
+        )
+        .await
+        .unwrap();
+    storage
+        .write_existing_runtime_sidecar_durable_unchecked(
+            &root_updated,
+            Event::SecondUpdatedSidecarPublished,
+            &guard,
+        )
+        .await
+        .unwrap();
+    let path = match marker {
+        super::RuntimeTaskJournalMarkerState::Prepared => prepared,
+        super::RuntimeTaskJournalMarkerState::Committing
+        | super::RuntimeTaskJournalMarkerState::Committed => {
+            let extension = if marker == super::RuntimeTaskJournalMarkerState::Committing {
+                "committing"
+            } else {
+                "committed"
+            };
+            let path = prepared.with_extension(extension);
+            super::atomic_rename(&prepared, &path).await.unwrap();
+            super::sync_parent_directory_entry(&path).await.unwrap();
+            path
+        }
+    };
+    drop(guard);
+    storage.take_runtime_task_durability_events();
+    path
+}
+
+#[tokio::test]
+async fn session_version_task_recovery_preflights_all_members_before_undo() {
+    use super::RuntimeTaskJournalMarkerState::{Committing, Prepared};
+    let mut failures = Vec::new();
+    for marker in [Prepared, Committing] {
+        for id in ["tx-child", "tx-root"] {
+            for conflict in TASK_CONTRACT_CONFLICTS {
+                let home = tempfile::tempdir().unwrap();
+                let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+                seed_task_undo(&storage, marker).await;
+                task_future_contract(&storage, id, conflict).await;
+                let before = task_contract_bytes(home.path()).await;
+                let result = storage
+                    .recover_task_control_plane_transaction("tx-child", "tx-root")
+                    .await;
+                record_task_refusal(
+                    &format!("recover/{marker:?}/{id}/{conflict}"),
+                    result,
+                    before == task_contract_bytes(home.path()).await,
+                    storage.take_runtime_task_durability_events().is_empty(),
+                    &mut failures,
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn session_version_task_orphan_recovery_retains_both_members_on_conflict() {
+    use super::RuntimeTaskJournalMarkerState::{Committing, Prepared};
+    let mut failures = Vec::new();
+    for marker in [Prepared, Committing] {
+        for id in ["tx-child", "tx-root"] {
+            for conflict in TASK_CONTRACT_CONFLICTS {
+                let home = tempfile::tempdir().unwrap();
+                let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+                seed_task_undo(&storage, marker).await;
+                task_future_contract(&storage, id, conflict).await;
+                let before = task_contract_bytes(home.path()).await;
+                drop(storage);
+                let result = SessionStoreV2::new(home.path().into()).await.map(|_| ());
+                record_task_refusal(
+                    &format!("reopen/{marker:?}/{id}/{conflict}"),
+                    result,
+                    before == task_contract_bytes(home.path()).await,
+                    true,
+                    &mut failures,
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[tokio::test]
+async fn session_version_task_legacy_stamps_keep_cas_and_undo_usable() {
+    use super::RuntimeTaskJournalMarkerState::{Committing, Prepared};
+    for missing_main in [false, true] {
+        for operation in ["single", "pair", "prepared", "committing"] {
+            let home = tempfile::tempdir().unwrap();
+            let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+            let mut staged = None;
+            if operation == "single" || operation == "pair" {
+                staged = Some(
+                    super::tests::seed_runtime_task_transaction_pair(&storage)
+                        .await
+                        .unwrap(),
+                );
+            } else {
+                seed_task_undo(
+                    &storage,
+                    if operation == "prepared" {
+                        Prepared
+                    } else {
+                        Committing
+                    },
+                )
+                .await;
+            }
+            for id in ["tx-child", "tx-root"] {
+                task_set_stamp(&storage, id, missing_main, None).await;
+            }
+            let before = task_contract_bytes(home.path()).await;
+            if let Some((child, child_updated, root, root_updated)) = staged {
+                let applied = if operation == "single" {
+                    storage
+                        .save_task_control_plane_if_matches(&child, &child_updated)
+                        .await
+                } else {
+                    storage
+                        .save_task_control_planes_atomically(
+                            &child,
+                            &child_updated,
+                            &root,
+                            &root_updated,
+                        )
+                        .await
+                }
+                .unwrap();
+                assert!(applied);
+            } else {
+                storage
+                    .recover_task_control_plane_transaction("tx-child", "tx-root")
+                    .await
+                    .unwrap();
+            }
+            let after = task_contract_bytes(home.path()).await;
+            for (path, raw) in before.iter().filter(|(path, _)| {
+                path.file_name().is_some_and(|name| {
+                    name == "session.json"
+                        || name == super::root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE
+                })
+            }) {
+                assert_eq!(after.get(path), Some(raw));
+            }
+            assert!(storage
+                .runtime_task_journal_paths()
+                .await
+                .unwrap()
+                .is_empty());
+            for id in ["tx-child", "tx-root"] {
+                let loaded = storage.load_session(id).await.unwrap().unwrap();
+                assert!(loaded.execution_compatibility().execution_allowed);
+                assert_eq!(
+                    loaded.session_version,
+                    if missing_main { None } else { Some(1) }
+                );
+                assert_eq!(loaded.messages.len(), 1);
+                let side: Value = serde_json::from_slice(
+                    &tokio::fs::read(
+                        task_member_directory(&storage, id)
+                            .await
+                            .join("runtime.json"),
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    side.get("session_version").and_then(Value::as_u64),
+                    if missing_main { Some(1) } else { None }
+                );
+                let generation =
+                    if operation == "pair" || (operation == "single" && id == "tx-child") {
+                        "2"
+                    } else {
+                        "1"
+                    };
+                assert_eq!(loaded.task_list_version_meta().as_deref(), Some(generation));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_version_task_committed_marker_only_cleans_up_future_history() {
+    use super::{RuntimeTaskDurabilityEvent as Event, RuntimeTaskJournalMarkerState::Committed};
+    for id in ["tx-child", "tx-root"] {
+        for conflict in TASK_CONTRACT_CONFLICTS {
+            let home = tempfile::tempdir().unwrap();
+            let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+            let journal = seed_task_undo(&storage, Committed).await;
+            task_future_contract(&storage, id, conflict).await;
+            let mut expected = task_contract_bytes(home.path()).await;
+            expected.remove(&journal);
+            drop(storage);
+            let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+            assert_eq!(
+                reopened.take_runtime_task_durability_events(),
+                vec![Event::JournalDeactivated]
+            );
+            assert_eq!(task_contract_bytes(home.path()).await, expected);
+            let loaded = reopened.load_session(id).await.unwrap().unwrap();
+            assert!(!loaded.execution_compatibility().execution_allowed);
+            assert_eq!(loaded.task_list_version_meta().as_deref(), Some("2"));
+            assert_eq!(loaded.messages.len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_version_task_rejection_does_not_publish_locked_store_callback() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let home = tempfile::tempdir().unwrap();
+    let storage = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+    let (_, _, _, updated) = super::tests::seed_runtime_task_transaction_pair(&storage)
+        .await
+        .unwrap();
+    task_future_contract(&storage, "tx-root", "main").await;
+    let before = task_contract_bytes(home.path()).await;
+    storage.take_runtime_task_durability_events();
+    let locked = crate::session_merge::LockedSessionStore::new(storage.clone());
+    let published = AtomicBool::new(false);
+    let result = locked
+        .update_task_list_control_plane_and_publish(
+            "tx-root",
+            updated.task_list.as_ref().unwrap(),
+            "2",
+            |_| {
+                published.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+    let mut failures = Vec::new();
+    record_task_refusal(
+        "locked-store/Main99",
+        result.map(|_| ()),
+        before == task_contract_bytes(home.path()).await,
+        !published.load(Ordering::SeqCst)
+            && storage.take_runtime_task_durability_events().is_empty(),
+        &mut failures,
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
