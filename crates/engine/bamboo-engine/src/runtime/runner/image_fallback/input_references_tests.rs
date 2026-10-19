@@ -184,8 +184,7 @@ async fn forged_cross_session_and_malformed_references_deny_without_reader_or_fi
             ViewImageTool::new().invoke(json!({"path": reference}), tool_ctx(&session.id)),
         )
         .await
-        .err()
-        .expect("forged reference rejected");
+        .expect_err("forged reference rejected");
         assert!(!error.to_string().contains("Failed to inspect image"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
