@@ -555,6 +555,7 @@ impl SessionStoreV2 {
         session: &Session,
         guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<(PathBuf, String)> {
+        reject_incompatible_session_write(session)?;
         let directory = directory.to_path_buf();
         let runtime = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(session))
             .map_err(|error| other_io_error(error.to_string()))?;

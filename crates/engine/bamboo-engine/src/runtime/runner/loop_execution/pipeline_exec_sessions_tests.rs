@@ -42,6 +42,7 @@ struct IgnoredQuietReminder {
     calls: AtomicUsize,
     handle: Mutex<Option<String>>,
     side_handle: String,
+    release_on_feedback: Option<PathBuf>,
 }
 
 #[async_trait::async_trait]
@@ -85,7 +86,58 @@ impl LLMProvider for IgnoredQuietReminder {
                 ));
                 polls
             }
-            round => panic!("quiet polling must pause before another provider request: {round}"),
+            round => {
+                let handle = self.handle.lock().unwrap().clone().unwrap();
+                if self.release_on_feedback.is_some() && round == 3 {
+                    let result = result_for(messages, "feedback-final");
+                    assert_eq!(result["status"], "completed");
+                    assert_eq!(result["exit_code"], 7);
+                    assert_eq!(result["output"], "quiet-finished");
+                    return Ok(Box::pin(stream::iter([
+                        Ok(LLMChunk::Token(
+                            "Observed command exit 7 after runtime feedback.".into(),
+                        )),
+                        Ok(LLMChunk::Done),
+                    ])));
+                }
+                assert!(
+                    messages
+                        .iter()
+                        .any(|message| message.content.contains("[runtime_progress_feedback_v1]")),
+                    "the same model receives structured facts instead of a Human question"
+                );
+                if let Some(gate) = self.release_on_feedback.as_ref() {
+                    assert_eq!(round, 2);
+                    tokio::time::resume();
+                    std::fs::write(gate, b"release").unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while bamboo_tools::tools::bash_runtime::get_shell(&handle)
+                            .unwrap()
+                            .status()
+                            == "running"
+                        {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    vec![tool_call(
+                        "feedback-final",
+                        "write_stdin",
+                        json!({"session_id":handle,"yield_time_ms":30_000}),
+                    )]
+                } else {
+                    assert!(
+                        round < 6,
+                        "finite recovery ends before a seventh provider request"
+                    );
+                    vec![tool_call(
+                        &format!("feedback-poll-{round}"),
+                        "write_stdin",
+                        json!({"session_id":handle,"yield_time_ms":250}),
+                    )]
+                }
+            }
         };
         Ok(Box::pin(stream::iter([
             Ok(LLMChunk::ToolCalls(calls)),
@@ -162,72 +214,29 @@ impl LLMProvider for ReadQuietCompletion {
     }
 }
 
-struct FinishBeforePause {
-    gate: PathBuf,
-    fired: std::sync::atomic::AtomicBool,
-}
-
-#[async_trait::async_trait]
-impl bamboo_agent_core::AgentHook for FinishBeforePause {
-    fn point(&self) -> bamboo_domain::AgentHookPoint {
-        bamboo_domain::AgentHookPoint::AfterToolExecution
-    }
-    async fn run(
-        &self,
-        _: bamboo_domain::AgentHookPoint,
-        payload: &bamboo_domain::HookPayload,
-        _: &Session,
-    ) -> bamboo_domain::HookResult {
-        if let bamboo_domain::HookPayload::ToolResult { outcome, .. } = payload {
-            if let Some(value) = outcome
-                .result
-                .as_ref()
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-            {
-                if value["polling"]["state"] == "needs_diagnosis"
-                    && !self.fired.swap(true, Ordering::SeqCst)
-                {
-                    tokio::time::resume();
-                    std::fs::write(&self.gate, b"release").unwrap();
-                    let id = value["session_id"].as_str().unwrap();
-                    tokio::time::timeout(Duration::from_secs(5), async {
-                        while bamboo_tools::tools::bash_runtime::get_shell(id)
-                            .unwrap()
-                            .status()
-                            == "running"
-                        {
-                            tokio::time::sleep(Duration::from_millis(1)).await;
-                        }
-                    })
-                    .await
-                    .unwrap();
-                }
-            }
-        }
-        bamboo_domain::HookResult::Continue
-    }
+#[tokio::test(start_paused = true)]
+async fn ignored_quiet_polling_ends_bounded_recovery_without_question_or_killing() {
+    quiet_feedback_fixture(false).await;
 }
 
 #[tokio::test(start_paused = true)]
-async fn ignored_quiet_polling_pauses_without_killing_and_resumes_the_same_real_handle() {
-    quiet_pause_fixture(false).await;
+async fn output_and_exit_after_feedback_are_read_in_the_same_real_execution() {
+    quiet_feedback_fixture(true).await;
 }
 
-#[tokio::test(start_paused = true)]
-async fn output_and_exit_between_suppression_and_pause_are_read_once_after_resume() {
-    quiet_pause_fixture(true).await;
-}
-
-async fn quiet_pause_fixture(finish_before_pause: bool) {
+async fn quiet_feedback_fixture(finish_after_feedback: bool) {
     let dir = tempfile::tempdir().unwrap();
     let gate = dir.path().join("release");
     let _release = ReleaseGate(gate.clone());
     let quoted_gate = gate.to_string_lossy().replace('\'', "'\\''");
-    let (mut session, mut config, mut state) = fixture(if finish_before_pause {
+    let (mut session, mut config, mut state) = fixture(if finish_after_feedback {
         "quiet-exit-race"
     } else {
         "ignored-quiet-polling"
     });
+    // Let the diagnostic recovery budget, rather than the generic round cap,
+    // determine this fixture's stop. Other fixtures keep their original cap.
+    config.run_budget.max_rounds = None;
     let executor = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
     let mut side_ctx = ToolCtx::none("side-start");
     side_ctx.session_id = Some(Arc::from(session.id.as_str()));
@@ -253,16 +262,8 @@ async fn quiet_pause_fixture(finish_before_pause: bool) {
         calls: AtomicUsize::new(0),
         handle: Mutex::new(None),
         side_handle: side["session_id"].as_str().unwrap().to_owned(),
+        release_on_feedback: finish_after_feedback.then(|| gate.clone()),
     });
-    let race = Arc::new(FinishBeforePause {
-        gate: gate.clone(),
-        fired: std::sync::atomic::AtomicBool::new(false),
-    });
-    if finish_before_pause {
-        let mut hooks = crate::runtime::hooks::HookRunner::new();
-        hooks.register(race.clone());
-        config.hook_runner = Arc::new(hooks);
-    }
     let (tx, mut rx) = mpsc::channel(256);
     run_pipeline(
         &mut session,
@@ -275,30 +276,37 @@ async fn quiet_pause_fixture(finish_before_pause: bool) {
     )
     .await
     .unwrap();
-    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        if finish_after_feedback { 4 } else { 6 }
+    );
+    assert!(session.pending_question.is_none());
+    assert_ne!(
         state.runtime_state.status,
         bamboo_domain::AgentStatusState::Suspended
     );
-    let pending = session
-        .pending_question
-        .as_ref()
-        .expect("deterministic diagnostic pause");
-    assert!(crate::session_app::no_progress::is_no_progress_question(
-        &session, pending
-    ));
-    assert!(pending.question.contains("command remains pending"));
-    let handle = provider.handle.lock().unwrap().clone().unwrap();
-    let shell = bamboo_tools::tools::bash_runtime::get_shell(&handle).unwrap();
+    assert!(!session.metadata.contains_key("runtime.suspend_reason"));
     assert_eq!(
-        shell.status(),
-        if finish_before_pause {
-            "completed"
+        session
+            .metadata
+            .get("runtime.completion_reason")
+            .map(String::as_str),
+        if finish_after_feedback {
+            None
         } else {
-            "running"
+            Some("observation_progress_exhausted")
         }
     );
-    assert_eq!(race.fired.load(Ordering::SeqCst), finish_before_pause);
+    let handle = provider.handle.lock().unwrap().clone().unwrap();
+    let shell = bamboo_tools::tools::bash_runtime::get_shell(&handle);
+    if finish_after_feedback {
+        assert!(
+            shell.is_none(),
+            "the real final capture consumed the completed handle"
+        );
+    } else {
+        assert_eq!(shell.as_ref().unwrap().status(), "running");
+    }
     let mut suppressed = 0;
     for index in 0..8 {
         let result = result_for(&session.messages, &format!("ignored-poll-{index}"));
@@ -325,7 +333,17 @@ async fn quiet_pause_fixture(finish_before_pause: bool) {
             questions += 1;
         }
     }
-    assert_eq!(questions, 1);
+    assert_eq!(questions, 0);
+    if !finish_after_feedback {
+        for round in 2..6 {
+            let actual = result_for(&session.messages, &format!("feedback-poll-{round}"));
+            assert_eq!(actual["status"], "running");
+            assert!(
+                actual["polling"].get("poll_suppressed").is_none(),
+                "every post-feedback read reaches real capture, rather than synthetic running"
+            );
+        }
+    }
     for id in ["other-input", "other-operation"] {
         let other = result_for(&session.messages, id);
         assert!(other["polling"].get("poll_suppressed").is_none());
@@ -337,7 +355,7 @@ async fn quiet_pause_fixture(finish_before_pause: bool) {
     );
     // No synthetic completion or process control is needed to resume. Restore
     // real time before letting the real OS child produce its ordinary exit.
-    if !finish_before_pause {
+    if !finish_after_feedback {
         tokio::time::resume();
     }
     for id in ["other-input", "other-operation"] {
@@ -370,24 +388,27 @@ async fn quiet_pause_fixture(finish_before_pause: bool) {
             }
         );
     }
-    if !finish_before_pause {
+    if finish_after_feedback {
+        return;
+    }
+    if !finish_after_feedback {
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(3600)).await;
         assert_eq!(
-            shell.status(),
+            shell.as_ref().unwrap().status(),
             "running",
             "silence is not a short process timeout"
         );
         tokio::time::resume();
     }
     session.add_message(Message::user(
-        "Continue waiting and read the command result.",
+        "Read the still-pending command and collect its real result.",
     ));
     let resumed = Arc::new(ReadQuietCompletion {
         handle: handle.clone(),
         calls: AtomicUsize::new(0),
         gate,
-        wait_before_release: !finish_before_pause,
+        wait_before_release: true,
     });
     run_pipeline(
         &mut session,
@@ -401,10 +422,7 @@ async fn quiet_pause_fixture(finish_before_pause: bool) {
     .await
     .unwrap();
     assert!(session.pending_question.is_none());
-    assert_eq!(
-        resumed.calls.load(Ordering::SeqCst),
-        if finish_before_pause { 2 } else { 3 }
-    );
+    assert_eq!(resumed.calls.load(Ordering::SeqCst), 3);
     assert!(bamboo_tools::tools::bash_runtime::get_shell(&handle).is_none());
 }
 

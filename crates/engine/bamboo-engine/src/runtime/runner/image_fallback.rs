@@ -8,12 +8,18 @@ use bamboo_agent_core::{AgentError, Message};
 use bamboo_llm::{LLMProvider, ResolvedModel};
 
 mod attachment_urls;
+mod input_references;
+#[cfg(test)]
+pub(crate) use input_references::conversation_image_reference;
+pub(crate) use input_references::{
+    image_reference_reader, project_nonvision_images, round_needs_image_references,
+};
 #[cfg(windows)]
 mod ocr;
 mod placeholder;
 mod rewrite;
 mod vision_target;
-pub(crate) use vision_target::configured_vision_resolver;
+pub(crate) use vision_target::{configured_vision_resolver, validate_configured_vision_target};
 
 #[cfg(windows)]
 pub async fn ensure_session_image_ocr_cached(
@@ -93,7 +99,7 @@ pub(crate) type VisionModelResolver = Arc<
 pub(crate) const VISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const VISION_TIMEOUT_MESSAGE: &str =
     "Vision description timed out; no image or partial description was sent to the main model.";
-pub(crate) const VISION_CONFIGURATION_ERROR: &str = "ViewImage requires a configured Vision model for a main model without Vision. Configure defaults.vision (provider instance and model), or vision_model on the active provider. No image was sent.";
+pub(crate) const VISION_CONFIGURATION_ERROR: &str = "ViewImage requires a configured Vision model for a main model without Vision. Original images and attachment references were preserved. Configure defaults.vision (provider instance and model, with features.provider_model_ref enabled), or vision_model on the active provider, or select a genuinely Vision-capable main model. No image was sent.";
 
 pub(crate) async fn resolve_vision_target(
     config: &crate::runtime::config::AgentLoopConfig,
@@ -108,10 +114,14 @@ pub(crate) async fn resolve_vision_target(
             return Err(AgentError::LLM(VISION_CONFIGURATION_ERROR.into()));
         }
         if !target.provider.supports_vision(&target.model_name).await {
-            return Err(AgentError::LLM("Configured Vision model does not support Vision. Enable supports_vision for that exact provider/model or select another configured Vision model. No image was sent.".into()));
+            return Err(AgentError::LLM(format!(
+                "Configured Vision model does not support Vision. {VISION_CONFIGURATION_ERROR}"
+            )));
         }
         Ok(target)
-    }).await.map_err(|_| AgentError::LLM("Vision model resolution timed out. No image was sent.".into()))?
+    })
+    .await
+    .map_err(|_| AgentError::LLM("Vision model resolution timed out. No image was sent.".into()))?
 }
 
 pub(crate) async fn describe_tool_images(

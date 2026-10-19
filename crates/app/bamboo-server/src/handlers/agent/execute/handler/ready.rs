@@ -155,6 +155,41 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         return bad_request_error_response(error);
     }
 
+    // A non-Vision main receives references, never image payloads. Fail with
+    // actionable retained-image feedback when its explicit auxiliary target is
+    // unavailable. This inspects configuration only: no provider construction,
+    // credential initialization, target resolution or model request.
+    if vision_override == Some(false)
+        && session.messages.iter().any(|message| {
+            message.content_parts.as_ref().is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
+            })
+        })
+    {
+        let active_provider = session_effective_model_ref(&session)
+            .map(|model_ref| model_ref.provider)
+            .unwrap_or_else(|| config.provider_name.clone());
+        if let Err(error) =
+            bamboo_engine::model_config_helper::validate_image_reference_vision_config(
+                config_snapshot,
+                &active_provider,
+            )
+        {
+            super::fail_reserved_pending_startup(
+                state,
+                session_id,
+                ready.startup_turn_id.as_deref(),
+                &error,
+                ready.admission_reservation,
+                &mut *ready.startup_guard,
+            )
+            .await;
+            return bad_request_error_response(error);
+        }
+    }
+
     // #74: re-derive the "no interactive human approver" posture per
     // user-initiated execute, OVERWRITING the session's persisted flag (see
     // `apply_no_human_approver`). Done before the `merge_save_runtime` persist
