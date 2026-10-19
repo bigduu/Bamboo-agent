@@ -779,6 +779,9 @@ impl AgentRuntime {
         req: ExecuteRequest,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
+        session
+            .check_execution_compatibility()
+            .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
         // Refusals are not executions: never reach SessionEnd or the generic
         // final checkpoint, and never mutate another counted owner's clone.
         super::counted_loop::reject_ambiguous_reentry(session, self.persistence.as_ref()).await?;
