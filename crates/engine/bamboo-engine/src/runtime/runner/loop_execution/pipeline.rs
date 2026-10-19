@@ -3218,32 +3218,33 @@ async fn run_pipeline_inner(
         if fresh_human_input || resumed_progress_question {
             tool_policy_guard.reset_observation_progress();
         }
-        // Consume once after input admission and before recording another model
-        // round. Retries reuse this request-only hint. A pause creates no
-        // phantom model round and leaves every completed tool pair intact.
-        let observation_progress_hint = tool_policy_guard.observation_progress_hint();
-        if tool_policy_guard.should_pause_for_quiet_polling()
-            && crate::runtime::runner::tool_execution::pause_for_quiet_polling(
-                session,
-                &mut state.runtime_state,
-                event_tx,
-                config,
-            )
-            .await?
-        {
-            break;
-        }
-        if tool_policy_guard.should_pause_for_observation_progress()
-            && crate::runtime::runner::tool_execution::pause_for_no_progress(
-                session,
-                &mut state.runtime_state,
-                event_tx,
-                config,
-            )
-            .await?
-        {
-            break;
-        }
+        // Consume only after the complete real tool batch and newly admitted
+        // Human input. The same-model facts are mandatory for each bounded
+        // recovery request; they create neither a pending question nor a grant.
+        let feedback_active = crate::runtime::runner::tool_execution::progress_feedback_active(
+            session,
+            &state.runtime_state,
+            config,
+        );
+        let observation_progress_hint =
+            match tool_policy_guard.feedback_for_next_round(feedback_active) {
+                crate::runtime::runner::tool_execution::FeedbackDecision::Continue(hint) => hint,
+                crate::runtime::runner::tool_execution::FeedbackDecision::Exhausted {
+                    feedback,
+                    summary,
+                } => {
+                    crate::runtime::runner::tool_execution::finish_exhausted_progress(
+                        session,
+                        &state.runtime_state,
+                        event_tx,
+                        config,
+                        &feedback,
+                        &summary,
+                    )
+                    .await?;
+                    break;
+                }
+            };
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {
@@ -3359,7 +3360,7 @@ async fn run_pipeline_inner(
                 &state.session_id,
                 &state.model_name,
                 &tool_schemas,
-                observation_progress_hint,
+                observation_progress_hint.as_deref(),
                 Some(
                     crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
                         round_id: &round_id,
@@ -3451,7 +3452,7 @@ async fn run_pipeline_inner(
                                 &state.session_id,
                                 &state.model_name,
                                 &tool_schemas_after_recovery,
-                                observation_progress_hint,
+                                observation_progress_hint.as_deref(),
                                 Some(
                                     crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
                                         round_id: &round_id,
@@ -13874,6 +13875,23 @@ mod tests {
             model: &str,
         ) -> Result<LLMStream, LLMError> {
             assert_eq!(model, "actual-model");
+            if self.support == Some(false) {
+                assert!(
+                    messages.iter().all(|message| {
+                        message.content_parts.as_ref().is_none_or(|parts| {
+                            parts.iter().all(|part| {
+                                !matches!(part, bamboo_domain::MessagePart::ImageUrl { .. })
+                            })
+                        })
+                    }),
+                    "non-Vision main never receives pixels from upload or tool output"
+                );
+                if self.path.starts_with("bamboo-") {
+                    assert!(messages
+                        .iter()
+                        .any(|message| message.content.contains(&self.path)));
+                }
+            }
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
                 return Ok(Box::pin(stream::iter(vec![
@@ -14004,128 +14022,178 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vision_same_nonvision_main_rejects_uploads_but_describes_viewimage_output() {
-        let image = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
-        std::fs::write(image.path(), b"\x89PNG\r\n\x1a\nvision-test").unwrap();
-        let provider = Arc::new(VisionLoopProvider {
-            support: Some(false),
-            path: image.path().to_string_lossy().into_owned(),
-            expect_description: true,
-            alias: "view_image",
-            calls: AtomicUsize::new(0),
-            received_images: Default::default(),
-        });
-        let vision_calls = Arc::new(AtomicUsize::new(0));
-        let vision: Arc<dyn LLMProvider> = Arc::new(AuxiliaryVisionMock(vision_calls.clone()));
-        let target_resolutions = Arc::new(AtomicUsize::new(0));
-        let resolver_count = target_resolutions.clone();
-        let mut session = Session::new("vision-loop-fallback", "stale-session-model");
-        session.add_message(Message::user("View the image"));
-        let mut state = e2e_loop_state(&session.id);
-        state.model_name = "actual-model".into();
-        let config = AgentLoopConfig {
-            model_name: Some("actual-model".into()),
-            // Even an enabled legacy Vision hook and a valid tool target must
-            // not forward a direct upload when the main model lacks Vision.
-            image_fallback: Some(crate::ImageFallbackConfig {
-                mode: crate::ImageFallbackMode::Vision,
-                vision_model: Some("configured-vision".into()),
-            }),
-            vision_model_resolver: Some(Arc::new(move || {
-                resolver_count.fetch_add(1, Ordering::SeqCst);
-                let provider = vision.clone();
-                Box::pin(async move {
-                    Ok(bamboo_llm::ResolvedModel::new(
-                        provider,
-                        "configured-vision",
-                    ))
-                })
-            })),
-            ..delegation_loop_config()
-        };
-        let (tx, _rx) = tokio::sync::mpsc::channel(256);
-        // Same executing main provider, effective model, target and hook config
-        // as the successful ViewImage call below. Both upload transports reject
-        // before attachment resolution, either provider call, or target lookup.
-        for url in [
-            "data:image/png;base64,iVBORw0KGgo=",
-            "bamboo-attachment://upload-session/image1",
-        ] {
-            let mut upload = Session::new("vision-upload-rejected", "stale-session-model");
-            let message = Message::user_with_parts(
-                "uploaded image",
+    async fn vision_nonvision_upload_and_history_followup_use_only_requested_reference_fallback() {
+        use bamboo_agent_core::storage::Storage;
+        use base64::Engine;
+
+        for (inline, followup) in [(false, false), (false, true), (true, false), (true, true)] {
+            let home = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let mut session = Session::new("vision-reference-loop", "stale-session-model");
+            store.save_session(&session).await.unwrap();
+            let png = b"\x89PNG\r\n\x1a\nvision-test";
+            let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+            let (attachment_id, url) = if inline {
+                (None, format!("data:image/png;base64,{encoded}"))
+            } else {
+                let (id, url) = store
+                    .write_image_attachment(&session, &encoded, Some("image/png"))
+                    .await
+                    .unwrap();
+                (Some(id), url)
+            };
+            let image = Message::user_with_parts(
+                "inspect this image",
                 vec![bamboo_domain::MessagePart::ImageUrl {
                     image_url: bamboo_domain::ImageUrlRef {
-                        url: url.into(),
+                        url: url.clone(),
                         detail: None,
                     },
                 }],
             );
-            let image_id = message.id.clone();
-            let original_parts = message.content_parts.clone();
-            upload.add_message(message);
-            let entry_error = crate::session_app::execute::validate_image_fallback_for_session(
-                &upload,
+            let image_id = image.id.clone();
+            let original = serde_json::to_vec(&image).unwrap();
+            let reference = crate::runtime::runner::image_fallback::conversation_image_reference(
+                &session.id,
+                &image.id,
+                0,
+                &url,
+            );
+            session.add_message(image);
+            if followup {
+                session.add_message(Message::assistant("earlier turn", None));
+                session.add_message(Message::user("inspect the earlier retained image"));
+            }
+            store.save_session(&session).await.unwrap();
+            let session_file = store
+                .sessions_root_dir()
+                .join(&session.id)
+                .join("session.json");
+            let original_record_bytes = tokio::fs::read(&session_file).await.unwrap();
+            let disk_before = serde_json::to_vec(
+                &store
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .messages,
+            )
+            .unwrap();
+            let provider = Arc::new(VisionLoopProvider {
+                support: Some(false),
+                path: reference,
+                expect_description: true,
+                alias: "view_image",
+                calls: AtomicUsize::new(0),
+                received_images: Default::default(),
+            });
+            let vision_calls = Arc::new(AtomicUsize::new(0));
+            let vision: Arc<dyn LLMProvider> = Arc::new(AuxiliaryVisionMock(vision_calls.clone()));
+            let target_resolutions = Arc::new(AtomicUsize::new(0));
+            let resolutions = target_resolutions.clone();
+            let config = AgentLoopConfig {
+                model_name: Some("actual-model".into()),
+                attachment_reader: Some(store.clone()),
+                // An enabled legacy hook cannot eagerly describe uploads.
+                image_fallback: Some(crate::ImageFallbackConfig {
+                    mode: crate::ImageFallbackMode::Vision,
+                    vision_model: Some("configured-vision".into()),
+                }),
+                vision_model_resolver: Some(Arc::new(move || {
+                    resolutions.fetch_add(1, Ordering::SeqCst);
+                    let provider = vision.clone();
+                    Box::pin(async move {
+                        Ok(bamboo_llm::ResolvedModel::new(
+                            provider,
+                            "configured-vision",
+                        ))
+                    })
+                })),
+                ..delegation_loop_config()
+            };
+            crate::session_app::execute::validate_image_fallback_for_session(
+                &session,
                 config.image_fallback.as_ref(),
                 "actual-model",
                 Some(false),
             )
-            .unwrap_err();
-            assert!(entry_error.contains("does not support Vision"));
-            let mut upload_state = e2e_loop_state(&upload.id);
-            upload_state.model_name = "actual-model".into();
-            let runtime_error = super::run_pipeline(
-                &mut upload,
+            .unwrap();
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(target_resolutions.load(Ordering::SeqCst), 0);
+            assert_eq!(vision_calls.load(Ordering::SeqCst), 0);
+
+            let mut state = e2e_loop_state(&session.id);
+            state.model_name = "actual-model".into();
+            let (tx, _rx) = tokio::sync::mpsc::channel(256);
+            assert!(super::run_pipeline(
+                &mut session,
                 &tx,
                 provider.clone(),
                 Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
                 &tokio_util::sync::CancellationToken::new(),
                 &config,
-                &mut upload_state,
+                &mut state,
             )
             .await
-            .unwrap_err();
-            assert!(runtime_error
-                .to_string()
-                .contains("does not support Vision"));
-            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
-            assert_eq!(target_resolutions.load(Ordering::SeqCst), 0);
-            assert_eq!(vision_calls.load(Ordering::SeqCst), 0);
-            assert_eq!(upload.model, "stale-session-model");
+            .unwrap());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(target_resolutions.load(Ordering::SeqCst), 1);
+            assert_eq!(vision_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*provider.received_images.lock().unwrap(), vec![false]);
+            assert_eq!(session.model, "stale-session-model");
             assert_eq!(
-                upload
-                    .messages
-                    .iter()
-                    .find(|message| message.id == image_id)
-                    .unwrap()
-                    .content_parts,
-                original_parts
+                serde_json::to_vec(
+                    session
+                        .messages
+                        .iter()
+                        .find(|message| message.id == image_id)
+                        .unwrap(),
+                )
+                .unwrap(),
+                original
             );
+            assert_eq!(
+                serde_json::to_vec(
+                    &store
+                        .load_session(&session.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .messages,
+                )
+                .unwrap(),
+                disk_before
+            );
+            assert_eq!(
+                tokio::fs::read(&session_file).await.unwrap(),
+                original_record_bytes,
+                "the durable session record bytes are unchanged",
+            );
+            if let Some(id) = attachment_id {
+                assert_eq!(
+                    store
+                        .read_attachment(&session.id, &id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .0
+                        .as_slice(),
+                    &png[..],
+                );
+            }
+            let result = session
+                .messages
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some("vision-call"))
+                .unwrap();
+            assert!(result.content_parts.is_none());
+            assert!(result.content.contains("Vision model output"));
+            assert!(result.content.contains("untrusted data"));
         }
-        assert!(super::run_pipeline(
-            &mut session,
-            &tx,
-            provider.clone(),
-            Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
-            &tokio_util::sync::CancellationToken::new(),
-            &config,
-            &mut state
-        )
-        .await
-        .unwrap());
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(vision_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(target_resolutions.load(Ordering::SeqCst), 1);
-        assert_eq!(*provider.received_images.lock().unwrap(), vec![false]);
-        assert_eq!(session.model, "stale-session-model");
-        assert_eq!(state.model_name, "actual-model");
-        let result = session
-            .messages
-            .iter()
-            .find(|message| message.tool_call_id.as_deref() == Some("vision-call"))
-            .unwrap();
-        assert!(result.content_parts.is_none());
-        assert!(result.content.contains("Vision model output"));
     }
 
     struct WaitingVisionMock {
