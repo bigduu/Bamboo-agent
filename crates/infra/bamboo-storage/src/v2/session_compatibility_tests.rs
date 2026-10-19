@@ -1064,7 +1064,6 @@ async fn session_version_task_rejection_does_not_publish_locked_store_callback()
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-
 // Exercise maintenance/Host writers through their existing public APIs. Raw
 // extension fields model a parseable future producer; identity/proofs are kept.
 pub(super) fn writer_future_fields(raw: &mut Value, conflict: &str) {
@@ -1079,7 +1078,8 @@ pub(super) fn writer_future_fields(raw: &mut Value, conflict: &str) {
             raw["model_context_state"] = serde_json::to_value(bamboo_domain::ModelContextState {
                 schema_version: 99,
                 ..Default::default()
-            }).unwrap();
+            })
+            .unwrap();
         }
         _ => unreachable!(),
     }
@@ -1088,17 +1088,22 @@ pub(super) fn writer_future_fields(raw: &mut Value, conflict: &str) {
 pub(super) async fn writer_future_contract(directory: &Path, conflict: &str) {
     for name in ["session.json", "runtime.json"] {
         let path = directory.join(name);
-        let mut raw: Value = serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        let mut raw: Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
         raw["future_writer_extension"] = json!({"retained": true, "file": name});
         if name == "session.json" {
-            raw.as_object_mut().unwrap().remove("_bamboo_main_authority");
+            raw.as_object_mut()
+                .unwrap()
+                .remove("_bamboo_main_authority");
         }
         if (conflict == "main") == (name == "session.json") {
             writer_future_fields(&mut raw, conflict);
         }
         let bytes = serde_json::to_vec_pretty(&raw).unwrap();
         if name == "session.json" {
-            assert!(super::compact_main::validate_full_main(&bytes).unwrap().is_none());
+            assert!(super::compact_main::validate_full_main(&bytes)
+                .unwrap()
+                .is_none());
         }
         tokio::fs::write(path, bytes).await.unwrap();
     }
@@ -1118,7 +1123,9 @@ pub(super) fn writer_contract_bytes(
         super::SEARCH_INDEX_REVISION_FILE,
         ".actor-tree-revision.json",
         "attachments/sentinel",
-    ].map(|name| std::fs::read(directory.join(name)).ok()).to_vec();
+    ]
+    .map(|name| std::fs::read(directory.join(name)).ok())
+    .to_vec();
     snapshot.push(std::fs::read(storage.index_path()).ok());
     snapshot
 }
@@ -1130,9 +1137,16 @@ async fn session_version_writer_clear_rejects_future_root_and_child_without_rewr
         for conflict in TASK_CONTRACT_CONFLICTS {
             let home = tempfile::tempdir().unwrap();
             let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
-            super::tests::seed_runtime_task_transaction_pair(&storage).await.unwrap();
+            super::tests::seed_runtime_task_transaction_pair(&storage)
+                .await
+                .unwrap();
             let directory = task_member_directory(&storage, id).await;
-            tokio::fs::write(directory.join("attachments/sentinel"), b"retained attachment").await.unwrap();
+            tokio::fs::write(
+                directory.join("attachments/sentinel"),
+                b"retained attachment",
+            )
+            .await
+            .unwrap();
             writer_future_contract(&directory, conflict).await;
             let loaded = storage.load_session(id).await.unwrap().unwrap();
             assert!(!loaded.execution_compatibility().execution_allowed);
@@ -1144,10 +1158,19 @@ async fn session_version_writer_clear_rejects_future_root_and_child_without_rewr
                     && error.to_string().contains("session_execution_incompatible")
             });
             let retained = writer_contract_bytes(&storage, &directory) == before;
-            let readable = storage.load_session(id).await.unwrap().unwrap().messages.len() == 1;
+            let readable = storage
+                .load_session(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .messages
+                .len()
+                == 1;
             eprintln!("clear contract {id}/{conflict}: refused={refused} retained={retained} readable={readable}");
             if !refused || !retained || !readable {
-                failures.push(format!("{id}/{conflict}: {result:?}, retained={retained}, readable={readable}"));
+                failures.push(format!(
+                    "{id}/{conflict}: {result:?}, retained={retained}, readable={readable}"
+                ));
             }
         }
     }
@@ -1160,21 +1183,47 @@ async fn session_version_writer_clear_compatible_none_v1_preserves_main_stamp() 
         for (main, side) in [(None, Some(1)), (Some(1), None)] {
             let home = tempfile::tempdir().unwrap();
             let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
-            super::tests::seed_runtime_task_transaction_pair(&storage).await.unwrap();
+            super::tests::seed_runtime_task_transaction_pair(&storage)
+                .await
+                .unwrap();
             task_set_stamp(&storage, id, true, main).await;
             task_set_stamp(&storage, id, false, side).await;
             let directory = task_member_directory(&storage, id).await;
-            let proof = tokio::fs::read(directory.join(super::root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE)).await.ok();
-            tokio::fs::write(directory.join("attachments/sentinel"), b"clear this attachment").await.unwrap();
+            let proof = tokio::fs::read(
+                directory.join(super::root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE),
+            )
+            .await
+            .ok();
+            tokio::fs::write(
+                directory.join("attachments/sentinel"),
+                b"clear this attachment",
+            )
+            .await
+            .unwrap();
             assert!(storage.clear_session(id).await.unwrap());
             let loaded = storage.load_session(id).await.unwrap().unwrap();
             assert_eq!(loaded.session_version, main);
             assert!(loaded.execution_compatibility().execution_allowed);
             assert!(loaded.messages.is_empty());
             assert!(!directory.join("attachments/sentinel").exists());
-            assert_eq!(tokio::fs::read(directory.join(super::root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE)).await.ok(), proof);
-            let raw: Value = serde_json::from_slice(&tokio::fs::read(directory.join("session.json")).await.unwrap()).unwrap();
-            assert_eq!(raw.get("session_version").and_then(Value::as_u64), main.map(u64::from));
+            assert_eq!(
+                tokio::fs::read(
+                    directory.join(super::root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE)
+                )
+                .await
+                .ok(),
+                proof
+            );
+            let raw: Value = serde_json::from_slice(
+                &tokio::fs::read(directory.join("session.json"))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                raw.get("session_version").and_then(Value::as_u64),
+                main.map(u64::from)
+            );
         }
     }
 }

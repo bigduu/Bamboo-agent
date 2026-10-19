@@ -267,27 +267,38 @@ async fn session_version_http_future_workflow_stays_opaque_on_detail_read() {
     assert_eq!(probe.0.load(Ordering::SeqCst), 0);
 }
 
-
 fn clear_files(home: &Path, directory: &Path) -> Vec<Option<Vec<u8>>> {
     let mut files = [
-        "session.json", "runtime.json", "root-tool-authority.json",
-        "actor-authority.json", "actor-authority.initialized.json",
-        ".search-index-revision", "attachments/sentinel",
-    ].map(|name| std::fs::read(directory.join(name)).ok()).to_vec();
+        "session.json",
+        "runtime.json",
+        "root-tool-authority.json",
+        "actor-authority.json",
+        "actor-authority.initialized.json",
+        ".search-index-revision",
+        "attachments/sentinel",
+    ]
+    .map(|name| std::fs::read(directory.join(name)).ok())
+    .to_vec();
     files.push(std::fs::read(home.join("sessions.json")).ok());
     files
 }
-
 
 // A confirmed unrelated marker drains the same FIFO as SessionCleared. This
 // observes publication deterministically; the marker itself is excluded from
 // each assertion about the target session's clear event.
 async fn clear_feed_barrier(state: &crate::AppState) -> u64 {
     let marker = format!("clear-feed-barrier-{}", uuid::Uuid::new_v4());
-    assert!(state.account_sink.record_confirmed(
-        Some(&marker),
-        &bamboo_agent_core::AgentEvent::SessionCreated { session_id: marker.clone() },
-    ).await);
+    assert!(
+        state
+            .account_sink
+            .record_confirmed(
+                Some(&marker),
+                &bamboo_agent_core::AgentEvent::SessionCreated {
+                    session_id: marker.clone()
+                },
+            )
+            .await
+    );
     state.account_sink.latest_seq()
 }
 
@@ -300,19 +311,31 @@ async fn session_version_writer_http_clear_uses_fresh_contract_and_keeps_cache_f
         state.storage.save_session(&root).await.unwrap();
         let mut session = if child {
             Session::new_child_of("clear-http-child", &root, "test-model", "child")
-        } else { root };
+        } else {
+            root
+        };
         session.add_message(Message::user("retained clear history"));
         state.storage.save_session(&session).await.unwrap();
         let id = session.id.clone();
         let warm = Arc::new(bamboo_engine::SessionSnapshot::new(session));
         state.sessions.insert(id.clone(), warm.clone());
         let directory = if child {
-            home.path().join("sessions/clear-http-root/children").join(&id)
-        } else { home.path().join("sessions").join(&id) };
-        std::fs::write(directory.join("attachments/sentinel"), b"retained attachment").unwrap();
+            home.path()
+                .join("sessions/clear-http-root/children")
+                .join(&id)
+        } else {
+            home.path().join("sessions").join(&id)
+        };
+        std::fs::write(
+            directory.join("attachments/sentinel"),
+            b"retained attachment",
+        )
+        .unwrap();
         let main = directory.join("session.json");
         let mut raw: Value = serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
-        raw.as_object_mut().unwrap().remove("_bamboo_main_authority");
+        raw.as_object_mut()
+            .unwrap()
+            .remove("_bamboo_main_authority");
         raw["session_version"] = json!(99);
         raw["future_writer_extension"] = json!({"retained": true});
         std::fs::write(main, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
@@ -320,9 +343,17 @@ async fn session_version_writer_http_clear_uses_fresh_contract_and_keeps_cache_f
         let cache_before = serde_json::to_value(&*warm.read()).unwrap();
         let feed_before = clear_feed_barrier(&state).await;
         let app = test::init_service(App::new().app_data(state.clone()).route(
-            "/sessions/{id}/clear", web::post().to(crate::handlers::agent::sessions::clear_session),
-        )).await;
-        let response = test::call_service(&app, test::TestRequest::post().uri(&format!("/sessions/{id}/clear")).to_request()).await;
+            "/sessions/{id}/clear",
+            web::post().to(crate::handlers::agent::sessions::clear_session),
+        ))
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/sessions/{id}/clear"))
+                .to_request(),
+        )
+        .await;
         let status = response.status();
         let body: Value = test::read_body_json(response).await;
         let refused = status == StatusCode::CONFLICT
@@ -357,9 +388,17 @@ async fn session_version_writer_http_clear_compatible_legacy_keeps_existing_succ
         state.sessions.insert(id.into(), warm.clone());
         let feed_before = clear_feed_barrier(&state).await;
         let app = test::init_service(App::new().app_data(state.clone()).route(
-            "/sessions/{id}/clear", web::post().to(crate::handlers::agent::sessions::clear_session),
-        )).await;
-        let response = test::call_service(&app, test::TestRequest::post().uri(&format!("/sessions/{id}/clear")).to_request()).await;
+            "/sessions/{id}/clear",
+            web::post().to(crate::handlers::agent::sessions::clear_session),
+        ))
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/sessions/{id}/clear"))
+                .to_request(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!Arc::ptr_eq(&state.sessions.get(id).unwrap(), &warm));
         let cleared = state.storage.load_session(id).await.unwrap().unwrap();

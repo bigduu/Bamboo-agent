@@ -521,7 +521,6 @@ async fn startup_sidecar_replace_errors_cleanup_and_partial_rerun_preserve_confi
     }
 }
 
-
 #[tokio::test]
 async fn session_version_writer_startup_does_not_reconstruct_future_child_state() {
     use super::session_compatibility_tests::{writer_contract_bytes, writer_future_fields};
@@ -531,24 +530,33 @@ async fn session_version_writer_startup_does_not_reconstruct_future_child_state(
         let (store, _, _) = setup(home.path(), false).await;
         let directory = directory(home.path());
         let main = directory.join("session.json");
-        let mut raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
-        raw.as_object_mut().unwrap().remove("_bamboo_main_authority");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
+        raw.as_object_mut()
+            .unwrap()
+            .remove("_bamboo_main_authority");
         raw["future_writer_extension"] = serde_json::json!({"retained": true});
         writer_future_fields(&mut raw, conflict);
         let bytes = serde_json::to_vec_pretty(&raw).unwrap();
-        assert!(super::compact_main::validate_full_main(&bytes).unwrap().is_none());
+        assert!(super::compact_main::validate_full_main(&bytes)
+            .unwrap()
+            .is_none());
         let future: Session = serde_json::from_slice(&bytes).unwrap();
         assert!(!future.execution_compatibility().execution_allowed);
         std::fs::write(main, bytes).unwrap();
         remove_runtime(home.path());
         let before = writer_contract_bytes(&store, &directory);
         let result = store.migrate_runtime_sidecars().await;
-        let refused = result.as_ref().is_err_and(|error| error.to_string().contains("session_execution_incompatible"));
+        let refused = result
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("session_execution_incompatible"));
         let retained = writer_contract_bytes(&store, &directory) == before;
         let marker_absent = !home.path().join(RUNTIME_SIDECAR_MIGRATION_MARKER).exists();
         eprintln!("startup contract {conflict}: refused={refused} retained={retained} marker_absent={marker_absent}");
         if !refused || !retained || !marker_absent {
-            failures.push(format!("{conflict}: {result:?}, retained={retained}, marker_absent={marker_absent}"));
+            failures.push(format!(
+                "{conflict}: {result:?}, retained={retained}, marker_absent={marker_absent}"
+            ));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -561,16 +569,24 @@ async fn session_version_writer_startup_compatible_child_preserves_missing_or_cu
         let (store, _, _) = setup(home.path(), false).await;
         let directory = directory(home.path());
         let main = directory.join("session.json");
-        let mut raw: serde_json::Value = serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
-        raw.as_object_mut().unwrap().remove("_bamboo_main_authority");
-        if let Some(stamp) = stamp { raw["session_version"] = serde_json::json!(stamp); }
-        else { raw.as_object_mut().unwrap().remove("session_version"); }
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
+        raw.as_object_mut()
+            .unwrap()
+            .remove("_bamboo_main_authority");
+        if let Some(stamp) = stamp {
+            raw["session_version"] = serde_json::json!(stamp);
+        } else {
+            raw.as_object_mut().unwrap().remove("session_version");
+        }
         let before = serde_json::to_vec_pretty(&raw).unwrap();
         std::fs::write(&main, &before).unwrap();
         remove_runtime(home.path());
         assert_eq!(store.migrate_runtime_sidecars().await.unwrap(), 1);
         assert_eq!(std::fs::read(&main).unwrap(), before);
-        let side: Session = serde_json::from_slice(&std::fs::read(directory.join(RUNTIME_SIDECAR_FILE)).unwrap()).unwrap();
+        let side: Session =
+            serde_json::from_slice(&std::fs::read(directory.join(RUNTIME_SIDECAR_FILE)).unwrap())
+                .unwrap();
         assert_eq!(side.session_version, stamp);
         assert!(side.execution_compatibility().execution_allowed);
         assert!(side.messages.is_empty());
