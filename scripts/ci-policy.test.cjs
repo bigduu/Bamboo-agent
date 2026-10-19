@@ -166,8 +166,8 @@ test("macOS link guard preserves Cargo failures and rejects lost or oversized di
   }
 })
 
-test("full snapshot and main gates preserve locked Rust, formatting, and policy checks", () => {
-  assert.match(workflow, /push:\n\s+branches: \[ main \]/u)
+test("snapshots and PR gates retain validation without automatic post-merge main CI", () => {
+  assert.doesNotMatch(workflow, /^  push:/mu)
   assert.match(workflow, /pull_request:\n\s+branches: \[ dev, main \]/u)
 
   const testJob = job("test")

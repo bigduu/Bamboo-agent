@@ -150,7 +150,9 @@ function workflowIdentity(env = process.env) {
   assert.match(version, /^[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/)
   assert.match(sourceRevision, SHA)
   const event = JSON.parse(fs.readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))
-  validateSource({ eventName: env.GITHUB_EVENT_NAME, event, repository: REPOSITORY, sourceRevision })
+  const validation = env.SOURCE_VALIDATION ? JSON.parse(env.SOURCE_VALIDATION) : undefined
+  validateSource({ eventName: env.GITHUB_EVENT_NAME, event, repository: REPOSITORY, sourceRevision,
+    sourceTree: git(['rev-parse', 'HEAD^{tree}']), validation })
   assert.match(env.GITHUB_RUN_ID, /^[1-9][0-9]*$/)
   assert.match(env.GITHUB_RUN_ATTEMPT, /^[1-9][0-9]*$/)
   assert.match(env.GITHUB_WORKFLOW_SHA, SHA)
@@ -158,7 +160,8 @@ function workflowIdentity(env = process.env) {
   assert.equal(git(['status', '--porcelain', '--untracked-files=all']), '', 'Release checkout must start clean')
   return { repository: REPOSITORY, version, sourceRevision, sourceTree: git(['rev-parse', 'HEAD^{tree}']),
     workflowRevision: env.GITHUB_WORKFLOW_SHA, runId: env.GITHUB_RUN_ID,
-    runAttempt: Number(env.GITHUB_RUN_ATTEMPT), ciRun: event.workflow_run.html_url }
+    runAttempt: Number(env.GITHUB_RUN_ATTEMPT), ciRun: (validation?.ciRun || event.workflow_run).html_url,
+    ...(validation ? { validation } : {}) }
 }
 
 function gh(route, options = {}) {
@@ -184,6 +187,7 @@ function publishedRelease(identity, { signingKey, signingKeyDigest, request = gh
   assert.equal(receipt.automatic, true)
   assert.equal(receipt.completed, true)
   assert.equal(receipt.ciRun, identity.ciRun)
+  if (identity.validation) assert.deepEqual(receipt.validation, identity.validation)
   assert.ok(receipt.crates.includes('bamboo-agent'))
   assert.ok(Array.isArray(release.assets))
   assert.equal(new Set(release.assets.map((asset) => asset.name)).size, release.assets.length)
@@ -201,6 +205,7 @@ function assetBytes(asset, maximum) {
 
 function validateBuildReceipt(receipt, identity, target) {
   assert.equal(receipt?.schemaVersion, 1)
+  if (identity.validation) assert.deepEqual(receipt.validation, identity.validation)
   for (const key of ['repository', 'version', 'sourceRevision', 'sourceTree', 'workflowRevision', 'runId', 'ciRun']) {
     assert.equal(receipt[key], identity[key], `Executable build provenance mismatch: ${key}`)
   }
@@ -283,6 +288,7 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
   const bytes = await readAsset(checkpoint, 1024 * 1024)
   assert.ok(bytes.length <= 1024 * 1024)
   const proof = authenticateReceipt(JSON.parse(bytes), signingKey)
+  if (identity.validation) assert.deepEqual(proof.validation, identity.validation)
   assert.equal(proof.schemaVersion, 1)
   assert.equal(proof.kind, PROVENANCE_KIND)
   for (const key of ['repository', 'version', 'sourceRevision', 'sourceTree', 'workflowRevision', 'runId', 'ciRun']) {
