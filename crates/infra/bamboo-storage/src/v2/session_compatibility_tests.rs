@@ -13,7 +13,9 @@ async fn change_stamp(home: &Path, id: &str, main: Option<u32>, runtime: Option<
         if name == "session.json" {
             // Flat legacy Main keeps the original identity/proof fields while
             // avoiding a stale compact header after this fixture-only rewrite.
-            raw.as_object_mut().unwrap().remove("_bamboo_main_authority");
+            raw.as_object_mut()
+                .unwrap()
+                .remove("_bamboo_main_authority");
         }
         match version {
             Some(version) => raw["session_version"] = json!(version),
@@ -410,16 +412,24 @@ async fn session_version_compatible_io_failure_preserves_existing_publication_co
             publications.fetch_add(1, Ordering::SeqCst);
         };
         let result = match mode {
-            "runtime" => locked.save_runtime_only_and_publish(&mut caller, publish).await,
-            "runtime_success_only" => locked
-                .save_runtime_only_and_publish_on_success(&mut caller, publish)
-                .await,
-            "full" => locked
-                .merge_save_runtime_and_publish(&mut caller, |saved, committed| {
-                    assert!(!committed);
-                    publish(saved);
-                })
-                .await,
+            "runtime" => {
+                locked
+                    .save_runtime_only_and_publish(&mut caller, publish)
+                    .await
+            }
+            "runtime_success_only" => {
+                locked
+                    .save_runtime_only_and_publish_on_success(&mut caller, publish)
+                    .await
+            }
+            "full" => {
+                locked
+                    .merge_save_runtime_and_publish(&mut caller, |saved, committed| {
+                        assert!(!committed);
+                        publish(saved);
+                    })
+                    .await
+            }
             _ => unreachable!(),
         };
         let error = result.expect_err("the injected IO failure must remain visible");

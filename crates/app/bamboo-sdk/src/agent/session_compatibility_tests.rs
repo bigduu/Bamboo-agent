@@ -139,7 +139,9 @@ async fn future_durable(fixture: &Fixture, id: &str, conflict: &str) -> [Vec<u8>
     if name == "session.json" {
         // Re-encode this owned fixture as valid flat legacy Main. A retained
         // compact header would no longer match its framing after JSON rewrite.
-        raw.as_object_mut().unwrap().remove("_bamboo_main_authority");
+        raw.as_object_mut()
+            .unwrap()
+            .remove("_bamboo_main_authority");
     }
     match conflict {
         "main" | "runtime" => raw["session_version"] = json!(99),
