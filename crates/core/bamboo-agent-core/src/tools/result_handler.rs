@@ -557,11 +557,7 @@ async fn execute_sub_actions_with_persistence(
         // owner through dispatch; a composition or alias must not reselect it.
         let execution_name = if session.model_orchestration_only_enabled() {
             let selected =
-                bamboo_domain::resolve_tool_reference_name(&action.function.name, |name| {
-                    available_tools
-                        .iter()
-                        .any(|schema| schema.function.name == name)
-                });
+                tools.resolve_reference_for_session(session, &action.function.name);
             if selected
                 .as_deref()
                 .is_none_or(|name| !session.allows_model_tool_execution(name))

@@ -1766,6 +1766,22 @@ impl PermissionConfig {
     /// grants are intentionally evaluated only after hard-dangerous and
     /// always-ask rules.
     pub fn evaluate(&self, input: PermissionEvaluation) -> PermissionOutcome {
+        self.evaluate_with_additional_ask_rule(input, None)
+    }
+
+    /// The installed framework Root owner retains legacy create restrictions,
+    /// while its typed approval/replay identity remains the actual tool name.
+    /// The projection adds only an Ask restriction, never another allow source.
+    pub fn evaluate_framework_root_spawn(&self, input: PermissionEvaluation) -> PermissionOutcome {
+        let legacy_args = serde_json::json!({"action":"create", "request": input.tool_args});
+        self.evaluate_with_additional_ask_rule(input, Some(("session_control", &legacy_args)))
+    }
+
+    fn evaluate_with_additional_ask_rule(
+        &self,
+        input: PermissionEvaluation,
+        additional_rule_context: Option<(&str, &serde_json::Value)>,
+    ) -> PermissionOutcome {
         let configured_mode = self.mode();
         // Normalize legacy callers that accidentally supplied both booleans:
         // Auto is a no-prompt posture, never an alias for Bypass or its wider
@@ -1881,7 +1897,10 @@ impl PermissionConfig {
                 .read()
                 .recover_poison()
                 .iter()
-                .any(|rule| rule.matches_tool_call(&input.tool_name, &input.tool_args));
+                .any(|rule| {
+                    rule.matches_tool_call(&input.tool_name, &input.tool_args)
+                        || additional_rule_context.is_some_and(|(name, args)| rule.matches_tool_call(name, args))
+                });
         if hard_dangerous || configured_always_ask {
             let reason_code = if hard_dangerous {
                 PermissionReasonCode::HardDangerous

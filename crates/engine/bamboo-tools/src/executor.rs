@@ -767,7 +767,7 @@ impl BuiltinToolExecutor {
                     let workspace_path = ctx
                         .session_id
                         .and_then(|session_id| config.session_workspace(session_id));
-                    match config.evaluate(crate::permission::PermissionEvaluation {
+                    let evaluation = crate::permission::PermissionEvaluation {
                         request_id: call.id.clone(),
                         session_id: ctx.session_id.unwrap_or_default().to_string(),
                         workspace_path,
@@ -782,7 +782,13 @@ impl BuiltinToolExecutor {
                         platform_hard_deny,
                         consume_once: true,
                         supported_decisions,
-                    }) {
+                    };
+                    let outcome = if framework_root_spawn {
+                        config.evaluate_framework_root_spawn(evaluation)
+                    } else {
+                        config.evaluate(evaluation)
+                    };
+                    match outcome {
                         crate::permission::PermissionOutcome::Allow { .. } => continue,
                         crate::permission::PermissionOutcome::Deny { reason, .. } => {
                             return Err(ToolError::Execution(if private_browser_display {
@@ -820,7 +826,10 @@ impl BuiltinToolExecutor {
                         }));
                     }
                     let force_ask = focused_browser_input
-                        || permission_checker.requires_forced_confirmation(&tool_name, &args);
+                        || permission_checker.requires_forced_confirmation(&tool_name, &args)
+                        || (framework_root_spawn && permission_checker.requires_forced_confirmation(
+                            "session_control", &serde_json::json!({"action":"create", "request": args}),
+                        ));
                     let hook_allows = matches!(
                         hook_permission_override,
                         Some(crate::HookPermissionOverride::Allow)
