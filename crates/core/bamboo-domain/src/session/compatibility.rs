@@ -266,3 +266,7 @@ mod tests {
         assert_eq!(serde_json::to_value(session).unwrap(), before);
     }
 }
+
+#[cfg(test)]
+#[path = "versioned_spawn_tests.rs"]
+mod versioned_spawn_tests;
