@@ -8,19 +8,30 @@ use std::path::Path;
 async fn change_stamp(home: &Path, id: &str, main: Option<u32>, runtime: Option<u32>) {
     for (name, version) in [("session.json", main), ("runtime.json", runtime)] {
         let path = home.join("sessions").join(id).join(name);
-        let mut raw: Value = serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        let mut raw: Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
         match version {
             Some(version) => raw["session_version"] = json!(version),
-            None => { raw.as_object_mut().unwrap().remove("session_version"); }
+            None => {
+                raw.as_object_mut().unwrap().remove("session_version");
+            }
         }
-        tokio::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap()).await.unwrap();
+        tokio::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap())
+            .await
+            .unwrap();
     }
 }
 
 async fn pair(home: &Path, id: &str) -> [Vec<u8>; 2] {
     let directory = home.join("sessions").join(id);
-    [tokio::fs::read(directory.join("session.json")).await.unwrap(),
-     tokio::fs::read(directory.join("runtime.json")).await.unwrap()]
+    [
+        tokio::fs::read(directory.join("session.json"))
+            .await
+            .unwrap(),
+        tokio::fs::read(directory.join("runtime.json"))
+            .await
+            .unwrap(),
+    ]
 }
 
 #[tokio::test]
@@ -38,7 +49,10 @@ async fn session_version_store_overlay_preserves_main_and_conflict_after_reopen(
         let loaded = storage.load_session("pair").await.unwrap().unwrap();
         assert_eq!(loaded.session_version, main, "Main owns the behavior stamp");
         assert!(!loaded.execution_compatibility().execution_allowed);
-        assert_eq!(loaded.messages[0].content, "history survives a behavior conflict");
+        assert_eq!(
+            loaded.messages[0].content,
+            "history survives a behavior conflict"
+        );
         assert_eq!(pair(home.path(), "pair").await, before);
     }
 }
@@ -59,7 +73,10 @@ async fn conflicting_checkpoint(runtime_only: bool) {
         storage.save_session(&loaded).await
     };
     let error = result.expect_err("a conflicting behavior cannot checkpoint replacement state");
-    assert!(error.to_string().contains("session_execution_incompatible"), "{error}");
+    assert!(
+        error.to_string().contains("session_execution_incompatible"),
+        "{error}"
+    );
     assert_eq!(pair(home.path(), "future").await, before);
 }
 
@@ -77,7 +94,10 @@ async fn session_version_store_future_runtime_checkpoint_has_no_effect() {
 async fn session_version_store_legacy_checkpoints_preserve_missing_stamp() {
     let home = tempfile::tempdir().unwrap();
     let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
-    storage.save_session(&Session::new("legacy", "model")).await.unwrap();
+    storage
+        .save_session(&Session::new("legacy", "model"))
+        .await
+        .unwrap();
     change_stamp(home.path(), "legacy", None, None).await;
     let mut loaded = storage.load_session("legacy").await.unwrap().unwrap();
     assert!(loaded.execution_compatibility().execution_allowed);
@@ -101,13 +121,24 @@ async fn session_version_store_legacy_checkpoints_preserve_missing_stamp() {
 async fn session_version_store_ordinary_save_cannot_upgrade_an_existing_stamp() {
     let home = tempfile::tempdir().unwrap();
     let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
-    storage.save_session(&Session::new("legacy", "model")).await.unwrap();
+    storage
+        .save_session(&Session::new("legacy", "model"))
+        .await
+        .unwrap();
     change_stamp(home.path(), "legacy", None, None).await;
     let mut loaded = storage.load_session("legacy").await.unwrap().unwrap();
     let before = pair(home.path(), "legacy").await;
     loaded.session_version = Some(1);
-    let error = storage.save_session(&loaded).await.expect_err("ordinary save is not migration");
-    assert!(error.to_string().contains("session_version_change_requires_new_session"), "{error}");
+    let error = storage
+        .save_session(&loaded)
+        .await
+        .expect_err("ordinary save is not migration");
+    assert!(
+        error
+            .to_string()
+            .contains("session_version_change_requires_new_session"),
+        "{error}"
+    );
     assert_eq!(pair(home.path(), "legacy").await, before);
 }
 
@@ -116,14 +147,25 @@ async fn session_version_store_compatible_main_and_side_preserve_legacy_executio
     for (main, runtime) in [(None, Some(1)), (Some(1), None)] {
         let home = tempfile::tempdir().unwrap();
         let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
-        storage.save_session(&Session::new("compatible-pair", "model")).await.unwrap();
+        storage
+            .save_session(&Session::new("compatible-pair", "model"))
+            .await
+            .unwrap();
         change_stamp(home.path(), "compatible-pair", main, runtime).await;
-        let mut loaded = storage.load_session("compatible-pair").await.unwrap().unwrap();
+        let mut loaded = storage
+            .load_session("compatible-pair")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.session_version, main);
         assert!(loaded.execution_compatibility().execution_allowed);
         loaded.title = "compatible checkpoint".into();
         storage.save_runtime_state(&loaded).await.unwrap();
-        let loaded = storage.load_session("compatible-pair").await.unwrap().unwrap();
+        let loaded = storage
+            .load_session("compatible-pair")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.session_version, main);
         assert!(loaded.execution_compatibility().execution_allowed);
     }
@@ -132,12 +174,18 @@ async fn session_version_store_compatible_main_and_side_preserve_legacy_executio
 #[tokio::test]
 async fn session_version_store_rejected_checkpoint_does_not_publish_cache_snapshot() {
     use crate::session_merge::LockedSessionStore;
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     for runtime_only in [false, true] {
         let home = tempfile::tempdir().unwrap();
         let storage = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
-        storage.save_session(&Session::new("future-cache", "model")).await.unwrap();
+        storage
+            .save_session(&Session::new("future-cache", "model"))
+            .await
+            .unwrap();
         change_stamp(home.path(), "future-cache", Some(99), Some(99)).await;
         let mut loaded = storage.load_session("future-cache").await.unwrap().unwrap();
         loaded.title = "must not publish into cache".into();
@@ -145,13 +193,17 @@ async fn session_version_store_rejected_checkpoint_does_not_publish_cache_snapsh
         let locked = LockedSessionStore::new(storage);
         let published = AtomicBool::new(false);
         let result = if runtime_only {
-            locked.save_runtime_only_and_publish(&mut loaded, |_| {
-                published.store(true, Ordering::SeqCst);
-            }).await
+            locked
+                .save_runtime_only_and_publish(&mut loaded, |_| {
+                    published.store(true, Ordering::SeqCst);
+                })
+                .await
         } else {
-            locked.merge_save_runtime_and_publish(&mut loaded, |_, _| {
-                published.store(true, Ordering::SeqCst);
-            }).await
+            locked
+                .merge_save_runtime_and_publish(&mut loaded, |_, _| {
+                    published.store(true, Ordering::SeqCst);
+                })
+                .await
         };
         assert!(result.is_err());
         assert!(!published.load(Ordering::SeqCst));
@@ -159,42 +211,62 @@ async fn session_version_store_rejected_checkpoint_does_not_publish_cache_snapsh
     }
 }
 
-
 async fn rejected_context_merge(runtime_only: bool, durable_conflict: bool, stamp: Option<u32>) {
     use crate::session_merge::LockedSessionStore;
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     let home = tempfile::tempdir().unwrap();
     let storage = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
     let mut incoming = Session::new("context-merge", "model");
     incoming.session_version = stamp;
     incoming.model_context_state = Some(bamboo_domain::ModelContextState {
-        state_revision: 7, ..Default::default()
+        state_revision: 7,
+        ..Default::default()
     });
     storage.save_session(&incoming).await.unwrap();
     if durable_conflict {
         let path = home.path().join("sessions/context-merge/runtime.json");
-        let mut raw: Value = serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        let mut raw: Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
         raw["model_context_state"]["schema_version"] = json!(99);
-        tokio::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap()).await.unwrap();
+        tokio::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap())
+            .await
+            .unwrap();
     } else {
-        incoming.model_context_state.as_mut().unwrap().schema_version = 99;
+        incoming
+            .model_context_state
+            .as_mut()
+            .unwrap()
+            .schema_version = 99;
     }
     let before_memory = serde_json::to_value(&incoming).unwrap();
     let before_disk = pair(home.path(), &incoming.id).await;
     let locked = LockedSessionStore::new(storage);
     let published = AtomicBool::new(false);
     let result = if runtime_only {
-        locked.save_runtime_only_and_publish(&mut incoming, |_| {
-            published.store(true, Ordering::SeqCst);
-        }).await
+        locked
+            .save_runtime_only_and_publish(&mut incoming, |_| {
+                published.store(true, Ordering::SeqCst);
+            })
+            .await
     } else {
-        locked.merge_save_runtime_and_publish(&mut incoming, |_, _| {
-            published.store(true, Ordering::SeqCst);
-        }).await
+        locked
+            .merge_save_runtime_and_publish(&mut incoming, |_, _| {
+                published.store(true, Ordering::SeqCst);
+            })
+            .await
     };
-    let error = result.expect_err("merge must reject incompatible input before adopting any fields");
-    assert!(error.to_string().contains("unsupported_model_context_version"), "{error}");
+    let error =
+        result.expect_err("merge must reject incompatible input before adopting any fields");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported_model_context_version"),
+        "{error}"
+    );
     assert_eq!(serde_json::to_value(&incoming).unwrap(), before_memory);
     assert_eq!(pair(home.path(), &incoming.id).await, before_disk);
     assert!(!published.load(Ordering::SeqCst));
@@ -218,18 +290,21 @@ async fn session_version_merge_rejects_unknown_durable_schema_before_mutating_th
     }
 }
 
-
 #[tokio::test]
 async fn session_version_store_stale_checkpoint_cannot_replace_an_unknown_main() {
     use crate::session_merge::LockedSessionStore;
-    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
     for runtime_only in [false, true] {
         for through_wrapper in [false, true] {
             let home = tempfile::tempdir().unwrap();
             let storage = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
             let mut stale = Session::new("stale-main-stamp", "model");
             stale.model_context_state = Some(bamboo_domain::ModelContextState {
-                state_revision: 7, ..Default::default()
+                state_revision: 7,
+                ..Default::default()
             });
             storage.save_session(&stale).await.unwrap();
             change_stamp(home.path(), &stale.id, Some(99), Some(1)).await;
@@ -241,18 +316,29 @@ async fn session_version_store_stale_checkpoint_cannot_replace_an_unknown_main()
             let result = if through_wrapper {
                 let locked = LockedSessionStore::new(storage.clone());
                 if runtime_only {
-                    locked.save_runtime_only_and_publish(&mut stale, |_| {
-                        published.store(true, Ordering::SeqCst);
-                    }).await
+                    locked
+                        .save_runtime_only_and_publish(&mut stale, |_| {
+                            published.store(true, Ordering::SeqCst);
+                        })
+                        .await
                 } else {
-                    locked.merge_save_runtime_and_publish(&mut stale, |_, _| {
-                        published.store(true, Ordering::SeqCst);
-                    }).await
+                    locked
+                        .merge_save_runtime_and_publish(&mut stale, |_, _| {
+                            published.store(true, Ordering::SeqCst);
+                        })
+                        .await
                 }
-            } else if runtime_only { storage.save_runtime_state(&stale).await }
-                else { storage.save_session(&stale).await };
-            let error = result.expect_err("a compatible caller is not authority over a future canonical Main");
-            assert!(error.to_string().contains("session_execution_incompatible"), "{error}");
+            } else if runtime_only {
+                storage.save_runtime_state(&stale).await
+            } else {
+                storage.save_session(&stale).await
+            };
+            let error = result
+                .expect_err("a compatible caller is not authority over a future canonical Main");
+            assert!(
+                error.to_string().contains("session_execution_incompatible"),
+                "{error}"
+            );
             assert_eq!(serde_json::to_value(&stale).unwrap(), before_memory);
             assert_eq!(pair(home.path(), &stale.id).await, before);
             assert!(!published.load(Ordering::SeqCst));

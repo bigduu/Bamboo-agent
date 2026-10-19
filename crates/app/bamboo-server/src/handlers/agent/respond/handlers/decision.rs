@@ -687,18 +687,22 @@ mod tests {
         session
     }
 
-
     #[derive(Default)]
     struct CompatibilityPermissionProbe(std::sync::atomic::AtomicUsize);
 
     #[async_trait::async_trait]
     impl bamboo_llm::LLMProvider for CompatibilityPermissionProbe {
         async fn chat_stream(
-            &self, _messages: &[Message], _tools: &[bamboo_agent_core::tools::ToolSchema],
-            _max: Option<u32>, _model: &str,
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max: Option<u32>,
+            _model: &str,
         ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(Box::pin(futures::stream::iter([Ok(bamboo_llm::LLMChunk::Done)])))
+            Ok(Box::pin(futures::stream::iter([Ok(
+                bamboo_llm::LLMChunk::Done,
+            )])))
         }
     }
 
@@ -707,65 +711,137 @@ mod tests {
         let mut config = bamboo_llm::Config::from_data_dir(Some(dir.path().into()));
         config.provider = "openai".into();
         config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
-            model: Some("test-model".into()), ..Default::default()
+            model: Some("test-model".into()),
+            ..Default::default()
         });
         let probe = Arc::new(CompatibilityPermissionProbe::default());
-        let state = web::Data::new(AppState::new_with_provider(dir.path().into(), config, probe.clone()).await.unwrap());
+        let state = web::Data::new(
+            AppState::new_with_provider(dir.path().into(), config, probe.clone())
+                .await
+                .unwrap(),
+        );
         let policy_before = state.permission_section.snapshot();
-        let request = test_permission_request("future-cached-decision", "permission-contract", policy_before.revision,
-            PermissionRequest::ordinary_decisions(true));
+        let request = test_permission_request(
+            "future-cached-decision",
+            "permission-contract",
+            policy_before.revision,
+            PermissionRequest::ordinary_decisions(true),
+        );
         let mut session = if decision_kind.is_some() {
             parked_permission_session(&request)
         } else {
             let mut session = Session::new(&request.session_id, "test-model");
             session.add_message(Message::user("Existing question history"));
-            session.set_pending_question_with_source(request.request_id.clone(), "ask_user".into(),
-                "Continue?".into(), vec!["yes".into(), "no".into()], false, PendingQuestionSource::PauseTool);
+            session.set_pending_question_with_source(
+                request.request_id.clone(),
+                "ask_user".into(),
+                "Continue?".into(),
+                vec!["yes".into(), "no".into()],
+                false,
+                PendingQuestionSource::PauseTool,
+            );
             session
         };
         state.save_and_cache_session(&mut session).await;
-        let cached_before = serde_json::to_value(state.load_session(&session.id).await.unwrap()).unwrap();
+        let cached_before =
+            serde_json::to_value(state.load_session(&session.id).await.unwrap()).unwrap();
         let directory = dir.path().join("sessions").join(&session.id);
         for name in ["session.json", "runtime.json"] {
             let path = directory.join(name);
-            let mut raw: serde_json::Value = serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+            let mut raw: serde_json::Value =
+                serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
             raw["session_version"] = serde_json::json!(99);
-            tokio::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap()).await.unwrap();
+            tokio::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap())
+                .await
+                .unwrap();
         }
-        let before_disk = [tokio::fs::read(directory.join("session.json")).await.unwrap(),
-            tokio::fs::read(directory.join("runtime.json")).await.unwrap()];
+        let before_disk = [
+            tokio::fs::read(directory.join("session.json"))
+                .await
+                .unwrap(),
+            tokio::fs::read(directory.join("runtime.json"))
+                .await
+                .unwrap(),
+        ];
         let permissions = state.permission_checker.permission_config().unwrap();
         assert!(permissions.temporary_grants().is_empty());
         let response = if let Some(kind) = decision_kind {
-            match submit_permission_decision(state.clone(), web::Path::from(session.id.clone()), web::Json(PermissionDecision {
-                request_id: request.request_id.clone(), request_generation: request.request_generation.clone(),
-                decision: kind, matcher_id: (kind != PermissionDecisionKind::AllowOnce).then(|| "exact_resource".into()),
-                expected_policy_revision: Some(policy_before.revision), confirm_global: kind == PermissionDecisionKind::AllowGlobal,
-            })).await {
+            match submit_permission_decision(
+                state.clone(),
+                web::Path::from(session.id.clone()),
+                web::Json(PermissionDecision {
+                    request_id: request.request_id.clone(),
+                    request_generation: request.request_generation.clone(),
+                    decision: kind,
+                    matcher_id: (kind != PermissionDecisionKind::AllowOnce)
+                        .then(|| "exact_resource".into()),
+                    expected_policy_revision: Some(policy_before.revision),
+                    confirm_global: kind == PermissionDecisionKind::AllowGlobal,
+                }),
+            )
+            .await
+            {
                 Ok(response) => response,
                 Err(error) => actix_web::ResponseError::error_response(&error),
             }
         } else {
-            match super::super::submit::submit_response(state.clone(), web::Path::from(session.id.clone()),
-                web::Json(RespondRequest { response: "yes".into(), expected_tool_call_id: Some(request.request_id.clone()),
-                    model: None, provider: None, model_ref: None, reasoning_effort: None })).await {
+            match super::super::submit::submit_response(
+                state.clone(),
+                web::Path::from(session.id.clone()),
+                web::Json(RespondRequest {
+                    response: "yes".into(),
+                    expected_tool_call_id: Some(request.request_id.clone()),
+                    model: None,
+                    provider: None,
+                    model_ref: None,
+                    reasoning_effort: None,
+                }),
+            )
+            .await
+            {
                 Ok(response) => response,
                 Err(error) => error.error_response(),
             }
         };
-        assert!(permissions.temporary_grants().is_empty(), "a rejected response must not install temporary grants");
+        assert!(
+            permissions.temporary_grants().is_empty(),
+            "a rejected response must not install temporary grants"
+        );
         let policy_after = state.permission_section.snapshot();
         assert_eq!(policy_after.revision, policy_before.revision);
-        assert_eq!(serde_json::to_value(policy_after.data.as_ref()).unwrap(), serde_json::to_value(policy_before.data.as_ref()).unwrap());
-        assert!(permissions.decision_receipt(&session.id, &request.request_id, &request.request_generation).is_none());
+        assert_eq!(
+            serde_json::to_value(policy_after.data.as_ref()).unwrap(),
+            serde_json::to_value(policy_before.data.as_ref()).unwrap()
+        );
+        assert!(permissions
+            .decision_receipt(
+                &session.id,
+                &request.request_id,
+                &request.request_generation
+            )
+            .is_none());
         assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
-        let body = actix_web::body::to_bytes(response.into_body()).await.unwrap();
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["code"], "session_execution_incompatible");
         assert_eq!(body["compatibility"]["execution_allowed"], false);
-        assert_eq!(serde_json::to_value(state.load_session(&session.id).await.unwrap()).unwrap(), cached_before);
-        assert_eq!([tokio::fs::read(directory.join("session.json")).await.unwrap(),
-            tokio::fs::read(directory.join("runtime.json")).await.unwrap()], before_disk);
+        assert_eq!(
+            serde_json::to_value(state.load_session(&session.id).await.unwrap()).unwrap(),
+            cached_before
+        );
+        assert_eq!(
+            [
+                tokio::fs::read(directory.join("session.json"))
+                    .await
+                    .unwrap(),
+                tokio::fs::read(directory.join("runtime.json"))
+                    .await
+                    .unwrap()
+            ],
+            before_disk
+        );
         assert!(state.agent_runners.read().await.is_empty());
         assert!(state.session_event_senders.read().await.is_empty());
         assert_eq!(probe.0.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -773,13 +849,18 @@ mod tests {
 
     #[actix_web::test]
     async fn session_version_typed_decision_checks_durable_contract_before_any_grant() {
-        for kind in [PermissionDecisionKind::AllowOnce, PermissionDecisionKind::AllowSession, PermissionDecisionKind::AllowGlobal] {
+        for kind in [
+            PermissionDecisionKind::AllowOnce,
+            PermissionDecisionKind::AllowSession,
+            PermissionDecisionKind::AllowGlobal,
+        ] {
             assert_future_cached_response(Some(kind)).await;
         }
     }
 
     #[actix_web::test]
-    async fn session_version_ordinary_response_checks_durable_contract_before_consumption_or_reservation() {
+    async fn session_version_ordinary_response_checks_durable_contract_before_consumption_or_reservation(
+    ) {
         assert_future_cached_response(None).await;
     }
 

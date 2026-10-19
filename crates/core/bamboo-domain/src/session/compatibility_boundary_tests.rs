@@ -7,7 +7,10 @@ fn session_version_new_root_and_child_are_explicitly_stamped() {
     let root = Session::new("version-root", "model");
     let child = Session::new_child_of("version-child", &root, "model", "worker");
     for session in [root, child] {
-        assert_eq!(serde_json::to_value(session).unwrap()["session_version"], json!(1));
+        assert_eq!(
+            serde_json::to_value(session).unwrap()["session_version"],
+            json!(1)
+        );
     }
 }
 

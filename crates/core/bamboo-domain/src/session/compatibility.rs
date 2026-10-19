@@ -47,7 +47,9 @@ impl fmt::Display for SessionCompatibilityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("session_execution_incompatible: ")?;
         for (index, conflict) in self.compatibility.conflicts.iter().enumerate() {
-            if index != 0 { f.write_str("; ")?; }
+            if index != 0 {
+                f.write_str("; ")?;
+            }
             write!(f, "{}: {}", conflict.code, conflict.message)?;
         }
         f.write_str(" Read the existing history with a compatible runtime, or start a new session with selected context and an explicit workspace. No state was migrated.")
@@ -71,7 +73,10 @@ impl Session {
 
     pub fn execution_compatibility(&self) -> SessionCompatibilityReport {
         let mut conflicts = Vec::new();
-        if let Some(version) = self.session_version.filter(|_| !supported(self.session_version)) {
+        if let Some(version) = self
+            .session_version
+            .filter(|_| !supported(self.session_version))
+        {
             conflicts.push(SessionCompatibilityConflict {
                 code: "unsupported_session_version".into(),
                 message: format!("Session behavior version {version} is not supported; this runtime supports version {CURRENT_SESSION_VERSION} and compatible legacy records."),
@@ -153,7 +158,14 @@ mod tests {
         for version in [None, Some(CURRENT_SESSION_VERSION)] {
             for ultra in [false, true] {
                 for supervisor in [false, true] {
-                    let mut session = Session::new(if supervisor { crate::DEFAULT_SUPERVISOR_SESSION_ID } else { "root" }, "model");
+                    let mut session = Session::new(
+                        if supervisor {
+                            crate::DEFAULT_SUPERVISOR_SESSION_ID
+                        } else {
+                            "root"
+                        },
+                        "model",
+                    );
                     session.session_version = version;
                     session.set_root_orchestration_only(ultra).unwrap();
                     if supervisor {
@@ -165,7 +177,10 @@ mod tests {
                     assert!(session.execution_compatibility().execution_allowed);
                     session.check_execution_compatibility().unwrap();
                     assert_eq!(serde_json::to_value(&session).unwrap(), before);
-                    assert_eq!(session.allows_model_tool_execution("Bash"), !ultra && !supervisor);
+                    assert_eq!(
+                        session.allows_model_tool_execution("Bash"),
+                        !ultra && !supervisor
+                    );
                     let mut child = Session::new_child_of("child", &session, "model", "child");
                     child.session_version = version;
                     assert!(child.execution_compatibility().execution_allowed);
@@ -186,7 +201,11 @@ mod tests {
             assert!(report.history_readable);
             assert!(!report.execution_allowed);
             assert_eq!(report.conflicts[0].code, "unsupported_session_version");
-            assert!(reloaded.check_execution_compatibility().unwrap_err().to_string().contains("session_execution_incompatible"));
+            assert!(reloaded
+                .check_execution_compatibility()
+                .unwrap_err()
+                .to_string()
+                .contains("session_execution_incompatible"));
             assert_eq!(serde_json::to_value(reloaded).unwrap(), before);
         }
     }
@@ -223,7 +242,10 @@ mod tests {
         let before = serde_json::to_value(&session).unwrap();
         let report = session.execution_compatibility();
         assert!(!report.execution_allowed);
-        assert_eq!(report.conflicts[0].code, "unsupported_model_context_version");
+        assert_eq!(
+            report.conflicts[0].code,
+            "unsupported_model_context_version"
+        );
         assert_eq!(serde_json::to_value(session).unwrap(), before);
     }
 
@@ -237,7 +259,10 @@ mod tests {
         let before = serde_json::to_value(&session).unwrap();
         let report = session.execution_compatibility();
         assert!(!report.execution_allowed);
-        assert_eq!(report.conflicts[0].code, "unsupported_runtime_state_version");
+        assert_eq!(
+            report.conflicts[0].code,
+            "unsupported_runtime_state_version"
+        );
         assert_eq!(serde_json::to_value(session).unwrap(), before);
     }
 }
