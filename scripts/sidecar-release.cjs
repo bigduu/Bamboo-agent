@@ -265,13 +265,15 @@ function assembleRelease({ identity, inputDirectory, outputDirectory, sourceRoot
   })
   const browserHost = createBrowserHost({ sourceRoot, outputDirectory })
   const manifest = createManifest({ ...identity, artifacts: receipts, browserHost })
-  fs.writeFileSync(path.join(outputDirectory, MANIFEST), manifestBytes(manifest), { flag: 'wx' })
+  const originalManifestBytes = manifestBytes(manifest)
+  fs.writeFileSync(path.join(outputDirectory, MANIFEST), originalManifestBytes, { flag: 'wx' })
   // A failed final upload can rerun without changing immutable provenance.
   // Record the attempts that actually built these bytes, not the uploader's
   // later retry number (the complete per-target attempts remain in builds).
   const provenance = signReceipt({ schemaVersion: 1, kind: PROVENANCE_KIND, ...identity,
     runAttempt: Math.max(...receipts.map((item) => item.runAttempt)),
-    manifestSha256: sha256(manifestBytes(manifest)), builds: receipts }, signingKey)
+    manifestSha256: sha256(originalManifestBytes),
+    manifestBytesBase64: originalManifestBytes.toString('base64'), builds: receipts }, signingKey)
   fs.writeFileSync(path.join(outputDirectory, PROVENANCE),
     `${JSON.stringify(provenance, null, 2)}\n`, { flag: 'wx' })
   return manifest
@@ -309,11 +311,31 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
     assert.deepEqual(item.frontendBytes, frontendBytes)
   }
   assert.equal(proof.runAttempt, Math.max(...proof.builds.map((item) => item.runAttempt)))
-  const browserHost = createBrowserHost({ sourceRoot, outputDirectory })
-  const manifest = createManifest({ ...identity, artifacts: proof.builds, browserHost })
-  assert.equal(sha256(manifestBytes(manifest)), proof.manifestSha256,
+  let originalManifestBytes, legacyHostCreated = false
+  if (proof.manifestBytesBase64 !== undefined) {
+    assert.equal(typeof proof.manifestBytesBase64, 'string')
+    originalManifestBytes = Buffer.from(proof.manifestBytesBase64, 'base64')
+    assert.equal(originalManifestBytes.toString('base64'), proof.manifestBytesBase64)
+  } else {
+    const committed = release.assets.find((asset) => asset.name === MANIFEST)
+    if (committed) originalManifestBytes = await readAsset(committed, 1024 * 1024)
+    else {
+      // Legacy checkpoints lack the original serialized manifest. Keep their
+      // existing deterministic compatibility route; new checkpoints never use it.
+      const browserHost = createBrowserHost({ sourceRoot, outputDirectory })
+      originalManifestBytes = manifestBytes(createManifest({ ...identity, artifacts: proof.builds, browserHost }))
+      legacyHostCreated = true
+    }
+  }
+  assert.ok(originalManifestBytes.length > 0 && originalManifestBytes.length <= 1024 * 1024)
+  assert.equal(sha256(originalManifestBytes), proof.manifestSha256,
     'Recovery manifest does not match the authenticated checkpoint')
-  const required = [...proof.builds, browserHost]
+  const manifest = JSON.parse(originalManifestBytes.toString('utf8'))
+  // Validate the v1 contract and signed build identities without reserializing
+  // the original bytes or running the current controller's archive builder.
+  assert.deepEqual(manifest, createManifest({ ...identity, artifacts: proof.builds,
+    browserHost: manifest.browserHost }))
+  const required = [...proof.builds, manifest.browserHost]
   assert.ok(required.every((item) => release.assets.some((asset) => asset.name === item.assetName)),
     'Authenticated checkpoint has missing release assets')
   for (const item of required) {
@@ -321,14 +343,14 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
     const data = await readAsset(asset, item.sizeBytes)
     assert.deepEqual({ sha256: sha256(data), sizeBytes: data.length },
       { sha256: item.sha256, sizeBytes: item.sizeBytes }, 'Recovery asset differs from authenticated provenance')
-    if (item.target) {
-      const file = path.join(outputDirectory, item.assetName)
-      fs.writeFileSync(file, data, { flag: 'wx' })
-      binaryArchitecture(file, item.target)
-    }
+    const file = path.join(outputDirectory, item.assetName)
+    if (item.assetName === HOST_ASSET && legacyHostCreated) {
+      assert.deepEqual(fs.readFileSync(file), data)
+    } else fs.writeFileSync(file, data, { flag: 'wx' })
+    if (item.target) binaryArchitecture(file, item.target)
   }
   fs.writeFileSync(path.join(outputDirectory, PROVENANCE), bytes, { flag: 'wx' })
-  fs.writeFileSync(path.join(outputDirectory, MANIFEST), manifestBytes(manifest), { flag: 'wx' })
+  fs.writeFileSync(path.join(outputDirectory, MANIFEST), originalManifestBytes, { flag: 'wx' })
   return manifest
 }
 
@@ -390,7 +412,7 @@ async function main() {
   assert.equal(git(['rev-parse', 'HEAD']), identity.sourceRevision)
   assert.equal(git(['status', '--porcelain', '--untracked-files=all']), '')
   console.log(JSON.stringify({ status: 'published-and-verified', version: identity.version,
-    sourceRevision: identity.sourceRevision, manifestSha256: sha256(manifestBytes(manifest)), targets: TARGETS }))
+    sourceRevision: identity.sourceRevision, manifestSha256: fileIdentity(path.join(directory, MANIFEST), 1024 * 1024).sha256, targets: TARGETS }))
 }
 
 module.exports = { REPOSITORY, MANIFEST, HOST_ASSET, PROVENANCE, TARGETS, HOST_FILES, MAX_BINARY, MAX_HOST,
