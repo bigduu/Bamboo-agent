@@ -111,6 +111,8 @@ def api(route):
                 'repository': {'full_name': repo}, 'head_repository': {'full_name': repo},
                 'html_url': 'https://github.com/' + repo + '/actions/runs/123'}
     if route == 'git/ref/heads/' + branch:
+        if scenario == 'deleted_release_branch':
+            raise RuntimeError('HTTP 404: merged release branch was deleted')
         return {'object': {'type': 'commit', 'sha': source}}
     if route.startswith('compare/'):
         earlier, later = route.removeprefix('compare/').split('...')
@@ -134,10 +136,19 @@ def api(route):
     if route == 'pulls/7':
         return pr
     if route == 'issues/7/comments?per_page=100':
-        return [{'id': 99, 'html_url': 'https://github.com/' + repo + '/pull/7#issuecomment-99',
+        comments = [{'id': 99, 'html_url': 'https://github.com/' + repo + '/pull/7#issuecomment-99',
                  'user': {'login': 'bigduu' if scenario == 'forged_review' else 'chatgpt-codex-connector[bot]',
                           'type': 'User' if scenario == 'forged_review' else 'Bot'},
                  'body': '<!-- codex-review-state:v1 ' + json.dumps(reviews) + ' -->'}]
+        if scenario in ('later_clean_review', 'later_unresolved_review'):
+            latest_reviews = json.loads(json.dumps(reviews))
+            if scenario == 'later_unresolved_review':
+                latest_reviews['code_review']['has_unresolved_findings'] = True
+            comments.append({'id': 100, 'html_url': 'https://github.com/' + repo + '/pull/7#issuecomment-100',
+                'user': {'login': 'chatgpt-codex-connector[bot]', 'type': 'Bot',
+                         'avatar_url': 'https://example.invalid/new-avatar'},
+                'body': '<!-- codex-review-state:v1 ' + json.dumps(latest_reviews) + ' -->'})
+        return comments
     raise RuntimeError('Unexpected fixture API route: ' + route)
 def transport(argv, *, text):
     assert text is True and argv[:2] == ['gh', 'api'] and len(argv) == 3
@@ -231,4 +242,24 @@ test('actual complete-release recovery retains immutable validation after main a
   // Both invocations must still prove source/merge ancestry in their current main.
   assert.deepEqual(recovery, reserved)
   assert.equal(validateDispatch(fixture().event, recovery, sha, tree).id, 123)
+})
+
+test('actual publication uses immutable merged promotion evidence after release branch deletion', () => {
+  const result = runActualPreflight('deleted_release_branch')
+  assert.equal(result.status, 0, result.stderr)
+  const emitted = JSON.parse(result.stdout.trim().split('\n').at(-1))
+  const validation = JSON.parse(emitted.env.trim().slice('SOURCE_VALIDATION='.length))
+  assert.equal(validateDispatch(fixture().event, validation, sha, tree).id, 123)
+})
+
+test('later clean review metadata cannot change the signed publication recovery identity', () => {
+  const validation = scenario => {
+    const result = runActualPreflight(scenario)
+    assert.equal(result.status, 0, result.stderr)
+    const emitted = JSON.parse(result.stdout.trim().split('\n').at(-1))
+    return JSON.parse(emitted.env.trim().slice('SOURCE_VALIDATION='.length))
+  }
+  assert.deepEqual(validation('later_clean_review'), validation('accepted'))
+  // Fresh review is still checked; immutable identity never ignores a new finding.
+  assert.notEqual(runActualPreflight('later_unresolved_review').status, 0)
 })

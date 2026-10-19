@@ -440,8 +440,6 @@ jobs:
               assert ci["repository"]["full_name"] == ci["head_repository"]["full_name"] == repository
               assert source == ci["head_sha"]
               assert re.fullmatch(r"release/[0-9a-f]{40}", ci["head_branch"])
-              reference = api("git/ref/heads/" + ci["head_branch"])["object"]
-              assert reference["type"] == "commit"
               cut = ci["head_branch"].removeprefix("release/")
               assert re.fullmatch(r"[0-9a-f]{40}", cut)
               dev = api("branches/dev")
@@ -452,7 +450,7 @@ jobs:
                   return comparison
               ancestor(cut, ci["head_sha"])
               ancestor(ci["head_sha"], dev["commit"]["sha"])
-              ancestor(source, reference["sha"])
+              # Merged promotion and immutable CI bind the source; the head branch may be deleted.
               # Successful release-PR CI is validation, never main-promotion authority.
               ancestor(source, workflow_source)
               promotions = api(f"pulls?state=closed&base=main&head={owner}:{ci['head_branch']}&per_page=100")
@@ -483,10 +481,14 @@ jobs:
                       summaries.append((comment["html_url"], json.loads(match.group(1)), actor))
               assert summaries, "Require the promotion PR's actual Codex review summary"
               review_url, reviews, review_actor = summaries[-1]
+              stable_reviews = {}
               for kind in ("code_review", "security_review"):
                   review = reviews[kind]
                   assert review["commit_sha"] == source and review["status"] == "completed"
                   assert review["has_any_findings"] is False and review["has_unresolved_findings"] is False
+                  stable_reviews[kind] = {key: review[key] for key in
+                                          ("commit_sha", "status", "has_any_findings", "has_unresolved_findings")}
+              print(f"Verified current promotion review summary: {review_url}")
               main_promotion = {"mainProtected": main["protected"],
                                 "sourceInMain": True, "mergeRevision": merge_revision,
                                 "mergeTree": merge_commit["tree"]["sha"], "mergeParents": merge_parents,
@@ -494,7 +496,10 @@ jobs:
                                                 "state": promotion["state"], "merged": promotion["merged"], "draft": promotion["draft"],
                                                 "headRevision": promotion["head"]["sha"], "headRef": promotion["head"]["ref"],
                                                 "baseRef": promotion["base"]["ref"], "mergedAt": promotion["merged_at"]},
-                                "reviewSummary": {"url": review_url, "state": reviews, "actor": review_actor}}
+                                # Comment URLs and mutable bot profile metadata are audit details,
+                                # not part of the stable authenticated recovery identity.
+                                "reviewSummary": {"state": stable_reviews,
+                                                  "actor": {"type": "Bot", "login": "chatgpt-codex-connector[bot]"}}}
               paths = []
               required = ["Validation Source", "Promotion Source", "Test", "E2E Tests", "Lint",
                           "Build (ubuntu-latest)", "Build (macos-latest)", "Build (windows-latest)"]

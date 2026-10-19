@@ -52,8 +52,8 @@ function validateDispatch(event, validation, sourceRevision, sourceTree) {
   assert.equal(pr.headRevision, sourceRevision)
   assert.ok(typeof pr.mergedAt === 'string' && Number.isFinite(Date.parse(pr.mergedAt)))
   const summary = promotion.reviewSummary
-  assert.match(summary?.url, new RegExp(`^${pr.html_url.replaceAll('.', '\\.')}#issuecomment-[1-9][0-9]*$`))
-  assert.equal(summary.actor?.type, 'Bot')
+  // The preflight logs the actual comment URL; stable recovery binds its verified result.
+  assert.equal(summary?.actor?.type, 'Bot')
   assert.ok(['chatgpt-codex-connector[bot]', 'chatgpt-codex-connector'].includes(summary.actor.login))
   for (const kind of ['code_review', 'security_review']) {
     const review = summary.state[kind]
