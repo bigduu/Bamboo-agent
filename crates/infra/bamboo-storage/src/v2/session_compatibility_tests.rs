@@ -221,18 +221,41 @@ async fn session_version_merge_rejects_unknown_durable_schema_before_mutating_th
 
 #[tokio::test]
 async fn session_version_store_stale_checkpoint_cannot_replace_an_unknown_main() {
+    use crate::session_merge::LockedSessionStore;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
     for runtime_only in [false, true] {
-        let home = tempfile::tempdir().unwrap();
-        let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
-        let mut stale = Session::new("stale-main-stamp", "model");
-        storage.save_session(&stale).await.unwrap();
-        change_stamp(home.path(), &stale.id, Some(99), Some(1)).await;
-        let before = pair(home.path(), &stale.id).await;
-        stale.title = "must not replace future Main or sidecar".into();
-        let result = if runtime_only { storage.save_runtime_state(&stale).await }
-            else { storage.save_session(&stale).await };
-        let error = result.expect_err("a compatible caller is not authority over a future canonical Main");
-        assert!(error.to_string().contains("session_execution_incompatible"), "{error}");
-        assert_eq!(pair(home.path(), &stale.id).await, before);
+        for through_wrapper in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let storage = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+            let mut stale = Session::new("stale-main-stamp", "model");
+            stale.model_context_state = Some(bamboo_domain::ModelContextState {
+                state_revision: 7, ..Default::default()
+            });
+            storage.save_session(&stale).await.unwrap();
+            change_stamp(home.path(), &stale.id, Some(99), Some(1)).await;
+            let before = pair(home.path(), &stale.id).await;
+            stale.title = "must not replace future Main or sidecar".into();
+            stale.model_context_state = None;
+            let before_memory = serde_json::to_value(&stale).unwrap();
+            let published = AtomicBool::new(false);
+            let result = if through_wrapper {
+                let locked = LockedSessionStore::new(storage.clone());
+                if runtime_only {
+                    locked.save_runtime_only_and_publish(&mut stale, |_| {
+                        published.store(true, Ordering::SeqCst);
+                    }).await
+                } else {
+                    locked.merge_save_runtime_and_publish(&mut stale, |_, _| {
+                        published.store(true, Ordering::SeqCst);
+                    }).await
+                }
+            } else if runtime_only { storage.save_runtime_state(&stale).await }
+                else { storage.save_session(&stale).await };
+            let error = result.expect_err("a compatible caller is not authority over a future canonical Main");
+            assert!(error.to_string().contains("session_execution_incompatible"), "{error}");
+            assert_eq!(serde_json::to_value(&stale).unwrap(), before_memory);
+            assert_eq!(pair(home.path(), &stale.id).await, before);
+            assert!(!published.load(Ordering::SeqCst));
+        }
     }
 }

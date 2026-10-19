@@ -154,7 +154,7 @@ struct CompatibilityHook(Arc<AtomicUsize>);
 
 #[async_trait]
 impl AgentHook for CompatibilityHook {
-    fn point(&self) -> AgentHookPoint { AgentHookPoint::BeforeSessionSetup }
+    fn point(&self) -> AgentHookPoint { AgentHookPoint::AfterSessionSetup }
     async fn run(&self, _point: AgentHookPoint, _payload: &HookPayload, _session: &Session) -> HookResult {
         self.0.fetch_add(1, Ordering::SeqCst);
         HookResult::Continue
@@ -163,7 +163,7 @@ impl AgentHook for CompatibilityHook {
 
 #[tokio::test]
 async fn session_version_raw_engine_stale_snapshot_refuses_before_hooks_or_session_mutation() {
-    for conflict in ["main", "runtime", "context"] {
+    for conflict in ["compatible", "main", "runtime", "context"] {
         for explicit_inputs in [false, true] {
             let fixture = Fixture::new().await;
             let mut session = Session::new("stale-compatible-engine", "test-model");
@@ -171,7 +171,9 @@ async fn session_version_raw_engine_stale_snapshot_refuses_before_hooks_or_sessi
             session.metadata.insert(bamboo_engine::session_app::chat::SESSION_START_SOURCE_METADATA_KEY.into(), "resume".into());
             fixture.repo.save(&mut session).await.unwrap();
             let before_memory = serde_json::to_value(&session).unwrap();
-            let before_disk = future_durable(&fixture, &session.id, conflict).await;
+            let before_disk = if conflict == "compatible" {
+                durable_pair(&fixture, &session.id).await
+            } else { future_durable(&fixture, &session.id, conflict).await };
             let calls = Arc::new(AtomicUsize::new(0));
             let mut hooks = HookRunner::new();
             hooks.register(Arc::new(CompatibilityHook(calls.clone())));
@@ -200,6 +202,12 @@ async fn session_version_raw_engine_stale_snapshot_refuses_before_hooks_or_sessi
             } else {
                 agent.execute(&mut session, request).await
             };
+            if conflict == "compatible" {
+                result.expect("compatible raw execution remains available");
+                assert!(calls.load(Ordering::SeqCst) > 0, "the same native hook must be reachable");
+                assert!(fixture.probe.provider_calls.load(Ordering::SeqCst) > 0);
+                continue;
+            }
             let error = result.expect_err("raw execution must check canonical compatibility before hooks");
             assert!(error.to_string().contains("session_execution_incompatible"), "{error}");
             assert_eq!(serde_json::to_value(&session).unwrap(), before_memory);
