@@ -938,6 +938,113 @@ mod tests {
         }
     }
 
+    struct NestedOwnerRecorder {
+        installed_root: bool,
+        entered: std::sync::Mutex<Vec<(String, ToolCall, bool)>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for NestedOwnerRecorder {
+        async fn execute(&self, _call: &ToolCall) -> crate::tools::executor::Result<ToolResult> {
+            panic!("orchestration actions must retain their selected exact owner")
+        }
+
+        async fn execute_exact_with_context_outcome(
+            &self,
+            call: &ToolCall,
+            execution_name: &str,
+            ctx: ToolExecutionContext<'_>,
+        ) -> crate::tools::executor::Result<crate::tools::ToolOutcome> {
+            let original_supervisor = ctx.session_id.is_some_and(|id| {
+                ctx.to_tool_ctx().executing_supervisor_for(id).is_some()
+            });
+            self.entered.lock().unwrap().push((
+                execution_name.to_string(), call.clone(), original_supervisor,
+            ));
+            Ok(crate::tools::ToolOutcome::Completed(ToolResult::text(true, "selected-owner-completed")))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            ["SubAgent", "spawn_session"].into_iter()
+                .filter(|name| *name != "spawn_session" || self.installed_root)
+                .map(|name| ToolSchema {
+                    schema_type: "function".into(),
+                    function: crate::tools::FunctionSchema {
+                        name: name.into(), description: "installed owner probe".into(),
+                        parameters: serde_json::json!({"type":"object"}),
+                    },
+                }).collect()
+        }
+    }
+
+    fn nested_owner_result(action: ToolCall) -> ToolResult {
+        ToolResult::text(true, serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+            actions: vec![action], reason: "explicit additional action".into(),
+        }).unwrap())
+    }
+
+    #[tokio::test]
+    async fn versioned_nested_spawn_uses_session_owner_and_preserves_legacy_aliases() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for version in [None, Some(1), Some(2)] {
+            for ultra in [false, true] {
+                for reference in ["spawn_session", "spawnSession", "default::spawn_session", "default::spawnSession"] {
+                    let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+                    session.session_version = version;
+                    session.authority_identity = SessionAuthorityIdentity::Supervisor { incarnation_id: uuid::Uuid::new_v4() };
+                    session.set_root_orchestration_only(ultra).unwrap();
+                    let action = make_tool_call("nested-original", reference, r#"{"message":"explicit nested input","keep":{"original":true}}"#);
+                    let original = action.clone();
+                    let tools = NestedOwnerRecorder { installed_root: version == Some(2), entered: Default::default() };
+                    let flags = ToolExecutionSessionFlags::from_session(&session);
+                    let (tx, mut rx) = mpsc::channel(16);
+                    let outcome = handle_tool_result_with_agentic_support(
+                        &nested_owner_result(action), &make_tool_call("parent", "Read", "{}"),
+                        &tx, &mut session, &tools, flags, None,
+                    ).await;
+                    assert_eq!(outcome, ToolHandlingOutcome::Continue);
+                    let expected = if version == Some(2) { "spawn_session" } else { "SubAgent" };
+                    assert_eq!(*tools.entered.lock().unwrap(), vec![(expected.into(), original.clone(), true)], "version={version:?} ultra={ultra} reference={reference}");
+                    assert!(session.messages.iter().any(|message| message.tool_call_id.as_deref() == Some("nested-original") && message.tool_success == Some(true) && message.content == "selected-owner-completed"));
+                    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+                    assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::ToolStart { .. })).count(), 1);
+                    assert!(!events.iter().any(|e| matches!(e, AgentEvent::ToolError { .. })));
+                    assert_eq!(original.function.name, reference);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn versioned_nested_spawn_missing_owner_or_ordinary_ultra_refuses_without_child_fallback() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for (supervisor, ultra, installed_root) in [(true, false, false), (true, true, false), (false, true, true)] {
+            for reference in ["spawn_session", "spawnSession", "default::spawn_session", "default::spawnSession"] {
+                let mut session = Session::new(if supervisor { DEFAULT_SUPERVISOR_SESSION_ID } else { "ordinary-root" }, "model");
+                session.session_version = Some(2);
+                if supervisor {
+                    session.authority_identity = SessionAuthorityIdentity::Supervisor { incarnation_id: uuid::Uuid::new_v4() };
+                }
+                session.set_root_orchestration_only(ultra).unwrap();
+                let action = make_tool_call("refused-nested", reference, "{}");
+                let original = action.clone();
+                let tools = NestedOwnerRecorder { installed_root, entered: Default::default() };
+                let flags = ToolExecutionSessionFlags::from_session(&session);
+                let (tx, mut rx) = mpsc::channel(16);
+                handle_tool_result_with_agentic_support(
+                    &nested_owner_result(action), &make_tool_call("parent", "Read", "{}"),
+                    &tx, &mut session, &tools, flags, None,
+                ).await;
+                assert!(tools.entered.lock().unwrap().is_empty(), "supervisor={supervisor} ultra={ultra} installed={installed_root} reference={reference}");
+                let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+                assert!(!events.iter().any(|e| matches!(e, AgentEvent::ToolStart { .. })));
+                assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::ToolError { .. })).count(), 1);
+                assert!(session.messages.iter().any(|message| message.tool_call_id.as_deref() == Some("refused-nested") && message.tool_success == Some(false)));
+                assert_eq!(original.function.name, reference);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn supervisor_delegation_first_blocks_queued_execution_after_worker_success_or_failure() {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
