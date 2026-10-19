@@ -1,9 +1,10 @@
 //! Outer filesystem adapter for retry metadata; never an execution authority.
 //! Each blocking transaction retains the same lock through file and directory
 //! synchronization, including when its async caller is cancelled.
-//! Clones pin one descriptor and serialize its use; observed inode/link loss
-//! fails closed around publication. A live adapter never reopens a changed
-//! lock. Trusted repair must drain live writers before replacing lock metadata.
+//! Each transaction also independently locks the stable Host root directory, so
+//! replacing and restoring the named lock cannot admit a competing publisher.
+//! Clones pin one file descriptor; observed inode/link loss fails closed. Trusted
+//! root repair and mixed-version access must drain live writers first.
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -115,10 +116,18 @@ fn key_hash(key: &ReadyRetryKey) -> Result<String> {
 struct TransactionLock<'a> {
     descriptor: MutexGuard<'a, Option<File>>,
     path: PathBuf,
+    root: File,
+    root_path: PathBuf,
 }
 
 impl TransactionLock<'_> {
     fn verify(&self) -> Result<()> {
+        let opened_root = self.root.metadata()?;
+        let named_root = fs::metadata(&self.root_path)
+            .map_err(|_| unavailable("Host root is missing or inaccessible"))?;
+        if !opened_root.is_dir() || !named_root.is_dir() {
+            return Err(unavailable("Host root is not a directory"));
+        }
         let file = self
             .descriptor
             .as_ref()
@@ -132,6 +141,15 @@ impl TransactionLock<'_> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            if opened_root.dev() != named_root.dev()
+                || opened_root.ino() != named_root.ino()
+                || opened_root.nlink() == 0
+                || named_root.nlink() == 0
+            {
+                return Err(unavailable(
+                    "Host root identity changed; explicit repair required",
+                ));
+            }
             if opened.dev() != named.dev()
                 || opened.ino() != named.ino()
                 || opened.nlink() != 1
@@ -155,6 +173,7 @@ impl Drop for TransactionLock<'_> {
         if let Some(file) = self.descriptor.as_ref() {
             let _ = FileExt::unlock(file);
         }
+        let _ = FileExt::unlock(&self.root);
     }
 }
 
@@ -196,6 +215,17 @@ impl FileReadyRetryStore {
             }
             std::sync::TryLockError::Poisoned(_) => unavailable("retry lock guard is poisoned"),
         })?;
+        // A separately opened directory descriptor is the publication mutex.
+        // Its inode does not change when LOCK is removed/replaced/restored.
+        // Acquire it before caching a named descriptor: a losing contender must
+        // not retain a transient replacement file for its next transaction.
+        let root = File::open(parent)?;
+        if !root.metadata()?.is_dir() {
+            return Err(unavailable("Host root is not a directory"));
+        }
+        FileExt::try_lock_exclusive(&root).map_err(|_| {
+            Error::ResourceBlocked("another Ready retry metadata transaction is active".into())
+        })?;
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(unavailable("retry lock is not a plain file"))
@@ -220,7 +250,12 @@ impl FileReadyRetryStore {
         file.try_lock_exclusive().map_err(|_| {
             Error::ResourceBlocked("another Ready retry metadata transaction is active".into())
         })?;
-        let lock = TransactionLock { descriptor, path };
+        let lock = TransactionLock {
+            descriptor,
+            path,
+            root,
+            root_path: parent.to_path_buf(),
+        };
         lock.verify()?;
         let created = match fs::create_dir(&self.directory) {
             Ok(()) => {
