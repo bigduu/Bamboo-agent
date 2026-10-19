@@ -446,3 +446,74 @@ async fn session_version_compatible_io_failure_preserves_existing_publication_co
         assert_eq!(publications.load(Ordering::SeqCst), expected_publications);
     }
 }
+
+
+async fn missing_main_repair_retains_contract(conflict: Option<&str>) {
+    let home = tempfile::tempdir().unwrap();
+    let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let mut caller = Session::new("missing-main-contract", "model");
+    caller.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new("retained-run"));
+    caller.model_context_state = Some(bamboo_domain::ModelContextState::default());
+    caller.add_message(Message::user("retained history"));
+    storage.save_session(&caller).await.unwrap();
+    let directory = home.path().join("sessions").join(&caller.id);
+    let runtime_path = directory.join("runtime.json");
+    if let Some(conflict) = conflict {
+        let mut raw: Value =
+            serde_json::from_slice(&tokio::fs::read(&runtime_path).await.unwrap()).unwrap();
+        match conflict {
+            "session" => raw["session_version"] = json!(99),
+            "runtime" => raw["agent_runtime_state"]["version"] = json!(99),
+            "context" => raw["model_context_state"]["schema_version"] = json!(99),
+            _ => unreachable!(),
+        }
+        tokio::fs::write(&runtime_path, serde_json::to_vec_pretty(&raw).unwrap())
+            .await
+            .unwrap();
+        // The fixture remains a legal same-birth Root with a readable future
+        // contract, not a failure caused by broken actor/authority evidence.
+        let retained = storage.load_session(&caller.id).await.unwrap().unwrap();
+        assert!(!retained.execution_compatibility().execution_allowed);
+    }
+    let runtime_before = tokio::fs::read(&runtime_path).await.unwrap();
+    tokio::fs::remove_file(directory.join("session.json"))
+        .await
+        .unwrap();
+    assert!(caller.execution_compatibility().execution_allowed);
+    let result = storage.save_session(&caller).await;
+    if conflict.is_some() {
+        let error = result.expect_err("full repair cannot reset an unknown retained contract");
+        assert!(
+            error.to_string().contains("session_execution_incompatible"),
+            "{error}"
+        );
+        assert!(!directory.join("session.json").exists());
+        assert_eq!(tokio::fs::read(runtime_path).await.unwrap(), runtime_before);
+    } else {
+        result.expect("a compatible interrupted Main creation remains repairable");
+        let restored = storage.load_session(&caller.id).await.unwrap().unwrap();
+        assert!(restored.execution_compatibility().execution_allowed);
+        assert_eq!(restored.messages, caller.messages);
+        assert_eq!(restored.created_at, caller.created_at);
+    }
+}
+
+#[tokio::test]
+async fn session_version_missing_main_preserves_unknown_side_stamp() {
+    missing_main_repair_retains_contract(Some("session")).await;
+}
+
+#[tokio::test]
+async fn session_version_missing_main_preserves_unknown_runtime_schema() {
+    missing_main_repair_retains_contract(Some("runtime")).await;
+}
+
+#[tokio::test]
+async fn session_version_missing_main_preserves_unknown_context_schema() {
+    missing_main_repair_retains_contract(Some("context")).await;
+}
+
+#[tokio::test]
+async fn session_version_missing_main_compatible_repair_remains_usable() {
+    missing_main_repair_retains_contract(None).await;
+}
