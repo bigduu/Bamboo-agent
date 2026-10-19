@@ -17,11 +17,10 @@ pub const CURRENT_SESSION_VERSION: u32 = 2;
 /// Missing/v1 retain the original Child-spawn tool contract. v2 separates
 /// independent Root spawning; support does not make these two contracts equal.
 pub fn same_session_tool_contract(left: Option<u32>, right: Option<u32>) -> bool {
-    match (left, right) {
-        (None | Some(1), None | Some(1)) => true,
-        (Some(2), Some(2)) => true,
-        _ => false,
-    }
+    matches!(
+        (left, right),
+        (None | Some(1), None | Some(1)) | (Some(2), Some(2))
+    )
 }
 
 pub fn independent_root_spawn_reference(reference: &str) -> bool {
