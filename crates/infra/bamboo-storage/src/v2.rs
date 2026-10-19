@@ -593,10 +593,12 @@ fn reject_session_version_change(incoming: &Session, durable: &Session) -> io::R
     // Main owns the behavior stamp, while the runtime sidecar owns the latest
     // retained control state. Do not mistake Main's older control snapshot for
     // the current state when a valid, compatible sidecar exists.
-    if durable
-        .session_version
-        .is_some_and(|v| v != bamboo_domain::CURRENT_SESSION_VERSION)
-    {
+    // Self-comparison rejects unsupported behavior stamps only. The current
+    // sidecar control schema is checked separately before either file is saved.
+    if !bamboo_domain::same_session_tool_contract(
+        durable.session_version,
+        durable.session_version,
+    ) {
         reject_incompatible_session_write(durable)?;
     }
     if incoming.created_at == durable.created_at
