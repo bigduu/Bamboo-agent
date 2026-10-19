@@ -1456,52 +1456,60 @@ async fn versioned_spawn_legacy_full_checkpoint_uses_the_current_sidecar_control
 }
 
 #[tokio::test]
-async fn versioned_spawn_runtime_checkpoint_without_sidecar_keeps_main_contract_and_legacy_pairing() {
-    for (retained, incoming, allowed) in [
-        (None, Some(2), false),
-        (Some(1), Some(2), false),
-        (Some(2), None, false),
-        (Some(2), Some(1), false),
-        (None, Some(1), true),
-        (Some(1), None, true),
-    ] {
-        let home = tempfile::tempdir().unwrap();
-        let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
-        let mut original = Session::new("main-without-sidecar", "model");
-        original.session_version = retained;
-        original.add_message(Message::user("Keep the retained Main contract and instruction"));
-        storage.save_session(&original).await.unwrap();
-        let directory = home.path().join("sessions").join(&original.id);
-        let main_path = directory.join("session.json");
-        let runtime_path = directory.join("runtime.json");
-        tokio::fs::remove_file(&runtime_path).await.unwrap();
-        let main_before = tokio::fs::read(&main_path).await.unwrap();
-        let index_before = tokio::fs::read(storage.index_path()).await.unwrap();
-        let mut checkpoint: Session =
-            serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
-        checkpoint.session_version = incoming;
-        checkpoint.title = "candidate runtime checkpoint".into();
-        assert!(checkpoint.execution_compatibility().execution_allowed);
-        let result = storage.save_runtime_state(&checkpoint).await;
-        if allowed {
-            result.expect("None/v1 are the same runtime tool contract without migrating Main");
-            assert!(runtime_path.is_file());
-        } else {
-            let error = result.expect_err(
-                "a missing sidecar does not authorize changing the retained Main tool contract",
-            );
-            assert!(
-                error.to_string().contains("session_version_change_requires_new_session"),
-                "{retained:?}->{incoming:?}: {error}"
-            );
-            assert!(!runtime_path.exists(), "a refused checkpoint must not create runtime.json");
-            assert_eq!(tokio::fs::read(storage.index_path()).await.unwrap(), index_before);
+async fn versioned_spawn_runtime_checkpoint_without_sidecar_refuses_root_and_child_without_writes() {
+    for child in [false, true] {
+        for (retained, incoming) in [
+            (None, Some(2)),
+            (Some(1), Some(2)),
+            (Some(2), None),
+            (Some(2), Some(1)),
+            (None, Some(1)),
+            (Some(1), None),
+            (Some(2), Some(2)),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+            let parent = Session::new("sidecar-parent", "model");
+            storage.save_session(&parent).await.unwrap();
+            let mut original = if child {
+                Session::new_child_of("main-without-sidecar", &parent, "model", "child")
+            } else {
+                Session::new("main-without-sidecar", "model")
+            };
+            original.session_version = retained;
+            original.add_message(Message::user("Keep the retained Main contract and instruction"));
+            storage.save_session(&original).await.unwrap();
+            let directory = task_member_directory(&storage, &original.id).await;
+            let main_path = directory.join("session.json");
+            let runtime_path = directory.join("runtime.json");
+            // Model retained pre-split Main bytes, not an invented writer exemption.
+            let main_bytes = serde_json::to_vec_pretty(&original).unwrap();
+            assert!(super::compact_main::validate_full_main(&main_bytes).unwrap().is_none());
+            tokio::fs::write(&main_path, &main_bytes).await.unwrap();
+            tokio::fs::remove_file(&runtime_path).await.unwrap();
+            let index_before = tokio::fs::read(storage.index_path()).await.unwrap();
+            let parent_before = pair(home.path(), &parent.id).await;
+            let mut checkpoint: Session =
+                serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+            checkpoint.session_version = incoming;
+            checkpoint.title = "candidate runtime checkpoint".into();
+            assert!(checkpoint.execution_compatibility().execution_allowed);
+            let expected_guard = if child {
+                "Child Project or identity changed or unavailable: canonical Child runtime sidecar is missing"
+            } else {
+                "Root context changed or unavailable: canonical runtime file is missing"
+            };
+            for store in [storage, SessionStoreV2::new(home.path().into()).await.unwrap()] {
+                let error = store.save_runtime_state(&checkpoint).await.expect_err(
+                    "missing runtime authority must refuse before contract comparison or publication",
+                );
+                assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                assert!(error.to_string().contains(expected_guard), "{child}/{retained:?}->{incoming:?}: {error}");
+                assert!(!runtime_path.exists(), "a refused checkpoint cannot reconstruct runtime authority");
+                assert_eq!(tokio::fs::read(&main_path).await.unwrap(), main_bytes);
+                assert_eq!(tokio::fs::read(store.index_path()).await.unwrap(), index_before);
+                assert_eq!(pair(home.path(), &parent.id).await, parent_before);
+            }
         }
-        assert_eq!(tokio::fs::read(&main_path).await.unwrap(), main_before);
-        let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
-        let loaded = reopened.load_session(&original.id).await.unwrap().unwrap();
-        assert_eq!(loaded.session_version, retained);
-        assert_eq!(loaded.messages[0].content, original.messages[0].content);
-        assert!(loaded.execution_compatibility().execution_allowed);
     }
 }
