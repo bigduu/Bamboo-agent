@@ -634,7 +634,8 @@ impl BuiltinToolExecutor {
         args: &serde_json::Value,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
-        self.check_owned_permissions(call, "spawn_session", args, ctx, true).await
+        self.check_owned_permissions(call, "spawn_session", args, ctx, true)
+            .await
     }
 
     async fn check_owned_permissions(
@@ -1143,7 +1144,8 @@ impl ToolExecutor for BuiltinToolExecutor {
         resolved_args: &serde_json::Value,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
-        self.check_owned_permissions(call, execution_name, resolved_args, ctx, false).await
+        self.check_owned_permissions(call, execution_name, resolved_args, ctx, false)
+            .await
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
@@ -4190,7 +4192,11 @@ mod tests {
         struct LegacyOwnerChecker(Arc<AtomicUsize>);
         #[async_trait]
         impl PermissionChecker for LegacyOwnerChecker {
-            async fn needs_confirmation(&self, _: crate::permission::PermissionType, _: &str) -> bool {
+            async fn needs_confirmation(
+                &self,
+                _: crate::permission::PermissionType,
+                _: &str,
+            ) -> bool {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 true
             }
@@ -4199,7 +4205,9 @@ mod tests {
                 _: crate::permission::PermissionContext,
             ) -> Result<bool, PermissionError> {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                Err(PermissionError::CheckFailed("unexpected framework Root permission".into()))
+                Err(PermissionError::CheckFailed(
+                    "unexpected framework Root permission".into(),
+                ))
             }
             fn grant_session_permission(&self, _: crate::permission::PermissionType, _: String) {
                 panic!("custom tool classification must not grant framework permissions");
@@ -4209,7 +4217,11 @@ mod tests {
         let mut failures = Vec::new();
         for name in ["spawn_session", "spawnSession", "vendor::spawn_session"] {
             let executor = BuiltinToolExecutorBuilder::new()
-                .with_tool(ExactRoutingTool { name, label: "legacy-custom-spawn", args_sensitive: false })
+                .with_tool(ExactRoutingTool {
+                    name,
+                    label: "legacy-custom-spawn",
+                    args_sensitive: false,
+                })
                 .unwrap()
                 .with_permission_checker(Arc::new(LegacyOwnerChecker(checks.clone())))
                 .build();
@@ -4217,15 +4229,28 @@ mod tests {
             let ctx = ToolExecutionContext::none(&call.id);
             for (entry, result) in [
                 ("raw", executor.check_permissions_for(&call, &ctx).await),
-                ("exact", executor.check_permissions_for_exact(&call, name, &ctx).await),
-                ("resolved", executor.check_permissions_for_resolved(&call, name, &args, &ctx).await),
+                (
+                    "exact",
+                    executor
+                        .check_permissions_for_exact(&call, name, &ctx)
+                        .await,
+                ),
+                (
+                    "resolved",
+                    executor
+                        .check_permissions_for_resolved(&call, name, &args, &ctx)
+                        .await,
+                ),
             ] {
                 match result {
                     Ok(None) => {}
                     other => failures.push(format!("{name}/{entry}: {other:?}")),
                 }
             }
-            match executor.execute_exact_with_context_outcome(&call, name, ctx).await {
+            match executor
+                .execute_exact_with_context_outcome(&call, name, ctx)
+                .await
+            {
                 Ok(ToolOutcome::Completed(result)) => {
                     assert!(result.success);
                     let result: serde_json::Value = serde_json::from_str(&result.result).unwrap();
@@ -4236,21 +4261,26 @@ mod tests {
             }
         }
         if checks.load(Ordering::SeqCst) != 0 {
-            failures.push(format!("framework permission checks: {}", checks.load(Ordering::SeqCst)));
+            failures.push(format!(
+                "framework permission checks: {}",
+                checks.load(Ordering::SeqCst)
+            ));
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[tokio::test]
     async fn legacy_exact_spawn_custom_arguments_do_not_gain_framework_root_permissions() {
-        assert_legacy_exact_spawn_permission_owner(json!({"payload":"legacy custom request"})).await;
+        assert_legacy_exact_spawn_permission_owner(json!({"payload":"legacy custom request"}))
+            .await;
     }
 
     #[tokio::test]
     async fn legacy_exact_spawn_framework_shaped_arguments_keep_the_custom_permission_owner() {
         assert_legacy_exact_spawn_permission_owner(json!({
             "project_id":"not-a-framework-request", "workspace_path":"/not-opened/custom-root",
-        })).await;
+        }))
+        .await;
     }
 
     #[tokio::test]

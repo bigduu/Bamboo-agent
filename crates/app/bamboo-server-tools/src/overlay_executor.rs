@@ -36,7 +36,10 @@ impl OverlayToolExecutor {
     }
 
     /// Add an owner-specific operation gate while retaining every base gate.
-    pub fn with_additional_permission_gate(mut self, gate: std::sync::Arc<dyn ToolExecutor>) -> Self {
+    pub fn with_additional_permission_gate(
+        mut self,
+        gate: std::sync::Arc<dyn ToolExecutor>,
+    ) -> Self {
         self.additional_permission_gate = Some(gate);
         self
     }
@@ -47,11 +50,18 @@ impl OverlayToolExecutor {
         args: &serde_json::Value,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
-        if let Some(outcome) = self.base.check_permissions_for_resolved(call, self.overlay.name(), args, ctx).await? {
+        if let Some(outcome) = self
+            .base
+            .check_permissions_for_resolved(call, self.overlay.name(), args, ctx)
+            .await?
+        {
             return Ok(Some(outcome));
         }
         match &self.additional_permission_gate {
-            Some(gate) => gate.check_permissions_for_resolved(call, self.overlay.name(), args, ctx).await,
+            Some(gate) => {
+                gate.check_permissions_for_resolved(call, self.overlay.name(), args, ctx)
+                    .await
+            }
             None => Ok(None),
         }
     }
@@ -139,10 +149,7 @@ impl OverlayToolExecutor {
         check_raw_tool_input(self.overlay.name(), &call.function.arguments)?;
         let args = self.resolve_args(call, &ctx);
         check_parsed_tool_input(self.overlay.name(), &args)?;
-        if let Some(outcome) = self
-            .check_overlay_permissions(call, &args, &ctx)
-            .await?
-        {
+        if let Some(outcome) = self.check_overlay_permissions(call, &args, &ctx).await? {
             return Ok(outcome);
         }
         self.overlay.invoke(args, ctx.to_tool_ctx()).await
@@ -230,9 +237,7 @@ impl ToolExecutor for OverlayToolExecutor {
                     .pre_parsed_args
                     .cloned()
                     .unwrap_or_else(|| parse_tool_args_best_effort(&call.function.arguments).0);
-                self
-                    .check_overlay_permissions(call, &args, ctx)
-                    .await
+                self.check_overlay_permissions(call, &args, ctx).await
             }
             OverlayRoute::BaseExact(execution_name) => {
                 self.base
@@ -254,9 +259,7 @@ impl ToolExecutor for OverlayToolExecutor {
                 .pre_parsed_args
                 .cloned()
                 .unwrap_or_else(|| parse_tool_args_best_effort(&call.function.arguments).0);
-            self
-                .check_overlay_permissions(call, &args, ctx)
-                .await
+            self.check_overlay_permissions(call, &args, ctx).await
         } else if self.base.owns_exact_tool(execution_name) {
             self.base
                 .check_permissions_for_exact(call, execution_name, ctx)
@@ -279,7 +282,9 @@ impl ToolExecutor for OverlayToolExecutor {
         if execution_name == self.overlay.name() {
             self.check_overlay_permissions(call, args, ctx).await
         } else {
-            self.base.check_permissions_for_resolved(call, execution_name, args, ctx).await
+            self.base
+                .check_permissions_for_resolved(call, execution_name, args, ctx)
+                .await
         }
     }
 

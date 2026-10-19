@@ -139,7 +139,9 @@ pub mod versioned {
     #[async_trait]
     impl ToolExecutor for RootSpawnPermissionGate {
         async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
-            Err(ToolError::Execution("permission-only Root operation gate".into()))
+            Err(ToolError::Execution(
+                "permission-only Root operation gate".into(),
+            ))
         }
         async fn check_permissions_for_resolved(
             &self,
@@ -149,11 +151,17 @@ pub mod versioned {
             ctx: &ToolExecutionContext<'_>,
         ) -> Result<Option<ToolOutcome>, ToolError> {
             if execution_name != "spawn_session" {
-                return Err(ToolError::Execution("Root operation permission owner differs".into()));
+                return Err(ToolError::Execution(
+                    "Root operation permission owner differs".into(),
+                ));
             }
-            self.0.check_framework_root_spawn_permissions(call, args, ctx).await
+            self.0
+                .check_framework_root_spawn_permissions(call, args, ctx)
+                .await
         }
-        fn list_tools(&self) -> Vec<ToolSchema> { Vec::new() }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
     }
 
     #[derive(Clone)]
@@ -172,8 +180,12 @@ pub mod versioned {
             storage: Arc<dyn Storage>,
             permission_executor: Arc<bamboo_tools::BuiltinToolExecutor>,
         ) -> Self {
-            let independent = Arc::new(OverlayToolExecutor::new(legacy.clone(), spawn.clone())
-                .with_additional_permission_gate(Arc::new(RootSpawnPermissionGate(permission_executor))));
+            let independent = Arc::new(
+                OverlayToolExecutor::new(legacy.clone(), spawn.clone())
+                    .with_additional_permission_gate(Arc::new(RootSpawnPermissionGate(
+                        permission_executor,
+                    ))),
+            );
             Self {
                 legacy,
                 independent,
@@ -326,9 +338,13 @@ pub mod versioned {
             if execution_name == "spawn_session" {
                 let (tools, name) = self.route(&call.function.name, ctx).await?;
                 if name != execution_name {
-                    return Err(ToolError::Execution("permission owner differs from the Session spawn contract".into()));
+                    return Err(ToolError::Execution(
+                        "permission owner differs from the Session spawn contract".into(),
+                    ));
                 }
-                return tools.check_permissions_for_resolved(call, execution_name, args, ctx).await;
+                return tools
+                    .check_permissions_for_resolved(call, execution_name, args, ctx)
+                    .await;
             }
             self.selected()
                 .check_permissions_for_resolved(call, execution_name, args, ctx)

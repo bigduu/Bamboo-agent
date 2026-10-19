@@ -1544,7 +1544,9 @@ mod tests {
             serde_json::json!({"workspace_path":"/p"}),
         ] {
             assert!(framework_root_spawn_permissions(&invalid).is_err());
-            assert!(check_permissions("spawn_session", &invalid).unwrap().is_none());
+            assert!(check_permissions("spawn_session", &invalid)
+                .unwrap()
+                .is_none());
         }
     }
 
