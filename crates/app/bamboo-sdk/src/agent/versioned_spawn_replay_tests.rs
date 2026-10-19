@@ -215,3 +215,36 @@ async fn versioned_spawn_conflicting_retained_contract_keeps_approval_markers_an
         &request.resource
     ));
 }
+
+#[tokio::test]
+async fn versioned_spawn_untyped_replay_without_root_port_never_enters_the_child_executor() {
+    let fixture = Fixture::new().await;
+    let (mut session, _) = parked("missing-root-port-v2", false);
+    assert_eq!(session.session_version, Some(2));
+    for message in &mut session.messages {
+        if let Some(calls) = &mut message.tool_calls {
+            for call in calls {
+                call.function.name = "spawnSession".into();
+                call.function.arguments =
+                    json!({"action":"create", "prompt":"must not become a Child"}).to_string();
+            }
+        }
+    }
+    fixture.repo.save(&mut session).await.unwrap();
+    let registry = bamboo_tools::ToolRegistry::new();
+    registry
+        .register(VersionedProbeTool {
+            name: "SubAgent",
+            probe: fixture.probe.clone(),
+        })
+        .unwrap();
+    let executor = std::sync::Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(registry));
+    let agent = fixture.agent_with_executor(None, executor, None);
+    let mut approved = agent.answer(&session.id, "Approve").await.unwrap().session;
+    agent.run_session(&mut approved).await.unwrap();
+    assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+    assert!(fixture.probe.calls.lock().unwrap().is_empty());
+    assert!(approved.messages.iter().any(
+        |message| message.role == Role::Tool && message.content.contains("no longer available")
+    ));
+}

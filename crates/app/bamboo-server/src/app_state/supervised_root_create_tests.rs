@@ -172,9 +172,11 @@ impl Fixture {
         let ctx = ctx.with_executing_supervisor(
             ExecutingSupervisorObservation::capture_from_executing_session(&executing),
         );
-        let result = self
-            .state
-            .tools_for(crate::tools::ToolSurface::Root)
+        let tools = self.state.tools_for(crate::tools::ToolSurface::Root);
+        // The model loop binds this immutable registration contract immediately
+        // after canonical Root authority admission; mirror that real boundary.
+        let tools = tools.for_session(&executing).unwrap_or(tools);
+        let result = tools
             .execute_with_context_outcome(&call, ctx)
             .await
             .expect("the Host must expose the independent Root creation operation");

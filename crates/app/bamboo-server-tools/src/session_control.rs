@@ -162,6 +162,18 @@ pub mod versioned {
                 &self.legacy
             }
         }
+        fn classification_reference(&self, reference: &str) -> String {
+            if self.contract == Some(true)
+                && bamboo_domain::independent_root_spawn_reference(reference)
+            {
+                bamboo_domain::resolve_session_tool_reference(Some(2), reference, |name| {
+                    self.independent.owns_exact_tool(name)
+                })
+                .unwrap_or_else(|| "spawn_session".into())
+            } else {
+                reference.to_owned()
+            }
+        }
         async fn route<'a>(
             &'a self,
             reference: &str,
@@ -304,16 +316,20 @@ pub mod versioned {
             self.selected().tool_guidance()
         }
         fn tool_mutability(&self, name: &str) -> bamboo_agent_core::ToolMutability {
-            self.selected().tool_mutability(name)
+            self.selected()
+                .tool_mutability(&self.classification_reference(name))
         }
         fn tool_concurrency_safe(&self, name: &str) -> bool {
-            self.selected().tool_concurrency_safe(name)
+            self.selected()
+                .tool_concurrency_safe(&self.classification_reference(name))
         }
         fn call_parallel_classification(
             &self,
             call: &ToolCall,
         ) -> (bamboo_agent_core::ToolMutability, bool) {
-            self.selected().call_parallel_classification(call)
+            let mut selected = call.clone();
+            selected.function.name = self.classification_reference(&call.function.name);
+            self.selected().call_parallel_classification(&selected)
         }
     }
 }
