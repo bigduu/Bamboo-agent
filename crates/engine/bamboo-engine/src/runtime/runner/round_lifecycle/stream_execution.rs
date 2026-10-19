@@ -858,7 +858,11 @@ fn build_request_envelope_reconciled_for_loading_mode(
     // Advisory context belongs only to this request, after the complete tool
     // result batch. Reconcile it before ledger/native transcript anchoring.
     if let Some(hint) = observation_progress_hint {
-        conversation_messages.push(Message::user(hint));
+        let mut message = Message::user(hint);
+        if crate::runtime::runner::tool_execution::is_required_progress_feedback(hint) {
+            message.metadata = Some(serde_json::json!({"runtime_kind":"observation_progress_feedback", "source":"runtime"}));
+        }
+        conversation_messages.push(message);
     }
 
     // Canonical prompt structure — where Bamboo OWNS assembly and providers are
@@ -1389,9 +1393,12 @@ pub(super) async fn execute_llm_stream(
         {
             session.model_context_state = previous_model_context_state;
             session.provider_transcript = previous_provider_transcript;
-            // Advice is optional. Reuse the existing candidate snapshots and
-            // rebuild without it before rejecting an otherwise sendable request.
-            if observation_progress_hint.take().is_some() {
+            // Legacy optional advice can be omitted, but the exact recovery
+            // control facts must reach the model or fail before dispatch. A
+            // budget retry must never silently claim that feedback was sent.
+            let required_progress_feedback = observation_progress_hint
+                .is_some_and(crate::runtime::runner::tool_execution::is_required_progress_feedback);
+            if !required_progress_feedback && observation_progress_hint.take().is_some() {
                 continue;
             }
             return Err(AgentError::Budget(format!(

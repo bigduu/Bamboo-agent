@@ -18,7 +18,8 @@ use bamboo_domain::{
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
-pub(crate) use no_progress::{pause_for_no_progress, pause_for_quiet_polling};
+pub(crate) use no_progress::{finish_exhausted_progress, quiet_poll_guard_active as progress_feedback_active};
+pub(crate) use progress_feedback::{FeedbackDecision, is_required_progress_feedback};
 pub(crate) use policy::ToolPolicyGuard;
 
 fn build_context_pressure(session: &Session) -> Option<output_compressor::ContextPressure> {
@@ -62,6 +63,7 @@ mod no_progress;
 mod output_compressor;
 mod per_call;
 mod policy;
+mod progress_feedback;
 #[cfg(test)]
 mod progress_hint_tests;
 #[cfg(test)]

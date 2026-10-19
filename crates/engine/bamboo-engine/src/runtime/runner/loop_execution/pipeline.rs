@@ -3218,32 +3218,21 @@ async fn run_pipeline_inner(
         if fresh_human_input || resumed_progress_question {
             tool_policy_guard.reset_observation_progress();
         }
-        // Consume once after input admission and before recording another model
-        // round. Retries reuse this request-only hint. A pause creates no
-        // phantom model round and leaves every completed tool pair intact.
-        let observation_progress_hint = tool_policy_guard.observation_progress_hint();
-        if tool_policy_guard.should_pause_for_quiet_polling()
-            && crate::runtime::runner::tool_execution::pause_for_quiet_polling(
-                session,
-                &mut state.runtime_state,
-                event_tx,
-                config,
-            )
-            .await?
-        {
-            break;
-        }
-        if tool_policy_guard.should_pause_for_observation_progress()
-            && crate::runtime::runner::tool_execution::pause_for_no_progress(
-                session,
-                &mut state.runtime_state,
-                event_tx,
-                config,
-            )
-            .await?
-        {
-            break;
-        }
+        // Consume only after the complete real tool batch and newly admitted
+        // Human input. The same-model facts are mandatory for each bounded
+        // recovery request; they create neither a pending question nor a grant.
+        let feedback_active = crate::runtime::runner::tool_execution::progress_feedback_active(
+            session, &state.runtime_state, config,
+        );
+        let observation_progress_hint = match tool_policy_guard.feedback_for_next_round(feedback_active) {
+            crate::runtime::runner::tool_execution::FeedbackDecision::Continue(hint) => hint,
+            crate::runtime::runner::tool_execution::FeedbackDecision::Exhausted { feedback, summary } => {
+                crate::runtime::runner::tool_execution::finish_exhausted_progress(
+                    session, &state.runtime_state, event_tx, config, &feedback, &summary,
+                ).await?;
+                break;
+            }
+        };
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {
@@ -3359,7 +3348,7 @@ async fn run_pipeline_inner(
                 &state.session_id,
                 &state.model_name,
                 &tool_schemas,
-                observation_progress_hint,
+                observation_progress_hint.as_deref(),
                 Some(
                     crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
                         round_id: &round_id,
@@ -3451,7 +3440,7 @@ async fn run_pipeline_inner(
                                 &state.session_id,
                                 &state.model_name,
                                 &tool_schemas_after_recovery,
-                                observation_progress_hint,
+                                observation_progress_hint.as_deref(),
                                 Some(
                                     crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
                                         round_id: &round_id,
