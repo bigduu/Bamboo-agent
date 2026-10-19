@@ -283,3 +283,50 @@ async fn plain_web_read_does_not_require_or_bootstrap_a_native_channel() {
     f.unchanged().await;
     f.state.shutdown().await;
 }
+
+#[actix_web::test]
+async fn existing_access_http_read_has_no_scope_login_prerequisite() {
+    let f = Fixture::new().await;
+    let (status, read) = f.call(Method::GET, None, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    assert_eq!(read["owner_authorization"]["kind"], "existing_access");
+    assert_eq!(read["owner_authorization"]["available"], true);
+    assert!(read["owner_authorization"]["code"].is_null());
+    assert_eq!(read["capabilities"]["project_scope_http_write_v1"], true);
+    f.unchanged().await;
+    f.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn existing_access_http_local_put_needs_no_new_login_and_survives_restart() {
+    let f = Fixture::new().await;
+    let (status, reply) = f.call(Method::PUT, Some(f.body(0)), None, None).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["receipt"]["state_revision"], 1);
+    assert_eq!(reply["receipt"]["changed"], true);
+    let (status, stale) = f.call(Method::PUT, Some(f.body(0)), None, None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+    assert_eq!(stale["code"], "scope_revision_conflict");
+    assert!(!f.state.config.read().await.features.ticket_mutation);
+    assert!(!f.state.config.read().await.features.ticket_dispatch);
+    assert!(!f.home.path().join("tickets").exists());
+    f.state.shutdown().await;
+    let recovered = Box::pin(AppState::new(f.home.path().into())).await.unwrap();
+    let scope = SupervisorSessionService::new(recovered.storage.clone())
+        .inspect_scope(&f.supervisor)
+        .await
+        .unwrap();
+    assert_eq!(scope.state_revision, 1);
+    assert_eq!(scope.allowed_projects, f.projects.into_iter().collect());
+    let authority = recovered
+        .storage
+        .load_root_authority(&f.supervisor.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(authority.messages.is_empty());
+    assert!(!recovered.config.read().await.features.ticket_mutation);
+    assert!(!recovered.config.read().await.features.ticket_dispatch);
+    assert!(!f.home.path().join("tickets").exists());
+    recovered.shutdown().await;
+}
