@@ -106,7 +106,7 @@ GET returns `scope: {supervisor, state_revision, allowed_projects}`, a
 `capabilities.project_scope_v1` / `supervised_root_create_v1` / `project_scope_http_write_v1`. The observation
 contains no target directory, history, credentials or permission configuration.
 
-After explicit consent through the installed Host channel, PUT accepts exactly:
+After the authenticated owner explicitly reviews the complete Project set, PUT accepts exactly:
 
 ```json
 {
