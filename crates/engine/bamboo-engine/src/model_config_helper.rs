@@ -10,6 +10,19 @@ use bamboo_llm::{LLMError, ProviderModelRouter, ProviderRegistry, ResolvedModel}
 
 pub const GOLD_CONFIG_METADATA_KEY: &str = "gold_config";
 
+/// Check the explicit image-description target without constructing a provider.
+/// Actual resolution and image dispatch remain exclusive to model-issued ViewImage.
+pub fn validate_image_reference_vision_config(
+    config: &Config,
+    active_provider: &str,
+) -> Result<(), String> {
+    crate::runtime::runner::image_fallback::validate_configured_vision_target(
+        config,
+        active_provider,
+    )
+    .map_err(|error| error.to_string())
+}
+
 /// Infer the underlying provider type from a bare model name.
 ///
 /// This is the single, canonical place that maps a model-name string to a
