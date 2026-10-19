@@ -207,13 +207,13 @@ fn resolve_catalog_with_activation(
         let Some(identity) = ClassifiedToolIdentity::from_schema_name(&schema.function.name) else {
             continue;
         };
-        let guide_name = if session.independent_root_spawn_contract()
-            && schema.function.name == "spawn_session"
-        {
-            "spawn_session"
-        } else {
-            identity.alias_fallback_name()
-        };
+        // The guide shortener also canonicalizes legacy aliases internally.
+        // Keep the complete Root contract instead of turning its description
+        // back into the old Child-spawn guide through that compatibility path.
+        if session.independent_root_spawn_contract() && schema.function.name == "spawn_session" {
+            continue;
+        }
+        let guide_name = identity.alias_fallback_name();
         if identity.loading_class() == CapabilityLoadingClass::Deferred
             && !activated.contains(guide_name)
         {

@@ -49,6 +49,7 @@ impl OverlayToolExecutor {
                 "browser",
                 "browser_eval",
                 "session_message",
+                "spawn_session",
                 "work_overview",
                 "work_search",
                 "work_inspect",
