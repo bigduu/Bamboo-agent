@@ -487,7 +487,7 @@ jobs:
                   review = reviews[kind]
                   assert review["commit_sha"] == source and review["status"] == "completed"
                   assert review["has_any_findings"] is False and review["has_unresolved_findings"] is False
-              main_promotion = {"mainRevision": workflow_source, "mainProtected": main["protected"],
+              main_promotion = {"mainProtected": main["protected"],
                                 "sourceInMain": True, "mergeRevision": merge_revision,
                                 "mergeTree": merge_commit["tree"]["sha"], "mergeParents": merge_parents,
                                 "pullRequest": {"number": promotion["number"], "html_url": promotion["html_url"],

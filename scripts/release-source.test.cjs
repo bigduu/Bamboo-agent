@@ -15,7 +15,7 @@ function fixture() {
       repository: { full_name: 'bigduu/Bamboo-agent' }, head_repository: { full_name: 'bigduu/Bamboo-agent' },
       html_url: 'https://github.com/bigduu/Bamboo-agent/actions/runs/123' } }
   validation.mainPromotion = {
-    mainRevision: 'd'.repeat(40), mainProtected: true, sourceInMain: true,
+    mainProtected: true, sourceInMain: true,
     mergeRevision: '1'.repeat(40), mergeTree: tree, mergeParents: ['8'.repeat(40), sha],
     pullRequest: { number: 7, html_url: 'https://github.com/bigduu/Bamboo-agent/pull/7', state: 'closed',
       merged: true, draft: false, baseRef: 'main', headRef: validation.ciRun.head_branch,
@@ -78,6 +78,8 @@ from pathlib import Path
 request = json.load(sys.stdin)
 scenario = request['scenario']
 source, tree, synthetic, controller, cut, dev, merge = [c * 40 for c in 'abcdef1']
+if scenario == 'accepted_later_main':
+    controller = '9' * 40
 repo = 'bigduu/Bamboo-agent'
 branch = 'release/' + cut
 pr = {'number': 7, 'html_url': 'https://github.com/' + repo + '/pull/7', 'state': 'closed',
@@ -174,7 +176,7 @@ test('actual complete-release fixture can publish the original source after norm
   assert.ok(emitted.env.startsWith('SOURCE_VALIDATION='))
   const validation = JSON.parse(emitted.env.trim().slice('SOURCE_VALIDATION='.length))
   assert.equal(validateDispatch(fixture().event, validation, sha, tree).id, 123)
-  assert.equal(validation.mainPromotion.mainRevision, 'd'.repeat(40))
+  assert.equal(validation.mainPromotion.mergeRevision, '1'.repeat(40))
 })
 
 test('actual complete-release preflight rejects green release CI before protected main promotion', () => {
@@ -214,4 +216,19 @@ test('receipt validation rejects absent or inconsistent protected main acceptanc
     mutate(validation)
     assert.throws(() => validateDispatch(event, validation, sha, tree))
   }
+})
+
+test('actual complete-release recovery retains immutable validation after main advances', () => {
+  function validation(scenario) {
+    const result = runActualPreflight(scenario)
+    assert.equal(result.status, 0, result.stderr)
+    const emitted = JSON.parse(result.stdout.trim().split('\n').at(-1))
+    return JSON.parse(emitted.env.trim().slice('SOURCE_VALIDATION='.length))
+  }
+  const reserved = validation('accepted')
+  const recovery = validation('accepted_later_main')
+  // Sidecar recovery checks equality with the authenticated reservation validation.
+  // Both invocations must still prove source/merge ancestry in their current main.
+  assert.deepEqual(recovery, reserved)
+  assert.equal(validateDispatch(fixture().event, recovery, sha, tree).id, 123)
 })
