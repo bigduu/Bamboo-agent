@@ -1227,3 +1227,91 @@ async fn session_version_writer_clear_compatible_none_v1_preserves_main_stamp() 
         }
     }
 }
+
+#[tokio::test]
+async fn session_version_copied_root_selects_current_contract_without_changing_source() {
+    let mut failures = Vec::new();
+    for id in ["tx-root", "tx-child"] {
+        for contract in ["current", "legacy", "main", "session", "runtime", "context"] {
+            let home = tempfile::tempdir().unwrap();
+            let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+            super::tests::seed_runtime_task_transaction_pair(&storage)
+                .await
+                .unwrap();
+            let directory = task_member_directory(&storage, id).await;
+            tokio::fs::write(
+                directory.join("attachments/sentinel"),
+                b"source copy attachment",
+            )
+            .await
+            .unwrap();
+            if contract == "legacy" {
+                task_set_stamp(&storage, id, true, None).await;
+                task_set_stamp(&storage, id, false, None).await;
+            } else if contract != "current" {
+                writer_future_contract(&directory, contract).await;
+            }
+            let source = storage.load_session(id).await.unwrap().unwrap();
+            let mut before = writer_contract_bytes(&storage, &directory);
+            // The new independent Root legitimately adds its own index entry.
+            // Only the source lifetime/files must remain byte-for-byte intact.
+            let _ = before.pop();
+            let copied = storage
+                .copy_session(id, "new-contract-copy")
+                .await
+                .unwrap()
+                .unwrap();
+            let fresh = SessionStoreV2::new(home.path().into()).await.unwrap();
+            let reopened = fresh.load_session(&copied.id).await.unwrap().unwrap();
+            let mut after = writer_contract_bytes(&storage, &directory);
+            let _ = after.pop();
+            let current = copied.session_version == Some(bamboo_domain::CURRENT_SESSION_VERSION)
+                && copied.observed_runtime_session_version.is_none()
+                && copied.execution_compatibility().execution_allowed
+                && reopened.session_version == Some(bamboo_domain::CURRENT_SESSION_VERSION)
+                && reopened.execution_compatibility().execution_allowed;
+            let preserved = before == after;
+            let independent = copied.id != source.id
+                && copied.created_at != source.created_at
+                && copied.kind == bamboo_domain::SessionKind::Root
+                && copied.root_session_id == copied.id
+                && copied.parent_session_id.is_none()
+                && copied.parent_created_at.is_none()
+                && copied.spawn_depth == 0
+                && copied.authority_identity.is_ordinary()
+                && copied.supervisor_management.is_none();
+            assert_eq!(
+                serde_json::to_value(&reopened.messages).unwrap(),
+                serde_json::to_value(&source.messages).unwrap()
+            );
+            assert_eq!(
+                tokio::fs::read(
+                    storage
+                        .sessions_root_dir()
+                        .join(&copied.id)
+                        .join("attachments/sentinel")
+                )
+                .await
+                .unwrap(),
+                b"source copy attachment"
+            );
+            for name in ["session.json", "runtime.json"] {
+                let bytes =
+                    tokio::fs::read(storage.sessions_root_dir().join(&copied.id).join(name))
+                        .await
+                        .unwrap();
+                let raw: Value = serde_json::from_slice(&bytes).unwrap();
+                if raw["session_version"] != json!(bamboo_domain::CURRENT_SESSION_VERSION) {
+                    failures.push(format!(
+                        "{id}/{contract}/{name}: new Root was not stamped v1"
+                    ));
+                }
+            }
+            eprintln!("copy contract {id}/{contract}: current={current} source_retained={preserved} independent={independent}");
+            if !current || !preserved || !independent {
+                failures.push(format!("{id}/{contract}: returned={:?}, observed={:?}, reopened={:?}, source_retained={preserved}, independent={independent}", copied.session_version, copied.observed_runtime_session_version, reopened.session_version));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\\n"));
+}
