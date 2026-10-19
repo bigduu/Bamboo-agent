@@ -166,8 +166,8 @@ test("macOS link guard preserves Cargo failures and rejects lost or oversized di
   }
 })
 
-test("snapshots and PR gates retain validation without automatic post-merge main CI", () => {
-  assert.doesNotMatch(workflow, /^  push:/mu)
+test("main-push validation remains reachable by the existing automatic publisher", () => {
+  assert.match(workflow, /^  push:\n    branches: \[ main \]$/mu)
   assert.match(workflow, /pull_request:\n\s+branches: \[ dev, main \]/u)
 
   const testJob = job("test")

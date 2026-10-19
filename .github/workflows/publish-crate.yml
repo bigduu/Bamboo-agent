@@ -408,6 +408,7 @@ jobs:
           import os
           import re
           import subprocess
+          from datetime import datetime
 
           repository = os.environ["GITHUB_REPOSITORY"]
           assert repository == "bigduu/Bamboo-agent"
@@ -478,9 +479,9 @@ jobs:
                       continue
                   match = re.search(r"<!-- codex-review-state:v1 (.*?) -->", comment.get("body", ""))
                   if match:
-                      summaries.append((comment["html_url"], json.loads(match.group(1)), actor))
+                      summaries.append((comment["html_url"], json.loads(match.group(1)), actor, comment))
               assert summaries, "Require the promotion PR's actual Codex review summary"
-              review_url, reviews, review_actor = summaries[-1]
+              review_url, reviews, review_actor, _ = summaries[-1]
               stable_reviews = {}
               for kind in ("code_review", "security_review"):
                   review = reviews[kind]
@@ -489,8 +490,26 @@ jobs:
                   stable_reviews[kind] = {key: review[key] for key in
                                           ("commit_sha", "status", "has_any_findings", "has_unresolved_findings")}
               print(f"Verified current promotion review summary: {review_url}")
+              def timestamp(value):
+                  parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                  assert parsed.tzinfo is not None
+                  return parsed
+              merged_at = timestamp(promotion["merged_at"])
+              accepted_reviews = []
+              for url, state, actor, comment in summaries:
+                  clean = all(state.get(kind, {}).get("commit_sha") == source
+                              and state[kind].get("status") == "completed"
+                              and state[kind].get("has_any_findings") is False
+                              and state[kind].get("has_unresolved_findings") is False
+                              for kind in ("code_review", "security_review"))
+                  # A comment created earlier but completed/edited after merge
+                  # cannot retroactively prove the pre-merge review gate.
+                  if clean and timestamp(comment["created_at"]) <= timestamp(comment["updated_at"]) < merged_at:
+                      accepted_reviews.append(url)
+              assert accepted_reviews, "Require an exact-source clean review completed before main promotion"
+              print(f"Verified pre-merge promotion review: {accepted_reviews[0]}")
               main_promotion = {"mainProtected": main["protected"],
-                                "sourceInMain": True, "mergeRevision": merge_revision,
+                                "sourceInMain": True, "reviewedBeforeMerge": True, "mergeRevision": merge_revision,
                                 "mergeTree": merge_commit["tree"]["sha"], "mergeParents": merge_parents,
                                 "pullRequest": {"number": promotion["number"], "html_url": promotion["html_url"],
                                                 "state": promotion["state"], "merged": promotion["merged"], "draft": promotion["draft"],

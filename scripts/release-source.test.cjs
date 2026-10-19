@@ -15,7 +15,7 @@ function fixture() {
       repository: { full_name: 'bigduu/Bamboo-agent' }, head_repository: { full_name: 'bigduu/Bamboo-agent' },
       html_url: 'https://github.com/bigduu/Bamboo-agent/actions/runs/123' } }
   validation.mainPromotion = {
-    mainProtected: true, sourceInMain: true,
+    mainProtected: true, sourceInMain: true, reviewedBeforeMerge: true,
     mergeRevision: '1'.repeat(40), mergeTree: tree, mergeParents: ['8'.repeat(40), sha],
     pullRequest: { number: 7, html_url: 'https://github.com/bigduu/Bamboo-agent/pull/7', state: 'closed',
       merged: true, draft: false, baseRef: 'main', headRef: validation.ciRun.head_branch,
@@ -137,6 +137,8 @@ def api(route):
         return pr
     if route == 'issues/7/comments?per_page=100':
         comments = [{'id': 99, 'html_url': 'https://github.com/' + repo + '/pull/7#issuecomment-99',
+                 'created_at': '2026-10-18T22:00:00Z' if scenario != 'review_after_merge' else '2026-10-19T01:00:00Z',
+                 'updated_at': '2026-10-18T23:00:00Z' if scenario not in ('review_after_merge', 'review_completed_after_merge') else '2026-10-19T01:01:00Z',
                  'user': {'login': 'bigduu' if scenario == 'forged_review' else 'chatgpt-codex-connector[bot]',
                           'type': 'User' if scenario == 'forged_review' else 'Bot'},
                  'body': '<!-- codex-review-state:v1 ' + json.dumps(reviews) + ' -->'}]
@@ -145,6 +147,7 @@ def api(route):
             if scenario == 'later_unresolved_review':
                 latest_reviews['code_review']['has_unresolved_findings'] = True
             comments.append({'id': 100, 'html_url': 'https://github.com/' + repo + '/pull/7#issuecomment-100',
+                'created_at': '2026-10-19T02:00:00Z', 'updated_at': '2026-10-19T02:01:00Z',
                 'user': {'login': 'chatgpt-codex-connector[bot]', 'type': 'Bot',
                          'avatar_url': 'https://example.invalid/new-avatar'},
                 'body': '<!-- codex-review-state:v1 ' + json.dumps(latest_reviews) + ' -->'})
@@ -210,6 +213,7 @@ test('receipt validation rejects absent or inconsistent protected main acceptanc
   for (const mutate of [
     v => { delete v.mainPromotion },
     v => { v.mainPromotion.mainProtected = false },
+    v => { v.mainPromotion.reviewedBeforeMerge = false },
     v => { v.mainPromotion.sourceInMain = false },
     v => { v.mainPromotion.mergeTree = '9'.repeat(40) },
     v => { v.mainPromotion.mergeParents = ['8'.repeat(40)] },
@@ -262,4 +266,16 @@ test('later clean review metadata cannot change the signed publication recovery 
   assert.deepEqual(validation('later_clean_review'), validation('accepted'))
   // Fresh review is still checked; immutable identity never ignores a new finding.
   assert.notEqual(runActualPreflight('later_unresolved_review').status, 0)
+})
+
+test('a review first posted after promotion cannot retroactively authorize publication', () => {
+  const result = runActualPreflight('review_after_merge')
+  assert.notEqual(result.status, 0, 'A clean post-merge review cannot authorize an unreviewed merge')
+  assert.match(result.stderr, /AssertionError/)
+})
+
+test('a pre-existing summary completed after promotion cannot retroactively authorize publication', () => {
+  const result = runActualPreflight('review_completed_after_merge')
+  assert.notEqual(result.status, 0, 'An earlier empty/running comment later changed to clean is not pre-merge acceptance')
+  assert.match(result.stderr, /AssertionError/)
 })

@@ -36,6 +36,7 @@ function validateDispatch(event, validation, sourceRevision, sourceTree) {
   const promotion = validation.mainPromotion
   assert.equal(promotion?.mainProtected, true, 'Require protected main promotion before publication')
   assert.equal(promotion.sourceInMain, true)
+  assert.equal(promotion.reviewedBeforeMerge, true, 'Require review completion before normal main promotion')
   assert.match(promotion.mergeRevision, SHA)
   assert.equal(promotion.mergeTree, sourceTree)
   assert.equal(promotion.mergeParents?.length, 2)

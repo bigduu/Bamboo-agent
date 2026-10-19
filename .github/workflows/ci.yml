@@ -1,15 +1,15 @@
 name: CI
 
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
     inputs:
       snapshot_sha:
         description: Exact 40-character SHA of the selected ref to validate as one frozen batch
         required: true
         type: string
-  # Main receives an accepted release; do not repeat its build/Test/E2E on merge.
-  # Explicit snapshots and PR admission remain available while release artifact
-  # production and promotion are moved onto the frozen release branch.
+  # Protected main-push CI supplies the existing automatic publication authority.
   pull_request:
     branches: [ dev, main ]
 
