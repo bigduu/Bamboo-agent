@@ -2211,7 +2211,7 @@ async fn admission_reads_reject_partial_corrupt_or_mismatched_root_without_write
 }
 
 #[tokio::test]
-async fn indexed_runtime_save_preserves_tool_proof_when_main_is_later_damaged() {
+async fn indexed_runtime_save_rejects_damaged_main_without_changing_tool_proof() {
     let initial = root();
     let fixture = Fixture::new(&initial, false).await;
     let main = directory(&fixture.first, &initial.id).join("session.json");
@@ -2223,11 +2223,21 @@ async fn indexed_runtime_save_preserves_tool_proof_when_main_is_later_damaged() 
     runtime
         .metadata
         .insert("last_run_status".into(), "completed".into());
-    fixture.second.save_runtime_state(&runtime).await.unwrap();
+    // Main owns the behavior stamp. A committed tool proof remains readable,
+    // but cannot authorize a checkpoint whose Main contract is unreadable.
+    let before = files(&fixture.first, &initial.id).await;
+    let error = fixture
+        .second
+        .save_runtime_state(&runtime)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(files(&fixture.first, &initial.id).await, before);
     assert_eq!(fs::read(&proof).await.unwrap(), proof_before);
     assert_eq!(fs::read(&main).await.unwrap(), b"{invalid");
     assert!(fixture.second.load_session(&initial.id).await.is_err());
     assert!(fixture.second.save_session(&runtime).await.is_err());
+    assert_eq!(files(&fixture.first, &initial.id).await, before);
     let control = fixture
         .second
         .load_runtime_control_plane(&initial.id)
