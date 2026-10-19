@@ -114,7 +114,13 @@ async fn replacement_during_publication(mutation: Mutation) {
         Err(_) => {
             assert_eq!(fs::read(record_path(root.path(), &stable)).unwrap(), before);
             if let Ok(value) = persisted {
-                assert_eq!(value, Some(VersionedReadyRetry { revision: 1, record: initial() }));
+                assert_eq!(
+                    value,
+                    Some(VersionedReadyRetry {
+                        revision: 1,
+                        record: initial()
+                    })
+                );
             }
         }
     }
@@ -136,14 +142,22 @@ async fn cloned_store_cannot_reopen_a_changed_or_aliased_lock_between_transactio
         let root = tempfile::tempdir().unwrap();
         let store = FileReadyRetryStore::new(root.path());
         let stable = key("cached-lock");
-        store.compare_exchange(&stable, None, reserved()).await.unwrap();
+        store
+            .compare_exchange(&stable, None, reserved())
+            .await
+            .unwrap();
         let before = fs::read(record_path(root.path(), &stable)).unwrap();
         let retained = store.clone();
         drop(store);
         mutate_lock(root.path(), mutation);
         let read = retained.load(&stable).await;
-        let exchange = retained.compare_exchange(&stable, Some(1), second_charge()).await;
-        assert!(read.is_err() && exchange.is_err(), "{mutation:?}: load={read:?}, CAS={exchange:?}");
+        let exchange = retained
+            .compare_exchange(&stable, Some(1), second_charge())
+            .await;
+        assert!(
+            read.is_err() && exchange.is_err(),
+            "{mutation:?}: load={read:?}, CAS={exchange:?}"
+        );
         assert_eq!(fs::read(record_path(root.path(), &stable)).unwrap(), before);
     }
 }

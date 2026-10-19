@@ -1,12 +1,15 @@
 //! Outer filesystem adapter for retry metadata; never an execution authority.
 //! Each blocking transaction retains the same lock through file and directory
 //! synchronization, including when its async caller is cancelled.
+//! Clones pin one descriptor and serialize its use; observed inode/link loss
+//! fails closed around publication. A live adapter never reopens a changed
+//! lock. Trusted repair must drain live writers before replacing lock metadata.
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use bamboo_orchestration::ready_recovery::{
@@ -48,6 +51,7 @@ pub type ReadyRetryPublicationFault =
 pub struct FileReadyRetryStore {
     directory: PathBuf,
     fault: Option<ReadyRetryPublicationFault>,
+    lock_file: Arc<Mutex<Option<File>>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -108,10 +112,49 @@ fn key_hash(key: &ReadyRetryKey) -> Result<String> {
     Ok(content_hash(&canonical_bytes(key)?))
 }
 
-struct TransactionLock(File);
-impl Drop for TransactionLock {
+struct TransactionLock<'a> {
+    descriptor: MutexGuard<'a, Option<File>>,
+    path: PathBuf,
+}
+
+impl TransactionLock<'_> {
+    fn verify(&self) -> Result<()> {
+        let file = self
+            .descriptor
+            .as_ref()
+            .ok_or_else(|| unavailable("retry lock descriptor is unavailable"))?;
+        let opened = file.metadata()?;
+        let named = fs::symlink_metadata(&self.path)
+            .map_err(|_| unavailable("retry lock is missing or inaccessible"))?;
+        if !opened.is_file() || named.file_type().is_symlink() || !named.is_file() {
+            return Err(unavailable("retry lock is not a plain file"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if opened.dev() != named.dev()
+                || opened.ino() != named.ino()
+                || opened.nlink() != 1
+                || named.nlink() != 1
+            {
+                return Err(unavailable(
+                    "retry lock identity changed; explicit repair required",
+                ));
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            Err(unavailable("durable filesystem platform not validated"))
+        }
+    }
+}
+
+impl Drop for TransactionLock<'_> {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
+        if let Some(file) = self.descriptor.as_ref() {
+            let _ = FileExt::unlock(file);
+        }
     }
 }
 
@@ -122,6 +165,7 @@ impl FileReadyRetryStore {
         Self {
             directory: data_root.join("ready-retry-v1"),
             fault: None,
+            lock_file: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -129,10 +173,11 @@ impl FileReadyRetryStore {
         Self {
             directory: data_root.join("ready-retry-v1"),
             fault: Some(fault),
+            lock_file: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn lock(&self) -> Result<(TransactionLock, bool)> {
+    fn lock(&self) -> Result<(TransactionLock<'_>, bool)> {
         if !cfg!(any(target_os = "macos", target_os = "linux")) {
             return Err(unavailable("durable filesystem platform not validated"));
         }
@@ -143,24 +188,46 @@ impl FileReadyRetryStore {
         // Bootstrap shares the same stable lock as every later transaction.
         // A losing first reader must not leave an uninitializable empty store.
         let path = parent.join(LOCK);
+        // Clones retain the original descriptor. A process-local guard is
+        // necessary because flock on that same descriptor is reentrant.
+        let mut descriptor = self.lock_file.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => {
+                Error::ResourceBlocked("another Ready retry metadata transaction is active".into())
+            }
+            std::sync::TryLockError::Poisoned(_) => unavailable("retry lock guard is poisoned"),
+        })?;
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(unavailable("retry lock is not a plain file"))
             }
             Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if self.directory.try_exists()? {
+                    return Err(unavailable(
+                        "initialized retry lock is missing; explicit repair required",
+                    ));
+                }
+            }
             Err(error) => return Err(error.into()),
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        if descriptor.is_none() {
+            *descriptor = Some(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)?,
+            );
+        }
+        let file = descriptor
+            .as_ref()
+            .ok_or_else(|| unavailable("retry lock descriptor is unavailable"))?;
         file.try_lock_exclusive().map_err(|_| {
             Error::ResourceBlocked("another Ready retry metadata transaction is active".into())
         })?;
-        let lock = TransactionLock(file);
+        let lock = TransactionLock { descriptor, path };
+        lock.verify()?;
         let created = match fs::create_dir(&self.directory) {
             Ok(()) => {
                 File::open(parent)?.sync_all()?;
@@ -173,10 +240,11 @@ impl FileReadyRetryStore {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(unavailable("retry directory is not a plain directory"));
         }
+        lock.verify()?;
         Ok((lock, created))
     }
 
-    fn read(&self, freshly_created: bool) -> Result<State> {
+    fn read(&self, freshly_created: bool, lock: &TransactionLock<'_>) -> Result<State> {
         let path = self.directory.join(STATE);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -186,7 +254,7 @@ impl FileReadyRetryStore {
                     revision: 0,
                     entries: BTreeMap::new(),
                 };
-                self.publish(&state)?;
+                self.publish(&state, lock)?;
                 return Ok(state);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -242,6 +310,7 @@ impl FileReadyRetryStore {
                 Err(error) => return Err(error.into()),
             }
         }
+        lock.verify()?;
         Ok(envelope.state)
     }
 
@@ -384,16 +453,20 @@ impl FileReadyRetryStore {
         Ok(Some(envelope.state.value))
     }
 
-    fn activate_individual_records(&self, state: &mut State) -> Result<()> {
+    fn activate_individual_records(
+        &self,
+        state: &mut State,
+        lock: &TransactionLock<'_>,
+    ) -> Result<()> {
         if matches!(state.schema, 2 | 3) {
             // A previous activation can have returned an uncertain error after
             // rename but before directory sync. Observing the format alone is
             // not proof that its old-reader rejection is durable. Re-establish
             // that barrier before any individual record may be published.
-            self.phase(ReadyRetryFilePhase::BeforeFormatSync)?;
+            self.phase(ReadyRetryFilePhase::BeforeFormatSync, lock)?;
             File::open(self.directory.join(STATE))?.sync_all()?;
             File::open(&self.directory)?.sync_all()?;
-            return self.phase(ReadyRetryFilePhase::AfterFormatSync);
+            return self.phase(ReadyRetryFilePhase::AfterFormatSync, lock);
         }
         for name in [RECORDS, MEMBERSHIP] {
             let directory = self.directory.join(name);
@@ -409,21 +482,28 @@ impl FileReadyRetryStore {
         // Both earlier readers reject schema 3 in this same state.json. A
         // separate marker alone could be ignored and refund a stored budget.
         state.schema = 3;
-        self.publish(state)
+        self.publish(state, lock)
     }
 
-    fn phase(&self, phase: ReadyRetryFilePhase) -> Result<()> {
+    fn phase(&self, phase: ReadyRetryFilePhase, lock: &TransactionLock<'_>) -> Result<()> {
+        lock.verify()?;
         if let Some(fault) = &self.fault {
             fault(phase)?;
         }
-        Ok(())
+        lock.verify()
     }
 
-    fn publish(&self, state: &State) -> Result<()> {
-        self.publish_state(&self.directory, state, MAX_BYTES)
+    fn publish(&self, state: &State, lock: &TransactionLock<'_>) -> Result<()> {
+        self.publish_state(&self.directory, state, MAX_BYTES, lock)
     }
 
-    fn publish_state<T: Serialize>(&self, directory: &Path, state: &T, limit: u64) -> Result<()> {
+    fn publish_state<T: Serialize>(
+        &self,
+        directory: &Path,
+        state: &T,
+        limit: u64,
+        lock: &TransactionLock<'_>,
+    ) -> Result<()> {
         let bytes = serde_json::to_vec(&Publication {
             state,
             sha256: content_hash(&canonical_bytes(state)?),
@@ -438,15 +518,15 @@ impl FileReadyRetryStore {
                 .write(true)
                 .open(&temporary)?;
             file.write_all(&bytes)?;
-            self.phase(ReadyRetryFilePhase::BeforeFileSync)?;
+            self.phase(ReadyRetryFilePhase::BeforeFileSync, lock)?;
             file.sync_all()?;
             drop(file);
-            self.phase(ReadyRetryFilePhase::BeforeReplace)?;
+            self.phase(ReadyRetryFilePhase::BeforeReplace, lock)?;
             fs::rename(&temporary, directory.join(STATE))?;
-            self.phase(ReadyRetryFilePhase::AfterReplace)?;
-            self.phase(ReadyRetryFilePhase::BeforeDirectorySync)?;
+            self.phase(ReadyRetryFilePhase::AfterReplace, lock)?;
+            self.phase(ReadyRetryFilePhase::BeforeDirectorySync, lock)?;
             File::open(directory)?.sync_all()?;
-            self.phase(ReadyRetryFilePhase::AfterDirectorySync)?;
+            self.phase(ReadyRetryFilePhase::AfterDirectorySync, lock)?;
             Ok(())
         })();
         // Never roll back the published record after an uncertain directory
@@ -459,9 +539,11 @@ impl FileReadyRetryStore {
 
     fn load_blocking(&self, key: &ReadyRetryKey) -> Result<Option<VersionedReadyRetry>> {
         let hash = key_hash(key)?;
-        let (_lock, created) = self.lock()?;
-        let state = self.read(created)?;
-        self.value(&state, key, &hash)
+        let (lock, created) = self.lock()?;
+        let state = self.read(created, &lock)?;
+        let value = self.value(&state, key, &hash)?;
+        lock.verify()?;
+        Ok(value)
     }
 
     fn exchange_blocking(
@@ -472,9 +554,10 @@ impl FileReadyRetryStore {
     ) -> Result<VersionedReadyRetry> {
         validate_ready_retry_record(&next)?;
         let hash = key_hash(key)?;
-        let (_lock, created) = self.lock()?;
-        let mut state = self.read(created)?;
+        let (lock, created) = self.lock()?;
+        let mut state = self.read(created, &lock)?;
         let previous = self.value(&state, key, &hash)?;
+        lock.verify()?;
         if previous.as_ref().map(|value| value.revision) != expected {
             return Err(Error::RevisionConflict);
         }
@@ -489,7 +572,7 @@ impl FileReadyRetryStore {
             record: next,
         };
         if !state.entries.contains_key(&hash) {
-            self.activate_individual_records(&mut state)?;
+            self.activate_individual_records(&mut state, &lock)?;
             let directory = self.record_directory(&hash);
             if previous.is_none() {
                 if state.schema != 3 {
@@ -502,11 +585,11 @@ impl FileReadyRetryStore {
                     .create_new(true)
                     .write(true)
                     .open(self.membership(&hash))?;
-                self.phase(ReadyRetryFilePhase::BeforeMembershipSync)?;
+                self.phase(ReadyRetryFilePhase::BeforeMembershipSync, &lock)?;
                 membership.sync_all()?;
                 drop(membership);
                 File::open(self.directory.join(MEMBERSHIP))?.sync_all()?;
-                self.phase(ReadyRetryFilePhase::AfterMembershipSync)?;
+                self.phase(ReadyRetryFilePhase::AfterMembershipSync, &lock)?;
                 // The permanent sibling marker also detects loss of the whole
                 // key directory. Neither marker nor directory is ever cleaned
                 // up after an error; a partial initialization must fail closed.
@@ -524,7 +607,8 @@ impl FileReadyRetryStore {
                 key: key.clone(),
                 value: value.clone(),
             };
-            self.publish_state(&directory, &record, MAX_RECORD_BYTES)?;
+            self.publish_state(&directory, &record, MAX_RECORD_BYTES, &lock)?;
+            lock.verify()?;
             return Ok(value);
         }
         state.revision = state
@@ -538,7 +622,8 @@ impl FileReadyRetryStore {
                 value: value.clone(),
             },
         );
-        self.publish(&state)?;
+        self.publish(&state, &lock)?;
+        lock.verify()?;
         Ok(value)
     }
 }
