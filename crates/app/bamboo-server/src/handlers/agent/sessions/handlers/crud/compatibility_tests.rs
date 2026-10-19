@@ -63,6 +63,8 @@ async fn session_version_http_future_is_readable_but_chat_and_execute_refuse_wit
         let mut session = Session::new(&id, "test-model");
         session.set_root_orchestration_only(ultra).unwrap();
         session.add_message(Message::user("Existing preserved history"));
+        session.metadata.insert(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.into(),
+            r#"{"future_workflow_state":true}"#.into());
         state.storage.save_session(&session).await.unwrap();
         stamp(home.path(), &id, Some(99)).await;
         let before = pair(home.path(), &id).await;
