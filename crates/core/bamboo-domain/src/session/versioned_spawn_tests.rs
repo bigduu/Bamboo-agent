@@ -189,3 +189,54 @@ fn only_v2_genuine_supervisors_gain_root_spawning_in_either_mode() {
         }
     }
 }
+
+fn assert_namespaced_spawn_keeps_unqualified_owner(framework_installed: bool) {
+    let mut catalog = vec!["SubAgent", "spawnSession"];
+    if framework_installed {
+        catalog.push("spawn_session");
+    }
+    for version in [None, Some(1), Some(2)] {
+        for reference in [
+            "default::spawnSession",
+            "vendor::spawnSession",
+            " wrapper::nested:: spawnSession ",
+        ] {
+            assert_eq!(
+                resolve_session_tool_reference(version, reference, |name| catalog.contains(&name))
+                    .as_deref(),
+                Some("spawnSession"),
+                "version={version:?}, framework={framework_installed}, reference={reference}"
+            );
+        }
+        assert_eq!(
+            resolve_session_tool_reference(version, "vendor::spawnSession", |name| {
+                name == "vendor::spawnSession" || catalog.contains(&name)
+            })
+            .as_deref(),
+            Some("vendor::spawnSession"),
+            "the fully qualified exact owner still wins before the unqualified owner"
+        );
+    }
+    assert!(resolve_session_tool_reference(Some(99), "default::spawnSession", |name| {
+        catalog.contains(&name)
+    })
+    .is_none());
+    let unshadowed = resolve_session_tool_reference(Some(2), "default::spawnSession", |name| {
+        name == "SubAgent" || (framework_installed && name == "spawn_session")
+    });
+    assert_eq!(
+        unshadowed.as_deref(),
+        framework_installed.then_some("spawn_session"),
+        "without an exact owner, only an installed v2 Root port may own the alias"
+    );
+}
+
+#[test]
+fn v2_namespaced_spawn_keeps_unqualified_owner_with_root_installed() {
+    assert_namespaced_spawn_keeps_unqualified_owner(true);
+}
+
+#[test]
+fn v2_namespaced_spawn_keeps_unqualified_owner_without_root_port() {
+    assert_namespaced_spawn_keeps_unqualified_owner(false);
+}
