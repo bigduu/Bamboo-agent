@@ -281,7 +281,11 @@ async fn compact_shared_workspace_supports_real_supervisor_nested_child_and_lega
                 h.storage
                     .root_mode_operation(&bamboo_domain::RootModeOperationRequest {
                         session_id: current.id.clone(),
-                        operation_id: Uuid::new_v4().to_string(),
+                        operation_id: format!(
+                            "{}:{}",
+                            current.root_mode_transition_epoch,
+                            Uuid::new_v4()
+                        ),
                         birth_token: current.root_mode_birth_token(),
                         expected_epoch: current.root_mode_transition_epoch,
                         requested_enabled: ultra,
@@ -309,6 +313,9 @@ async fn compact_shared_workspace_supports_real_supervisor_nested_child_and_lega
             }
             _ => unreachable!(),
         };
+        if kind == "supervisor" {
+            assert_eq!(parent.root_orchestration_only, ultra);
+        }
         // A usable legacy parent field remains sufficient without publishing
         // a new metadata plane or changing its behavior stamp.
         parent.workspace = Some(h.workspace_path.to_string_lossy().into_owned());
