@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict')
 
-// The owner-requested dispatch publishes the original completed CI tree.
-// Updated workflow controllers execute outside that immutable product tree.
+// Historical dispatch receipt shape retained for inspecting signed evidence.
+// New complete publication authority is workflow_run from successful main CI only.
 const REQUIRED = Object.freeze(['Validation Source', 'Promotion Source', 'Test', 'E2E Tests', 'Lint',
   'Build (ubuntu-latest)', 'Build (macos-latest)', 'Build (windows-latest)'])
 const SHA = /^[0-9a-f]{40}$/

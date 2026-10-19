@@ -9,16 +9,6 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
-      complete_release:
-        description: "Publish the complete frozen release using an already successful CI snapshot; never reruns Test/E2E"
-        required: false
-        default: false
-        type: boolean
-      accepted_ci_run:
-        description: "Successful release PR CI run whose exact product tree is being published"
-        required: false
-        default: ""
-        type: string
       expected_source_sha:
         description: "Exact accepted source commit selected by the release train"
         required: true
@@ -50,7 +40,7 @@ on:
 permissions:
   contents: read
 
-# Manual trains and automatic main releases serialize every upload attempt.
+# Existing crate-only manual uploads and automatic main releases serialize every upload attempt.
 concurrency:
   group: bamboo-crate-publication
   queue: max
@@ -61,7 +51,7 @@ env:
 
 jobs:
   manual:
-    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && !inputs.complete_release
+    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && !fromJSON(toJSON(github.event.inputs)).complete_release
     runs-on: ubuntu-latest
     environment: bamboo-release
     steps:
@@ -336,7 +326,7 @@ jobs:
           echo "Published Bamboo crates for version ${TARGET_VERSION}"
 
   dry-run:
-    if: github.event_name == 'workflow_dispatch' && inputs.dry_run && !inputs.complete_release
+    if: github.event_name == 'workflow_dispatch' && inputs.dry_run && !fromJSON(toJSON(github.event.inputs)).complete_release
     runs-on: ubuntu-latest
     # No Environment or publication credentials, including on feature refs.
     env:
@@ -380,15 +370,16 @@ jobs:
           EOF
           python3 scripts/compute-publish-order.py
 
+  # Complete releases have one authority and allocator identity: successful actual-main CI.
+  # Experimental release-head dispatch must not compete with its main merge publication.
   automatic:
     if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.complete_release && !inputs.dry_run) ||
-      (github.event_name == 'workflow_run' &&
+      github.event_name == 'workflow_run' &&
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
-      github.event.workflow_run.repository.full_name == github.repository)
+      github.event.workflow_run.repository.full_name == github.repository
     runs-on: ubuntu-latest
     environment: bamboo-release
     permissions:
@@ -396,7 +387,6 @@ jobs:
     outputs:
       source: ${{ steps.source.outputs.revision }}
       version: ${{ steps.version.outputs.version }}
-      validation: ${{ steps.source.outputs.validation }}
     steps:
       - name: Authorize the exact source before checkout
         id: source
@@ -408,148 +398,12 @@ jobs:
           import os
           import re
           import subprocess
-          from datetime import datetime
 
           repository = os.environ["GITHUB_REPOSITORY"]
           assert repository == "bigduu/Bamboo-agent"
           event_name = os.environ["GITHUB_EVENT_NAME"]
           with open(os.environ["GITHUB_EVENT_PATH"]) as stream:
               event = json.load(stream)
-          if event_name == "workflow_dispatch":
-              owner = repository.split("/")[0]
-              assert os.environ["GITHUB_ACTOR"] == owner and os.environ["GITHUB_TRIGGERING_ACTOR"] == owner
-              assert event["sender"]["login"] == owner
-              inputs = event["inputs"]
-              assert inputs["complete_release"] in (True, "true") and inputs["dry_run"] in (False, "false")
-              source = inputs["expected_source_sha"]
-              assert re.fullmatch(r"[0-9a-f]{40}", source)
-              workflow_source = os.environ["GITHUB_WORKFLOW_SHA"]
-              assert re.fullmatch(r"[0-9a-f]{40}", workflow_source)
-              assert os.environ["GITHUB_SHA"] == workflow_source
-              ref = os.environ["GITHUB_REF"]
-              assert ref == "refs/heads/main"
-              assert os.environ["GITHUB_WORKFLOW_REF"] == f"{repository}/.github/workflows/publish-crate.yml@{ref}"
-              def api(route):
-                  return json.loads(subprocess.check_output(["gh", "api", f"repos/{repository}/{route}"], text=True))
-              main = api("branches/main")
-              assert main["protected"] is True and main["commit"]["sha"] == workflow_source
-              run_id = inputs["accepted_ci_run"]
-              assert re.fullmatch(r"[1-9][0-9]*", run_id)
-              ci = api("actions/runs/" + run_id)
-              assert ci["name"] == "CI" and ci["path"] == ".github/workflows/ci.yml"
-              assert ci["status"] == "completed" and ci["conclusion"] == "success" and ci["event"] == "pull_request"
-              assert ci["repository"]["full_name"] == ci["head_repository"]["full_name"] == repository
-              assert source == ci["head_sha"]
-              assert re.fullmatch(r"release/[0-9a-f]{40}", ci["head_branch"])
-              cut = ci["head_branch"].removeprefix("release/")
-              assert re.fullmatch(r"[0-9a-f]{40}", cut)
-              dev = api("branches/dev")
-              assert dev["protected"] is True
-              def ancestor(earlier, later):
-                  comparison = api(f"compare/{earlier}...{later}")
-                  assert comparison["status"] in ("ahead", "identical") and comparison["merge_base_commit"]["sha"] == earlier
-                  return comparison
-              ancestor(cut, ci["head_sha"])
-              ancestor(ci["head_sha"], dev["commit"]["sha"])
-              # Merged promotion and immutable CI bind the source; the head branch may be deleted.
-              # Successful release-PR CI is validation, never main-promotion authority.
-              ancestor(source, workflow_source)
-              promotions = api(f"pulls?state=closed&base=main&head={owner}:{ci['head_branch']}&per_page=100")
-              assert len(promotions) < 100, "Incomplete promotion PR inventory"
-              promotions = [pr for pr in promotions if pr["head"]["sha"] == source and pr.get("merged_at")]
-              assert len(promotions) == 1, "Require the exact normally merged main promotion PR"
-              promotion = api(f"pulls/{promotions[0]['number']}")
-              assert promotion["state"] == "closed" and promotion["merged"] is True and promotion["draft"] is False
-              assert promotion["head"]["sha"] == source and promotion["head"]["ref"] == ci["head_branch"]
-              assert promotion["head"]["repo"]["full_name"] == promotion["base"]["repo"]["full_name"] == repository
-              assert promotion["base"]["ref"] == "main" and promotion["merged_at"]
-              merge_revision = promotion["merge_commit_sha"]
-              assert re.fullmatch(r"[0-9a-f]{40}", merge_revision)
-              ancestor(merge_revision, workflow_source)
-              merge_commit = api("git/commits/" + merge_revision)
-              merge_parents = [parent["sha"] for parent in merge_commit["parents"]]
-              assert len(merge_parents) == 2 and source in merge_parents
-              assert merge_commit["tree"]["sha"] == api("git/commits/" + source)["tree"]["sha"]
-              comments = api(f"issues/{promotion['number']}/comments?per_page=100")
-              assert len(comments) < 100, "Incomplete promotion review inventory"
-              summaries = []
-              for comment in comments:
-                  actor = comment.get("user", {})
-                  if actor.get("type") != "Bot" or actor.get("login") not in ("chatgpt-codex-connector[bot]", "chatgpt-codex-connector"):
-                      continue
-                  match = re.search(r"<!-- codex-review-state:v1 (.*?) -->", comment.get("body", ""))
-                  if match:
-                      summaries.append((comment["html_url"], json.loads(match.group(1)), actor, comment))
-              assert summaries, "Require the promotion PR's actual Codex review summary"
-              review_url, reviews, review_actor, _ = summaries[-1]
-              stable_reviews = {}
-              for kind in ("code_review", "security_review"):
-                  review = reviews[kind]
-                  assert review["commit_sha"] == source and review["status"] == "completed"
-                  assert review["has_any_findings"] is False and review["has_unresolved_findings"] is False
-                  stable_reviews[kind] = {key: review[key] for key in
-                                          ("commit_sha", "status", "has_any_findings", "has_unresolved_findings")}
-              print(f"Verified current promotion review summary: {review_url}")
-              def timestamp(value):
-                  parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                  assert parsed.tzinfo is not None
-                  return parsed
-              merged_at = timestamp(promotion["merged_at"])
-              accepted_reviews = []
-              for url, state, actor, comment in summaries:
-                  clean = all(state.get(kind, {}).get("commit_sha") == source
-                              and state[kind].get("status") == "completed"
-                              and state[kind].get("has_any_findings") is False
-                              and state[kind].get("has_unresolved_findings") is False
-                              for kind in ("code_review", "security_review"))
-                  # A comment created earlier but completed/edited after merge
-                  # cannot retroactively prove the pre-merge review gate.
-                  if clean and timestamp(comment["created_at"]) <= timestamp(comment["updated_at"]) < merged_at:
-                      accepted_reviews.append(url)
-              assert accepted_reviews, "Require an exact-source clean review completed before main promotion"
-              print(f"Verified pre-merge promotion review: {accepted_reviews[0]}")
-              main_promotion = {"mainProtected": main["protected"],
-                                "sourceInMain": True, "reviewedBeforeMerge": True, "mergeRevision": merge_revision,
-                                "mergeTree": merge_commit["tree"]["sha"], "mergeParents": merge_parents,
-                                "pullRequest": {"number": promotion["number"], "html_url": promotion["html_url"],
-                                                "state": promotion["state"], "merged": promotion["merged"], "draft": promotion["draft"],
-                                                "headRevision": promotion["head"]["sha"], "headRef": promotion["head"]["ref"],
-                                                "baseRef": promotion["base"]["ref"], "mergedAt": promotion["merged_at"]},
-                                # Comment URLs and mutable bot profile metadata are audit details,
-                                # not part of the stable authenticated recovery identity.
-                                "reviewSummary": {"state": stable_reviews,
-                                                  "actor": {"type": "Bot", "login": "chatgpt-codex-connector[bot]"}}}
-              paths = []
-              required = ["Validation Source", "Promotion Source", "Test", "E2E Tests", "Lint",
-                          "Build (ubuntu-latest)", "Build (macos-latest)", "Build (windows-latest)"]
-              jobs = api(f"actions/runs/{run_id}/jobs?per_page=100")["jobs"]
-              for name in required:
-                  matches = [job for job in jobs if job["name"] == name]
-                  assert len(matches) == 1 and matches[0]["status"] == "completed" and matches[0]["conclusion"] == "success"
-              test = next(job for job in jobs if job["name"] == "Test")
-              assert any(step["name"] == "Require the exact clean source after full validation" and step["conclusion"] == "success" for step in test["steps"])
-              log = subprocess.check_output(["gh", "api", f"repos/{repository}/actions/jobs/{test['id']}/logs"], text=True)
-              matches = re.findall(r"Source: ([0-9a-f]{40}) tree: ([0-9a-f]{40})", log)
-              assert len(set(matches)) == 1
-              revision, tree = matches[0]
-              assert api("git/commits/" + revision)["tree"]["sha"] == tree
-              assert api("git/commits/" + ci["head_sha"])["tree"]["sha"] == tree
-              source_tree = api("git/commits/" + source)["tree"]["sha"]
-              assert source_tree == tree
-              ci_identity = {key: ci[key] for key in ("id", "name", "path", "status", "conclusion", "event", "head_sha", "head_branch", "html_url")}
-              ci_identity["repository"] = {"full_name": repository}
-              ci_identity["head_repository"] = {"full_name": repository}
-              validation = {"kind": "bamboo-release-ci-reuse/v1", "sourceRevision": source, "sourceTree": source_tree,
-                            "validatedRevision": revision, "validatedTree": tree, "ciRun": ci_identity,
-                            "requiredChecks": required, "policyOnlyPaths": paths, "productTreeVerified": True,
-                            "mainPromotion": main_promotion}
-              value = json.dumps(validation, separators=(",", ":"))
-              with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
-                  stream.write(f"revision={source}\nvalidation={value}\n")
-              with open(os.environ["GITHUB_ENV"], "a") as stream:
-                  stream.write(f"SOURCE_VALIDATION={value}\n")
-              print(f"Accepted actual CI {run_id}; source={source} tree={source_tree}; validated={revision} tree={tree}; policy-only paths={paths}")
-              raise SystemExit(0)
           assert event_name == "workflow_run"
           run = event["workflow_run"]
           assert run["name"] == "CI"
@@ -741,7 +595,6 @@ jobs:
             os: windows-latest
     env:
       SOURCE_REVISION: ${{ needs.automatic.outputs.source }}
-      SOURCE_VALIDATION: ${{ needs.automatic.outputs.validation }}
       TARGET_VERSION: ${{ needs.automatic.outputs.version }}
       BAMBOO_RELEASE_TARGET: ${{ matrix.target }}
     steps:
@@ -783,7 +636,6 @@ jobs:
       contents: write
     env:
       SOURCE_REVISION: ${{ needs.automatic.outputs.source }}
-      SOURCE_VALIDATION: ${{ needs.automatic.outputs.validation }}
       TARGET_VERSION: ${{ needs.automatic.outputs.version }}
       EXPECTED_BUILDS: ${{ toJSON(needs.executables.outputs) }}
     steps:

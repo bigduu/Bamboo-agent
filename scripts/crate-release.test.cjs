@@ -851,29 +851,14 @@ test('interrupted initial frontend upload can recover before any crate, while pa
   assert.deepEqual(calls, ['atomic-body', 'upload'])
 })
 
-test('complete release reads CI logs with portable gh API arguments and retains exact source parsing', () => {
+test('complete publication uses the canonical main CI source without release-PR log parsing', () => {
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
-  const block = workflow.match(/log = subprocess\.check_output[\s\S]*?revision, tree = matches\[0\]/)?.[0]
-  assert.ok(block, 'complete-release log source verification must exist')
-  const result = spawnSync('python3', ['-B', '-c', String.raw`
-import json, re, sys, textwrap
-block = json.loads(sys.stdin.read())
-repository = 'bigduu/Bamboo-agent'
-test = {'id': 42}
-expected = ['gh', 'api', 'repos/bigduu/Bamboo-agent/actions/jobs/42/logs']
-source, expected_tree = 'a' * 40, 'b' * 40
-def read_log(argv, *, text):
-    if argv != expected or text is not True:
-        raise RuntimeError('unsupported gh api log command arguments: ' + repr(argv))
-    return '2026-10-19T00:00:00Z Source: ' + source + ' tree: ' + expected_tree + '\n'
-subprocess = type('Transport', (), {'check_output': staticmethod(read_log)})
-# The first extracted line has no YAML indent; normalize the following lines.
-lines = block.splitlines()
-code = lines[0] + '\n' + textwrap.dedent('\n'.join(lines[1:]))
-exec(code)
-assert revision == source and tree == expected_tree
-`], { input: JSON.stringify(block), encoding: 'utf8', env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' } })
-  assert.equal(result.status, 0, result.stderr)
+  const automatic = workflow.split('  automatic:\n')[1]
+  const preflight = automatic.split('      - uses: actions/checkout')[0]
+  assert.match(preflight, /assert event_name == "workflow_run"/)
+  assert.match(preflight, /run = event\["workflow_run"\]/)
+  assert.match(preflight, /source = run\["head_sha"\]/)
+  assert.doesNotMatch(preflight, /actions\/jobs\/|matches\[0\]|--method=GET|accepted_ci_run/)
 })
 
 test('trusted manual publication and automatic receipts share a queue while dry runs stay credential-free', () => {
@@ -914,9 +899,7 @@ test('trusted manual publication and automatic receipts share a queue while dry 
   assert.ok(automatic.indexOf('Authorize the exact source') < automatic.indexOf('uses: actions/checkout'))
   assert.ok(automatic.indexOf('Verify checkout matches') < automatic.indexOf('node scripts/'))
   assert.doesNotMatch(automatic, /inputs\.version/)
-  assert.match(automatic, /inputs\.complete_release/)
-  assert.match(automatic, /accepted_ci_run/)
-  assert.match(automatic, /SOURCE_VALIDATION/)
+  assert.doesNotMatch(automatic, /workflow_dispatch|inputs\.complete_release|accepted_ci_run|SOURCE_VALIDATION/)
   for (const name of ['BAMBOO_RELEASE_TOKEN', 'BAMBOO_RELEASE_SIGNING_KEY']) {
     assert.equal(automatic.split(`secrets.${name}`).length - 1, name === 'BAMBOO_RELEASE_TOKEN' ? 3 : 2)
   }

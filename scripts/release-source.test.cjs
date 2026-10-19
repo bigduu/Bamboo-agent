@@ -27,11 +27,11 @@ function fixture() {
   }
   return { event, validation }
 }
-test('explicit complete release consumes actual successful CI and records its distinct source', () => {
+test('historical dispatch validation is not authority to start a new publication', () => {
   const { event, validation } = fixture()
   assert.equal(validateDispatch(event, validation, sha, tree), validation.ciRun)
-  assert.equal(validateSource({ eventName: 'workflow_dispatch', event, sourceRevision: sha,
-    sourceTree: tree, repository: 'bigduu/Bamboo-agent', validation }), true)
+  assert.throws(() => validateSource({ eventName: 'workflow_dispatch', event, sourceRevision: sha,
+    sourceTree: tree, repository: 'bigduu/Bamboo-agent', validation }), /Unsupported release trigger/)
 })
 test('cancelled, failed, foreign, mismatched or incomplete CI cannot authorize publication', () => {
   for (const mutate of [
@@ -70,142 +70,110 @@ test('earlier CI cannot cover runtime, lockfile, Rust manifest or renamed-source
 
 function runActualPreflight(scenario) {
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
-  const automatic = workflow.split('  automatic:\n')[1]
-  const source = automatic.match(/python3 - <<'PY'\n([\s\S]*?)\n          PY/)[1]
+  const source = workflow.split('  automatic:\n')[1].match(/python3 - <<'PY'\n([\s\S]*?)\n          PY/)[1]
   return spawnSync('python3', ['-B', '-c', String.raw`
-import json, os, re, subprocess, sys, tempfile, textwrap
+import json, os, subprocess, sys, tempfile, textwrap
 from pathlib import Path
 request = json.load(sys.stdin)
 scenario = request['scenario']
-source, tree, synthetic, controller, cut, dev, merge = [c * 40 for c in 'abcdef1']
-if scenario == 'accepted_later_main':
-    controller = '9' * 40
 repo = 'bigduu/Bamboo-agent'
-branch = 'release/' + cut
-pr = {'number': 7, 'html_url': 'https://github.com/' + repo + '/pull/7', 'state': 'closed',
-      'merged': True, 'draft': False, 'merged_at': '2026-10-19T00:00:00Z', 'merge_commit_sha': merge,
-      'head': {'sha': source, 'ref': branch, 'repo': {'full_name': repo}},
-      'base': {'ref': 'main', 'repo': {'full_name': repo}}}
-if scenario in ('unmerged', 'unmerged_but_on_main'):
-    pr.update(state='open', merged=False, merged_at=None)
-if scenario == 'wrong_promotion_head':
-    pr['head']['sha'] = '9' * 40
-if scenario == 'wrong_promotion_base':
-    pr['base']['ref'] = 'dev'
-reviews = {k: {'commit_sha': source, 'status': 'completed', 'has_any_findings': False,
-               'has_unresolved_findings': False} for k in ('code_review', 'security_review')}
-if scenario == 'review_pending':
-    reviews['code_review']['status'] = 'running'
-if scenario == 'review_unresolved':
-    reviews['security_review']['has_unresolved_findings'] = True
-required = ['Validation Source', 'Promotion Source', 'Test', 'E2E Tests', 'Lint',
-            'Build (ubuntu-latest)', 'Build (macos-latest)', 'Build (windows-latest)']
-def api(route):
-    if route == 'branches/main':
-        return {'protected': scenario != 'unprotected_main', 'commit': {'sha': controller}}
-    if route == 'branches/dev':
-        return {'protected': True, 'commit': {'sha': dev}}
-    if route == 'actions/runs/123':
-        return {'id': 123, 'name': 'CI', 'path': '.github/workflows/ci.yml', 'status': 'completed',
-                'conclusion': 'success', 'event': 'pull_request', 'head_sha': source, 'head_branch': branch,
-                'repository': {'full_name': repo}, 'head_repository': {'full_name': repo},
-                'html_url': 'https://github.com/' + repo + '/actions/runs/123'}
-    if route == 'git/ref/heads/' + branch:
-        if scenario == 'deleted_release_branch':
-            raise RuntimeError('HTTP 404: merged release branch was deleted')
-        return {'object': {'type': 'commit', 'sha': source}}
-    if route.startswith('compare/'):
-        earlier, later = route.removeprefix('compare/').split('...')
-        bad = (scenario == 'unmerged' and (earlier, later) == (source, controller)) or (
-            scenario == 'merge_not_on_main' and (earlier, later) == (merge, controller))
-        return {'status': 'diverged' if bad else ('identical' if earlier == later else 'ahead'),
-                'merge_base_commit': {'sha': '0' * 40 if bad else earlier}}
-    if route == 'actions/runs/123/jobs?per_page=100':
-        return {'jobs': [{'id': 42 + i, 'name': name, 'status': 'completed', 'conclusion': 'success',
-                 'steps': [{'name': 'Require the exact clean source after full validation', 'conclusion': 'success'}]}
-                 for i, name in enumerate(required)]}
-    if route.startswith('git/commits/'):
-        revision = route.removeprefix('git/commits/')
-        parents = [{'sha': '8' * 40}, {'sha': source}]
-        if scenario == 'not_a_normal_merge' and revision == merge:
-            parents = [{'sha': '8' * 40}]
-        return {'sha': revision, 'tree': {'sha': '9' * 40 if scenario == 'changed_merge_tree' and revision == merge else tree},
-                'parents': parents}
-    if route.startswith('pulls?state=closed&base=main&head=bigduu:'):
-        return [pr]
-    if route == 'pulls/7':
-        return pr
-    if route == 'issues/7/comments?per_page=100':
-        comments = [{'id': 99, 'html_url': 'https://github.com/' + repo + '/pull/7#issuecomment-99',
-                 'created_at': '2026-10-18T22:00:00Z' if scenario != 'review_after_merge' else '2026-10-19T01:00:00Z',
-                 'updated_at': '2026-10-18T23:00:00Z' if scenario not in ('review_after_merge', 'review_completed_after_merge') else '2026-10-19T01:01:00Z',
-                 'user': {'login': 'bigduu' if scenario == 'forged_review' else 'chatgpt-codex-connector[bot]',
-                          'type': 'User' if scenario == 'forged_review' else 'Bot'},
-                 'body': '<!-- codex-review-state:v1 ' + json.dumps(reviews) + ' -->'}]
-        if scenario in ('later_clean_review', 'later_unresolved_review'):
-            latest_reviews = json.loads(json.dumps(reviews))
-            if scenario == 'later_unresolved_review':
-                latest_reviews['code_review']['has_unresolved_findings'] = True
-            comments.append({'id': 100, 'html_url': 'https://github.com/' + repo + '/pull/7#issuecomment-100',
-                'created_at': '2026-10-19T02:00:00Z', 'updated_at': '2026-10-19T02:01:00Z',
-                'user': {'login': 'chatgpt-codex-connector[bot]', 'type': 'Bot',
-                         'avatar_url': 'https://example.invalid/new-avatar'},
-                'body': '<!-- codex-review-state:v1 ' + json.dumps(latest_reviews) + ' -->'})
-        return comments
-    raise RuntimeError('Unexpected fixture API route: ' + route)
+source, controller, tip, release_head = [c * 40 for c in 'adfe']
+run = {'name': 'CI', 'event': 'push', 'conclusion': 'success', 'head_branch': 'main',
+       'head_sha': source, 'repository': {'full_name': repo}, 'head_repository': {'full_name': repo}}
+for name, key, value in [('failed', 'conclusion', 'failure'), ('cancelled', 'conclusion', 'cancelled'),
+                         ('release_pr', 'event', 'pull_request'), ('non_main', 'head_branch', 'dev'),
+                         ('other_workflow', 'name', 'Unrelated CI')]:
+    if scenario == name: run[key] = value
+if scenario == 'foreign_repository': run['repository']['full_name'] = 'other/repository'
+if scenario == 'fork': run['head_repository']['full_name'] = 'other/repository'
+api_calls = []
 def transport(argv, *, text):
     assert text is True and argv[:2] == ['gh', 'api'] and len(argv) == 3
-    prefix = 'repos/' + repo + '/'
-    assert argv[2].startswith(prefix)
-    route = argv[2].removeprefix(prefix)
-    if re.fullmatch(r'actions/jobs/[0-9]+/logs', route):
-        return 'Source: ' + synthetic + ' tree: ' + tree + '\n'
-    return json.dumps(api(route))
+    route = argv[2].removeprefix('repos/' + repo + '/')
+    api_calls.append(route)
+    if route in ('branches/dev', 'branches/main'):
+        name = route.split('/')[1]
+        return json.dumps({'name': name, 'protected': scenario != 'unprotected_' + name,
+                           'commit': {'sha': tip}})
+    if route.startswith('compare/'):
+        earlier, later = route.removeprefix('compare/').split('...')
+        bad = (scenario == 'unrelated_source' and earlier == source) or (
+               scenario == 'unrelated_controller' and earlier == controller)
+        return json.dumps({'status': 'diverged' if bad else 'ahead',
+                           'merge_base_commit': {'sha': '0' * 40 if bad else earlier}})
+    raise RuntimeError('Unexpected API route: ' + route)
 subprocess.check_output = transport
-with tempfile.TemporaryDirectory(prefix='bamboo-release-main-preflight-') as directory:
+with tempfile.TemporaryDirectory(prefix='bamboo-main-publication-preflight-') as directory:
     root = Path(directory)
-    event = {'sender': {'login': 'bigduu'}, 'inputs': {'complete_release': 'true', 'dry_run': 'false',
-             'expected_source_sha': source, 'accepted_ci_run': '123'}}
+    event = {'workflow_run': run}
+    event_name = 'workflow_run'
+    if scenario.startswith('manual'):
+        event_name = 'workflow_dispatch'
+        event = {'sender': {'login': 'bigduu'}, 'inputs': {'complete_release': 'true', 'dry_run': 'false',
+                 'expected_source_sha': release_head, 'accepted_ci_run': '123'}}
     (root / 'event').write_text(json.dumps(event))
-    os.environ.update(GITHUB_REPOSITORY=repo, GITHUB_EVENT_NAME='workflow_dispatch', GITHUB_ACTOR='bigduu',
+    ref = 'refs/heads/main' if scenario != 'untrusted_ref' else 'refs/heads/topic'
+    os.environ.update(GITHUB_REPOSITORY=repo, GITHUB_EVENT_NAME=event_name, GITHUB_ACTOR='bigduu',
         GITHUB_TRIGGERING_ACTOR='bigduu', GITHUB_EVENT_PATH=str(root / 'event'), GITHUB_WORKFLOW_SHA=controller,
-        GITHUB_SHA=controller, GITHUB_REF='refs/heads/main',
-        GITHUB_WORKFLOW_REF=repo + '/.github/workflows/publish-crate.yml@refs/heads/main',
+        GITHUB_SHA=controller, GITHUB_REF=ref,
+        GITHUB_REF_PROTECTED='false' if scenario == 'unprotected_workflow_ref' else 'true',
+        GITHUB_WORKFLOW_REF=repo + '/.github/workflows/publish-crate.yml@' + ref,
         GITHUB_OUTPUT=str(root / 'output'), GITHUB_ENV=str(root / 'env'))
     try:
         exec(textwrap.dedent(request['source']), {})
-    except SystemExit as result:
-        if result.code:
-            raise
-    print(json.dumps({'output': (root / 'output').read_text(), 'env': (root / 'env').read_text()}))
+    except BaseException:
+        print(json.dumps({'apiCalls': api_calls, 'outputCreated': (root / 'output').exists()}))
+        raise
+    print(json.dumps({'output': (root / 'output').read_text(), 'envCreated': (root / 'env').exists(),
+                      'apiCalls': api_calls}))
 `], { input: JSON.stringify({ source, scenario }), encoding: 'utf8',
     env: { PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: '1' } })
 }
 
-test('actual complete-release fixture can publish the original source after normal main promotion', () => {
-  const result = runActualPreflight('accepted')
+test('complete automatic publication has one route and never accepts the experimental manual authority', () => {
+  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+  const automatic = workflow.split('  automatic:\n')[1]
+  const condition = automatic.match(/^    if: >-\n([\s\S]*?)\n    runs-on:/m)[1]
+  assert.match(condition, /github\.event_name == 'workflow_run'/)
+  assert.doesNotMatch(condition, /workflow_dispatch|inputs\./)
+  assert.doesNotMatch(workflow.split('\npermissions:')[0], /complete_release|accepted_ci_run/)
+  assert.doesNotMatch(workflow, /accepted_ci_run|SOURCE_VALIDATION/)
+  assert.ok(workflow.includes("if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && !fromJSON(toJSON(github.event.inputs)).complete_release"))
+  assert.ok(workflow.includes("if: github.event_name == 'workflow_dispatch' && inputs.dry_run && !fromJSON(toJSON(github.event.inputs)).complete_release"))
+  // Existing guarded crate-only manual/dry-run modes do not call the complete publisher.
+  assert.match(workflow.split('  automatic:\n')[0], /  manual:\n/)
+  assert.match(workflow.split('  automatic:\n')[0], /  dry-run:\n/)
+})
+
+test('actual automatic preflight selects the successful main merge, never the separate release head', () => {
+  const result = runActualPreflight('accepted_after_main_advances')
   assert.equal(result.status, 0, result.stderr)
-  assert.match(result.stdout, new RegExp(`revision=${sha}`))
   const emitted = JSON.parse(result.stdout.trim().split('\n').at(-1))
-  assert.ok(emitted.env.startsWith('SOURCE_VALIDATION='))
-  const validation = JSON.parse(emitted.env.trim().slice('SOURCE_VALIDATION='.length))
-  assert.equal(validateDispatch(fixture().event, validation, sha, tree).id, 123)
-  assert.equal(validation.mainPromotion.mergeRevision, '1'.repeat(40))
+  assert.equal(emitted.output, `revision=${sha}\n`)
+  assert.equal(emitted.envCreated, false)
+  assert.ok(emitted.apiCalls.includes(`compare/${sha}...${'f'.repeat(40)}`))
+  assert.ok(!emitted.output.includes('e'.repeat(40)), 'Do not create a second release-head publication identity')
 })
 
-test('actual complete-release preflight rejects green release CI before protected main promotion', () => {
-  const result = runActualPreflight('unmerged')
-  assert.notEqual(result.status, 0, 'An unmerged release with green CI must not emit publication authority')
-  assert.match(result.stderr, /AssertionError/)
+test('actual manual complete dispatch fails before API or output even with owner and accepted-CI inputs', () => {
+  for (const scenario of ['manual_release_head', 'manual_changed_base']) {
+    const result = runActualPreflight(scenario)
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /AssertionError/)
+    const emitted = JSON.parse(result.stdout.trim().split('\n').at(-1))
+    assert.deepEqual(emitted.apiCalls, [], 'No promotion/review summary can become alternate publication authority')
+    assert.equal(emitted.outputCreated, false)
+  }
 })
 
-test('actual preflight rejects incomplete, foreign, unreviewed or bypassed main promotion', () => {
-  for (const scenario of ['unmerged_but_on_main', 'unprotected_main', 'wrong_promotion_head',
-    'wrong_promotion_base', 'review_pending', 'review_unresolved', 'forged_review',
-    'merge_not_on_main', 'not_a_normal_merge', 'changed_merge_tree']) {
+test('actual automatic preflight preserves CI, protected history and workflow-ref rejection boundaries', () => {
+  for (const scenario of ['failed', 'cancelled', 'release_pr', 'non_main', 'other_workflow',
+    'foreign_repository', 'fork', 'unprotected_main', 'unprotected_dev', 'untrusted_ref',
+    'unprotected_workflow_ref', 'unrelated_source', 'unrelated_controller']) {
     const result = runActualPreflight(scenario)
     assert.notEqual(result.status, 0, `${scenario} must not authorize publication`)
     assert.match(result.stderr, /AssertionError/, result.stderr)
+    assert.equal(JSON.parse(result.stdout.trim().split('\n').at(-1)).outputCreated, false)
   }
 })
 
@@ -231,51 +199,4 @@ test('receipt validation rejects absent or inconsistent protected main acceptanc
     mutate(validation)
     assert.throws(() => validateDispatch(event, validation, sha, tree))
   }
-})
-
-test('actual complete-release recovery retains immutable validation after main advances', () => {
-  function validation(scenario) {
-    const result = runActualPreflight(scenario)
-    assert.equal(result.status, 0, result.stderr)
-    const emitted = JSON.parse(result.stdout.trim().split('\n').at(-1))
-    return JSON.parse(emitted.env.trim().slice('SOURCE_VALIDATION='.length))
-  }
-  const reserved = validation('accepted')
-  const recovery = validation('accepted_later_main')
-  // Sidecar recovery checks equality with the authenticated reservation validation.
-  // Both invocations must still prove source/merge ancestry in their current main.
-  assert.deepEqual(recovery, reserved)
-  assert.equal(validateDispatch(fixture().event, recovery, sha, tree).id, 123)
-})
-
-test('actual publication uses immutable merged promotion evidence after release branch deletion', () => {
-  const result = runActualPreflight('deleted_release_branch')
-  assert.equal(result.status, 0, result.stderr)
-  const emitted = JSON.parse(result.stdout.trim().split('\n').at(-1))
-  const validation = JSON.parse(emitted.env.trim().slice('SOURCE_VALIDATION='.length))
-  assert.equal(validateDispatch(fixture().event, validation, sha, tree).id, 123)
-})
-
-test('later clean review metadata cannot change the signed publication recovery identity', () => {
-  const validation = scenario => {
-    const result = runActualPreflight(scenario)
-    assert.equal(result.status, 0, result.stderr)
-    const emitted = JSON.parse(result.stdout.trim().split('\n').at(-1))
-    return JSON.parse(emitted.env.trim().slice('SOURCE_VALIDATION='.length))
-  }
-  assert.deepEqual(validation('later_clean_review'), validation('accepted'))
-  // Fresh review is still checked; immutable identity never ignores a new finding.
-  assert.notEqual(runActualPreflight('later_unresolved_review').status, 0)
-})
-
-test('a review first posted after promotion cannot retroactively authorize publication', () => {
-  const result = runActualPreflight('review_after_merge')
-  assert.notEqual(result.status, 0, 'A clean post-merge review cannot authorize an unreviewed merge')
-  assert.match(result.stderr, /AssertionError/)
-})
-
-test('a pre-existing summary completed after promotion cannot retroactively authorize publication', () => {
-  const result = runActualPreflight('review_completed_after_merge')
-  assert.notEqual(result.status, 0, 'An earlier empty/running comment later changed to clean is not pre-merge acceptance')
-  assert.match(result.stderr, /AssertionError/)
 })
