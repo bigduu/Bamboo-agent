@@ -911,11 +911,20 @@ async fn session_version_task_legacy_stamps_keep_cas_and_undo_usable() {
                 )
                 .await;
             }
+            // This fixture models legacy data explicitly. New Sessions now use
+            // v2; changing only one file would create a real contract conflict.
+            let main_stamp = if missing_main { None } else { Some(1) };
+            let runtime_stamp = if missing_main { Some(1) } else { None };
             for id in ["tx-child", "tx-root"] {
-                task_set_stamp(&storage, id, missing_main, None).await;
+                task_set_stamp(&storage, id, true, main_stamp).await;
+                task_set_stamp(&storage, id, false, runtime_stamp).await;
             }
             let before = task_contract_bytes(home.path()).await;
-            if let Some((child, child_updated, root, root_updated)) = staged {
+            if let Some((mut child, mut child_updated, mut root, mut root_updated)) = staged {
+                for snapshot in [&mut child, &mut child_updated, &mut root, &mut root_updated] {
+                    snapshot.session_version = runtime_stamp;
+                    snapshot.observe_main_session_version(main_stamp);
+                }
                 let applied = if operation == "single" {
                     storage
                         .save_task_control_plane_if_matches(&child, &child_updated)
