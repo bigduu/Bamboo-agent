@@ -98,11 +98,7 @@ async fn compact_keeps_selected_native_worktree_after_project_default_changes() 
             "Shared checkout",
             None,
             selected.to_str().unwrap(),
-            vec![bamboo_domain::WorkspaceBinding {
-                path: selected.to_string_lossy().into_owned(),
-                label: None,
-                git_common_dir: None,
-            }],
+            Vec::new(),
         )
         .unwrap();
     h.project_store
@@ -216,6 +212,7 @@ async fn compact_does_not_replace_missing_or_foreign_parent_workspace_with_proje
             "foreign" => parent.set_workspace_path_meta(foreign.path().to_string_lossy()),
             _ => unreachable!(),
         }
+        parent.metadata_version += 1;
         h.storage.save_session(&parent).await.unwrap();
         let before = h.adapter.session_store.list_index_entries().await.len();
         let (tool, port) = recording_tool(&h);
@@ -257,4 +254,129 @@ async fn compact_refuses_confinement_relocation_instead_of_creating_another_chec
     );
     assert_no_creation(&h, &port, &parent, before).await;
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), before_root);
+}
+
+#[tokio::test]
+async fn compact_shared_workspace_supports_real_supervisor_nested_child_and_legacy_parent() {
+    for (kind, ultra) in [
+        ("supervisor", false),
+        ("supervisor", true),
+        ("child", false),
+        ("legacy_root", false),
+    ] {
+        let h = build_test_harness_with_storage(None, None, true).await;
+        let mut parent = match kind {
+            "supervisor" => {
+                let receipt = h
+                    .storage
+                    .get_or_create_default_supervisor("gpt-5")
+                    .await
+                    .unwrap();
+                let current = h
+                    .storage
+                    .load_session(&receipt.session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                h.storage
+                    .root_mode_operation(&bamboo_domain::RootModeOperationRequest {
+                        session_id: current.id.clone(),
+                        operation_id: Uuid::new_v4().to_string(),
+                        birth_token: current.root_mode_birth_token(),
+                        expected_epoch: current.root_mode_transition_epoch,
+                        requested_enabled: ultra,
+                        action: bamboo_domain::RootModeOperationAction::Select,
+                    })
+                    .await
+                    .unwrap();
+                h.storage
+                    .load_session(&receipt.session_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+            "child" => h
+                .storage
+                .load_session(&h.child_session_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            "legacy_root" => {
+                let mut session =
+                    Session::new(format!("legacy-parent-{}", Uuid::new_v4()), "gpt-5");
+                session.session_version = None;
+                session
+            }
+            _ => unreachable!(),
+        };
+        // A usable legacy parent field remains sufficient without publishing
+        // a new metadata plane or changing its behavior stamp.
+        parent.workspace = Some(h.workspace_path.to_string_lossy().into_owned());
+        parent.metadata.remove("workspace_path");
+        if let Some(metadata) = &mut parent.runtime_metadata {
+            metadata.workspace_path = None;
+        }
+        parent.metadata_version += 1;
+        h.storage.save_session(&parent).await.unwrap();
+        let (tool, _) = recording_tool(&h);
+        let result = compact_create(&tool, &parent.id).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        let child = h
+            .storage
+            .load_session(payload["actor_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child.workspace_path_meta().as_deref(),
+            h.workspace_path.to_str(),
+            "{kind}/{ultra}"
+        );
+        assert_eq!(child.parent_session_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(child.root_session_id, parent.root_session_id);
+        assert_eq!(child.spawn_depth, parent.spawn_depth + 1);
+        assert!(child.authority_identity.is_ordinary());
+        let retained = h.storage.load_session(&parent.id).await.unwrap().unwrap();
+        assert_eq!(retained.authority_identity, parent.authority_identity);
+        assert_eq!(retained.session_version, parent.session_version);
+        assert_eq!(
+            retained.root_orchestration_only,
+            parent.root_orchestration_only
+        );
+        assert!(retained.workspace_path_meta().is_none());
+        assert_eq!(h.activation.calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn compact_shared_workspace_rechecks_policy_before_child_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver = bamboo_agent_core::workspace_state::WorkspaceResolver::new(|| None, {
+        let root = root.path().canonicalize().unwrap();
+        let calls = calls.clone();
+        move || bamboo_agent_core::workspace_state::WorkspaceRootConfig {
+            root: root.clone(),
+            confine: calls.fetch_add(1, Ordering::SeqCst) >= 2,
+        }
+    });
+    let h = build_test_harness_with_storage(None, Some(resolver), true).await;
+    let mut parent = h
+        .storage
+        .load_session(&h.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    parent.set_workspace_path_meta(h.workspace_path.to_string_lossy());
+    h.storage.save_session(&parent).await.unwrap();
+    let before = h.adapter.session_store.list_index_entries().await.len();
+    let (tool, port) = recording_tool(&h);
+    let result = compact_create(&tool, &parent.id).await;
+    assert!(
+        result.is_err(),
+        "a newly confined parent must not publish a child: {result:?}"
+    );
+    assert!(calls.load(Ordering::SeqCst) >= 3);
+    assert_no_creation(&h, &port, &parent, before).await;
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
