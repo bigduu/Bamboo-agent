@@ -785,7 +785,14 @@ mod tests {
         }
 
         async fn load_session(&self, _session_id: &str) -> std::io::Result<Option<Session>> {
-            unreachable!("approval replay must use load_runtime_control_plane")
+            unreachable!("approval replay must use an explicit canonical/control-plane read")
+        }
+
+        async fn load_execution_admission_snapshot(
+            &self,
+            session_id: &str,
+        ) -> std::io::Result<Option<Session>> {
+            self.load_runtime_control_plane(session_id).await
         }
 
         async fn load_runtime_control_plane(
