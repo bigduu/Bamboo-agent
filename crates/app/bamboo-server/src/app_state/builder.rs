@@ -1439,6 +1439,7 @@ impl AppState {
             sessions,
             storage,
             session_store,
+            supervisor_project_scope_owner_authorizer: None,
             session_create_operations,
             mutation_idempotency,
             project_store,

@@ -124,9 +124,13 @@ target authorization.
 ## Trusted Project scope and links
 
 The same service exposes `inspect_scope`, `configure_project_scope`, `attach`,
-`detach` and `inspect_link`. These are trusted in-process host operations; there
-is no model tool, HTTP self-grant route, automatic scope inheritance, session
-directory or cross-Root history export.
+`detach` and `inspect_link`. These are trusted in-process host operations;
+there is no model self-grant tool, automatic scope inheritance, session
+directory or cross-Root history export. The Server's separate verified owner
+adapter exposes explicit Project-set GET/PUT at
+`/api/v1/supervisor/default/scope`; see [the owner contract](./supervised-root-create.md#explicit-server-owner-project-authorization).
+It does not expose attach, initialize Work or authorize a model to change its
+own scope.
 
 ```rust,no_run
 use bamboo_sdk::{Agent, SupervisorReference};

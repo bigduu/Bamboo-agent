@@ -62,3 +62,110 @@ recovery; no automatic deletion or permission repair is performed.
 This slice addresses Bamboo #1058 under #1048/#1968/#2072. Work initialization,
 status rendering and existing frontend actions remain separate canonical
 Ticket/UI responsibilities; this feature does not remove their gates.
+
+## Explicit Server owner Project authorization
+
+A normal browser and Lotus inside Bodhi use the same Bamboo
+`GET /api/v1/supervisor/default/scope` and protected single
+`PUT /api/v1/supervisor/default/scope`. Bodhi owns windows/process lifetime and
+communication safety; it does not validate Project scope, interpret CAS or
+provide business approval. A native dialog is not required for browser use.
+
+GET and PUT reuse the application's existing request access mode. Local access
+continues to work as before, and existing remote access controls remain in
+force. This feature adds no scope-specific login, credential, Origin check or
+security configuration. It does not require Bodhi or a native confirmation.
+
+The owner reviews the complete Project set and sends one PUT with the observed
+incarnation/revision. There is no prepare endpoint, extra proof credential or
+multi-round approval protocol. Disable automatic PUT retry; a lost/unknown
+result requires a canonical read and a new explicit decision. Existing
+Project/identity checks and storage CAS remain authoritative in Bamboo.
+
+GET advertises `capabilities.project_scope_http_write_v1` and
+`owner_authorization: {available: true, required: true, kind: "existing_access",
+http_registration: false, code: null}` after the existing request gate passes.
+This metadata describes the shared HTTP route; it does not enroll credentials,
+grant Projects or replace the existing access policy.
+
+Trusted Rust embeddings may retain an explicitly installed exact-intent
+`AppState::with_supervisor_project_scope_authorizer`. Ordinary browser and shell
+clients do not require that optional port or the native channel. Its rejection
+remains a rejection; the Web path does not bypass a custom Host verifier.
+
+GET returns `scope: {supervisor, state_revision, allowed_projects}`, a
+`project_scope_uninitialized` or `project_scope_configured` code, and
+`capabilities.project_scope_v1` / `supervised_root_create_v1` / `project_scope_http_write_v1`. The observation
+contains no target directory, history, credentials or permission configuration.
+
+After the owner explicitly reviews the complete Project set, PUT accepts exactly:
+
+```json
+{
+  "incarnation_id": "the observed canonical Supervisor incarnation UUID",
+  "expected_state_revision": 0,
+  "allowed_projects": ["an-existing-active-project-id"]
+}
+```
+
+This replaces the complete set, bounded to 64 typed Project IDs. Unknown,
+archived or unreadable Projects are rejected before the existing canonical
+management CAS. Removing a Project disables its links; regranting it never
+revives the disabled links or attaches a historical Root. The original
+Supervisor lifetime, management fences, proof publication and revision rules
+remain in force. Workspace ownership is checked separately by Root creation.
+
+A success returns `receipt` with the exact Supervisor reference,
+`state_revision`, `changed` and `link_revision`. A fresh already-satisfied
+desired set is a no-op. A stale revision returns 409
+`scope_revision_conflict`, including when the desired set has since been
+achieved. After CAS issuance, only the storage's typed authority conflict is
+known rejected; generic I/O errors return 503 `scope_outcome_unconfirmed` with
+no receipt or not-submitted guarantee. The owner must read again and explicitly confirm the complete set;
+the client must not silently replay a stale write or add Projects. This scope
+CAS retry rule is separate from the unchanged-request replay of an uncertain
+Root creation operation.
+
+GET and PUT both return 404 `supervisor_missing` before bootstrap without
+creating an identity. Other refusals include 403 `supervisor_identity_mismatch`, 400
+`project_scope_invalid`, 404 `supervisor_missing` / `project_unavailable`, 409
+`project_archived`, and 503 `project_store_unavailable`,
+`scope_authority_invalid` or `scope_unavailable`. Existing owner authentication
+refusals and malformed JSON use the existing HTTP error boundary. No error
+authorizes fallback to ordinary Session save, permission changes or storage
+repair.
+
+The model's `session_control scope` names this explicit owner action as
+`model_callable: false`. Its Work projection is `availability: not_observed`:
+Project scope does not imply that formal Work is ready. The owner reads
+`GET /api/v1/tickets/scope` separately and offers initialization only from that
+endpoint's `can_initialize=true` and exact `initialization` payload.
+`binding_revision` is a Work authority revision; `state_revision` is the
+management CAS revision. They are not interchangeable. Neither operation
+grants shell/build permissions, binds a workspace, creates a worktree or
+changes a feature/mode setting.
+
+## Shared browser and shell acceptance (#2072)
+
+Freeze and record Bamboo source/binary, Lotus resources and any shell version
+independently. Preserve earlier native-only test/failed-trial receipts as
+historical evidence; they do not prove the unified Web path. Use temporary
+projects and data, no paid model, and keep the installed app untouched.
+
+1. Run Lotus in a normal browser without Tauri globals. Read the exact Supervisor,
+   revision and Project catalog. The owner uses the existing access mode, one full-set
+   preview and one PUT; verify its receipt, fresh canonical scope and restart
+   persistence. The same UI/API is used inside Bodhi.
+2. Verify ordinary local access works without new login or credential setup.
+   Preserve the existing request access controls and Worker restriction unchanged;
+   do not substitute test-only authenticated subjects for the real browser path.
+3. Reject stale incarnation/revision, archived/missing Projects and unknown claims.
+   Never auto-retry a conflict or uncertain result. Removing Projects revokes
+   links; regrant never revives historical links.
+4. Scope does not initialize Work or grant execution/tool permissions. The
+   separate existing Root-creation and Work contracts remain in force.
+
+The shared HTTP composition and browser integration require their own
+current-source acceptance. Optional native channels, installed-app changes,
+model routing and publication remain separate; they are not prerequisites for
+normal-browser scope management.

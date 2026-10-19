@@ -291,6 +291,33 @@ pub async fn run_with_bind_and_static_tls(
     static_dir: Option<PathBuf>,
     tls: Option<TlsConfig>,
 ) -> Result<(), String> {
+    run_with_static_options(bamboo_home_dir, port, bind, static_dir, tls, false).await
+}
+
+/// Explicit native UI channel for desktop hosts. This enables requests for
+/// Bamboo's own per-intent confirmation; it never installs an HTTP verifier.
+/// Ordinary serve, WebService and SDK entry points remain disabled.
+pub async fn run_with_native_scope_confirmation(
+    bamboo_home_dir: PathBuf,
+    port: u16,
+    bind: &str,
+    static_dir: Option<PathBuf>,
+    tls: Option<TlsConfig>,
+) -> Result<(), String> {
+    if !is_loopback_bind(bind) {
+        return Err("Native Supervisor confirmation requires a loopback desktop bind".into());
+    }
+    run_with_static_options(bamboo_home_dir, port, bind, static_dir, tls, true).await
+}
+
+async fn run_with_static_options(
+    bamboo_home_dir: PathBuf,
+    port: u16,
+    bind: &str,
+    static_dir: Option<PathBuf>,
+    tls: Option<TlsConfig>,
+    native_scope: bool,
+) -> Result<(), String> {
     info!("Starting unified server on {}:{}...", bind, port);
 
     // Loopback/desktop binds skip the limiter (see is_loopback_bind): the local
@@ -371,8 +398,19 @@ pub async fn run_with_bind_and_static_tls(
         "http"
     };
     info!("Unified server running on {scheme}://{}:{}", bind, port);
+    let native_channel = if native_scope {
+        Some(
+            super::supervisor_host_protocol::NativeChannel::start(app_state_for_shutdown.clone())
+                .map_err(|e| format!("Native Supervisor channel unavailable: {e}"))?,
+        )
+    } else {
+        None
+    };
 
     let result = server.await;
+    if let Some(channel) = native_channel {
+        channel.shutdown().await;
+    }
 
     // Gracefully stop AppState-owned background tasks (the #47 MCP-proxy reconnect
     // supervisor + MCP servers) once the server stops, instead of leaking them
@@ -391,6 +429,16 @@ pub async fn run_with_bind_and_static_tls(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn native_confirmation_routable_bind_is_rejected_before_appstate_or_stdio() {
+        let home = tempdir().unwrap();
+        let absent = home.path().join("must-not-be-created");
+        let result =
+            run_with_native_scope_confirmation(absent.clone(), 0, "0.0.0.0", None, None).await;
+        assert!(result.is_err());
+        assert!(!absent.exists());
+    }
 
     #[test]
     fn resolve_runtime_static_dir_uses_configured_dir_when_present() {
