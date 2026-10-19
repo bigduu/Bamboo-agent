@@ -1359,3 +1359,42 @@ async fn versioned_spawn_known_contract_mismatch_survives_reopen_and_refuses_bot
         assert_eq!(pair(home.path(), &session.id).await, before);
     }
 }
+
+#[tokio::test]
+async fn versioned_spawn_runtime_checkpoint_cannot_reinterpret_a_known_contract() {
+    for (retained, incoming) in [
+        (Some(2), None),
+        (Some(2), Some(1)),
+        (Some(1), Some(2)),
+        (None, Some(2)),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let mut session = Session::new("immutable-contract", "model");
+        session.session_version = retained;
+        session.add_message(Message::user("Keep the original instruction and contract"));
+        storage.save_session(&session).await.unwrap();
+        let before = pair(home.path(), &session.id).await;
+        let mut stale: Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        stale.session_version = incoming;
+        stale
+            .metadata
+            .insert("not_published".into(), "rejected runtime contract".into());
+        let error = storage
+            .save_runtime_state(&stale)
+            .await
+            .expect_err("a runtime checkpoint must not change the retained tool contract");
+        assert!(
+            error
+                .to_string()
+                .contains("session_version_change_requires_new_session"),
+            "{error}"
+        );
+        assert_eq!(pair(home.path(), &session.id).await, before);
+        let fresh = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let loaded = fresh.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(loaded.session_version, retained);
+        assert!(loaded.execution_compatibility().execution_allowed);
+    }
+}

@@ -6303,12 +6303,10 @@ impl SessionStoreV2 {
             // identical semantics; never turn this compatible pair into a
             // false conflict or rewrite Main from the runtime-only path.
             if session.session_version != previous.session_version
-                && !(session
-                    .session_version
-                    .is_none_or(|v| v == bamboo_domain::CURRENT_SESSION_VERSION)
-                    && previous
-                        .session_version
-                        .is_none_or(|v| v == bamboo_domain::CURRENT_SESSION_VERSION))
+                && !bamboo_domain::same_session_tool_contract(
+                    session.session_version,
+                    previous.session_version,
+                )
             {
                 reject_session_version_change(session, &previous)?;
             }
