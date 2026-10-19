@@ -211,15 +211,20 @@ fn actual_file_write_receipt_replay_changed_payload_and_full_manifest_backup() {
 
 #[test]
 fn schema_four_file_evidence_survives_stopped_offline_transfer_without_downgrade() {
-    file_evidence_transfer_preserves_schema(false);
+    file_evidence_transfer_preserves_schema(false, false);
 }
 
 #[test]
 fn schema_five_project_and_file_evidence_survive_stopped_transfer_without_downgrade() {
-    file_evidence_transfer_preserves_schema(true);
+    file_evidence_transfer_preserves_schema(true, false);
 }
 
-fn file_evidence_transfer_preserves_schema(with_project: bool) {
+#[test]
+fn schema_six_sprint_project_and_file_evidence_survive_stopped_transfer() {
+    file_evidence_transfer_preserves_schema(true, true);
+}
+
+fn file_evidence_transfer_preserves_schema(with_project: bool, with_sprint: bool) {
     let f = fixture();
     if with_project {
         let snapshot = f.service.published().unwrap().1;
@@ -229,7 +234,7 @@ fn file_evidence_transfer_preserves_schema(with_project: bool) {
                 user_id: "owner".into(),
             },
         );
-        execute(
+        let linked = execute(
             &f.service,
             &host,
             "linked-work",
@@ -248,6 +253,46 @@ fn file_evidence_transfer_preserves_schema(with_project: bool) {
             ],
         )
         .unwrap();
+        if with_sprint {
+            let sprint_id = SprintId::parse("planning").unwrap();
+            for (operation_id, action) in [
+                (
+                    "create-sprint",
+                    SprintAction::Create {
+                        definition: SprintDefinition {
+                            name: "Planning".into(),
+                            goal: "Preserve evidence".into(),
+                            starts_at: None,
+                            ends_at: None,
+                        },
+                    },
+                ),
+                (
+                    "add-sprint-member",
+                    SprintAction::Add {
+                        expected_revision: 1,
+                        work_id: linked.ids["project-work"].clone(),
+                    },
+                ),
+            ] {
+                let s = f.service.published().unwrap().1;
+                f.service
+                    .execute_sprint(
+                        &host,
+                        &SprintCommand {
+                            operation_id: operation_id.into(),
+                            binding: s.binding,
+                            expected_seq: s.seq,
+                            expected_epoch: s.authority_epoch,
+                            project_id: bamboo_domain::ProjectId::parse("durable-project").unwrap(),
+                            sprint_id: sprint_id.clone(),
+                            source: "schema transfer fixture".into(),
+                            action,
+                        },
+                    )
+                    .unwrap();
+            }
+        }
     }
     let path = Path::new(&f.workspace.worktree).join("code.rs");
     let artifact = f
@@ -307,7 +352,22 @@ fn file_evidence_transfer_preserves_schema(with_project: bool) {
         .activate_migrated_copy(&source, &user, &request, &proof)
         .unwrap();
     let migrated = destination.published().unwrap().1;
-    assert_eq!(migrated.schema, if with_project { 5 } else { 4 });
+    assert_eq!(
+        migrated.schema,
+        if with_sprint {
+            6
+        } else if with_project {
+            5
+        } else {
+            4
+        }
+    );
+    assert_eq!(migrated.sprint.sprints.len(), usize::from(with_sprint));
+    if with_sprint {
+        let sprint = &migrated.sprint.sprints[&SprintId::parse("planning").unwrap()];
+        assert_eq!(sprint.history.len(), 1);
+        assert_eq!(sprint.members.len(), 1);
+    }
     assert_eq!(migrated.project.links.len(), usize::from(with_project));
     assert_eq!(
         destination
