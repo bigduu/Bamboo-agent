@@ -65,46 +65,40 @@ Ticket/UI responsibilities; this feature does not remove their gates.
 
 ## Explicit Server owner Project authorization
 
-The Server provides `GET /api/v1/supervisor/default/scope` and
-`PUT /api/v1/supervisor/default/scope`. The existing owner-read transport
-boundary rejects run-scoped Worker credentials and unauthenticated remote
-requests; locality may still bypass that read gate. **This is not permission
-to update scope.** PUT additionally requires exact owner consent verified by
-the trusted embedding Host. Neither endpoint is a model tool. GET does not
-open, promote or repair a Supervisor; an absent identity requires the existing
-explicit open action.
+A normal browser and Lotus inside Bodhi use the same Bamboo
+`GET /api/v1/supervisor/default/scope` and protected single
+`PUT /api/v1/supervisor/default/scope`. Bodhi owns windows/process lifetime and
+communication safety; it does not validate Project scope, interpret CAS or
+provide business approval. A native dialog is not required for browser use.
 
-The default Server has no mutation authorizer and returns 503
-`host_owner_authorization_unavailable`. GET reports
-`owner_authorization: {available, required: true, kind: "trusted_host_intent",
-http_registration: false}`. Contract-version capabilities advertise the API
-shape, not an available owner channel or worker readiness.
+GET and PUT reuse the application's existing request access mode. Local access
+continues to work as before, and existing remote access controls remain in
+force. This feature adds no scope-specific login, credential, Origin check or
+security configuration. It does not require Bodhi or a native confirmation.
 
-Rust embedding code can call
-`AppState::with_supervisor_project_scope_authorizer` before serving requests.
-Its `SupervisorProjectScopeOwnerAuthorizer` verifies owner consent for the
-entire typed `SupervisorManagementRequest`: current Supervisor incarnation,
-expected revision and complete desired Project set. The Host must obtain this
-proof outside the HTTP control plane and must not approve by locality,
-run/device token or ordinary access cookie alone. Existing pairing/password
-administration has local-bypass behavior, so accepting its credentials alone
-would permit a downgrade. Bamboo registers no HTTP/config/model mechanism to
-install the verifier or mint its proof, and adds no credential/grant registry.
-An installed verifier refusing a request returns 403
-`host_owner_authorization_required` without mutating scope.
+The owner reviews the complete Project set and sends one PUT with the observed
+incarnation/revision. There is no prepare endpoint, extra proof credential or
+multi-round approval protocol. Disable automatic PUT retry; a lost/unknown
+result requires a canonical read and a new explicit decision. Existing
+Project/identity checks and storage CAS remain authoritative in Bamboo.
 
-The trusted in-process `SupervisorSessionService::configure_project_scope`
-remains available to an embedding Host. Wiring an actual Bodhi native owner
-consent channel is a separately required consumer step; this backend does not
-silently create credentials, change security settings or treat a test-native
-approval as a production authentication implementation.
+GET advertises `capabilities.project_scope_http_write_v1` and
+`owner_authorization: {available: true, required: true, kind: "existing_access",
+http_registration: false, code: null}` after the existing request gate passes.
+This metadata describes the shared HTTP route; it does not enroll credentials,
+grant Projects or replace the existing access policy.
+
+Trusted Rust embeddings may retain an explicitly installed exact-intent
+`AppState::with_supervisor_project_scope_authorizer`. Ordinary browser and shell
+clients do not require that optional port or the native channel. Its rejection
+remains a rejection; the Web path does not bypass a custom Host verifier.
 
 GET returns `scope: {supervisor, state_revision, allowed_projects}`, a
 `project_scope_uninitialized` or `project_scope_configured` code, and
-`capabilities.project_scope_v1` / `supervised_root_create_v1`. The observation
+`capabilities.project_scope_v1` / `supervised_root_create_v1` / `project_scope_http_write_v1`. The observation
 contains no target directory, history, credentials or permission configuration.
 
-After explicit consent through the installed Host channel, PUT accepts exactly:
+After the owner explicitly reviews the complete Project set, PUT accepts exactly:
 
 ```json
 {
@@ -125,7 +119,9 @@ A success returns `receipt` with the exact Supervisor reference,
 `state_revision`, `changed` and `link_revision`. A fresh already-satisfied
 desired set is a no-op. A stale revision returns 409
 `scope_revision_conflict`, including when the desired set has since been
-achieved. The owner must read again and explicitly confirm the complete set;
+achieved. After CAS issuance, only the storage's typed authority conflict is
+known rejected; generic I/O errors return 503 `scope_outcome_unconfirmed` with
+no receipt or not-submitted guarantee. The owner must read again and explicitly confirm the complete set;
 the client must not silently replay a stale write or add Projects. This scope
 CAS retry rule is separate from the unchanged-request replay of an uncertain
 Root creation operation.
@@ -149,51 +145,27 @@ management CAS revision. They are not interchangeable. Neither operation
 grants shell/build permissions, binds a workspace, creates a worktree or
 changes a feature/mode setting.
 
-## Bodhi consumer integration boundary (#2072)
+## Shared browser and shell acceptance (#2072)
 
-Read-only inventory on 2026-10-18 found installed Bodhi **2026.10.17** and its
-external Lotus receipt **2026.10.15**, source
-`58920d5b58b98847ef10f70e60b8f8c23afb9df4`, receipt SHA-256
-`1f198f4e3f244c383e62f08c8b319f1fee60600ff52e8b5f7638a43cea90882b`.
-That installed consumer is not claimed to contain this API or the newer UI.
-The frontend owner's local candidate is
-`8831769170784d85ea23c1ac9f834a48890de19c`; it is not pushed or published by
-this backend slice. Its current Work v1 contract requires no additional field.
+Freeze and record Bamboo source/binary, Lotus resources and any shell version
+independently. Preserve earlier native-only test/failed-trial receipts as
+historical evidence; they do not prove the unified Web path. Use temporary
+projects and data, no paid model, and keep the installed app untouched.
 
-The next actual Bodhi integration must record the native backend source and
-the external frontend receipt independently. Use a separate temporary data
-directory, isolated existing workspace, loopback server and a deterministic
-in-process provider; never use the user's Project grants, configuration,
-history or a paid model. Keep the installed app untouched.
+1. Run Lotus in a normal browser without Tauri globals. Read the exact Supervisor,
+   revision and Project catalog. The owner uses the existing access mode, one full-set
+   preview and one PUT; verify its receipt, fresh canonical scope and restart
+   persistence. The same UI/API is used inside Bodhi.
+2. Verify ordinary local access works without new login or credential setup.
+   Preserve the existing request access controls and Worker restriction unchanged;
+   do not substitute test-only authenticated subjects for the real browser path.
+3. Reject stale incarnation/revision, archived/missing Projects and unknown claims.
+   Never auto-retry a conflict or uncertain result. Removing Projects revokes
+   links; regrant never revives historical links.
+4. Scope does not initialize Work or grant execution/tool permissions. The
+   separate existing Root-creation and Work contracts remain in force.
 
-1. Record whether the actual Host has installed its native owner-consent
-   verifier. An unavailable channel must stay explicitly blocked; no cookie,
-   device setup or anonymous loopback call may substitute for it. Reproduce
-   empty management scope and show the explicit owner selection route. Querying scope, opening Supervisor and initializing Work must leave
-   the management set unchanged. Cover missing/ordinary identity and
-   authenticated versus refused owner access.
-2. Explicitly select one existing active Project through the actual Host owner
-   channel and PUT, binding consent to its observed incarnation, management
-   revision and entire Project set. In Standard and Ultra,
-   issue the actual Host-wired `session_control create` under its separate
-   native approval. Verify a visible independent Ordinary Root, exact Project
-   and workspace, one managed link and one initial Inbox receipt. Retry and
-   restart with the same full operation request; verify no duplicate Root or
-   initial input and preserve all no-inheritance assertions.
-3. Exercise formal Work states independently in the real side panel: ready
-   with zero items, uninitialized, disabled, forbidden/mode required,
-   binding mismatch, recovery required and I/O failure. Offer initialization
-   only on a valid owner response; send the three captured fields once. On
-   conflict/unknown outcome re-read canonical state without automatically
-   repeating the POST. The present Standard Work mode gate remains unchanged;
-   report `supervisor_mode_required` rather than claiming universal readiness.
-4. Revoke management Project scope and verify creation/followup refusal with
-   no worker, link, Work or permission side effects. Regrant must not revive
-   links. An unknown grant outcome requires a canonical read and explicit owner
-   decision. Tool/model guidance must report the requested route's blocker;
-   a read-only Child is not proof of an independent implementation.
-
-Native HTTP/model contract tests prove the backend composition in temporary
-fixtures. They do not prove the installed Bodhi UI, real model routing,
-publication or a completed implementation task. The owner selection UI, actual native Host consent verifier,
-consumer integration and any release remain separately pending.
+The shared HTTP composition and browser integration require their own
+current-source acceptance. Optional native channels, installed-app changes,
+model routing and publication remain separate; they are not prerequisites for
+normal-browser scope management.

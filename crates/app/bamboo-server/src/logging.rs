@@ -10,5 +10,6 @@
 //! call paths.
 pub use bamboo_infrastructure::logging::{
     init_logging, init_logging_with_home, init_logging_with_options, init_server_logging_with_home,
-    LogOptions, DEFAULT_MAX_LOG_BYTES, DEFAULT_MAX_LOG_FILES,
+    init_server_logging_with_home_to_stderr, LogOptions, DEFAULT_MAX_LOG_BYTES,
+    DEFAULT_MAX_LOG_FILES,
 };

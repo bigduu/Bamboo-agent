@@ -52,3 +52,6 @@ mod tests;
 
 #[cfg(test)]
 mod project_scope_tests;
+
+#[cfg(test)]
+mod project_scope_web_tests;

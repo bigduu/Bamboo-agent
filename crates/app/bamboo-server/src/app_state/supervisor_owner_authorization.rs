@@ -1,11 +1,10 @@
 //! Trusted Host authorization for an exact Project-scope intent.
 //!
-//! The default Server has no authorizer. This port is installed only by Rust
-//! embedding code before serving requests; no HTTP/config/model path installs
-//! it or issues its proof. Locality, run/device tokens and ordinary access
-//! cookies are not sufficient proof: their HTTP administration supports local
-//! bypass. A Host implementation must verify explicit owner consent through a
-//! channel outside that control plane and bind it to the complete intent.
+//! This optional verifier is installed only by trusted Rust embedding code.
+//! No HTTP/config/model path installs this port. A custom verifier must bind
+//! its decision to the complete intent. Normal browser and shell clients use
+//! the existing request access gate without an additional scope login or Origin
+//! policy. This operation does not enroll credentials or change settings.
 use std::sync::Arc;
 
 use actix_web::HttpRequest;
