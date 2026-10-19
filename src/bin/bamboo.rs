@@ -1361,11 +1361,19 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
     // owns its quiet-by-default policy; embedding applications do not need to
     // pass a log-level argument based on how the binary was built.
     match &cli.command {
-        Some(Commands::Serve { data_dir, .. }) => {
+        Some(Commands::Serve {
+            data_dir,
+            supervisor_scope_native_confirmation,
+            ..
+        }) => {
             let home = data_dir
                 .clone()
                 .unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
-            bamboo_agent::server::logging::init_server_logging_with_home(&home);
+            if *supervisor_scope_native_confirmation {
+                bamboo_agent::server::logging::init_server_logging_with_home_to_stderr(&home);
+            } else {
+                bamboo_agent::server::logging::init_server_logging_with_home(&home);
+            }
         }
         Some(Commands::Config { .. }) => {
             // No file logging for config subcommand; stdout only.
@@ -1564,7 +1572,11 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
             bamboo_agent::server::notify_sinks::set_sidecar_mode(parent_pid.is_some());
 
             // Start server using the unified config
-            println!("Starting Bamboo server at {}", config.server_addr());
+            if supervisor_scope_native_confirmation {
+                eprintln!("Starting Bamboo server at {}", config.server_addr());
+            } else {
+                println!("Starting Bamboo server at {}", config.server_addr());
+            }
             // v2-P1 (#181): honor `server.tls` for in-process TLS termination
             // (fail-fast on bad/missing certs); absent → unchanged plaintext.
             let tls = config.server.tls.clone();

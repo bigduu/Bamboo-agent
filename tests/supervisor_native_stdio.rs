@@ -24,7 +24,11 @@ fn assert_native_stdout_is_frames_only(block_file_logging: bool) {
     let home = root.path().join("data");
     std::fs::create_dir(&home).unwrap();
     if block_file_logging {
-        std::fs::write(home.join("logs"), b"own test fixture blocks directory creation").unwrap();
+        std::fs::write(
+            home.join("logs"),
+            b"own test fixture blocks directory creation",
+        )
+        .unwrap();
     }
     let mut child = OwnedChild(
         Command::new(env!("CARGO_BIN_EXE_bamboo"))
@@ -85,7 +89,7 @@ fn assert_native_stdout_is_frames_only(block_file_logging: bool) {
     let ready = next_frame();
     assert_eq!(ready["kind"], "ready");
     assert_eq!(ready["launch_id"], hello["launch_id"]);
-    assert_eq!(ready["transport_ready"], true);
+    assert!(ready["transport_ready"].as_bool().unwrap());
 }
 
 #[test]
