@@ -4350,20 +4350,35 @@ mod hook_tests {
                 self.0.lock().unwrap().extend_from_slice(bytes);
                 Ok(bytes.len())
             }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
         impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
             type Writer = Self;
-            fn make_writer(&'a self) -> Self::Writer { self.clone() }
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
         }
 
         for ultra in [false, true] {
             let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
             session.session_version = Some(2);
-            session.authority_identity = SessionAuthorityIdentity::Supervisor { incarnation_id: uuid::Uuid::new_v4() };
+            session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: uuid::Uuid::new_v4(),
+            };
             session.set_root_orchestration_only(ultra).unwrap();
-            let callable = effective_callable_set(&["spawn_session"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
-            for name in ["spawn_session", "spawnSession", "default::spawn_session", "default::spawnSession"] {
+            let callable = effective_callable_set(
+                &["spawn_session"],
+                CapabilityLoadingMode::LegacyFullCatalog,
+                &[],
+            );
+            for name in [
+                "spawn_session",
+                "spawnSession",
+                "default::spawn_session",
+                "default::spawnSession",
+            ] {
                 let concrete = Arc::new(NameRecordingExecutor::new(&["spawn_session"]));
                 let tools: Arc<dyn ToolExecutor> = concrete.clone();
                 let mut call = probe_call(name);
@@ -4371,21 +4386,51 @@ mod hook_tests {
                 let original = call.clone();
                 let (tx, mut rx) = mpsc::channel(16);
                 let logs = Logs::default();
-                let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
-                    .with_max_level(tracing::Level::WARN).with_writer(logs.clone()).finish();
-                let outcome = execute_model_requested_tool_call_only(&callable, ToolExecutionOnlyContext {
-                    session_behavior_version: Some(2), vision_support: true, output_cap: None,
-                    executing_supervisor: ExecutingSupervisorObservation::capture_from_executing_session(&session),
-                    tool_call: &call, event_tx: &tx, metrics_collector: None, session_id: &session.id,
-                    root_session_id: &session.root_session_id, root_orchestration_only: session.root_orchestration_only_enabled(),
-                    round_id: "private-Root-parse", round: 0, tools: &tools, config: &AgentLoopConfig::default(),
-                    hook_session: None, hook_runtime_state: None, session_flags: ToolExecutionSessionFlags::from_session(&session),
-                    available_tool_schemas: &[],
-                }).with_subscriber(subscriber).await.unwrap();
-                assert!(outcome.result.is_ok(), "{name}/{ultra}: {:?}", outcome.result);
+                let subscriber = tracing_subscriber::fmt()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::WARN)
+                    .with_writer(logs.clone())
+                    .finish();
+                let outcome =
+                    execute_model_requested_tool_call_only(
+                        &callable,
+                        ToolExecutionOnlyContext {
+                            session_behavior_version: Some(2),
+                            vision_support: true,
+                            output_cap: None,
+                            executing_supervisor:
+                                ExecutingSupervisorObservation::capture_from_executing_session(
+                                    &session,
+                                ),
+                            tool_call: &call,
+                            event_tx: &tx,
+                            metrics_collector: None,
+                            session_id: &session.id,
+                            root_session_id: &session.root_session_id,
+                            root_orchestration_only: session.root_orchestration_only_enabled(),
+                            round_id: "private-Root-parse",
+                            round: 0,
+                            tools: &tools,
+                            config: &AgentLoopConfig::default(),
+                            hook_session: None,
+                            hook_runtime_state: None,
+                            session_flags: ToolExecutionSessionFlags::from_session(&session),
+                            available_tool_schemas: &[],
+                        },
+                    )
+                    .with_subscriber(subscriber)
+                    .await
+                    .unwrap();
+                assert!(
+                    outcome.result.is_ok(),
+                    "{name}/{ultra}: {:?}",
+                    outcome.result
+                );
                 assert_eq!(concrete.entered(), vec!["spawn_session"]);
                 assert_eq!(call, original);
-                assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(event, AgentEvent::ToolStart { .. })));
+                assert!(std::iter::from_fn(|| rx.try_recv().ok())
+                    .any(|event| matches!(event, AgentEvent::ToolStart { .. })));
                 let log = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
                 assert!(log.contains("required fallback before ToolStart"), "{log}");
                 assert!(log.contains("args_preview="), "{log}");
