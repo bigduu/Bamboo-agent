@@ -3179,16 +3179,15 @@ mod owner_credential_tests {
     fn configured() -> Config {
         let salt = "11".repeat(16);
         let hash = compute_password_hash("memory-only-unit-owner", &salt).unwrap();
-        Config {
-            access_control: Some(bamboo_config::AccessControlConfig {
-                password_enabled: true,
-                password_configured: true,
-                password_hash: Some(hash),
-                password_salt: Some(salt),
-                ..Default::default()
-            }),
+        let mut config = Config::default();
+        config.access_control = Some(bamboo_config::AccessControlConfig {
+            password_enabled: true,
+            password_configured: true,
+            password_hash: Some(hash),
+            password_salt: Some(salt),
             ..Default::default()
-        }
+        });
+        config
     }
     #[test]
     fn local_bypass_and_open_policy_do_not_authenticate_an_owner() {
@@ -3237,13 +3236,11 @@ mod owner_credential_tests {
     #[test]
     fn existing_device_token_is_verified_and_revocation_never_authenticates() {
         let (device, token) = issue_device_token("memory-only-existing-device");
-        let mut config = Config {
-            access_control: Some(bamboo_config::AccessControlConfig {
-                devices: vec![device.clone()],
-                ..Default::default()
-            }),
+        let mut config = Config::default();
+        config.access_control = Some(bamboo_config::AccessControlConfig {
+            devices: vec![device.clone()],
             ..Default::default()
-        };
+        });
         let request = TestRequest::get()
             .insert_header((header::AUTHORIZATION, format!("Bearer {token}")))
             .insert_header((DEVICE_ID_HEADER, device.device_id))
