@@ -45,7 +45,6 @@ pub async fn open_default(
 }
 
 mod project_scope;
-mod project_scope_owner;
 pub use project_scope::{configure_project_scope, inspect_project_scope};
 
 #[cfg(test)]

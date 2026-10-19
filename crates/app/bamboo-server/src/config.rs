@@ -460,12 +460,6 @@ fn parse_cors_allowlist(raw: &str) -> CorsAllowlist {
     allow
 }
 
-/// Sensitive cookie-authenticated mutations may use an explicitly configured
-/// exact browser origin, but not the implicit all-loopback development allowance.
-pub(crate) fn is_explicitly_allowed_browser_origin(origin: &str) -> bool {
-    parse_cors_allowlist_env().exact_origins.contains(origin)
-}
-
 fn parse_cors_allowlist_env() -> CorsAllowlist {
     // Comma-separated list. Examples:
     //   BAMBOO_CORS_ALLOW_ORIGINS="https://app.example.com,http://localhost:5173,*.example.com"

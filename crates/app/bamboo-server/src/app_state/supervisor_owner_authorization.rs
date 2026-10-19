@@ -1,11 +1,10 @@
 //! Trusted Host authorization for an exact Project-scope intent.
 //!
 //! This optional verifier is installed only by trusted Rust embedding code.
-//! No HTTP/config/model path installs this port. A custom Host verifier must
-//! bind its decision to the complete intent. The default browser API separately
-//! uses verified existing owner credentials, JSON/Origin protection and the full
-//! revision-bound PUT; locality/open access and frontend approval claims never
-//! authenticate an owner. No operation enrolls credentials or changes settings.
+//! No HTTP/config/model path installs this port. A custom verifier must bind
+//! its decision to the complete intent. Normal browser and shell clients use
+//! the existing request access gate without an additional scope login or Origin
+//! policy. This operation does not enroll credentials or change settings.
 use std::sync::Arc;
 
 use actix_web::HttpRequest;

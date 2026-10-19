@@ -437,7 +437,7 @@ async fn model_scope_reports_owner_action_without_grant_or_work_readiness() {
     assert_eq!(scope["code"], "project_scope_uninitialized");
     assert_eq!(scope["owner_action"]["model_callable"], false);
     assert_eq!(scope["owner_action"]["path"], URI);
-    assert_eq!(scope["owner_action"]["requires"], "authenticated_owner");
+    assert_eq!(scope["owner_action"]["requires"], "existing_access");
     assert_eq!(scope["work_scope"]["availability"], "not_observed");
     assert_eq!(scope["work_scope"]["status_path"], "/api/v1/tickets/scope");
     let observed = SupervisorSessionService::new(f.state.storage.clone())
@@ -593,48 +593,6 @@ async fn review_put_before_bootstrap_reports_missing_without_creating_identity()
         .await
         .unwrap()
         .is_none());
-    state.shutdown().await;
-}
-
-#[actix_web::test]
-async fn default_host_without_owner_verifier_never_accepts_scope_grant() {
-    let home = tempfile::tempdir().unwrap();
-    let state = web::Data::new(Box::pin(AppState::new(home.path().into())).await.unwrap());
-    let service = SupervisorSessionService::new(state.storage.clone());
-    let reference =
-        SupervisorReference::from(&service.get_or_create_default("no-model").await.unwrap());
-    let project = state
-        .project_store
-        .create("Unapproved Project", None)
-        .unwrap();
-    let app = test::init_service(
-        App::new()
-            .app_data(state.clone())
-            .configure(configure_routes),
-    )
-    .await;
-    let response = test::call_service(
-        &app,
-        test::TestRequest::get()
-            .uri(URI)
-            .peer_addr("127.0.0.1:12345".parse().unwrap())
-            .to_request(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let observed: Value = test::read_body_json(response).await;
-    assert_eq!(observed["owner_authorization"]["available"], false);
-    assert_eq!(observed["owner_authorization"]["http_registration"], false);
-    let response=test::call_service(&app,test::TestRequest::put().uri(URI).peer_addr("127.0.0.1:12345".parse().unwrap())
-        .insert_header(("X-Bamboo-Owner","true"))
-        .set_json(json!({"incarnation_id":reference.incarnation_id,"expected_state_revision":0,"allowed_projects":[project.id]})).to_request()).await;
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let error: Value = test::read_body_json(response).await;
-    assert_eq!(error["code"], "owner_authentication_unconfigured");
-    let scope = service.inspect_scope(&reference).await.unwrap();
-    assert_eq!(scope.state_revision, 0);
-    assert!(scope.allowed_projects.is_empty());
-    assert!(!state.config.read().await.features.ticket_mutation);
     state.shutdown().await;
 }
 

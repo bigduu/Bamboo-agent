@@ -1,14 +1,14 @@
 # Bamboo-owned native Project-scope confirmation
 
 This is an optional historical Host channel. Normal browsers and Lotus inside
-Bodhi use the same authenticated Bamboo GET/PUT scope API; neither requires
+Bodhi use the same Bamboo GET/PUT scope API under its existing access mode; neither requires
 this native path. See the shared [Web owner contract](../supervised-root-create.md#explicit-server-owner-project-authorization).
 
 The private v1 channel requests one native confirmation for the complete typed
 Supervisor Project-scope intent. It never imports a Bodhi/JavaScript approval,
 creates a credential, registers trust, or enables the HTTP owner verifier.
-The legacy pipe `owner_authorization_available` stays false; authenticated HTTP
-owner availability is evaluated separately from the pipe. The exact
+The legacy pipe `owner_authorization_available` stays false; shared HTTP
+route availability is evaluated separately from the pipe. The exact
 `bamboo_native_confirmation_v1` profile means the current Bamboo process can ask
 once; it is not consent. Missing/legacy profiles remain unavailable.
 

@@ -83,9 +83,9 @@ impl SupervisedRootCreatePort for SupervisedRootCreator {
             "code":if scope.allowed_projects.is_empty() {"project_scope_uninitialized"} else {"project_scope_configured"},
             "owner_action":{
                 "method":"PUT", "path":"/api/v1/supervisor/default/scope",
-                "requires":"authenticated_owner", "model_callable":false,
+                "requires":"existing_access", "model_callable":false,
                 "required_fields":["incarnation_id","expected_state_revision","allowed_projects"],
-                "next_step":"The owner must sign in with existing owner credentials, check GET /api/v1/supervisor/default/scope and explicitly submit the complete selected Project set through its protected PUT. Local/open access is not owner authentication. Then read scope again and use the selected Project and existing bound workspace with create under its separate tool approval.",
+                "next_step":"Using the existing application access mode, the owner checks GET /api/v1/supervisor/default/scope and explicitly submits the complete selected Project set through PUT. Then read scope again and use the selected Project and existing bound workspace with create under its separate tool approval.",
                 "note":"The owner must explicitly select the complete existing active Project set using the current incarnation and management revision. Project scope is independent of workspace binding, native tool approval and Work initialization. Never issue this owner action through another tool or auto-grant Projects."
             },
             "work_scope":{

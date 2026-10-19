@@ -71,13 +71,10 @@ A normal browser and Lotus inside Bodhi use the same Bamboo
 communication safety; it does not validate Project scope, interpret CAS or
 provide business approval. A native dialog is not required for browser use.
 
-PUT verifies the existing password-login cookie or device credential against
-current durable AccessControl, independently of locality. Open/local access,
-Worker/run tokens and frontend `approved` claims do not authenticate an owner.
-No credential is enrolled and no security setting is changed by this operation.
-The browser sends `application/json` and its exact backend Origin, or an exact
-origin already explicitly configured in the existing CORS allowlist. General
-loopback-development CORS and SameSite alone do not authorize the mutation.
+GET and PUT reuse the application's existing request access mode. Local access
+continues to work as before, and existing remote access controls remain in
+force. This feature adds no scope-specific login, credential, Origin check or
+security configuration. It does not require Bodhi or a native confirmation.
 
 The owner reviews the complete Project set and sends one PUT with the observed
 incarnation/revision. There is no prepare endpoint, extra proof credential or
@@ -86,15 +83,10 @@ result requires a canonical read and a new explicit decision. Existing
 Project/identity checks and storage CAS remain authoritative in Bamboo.
 
 GET advertises `capabilities.project_scope_http_write_v1` and
-`owner_authorization: {available, required: true, kind: "authenticated_owner",
-http_registration: false, code}`. `available` reflects verified credentials on
-this request, not `local_bypass`. Codes distinguish
-`owner_authentication_required` (401 on PUT),
-`owner_authentication_unconfigured` and `owner_authentication_unavailable`
-(503). Invalid Web request Origin is 403 `owner_request_origin_invalid`.
-An unconfigured real server needs the user to use the existing owner setup/login
-flow; tests must not silently configure credentials or claim injected subjects
-prove real browser authentication.
+`owner_authorization: {available: true, required: true, kind: "existing_access",
+http_registration: false, code: null}` after the existing request gate passes.
+This metadata describes the shared HTTP route; it does not enroll credentials,
+grant Projects or replace the existing access policy.
 
 Trusted Rust embeddings may retain an explicitly installed exact-intent
 `AppState::with_supervisor_project_scope_authorizer`. Ordinary browser and shell
@@ -106,7 +98,7 @@ GET returns `scope: {supervisor, state_revision, allowed_projects}`, a
 `capabilities.project_scope_v1` / `supervised_root_create_v1` / `project_scope_http_write_v1`. The observation
 contains no target directory, history, credentials or permission configuration.
 
-After the authenticated owner explicitly reviews the complete Project set, PUT accepts exactly:
+After the owner explicitly reviews the complete Project set, PUT accepts exactly:
 
 ```json
 {
@@ -161,19 +153,19 @@ historical evidence; they do not prove the unified Web path. Use temporary
 projects and data, no paid model, and keep the installed app untouched.
 
 1. Run Lotus in a normal browser without Tauri globals. Read the exact Supervisor,
-   revision and Project catalog. An existing authenticated owner uses one full-set
+   revision and Project catalog. The owner uses the existing access mode, one full-set
    preview and one PUT; verify its receipt, fresh canonical scope and restart
    persistence. The same UI/API is used inside Bodhi.
-2. Reject local/open-only, missing/revoked/run credentials and wrong/missing Origin
-   without scope or task side effects. Test-host injected principals prove those
-   code paths only; report real owner login/configuration gaps separately.
+2. Verify ordinary local access works without new login or credential setup.
+   Preserve the existing request access controls and Worker restriction unchanged;
+   do not substitute test-only authenticated subjects for the real browser path.
 3. Reject stale incarnation/revision, archived/missing Projects and unknown claims.
    Never auto-retry a conflict or uncertain result. Removing Projects revokes
    links; regrant never revives historical links.
 4. Scope does not initialize Work or grant execution/tool permissions. The
    separate existing Root-creation and Work contracts remain in force.
 
-The authenticated HTTP composition and browser integration require their own
+The shared HTTP composition and browser integration require their own
 current-source acceptance. Optional native channels, installed-app changes,
 model routing and publication remain separate; they are not prerequisites for
 normal-browser scope management.
