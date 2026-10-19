@@ -28,6 +28,9 @@ const SECOND: &str = "generation-b";
 #[path = "approval_supervisor_tests.rs"]
 mod supervisor;
 
+#[path = "session_compatibility_tests.rs"]
+mod session_compatibility;
+
 #[derive(Debug)]
 struct Invocation {
     name: String,

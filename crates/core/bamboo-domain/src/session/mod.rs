@@ -65,3 +65,6 @@ pub use task::*;
 pub use tool_authority::*;
 pub use tool_types::{FunctionCall, ToolCall};
 pub use types::*;
+
+#[cfg(test)]
+mod compatibility_boundary_tests;
