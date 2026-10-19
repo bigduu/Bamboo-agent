@@ -290,6 +290,9 @@ pub fn validate_permission_replay_authority(
     target: &PermissionReplayTarget,
     execution_name: &str,
 ) -> Result<Option<ExecutingSupervisorObservation>, AgentError> {
+    session
+        .check_execution_compatibility()
+        .map_err(|error| AgentError::Tool(error.to_string()))?;
     let observation = ExecutingSupervisorObservation::restore_permission_replay_record(
         session,
         target.result_message_index,
@@ -673,8 +676,11 @@ pub async fn refresh_approval_replay_posture(
     configured_mode: PermissionMode,
     execution_name: Option<&str>,
 ) -> Result<ApprovalReplayDecision, AgentError> {
+    session
+        .check_execution_compatibility()
+        .map_err(|error| AgentError::Tool(error.to_string()))?;
     let latest = storage
-        .load_runtime_control_plane(&session.id)
+        .load_execution_admission_snapshot(&session.id)
         .await
         .map_err(|error| {
             AgentError::Tool(format!(
@@ -687,6 +693,9 @@ pub async fn refresh_approval_replay_posture(
                     .to_string(),
             )
         })?;
+    latest
+        .check_execution_compatibility()
+        .map_err(|error| AgentError::Tool(error.to_string()))?;
     let latest_runtime = latest.agent_runtime_state.as_ref().ok_or_else(|| {
         AgentError::Tool(
             "authoritative approval replay posture refresh failed closed: typed mode missing"

@@ -217,6 +217,11 @@ impl Agent {
         session: &mut Session,
         input: impl Into<String>,
     ) -> Option<bamboo_engine::config::UntrustedExecutionInputs> {
+        if session.check_execution_compatibility().is_err() {
+            // The async execution path returns the exact diagnostic; no User
+            // message or optional Skill receipt may precede that refusal.
+            return None;
+        }
         if self.sdk_skills.is_none() {
             return Self::append_user_input(session, input);
         }
@@ -259,6 +264,9 @@ impl Agent {
         input: SdkSkillInput,
         cancel_token: CancellationToken,
     ) -> Result<(), SdkError> {
+        session
+            .check_execution_compatibility()
+            .map_err(|error| AgentError::Tool(error.to_string()))?;
         let skills = self.sdk_skills.as_ref().ok_or_else(|| {
             SdkError::Unsupported(
                 "typed Skills require the complete defaults-backed built-in SDK host".into(),
@@ -344,9 +352,35 @@ impl Agent {
         session: &mut Session,
         input: impl Into<String>,
     ) -> Result<(), AgentError> {
+        self.check_retained_execution_compatibility(session).await?;
         let inputs = self.append_local_user_input(session, input);
         self.run_session_with_cancel_and_inputs(session, CancellationToken::new(), inputs)
             .await
+    }
+
+    async fn check_retained_execution_compatibility(
+        &self,
+        session: &Session,
+    ) -> Result<(), AgentError> {
+        session
+            .check_execution_compatibility()
+            .map_err(|error| AgentError::Tool(error.to_string()))?;
+        let durable = self
+            .inner
+            .persistence()
+            .load_runtime_admission_snapshot(&session.id)
+            .await
+            .map_err(|error| {
+                AgentError::Tool(format!(
+                    "cannot inspect retained Session compatibility: {error}"
+                ))
+            })?;
+        if let Some(durable) = durable {
+            durable
+                .check_execution_compatibility()
+                .map_err(|error| AgentError::Tool(error.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Like [`run`](Self::run) but driven by a caller-owned
@@ -358,6 +392,7 @@ impl Agent {
         input: impl Into<String>,
         cancel_token: CancellationToken,
     ) -> Result<(), AgentError> {
+        self.check_retained_execution_compatibility(session).await?;
         let inputs = self.append_local_user_input(session, input);
         self.run_session_with_cancel_and_inputs(session, cancel_token, inputs)
             .await
@@ -496,6 +531,15 @@ impl Agent {
                 .execute_internal(&mut session, execution_tx, cancel_token, inputs)
                 .await
             {
+                if matches!(&error, AgentError::Tool(message)
+                    if message.starts_with("session_execution_incompatible:"))
+                {
+                    let _ = event_tx
+                        .send(AgentEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                }
                 tracing::warn!("Agent::run_stream execution failed: {error}");
             }
         });
@@ -561,6 +605,9 @@ impl Agent {
         // Keep the existing execution and String append/lease order. The guard
         // is owned by this actual future, independently from cloned executors.
         Box::pin(async move {
+            session
+                .check_execution_compatibility()
+                .map_err(|error| AgentError::Tool(error.to_string()))?;
             // One execution-private view covers Project assignment, approved
             // tool replay and all later runtime checkpoints. Freeze None too.
             let mut execution = self.clone();

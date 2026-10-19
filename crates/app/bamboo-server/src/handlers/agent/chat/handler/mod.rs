@@ -303,6 +303,11 @@ async fn handle_chat(
         existing_workspace_source,
     ) = match state.storage.load_session(&session_id).await {
         Ok(Some(existing)) => {
+            if let Some(response) =
+                crate::handlers::agent::sessions::SessionSummary::execution_conflict(&existing)
+            {
+                return response;
+            }
             let project_id = match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&existing) {
                     bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => Some(project_id),
                     bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
@@ -616,6 +621,12 @@ async fn handle_chat(
     // An existing Root changes tool authority through the recoverable
     // mode-only operation. Keeping an unfenced inline path would allow a late
     // chat POST to undo a recovery result after the client has read detail.
+    if let Some(response) = authoritative_session
+        .as_ref()
+        .and_then(crate::handlers::agent::sessions::SessionSummary::execution_conflict)
+    {
+        return response;
+    }
     let existing_root = authoritative_session.as_ref().is_some_and(|session| {
         session.kind == bamboo_domain::SessionKind::Root && session.parent_session_id.is_none()
     });

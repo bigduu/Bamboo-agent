@@ -270,6 +270,24 @@ pub async fn submit_permission_decision(
     let response_guard =
         bamboo_engine::session_app::respond::acquire_pending_response_guard(&session_id).await;
     let mut permission_guard = Some(Arc::clone(&state.permission_io_lock).lock_owned().await);
+    // The cache may predate another producer's behavior contract. Inspect
+    // canonical storage under the existing response/permission guards before
+    // installing any Once, Session or durable rule, or recording a receipt.
+    let session = state
+        .storage
+        .load_session(&session_id)
+        .await
+        .map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!(
+                "Failed to inspect Session compatibility: {error}"
+            ))
+        })?
+        .ok_or_else(|| AppError::NotFound("session".to_string()))?;
+    if let Some(response) =
+        crate::handlers::agent::sessions::SessionSummary::execution_conflict(&session)
+    {
+        return Ok(response);
+    }
     let existing = config.decision_receipt(
         &session_id,
         &decision.request_id,
@@ -282,10 +300,6 @@ pub async fn submit_permission_decision(
         // A provider may legally reuse a tool-call id in a later round. Even
         // an exact replay receipt for the old generation must not consume that
         // newer parked operation.
-        let session = state
-            .load_session(&session_id)
-            .await
-            .ok_or_else(|| AppError::NotFound("session".to_string()))?;
         if let Some(request) =
             super::pending::persisted_permission_request(&session, &decision.request_id)
         {
@@ -319,10 +333,6 @@ pub async fn submit_permission_decision(
         // Validate the durable pending identity before any grant or policy
         // mutation. The later response CAS repeats this check, closing normal
         // races without ever trusting display text.
-        let session = state
-            .load_session(&session_id)
-            .await
-            .ok_or_else(|| AppError::NotFound("session".to_string()))?;
         let Some(pending) = session.pending_question.as_ref() else {
             if let Some(receipt) = super::pending::persisted_permission_decision_receipt(
                 &session,

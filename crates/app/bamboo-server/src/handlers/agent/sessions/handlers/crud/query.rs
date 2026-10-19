@@ -170,6 +170,7 @@ pub async fn get_session(
                     ));
                 }
             };
+            summary.execution_compatibility = Some(durable_session.execution_compatibility());
             summary.root_orchestration_only =
                 Some(durable_session.root_orchestration_only_enabled());
             summary.thinking_mode = Some(durable_session.root_thinking_mode());
@@ -196,32 +197,42 @@ pub async fn get_session(
                         .ok()
                 })
                 .unwrap_or_default();
-            summary.active_workflow = match durable_session
-                .metadata
-                .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+            // Conflicting execution state remains opaque on read. History and
+            // the compatibility report stay available without interpreting a
+            // retained Workflow payload under this runtime's older contract.
+            summary.active_workflow = if !durable_session
+                .execution_compatibility()
+                .execution_allowed
             {
-                Some(raw) => match serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw) {
-                    Ok(active) => {
-                        let entry = selected_catalog.iter().find(|entry| {
-                            entry.id == active.id
-                                && entry.source == active.source
-                                && entry.revision == active.revision
-                        });
-                        Some(SessionActiveWorkflow::from_active(active, entry))
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            %session_id,
-                            %error,
-                            "active Workflow metadata is malformed in authoritative session detail"
-                        );
-                        return Ok(crate::error::json_error(
-                            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                            "Failed to load active Workflow state",
-                        ));
-                    }
-                },
-                None => None,
+                None
+            } else {
+                match durable_session
+                    .metadata
+                    .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+                {
+                    Some(raw) => match serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw) {
+                        Ok(active) => {
+                            let entry = selected_catalog.iter().find(|entry| {
+                                entry.id == active.id
+                                    && entry.source == active.source
+                                    && entry.revision == active.revision
+                            });
+                            Some(SessionActiveWorkflow::from_active(active, entry))
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                %session_id,
+                                %error,
+                                "active Workflow metadata is malformed in authoritative session detail"
+                            );
+                            return Ok(crate::error::json_error(
+                                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                "Failed to load active Workflow state",
+                            ));
+                        }
+                    },
+                    None => None,
+                }
             };
             // Surface the session ETag (`metadata_version`) so clients can send
             // it back as `If-Match` on metadata writes (optimistic concurrency).

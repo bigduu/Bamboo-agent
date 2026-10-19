@@ -113,6 +113,9 @@ impl Agent {
         user: &bamboo_agent_core::Message,
         app_data_dir: Option<std::path::PathBuf>,
     ) -> crate::runtime::runner::Result<SdkInputSubmission> {
+        session
+            .check_execution_compatibility()
+            .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
         if user.role != bamboo_agent_core::Role::User
             || crate::runtime::config::UntrustedInputObservation::new(&user.id, None).is_none()
             || session.messages.iter().any(|message| message.id == user.id)
@@ -160,6 +163,9 @@ impl Agent {
         receipt: Option<SdkInputSubmission>,
         request: Option<bamboo_domain::SessionSkillRequest>,
     ) -> crate::runtime::runner::Result<crate::runtime::config::UntrustedExecutionInputs> {
+        session
+            .check_execution_compatibility()
+            .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
         use crate::runtime::config::{
             sdk_message_digest, sdk_message_header_digest, SdkPendingInput,
             UntrustedExecutionInputs, UntrustedInputObservation,
@@ -250,6 +256,9 @@ impl Agent {
         session: &mut Session,
         req: ExecuteRequest,
     ) -> crate::runtime::runner::Result<()> {
+        session
+            .check_execution_compatibility()
+            .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
         let lease = self.begin_direct_execution(&session.id).await?;
         self.check_direct_execution_admission(session, &lease)
             .await?;
@@ -276,6 +285,9 @@ impl Agent {
                     "direct execution lease target does not match session".into(),
                 ));
             }
+            session
+                .check_execution_compatibility()
+                .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
             super::counted_loop::admit_registered(
                 session,
                 ownership.as_ref(),

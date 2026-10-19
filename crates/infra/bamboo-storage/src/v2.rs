@@ -578,6 +578,37 @@ pub struct SessionCopyProjectionGuard {
     _runtime_task: RuntimeTaskTransactionWriteGuard,
 }
 
+fn reject_incompatible_session_write(session: &Session) -> io::Result<()> {
+    session.check_execution_compatibility().map_err(|error| {
+        // Existing publisher fences already suppress cache publication of a
+        // rejected Session snapshot; do not turn this refusal into a checkpoint.
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            bamboo_domain::SessionAuthorityConflict(error.to_string()),
+        )
+    })
+}
+
+fn reject_session_version_change(incoming: &Session, durable: &Session) -> io::Result<()> {
+    // Main owns the behavior stamp, while the runtime sidecar owns the latest
+    // retained control state. Do not mistake Main's older control snapshot for
+    // the current state when a valid, compatible sidecar exists.
+    if durable
+        .session_version
+        .is_some_and(|v| v != bamboo_domain::CURRENT_SESSION_VERSION)
+    {
+        reject_incompatible_session_write(durable)?;
+    }
+    if incoming.created_at == durable.created_at
+        && incoming.session_version != durable.session_version
+    {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, bamboo_domain::SessionAuthorityConflict(
+            "session_version_change_requires_new_session: existing behavior stamps are not migrated by ordinary saves".into(),
+        )));
+    }
+    Ok(())
+}
+
 /// Build the sidecar snapshot: the full session minus its `messages` history.
 /// Every field except `messages` is authoritative in the sidecar; on load the
 /// message history is taken back from `session.json`.
@@ -607,6 +638,7 @@ pub(crate) fn runtime_sidecar_snapshot(session: &Session) -> Session {
 fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
     match sidecar {
         Some(mut side) => {
+            side.observe_main_session_version(main.session_version);
             let admission = main
                 .runtime_metadata
                 .as_ref()
@@ -6150,6 +6182,50 @@ impl SessionStoreV2 {
         publish: Option<bamboo_domain::RootActorRuntimePublisher>,
         inherited: Option<&bamboo_domain::InheritedChildWait>,
     ) -> io::Result<Option<Session>> {
+        reject_incompatible_session_write(session)?;
+        // Main owns the behavior contract. A stale compatible caller and
+        // sidecar cannot authorize a checkpoint over a future Main. Reuse the
+        // internal strict reader while these physical writer guards are held;
+        // the public admission reader would acquire the same locks again.
+        // Legacy runtime-only saves now inspect Main too: this correctness
+        // check reads/decodes history and is not an O(1) checkpoint promise.
+        let expected_root_id = if session.kind == SessionKind::Root {
+            session.id.as_str()
+        } else {
+            session.root_session_id.as_str()
+        };
+        if let Some(durable) = self
+            .load_session_from_dir_strict(
+                &self.abs_path_from_rel(rel),
+                &session.id,
+                session.kind,
+                expected_root_id,
+            )
+            .await?
+        {
+            reject_incompatible_session_write(&durable)?;
+        }
+        if let Some(previous) = Self::read_runtime_sidecar_at(
+            &self.abs_path_from_rel(rel).join(RUNTIME_SIDECAR_FILE),
+            &session.id,
+        )
+        .await?
+        {
+            reject_incompatible_session_write(&previous)?;
+            // Runtime does not own Main's stamp. Legacy absence and v1 have
+            // identical semantics; never turn this compatible pair into a
+            // false conflict or rewrite Main from the runtime-only path.
+            if session.session_version != previous.session_version
+                && !(session
+                    .session_version
+                    .is_none_or(|v| v == bamboo_domain::CURRENT_SESSION_VERSION)
+                    && previous
+                        .session_version
+                        .is_none_or(|v| v == bamboo_domain::CURRENT_SESSION_VERSION))
+            {
+                reject_session_version_change(session, &previous)?;
+            }
+        }
         if session
             .metadata
             .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY)
@@ -6347,6 +6423,7 @@ impl SessionStoreV2 {
         answer_permit: Option<&ParentQuestion>,
         manual_title: bool,
     ) -> io::Result<()> {
+        reject_incompatible_session_write(session)?;
         if session
             .metadata
             .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY)
@@ -6383,6 +6460,21 @@ impl SessionStoreV2 {
                 compact_main::validate_full_main(raw.as_bytes())?;
                 let durable: Session = serde_json::from_str(&raw)
                     .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
+                reject_session_version_change(session, &durable)?;
+                if let Some(mut previous_runtime) = Self::read_runtime_sidecar_at(
+                    &current_main
+                        .parent()
+                        .expect("session.json has a parent")
+                        .join(RUNTIME_SIDECAR_FILE),
+                    &session.id,
+                )
+                .await?
+                {
+                    previous_runtime.observe_main_session_version(durable.session_version);
+                    reject_incompatible_session_write(&previous_runtime)?;
+                } else {
+                    reject_incompatible_session_write(&durable)?;
+                }
                 reject_regressing_direct_parent_terminals(session, &durable)?;
                 self.reject_rewriting_broker_receipts(
                     session,
