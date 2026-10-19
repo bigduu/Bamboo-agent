@@ -6234,6 +6234,38 @@ impl SessionStoreV2 {
         inherited: Option<&bamboo_domain::InheritedChildWait>,
     ) -> io::Result<Option<Session>> {
         reject_incompatible_session_write(session)?;
+        if session
+            .metadata
+            .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "scoped Loop checkpoint outcome is uncertain; strict canonical reload required",
+            ));
+        }
+
+        let reconciled = match inherited {
+            Some(inherited) => Some(
+                self.reconcile_inherited_runtime_snapshot(session, inherited, true)
+                    .await?,
+            ),
+            None => None,
+        };
+        let session = reconciled.as_ref().unwrap_or(session);
+        self.check_default_or_root_actor_context(
+            session,
+            &self.abs_path_from_rel(rel),
+            false,
+            guards,
+        )
+        .await?;
+        self.validate_authority_for_save(session).await?;
+        self.validate_root_context_for_save(session).await?;
+        self.validate_child_project_for_write(session, false, Some(rel))
+            .await?;
+        self.reject_regressing_runtime_task(session).await?;
+        // Keep existing Actor/authority refusals typed before the additional
+        // strict read. Compatibility still precedes all physical/index writes.
         // Main owns the behavior contract. A stale compatible caller and
         // sidecar cannot authorize a checkpoint over a future Main. Reuse the
         // internal strict reader while these physical writer guards are held;
@@ -6277,36 +6309,6 @@ impl SessionStoreV2 {
                 reject_session_version_change(session, &previous)?;
             }
         }
-        if session
-            .metadata
-            .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "scoped Loop checkpoint outcome is uncertain; strict canonical reload required",
-            ));
-        }
-
-        let reconciled = match inherited {
-            Some(inherited) => Some(
-                self.reconcile_inherited_runtime_snapshot(session, inherited, true)
-                    .await?,
-            ),
-            None => None,
-        };
-        let session = reconciled.as_ref().unwrap_or(session);
-        self.check_default_or_root_actor_context(
-            session,
-            &self.abs_path_from_rel(rel),
-            false,
-            guards,
-        )
-        .await?;
-        self.validate_authority_for_save(session).await?;
-        self.validate_root_context_for_save(session).await?;
-        self.validate_child_project_for_write(session, false, Some(rel))
-            .await?;
-        self.reject_regressing_runtime_task(session).await?;
         if session.kind == SessionKind::Root && self.get_index_entry(&session.id).await.is_none() {
             let index_bytes = fs::read(&self.index_path).await?;
             let global_index: SessionsIndex = serde_json::from_slice(&index_bytes)
