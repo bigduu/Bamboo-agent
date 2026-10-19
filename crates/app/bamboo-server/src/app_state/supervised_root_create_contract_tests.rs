@@ -879,3 +879,63 @@ async fn versioned_spawn_disabled_stale_and_invalid_scope_refusals_have_no_side_
         );
     }
 }
+
+#[tokio::test]
+async fn versioned_spawn_disabled_exact_shadow_does_not_block_framework_creation_or_approval_recheck() {
+    use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutionContext, ToolExecutor};
+    use bamboo_server_tools::session_control::versioned::{SpawnSessionTool, VersionedRootTools};
+
+    struct ExactShadow(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Tool for ExactShadow {
+        fn name(&self) -> &str { "vendor::spawn_session" }
+        fn description(&self) -> &str { "independent exact registration" }
+        fn parameters_schema(&self) -> serde_json::Value { json!({"type":"object"}) }
+        async fn invoke(&self, _: serde_json::Value, _: ToolCtx) -> Result<ToolOutcome, bamboo_agent_core::tools::ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutcome::Completed(ToolResult::text(true, "exact shadow")))
+        }
+    }
+
+    let f = Fixture::new().await;
+    let session = f.creator.store.load_session(&f.supervisor.session_id).await.unwrap().unwrap();
+    let shadow_calls = Arc::new(AtomicUsize::new(0));
+    let registry = bamboo_tools::ToolRegistry::new();
+    registry.register(ExactShadow(shadow_calls.clone())).unwrap();
+    let legacy: Arc<dyn ToolExecutor> = Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(registry));
+    let spawn = Arc::new(SpawnSessionTool::new(Arc::new(f.creator.clone()), f.creator.store.clone(), f.creator.config.clone()));
+    let installed = VersionedRootTools::new(legacy, spawn, f.creator.store.clone());
+    let tools = installed.for_session(&session).unwrap();
+    let context = || ToolExecutionContext {
+        session_id: Some(&session.id),
+        root_session_id: Some(&session.id),
+        executing_supervisor: ExecutingSupervisorObservation::capture_from_executing_session(&session),
+        ..ToolExecutionContext::none("disabled-owner-recheck")
+    };
+    let call = ToolCall {
+        id: "disabled-owner-recheck".into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "default::spawnSession".into(),
+            arguments: serde_json::to_string(&f.request).unwrap(),
+        },
+    };
+    f.creator.config.write().await.tools.disabled = vec!["vendor::spawn_session".into()];
+    assert_eq!(bamboo_domain::resolve_session_tool_reference(Some(2), "vendor::spawn_session", |name| tools.owns_exact_tool(name)).as_deref(), Some("vendor::spawn_session"));
+    assert!(tools.check_permissions_for_exact(&call, "spawn_session", &context()).await.unwrap().is_none());
+    assert_eq!(f.count().await, 1, "permission recheck must not create a Root");
+    let result = tools.execute_exact_with_context_outcome(&call, "spawn_session", context()).await.unwrap().into_tool_result();
+    let receipt = accepted(result);
+    let target = receipt["target_session_id"].as_str().unwrap();
+    assert_eq!(f.creator.store.load_session(target).await.unwrap().unwrap().kind, bamboo_domain::SessionKind::Root);
+    assert_eq!(f.inbox.inspect(target).await.unwrap().generation, 1);
+    assert_eq!(shadow_calls.load(Ordering::SeqCst), 0);
+    for disabled in ["spawn_session", "spawnSession", "default::spawnSession", "other::spawn_session"] {
+        f.creator.config.write().await.tools.disabled = vec![disabled.into()];
+        let error = tools.check_permissions_for_exact(&call, "spawn_session", &context()).await.err().expect("unshadowed disabled Root must still refuse");
+        assert!(error.to_string().contains("disabled"), "{disabled}: {error}");
+        assert_eq!(f.count().await, 2);
+        assert_eq!(f.inbox.inspect(target).await.unwrap().generation, 1);
+        assert_eq!(shadow_calls.load(Ordering::SeqCst), 0);
+    }
+}

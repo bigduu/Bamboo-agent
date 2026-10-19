@@ -763,4 +763,42 @@ mod tests {
             assert!(observation_round(&mut guard, 5, &[observation.clone()]));
         }
     }
+    #[test]
+    fn versioned_spawn_policy_accounting_keeps_root_and_child_failure_circuits_independent() {
+        for (owner, reference) in [
+            ("spawn_session", "default::spawnSession"),
+            ("vendor::spawn_session", "vendor::spawn_session"),
+            ("spawnSession", "spawnSession"),
+        ] {
+            let call = tool_call(reference, "{}");
+            let child = tool_call("SubAgent", "{}");
+            let mut guard = ToolPolicyGuard::default();
+            for _ in 0..3 {
+                guard.begin_round(80, 3);
+                guard.observe_accounted_outcome(
+                    &call,
+                    &Err("correctable Project/workspace input".into()),
+                    Some(owner),
+                    super::super::per_call::ShellAccountingOutcome::Ordinary,
+                );
+                assert!(guard.check_before_execution_for_name(&child, 0, Some("SubAgent")).is_ok(), "{owner}");
+            }
+            assert!(guard.delegation_failure_message().is_none(), "{owner}");
+            guard.begin_round(80, 3);
+            assert!(guard.check_before_execution_for_name(&call, 0, Some(owner)).is_ok(), "{owner}");
+            for _ in 0..3 {
+                guard.observe_accounted_outcome(
+                    &child,
+                    &Err("actual Child delegation failed".into()),
+                    Some("SubAgent"),
+                    super::super::per_call::ShellAccountingOutcome::Ordinary,
+                );
+            }
+            guard.begin_round(80, 3);
+            assert!(guard.check_before_execution_for_name(&child, 0, Some("SubAgent")).is_err());
+            assert!(guard.check_before_execution_for_name(&call, 0, Some(owner)).is_ok(), "{owner}");
+            assert!(guard.delegation_failure_message().is_some());
+        }
+    }
+
 }
