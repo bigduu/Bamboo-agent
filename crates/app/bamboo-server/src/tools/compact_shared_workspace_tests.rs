@@ -405,7 +405,6 @@ async fn compact_shared_workspace_rechecks_policy_before_child_publication() {
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
 
-
 #[cfg(unix)]
 #[tokio::test]
 async fn compact_rejects_significant_parent_path_whitespace_redirection() {
@@ -427,12 +426,7 @@ async fn compact_rejects_significant_parent_path_whitespace_redirection() {
     parent.set_workspace_path_meta(selected.to_string_lossy());
     parent.metadata_version += 1;
     h.storage.save_session(&parent).await.unwrap();
-    let parent = h
-        .storage
-        .load_session(&parent.id)
-        .await
-        .unwrap()
-        .unwrap();
+    let parent = h.storage.load_session(&parent.id).await.unwrap().unwrap();
     assert_eq!(parent.workspace_path_meta().as_deref(), selected.to_str());
     let before = h.adapter.session_store.list_index_entries().await.len();
     let (tool, port) = recording_tool(&h);
