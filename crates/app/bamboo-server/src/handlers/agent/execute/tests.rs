@@ -2752,16 +2752,16 @@ mod execution_input_http {
                 );
             }
         }
+        let mut events = state.get_session_event_sender(&id).await.subscribe();
         let (status, body) = execute(&state, &id, None).await;
         assert_eq!(status, expected, "{support:?} {model}: {body}");
         if expected == StatusCode::ACCEPTED {
-            tokio::time::timeout(std::time::Duration::from_secs(20), async {
-                while !received.load(Ordering::SeqCst) {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("main provider receives native image or retained reference");
+            let run = body["run_id"].as_str().expect("accepted owned Root run");
+            wait_for_owned_terminal(&state, &id, run, &mut events).await;
+            assert!(
+                received.load(Ordering::SeqCst),
+                "completed main provider received native image or retained reference"
+            );
         } else {
             assert!(
                 !received.load(Ordering::SeqCst),
@@ -2790,6 +2790,13 @@ mod execution_input_http {
             assert!(error.contains("defaults.vision"));
             assert!(error.contains("vision_model"));
             assert!(error.contains("genuinely Vision-capable main"));
+        }
+        if expected == StatusCode::ACCEPTED {
+            tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+                .await
+                .expect("Vision HTTP fixture infrastructure shutdown");
+        } else {
+            shutdown_rejected_race(&state, &[&id]).await;
         }
     }
 
