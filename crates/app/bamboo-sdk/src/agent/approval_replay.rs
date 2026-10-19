@@ -140,7 +140,9 @@ impl Agent {
             return Err(invalid("generation marker has no tool-call marker"));
         }
         let executor = self.inner.default_tools();
-        let executor = executor.for_session(session).unwrap_or(executor);
+        let executor = executor
+            .for_session(session)
+            .unwrap_or_else(|| executor.clone());
 
         if let Some(pending) = session.pending_question.as_ref() {
             if let Some(message) = latest_result(session, &pending.tool_call_id) {

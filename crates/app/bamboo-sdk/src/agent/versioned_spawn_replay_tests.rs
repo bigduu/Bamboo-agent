@@ -28,7 +28,11 @@ impl Tool for VersionedProbeTool {
                 ctx.session_id().unwrap(),
                 &ctx.tool_call_id,
             ),
-            flags: ToolExecutionSessionFlags::default(),
+            flags: ToolExecutionSessionFlags {
+                bypass_permissions: ctx.bypass_permissions,
+                auto_approve_permissions: ctx.auto_approve_permissions,
+                plan_read_only: ctx.plan_read_only,
+            },
             supervisor_absent: ctx.executing_supervisor.is_none(),
         });
         self.probe.actions.fetch_add(1, Ordering::SeqCst);
@@ -88,10 +92,11 @@ fn versioned_agent(fixture: &Fixture) -> (Arc<PermissionConfig>, Agent) {
 
 async fn versioned_pending(fixture: &Fixture, version: Option<u32>) -> (Session, Value) {
     let session = if version == Some(2) {
-        SupervisorSessionService::new(fixture.store.clone())
+        let receipt = SupervisorSessionService::new(fixture.store.clone())
             .get_or_create_default("test-model")
             .await
-            .unwrap()
+            .unwrap();
+        fixture.reload(&receipt.session_id).await
     } else {
         let mut session = Session::new("legacy-spawn-sdk", "test-model");
         session.session_version = version;
@@ -99,7 +104,7 @@ async fn versioned_pending(fixture: &Fixture, version: Option<u32>) -> (Session,
         session
     };
     let args = if version == Some(2) {
-        json!({"operation_id":uuid::Uuid::new_v4(), "expected_state_revision":1,
+        json!({"operation_id":"7d4fd839-3f5f-4e26-b587-a0d2cb5724cb", "expected_state_revision":1,
             "project_id":"explicit-project", "workspace_path":"/explicit/worker", "message":"bounded instruction"})
     } else {
         json!({"action":"create", "prompt":"bounded child instruction"})
@@ -159,6 +164,7 @@ async fn versioned_spawn_typed_replay_reopens_with_original_owner_and_no_reinter
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, expected);
         assert_eq!(calls[0].arguments, args);
+        assert_eq!(calls[0].flags, ToolExecutionSessionFlags::default());
         assert_eq!(
             calls[0].generation.as_deref(),
             Some(request.request_generation.as_str())
