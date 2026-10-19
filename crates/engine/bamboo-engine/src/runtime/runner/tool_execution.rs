@@ -566,7 +566,34 @@ pub(crate) async fn execute_round_tool_calls(
     // Retain observation outside the pre-Start parallel timeouts. Per-call
     // observers share this token, even if their futures are dropped.
     let control = execution.frame.config.loop_control.as_ref();
-    let dispatch = execute_round_tool_calls_inner(execution);
+    let session_id = execution.session.id.clone();
+    let reader = super::image_fallback::round_needs_image_references(
+        execution.tool_calls,
+        execution.effective_callable_set,
+        execution
+            .frame
+            .config
+            .hook_runner
+            .has_hooks_for(AgentHookPoint::BeforeToolExecution),
+    )
+    .then(|| {
+        super::image_fallback::image_reference_reader(
+            &*execution.session,
+            execution.frame.config.attachment_reader.clone(),
+        )
+    });
+    let dispatch = async move {
+        if let Some(reader) = reader {
+            bamboo_tools::tools::view_image::with_image_reference_reader(
+                &session_id,
+                reader,
+                execute_round_tool_calls_inner(execution),
+            )
+            .await
+        } else {
+            execute_round_tool_calls_inner(execution).await
+        }
+    };
     if let Some(control) = control {
         let (result, observation) =
             bamboo_agent_core::tools::observe_tool_suspension(false, dispatch).await;
