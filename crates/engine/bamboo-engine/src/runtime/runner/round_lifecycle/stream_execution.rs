@@ -860,7 +860,9 @@ fn build_request_envelope_reconciled_for_loading_mode(
     if let Some(hint) = observation_progress_hint {
         let mut message = Message::user(hint);
         if crate::runtime::runner::tool_execution::is_required_progress_feedback(hint) {
-            message.metadata = Some(serde_json::json!({"runtime_kind":"observation_progress_feedback", "source":"runtime"}));
+            message.metadata = Some(
+                serde_json::json!({"runtime_kind":"observation_progress_feedback", "source":"runtime"}),
+            );
         }
         conversation_messages.push(message);
     }

@@ -111,7 +111,9 @@ pub(crate) async fn finish_exhausted_progress(
     summary: &str,
 ) -> Result<(), AgentError> {
     if !quiet_poll_guard_active(session, runtime, config) {
-        return Err(AgentError::Tool("progress feedback cannot end this owned execution".into()));
+        return Err(AgentError::Tool(
+            "progress feedback cannot end this owned execution".into(),
+        ));
     }
     let mut candidate = session.clone();
     let mut notice = bamboo_agent_core::Message::assistant(summary, None);
@@ -121,15 +123,25 @@ pub(crate) async fn finish_exhausted_progress(
         "progress_feedback": feedback,
     }));
     candidate.add_message(notice.clone());
-    candidate.metadata.insert("runtime.completion_reason".into(), "observation_progress_exhausted".into());
+    candidate.metadata.insert(
+        "runtime.completion_reason".into(),
+        "observation_progress_exhausted".into(),
+    );
     crate::runtime::runner::state_bridge::write_runtime_state(&mut candidate, runtime);
     if let Some(persistence) = config.persistence.as_ref() {
-        persistence.save_runtime_session(&mut candidate).await.map_err(|error| {
-            AgentError::Tool(format!("Progress feedback summary could not be saved: {error}"))
-        })?;
+        persistence
+            .save_runtime_session(&mut candidate)
+            .await
+            .map_err(|error| {
+                AgentError::Tool(format!(
+                    "Progress feedback summary could not be saved: {error}"
+                ))
+            })?;
     }
     *session = candidate;
-    let _ = event_tx.send(AgentEvent::message_appended(&session.id, &notice)).await;
+    let _ = event_tx
+        .send(AgentEvent::message_appended(&session.id, &notice))
+        .await;
     Ok(())
 }
 
@@ -302,36 +314,70 @@ mod tests {
 
     #[tokio::test]
     async fn model_progress_exhaustion_checkpoints_normal_notice_without_question() {
-        let store = Arc::new(QuestionPersistence { saved: Mutex::new(None), fail: false });
-        let config = AgentLoopConfig { persistence: Some(store.clone()), ..Default::default() };
+        let store = Arc::new(QuestionPersistence {
+            saved: Mutex::new(None),
+            fail: false,
+        });
+        let config = AgentLoopConfig {
+            persistence: Some(store.clone()),
+            ..Default::default()
+        };
         let mut session = Session::new("feedback-finish", "model");
         let runtime = AgentRuntimeState::default();
         let (tx, mut rx) = mpsc::channel(4);
-        finish_exhausted_progress(&mut session, &runtime, &tx, &config,
-            "[runtime_progress_feedback_v1]\n{}", "The task is not confirmed complete.").await.unwrap();
+        finish_exhausted_progress(
+            &mut session,
+            &runtime,
+            &tx,
+            &config,
+            "[runtime_progress_feedback_v1]\n{}",
+            "The task is not confirmed complete.",
+        )
+        .await
+        .unwrap();
         let saved = store.saved.lock().unwrap().clone().unwrap();
         assert!(saved.pending_question.is_none());
         assert!(!saved.metadata.contains_key("runtime.suspend_reason"));
-        assert_eq!(saved.metadata["runtime.completion_reason"], "observation_progress_exhausted");
-        assert_eq!(saved.messages.last().unwrap().metadata.as_ref().unwrap()["runtime_kind"],
-            "observation_progress_exhausted");
-        assert!(matches!(rx.try_recv().unwrap(), AgentEvent::MessageAppended { .. }));
+        assert_eq!(
+            saved.metadata["runtime.completion_reason"],
+            "observation_progress_exhausted"
+        );
+        assert_eq!(
+            saved.messages.last().unwrap().metadata.as_ref().unwrap()["runtime_kind"],
+            "observation_progress_exhausted"
+        );
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::MessageAppended { .. }
+        ));
         assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn model_progress_exhaustion_failed_checkpoint_keeps_caller_and_events() {
-        let store = Arc::new(QuestionPersistence { saved: Mutex::new(None), fail: true });
-        let config = AgentLoopConfig { persistence: Some(store), ..Default::default() };
+        let store = Arc::new(QuestionPersistence {
+            saved: Mutex::new(None),
+            fail: true,
+        });
+        let config = AgentLoopConfig {
+            persistence: Some(store),
+            ..Default::default()
+        };
         let mut session = Session::new("feedback-finish-failure", "model");
         let before = serde_json::to_value(&session).unwrap();
         let (tx, mut rx) = mpsc::channel(4);
-        let error = finish_exhausted_progress(&mut session, &AgentRuntimeState::default(),
-            &tx, &config, "[runtime_progress_feedback_v1]\n{}", "The task is not confirmed complete.")
-            .await.expect_err("rejected checkpoint must not publish a completion notice");
+        let error = finish_exhausted_progress(
+            &mut session,
+            &AgentRuntimeState::default(),
+            &tx,
+            &config,
+            "[runtime_progress_feedback_v1]\n{}",
+            "The task is not confirmed complete.",
+        )
+        .await
+        .expect_err("rejected checkpoint must not publish a completion notice");
         assert!(error.to_string().contains("question save failed"));
         assert_eq!(serde_json::to_value(&session).unwrap(), before);
         assert!(rx.try_recv().is_err());
     }
-
 }

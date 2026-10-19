@@ -72,17 +72,26 @@ impl QuietPollGuard {
         let Some((id, empty_poll)) = poll_args(call) else {
             return;
         };
-        let raw = outcome.result.as_ref().ok()
+        let raw = outcome
+            .result
+            .as_ref()
+            .ok()
             .filter(|result| result.success && result.images.is_empty())
             .and_then(|result| serde_json::from_str::<serde_json::Value>(&result.result).ok());
         if let Some(value) = raw.as_ref() {
             let owned_result = value["session_id"].as_str() == Some(id.as_str())
                 // Terminal exec results intentionally omit their collected handle.
                 || (value["status"] == "completed" && value.get("session_id").is_none());
-            if owned_result && (value["output"].as_str().is_some_and(|output| !output.is_empty())
-                || value["output_omitted_bytes"].as_u64().is_some_and(|bytes| bytes > 0)
-                || value["status"] == "completed"
-                || value["polling"]["exit_observed"] == true) {
+            if owned_result
+                && (value["output"]
+                    .as_str()
+                    .is_some_and(|output| !output.is_empty())
+                    || value["output_omitted_bytes"]
+                        .as_u64()
+                        .is_some_and(|bytes| bytes > 0)
+                    || value["status"] == "completed"
+                    || value["polling"]["exit_observed"] == true)
+            {
                 self.observed_progress = true;
             }
         }
@@ -129,7 +138,9 @@ impl QuietPollGuard {
                 tool_call_id: call.id.chars().take(129).collect(),
                 elapsed_ms: value["polling"]["elapsed_ms"].as_u64().unwrap_or(0),
                 output_idle_ms: value["polling"]["output_idle_ms"].as_u64().unwrap_or(0),
-                consecutive_empty_readouts: value["polling"]["consecutive_empty_readouts"].as_u64().unwrap_or(0),
+                consecutive_empty_readouts: value["polling"]["consecutive_empty_readouts"]
+                    .as_u64()
+                    .unwrap_or(0),
             });
             self.pending = Some(id);
         }
@@ -141,7 +152,9 @@ impl QuietPollGuard {
 
     /// Once the complete batch is paired, feedback releases its suppression.
     /// The next model-requested read must reach the real owned capture again.
-    pub(super) fn take_feedback_evidence(&mut self) -> Option<super::progress_feedback::ProgressEvidence> {
+    pub(super) fn take_feedback_evidence(
+        &mut self,
+    ) -> Option<super::progress_feedback::ProgressEvidence> {
         let id = self.pending.take()?;
         self.readouts.remove(&id);
         self.last_quiet.take()
@@ -378,12 +391,18 @@ mod tests {
     fn feedback_consumption_rearms_a_real_poll_for_late_output() {
         let mut guard = QuietPollGuard::default();
         let poll = call("write_stdin", serde_json::json!({"session_id":"handle"}));
-        for tick in 0..4 { guard.observe(&poll, &outcome(tick, ""), Some("write_stdin")); }
+        for tick in 0..4 {
+            guard.observe(&poll, &outcome(tick, ""), Some("write_stdin"));
+        }
         assert!(guard.suppress(&poll, Some("write_stdin")).is_some());
-        assert!(matches!(guard.take_feedback_evidence(),
-            Some(super::super::progress_feedback::ProgressEvidence::QuietCommand { .. })));
-        assert!(guard.suppress(&poll, Some("write_stdin")).is_none(),
-            "the next model round must reach the real owned capture");
+        assert!(matches!(
+            guard.take_feedback_evidence(),
+            Some(super::super::progress_feedback::ProgressEvidence::QuietCommand { .. })
+        ));
+        assert!(
+            guard.suppress(&poll, Some("write_stdin")).is_none(),
+            "the next model round must reach the real owned capture"
+        );
         guard.observe(&poll, &outcome(4, "late output"), Some("write_stdin"));
         assert!(guard.take_observed_progress());
         assert!(!guard.take_observed_progress());
@@ -395,10 +414,13 @@ mod tests {
         let mut guard = QuietPollGuard::default();
         let poll = call("write_stdin", serde_json::json!({"session_id":"handle"}));
         let mut result = outcome(4, "");
-        let mut raw: serde_json::Value = serde_json::from_str(&result.result.as_ref().unwrap().result).unwrap();
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&result.result.as_ref().unwrap().result).unwrap();
         raw["polling"]["exit_observed"] = serde_json::json!(true);
         result.result.as_mut().unwrap().result = raw.to_string();
-        for _ in 0..8 { guard.observe(&poll, &result, Some("write_stdin")); }
+        for _ in 0..8 {
+            guard.observe(&poll, &result, Some("write_stdin"));
+        }
         assert!(!guard.pending());
         assert!(guard.take_feedback_evidence().is_none());
         assert!(guard.take_observed_progress());
@@ -408,17 +430,19 @@ mod tests {
     fn collected_terminal_result_releases_recovery_even_without_a_numeric_exit_code() {
         let mut guard = QuietPollGuard::default();
         let poll = call("write_stdin", serde_json::json!({"session_id":"handle"}));
-        for tick in 0..4 { guard.observe(&poll, &outcome(tick, ""), Some("write_stdin")); }
+        for tick in 0..4 {
+            guard.observe(&poll, &outcome(tick, ""), Some("write_stdin"));
+        }
         guard.take_feedback_evidence().unwrap();
         let mut terminal = outcome(5, "");
         terminal.result.as_mut().unwrap().result = serde_json::json!({
             "status":"completed", "output":"", "exit_code":null,
             "polling":{"exit_observed":true},
-        }).to_string();
+        })
+        .to_string();
         guard.observe(&poll, &terminal, Some("write_stdin"));
         assert!(guard.take_observed_progress());
         assert!(!guard.pending());
         assert!(guard.suppress(&poll, Some("write_stdin")).is_none());
     }
-
 }

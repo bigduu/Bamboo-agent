@@ -435,7 +435,7 @@ mod tests {
         assert_eq!(packet["exhaustion"], "recovery_round_limit");
         assert_eq!(packet["recovery"]["rounds_remaining"], 0);
         assert!(summary.contains("not confirmed complete"));
-        assert!(summary.contains("before another model request or tool round"));
+        assert!(summary.contains("before another recovery-model request or tool round"));
         assert!(!summary.contains("command"));
         // Exhausted is an instruction to stop, not a fifth/summary provider turn.
     }
@@ -574,7 +574,14 @@ mod tests {
                 true
             );
         }
-        for absent in ["args", "arguments", "stdout", "output", "command", "approval"] {
+        for absent in [
+            "args",
+            "arguments",
+            "stdout",
+            "output",
+            "command",
+            "approval",
+        ] {
             assert!(packet["evidence"].get(absent).is_none());
         }
     }

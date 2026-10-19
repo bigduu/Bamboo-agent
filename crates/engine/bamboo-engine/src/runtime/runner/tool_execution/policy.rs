@@ -82,7 +82,9 @@ impl ObservationProgress {
 
     fn finish_round(&mut self) -> Option<&'static str> {
         let current = self.current.take().filter(|round| !round.is_empty());
-        self.made_progress = current.as_ref().is_some_and(|round| self.previous.as_ref() != Some(round));
+        self.made_progress = current
+            .as_ref()
+            .is_some_and(|round| self.previous.as_ref() != Some(round));
         self.unchanged_rounds = match &current {
             Some(round) if self.previous.as_ref() == Some(round) => {
                 self.unchanged_rounds.saturating_add(1)
@@ -306,15 +308,20 @@ impl ToolPolicyGuard {
             return FeedbackDecision::Continue(legacy_hint.map(str::to_owned));
         }
         let quiet_evidence = self.quiet_polls.take_feedback_evidence();
-        let made_progress = self.observation_progress.made_progress
-            || self.quiet_polls.take_observed_progress();
+        let made_progress =
+            self.observation_progress.made_progress || self.quiet_polls.take_observed_progress();
         let evidence = quiet_evidence.or_else(|| {
-            (self.observation_progress.unchanged_rounds >= UNCHANGED_OBSERVATION_ROUNDS)
-                .then(|| ProgressEvidence::UnchangedFiles {
+            (self.observation_progress.unchanged_rounds >= UNCHANGED_OBSERVATION_ROUNDS).then(
+                || ProgressEvidence::UnchangedFiles {
                     consecutive_rounds: self.observation_progress.unchanged_rounds,
-                    observation_count: self.observation_progress.previous.as_ref().map_or(0, BTreeSet::len),
+                    observation_count: self
+                        .observation_progress
+                        .previous
+                        .as_ref()
+                        .map_or(0, BTreeSet::len),
                     tool_call_ids: self.observation_progress.last_call_ids.clone(),
-                })
+                },
+            )
         });
         self.progress_feedback.next_round(evidence, made_progress)
     }

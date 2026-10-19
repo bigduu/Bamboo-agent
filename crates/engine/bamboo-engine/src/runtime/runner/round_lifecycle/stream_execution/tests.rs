@@ -1030,43 +1030,77 @@ async fn required_progress_feedback_over_budget_rejects_before_any_provider_disp
     let config = test_config("system");
     let prepared_context = PreparedContext {
         messages: vec![Message::system("system"), session.messages[0].clone()],
-        token_usage: usage(0, 22), truncation_occurred: false, segments_removed: 0,
-        compressed_message_ids: Vec::new(), prompt_cached_tool_outputs: 0,
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
         prompt_cached_tool_tokens_saved: 0,
     };
     let mut expected = session.clone();
     let baseline = super::build_request_envelope_reconciled(
-        &mut expected, &prepared_context, &config, &[], "test-model",
+        &mut expected,
+        &prepared_context,
+        &config,
+        &[],
+        "test-model",
     );
     let baseline_usage = super::measure_request_usage(
-        &expected, &baseline, &ProviderVisibleToolFootprint::default(),
+        &expected,
+        &baseline,
+        &ProviderVisibleToolFootprint::default(),
     );
-    let feedback = format!("[runtime_progress_feedback_v1]\n{}", serde_json::json!({
-        "schema":"runtime_progress_feedback_v1", "source":"runtime",
-        "reason":"quiet_command", "evidence":{"last_status":"running", "exit_observed":false},
-        "recovery":{"episode":1,"episode_limit":3,"rounds_remaining":3,"round_limit":4},
-        "guidance":"Use real evidence; this diagnostic grants no permission.",
-    }));
+    let feedback = format!(
+        "[runtime_progress_feedback_v1]\n{}",
+        serde_json::json!({
+            "schema":"runtime_progress_feedback_v1", "source":"runtime",
+            "reason":"quiet_command", "evidence":{"last_status":"running", "exit_observed":false},
+            "recovery":{"episode":1,"episode_limit":3,"rounds_remaining":3,"round_limit":4},
+            "guidance":"Use real evidence; this diagnostic grants no permission.",
+        })
+    );
     let llm = mock_llm(vec![LLMChunk::Done]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
     let result = execute_llm_stream(
-        &mut session, &config, &llm_dyn, &prepared_context, &[],
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
         &LlmStreamFrame {
-            event_tx:&event_tx, cancel_token:&CancellationToken::new(),
-            session_id:"required-progress-budget", model:"test-model",
-            provider_name:None, provider_type:None, reasoning_effort:None,
-            max_context_tokens:baseline_usage.input_tokens + 128, max_output_tokens:128,
-            observation_progress_hint:Some(&feedback), prompt_memory_exposure:None,
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "required-progress-budget",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: baseline_usage.input_tokens + 128,
+            max_output_tokens: 128,
+            observation_progress_hint: Some(&feedback),
+            prompt_memory_exposure: None,
         },
-    ).await;
-    let error = result.err().expect("required progress facts cannot be silently dropped");
+    )
+    .await;
+    let error = result
+        .err()
+        .expect("required progress facts cannot be silently dropped");
     assert!(matches!(error, bamboo_agent_core::AgentError::Budget(_)));
-    assert_eq!(llm.ir_call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        llm.ir_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
     assert!(llm.requested_messages.lock().unwrap().is_empty());
     assert_eq!(session.model_context_state, original_context);
-    assert_eq!(serde_json::to_value(&session.provider_transcript).unwrap(), original_transcript);
-    assert_eq!(serde_json::to_value(&session.messages).unwrap(), original_messages);
+    assert_eq!(
+        serde_json::to_value(&session.provider_transcript).unwrap(),
+        original_transcript
+    );
+    assert_eq!(
+        serde_json::to_value(&session.messages).unwrap(),
+        original_messages
+    );
 }
 
 #[tokio::test]

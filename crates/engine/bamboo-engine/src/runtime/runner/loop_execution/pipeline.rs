@@ -3222,17 +3222,29 @@ async fn run_pipeline_inner(
         // Human input. The same-model facts are mandatory for each bounded
         // recovery request; they create neither a pending question nor a grant.
         let feedback_active = crate::runtime::runner::tool_execution::progress_feedback_active(
-            session, &state.runtime_state, config,
+            session,
+            &state.runtime_state,
+            config,
         );
-        let observation_progress_hint = match tool_policy_guard.feedback_for_next_round(feedback_active) {
-            crate::runtime::runner::tool_execution::FeedbackDecision::Continue(hint) => hint,
-            crate::runtime::runner::tool_execution::FeedbackDecision::Exhausted { feedback, summary } => {
-                crate::runtime::runner::tool_execution::finish_exhausted_progress(
-                    session, &state.runtime_state, event_tx, config, &feedback, &summary,
-                ).await?;
-                break;
-            }
-        };
+        let observation_progress_hint =
+            match tool_policy_guard.feedback_for_next_round(feedback_active) {
+                crate::runtime::runner::tool_execution::FeedbackDecision::Continue(hint) => hint,
+                crate::runtime::runner::tool_execution::FeedbackDecision::Exhausted {
+                    feedback,
+                    summary,
+                } => {
+                    crate::runtime::runner::tool_execution::finish_exhausted_progress(
+                        session,
+                        &state.runtime_state,
+                        event_tx,
+                        config,
+                        &feedback,
+                        &summary,
+                    )
+                    .await?;
+                    break;
+                }
+            };
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {

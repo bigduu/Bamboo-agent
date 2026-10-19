@@ -94,29 +94,50 @@ impl LLMProvider for IgnoredQuietReminder {
                     assert_eq!(result["exit_code"], 7);
                     assert_eq!(result["output"], "quiet-finished");
                     return Ok(Box::pin(stream::iter([
-                        Ok(LLMChunk::Token("Observed command exit 7 after runtime feedback.".into())),
+                        Ok(LLMChunk::Token(
+                            "Observed command exit 7 after runtime feedback.".into(),
+                        )),
                         Ok(LLMChunk::Done),
                     ])));
                 }
-                assert!(messages.iter().any(|message| message.content.contains("[runtime_progress_feedback_v1]")),
-                    "the same model receives structured facts instead of a Human question");
+                assert!(
+                    messages
+                        .iter()
+                        .any(|message| message.content.contains("[runtime_progress_feedback_v1]")),
+                    "the same model receives structured facts instead of a Human question"
+                );
                 if let Some(gate) = self.release_on_feedback.as_ref() {
                     assert_eq!(round, 2);
                     tokio::time::resume();
                     std::fs::write(gate, b"release").unwrap();
                     tokio::time::timeout(Duration::from_secs(5), async {
-                        while bamboo_tools::tools::bash_runtime::get_shell(&handle).unwrap().status() == "running" {
+                        while bamboo_tools::tools::bash_runtime::get_shell(&handle)
+                            .unwrap()
+                            .status()
+                            == "running"
+                        {
                             tokio::time::sleep(Duration::from_millis(1)).await;
                         }
-                    }).await.unwrap();
-                    vec![tool_call("feedback-final", "write_stdin",
-                        json!({"session_id":handle,"yield_time_ms":30_000}))]
+                    })
+                    .await
+                    .unwrap();
+                    vec![tool_call(
+                        "feedback-final",
+                        "write_stdin",
+                        json!({"session_id":handle,"yield_time_ms":30_000}),
+                    )]
                 } else {
-                    assert!(round < 6, "finite recovery ends before a seventh provider request");
-                    vec![tool_call(&format!("feedback-poll-{round}"), "write_stdin",
-                        json!({"session_id":handle,"yield_time_ms":250}))]
+                    assert!(
+                        round < 6,
+                        "finite recovery ends before a seventh provider request"
+                    );
+                    vec![tool_call(
+                        &format!("feedback-poll-{round}"),
+                        "write_stdin",
+                        json!({"session_id":handle,"yield_time_ms":250}),
+                    )]
                 }
-            },
+            }
         };
         Ok(Box::pin(stream::iter([
             Ok(LLMChunk::ToolCalls(calls)),
@@ -252,16 +273,34 @@ async fn quiet_feedback_fixture(finish_after_feedback: bool) {
     )
     .await
     .unwrap();
-    assert_eq!(provider.calls.load(Ordering::SeqCst), if finish_after_feedback { 4 } else { 6 });
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        if finish_after_feedback { 4 } else { 6 }
+    );
     assert!(session.pending_question.is_none());
-    assert_ne!(state.runtime_state.status, bamboo_domain::AgentStatusState::Suspended);
+    assert_ne!(
+        state.runtime_state.status,
+        bamboo_domain::AgentStatusState::Suspended
+    );
     assert!(!session.metadata.contains_key("runtime.suspend_reason"));
-    assert_eq!(session.metadata.get("runtime.completion_reason").map(String::as_str),
-        if finish_after_feedback { None } else { Some("observation_progress_exhausted") });
+    assert_eq!(
+        session
+            .metadata
+            .get("runtime.completion_reason")
+            .map(String::as_str),
+        if finish_after_feedback {
+            None
+        } else {
+            Some("observation_progress_exhausted")
+        }
+    );
     let handle = provider.handle.lock().unwrap().clone().unwrap();
     let shell = bamboo_tools::tools::bash_runtime::get_shell(&handle);
     if finish_after_feedback {
-        assert!(shell.is_none(), "the real final capture consumed the completed handle");
+        assert!(
+            shell.is_none(),
+            "the real final capture consumed the completed handle"
+        );
     } else {
         assert_eq!(shell.as_ref().unwrap().status(), "running");
     }
@@ -296,8 +335,10 @@ async fn quiet_feedback_fixture(finish_after_feedback: bool) {
         for round in 2..6 {
             let actual = result_for(&session.messages, &format!("feedback-poll-{round}"));
             assert_eq!(actual["status"], "running");
-            assert!(actual["polling"].get("poll_suppressed").is_none(),
-                "every post-feedback read reaches real capture, rather than synthetic running");
+            assert!(
+                actual["polling"].get("poll_suppressed").is_none(),
+                "every post-feedback read reaches real capture, rather than synthetic running"
+            );
         }
     }
     for id in ["other-input", "other-operation"] {
@@ -378,10 +419,7 @@ async fn quiet_feedback_fixture(finish_after_feedback: bool) {
     .await
     .unwrap();
     assert!(session.pending_question.is_none());
-    assert_eq!(
-        resumed.calls.load(Ordering::SeqCst),
-        3
-    );
+    assert_eq!(resumed.calls.load(Ordering::SeqCst), 3);
     assert!(bamboo_tools::tools::bash_runtime::get_shell(&handle).is_none());
 }
 

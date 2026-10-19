@@ -36,7 +36,10 @@ fn provider_hint_count(messages: &[Message]) -> usize {
     messages
         .iter()
         .filter(|message| message.role == Role::User)
-        .map(|message| message.content.matches(HINT_TEXT).count() + message.content.matches(FEEDBACK_PREFIX).count())
+        .map(|message| {
+            message.content.matches(HINT_TEXT).count()
+                + message.content.matches(FEEDBACK_PREFIX).count()
+        })
         .sum()
 }
 
@@ -306,13 +309,23 @@ async fn run_observation_loop_with_retry(
         completes, 1,
         "the existing terminal event is sent for completed and suspended runs"
     );
-    assert_eq!(questions, 0, "new repeat feedback never asks Human to Continue");
+    assert_eq!(
+        questions, 0,
+        "new repeat feedback never asks Human to Continue"
+    );
     assert!(session.pending_question.is_none());
     assert_eq!(provider.calls.load(Ordering::SeqCst), 7);
     // Model feedback must neither replace a real observation nor manufacture
     // execution. Every original call still keeps its successful paired result.
-    for call in session.messages.iter().filter_map(|message| message.tool_calls.as_ref()).flatten() {
-        let result = session.messages.iter()
+    for call in session
+        .messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+    {
+        let result = session
+            .messages
+            .iter()
             .find(|message| message.tool_call_id.as_deref() == Some(call.id.as_str()))
             .expect("every real call remains paired");
         assert_eq!(result.tool_success, Some(true));
@@ -336,8 +349,7 @@ async fn observation_progress_request_retry_keeps_the_same_one_shot_hint() {
 }
 
 #[tokio::test]
-async fn observation_progress_real_loop_feedback_keeps_pairs_and_resets_on_user_message(
-) {
+async fn observation_progress_real_loop_feedback_keeps_pairs_and_resets_on_user_message() {
     let mut session = Session::new("observation-progress", "model");
     assert_eq!(
         run_observation_loop(&mut session, "Read", None).await,
