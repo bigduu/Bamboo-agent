@@ -229,11 +229,14 @@ async fn quiet_feedback_fixture(finish_after_feedback: bool) {
     let gate = dir.path().join("release");
     let _release = ReleaseGate(gate.clone());
     let quoted_gate = gate.to_string_lossy().replace('\'', "'\\''");
-    let (mut session, config, mut state) = fixture(if finish_after_feedback {
+    let (mut session, mut config, mut state) = fixture(if finish_after_feedback {
         "quiet-exit-race"
     } else {
         "ignored-quiet-polling"
     });
+    // Let the diagnostic recovery budget, rather than the generic round cap,
+    // determine this fixture's stop. Other fixtures keep their original cap.
+    config.run_budget.max_rounds = None;
     let executor = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
     let mut side_ctx = ToolCtx::none("side-start");
     side_ctx.session_id = Some(Arc::from(session.id.as_str()));

@@ -660,7 +660,28 @@ async fn observation_progress_new_human_input_resets_streak_before_exhaustion() 
 #[tokio::test]
 async fn observation_progress_hidden_resume_keeps_question_with_zero_model_dispatch() {
     let mut session = Session::new("progress-hidden-resume", "model");
-    run_observation_loop(&mut session, "Read", None).await;
+    // A legacy pause snapshot remains valid history. The new detector must
+    // not be run to manufacture it or leave new exhaustion metadata behind.
+    session.add_message(Message::system(
+        "Complete the bounded task using collected evidence.",
+    ));
+    session.add_message(Message::user("Inspect the file and finish the task."));
+    session.add_message(Message::assistant(
+        "",
+        Some(vec![ToolCall {
+            id: "legacy-progress-read".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "Read".into(),
+                arguments: serde_json::json!({"path":"file","offset":1}).to_string(),
+            },
+        }]),
+    ));
+    let mut result = Message::tool_result("legacy-progress-read", "same evidence");
+    result.tool_success = Some(true);
+    session.add_message(result);
+    let mut runtime = bamboo_domain::AgentRuntimeState::new(&session.id);
+    crate::session_app::no_progress::create_question(&mut session, &mut runtime);
     let question_id = session
         .pending_question
         .as_ref()
@@ -716,8 +737,8 @@ async fn observation_progress_hidden_resume_keeps_question_with_zero_model_dispa
         bamboo_domain::AgentStatusState::Suspended
     );
     let original_count = evidence.as_array().unwrap().len();
-    // System prompt setup may refresh its own body; the original real tool
-    // pairs and runtime question remain byte-for-byte identical.
+    // System prompt setup may refresh its own body; the retained historical
+    // tool pair and runtime question remain byte-for-byte identical.
     for original in evidence
         .as_array()
         .unwrap()
