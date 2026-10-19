@@ -447,7 +447,6 @@ async fn session_version_compatible_io_failure_preserves_existing_publication_co
     }
 }
 
-
 async fn missing_main_repair_retains_contract(conflict: Option<&str>) {
     let home = tempfile::tempdir().unwrap();
     let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
@@ -476,6 +475,8 @@ async fn missing_main_repair_retains_contract(conflict: Option<&str>) {
         assert!(!retained.execution_compatibility().execution_allowed);
     }
     let runtime_before = tokio::fs::read(&runtime_path).await.unwrap();
+    let proof_path = directory.join(super::root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE);
+    let proof_before = tokio::fs::read(&proof_path).await.unwrap();
     tokio::fs::remove_file(directory.join("session.json"))
         .await
         .unwrap();
@@ -489,11 +490,15 @@ async fn missing_main_repair_retains_contract(conflict: Option<&str>) {
         );
         assert!(!directory.join("session.json").exists());
         assert_eq!(tokio::fs::read(runtime_path).await.unwrap(), runtime_before);
+        assert_eq!(tokio::fs::read(proof_path).await.unwrap(), proof_before);
     } else {
         result.expect("a compatible interrupted Main creation remains repairable");
         let restored = storage.load_session(&caller.id).await.unwrap().unwrap();
         assert!(restored.execution_compatibility().execution_allowed);
-        assert_eq!(restored.messages, caller.messages);
+        assert_eq!(
+            serde_json::to_value(&restored.messages).unwrap(),
+            serde_json::to_value(&caller.messages).unwrap()
+        );
         assert_eq!(restored.created_at, caller.created_at);
     }
 }
