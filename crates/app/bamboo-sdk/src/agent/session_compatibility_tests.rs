@@ -487,23 +487,22 @@ async fn session_version_sdk_race_rejects_without_borrowed_input_or_checkpoint_s
             for conflict in ["main", "runtime", "agent", "context"] {
                 let fixture = Fixture::new().await;
                 let id = format!("sdk-race-{flavor}-{replay}-{cancellable}-{conflict}");
-                let mut session = if replay {
+                if replay {
                     let (mut pending, request) = parked(&id, true);
                     fixture.repo.save(&mut pending).await.unwrap();
-                    fixture.approve(&request).await
+                    fixture.approve(&request).await;
                 } else {
                     let mut fresh = Session::new(&id, "test-model");
                     fresh.add_message(Message::user("retained caller history"));
                     fixture.repo.save(&mut fresh).await.unwrap();
-                    fresh
-                };
+                }
                 let config = Arc::new(PermissionConfig::new());
                 let mut agent = if flavor == "plain" {
                     fixture.agent(Some(config.clone()), replay, false, None)
                 } else {
                     defaults_race_agent(&fixture).await
                 };
-                session = agent.storage().load_session(&id).await.unwrap().unwrap();
+                let mut session = agent.storage().load_session(&id).await.unwrap().unwrap();
                 let before_memory = serde_json::to_value(&session).unwrap();
                 let before_pair = durable_pair(&fixture, &id).await;
                 let publication = future_durable(&fixture, &id, conflict).await;
