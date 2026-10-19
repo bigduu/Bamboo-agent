@@ -354,3 +354,85 @@ async fn session_version_store_stale_checkpoint_cannot_replace_an_unknown_main()
         }
     }
 }
+
+struct CompatibleIoFailureStorage {
+    retained: Session,
+    saves: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Storage for CompatibleIoFailureStorage {
+    async fn save_session(&self, _: &Session) -> std::io::Result<()> {
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(std::io::Error::other("ordinary compatible save IO failure"))
+    }
+
+    async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+        assert_eq!(id, self.retained.id);
+        Ok(Some(self.retained.clone()))
+    }
+
+    async fn delete_session(&self, _: &str) -> std::io::Result<bool> {
+        panic!("compatible save fixture must not delete a Session")
+    }
+}
+
+#[tokio::test]
+async fn session_version_compatible_io_failure_preserves_existing_publication_contract() {
+    use crate::session_merge::LockedSessionStore;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    // The compatibility fence must preserve the established generic-IO policy:
+    // adopt valid durable fields into the caller, publish failure only when the
+    // selected public API requests it, and preserve the original write error.
+    for mode in ["runtime", "runtime_success_only", "full"] {
+        let mut caller = Session::new("compatible-io-failure", "model");
+        caller.add_message(Message::user("Unchanged caller history"));
+        let mut retained = caller.clone();
+        retained.metadata_version += 1;
+        retained.title = "Newer durable metadata".into();
+        retained.model_context_state = Some(bamboo_domain::ModelContextState {
+            state_revision: 7,
+            ..Default::default()
+        });
+        let storage = Arc::new(CompatibleIoFailureStorage {
+            retained: retained.clone(),
+            saves: AtomicUsize::new(0),
+        });
+        let locked = LockedSessionStore::new(storage.clone());
+        let publications = AtomicUsize::new(0);
+        let publish = |saved: &Session| {
+            assert_eq!(saved.title, retained.title);
+            assert_eq!(saved.model_context_state, retained.model_context_state);
+            publications.fetch_add(1, Ordering::SeqCst);
+        };
+        let result = match mode {
+            "runtime" => locked.save_runtime_only_and_publish(&mut caller, publish).await,
+            "runtime_success_only" => locked
+                .save_runtime_only_and_publish_on_success(&mut caller, publish)
+                .await,
+            "full" => locked
+                .merge_save_runtime_and_publish(&mut caller, |saved, committed| {
+                    assert!(!committed);
+                    publish(saved);
+                })
+                .await,
+            _ => unreachable!(),
+        };
+        let error = result.expect_err("the injected IO failure must remain visible");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "ordinary compatible save IO failure");
+        assert_eq!(storage.saves.load(Ordering::SeqCst), 1);
+        assert_eq!(caller.title, retained.title);
+        assert_eq!(caller.model_context_state, retained.model_context_state);
+        assert_eq!(
+            serde_json::to_value(&caller.messages).unwrap(),
+            serde_json::to_value(&retained.messages).unwrap()
+        );
+        let expected_publications = if mode == "runtime_success_only" { 0 } else { 1 };
+        assert_eq!(publications.load(Ordering::SeqCst), expected_publications);
+    }
+}
