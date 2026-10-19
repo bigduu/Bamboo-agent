@@ -176,8 +176,12 @@ async fn execute_and_apply_single_tool_call(
     let executing_supervisor =
         ExecutingSupervisorObservation::capture_from_executing_session(session);
     let root_orchestration_only = session.root_orchestration_only_enabled();
-    let admitted_execution_name =
-        effective_callable_set.resolve_callable_reference(&tool_call.function.name);
+    let session_behavior_version = session.session_version;
+    let admitted_execution_name = per_call::resolve_callable_for_session(
+        session_behavior_version,
+        effective_callable_set,
+        &tool_call.function.name,
+    );
     // Plan mode gate: block mutating tools (except pause/clarification tools)
     if session_flags.plan_read_only {
         let tool_name = tool_call.function.name.trim();
@@ -265,6 +269,7 @@ async fn execute_and_apply_single_tool_call(
             permission_replay_origin: None,
             needs_human: None,
             portable_tool: per_call::portable_tool_for_admitted_call(
+                session_behavior_version,
                 effective_callable_set,
                 tool_call,
             ),
@@ -280,6 +285,7 @@ async fn execute_and_apply_single_tool_call(
             let dispatch = per_call::execute_model_requested_tool_call_only(
                 effective_callable_set,
                 per_call::ToolExecutionOnlyContext {
+                    session_behavior_version,
                     vision_support,
                     output_cap: None,
                     tool_call,
@@ -326,6 +332,7 @@ async fn execute_and_apply_single_tool_call(
                             permission_replay_origin: None,
                             needs_human: None,
                             portable_tool: per_call::portable_tool_for_admitted_call(
+                                session_behavior_version,
                                 effective_callable_set,
                                 tool_call,
                             ),
@@ -681,9 +688,12 @@ async fn execute_round_tool_calls_inner(
             .iter()
             .map(|tc| {
                 if no_progress::quiet_poll_guard_active(session, runtime_state, config)
-                    && effective_callable_set
-                        .resolve_callable_reference(&tc.function.name)
-                        .as_deref()
+                    && per_call::resolve_callable_for_session(
+                        session.session_version,
+                        effective_callable_set,
+                        &tc.function.name,
+                    )
+                    .as_deref()
                         == Some("write_stdin")
                 {
                     ToolSchedulingMode::Sequential
@@ -717,9 +727,12 @@ async fn execute_round_tool_calls_inner(
                     .check_before_execution_for_name(
                         call,
                         offset,
-                        effective_callable_set
-                            .resolve_callable_reference(&call.function.name)
-                            .as_deref(),
+                        per_call::resolve_callable_for_session(
+                            session.session_version,
+                            effective_callable_set,
+                            &call.function.name,
+                        )
+                        .as_deref(),
                     )
                     .err()
             });
@@ -843,6 +856,7 @@ async fn execute_round_tool_calls_inner(
             let executing_supervisor =
                 ExecutingSupervisorObservation::capture_from_executing_session(session);
             let root_orchestration_only = session.root_orchestration_only_enabled();
+            let session_behavior_version = session.session_version;
             let output_cap = session
                 .effective_token_budget()
                 .map(|budget| budget.max_tool_output_tokens);
@@ -856,6 +870,7 @@ async fn execute_round_tool_calls_inner(
                             per_call::execute_model_requested_tool_call_only(
                                 effective_callable_set,
                                 per_call::ToolExecutionOnlyContext {
+                                    session_behavior_version,
                                     vision_support,
                                     output_cap,
                                     tool_call,
@@ -883,6 +898,7 @@ async fn execute_round_tool_calls_inner(
                                 permission_replay_origin: None,
                                 needs_human: None,
                                 portable_tool: per_call::portable_tool_for_admitted_call(
+                                    session_behavior_version,
                                     effective_callable_set,
                                     tool_call,
                                 ),
@@ -914,6 +930,7 @@ async fn execute_round_tool_calls_inner(
                             permission_replay_origin: None,
                             needs_human: None,
                             portable_tool: per_call::portable_tool_for_admitted_call(
+                                session_behavior_version,
                                 effective_callable_set,
                                 batch_call,
                             ),
@@ -997,8 +1014,11 @@ async fn execute_round_tool_calls_inner(
                 .await;
 
             for (batch_call, outcome) in batch.iter().zip(compressed) {
-                let admitted_execution_name =
-                    effective_callable_set.resolve_callable_reference(&batch_call.function.name);
+                let admitted_execution_name = per_call::resolve_callable_for_session(
+                    session.session_version,
+                    effective_callable_set,
+                    &batch_call.function.name,
+                );
 
                 let should_break = per_call::apply_tool_execution_outcome(
                     per_call::ToolExecutionApplyContext {

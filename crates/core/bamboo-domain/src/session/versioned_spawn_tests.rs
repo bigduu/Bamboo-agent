@@ -124,3 +124,68 @@ fn legacy_and_explicit_v1_are_the_same_supported_tool_contract_on_refresh() {
         );
     }
 }
+
+#[test]
+fn root_spawn_reference_never_falls_back_to_child_in_v2() {
+    for reference in [
+        "spawn_session",
+        "spawnSession",
+        "default::spawn_session",
+        "default::spawnSession",
+    ] {
+        for version in [None, Some(1)] {
+            assert_eq!(
+                resolve_session_tool_reference(version, reference, |name| name == "SubAgent")
+                    .as_deref(),
+                Some("SubAgent")
+            );
+        }
+        assert!(
+            resolve_session_tool_reference(Some(2), reference, |name| name == "SubAgent").is_none()
+        );
+        assert_eq!(
+            resolve_session_tool_reference(Some(2), reference, |name| name == "spawn_session"
+                || name == "SubAgent")
+            .as_deref(),
+            Some("spawn_session")
+        );
+    }
+}
+
+#[test]
+fn only_v2_genuine_supervisors_gain_root_spawning_in_either_mode() {
+    for version in [None, Some(1), Some(2)] {
+        for ultra in [false, true] {
+            for supervisor in [false, true] {
+                let mut session = Session::new(
+                    if supervisor {
+                        crate::DEFAULT_SUPERVISOR_SESSION_ID
+                    } else {
+                        "ordinary"
+                    },
+                    "model",
+                );
+                session.session_version = version;
+                session.set_root_orchestration_only(ultra).unwrap();
+                if supervisor {
+                    session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                        incarnation_id: uuid::Uuid::new_v4(),
+                    };
+                }
+                let expected = if version == Some(2) {
+                    supervisor
+                } else {
+                    !ultra && !supervisor
+                };
+                assert_eq!(
+                    session.allows_model_tool_execution("spawn_session"),
+                    expected,
+                    "{version:?}/{ultra}/{supervisor}"
+                );
+                let child = Session::new_child_of("child", &session, "model", "child");
+                assert!(!child.allows_model_tool_execution("spawn_session"));
+                assert!(child.supervisor_incarnation_id().is_none());
+            }
+        }
+    }
+}

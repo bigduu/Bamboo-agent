@@ -445,6 +445,14 @@ pub(super) fn build_root_tools(
 
     // Intentional same-name overlay replacement: Root keeps every privileged
     // cross-session action while Base/Child expose only current-Session reads.
+    let spawn_session = Arc::new(
+        bamboo_server_tools::session_control::versioned::SpawnSessionTool::new(
+            root_creator.clone(),
+            storage.clone(),
+            config.clone(),
+        ),
+    );
+    let spawn_storage = storage.clone();
     let session_inspector_tool = Arc::new(crate::tools::SessionInspectorTool::new(
         session_store.clone(),
         storage,
@@ -501,6 +509,13 @@ pub(super) fn build_root_tools(
         }
         _ => tools_with_control,
     };
+    let tools = Arc::new(
+        bamboo_server_tools::session_control::versioned::VersionedRootTools::new(
+            tools,
+            spawn_session,
+            spawn_storage,
+        ),
+    );
     (tools, sub_agent_tool)
 }
 

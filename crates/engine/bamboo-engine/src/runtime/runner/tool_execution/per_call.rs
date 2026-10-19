@@ -76,6 +76,7 @@ fn tool_start_name_for_display(tool_name: &str) -> String {
 
 pub(super) struct ToolExecutionOnlyContext<'a> {
     pub vision_support: bool,
+    pub session_behavior_version: Option<u32>,
     pub tool_call: &'a ToolCall,
     pub event_tx: &'a mpsc::Sender<AgentEvent>,
     pub metrics_collector: Option<&'a MetricsCollector>,
@@ -160,18 +161,33 @@ impl PortableToolExecution {
     }
 }
 
+pub(super) fn resolve_callable_for_session(
+    version: Option<u32>,
+    callable: &EffectiveCallableSet,
+    reference: &str,
+) -> Option<String> {
+    if version == Some(2) && bamboo_domain::independent_root_spawn_reference(reference) {
+        bamboo_domain::resolve_session_tool_reference(version, reference, |name| {
+            callable.contains_execution_name(name)
+        })
+    } else {
+        callable.resolve_callable_reference(reference)
+    }
+}
+
 pub(super) fn portable_tool_for_admitted_call(
+    version: Option<u32>,
     callable: &EffectiveCallableSet,
     call: &ToolCall,
 ) -> Option<PortableToolExecution> {
     // Timeout synthesis uses the same immutable admission snapshot as dispatch,
     // never a later catalog or a generic name normalizer.
-    callable
-        .resolve_callable_reference(&call.function.name)
-        .map(|name| PortableToolExecution {
+    resolve_callable_for_session(version, callable, &call.function.name).map(|name| {
+        PortableToolExecution {
             name,
             input: parse_tool_args_best_effort(&call.function.arguments).0,
-        })
+        }
+    })
 }
 
 pub(super) struct ToolExecutionOutcome {
@@ -279,9 +295,11 @@ pub(super) async fn execute_model_requested_tool_call_only(
     effective_callable_set: &EffectiveCallableSet,
     ctx: ToolExecutionOnlyContext<'_>,
 ) -> Result<ToolExecutionOutcome, AgentError> {
-    let Some(execution_name) =
-        effective_callable_set.resolve_callable_reference(&ctx.tool_call.function.name)
-    else {
+    let Some(execution_name) = resolve_callable_for_session(
+        ctx.session_behavior_version,
+        effective_callable_set,
+        &ctx.tool_call.function.name,
+    ) else {
         let message = format!(
             "Tool '{}' is not callable at the current conversation position",
             ctx.tool_call.function.name
@@ -360,12 +378,16 @@ async fn execute_tool_call_only_with_execution_name_inner(
     // not turn its spelling into a compatibility alias for another owner.
     let reference = ctx.tool_call.function.name.trim();
     let exact_owner_shadowed = reference != execution_name && ctx.tools.owns_exact_tool(reference);
-    if (ctx.root_orchestration_only || executing_supervisor)
-        && (exact_owner_shadowed
-            || !bamboo_domain::orchestration_only_allows_execution_name_for_supervisor(
-                execution_name,
-                executing_supervisor,
-            ))
+    let independent_root_denied = ctx.session_behavior_version == Some(2)
+        && execution_name == "spawn_session"
+        && !executing_supervisor;
+    if independent_root_denied
+        || ((ctx.root_orchestration_only || executing_supervisor)
+            && (exact_owner_shadowed
+                || !bamboo_domain::orchestration_only_allows_execution_name_for_supervisor(
+                    execution_name,
+                    executing_supervisor,
+                )))
     {
         tracing::warn!(
             "[{}][round:{}] Tool call rejected by Root authority before ToolStart: tool_call_id={}, tool_name={}, execution_name={}",
@@ -1686,6 +1708,7 @@ mod task_progress_tests {
                 execute_tool_call_only_with_execution_name(
                     execution_name,
                     ToolExecutionOnlyContext {
+                        session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
                         executing_supervisor: None,
@@ -2494,6 +2517,7 @@ mod hook_tests {
         let outcome = execute_model_requested_tool_call_only(
             callable,
             ToolExecutionOnlyContext {
+                session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
                 executing_supervisor: None,
@@ -2681,6 +2705,7 @@ mod hook_tests {
             let execution = execute_model_requested_tool_call_only(
                 &callable,
                 ToolExecutionOnlyContext {
+                    session_behavior_version: None,
                     vision_support: true,
                     output_cap: cap,
                     executing_supervisor: None,
@@ -2826,6 +2851,7 @@ mod hook_tests {
         execute_model_requested_tool_call_only(
             effective_callable_set,
             ToolExecutionOnlyContext {
+                session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
                 executing_supervisor: None,
@@ -2994,6 +3020,7 @@ mod hook_tests {
                 let outcome = execute_model_requested_tool_call_only(
                     &callable,
                     ToolExecutionOnlyContext {
+                        session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
                         executing_supervisor: observation,
@@ -3081,6 +3108,7 @@ mod hook_tests {
                 let outcome = execute_model_requested_tool_call_only(
                     &callable,
                     ToolExecutionOnlyContext {
+                        session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
                         executing_supervisor: observation,
@@ -3234,6 +3262,7 @@ mod hook_tests {
         let unloaded = execute_model_requested_tool_call_only(
             &effective_callable_set,
             ToolExecutionOnlyContext {
+                session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
                 executing_supervisor: None,
@@ -3596,6 +3625,7 @@ mod hook_tests {
         let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
         let outcome = trace
             .scope(execute_tool_call_only(ToolExecutionOnlyContext {
+                session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
                 executing_supervisor: None,
@@ -3663,6 +3693,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            session_behavior_version: None,
             vision_support: true,
             output_cap: None,
             executing_supervisor: None,
@@ -3745,6 +3776,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            session_behavior_version: None,
             vision_support: true,
             output_cap: None,
             executing_supervisor: None,
@@ -3803,6 +3835,7 @@ mod hook_tests {
         let outcome = bamboo_tools::with_approval_proxy(
             Some(reviewer_proxy),
             execute_tool_call_only(ToolExecutionOnlyContext {
+                session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
                 executing_supervisor: None,
@@ -4482,6 +4515,7 @@ mod hook_tests {
             let mut session = Session::new(session_id, "model");
             let session_flags = ToolExecutionSessionFlags::from_session(&session);
             let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+                session_behavior_version: None,
                 vision_support: true,
                 output_cap: Some(97),
                 executing_supervisor: None,
@@ -4545,6 +4579,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            session_behavior_version: None,
             vision_support: true,
             output_cap: None,
             executing_supervisor: None,
@@ -4632,6 +4667,7 @@ mod hook_tests {
         execute_model_requested_tool_call_only(
             &callable,
             ToolExecutionOnlyContext {
+                session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
                 executing_supervisor: None,

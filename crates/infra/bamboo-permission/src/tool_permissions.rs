@@ -1263,6 +1263,18 @@ pub fn check_permissions(
                 _ => Ok(None), // list / list_sessions → read-only
             }
         }
+        "spawn_session" => {
+            let project = required_string_arg(args, "project_id")?;
+            let workspace = required_string_arg(args, "workspace_path")?;
+            // Same scoped Root operation and resource ceiling as the existing
+            // session_control create entry. The typed request still retains
+            // spawn_session as its exact executor identity and original args.
+            Ok(Some(vec![PermissionContext::new(
+                PermissionType::ExecuteCommand,
+                format!("session_control create {project} {workspace}"),
+                "spawn_session: create an independent Root in the explicit Host-authorized Project/workspace and submit its first instruction",
+            )]))
+        }
         "session_control" => {
             let action = required_string_arg(args, "action")?;
             if action == "scope" {
@@ -1506,6 +1518,32 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    #[test]
+    fn versioned_root_spawn_retains_the_existing_scoped_permission_ceiling() {
+        let args = serde_json::json!({"project_id":"explicit-project", "workspace_path":"/explicit/worker"});
+        let new = check_permissions("spawn_session", &args).unwrap().unwrap();
+        let old = check_permissions(
+            "session_control",
+            &serde_json::json!({"action":"create", "request":args}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].permission_type, old[0].permission_type);
+        assert_eq!(new[0].resource, old[0].resource);
+        assert_eq!(
+            new[0].resource,
+            "session_control create explicit-project /explicit/worker"
+        );
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"project_id":"p"}),
+            serde_json::json!({"workspace_path":"/p"}),
+        ] {
+            assert!(check_permissions("spawn_session", &invalid).is_err());
+        }
+    }
 
     #[test]
     fn browser_eval_fingerprint_child_process() {

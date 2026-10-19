@@ -185,6 +185,11 @@ pub fn normalize_tool_ref(value: &str) -> Option<String> {
         return None;
     }
     let raw_tool_name = trimmed.split("::").last().unwrap_or(trimmed);
+    // Keep the ambiguous spelling until the actual Session registry/version
+    // selects its owner. Canonical v1 alias resolution itself remains unchanged.
+    if crate::independent_root_spawn_reference(raw_tool_name) {
+        return Some("spawn_session".into());
+    }
     let normalized = normalize_builtin_alias(raw_tool_name);
 
     // Check canonical tool names first
@@ -423,8 +428,15 @@ mod tests {
 
     #[test]
     fn test_normalize_tool_ref_accepts_spawn_task_aliases() {
-        for alias in [
+        for reference in [
+            "spawn_session",
             "default::spawn_session",
+            "default::spawnSession",
+        ] {
+            assert_eq!(normalize_tool_ref(reference), Some("spawn_session".into()));
+            assert_eq!(canonical_tool_name(reference), "SubAgent");
+        }
+        for alias in [
             "default::sub_session",
             "default::sub_task",
             "default::team_agent",

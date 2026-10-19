@@ -145,12 +145,26 @@ fn resolve_catalog_with_activation(
     session: &Session,
     activated: &std::collections::BTreeSet<String>,
 ) -> Vec<ClassifiedToolSchema> {
+    let bound = tools.for_session(session);
+    let tools = bound.as_deref().unwrap_or(tools);
     let mut tool_schemas = config.tool_registry.list_tools();
     if tool_schemas.is_empty() {
         tool_schemas = tools.list_tools();
     }
 
     tool_schemas.extend(config.additional_tool_schemas.clone());
+    // Config registries may be shared by old and new Sessions. Only an actually
+    // installed, version-bound Host port contributes the new Root schema.
+    if session.independent_root_spawn_contract() {
+        tool_schemas.retain(|schema| schema.function.name != "spawn_session");
+        tool_schemas.extend(
+            tools
+                .list_tools()
+                .into_iter()
+                .filter(|schema| schema.function.name == "spawn_session"),
+        );
+    }
+
     tool_schemas.sort_by(|left, right| left.function.name.cmp(&right.function.name));
     tool_schemas.dedup_by(|left, right| left.function.name == right.function.name);
     if config.ticket_worker_plan.is_some() {
@@ -193,7 +207,13 @@ fn resolve_catalog_with_activation(
         let Some(identity) = ClassifiedToolIdentity::from_schema_name(&schema.function.name) else {
             continue;
         };
-        let guide_name = identity.alias_fallback_name();
+        let guide_name = if session.independent_root_spawn_contract()
+            && schema.function.name == "spawn_session"
+        {
+            "spawn_session"
+        } else {
+            identity.alias_fallback_name()
+        };
         if identity.loading_class() == CapabilityLoadingClass::Deferred
             && !activated.contains(guide_name)
         {
@@ -240,9 +260,19 @@ fn resolve_catalog_with_activation(
     let disabled_execution_names = disabled_tools
         .iter()
         .filter_map(|reference| {
-            resolve_disabled_tool_reference_name(reference, |name| {
-                by_execution_name.contains_key(name)
-            })
+            if session.independent_root_spawn_contract()
+                && bamboo_domain::independent_root_spawn_reference(reference)
+            {
+                bamboo_domain::resolve_session_tool_reference(
+                    session.session_version,
+                    reference,
+                    |name| by_execution_name.contains_key(name),
+                )
+            } else {
+                resolve_disabled_tool_reference_name(reference, |name| {
+                    by_execution_name.contains_key(name)
+                })
+            }
         })
         .flat_map(|name| {
             let replacement = bamboo_domain::legacy_shell_replacement(&name).map(str::to_owned);

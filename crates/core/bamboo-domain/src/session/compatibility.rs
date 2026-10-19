@@ -12,7 +12,48 @@ use super::{
     AgentRuntimeState, Session, AGENT_RUNTIME_STATE_VERSION, MODEL_CONTEXT_SCHEMA_VERSION,
 };
 
-pub const CURRENT_SESSION_VERSION: u32 = 1;
+pub const CURRENT_SESSION_VERSION: u32 = 2;
+
+/// Missing/v1 retain the original Child-spawn tool contract. v2 separates
+/// independent Root spawning; support does not make these two contracts equal.
+pub fn same_session_tool_contract(left: Option<u32>, right: Option<u32>) -> bool {
+    match (left, right) {
+        (None | Some(1), None | Some(1)) => true,
+        (Some(2), Some(2)) => true,
+        _ => false,
+    }
+}
+
+pub fn independent_root_spawn_reference(reference: &str) -> bool {
+    let name = reference
+        .trim()
+        .rsplit("::")
+        .next()
+        .unwrap_or(reference)
+        .trim();
+    name.eq_ignore_ascii_case("spawn_session") || name.eq_ignore_ascii_case("spawnSession")
+}
+
+/// Exact registrations still win. Only the new behavior contract gives the
+/// unshadowed historical spellings an independent-Root owner; no owner means
+/// unavailable, never a fallback to SubAgent.
+pub fn resolve_session_tool_reference(
+    version: Option<u32>,
+    reference: &str,
+    mut contains: impl FnMut(&str) -> bool,
+) -> Option<String> {
+    if !supported(version) {
+        return None;
+    }
+    if version == Some(2) && independent_root_spawn_reference(reference) {
+        let exact = reference.trim();
+        if contains(exact) {
+            return Some(exact.to_string());
+        }
+        return contains("spawn_session").then(|| "spawn_session".to_string());
+    }
+    crate::resolve_tool_reference_name(reference, contains)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,10 +100,14 @@ impl fmt::Display for SessionCompatibilityError {
 impl std::error::Error for SessionCompatibilityError {}
 
 fn supported(version: Option<u32>) -> bool {
-    version.is_none_or(|version| version == CURRENT_SESSION_VERSION)
+    matches!(version, None | Some(1) | Some(2))
 }
 
 impl Session {
+    pub fn independent_root_spawn_contract(&self) -> bool {
+        self.session_version == Some(2)
+    }
+
     /// Called only by the storage overlay: Main owns the behavior stamp, while
     /// a conflicting runtime observation must remain visible to execution.
     /// Absence and v1 have the same existing semantics, so that pair is safe.
@@ -79,12 +124,12 @@ impl Session {
         {
             conflicts.push(SessionCompatibilityConflict {
                 code: "unsupported_session_version".into(),
-                message: format!("Session behavior version {version} is not supported; this runtime supports version {CURRENT_SESSION_VERSION} and compatible legacy records."),
+                message: format!("Session behavior version {version} is not supported; this runtime supports versions 1 and {CURRENT_SESSION_VERSION} and compatible legacy records."),
             });
         }
         if let Some(runtime_version) = self.observed_runtime_session_version {
             if runtime_version != self.session_version
-                && !(supported(runtime_version) && supported(self.session_version))
+                && !same_session_tool_contract(runtime_version, self.session_version)
             {
                 conflicts.push(SessionCompatibilityConflict {
                     code: "session_version_mismatch".into(),
@@ -192,7 +237,7 @@ mod tests {
 
     #[test]
     fn unsupported_versions_are_diagnostics_not_deserialization_failures() {
-        for version in [0, 2, u32::MAX] {
+        for version in [0, CURRENT_SESSION_VERSION + 1, u32::MAX] {
             let mut session = Session::new("future", "model");
             session.session_version = Some(version);
             let before = serde_json::to_value(&session).unwrap();

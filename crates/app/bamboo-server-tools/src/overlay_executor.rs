@@ -109,6 +109,18 @@ impl OverlayToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for OverlayToolExecutor {
+    fn for_session(
+        &self,
+        session: &bamboo_domain::Session,
+    ) -> Option<std::sync::Arc<dyn ToolExecutor>> {
+        self.base.for_session(session).map(|base| {
+            std::sync::Arc::new(Self {
+                base,
+                overlay: self.overlay.clone(),
+            }) as std::sync::Arc<dyn ToolExecutor>
+        })
+    }
+
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
         self.execute_with_context(call, ToolExecutionContext::none(&call.id))
             .await
