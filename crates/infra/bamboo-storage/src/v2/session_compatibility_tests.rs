@@ -1232,7 +1232,9 @@ async fn session_version_writer_clear_compatible_none_v1_preserves_main_stamp() 
 async fn session_version_copied_root_selects_current_contract_without_changing_source() {
     let mut failures = Vec::new();
     for id in ["tx-root", "tx-child"] {
-        for contract in ["current", "legacy", "main", "session", "runtime", "context"] {
+        for contract in [
+            "current", "v1", "legacy", "main", "session", "runtime", "context",
+        ] {
             let home = tempfile::tempdir().unwrap();
             let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
             super::tests::seed_runtime_task_transaction_pair(&storage)
@@ -1245,9 +1247,10 @@ async fn session_version_copied_root_selects_current_contract_without_changing_s
             )
             .await
             .unwrap();
-            if contract == "legacy" {
-                task_set_stamp(&storage, id, true, None).await;
-                task_set_stamp(&storage, id, false, None).await;
+            if contract == "legacy" || contract == "v1" {
+                let stamp = (contract == "v1").then_some(1);
+                task_set_stamp(&storage, id, true, stamp).await;
+                task_set_stamp(&storage, id, false, stamp).await;
             } else if contract != "current" {
                 writer_future_contract(&directory, contract).await;
             }
@@ -1303,7 +1306,7 @@ async fn session_version_copied_root_selects_current_contract_without_changing_s
                 let raw: Value = serde_json::from_slice(&bytes).unwrap();
                 if raw["session_version"] != json!(bamboo_domain::CURRENT_SESSION_VERSION) {
                     failures.push(format!(
-                        "{id}/{contract}/{name}: new Root was not stamped v1"
+                        "{id}/{contract}/{name}: new Root was not stamped with the current contract"
                     ));
                 }
             }
@@ -1314,4 +1317,45 @@ async fn session_version_copied_root_selects_current_contract_without_changing_s
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\\n"));
+}
+
+#[tokio::test]
+async fn versioned_spawn_known_contract_mismatch_survives_reopen_and_refuses_both_checkpoints() {
+    for (main, runtime) in [
+        (Some(1), Some(2)),
+        (Some(2), Some(1)),
+        (None, Some(2)),
+        (Some(2), None),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let mut session = Session::new("known-version-pair", "model");
+        session.add_message(Message::user(
+            "retain goal and history for explicit continuation",
+        ));
+        session.metadata.insert(
+            "retained_pending_operation".into(),
+            "never consume on a contract conflict".into(),
+        );
+        storage.save_session(&session).await.unwrap();
+        change_stamp(home.path(), &session.id, main, runtime).await;
+        let before = pair(home.path(), &session.id).await;
+        drop(storage);
+        let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let loaded = reopened.load_session(&session.id).await.unwrap().unwrap();
+        let report = loaded.execution_compatibility();
+        assert!(report.history_readable && !report.execution_allowed);
+        assert!(report
+            .conflicts
+            .iter()
+            .any(|c| c.code == "session_version_mismatch"));
+        assert!(report
+            .conflicts
+            .iter()
+            .all(|c| c.code != "unsupported_session_version"));
+        assert_eq!(loaded.messages[0].content, session.messages[0].content);
+        assert!(reopened.save_session(&loaded).await.is_err());
+        assert!(reopened.save_runtime_state(&loaded).await.is_err());
+        assert_eq!(pair(home.path(), &session.id).await, before);
+    }
 }

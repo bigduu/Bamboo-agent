@@ -280,6 +280,14 @@ async fn assert_v2_spawn_uses_root_port_in_both_modes(ultra: bool) {
         root.workspace_path_meta().as_deref(),
         Some(f.workspace.as_str())
     );
+    let old_entry_retry = f
+        .invoke(json!({"action":"create", "request":request.clone()}))
+        .await;
+    assert_eq!(
+        old_entry_retry["target_session_id"],
+        created["target_session_id"]
+    );
+    assert_eq!(old_entry_retry["receipt_id"], created["receipt_id"]);
     let replay = f.invoke_named("default::spawnSession", request).await;
     assert_eq!(replay["target_session_id"], created["target_session_id"]);
     assert_eq!(replay["receipt_id"], created["receipt_id"]);
