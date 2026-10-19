@@ -625,156 +625,25 @@ impl BuiltinToolExecutor {
         Ok(outcome)
     }
 
-    /// Build enhanced prompt for all registered tools
-    pub fn build_enhanced_prompt(&self, context: GuideBuildContext) -> String {
-        EnhancedPromptBuilder::build(Some(&self.registry), &self.list_tools(), &context)
-    }
-}
-
-/// Keep this inside an owned child's captured scope, before sending its
-/// result; the awaiting parent may already have timed out or been dropped.
-fn enforce_registered_tool_suspension(
-    outcome: Result<ToolOutcome, ToolError>,
-) -> Result<ToolOutcome, ToolError> {
-    let outcome = outcome.map(ToolOutcome::enforce_suspension_restriction);
-    if bamboo_agent_core::tools::suspension_running_violated() {
-        if let Some(resources) = crate::LocalTaskResources::current() {
-            resources.record_unconfirmed(
-                "restricted tool returned Running; cooperative kill has no stop receipt",
-            );
-        }
-    }
-    outcome
-}
-
-fn permission_error_to_tool_error(error: PermissionError) -> ToolError {
-    match error {
-        PermissionError::CheckFailed(_) => ToolError::InvalidArguments(error.to_string()),
-        _ => ToolError::Execution(error.to_string()),
-    }
-}
-
-impl Default for BuiltinToolExecutor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl ToolExecutor for BuiltinToolExecutor {
-    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(call, ToolExecutionContext::none(&call.id))
-            .await
-    }
-
-    async fn execute_with_context(
+    /// Host-side permission entry used only by the installed v2 Root owner.
+    /// Classification is explicit while the typed request retains the actual
+    /// spawn_session identity, original argument bytes and existing once gates.
+    pub async fn check_framework_root_spawn_permissions(
         &self,
         call: &ToolCall,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        self.execute_with_context_outcome(call, ctx)
-            .await
-            .map(ToolOutcome::into_tool_result)
-    }
-
-    async fn execute_with_context_outcome(
-        &self,
-        call: &ToolCall,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolOutcome, ToolError> {
-        let reference = call.function.name.trim();
-        let tool_name =
-            resolve_registered_tool_name(&self.registry, reference).ok_or_else(|| {
-                ToolError::NotFound(format!("Tool '{}' not found", call.function.name))
-            })?;
-        self.execute_registered_with_context_outcome(call, &tool_name, ctx)
-            .await
-    }
-
-    async fn execute_exact_with_context_outcome(
-        &self,
-        call: &ToolCall,
-        execution_name: &str,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolOutcome, ToolError> {
-        self.execute_registered_with_context_outcome(call, execution_name, ctx)
-            .await
-    }
-
-    /// The real permission gate for built-in tools, extracted from the execute
-    /// path so it is reusable by wrapping executors (issue #341). The behavior is
-    /// byte-for-byte the same block that used to run inline in
-    /// `execute_with_context_outcome`:
-    ///
-    /// - resolves the SAME `tool_name` + `args` the execute path runs with (so
-    ///   the check sees exactly what the tool will run with);
-    /// - "always ask" rules (`requires_forced_confirmation`) force a confirmation
-    ///   even under bypass; everything else is skipped when the session is in
-    ///   bypass-permissions mode;
-    /// - forced confirmations route through `check_or_request_forced` so the
-    ///   active mode/bypass can't suppress the prompt;
-    /// - a `ConfirmationRequired` first tries the cross-process `ApprovalProxy`
-    ///   (a subagent worker forwarding to its host), then the interactive human
-    ///   sink (returning the synthesized approval pause as `Ok(Some(..))`), then
-    ///   fails closed;
-    /// - deny fails closed.
-    ///
-    /// The only mechanical difference from the old inline block: the interactive
-    /// pause is returned as `Ok(Some(outcome))` and a clean pass returns
-    /// `Ok(None)`, so the caller decides whether to run the tool. The fallback
-    /// arg-parse warning is intentionally NOT re-logged here — the execute path
-    /// already logs it once for this call.
-    async fn check_permissions_for(
-        &self,
-        call: &ToolCall,
+        args: &serde_json::Value,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
-        let reference = call.function.name.trim();
-        let tool_name = resolve_registered_tool_name(&self.registry, reference)
-            .unwrap_or_else(|| canonical_tool_name(reference));
-        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
-            pre_parsed.clone()
-        } else {
-            parse_tool_args_best_effort(&call.function.arguments).0
-        };
-        if let Some(tool) = self.registry.get(&tool_name) {
-            self.normalize_registered_builtin_args(reference, &tool_name, &tool, &mut args);
-        }
-        self.check_permissions_for_resolved(call, &tool_name, &args, ctx)
-            .await
+        self.check_owned_permissions(call, "spawn_session", args, ctx, true).await
     }
 
-    async fn check_permissions_for_exact(
-        &self,
-        call: &ToolCall,
-        execution_name: &str,
-        ctx: &ToolExecutionContext<'_>,
-    ) -> Result<Option<ToolOutcome>, ToolError> {
-        let tool = self
-            .registry
-            .get(execution_name)
-            .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", execution_name)))?;
-        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
-            pre_parsed.clone()
-        } else {
-            parse_tool_args_best_effort(&call.function.arguments).0
-        };
-        self.normalize_registered_builtin_args(
-            call.function.name.trim(),
-            execution_name,
-            &tool,
-            &mut args,
-        );
-        self.check_permissions_for_resolved(call, execution_name, &args, ctx)
-            .await
-    }
-
-    async fn check_permissions_for_resolved(
+    async fn check_owned_permissions(
         &self,
         call: &ToolCall,
         execution_name: &str,
         resolved_args: &serde_json::Value,
         ctx: &ToolExecutionContext<'_>,
+        framework_root_spawn: bool,
     ) -> Result<Option<ToolOutcome>, ToolError> {
         if self.native_tool_ceiling.is_some() {
             let tool = self
@@ -806,9 +675,13 @@ impl ToolExecutor for BuiltinToolExecutor {
         };
         let hook_permission_override = crate::current_hook_permission_override(&call.id);
 
-        if let Some(contexts) =
-            check_permissions(&tool_name, &args).map_err(permission_error_to_tool_error)?
-        {
+        let contexts = if framework_root_spawn {
+            crate::permission::tool_permissions::framework_root_spawn_permissions(&args)
+        } else {
+            check_permissions(&tool_name, &args)
+        }
+        .map_err(permission_error_to_tool_error)?;
+        if let Some(contexts) = contexts {
             let proactive_permission_request =
                 tool_name.eq_ignore_ascii_case("request_permissions");
             for context in contexts {
@@ -1117,6 +990,160 @@ impl ToolExecutor for BuiltinToolExecutor {
         }
 
         Ok(None)
+    }
+
+    /// Build enhanced prompt for all registered tools
+    pub fn build_enhanced_prompt(&self, context: GuideBuildContext) -> String {
+        EnhancedPromptBuilder::build(Some(&self.registry), &self.list_tools(), &context)
+    }
+}
+
+/// Keep this inside an owned child's captured scope, before sending its
+/// result; the awaiting parent may already have timed out or been dropped.
+fn enforce_registered_tool_suspension(
+    outcome: Result<ToolOutcome, ToolError>,
+) -> Result<ToolOutcome, ToolError> {
+    let outcome = outcome.map(ToolOutcome::enforce_suspension_restriction);
+    if bamboo_agent_core::tools::suspension_running_violated() {
+        if let Some(resources) = crate::LocalTaskResources::current() {
+            resources.record_unconfirmed(
+                "restricted tool returned Running; cooperative kill has no stop receipt",
+            );
+        }
+    }
+    outcome
+}
+
+fn permission_error_to_tool_error(error: PermissionError) -> ToolError {
+    match error {
+        PermissionError::CheckFailed(_) => ToolError::InvalidArguments(error.to_string()),
+        _ => ToolError::Execution(error.to_string()),
+    }
+}
+
+impl Default for BuiltinToolExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for BuiltinToolExecutor {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        self.execute_with_context(call, ToolExecutionContext::none(&call.id))
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.execute_with_context_outcome(call, ctx)
+            .await
+            .map(ToolOutcome::into_tool_result)
+    }
+
+    async fn execute_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        let reference = call.function.name.trim();
+        let tool_name =
+            resolve_registered_tool_name(&self.registry, reference).ok_or_else(|| {
+                ToolError::NotFound(format!("Tool '{}' not found", call.function.name))
+            })?;
+        self.execute_registered_with_context_outcome(call, &tool_name, ctx)
+            .await
+    }
+
+    async fn execute_exact_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        self.execute_registered_with_context_outcome(call, execution_name, ctx)
+            .await
+    }
+
+    /// The real permission gate for built-in tools, extracted from the execute
+    /// path so it is reusable by wrapping executors (issue #341). The behavior is
+    /// byte-for-byte the same block that used to run inline in
+    /// `execute_with_context_outcome`:
+    ///
+    /// - resolves the SAME `tool_name` + `args` the execute path runs with (so
+    ///   the check sees exactly what the tool will run with);
+    /// - "always ask" rules (`requires_forced_confirmation`) force a confirmation
+    ///   even under bypass; everything else is skipped when the session is in
+    ///   bypass-permissions mode;
+    /// - forced confirmations route through `check_or_request_forced` so the
+    ///   active mode/bypass can't suppress the prompt;
+    /// - a `ConfirmationRequired` first tries the cross-process `ApprovalProxy`
+    ///   (a subagent worker forwarding to its host), then the interactive human
+    ///   sink (returning the synthesized approval pause as `Ok(Some(..))`), then
+    ///   fails closed;
+    /// - deny fails closed.
+    ///
+    /// The only mechanical difference from the old inline block: the interactive
+    /// pause is returned as `Ok(Some(outcome))` and a clean pass returns
+    /// `Ok(None)`, so the caller decides whether to run the tool. The fallback
+    /// arg-parse warning is intentionally NOT re-logged here — the execute path
+    /// already logs it once for this call.
+    async fn check_permissions_for(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        let reference = call.function.name.trim();
+        let tool_name = resolve_registered_tool_name(&self.registry, reference)
+            .unwrap_or_else(|| canonical_tool_name(reference));
+        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
+            pre_parsed.clone()
+        } else {
+            parse_tool_args_best_effort(&call.function.arguments).0
+        };
+        if let Some(tool) = self.registry.get(&tool_name) {
+            self.normalize_registered_builtin_args(reference, &tool_name, &tool, &mut args);
+        }
+        self.check_permissions_for_resolved(call, &tool_name, &args, ctx)
+            .await
+    }
+
+    async fn check_permissions_for_exact(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        let tool = self
+            .registry
+            .get(execution_name)
+            .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", execution_name)))?;
+        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
+            pre_parsed.clone()
+        } else {
+            parse_tool_args_best_effort(&call.function.arguments).0
+        };
+        self.normalize_registered_builtin_args(
+            call.function.name.trim(),
+            execution_name,
+            &tool,
+            &mut args,
+        );
+        self.check_permissions_for_resolved(call, execution_name, &args, ctx)
+            .await
+    }
+
+    async fn check_permissions_for_resolved(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        resolved_args: &serde_json::Value,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        self.check_owned_permissions(call, execution_name, resolved_args, ctx, false).await
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {

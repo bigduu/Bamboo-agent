@@ -933,15 +933,15 @@ async fn versioned_spawn_disabled_exact_shadow_does_not_block_framework_creation
     registry
         .register(ExactShadow(shadow_calls.clone()))
         .unwrap();
-    let legacy: Arc<dyn ToolExecutor> =
-        Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(registry));
+    let builtin = Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(registry));
+    let legacy: Arc<dyn ToolExecutor> = builtin.clone();
     let spawn = Arc::new(SpawnSessionTool::new(
         Arc::new(f.creator.clone()),
         f.creator.store.clone(),
         f.creator.config.clone(),
         legacy.clone(),
     ));
-    let installed = VersionedRootTools::new(legacy, spawn, f.creator.store.clone());
+    let installed = VersionedRootTools::new(legacy, spawn, f.creator.store.clone(), builtin);
     let tools = installed.for_session(&session).unwrap();
     let context = || ToolExecutionContext {
         session_id: Some(&session.id),
@@ -1016,4 +1016,140 @@ async fn versioned_spawn_disabled_exact_shadow_does_not_block_framework_creation
         assert_eq!(f.inbox.inspect(target).await.unwrap().generation, 1);
         assert_eq!(shadow_calls.load(Ordering::SeqCst), 0);
     }
+}
+
+struct LegacySpawnPermissionOwner {
+    name: &'static str,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for LegacySpawnPermissionOwner {
+    fn name(&self) -> &str { self.name }
+    fn description(&self) -> &str { "exact legacy custom owner" }
+    fn parameters_schema(&self) -> Value { json!({"type":"object"}) }
+    async fn invoke(&self, args: Value, _: ToolCtx) -> Result<ToolOutcome, bamboo_agent_core::tools::ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutcome::Completed(ToolResult::text(true, json!({"owner":self.name,"args":args}).to_string())))
+    }
+}
+
+struct RootOwnerPermissionProbe {
+    checks: Arc<AtomicUsize>,
+    deny: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl bamboo_tools::permission::PermissionChecker for RootOwnerPermissionProbe {
+    async fn needs_confirmation(&self, _: bamboo_tools::permission::PermissionType, _: &str) -> bool { true }
+    async fn request_confirmation(&self, context: bamboo_tools::permission::PermissionContext) -> Result<bool, bamboo_tools::permission::PermissionError> {
+        self.checks.fetch_add(1, Ordering::SeqCst);
+        if self.deny.load(Ordering::SeqCst) {
+            Err(bamboo_tools::permission::PermissionError::Denied("Host denied exact Root operation".into()))
+        } else {
+            Err(bamboo_tools::permission::PermissionError::confirmation_required(context))
+        }
+    }
+    fn grant_session_permission(&self, _: bamboo_tools::permission::PermissionType, _: String) {
+        panic!("classification and pending/denied approval cannot install a grant");
+    }
+}
+
+#[tokio::test]
+async fn versioned_spawn_legacy_custom_owner_keeps_arguments_and_permission_route() {
+    use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutionContext, ToolExecutor};
+    use bamboo_server_tools::session_control::versioned::{SpawnSessionTool, VersionedRootTools};
+    let f = Fixture::new().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let registry = bamboo_tools::ToolRegistry::new();
+    for name in ["spawn_session", "spawnSession", "vendor::spawn_session"] {
+        registry.register(LegacySpawnPermissionOwner { name, calls: calls.clone() }).unwrap();
+    }
+    let builtin = Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry_and_permissions(registry,
+        Arc::new(RootOwnerPermissionProbe { checks: checks.clone(), deny: Arc::new(AtomicBool::new(true)) })));
+    let legacy: Arc<dyn ToolExecutor> = builtin.clone();
+    let spawn = Arc::new(SpawnSessionTool::new(Arc::new(f.creator.clone()), f.creator.store.clone(), f.creator.config.clone(), legacy.clone()));
+    let installed: Arc<dyn ToolExecutor> = Arc::new(VersionedRootTools::new(legacy, spawn, f.creator.store.clone(), builtin));
+    for version in [None, Some(1)] {
+        let mut session = Session::new(uuid::Uuid::new_v4().to_string(), "private-model");
+        session.session_version = version;
+        f.creator.store.save_session(&session).await.unwrap();
+        let before_count = f.count().await;
+        let bound = installed.for_session(&session).unwrap();
+        for tools in [&installed, &bound] {
+            for name in ["spawn_session", "spawnSession", "vendor::spawn_session"] {
+                for args in [json!({"payload":"custom"}), serde_json::to_value(&f.request).unwrap()] {
+                    let call = ToolCall { id: uuid::Uuid::new_v4().to_string(), tool_type: "function".into(),
+                        function: FunctionCall { name: name.into(), arguments: args.to_string() } };
+                    let context = || ToolExecutionContext { session_id: Some(&session.id), root_session_id: Some(&session.id), ..ToolExecutionContext::none(&call.id) };
+                    assert!(tools.check_permissions_for(&call, &context()).await.unwrap().is_none());
+                    assert!(tools.check_permissions_for_exact(&call, name, &context()).await.unwrap().is_none());
+                    assert!(tools.check_permissions_for_resolved(&call, name, &args, &context()).await.unwrap().is_none());
+                    let result = tools.execute_exact_with_context_outcome(&call, name, context()).await.unwrap().into_tool_result();
+                    assert!(result.success);
+                    assert_eq!(value(result), json!({"owner":name,"args":args}));
+                }
+            }
+        }
+        assert_eq!(f.count().await, before_count);
+        assert_eq!(serde_json::to_value(f.creator.store.load_session(&session.id).await.unwrap().unwrap()).unwrap(), serde_json::to_value(&session).unwrap());
+        assert_eq!(f.inbox.inspect(&session.id).await.unwrap().generation, 0);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 24);
+    assert_eq!(checks.load(Ordering::SeqCst), 0);
+    assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn versioned_spawn_framework_owner_keeps_typed_approval_and_deny_before_side_effects() {
+    use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutionContext, ToolExecutor};
+    use bamboo_server_tools::session_control::versioned::{SpawnSessionTool, VersionedRootTools};
+    let f = Fixture::new().await;
+    let session = f.creator.store.load_session(&f.supervisor.session_id).await.unwrap().unwrap();
+    let original = serde_json::to_value(&session).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let deny = Arc::new(AtomicBool::new(false));
+    let registry = bamboo_tools::ToolRegistry::new();
+    registry.register(LegacySpawnPermissionOwner { name: "spawn_session", calls: calls.clone() }).unwrap();
+    let builtin = Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry_and_permissions(registry,
+        Arc::new(RootOwnerPermissionProbe { checks: checks.clone(), deny: deny.clone() })));
+    let legacy: Arc<dyn ToolExecutor> = builtin.clone();
+    let spawn = Arc::new(SpawnSessionTool::new(Arc::new(f.creator.clone()), f.creator.store.clone(), f.creator.config.clone(), legacy.clone()));
+    let installed = VersionedRootTools::new(legacy, spawn, f.creator.store.clone(), builtin);
+    let tools = installed.for_session(&session).unwrap();
+    let args = serde_json::to_value(&f.request).unwrap();
+    let call = ToolCall { id: "framework-Root-owner-approval".into(), tool_type: "function".into(),
+        function: FunctionCall { name: "default::spawnSession".into(), arguments: args.to_string() } };
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+    let context = || ToolExecutionContext { session_id: Some(&session.id), root_session_id: Some(&session.id), event_tx: Some(&event_tx),
+        executing_supervisor: ExecutingSupervisorObservation::capture_from_executing_session(&session), ..ToolExecutionContext::none(&call.id) };
+    let asks = [
+        tools.check_permissions_for(&call, &context()).await.unwrap().unwrap(),
+        tools.check_permissions_for_exact(&call, "spawn_session", &context()).await.unwrap().unwrap(),
+        tools.check_permissions_for_resolved(&call, "spawn_session", &args, &context()).await.unwrap().unwrap(),
+        tools.execute_exact_with_context_outcome(&call, "spawn_session", context()).await.unwrap(),
+    ];
+    for outcome in asks {
+        let payload = value(outcome.into_tool_result());
+        assert_eq!(payload["status"], "awaiting_permission_approval");
+        let request: bamboo_tools::permission::PermissionRequest = serde_json::from_value(payload["permission_request"].clone()).unwrap();
+        assert_eq!(request.tool_name, "spawn_session");
+        assert_eq!(request.tool_call_id, call.id);
+        assert_eq!(request.session_id, session.id);
+        assert!(request.resource.contains(&f.request.project_id.to_string()));
+        assert!(request.resource.contains(&f.request.workspace_path));
+        let event = event_rx.try_recv().unwrap();
+        assert!(matches!(event, bamboo_agent_core::AgentEvent::ToolApprovalRequested { tool_call_id, parameters, .. } if tool_call_id == call.id && parameters == args));
+    }
+    deny.store(true, Ordering::SeqCst);
+    let result = tools.execute_exact_with_context_outcome(&call, "spawn_session", context()).await;
+    assert!(matches!(result, Err(bamboo_agent_core::tools::ToolError::Execution(ref error)) if error.contains("Host denied exact Root operation")), "{result:?}");
+    assert_eq!(checks.load(Ordering::SeqCst), 5);
+    assert_eq!(calls.load(Ordering::SeqCst), 0, "framework ownership cannot run the custom legacy implementation");
+    assert_eq!(f.count().await, 1);
+    assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.inbox.inspect(&session.id).await.unwrap().generation, 0);
+    assert_eq!(serde_json::to_value(f.creator.store.load_session(&session.id).await.unwrap().unwrap()).unwrap(), original);
 }

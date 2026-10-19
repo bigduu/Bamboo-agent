@@ -569,7 +569,7 @@ impl AppState {
         })?;
 
         let diagnostics = Arc::new(crate::tools::diagnostics::DiagnosticsSource::default());
-        let (base_tools, native_tool_ceiling) = build_base_tools(
+        let (base_tools, native_tool_ceiling, builtin_permission_executor) = build_base_tools(
             config.clone(),
             permission_checker.clone(),
             mcp_manager.clone(),
@@ -1143,6 +1143,7 @@ impl AppState {
         });
         let (tools, canonical_subagent_tool) = build_root_tools(
             tools_with_task.clone(),
+            builtin_permission_executor,
             schedule_store.clone(),
             schedule_manager.clone(),
             session_store.clone(),

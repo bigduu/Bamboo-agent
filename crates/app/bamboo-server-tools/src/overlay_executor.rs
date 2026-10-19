@@ -21,6 +21,7 @@ enum OverlayRoute {
 pub struct OverlayToolExecutor {
     base: std::sync::Arc<dyn ToolExecutor>,
     overlay: std::sync::Arc<dyn Tool>,
+    additional_permission_gate: Option<std::sync::Arc<dyn ToolExecutor>>,
     session_behavior_version: Option<Option<u32>>,
 }
 
@@ -29,7 +30,29 @@ impl OverlayToolExecutor {
         Self {
             base,
             overlay,
+            additional_permission_gate: None,
             session_behavior_version: None,
+        }
+    }
+
+    /// Add an owner-specific operation gate while retaining every base gate.
+    pub fn with_additional_permission_gate(mut self, gate: std::sync::Arc<dyn ToolExecutor>) -> Self {
+        self.additional_permission_gate = Some(gate);
+        self
+    }
+
+    async fn check_overlay_permissions(
+        &self,
+        call: &ToolCall,
+        args: &serde_json::Value,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        if let Some(outcome) = self.base.check_permissions_for_resolved(call, self.overlay.name(), args, ctx).await? {
+            return Ok(Some(outcome));
+        }
+        match &self.additional_permission_gate {
+            Some(gate) => gate.check_permissions_for_resolved(call, self.overlay.name(), args, ctx).await,
+            None => Ok(None),
         }
     }
 
@@ -117,8 +140,7 @@ impl OverlayToolExecutor {
         let args = self.resolve_args(call, &ctx);
         check_parsed_tool_input(self.overlay.name(), &args)?;
         if let Some(outcome) = self
-            .base
-            .check_permissions_for_resolved(call, self.overlay.name(), &args, &ctx)
+            .check_overlay_permissions(call, &args, &ctx)
             .await?
         {
             return Ok(outcome);
@@ -137,6 +159,7 @@ impl ToolExecutor for OverlayToolExecutor {
             std::sync::Arc::new(Self {
                 base,
                 overlay: self.overlay.clone(),
+                additional_permission_gate: self.additional_permission_gate.clone(),
                 session_behavior_version: Some(session.session_version),
             }) as std::sync::Arc<dyn ToolExecutor>
         })
@@ -207,8 +230,8 @@ impl ToolExecutor for OverlayToolExecutor {
                     .pre_parsed_args
                     .cloned()
                     .unwrap_or_else(|| parse_tool_args_best_effort(&call.function.arguments).0);
-                self.base
-                    .check_permissions_for_resolved(call, self.overlay.name(), &args, ctx)
+                self
+                    .check_overlay_permissions(call, &args, ctx)
                     .await
             }
             OverlayRoute::BaseExact(execution_name) => {
@@ -231,8 +254,8 @@ impl ToolExecutor for OverlayToolExecutor {
                 .pre_parsed_args
                 .cloned()
                 .unwrap_or_else(|| parse_tool_args_best_effort(&call.function.arguments).0);
-            self.base
-                .check_permissions_for_resolved(call, execution_name, &args, ctx)
+            self
+                .check_overlay_permissions(call, &args, ctx)
                 .await
         } else if self.base.owns_exact_tool(execution_name) {
             self.base
@@ -253,9 +276,11 @@ impl ToolExecutor for OverlayToolExecutor {
         args: &serde_json::Value,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
-        self.base
-            .check_permissions_for_resolved(call, execution_name, args, ctx)
-            .await
+        if execution_name == self.overlay.name() {
+            self.check_overlay_permissions(call, args, ctx).await
+        } else {
+            self.base.check_permissions_for_resolved(call, execution_name, args, ctx).await
+        }
     }
 
     fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {

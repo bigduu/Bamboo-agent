@@ -51,6 +51,7 @@ pub(super) fn build_base_tools(
 ) -> (
     Arc<dyn ToolExecutor>,
     Arc<dyn bamboo_engine::external_agents::runtime::NativeToolCeilingSource>,
+    Arc<bamboo_tools::BuiltinToolExecutor>,
 ) {
     let ceiling_config = config.clone();
     let ceiling_projects = project_store.clone();
@@ -212,12 +213,12 @@ pub(super) fn build_base_tools(
         )),
     ));
     let ceiling = Arc::new(HostNativeToolCeiling {
-        builtin: builtin_executor,
+        builtin: builtin_executor.clone(),
         base: base.clone(),
         config: ceiling_config,
         projects: ceiling_projects,
     });
-    (base, ceiling)
+    (base, ceiling, builtin_executor)
 }
 
 /// Keep the actual instances and complete resolver assembled above. No Root
@@ -355,6 +356,7 @@ impl bamboo_engine::external_agents::runtime::NativeToolCeilingSource for HostNa
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_root_tools(
     base_tools: Arc<dyn ToolExecutor>,
+    permission_executor: Arc<bamboo_tools::BuiltinToolExecutor>,
     schedule_store: Arc<ScheduleStore>,
     schedule_manager: Arc<ScheduleManager>,
     session_store: Arc<SessionStoreV2>,
@@ -517,6 +519,7 @@ pub(super) fn build_root_tools(
             tools,
             spawn_session,
             spawn_storage,
+            permission_executor,
         ),
     );
     (tools, sub_agent_tool)

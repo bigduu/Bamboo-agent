@@ -134,6 +134,28 @@ pub mod versioned {
         }
     }
 
+    struct RootSpawnPermissionGate(Arc<bamboo_tools::BuiltinToolExecutor>);
+
+    #[async_trait]
+    impl ToolExecutor for RootSpawnPermissionGate {
+        async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+            Err(ToolError::Execution("permission-only Root operation gate".into()))
+        }
+        async fn check_permissions_for_resolved(
+            &self,
+            call: &ToolCall,
+            execution_name: &str,
+            args: &Value,
+            ctx: &ToolExecutionContext<'_>,
+        ) -> Result<Option<ToolOutcome>, ToolError> {
+            if execution_name != "spawn_session" {
+                return Err(ToolError::Execution("Root operation permission owner differs".into()));
+            }
+            self.0.check_framework_root_spawn_permissions(call, args, ctx).await
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> { Vec::new() }
+    }
+
     #[derive(Clone)]
     pub struct VersionedRootTools {
         legacy: Arc<dyn ToolExecutor>,
@@ -148,8 +170,10 @@ pub mod versioned {
             legacy: Arc<dyn ToolExecutor>,
             spawn: Arc<SpawnSessionTool>,
             storage: Arc<dyn Storage>,
+            permission_executor: Arc<bamboo_tools::BuiltinToolExecutor>,
         ) -> Self {
-            let independent = Arc::new(OverlayToolExecutor::new(legacy.clone(), spawn.clone()));
+            let independent = Arc::new(OverlayToolExecutor::new(legacy.clone(), spawn.clone())
+                .with_additional_permission_gate(Arc::new(RootSpawnPermissionGate(permission_executor))));
             Self {
                 legacy,
                 independent,
@@ -300,7 +324,11 @@ pub mod versioned {
             // Outer Work/broker overlays still use the real inner permission gate,
             // even though their registration is outside this wrapper's catalog.
             if execution_name == "spawn_session" {
-                self.spawn.validate_context(&ctx.to_tool_ctx()).await?;
+                let (tools, name) = self.route(&call.function.name, ctx).await?;
+                if name != execution_name {
+                    return Err(ToolError::Execution("permission owner differs from the Session spawn contract".into()));
+                }
+                return tools.check_permissions_for_resolved(call, execution_name, args, ctx).await;
             }
             self.selected()
                 .check_permissions_for_resolved(call, execution_name, args, ctx)
