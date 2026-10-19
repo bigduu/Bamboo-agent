@@ -45,6 +45,7 @@ fn parse_warning_log_details<'a>(
         || execution_name.eq_ignore_ascii_case("browser_eval")
         || execution_name.eq_ignore_ascii_case("session_message")
         || [
+            "spawn_session",
             "work_overview",
             "work_search",
             "work_inspect",
