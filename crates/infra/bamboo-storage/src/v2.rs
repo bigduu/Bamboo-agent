@@ -4827,6 +4827,7 @@ impl SessionStoreV2 {
         self.validate_root_context_for_save(&session).await?;
         self.check_actor_reconstruction(&session, &directory)
             .await?;
+        reject_incompatible_session_write(&session)?;
         let bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(&session))
             .map_err(|error| other_io_error(error.to_string()))?;
         self.write_default_bytes(&path, bytes, &guards).await?;
@@ -5461,6 +5462,7 @@ impl SessionStoreV2 {
             return Ok(false);
         };
 
+        reject_incompatible_session_write(&session)?;
         self.validate_root_context_for_save(&session).await?;
 
         // Keep only the first System message if present; drop all other messages.
