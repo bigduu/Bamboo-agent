@@ -4321,6 +4321,79 @@ mod hook_tests {
     }
 
     #[test]
+    fn versioned_spawn_parse_warning_helper_redacts_instruction_and_repair_preview() {
+        let raw = r#"{"message":"private Root instruction"#;
+        let (parsed, warning) = parse_tool_args_best_effort(raw);
+        let warning = warning.expect("repair warning includes the synthetic instruction");
+        assert!(warning.contains("private Root instruction"));
+        assert_eq!(parsed["message"], "private Root instruction");
+        for execution_name in ["spawn_session", "SPAWN_SESSION"] {
+            let (preview, warning) = parse_warning_log_details(execution_name, raw, &warning);
+            assert_eq!(preview, "[redacted]");
+            assert_eq!(warning, "[redacted]");
+        }
+        let (preview, kept_warning) = parse_warning_log_details("probe", raw, &warning);
+        assert!(preview.contains("private Root instruction"));
+        assert_eq!(kept_warning, warning);
+    }
+
+    #[tokio::test]
+    async fn versioned_spawn_parse_warning_real_dispatch_refuses_before_instruction_logging() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone, Default)]
+        struct Logs(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Logs {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer { self.clone() }
+        }
+
+        for ultra in [false, true] {
+            let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+            session.session_version = Some(2);
+            session.authority_identity = SessionAuthorityIdentity::Supervisor { incarnation_id: uuid::Uuid::new_v4() };
+            session.set_root_orchestration_only(ultra).unwrap();
+            let callable = effective_callable_set(&["spawn_session"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+            for name in ["spawn_session", "spawnSession", "default::spawn_session", "default::spawnSession"] {
+                let concrete = Arc::new(NameRecordingExecutor::new(&["spawn_session"]));
+                let tools: Arc<dyn ToolExecutor> = concrete.clone();
+                let mut call = probe_call(name);
+                call.function.arguments = r#"{"message":"PRIVATE_ROOT_DISPATCH_SENTINEL"#.into();
+                let original = call.clone();
+                let (tx, mut rx) = mpsc::channel(16);
+                let logs = Logs::default();
+                let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+                    .with_max_level(tracing::Level::WARN).with_writer(logs.clone()).finish();
+                let outcome = execute_model_requested_tool_call_only(&callable, ToolExecutionOnlyContext {
+                    session_behavior_version: Some(2), vision_support: true, output_cap: None,
+                    executing_supervisor: ExecutingSupervisorObservation::capture_from_executing_session(&session),
+                    tool_call: &call, event_tx: &tx, metrics_collector: None, session_id: &session.id,
+                    root_session_id: &session.root_session_id, root_orchestration_only: session.root_orchestration_only_enabled(),
+                    round_id: "private-Root-parse", round: 0, tools: &tools, config: &AgentLoopConfig::default(),
+                    hook_session: None, hook_runtime_state: None, session_flags: ToolExecutionSessionFlags::from_session(&session),
+                    available_tool_schemas: &[],
+                }).with_subscriber(subscriber).await.unwrap();
+                assert!(matches!(outcome.result, Err(ref error) if error.contains("invalid JSON arguments")), "{name}/{ultra}: {:?}", outcome.result);
+                assert!(concrete.entered().is_empty());
+                assert_eq!(call, original);
+                assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(event, AgentEvent::ToolStart { .. })));
+                let log = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+                assert!(log.contains("blocked by strict argument policy before ToolStart"), "{log}");
+                assert!(!log.contains("PRIVATE_ROOT_DISPATCH_SENTINEL"), "{log}");
+                assert!(!log.contains("args_preview="), "{log}");
+            }
+        }
+    }
+
+    #[test]
     fn malformed_browser_tool_warning_hides_raw_preview_and_repair_message() {
         for (tool_name, raw) in [
             (
