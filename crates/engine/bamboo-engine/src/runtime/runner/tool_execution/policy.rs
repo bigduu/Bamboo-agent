@@ -114,7 +114,12 @@ const STRICT_ARGUMENT_TOOL_NAMES: [&str; 11] = [
 ];
 
 fn normalize_tool_for_policy(raw_tool_name: &str, admitted_execution_name: Option<&str>) -> String {
-    let selected = admitted_execution_name.unwrap_or(raw_tool_name).trim();
+    if let Some(execution_name) = admitted_execution_name {
+        // Admission already selected an exact registered owner. Legacy alias
+        // normalization here would charge a Root/custom failure to SubAgent.
+        return execution_name.to_owned();
+    }
+    let selected = raw_tool_name.trim();
     let name = bamboo_tools::normalize_tool_ref(selected)
         .unwrap_or_else(|| normalize_tool_name(selected).trim().to_string());
     if matches!(name.as_str(), "exec_command" | "write_stdin") {
@@ -761,6 +766,90 @@ mod tests {
             assert!(!observation_round(&mut guard, 3, &[observation.clone()]));
             assert!(!observation_round(&mut guard, 4, &[observation.clone()]));
             assert!(observation_round(&mut guard, 5, &[observation.clone()]));
+        }
+    }
+    #[test]
+    fn versioned_spawn_policy_accounting_keeps_root_and_child_failure_circuits_independent() {
+        for (owner, reference) in [
+            ("spawn_session", "default::spawnSession"),
+            ("vendor::spawn_session", "vendor::spawn_session"),
+            ("spawnSession", "spawnSession"),
+        ] {
+            let call = tool_call(reference, "{}");
+            let child = tool_call("SubAgent", "{}");
+            let mut guard = ToolPolicyGuard::default();
+            for _ in 0..3 {
+                guard.begin_round(80, 3);
+                guard.observe_accounted_outcome(
+                    &call,
+                    &Err("correctable Project/workspace input".into()),
+                    Some(owner),
+                    super::super::per_call::ShellAccountingOutcome::Ordinary,
+                );
+                assert!(
+                    guard
+                        .check_before_execution_for_name(&child, 0, Some("SubAgent"))
+                        .is_ok(),
+                    "{owner}"
+                );
+            }
+            assert!(guard.delegation_failure_message().is_none(), "{owner}");
+            guard.begin_round(80, 3);
+            assert!(
+                guard
+                    .check_before_execution_for_name(&call, 0, Some(owner))
+                    .is_ok(),
+                "{owner}"
+            );
+            for _ in 0..3 {
+                guard.observe_accounted_outcome(
+                    &call,
+                    &Err("same exact owner failed again".into()),
+                    Some(owner),
+                    super::super::per_call::ShellAccountingOutcome::Ordinary,
+                );
+            }
+            assert!(guard
+                .check_before_execution_for_name(&call, 0, Some(owner))
+                .is_err());
+            for other_owner in ["spawn_session", "vendor::spawn_session", "spawnSession"] {
+                if other_owner != owner {
+                    let other = tool_call(other_owner, "{}");
+                    assert!(
+                        guard.check_before_execution_for_name(&other, 0, Some(other_owner)).is_ok(),
+                        "{owner} failures must not open the distinct exact owner {other_owner} circuit"
+                    );
+                }
+            }
+            assert!(guard
+                .check_before_execution_for_name(&child, 0, Some("SubAgent"))
+                .is_ok());
+            guard.begin_round(80, 3);
+            assert!(
+                guard
+                    .check_before_execution_for_name(&call, 0, Some(owner))
+                    .is_ok(),
+                "{owner}"
+            );
+            for _ in 0..3 {
+                guard.observe_accounted_outcome(
+                    &child,
+                    &Err("actual Child delegation failed".into()),
+                    Some("SubAgent"),
+                    super::super::per_call::ShellAccountingOutcome::Ordinary,
+                );
+            }
+            guard.begin_round(80, 3);
+            assert!(guard
+                .check_before_execution_for_name(&child, 0, Some("SubAgent"))
+                .is_err());
+            assert!(
+                guard
+                    .check_before_execution_for_name(&call, 0, Some(owner))
+                    .is_ok(),
+                "{owner}"
+            );
+            assert!(guard.delegation_failure_message().is_some());
         }
     }
 }

@@ -625,156 +625,26 @@ impl BuiltinToolExecutor {
         Ok(outcome)
     }
 
-    /// Build enhanced prompt for all registered tools
-    pub fn build_enhanced_prompt(&self, context: GuideBuildContext) -> String {
-        EnhancedPromptBuilder::build(Some(&self.registry), &self.list_tools(), &context)
-    }
-}
-
-/// Keep this inside an owned child's captured scope, before sending its
-/// result; the awaiting parent may already have timed out or been dropped.
-fn enforce_registered_tool_suspension(
-    outcome: Result<ToolOutcome, ToolError>,
-) -> Result<ToolOutcome, ToolError> {
-    let outcome = outcome.map(ToolOutcome::enforce_suspension_restriction);
-    if bamboo_agent_core::tools::suspension_running_violated() {
-        if let Some(resources) = crate::LocalTaskResources::current() {
-            resources.record_unconfirmed(
-                "restricted tool returned Running; cooperative kill has no stop receipt",
-            );
-        }
-    }
-    outcome
-}
-
-fn permission_error_to_tool_error(error: PermissionError) -> ToolError {
-    match error {
-        PermissionError::CheckFailed(_) => ToolError::InvalidArguments(error.to_string()),
-        _ => ToolError::Execution(error.to_string()),
-    }
-}
-
-impl Default for BuiltinToolExecutor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl ToolExecutor for BuiltinToolExecutor {
-    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
-        self.execute_with_context(call, ToolExecutionContext::none(&call.id))
-            .await
-    }
-
-    async fn execute_with_context(
+    /// Host-side permission entry used only by the installed v2 Root owner.
+    /// Classification is explicit while the typed request retains the actual
+    /// spawn_session identity, original argument bytes and existing once gates.
+    pub async fn check_framework_root_spawn_permissions(
         &self,
         call: &ToolCall,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolResult, ToolError> {
-        self.execute_with_context_outcome(call, ctx)
-            .await
-            .map(ToolOutcome::into_tool_result)
-    }
-
-    async fn execute_with_context_outcome(
-        &self,
-        call: &ToolCall,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolOutcome, ToolError> {
-        let reference = call.function.name.trim();
-        let tool_name =
-            resolve_registered_tool_name(&self.registry, reference).ok_or_else(|| {
-                ToolError::NotFound(format!("Tool '{}' not found", call.function.name))
-            })?;
-        self.execute_registered_with_context_outcome(call, &tool_name, ctx)
-            .await
-    }
-
-    async fn execute_exact_with_context_outcome(
-        &self,
-        call: &ToolCall,
-        execution_name: &str,
-        ctx: ToolExecutionContext<'_>,
-    ) -> Result<ToolOutcome, ToolError> {
-        self.execute_registered_with_context_outcome(call, execution_name, ctx)
-            .await
-    }
-
-    /// The real permission gate for built-in tools, extracted from the execute
-    /// path so it is reusable by wrapping executors (issue #341). The behavior is
-    /// byte-for-byte the same block that used to run inline in
-    /// `execute_with_context_outcome`:
-    ///
-    /// - resolves the SAME `tool_name` + `args` the execute path runs with (so
-    ///   the check sees exactly what the tool will run with);
-    /// - "always ask" rules (`requires_forced_confirmation`) force a confirmation
-    ///   even under bypass; everything else is skipped when the session is in
-    ///   bypass-permissions mode;
-    /// - forced confirmations route through `check_or_request_forced` so the
-    ///   active mode/bypass can't suppress the prompt;
-    /// - a `ConfirmationRequired` first tries the cross-process `ApprovalProxy`
-    ///   (a subagent worker forwarding to its host), then the interactive human
-    ///   sink (returning the synthesized approval pause as `Ok(Some(..))`), then
-    ///   fails closed;
-    /// - deny fails closed.
-    ///
-    /// The only mechanical difference from the old inline block: the interactive
-    /// pause is returned as `Ok(Some(outcome))` and a clean pass returns
-    /// `Ok(None)`, so the caller decides whether to run the tool. The fallback
-    /// arg-parse warning is intentionally NOT re-logged here — the execute path
-    /// already logs it once for this call.
-    async fn check_permissions_for(
-        &self,
-        call: &ToolCall,
+        args: &serde_json::Value,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
-        let reference = call.function.name.trim();
-        let tool_name = resolve_registered_tool_name(&self.registry, reference)
-            .unwrap_or_else(|| canonical_tool_name(reference));
-        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
-            pre_parsed.clone()
-        } else {
-            parse_tool_args_best_effort(&call.function.arguments).0
-        };
-        if let Some(tool) = self.registry.get(&tool_name) {
-            self.normalize_registered_builtin_args(reference, &tool_name, &tool, &mut args);
-        }
-        self.check_permissions_for_resolved(call, &tool_name, &args, ctx)
+        self.check_owned_permissions(call, "spawn_session", args, ctx, true)
             .await
     }
 
-    async fn check_permissions_for_exact(
-        &self,
-        call: &ToolCall,
-        execution_name: &str,
-        ctx: &ToolExecutionContext<'_>,
-    ) -> Result<Option<ToolOutcome>, ToolError> {
-        let tool = self
-            .registry
-            .get(execution_name)
-            .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", execution_name)))?;
-        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
-            pre_parsed.clone()
-        } else {
-            parse_tool_args_best_effort(&call.function.arguments).0
-        };
-        self.normalize_registered_builtin_args(
-            call.function.name.trim(),
-            execution_name,
-            &tool,
-            &mut args,
-        );
-        self.check_permissions_for_resolved(call, execution_name, &args, ctx)
-            .await
-    }
-
-    async fn check_permissions_for_resolved(
+    async fn check_owned_permissions(
         &self,
         call: &ToolCall,
         execution_name: &str,
         resolved_args: &serde_json::Value,
         ctx: &ToolExecutionContext<'_>,
+        framework_root_spawn: bool,
     ) -> Result<Option<ToolOutcome>, ToolError> {
         if self.native_tool_ceiling.is_some() {
             let tool = self
@@ -806,9 +676,13 @@ impl ToolExecutor for BuiltinToolExecutor {
         };
         let hook_permission_override = crate::current_hook_permission_override(&call.id);
 
-        if let Some(contexts) =
-            check_permissions(&tool_name, &args).map_err(permission_error_to_tool_error)?
-        {
+        let contexts = if framework_root_spawn {
+            crate::permission::tool_permissions::framework_root_spawn_permissions(&args)
+        } else {
+            check_permissions(&tool_name, &args)
+        }
+        .map_err(permission_error_to_tool_error)?;
+        if let Some(contexts) = contexts {
             let proactive_permission_request =
                 tool_name.eq_ignore_ascii_case("request_permissions");
             for context in contexts {
@@ -893,7 +767,7 @@ impl ToolExecutor for BuiltinToolExecutor {
                     let workspace_path = ctx
                         .session_id
                         .and_then(|session_id| config.session_workspace(session_id));
-                    match config.evaluate(crate::permission::PermissionEvaluation {
+                    let evaluation = crate::permission::PermissionEvaluation {
                         request_id: call.id.clone(),
                         session_id: ctx.session_id.unwrap_or_default().to_string(),
                         workspace_path,
@@ -908,7 +782,13 @@ impl ToolExecutor for BuiltinToolExecutor {
                         platform_hard_deny,
                         consume_once: true,
                         supported_decisions,
-                    }) {
+                    };
+                    let outcome = if framework_root_spawn {
+                        config.evaluate_framework_root_spawn(evaluation)
+                    } else {
+                        config.evaluate(evaluation)
+                    };
+                    match outcome {
                         crate::permission::PermissionOutcome::Allow { .. } => continue,
                         crate::permission::PermissionOutcome::Deny { reason, .. } => {
                             return Err(ToolError::Execution(if private_browser_display {
@@ -946,7 +826,12 @@ impl ToolExecutor for BuiltinToolExecutor {
                         }));
                     }
                     let force_ask = focused_browser_input
-                        || permission_checker.requires_forced_confirmation(&tool_name, &args);
+                        || permission_checker.requires_forced_confirmation(&tool_name, &args)
+                        || (framework_root_spawn
+                            && permission_checker.requires_forced_confirmation(
+                                "session_control",
+                                &serde_json::json!({"action":"create", "request": args}),
+                            ));
                     let hook_allows = matches!(
                         hook_permission_override,
                         Some(crate::HookPermissionOverride::Allow)
@@ -1117,6 +1002,161 @@ impl ToolExecutor for BuiltinToolExecutor {
         }
 
         Ok(None)
+    }
+
+    /// Build enhanced prompt for all registered tools
+    pub fn build_enhanced_prompt(&self, context: GuideBuildContext) -> String {
+        EnhancedPromptBuilder::build(Some(&self.registry), &self.list_tools(), &context)
+    }
+}
+
+/// Keep this inside an owned child's captured scope, before sending its
+/// result; the awaiting parent may already have timed out or been dropped.
+fn enforce_registered_tool_suspension(
+    outcome: Result<ToolOutcome, ToolError>,
+) -> Result<ToolOutcome, ToolError> {
+    let outcome = outcome.map(ToolOutcome::enforce_suspension_restriction);
+    if bamboo_agent_core::tools::suspension_running_violated() {
+        if let Some(resources) = crate::LocalTaskResources::current() {
+            resources.record_unconfirmed(
+                "restricted tool returned Running; cooperative kill has no stop receipt",
+            );
+        }
+    }
+    outcome
+}
+
+fn permission_error_to_tool_error(error: PermissionError) -> ToolError {
+    match error {
+        PermissionError::CheckFailed(_) => ToolError::InvalidArguments(error.to_string()),
+        _ => ToolError::Execution(error.to_string()),
+    }
+}
+
+impl Default for BuiltinToolExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for BuiltinToolExecutor {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        self.execute_with_context(call, ToolExecutionContext::none(&call.id))
+            .await
+    }
+
+    async fn execute_with_context(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.execute_with_context_outcome(call, ctx)
+            .await
+            .map(ToolOutcome::into_tool_result)
+    }
+
+    async fn execute_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        let reference = call.function.name.trim();
+        let tool_name =
+            resolve_registered_tool_name(&self.registry, reference).ok_or_else(|| {
+                ToolError::NotFound(format!("Tool '{}' not found", call.function.name))
+            })?;
+        self.execute_registered_with_context_outcome(call, &tool_name, ctx)
+            .await
+    }
+
+    async fn execute_exact_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        self.execute_registered_with_context_outcome(call, execution_name, ctx)
+            .await
+    }
+
+    /// The real permission gate for built-in tools, extracted from the execute
+    /// path so it is reusable by wrapping executors (issue #341). The behavior is
+    /// byte-for-byte the same block that used to run inline in
+    /// `execute_with_context_outcome`:
+    ///
+    /// - resolves the SAME `tool_name` + `args` the execute path runs with (so
+    ///   the check sees exactly what the tool will run with);
+    /// - "always ask" rules (`requires_forced_confirmation`) force a confirmation
+    ///   even under bypass; everything else is skipped when the session is in
+    ///   bypass-permissions mode;
+    /// - forced confirmations route through `check_or_request_forced` so the
+    ///   active mode/bypass can't suppress the prompt;
+    /// - a `ConfirmationRequired` first tries the cross-process `ApprovalProxy`
+    ///   (a subagent worker forwarding to its host), then the interactive human
+    ///   sink (returning the synthesized approval pause as `Ok(Some(..))`), then
+    ///   fails closed;
+    /// - deny fails closed.
+    ///
+    /// The only mechanical difference from the old inline block: the interactive
+    /// pause is returned as `Ok(Some(outcome))` and a clean pass returns
+    /// `Ok(None)`, so the caller decides whether to run the tool. The fallback
+    /// arg-parse warning is intentionally NOT re-logged here — the execute path
+    /// already logs it once for this call.
+    async fn check_permissions_for(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        let reference = call.function.name.trim();
+        let tool_name = resolve_registered_tool_name(&self.registry, reference)
+            .unwrap_or_else(|| canonical_tool_name(reference));
+        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
+            pre_parsed.clone()
+        } else {
+            parse_tool_args_best_effort(&call.function.arguments).0
+        };
+        if let Some(tool) = self.registry.get(&tool_name) {
+            self.normalize_registered_builtin_args(reference, &tool_name, &tool, &mut args);
+        }
+        self.check_permissions_for_resolved(call, &tool_name, &args, ctx)
+            .await
+    }
+
+    async fn check_permissions_for_exact(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        let tool = self
+            .registry
+            .get(execution_name)
+            .ok_or_else(|| ToolError::NotFound(format!("Tool '{}' not found", execution_name)))?;
+        let mut args = if let Some(pre_parsed) = ctx.pre_parsed_args {
+            pre_parsed.clone()
+        } else {
+            parse_tool_args_best_effort(&call.function.arguments).0
+        };
+        self.normalize_registered_builtin_args(
+            call.function.name.trim(),
+            execution_name,
+            &tool,
+            &mut args,
+        );
+        self.check_permissions_for_resolved(call, execution_name, &args, ctx)
+            .await
+    }
+
+    async fn check_permissions_for_resolved(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        resolved_args: &serde_json::Value,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        self.check_owned_permissions(call, execution_name, resolved_args, ctx, false)
+            .await
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
@@ -4157,6 +4197,338 @@ mod tests {
             let result = executor.execute(&call).await;
             assert!(matches!(result, Err(ToolError::NotFound(_))));
         }
+    }
+
+    #[tokio::test]
+    async fn framework_root_spawn_preserves_legacy_ask_and_typed_once_identity() {
+        use crate::permission::{
+            ConfigPermissionChecker, PermissionConfig, PermissionMode, PermissionReasonCode,
+            PermissionRequest,
+        };
+        let args = json!({"project_id":"explicit-project", "workspace_path":"/not-opened/authorized-root", "message":"explicit first instruction"});
+        let legacy_args = json!({"action":"create", "request":args.clone()});
+        for rule in [
+            "session_control",
+            "session_control(*)",
+            r#"session_control(*"action":"create"*)"#,
+            "spawn_session",
+        ] {
+            for reference in ["spawn_session", "spawnSession", "default::spawn_session"] {
+                let config = Arc::new(PermissionConfig::new());
+                config.set_mode(PermissionMode::BypassPermissions);
+                config.set_ask_rules([rule.to_string()]);
+                let executor = BuiltinToolExecutorBuilder::new()
+                    .with_permission_checker(Arc::new(ConfigPermissionChecker::new(config.clone())))
+                    .build();
+                let call = make_tool_call_with_id("root-policy-request", reference, args.clone());
+                let original = call.clone();
+                let (tx, mut rx) = mpsc::channel(16);
+                let ctx = ToolExecutionContext {
+                    session_id: Some("explicit-root-caller"),
+                    event_tx: Some(&tx),
+                    bypass_permissions: true,
+                    ..ToolExecutionContext::none(&call.id)
+                };
+                if rule.starts_with("session_control") {
+                    let legacy_call = make_tool_call_with_id(
+                        "legacy-create-request",
+                        "session_control",
+                        legacy_args.clone(),
+                    );
+                    let legacy = executor
+                        .check_permissions_for(&legacy_call, &ctx)
+                        .await
+                        .unwrap();
+                    assert!(
+                        legacy.is_some(),
+                        "the original create gate must still force Ask: {rule}"
+                    );
+                    while rx.try_recv().is_ok() {}
+                }
+                let decision = executor
+                    .check_framework_root_spawn_permissions(&call, &args, &ctx)
+                    .await
+                    .unwrap();
+                let Some(ToolOutcome::Completed(result)) = decision else {
+                    panic!("legacy create Ask must survive Bypass for {rule}/{reference}: {decision:?}")
+                };
+                assert_eq!(
+                    result.display_preference.as_deref(),
+                    Some("request_permissions")
+                );
+                let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+                let request: PermissionRequest =
+                    serde_json::from_value(payload["permission_request"].clone()).unwrap();
+                assert_eq!(request.tool_name, "spawn_session");
+                assert_eq!(request.request_id, call.id);
+                assert_eq!(request.session_id, "explicit-root-caller");
+                assert_eq!(
+                    request.reason_code,
+                    PermissionReasonCode::ConfiguredAlwaysAsk
+                );
+                assert_eq!(
+                    request.resource,
+                    "session_control create explicit-project /not-opened/authorized-root"
+                );
+                assert!(!request.request_generation.is_empty());
+                assert_eq!(
+                    config.pending_request(&request.session_id, &call.id),
+                    Some(request.clone())
+                );
+                assert_eq!(call, original);
+                assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|e| matches!(e, AgentEvent::ToolApprovalRequested { tool_name, .. } if tool_name == "spawn_session")));
+                config
+                    .grant_once_for_generation(
+                        &request.session_id,
+                        &call.id,
+                        &request.request_generation,
+                        request.permission_type,
+                        request.resource.clone(),
+                    )
+                    .unwrap();
+                let approved = crate::permission::with_permission_replay_generation(
+                    &request.session_id,
+                    &call.id,
+                    Some(&request.request_generation),
+                    executor.check_framework_root_spawn_permissions(&call, &args, &ctx),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    approved.is_none(),
+                    "exact approved generation must consume once"
+                );
+                assert!(rx.try_recv().is_err());
+                let replayed = crate::permission::with_permission_replay_generation(
+                    &request.session_id,
+                    &call.id,
+                    Some(&request.request_generation),
+                    executor.check_framework_root_spawn_permissions(&call, &args, &ctx),
+                )
+                .await
+                .unwrap();
+                let Some(ToolOutcome::Completed(result)) = replayed else {
+                    panic!("consumed approval cannot be reused")
+                };
+                let next: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+                assert_ne!(
+                    next["permission_request"]["request_generation"],
+                    request.request_generation
+                );
+            }
+        }
+        // The additional legacy restriction must preserve all existing mode and deny precedence.
+        for (label, plan, auto, denied, expect_deny) in [
+            ("plan", true, false, false, true),
+            ("explicit-deny", false, false, true, true),
+            ("auto-deny", false, true, true, true),
+            ("auto", false, true, false, false),
+        ] {
+            let config = Arc::new(PermissionConfig::new());
+            config.set_mode(PermissionMode::BypassPermissions);
+            config.set_ask_rules(["session_control".into()]);
+            if denied {
+                config.deny_scoped_session_permission(
+                    "root-policy-mode",
+                    crate::permission::PermissionType::ExecuteCommand,
+                    "session_control create explicit-project /not-opened/authorized-root",
+                );
+            }
+            let executor = BuiltinToolExecutorBuilder::new()
+                .with_permission_checker(Arc::new(ConfigPermissionChecker::new(config)))
+                .build();
+            let call = make_tool_call("spawn_session", args.clone());
+            let (tx, mut rx) = mpsc::channel(8);
+            let ctx = ToolExecutionContext {
+                session_id: Some("root-policy-mode"),
+                event_tx: Some(&tx),
+                bypass_permissions: true,
+                auto_approve_permissions: auto,
+                plan_read_only: plan,
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let result = executor
+                .check_framework_root_spawn_permissions(&call, &args, &ctx)
+                .await;
+            if expect_deny {
+                assert!(result.is_err(), "{label}: {result:?}");
+            } else {
+                assert!(
+                    result.unwrap().is_none(),
+                    "{label} must preserve no-prompt behavior"
+                );
+            }
+            assert!(rx.try_recv().is_err(), "{label} must not ask");
+        }
+        // A rule restricted to followup does not become a create restriction.
+        let config = Arc::new(PermissionConfig::new());
+        config.set_mode(PermissionMode::BypassPermissions);
+        config.set_ask_rules([r#"session_control(*"action":"followup"*)"#.into()]);
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_permission_checker(Arc::new(ConfigPermissionChecker::new(config)))
+            .build();
+        let call = make_tool_call("spawn_session", args.clone());
+        assert!(executor
+            .check_framework_root_spawn_permissions(
+                &call,
+                &args,
+                &ToolExecutionContext {
+                    bypass_permissions: true,
+                    ..ToolExecutionContext::none(&call.id)
+                }
+            )
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn framework_root_spawn_preserves_configless_legacy_force_ask_and_denial() {
+        struct LegacyCreateChecker(Arc<AtomicUsize>);
+        #[async_trait]
+        impl PermissionChecker for LegacyCreateChecker {
+            async fn needs_confirmation(
+                &self,
+                _: crate::permission::PermissionType,
+                _: &str,
+            ) -> bool {
+                true
+            }
+            async fn request_confirmation(
+                &self,
+                context: crate::permission::PermissionContext,
+            ) -> Result<bool, PermissionError> {
+                assert_eq!(
+                    context.resource,
+                    "session_control create explicit-project /not-opened/authorized-root"
+                );
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(false)
+            }
+            fn requires_forced_confirmation(&self, name: &str, args: &serde_json::Value) -> bool {
+                name == "session_control"
+                    && args["action"] == "create"
+                    && args["request"]["project_id"] == "explicit-project"
+            }
+            fn grant_session_permission(&self, _: crate::permission::PermissionType, _: String) {
+                panic!("a denied call must not create a grant");
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_permission_checker(Arc::new(LegacyCreateChecker(calls.clone())))
+            .build();
+        let args = json!({"project_id":"explicit-project", "workspace_path":"/not-opened/authorized-root"});
+        let call = make_tool_call("default::spawnSession", args.clone());
+        let original = call.clone();
+        let ctx = ToolExecutionContext {
+            bypass_permissions: true,
+            ..ToolExecutionContext::none(&call.id)
+        };
+        let decision = executor
+            .check_framework_root_spawn_permissions(&call, &args, &ctx)
+            .await;
+        assert!(
+            decision.is_err(),
+            "legacy forced denial must not become Bypass allow: {decision:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(call, original);
+    }
+
+    async fn assert_legacy_exact_spawn_permission_owner(args: serde_json::Value) {
+        struct LegacyOwnerChecker(Arc<AtomicUsize>);
+        #[async_trait]
+        impl PermissionChecker for LegacyOwnerChecker {
+            async fn needs_confirmation(
+                &self,
+                _: crate::permission::PermissionType,
+                _: &str,
+            ) -> bool {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            async fn request_confirmation(
+                &self,
+                _: crate::permission::PermissionContext,
+            ) -> Result<bool, PermissionError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(PermissionError::CheckFailed(
+                    "unexpected framework Root permission".into(),
+                ))
+            }
+            fn grant_session_permission(&self, _: crate::permission::PermissionType, _: String) {
+                panic!("custom tool classification must not grant framework permissions");
+            }
+        }
+        let checks = Arc::new(AtomicUsize::new(0));
+        let mut failures = Vec::new();
+        for name in ["spawn_session", "spawnSession", "vendor::spawn_session"] {
+            let executor = BuiltinToolExecutorBuilder::new()
+                .with_tool(ExactRoutingTool {
+                    name,
+                    label: "legacy-custom-spawn",
+                    args_sensitive: false,
+                })
+                .unwrap()
+                .with_permission_checker(Arc::new(LegacyOwnerChecker(checks.clone())))
+                .build();
+            let call = make_tool_call(name, args.clone());
+            let ctx = ToolExecutionContext::none(&call.id);
+            for (entry, result) in [
+                ("raw", executor.check_permissions_for(&call, &ctx).await),
+                (
+                    "exact",
+                    executor
+                        .check_permissions_for_exact(&call, name, &ctx)
+                        .await,
+                ),
+                (
+                    "resolved",
+                    executor
+                        .check_permissions_for_resolved(&call, name, &args, &ctx)
+                        .await,
+                ),
+            ] {
+                match result {
+                    Ok(None) => {}
+                    other => failures.push(format!("{name}/{entry}: {other:?}")),
+                }
+            }
+            match executor
+                .execute_exact_with_context_outcome(&call, name, ctx)
+                .await
+            {
+                Ok(ToolOutcome::Completed(result)) => {
+                    assert!(result.success);
+                    let result: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+                    assert_eq!(result["label"], "legacy-custom-spawn");
+                    assert_eq!(result["args"], args);
+                }
+                other => failures.push(format!("{name}/execute: {other:?}")),
+            }
+        }
+        if checks.load(Ordering::SeqCst) != 0 {
+            failures.push(format!(
+                "framework permission checks: {}",
+                checks.load(Ordering::SeqCst)
+            ));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn legacy_exact_spawn_custom_arguments_do_not_gain_framework_root_permissions() {
+        assert_legacy_exact_spawn_permission_owner(json!({"payload":"legacy custom request"}))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn legacy_exact_spawn_framework_shaped_arguments_keep_the_custom_permission_owner() {
+        assert_legacy_exact_spawn_permission_owner(json!({
+            "project_id":"not-a-framework-request", "workspace_path":"/not-opened/custom-root",
+        }))
+        .await;
     }
 
     #[tokio::test]

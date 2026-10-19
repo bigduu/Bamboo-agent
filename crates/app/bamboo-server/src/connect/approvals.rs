@@ -785,9 +785,8 @@ impl ResumeExecutionPort for ConnectResumePort {
                 let tool_call = replay_target.tool_call().clone();
                 let tool_name = tool_call.function.name.clone();
                 let executor = ctx.tools.clone();
-                let replay_owner = bamboo_domain::resolve_tool_reference_name(&tool_name, |name| {
-                    executor.owns_exact_tool(name)
-                });
+                let executor = executor.for_session(&session).unwrap_or(executor);
+                let replay_owner = executor.resolve_reference_for_session(&session, &tool_name);
                 if replay_owner.is_none() && reexecute_request_generation.is_some() {
                     tracing::error!(%session_id, %tool_name, "connect approved replay has no registered execution owner; markers retained");
                     return;

@@ -64,6 +64,28 @@ pub type Result<T> = std::result::Result<T, ToolError>;
 /// ```
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
+    /// Optionally bind an already installed Host tool surface to a canonical
+    /// Session contract. This selects registrations, never adds a grant.
+    /// Unknown wrappers retain the existing behavior with None.
+    fn for_session(&self, _session: &crate::Session) -> Option<Arc<dyn ToolExecutor>> {
+        None
+    }
+
+    /// Use the same versioned exact owner for live dispatch and typed replay.
+    fn resolve_reference_for_session(
+        &self,
+        session: &crate::Session,
+        reference: &str,
+    ) -> Option<String> {
+        let bound = self.for_session(session);
+        bamboo_domain::resolve_session_tool_reference(session.session_version, reference, |name| {
+            match bound.as_ref() {
+                Some(tools) => tools.owns_exact_tool(name),
+                None => self.owns_exact_tool(name),
+            }
+        })
+    }
+
     /// Executes a tool call
     ///
     /// # Arguments
