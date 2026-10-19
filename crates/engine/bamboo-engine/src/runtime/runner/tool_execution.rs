@@ -64,6 +64,8 @@ mod per_call;
 mod policy;
 #[cfg(test)]
 mod progress_hint_tests;
+#[cfg(test)]
+mod model_progress_feedback_tests;
 mod quiet_poll;
 #[cfg(test)]
 mod supervisor_dispatch_tests;
