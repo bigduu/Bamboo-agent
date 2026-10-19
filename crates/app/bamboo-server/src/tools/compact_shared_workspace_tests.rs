@@ -37,12 +37,18 @@ fn recording_tool(h: &TestHarness) -> (SubAgentTool, Arc<WaitOrderPort>) {
 }
 
 async fn compact_create(tool: &SubAgentTool, parent: &str) -> Result<ToolResult, ToolError> {
-    invoke_completed(
+    let call = format!("shared-workspace-{}", Uuid::new_v4());
+    let diagnostic = bamboo_server_tools::sub_agent::test_diagnostics::install(parent, &call);
+    let result = invoke_completed(
         tool,
         json!({"message":"Inspect this checkout without changing it"}),
-        subagent_test_ctx(parent, &format!("shared-workspace-{}", Uuid::new_v4())),
+        subagent_test_ctx(parent, &call),
     )
-    .await
+    .await;
+    if result.is_err() {
+        eprintln!("fixture-only SubAgent diagnostic: {:?}", diagnostic.take());
+    }
+    result
 }
 
 async fn assert_no_creation(
@@ -326,7 +332,9 @@ async fn compact_shared_workspace_supports_real_supervisor_nested_child_and_lega
         parent.metadata_version += 1;
         h.storage.save_session(&parent).await.unwrap();
         let (tool, _) = recording_tool(&h);
-        let result = compact_create(&tool, &parent.id).await.unwrap();
+        let result = compact_create(&tool, &parent.id)
+            .await
+            .unwrap_or_else(|error| panic!("{kind}/{ultra}: {error}"));
         let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
         let child = h
             .storage
