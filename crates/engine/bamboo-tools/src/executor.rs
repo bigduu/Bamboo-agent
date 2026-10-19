@@ -4188,6 +4188,102 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn framework_root_spawn_preserves_legacy_ask_and_typed_once_identity() {
+        use crate::permission::{PermissionConfig, ConfigPermissionChecker, PermissionMode, PermissionRequest, PermissionReasonCode};
+        let args = json!({"project_id":"explicit-project", "workspace_path":"/not-opened/authorized-root", "message":"explicit first instruction"});
+        let legacy_args = json!({"action":"create", "request":args.clone()});
+        for rule in ["session_control", "session_control(*)", r#"session_control(*"action":"create"*)"#, "spawn_session"] {
+            for reference in ["spawn_session", "spawnSession", "default::spawn_session"] {
+                let config = Arc::new(PermissionConfig::new());
+                config.set_mode(PermissionMode::BypassPermissions);
+                config.set_ask_rules([rule.to_string()]);
+                let executor = BuiltinToolExecutorBuilder::new()
+                    .with_permission_checker(Arc::new(ConfigPermissionChecker::new(config.clone()))).build();
+                let call = make_tool_call_with_id("root-policy-request", reference, args.clone());
+                let original = call.clone();
+                let (tx, mut rx) = mpsc::channel(16);
+                let ctx = ToolExecutionContext { session_id: Some("explicit-root-caller"), event_tx: Some(&tx), bypass_permissions: true, ..ToolExecutionContext::none(&call.id) };
+                if rule.starts_with("session_control") {
+                    let legacy_call = make_tool_call_with_id("legacy-create-request", "session_control", legacy_args.clone());
+                    let legacy = executor.check_permissions_for(&legacy_call, &ctx).await.unwrap();
+                    assert!(legacy.is_some(), "the original create gate must still force Ask: {rule}");
+                    while rx.try_recv().is_ok() {}
+                }
+                let decision = executor.check_framework_root_spawn_permissions(&call, &args, &ctx).await.unwrap();
+                let Some(ToolOutcome::Completed(result)) = decision else { panic!("legacy create Ask must survive Bypass for {rule}/{reference}: {decision:?}") };
+                assert_eq!(result.display_preference.as_deref(), Some("request_permissions"));
+                let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+                let request: PermissionRequest = serde_json::from_value(payload["permission_request"].clone()).unwrap();
+                assert_eq!(request.tool_name, "spawn_session");
+                assert_eq!(request.request_id, call.id);
+                assert_eq!(request.session_id, "explicit-root-caller");
+                assert_eq!(request.reason_code, PermissionReasonCode::ConfiguredAlwaysAsk);
+                assert_eq!(request.resource, "session_control create explicit-project /not-opened/authorized-root");
+                assert!(!request.request_generation.is_empty());
+                assert_eq!(config.pending_request(&request.session_id, &call.id), Some(request.clone()));
+                assert_eq!(call, original);
+                assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|e| matches!(e, AgentEvent::ToolApprovalRequested { tool_name, .. } if tool_name == "spawn_session")));
+                config.grant_once_for_generation(&request.session_id, &call.id, &request.request_generation, request.permission_type, request.resource.clone()).unwrap();
+                let approved = crate::permission::with_permission_replay_generation(&request.session_id, &call.id, Some(&request.request_generation), executor.check_framework_root_spawn_permissions(&call, &args, &ctx)).await.unwrap();
+                assert!(approved.is_none(), "exact approved generation must consume once");
+                assert!(rx.try_recv().is_err());
+                let replayed = crate::permission::with_permission_replay_generation(&request.session_id, &call.id, Some(&request.request_generation), executor.check_framework_root_spawn_permissions(&call, &args, &ctx)).await.unwrap();
+                let Some(ToolOutcome::Completed(result)) = replayed else { panic!("consumed approval cannot be reused") };
+                let next: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+                assert_ne!(next["permission_request"]["request_generation"], request.request_generation);
+            }
+        }
+        // The additional legacy restriction must preserve all existing mode and deny precedence.
+        for (label, plan, auto, denied, expect_deny) in [("plan", true, false, false, true), ("explicit-deny", false, false, true, true), ("auto-deny", false, true, true, true), ("auto", false, true, false, false)] {
+            let config = Arc::new(PermissionConfig::new());
+            config.set_mode(PermissionMode::BypassPermissions);
+            config.set_ask_rules(["session_control".into()]);
+            if denied { config.deny_scoped_session_permission("root-policy-mode", crate::permission::PermissionType::ExecuteCommand, "session_control create explicit-project /not-opened/authorized-root"); }
+            let executor = BuiltinToolExecutorBuilder::new().with_permission_checker(Arc::new(ConfigPermissionChecker::new(config))).build();
+            let call = make_tool_call("spawn_session", args.clone());
+            let (tx, mut rx) = mpsc::channel(8);
+            let ctx = ToolExecutionContext { session_id: Some("root-policy-mode"), event_tx: Some(&tx), bypass_permissions: true, auto_approve_permissions: auto, plan_read_only: plan, ..ToolExecutionContext::none(&call.id) };
+            let result = executor.check_framework_root_spawn_permissions(&call, &args, &ctx).await;
+            if expect_deny { assert!(result.is_err(), "{label}: {result:?}"); } else { assert!(result.unwrap().is_none(), "{label} must preserve no-prompt behavior"); }
+            assert!(rx.try_recv().is_err(), "{label} must not ask");
+        }
+        // A rule restricted to followup does not become a create restriction.
+        let config = Arc::new(PermissionConfig::new());
+        config.set_mode(PermissionMode::BypassPermissions);
+        config.set_ask_rules([r#"session_control(*"action":"followup"*)"#.into()]);
+        let executor = BuiltinToolExecutorBuilder::new().with_permission_checker(Arc::new(ConfigPermissionChecker::new(config))).build();
+        let call = make_tool_call("spawn_session", args.clone());
+        assert!(executor.check_framework_root_spawn_permissions(&call, &args, &ToolExecutionContext { bypass_permissions: true, ..ToolExecutionContext::none(&call.id) }).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn framework_root_spawn_preserves_configless_legacy_force_ask_and_denial() {
+        struct LegacyCreateChecker(Arc<AtomicUsize>);
+        #[async_trait]
+        impl PermissionChecker for LegacyCreateChecker {
+            async fn needs_confirmation(&self, _: crate::permission::PermissionType, _: &str) -> bool { true }
+            async fn request_confirmation(&self, context: crate::permission::PermissionContext) -> Result<bool, PermissionError> {
+                assert_eq!(context.resource, "session_control create explicit-project /not-opened/authorized-root");
+                self.0.fetch_add(1, Ordering::SeqCst); Ok(false)
+            }
+            fn requires_forced_confirmation(&self, name: &str, args: &serde_json::Value) -> bool {
+                name == "session_control" && args["action"] == "create" && args["request"]["project_id"] == "explicit-project"
+            }
+            fn grant_session_permission(&self, _: crate::permission::PermissionType, _: String) { panic!("a denied call must not create a grant"); }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = BuiltinToolExecutorBuilder::new().with_permission_checker(Arc::new(LegacyCreateChecker(calls.clone()))).build();
+        let args = json!({"project_id":"explicit-project", "workspace_path":"/not-opened/authorized-root"});
+        let call = make_tool_call("default::spawnSession", args.clone());
+        let original = call.clone();
+        let ctx = ToolExecutionContext { bypass_permissions: true, ..ToolExecutionContext::none(&call.id) };
+        let decision = executor.check_framework_root_spawn_permissions(&call, &args, &ctx).await;
+        assert!(decision.is_err(), "legacy forced denial must not become Bypass allow: {decision:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(call, original);
+    }
+
     async fn assert_legacy_exact_spawn_permission_owner(args: serde_json::Value) {
         struct LegacyOwnerChecker(Arc<AtomicUsize>);
         #[async_trait]
