@@ -1892,15 +1892,11 @@ impl PermissionConfig {
             .matching_durable_rule(&input, PermissionRuleEffect::AlwaysAsk)
             .map(|rule| PermissionRuleRef::from(&rule));
         let configured_always_ask = typed_always_ask.is_some()
-            || self
-                .ask_rules
-                .read()
-                .recover_poison()
-                .iter()
-                .any(|rule| {
-                    rule.matches_tool_call(&input.tool_name, &input.tool_args)
-                        || additional_rule_context.is_some_and(|(name, args)| rule.matches_tool_call(name, args))
-                });
+            || self.ask_rules.read().recover_poison().iter().any(|rule| {
+                rule.matches_tool_call(&input.tool_name, &input.tool_args)
+                    || additional_rule_context
+                        .is_some_and(|(name, args)| rule.matches_tool_call(name, args))
+            });
         if hard_dangerous || configured_always_ask {
             let reason_code = if hard_dangerous {
                 PermissionReasonCode::HardDangerous
