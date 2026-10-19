@@ -793,6 +793,27 @@ mod tests {
             assert!(guard.check_before_execution_for_name(&call, 0, Some(owner)).is_ok(), "{owner}");
             for _ in 0..3 {
                 guard.observe_accounted_outcome(
+                    &call,
+                    &Err("same exact owner failed again".into()),
+                    Some(owner),
+                    super::super::per_call::ShellAccountingOutcome::Ordinary,
+                );
+            }
+            assert!(guard.check_before_execution_for_name(&call, 0, Some(owner)).is_err());
+            for other_owner in ["spawn_session", "vendor::spawn_session", "spawnSession"] {
+                if other_owner != owner {
+                    let other = tool_call(other_owner, "{}");
+                    assert!(
+                        guard.check_before_execution_for_name(&other, 0, Some(other_owner)).is_ok(),
+                        "{owner} failures must not open the distinct exact owner {other_owner} circuit"
+                    );
+                }
+            }
+            assert!(guard.check_before_execution_for_name(&child, 0, Some("SubAgent")).is_ok());
+            guard.begin_round(80, 3);
+            assert!(guard.check_before_execution_for_name(&call, 0, Some(owner)).is_ok(), "{owner}");
+            for _ in 0..3 {
+                guard.observe_accounted_outcome(
                     &child,
                     &Err("actual Child delegation failed".into()),
                     Some("SubAgent"),
