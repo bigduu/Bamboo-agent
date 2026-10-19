@@ -64,10 +64,27 @@ impl ToolExecutor for VersionedProbeSurface {
     }
 }
 
+
+// Use the production overlay composition and the real Host operation gate.
+// A bare custom tool named spawn_session is deliberately not a framework owner.
+struct VersionedProbeRootPermissionGate(Arc<bamboo_tools::BuiltinToolExecutor>);
+
+#[async_trait]
+impl ToolExecutor for VersionedProbeRootPermissionGate {
+    async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
+        panic!("permission-only framework probe gate cannot execute an operation")
+    }
+    async fn check_permissions_for_resolved(&self, call: &ToolCall, execution_name: &str, args: &Value, ctx: &ToolExecutionContext<'_>) -> Result<Option<ToolOutcome>, ToolError> {
+        assert_eq!(execution_name, "spawn_session");
+        self.0.check_framework_root_spawn_permissions(call, args, ctx).await
+    }
+    fn list_tools(&self) -> Vec<ToolSchema> { Vec::new() }
+}
+
 fn versioned_agent(fixture: &Fixture) -> (Arc<PermissionConfig>, Agent) {
     let config = Arc::new(PermissionConfig::new());
     config.set_ask_rules(["spawn_session".into(), "SubAgent".into()]);
-    let make = |name| -> Arc<dyn ToolExecutor> {
+    let make = |name| -> Arc<bamboo_tools::BuiltinToolExecutor> {
         let registry = bamboo_tools::ToolRegistry::new();
         registry
             .register(VersionedProbeTool {
@@ -82,9 +99,16 @@ fn versioned_agent(fixture: &Fixture) -> (Arc<PermissionConfig>, Agent) {
             ),
         )
     };
+    let root_builtin = make("spawn_session");
+    let independent = Arc::new(
+        bamboo_server_tools::overlay_executor::OverlayToolExecutor::new(
+            root_builtin.clone(),
+            Arc::new(VersionedProbeTool { name: "spawn_session", probe: fixture.probe.clone() }),
+        ).with_additional_permission_gate(Arc::new(VersionedProbeRootPermissionGate(root_builtin)))
+    );
     let surface = Arc::new(VersionedProbeSurface {
         legacy: make("SubAgent"),
-        independent: make("spawn_session"),
+        independent,
     });
     let agent = fixture.agent_with_executor(Some(config.clone()), surface, None);
     (config, agent)
