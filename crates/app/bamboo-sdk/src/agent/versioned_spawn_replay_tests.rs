@@ -64,7 +64,6 @@ impl ToolExecutor for VersionedProbeSurface {
     }
 }
 
-
 // Use the production overlay composition and the real Host operation gate.
 // A bare custom tool named spawn_session is deliberately not a framework owner.
 struct VersionedProbeRootPermissionGate(Arc<bamboo_tools::BuiltinToolExecutor>);
@@ -74,11 +73,21 @@ impl ToolExecutor for VersionedProbeRootPermissionGate {
     async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
         panic!("permission-only framework probe gate cannot execute an operation")
     }
-    async fn check_permissions_for_resolved(&self, call: &ToolCall, execution_name: &str, args: &Value, ctx: &ToolExecutionContext<'_>) -> Result<Option<ToolOutcome>, ToolError> {
+    async fn check_permissions_for_resolved(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        args: &Value,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
         assert_eq!(execution_name, "spawn_session");
-        self.0.check_framework_root_spawn_permissions(call, args, ctx).await
+        self.0
+            .check_framework_root_spawn_permissions(call, args, ctx)
+            .await
     }
-    fn list_tools(&self) -> Vec<ToolSchema> { Vec::new() }
+    fn list_tools(&self) -> Vec<ToolSchema> {
+        Vec::new()
+    }
 }
 
 fn versioned_agent(fixture: &Fixture) -> (Arc<PermissionConfig>, Agent) {
@@ -103,8 +112,12 @@ fn versioned_agent(fixture: &Fixture) -> (Arc<PermissionConfig>, Agent) {
     let independent = Arc::new(
         bamboo_server_tools::overlay_executor::OverlayToolExecutor::new(
             root_builtin.clone(),
-            Arc::new(VersionedProbeTool { name: "spawn_session", probe: fixture.probe.clone() }),
-        ).with_additional_permission_gate(Arc::new(VersionedProbeRootPermissionGate(root_builtin)))
+            Arc::new(VersionedProbeTool {
+                name: "spawn_session",
+                probe: fixture.probe.clone(),
+            }),
+        )
+        .with_additional_permission_gate(Arc::new(VersionedProbeRootPermissionGate(root_builtin))),
     );
     let surface = Arc::new(VersionedProbeSurface {
         legacy: make("SubAgent"),
