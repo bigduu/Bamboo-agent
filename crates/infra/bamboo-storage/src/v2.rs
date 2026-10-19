@@ -1527,6 +1527,8 @@ const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
 fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     let now = Utc::now();
     let mut copy = source.clone();
+    copy.session_version = Some(bamboo_domain::CURRENT_SESSION_VERSION);
+    copy.observed_runtime_session_version = None;
     copy.authority_identity = SessionAuthorityIdentity::Ordinary;
     copy.supervisor_management = None;
     copy.id = new_id.to_string();
