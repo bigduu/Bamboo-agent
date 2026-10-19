@@ -18,8 +18,7 @@ fn parent_workspace(parent: &Session) -> Result<PathBuf, ChildSessionError> {
         .or_else(|| parent.workspace.clone());
     let selected = selected
         .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .ok_or_else(invalid)?;
     let path = Path::new(selected);
     if !path.is_absolute() || !path.is_dir() {
