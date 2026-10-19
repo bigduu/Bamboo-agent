@@ -201,13 +201,7 @@ impl FileReadyRetryStore {
                 return Err(unavailable("retry lock is not a plain file"))
             }
             Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if self.directory.try_exists()? {
-                    return Err(unavailable(
-                        "initialized retry lock is missing; explicit repair required",
-                    ));
-                }
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
         if descriptor.is_none() {
