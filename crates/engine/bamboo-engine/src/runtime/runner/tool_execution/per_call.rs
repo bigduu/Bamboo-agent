@@ -4338,7 +4338,7 @@ mod hook_tests {
     }
 
     #[tokio::test]
-    async fn versioned_spawn_parse_warning_real_dispatch_refuses_before_instruction_logging() {
+    async fn versioned_spawn_parse_warning_real_dispatch_redacts_instruction_logging() {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
         use tracing::instrument::WithSubscriber;
 
@@ -4381,14 +4381,15 @@ mod hook_tests {
                     hook_session: None, hook_runtime_state: None, session_flags: ToolExecutionSessionFlags::from_session(&session),
                     available_tool_schemas: &[],
                 }).with_subscriber(subscriber).await.unwrap();
-                assert!(matches!(outcome.result, Err(ref error) if error.contains("invalid JSON arguments")), "{name}/{ultra}: {:?}", outcome.result);
-                assert!(concrete.entered().is_empty());
+                assert!(outcome.result.is_ok(), "{name}/{ultra}: {:?}", outcome.result);
+                assert_eq!(concrete.entered(), vec!["spawn_session"]);
                 assert_eq!(call, original);
-                assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(event, AgentEvent::ToolStart { .. })));
+                assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(event, AgentEvent::ToolStart { .. })));
                 let log = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-                assert!(log.contains("blocked by strict argument policy before ToolStart"), "{log}");
+                assert!(log.contains("required fallback before ToolStart"), "{log}");
+                assert!(log.contains("args_preview="), "{log}");
                 assert!(!log.contains("PRIVATE_ROOT_DISPATCH_SENTINEL"), "{log}");
-                assert!(!log.contains("args_preview="), "{log}");
+                assert!(!log.contains(&call.function.arguments), "{log}");
             }
         }
     }
