@@ -391,3 +391,6 @@ mod capacity;
 
 #[path = "ready_retry_store/membership.rs"]
 mod membership;
+
+#[path = "ready_retry_store/lock_identity.rs"]
+mod lock_identity;
