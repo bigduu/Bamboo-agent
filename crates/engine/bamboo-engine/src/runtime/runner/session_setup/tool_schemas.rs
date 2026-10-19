@@ -649,4 +649,83 @@ mod live_disabled_tests {
             &session
         ));
     }
+    struct VersionedCatalog {
+        v2: bool,
+    }
+    #[async_trait::async_trait]
+    impl ToolExecutor for VersionedCatalog {
+        async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
+            unreachable!()
+        }
+        fn for_session(&self, session: &Session) -> Option<Arc<dyn ToolExecutor>> {
+            Some(Arc::new(Self {
+                v2: session.independent_root_spawn_contract(),
+            }))
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            let mut names = vec!["SubAgent", "session_control", "work_dispatch"];
+            if self.v2 {
+                names.push("spawn_session");
+            }
+            names
+                .into_iter()
+                .map(|name| {
+                    let mut s = schema(name);
+                    s.function.description = format!("actual {name} owner contract");
+                    s
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn versioned_spawn_catalog_keeps_root_schema_separate_and_native_disabled_exact() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let tools = VersionedCatalog { v2: false };
+        for version in [None, Some(1), Some(2)] {
+            for ultra in [false, true] {
+                for supervisor in [false, true] {
+                    let mut session = Session::new(
+                        if supervisor {
+                            DEFAULT_SUPERVISOR_SESSION_ID
+                        } else {
+                            "ordinary"
+                        },
+                        "model",
+                    );
+                    session.session_version = version;
+                    session.set_root_orchestration_only(ultra).unwrap();
+                    if supervisor {
+                        session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                            incarnation_id: uuid::Uuid::new_v4(),
+                        };
+                    }
+                    let config = AgentLoopConfig::default();
+                    let schemas =
+                        resolve_available_tool_schemas_for_session(&config, &tools, &session);
+                    let root = schemas.iter().find(|s| s.function.name == "spawn_session");
+                    assert_eq!(root.is_some(), version == Some(2) && supervisor);
+                    if let Some(root) = root {
+                        assert_eq!(
+                            root.function.description,
+                            "actual spawn_session owner contract"
+                        );
+                    }
+                    for reference in ["spawn_session", "spawnSession", "default::spawn_session"] {
+                        let config = AgentLoopConfig {
+                            disabled_tools: BTreeSet::from([reference.to_owned()]),
+                            ..Default::default()
+                        };
+                        let schemas =
+                            resolve_available_tool_schemas_for_session(&config, &tools, &session);
+                        assert!(schemas.iter().all(|s| s.function.name != "spawn_session"));
+                        assert_eq!(
+                            schemas.iter().any(|s| s.function.name == "SubAgent"),
+                            version == Some(2)
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

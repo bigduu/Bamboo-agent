@@ -656,3 +656,226 @@ async fn incomplete_or_corrupt_canonical_creation_requires_host_repair_without_o
         assert_eq!(f.count().await, 2);
     }
 }
+
+fn native_git(path: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn v2_context(session: &Session) -> ToolCtx {
+    let mut ctx = ToolCtx::none("v2-native-spawn");
+    ctx.session_id = Some(session.id.clone().into());
+    ctx.executing_supervisor =
+        ExecutingSupervisorObservation::capture_from_executing_session(session);
+    ctx
+}
+
+#[tokio::test]
+async fn versioned_spawn_uses_an_explicit_independent_checkout_and_recovers_first_task_on_reopen() {
+    use bamboo_server_tools::session_control::versioned::SpawnSessionTool;
+    let f = Fixture::new().await;
+    let main = f.home.path().join("workspaces").join("source-checkout");
+    std::fs::create_dir_all(&main).unwrap();
+    native_git(&main, &["init", "--initial-branch=fixture"]);
+    native_git(
+        &main,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "isolated fixture",
+        ],
+    );
+    native_git(
+        &main,
+        &["worktree", "add", "--detach", &f.request.workspace_path],
+    );
+    let worker = std::path::Path::new(&f.request.workspace_path);
+    assert_ne!(
+        native_git(&main, &["rev-parse", "--show-toplevel"]),
+        native_git(worker, &["rev-parse", "--show-toplevel"])
+    );
+    assert_eq!(
+        native_git(&main, &["rev-parse", "HEAD"]),
+        native_git(worker, &["rev-parse", "HEAD"])
+    );
+    let session = f
+        .creator
+        .store
+        .load_session(&f.supervisor.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let original = serde_json::to_value(&session).unwrap();
+    let tool = SpawnSessionTool::new(
+        Arc::new(f.creator.clone()),
+        f.creator.store.clone(),
+        f.creator.config.clone(),
+    );
+    f.activation.fail.store(true, Ordering::SeqCst);
+    let ToolOutcome::Completed(result) = tool
+        .invoke(
+            serde_json::to_value(&f.request).unwrap(),
+            v2_context(&session),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("bounded Root receipt")
+    };
+    let one = accepted(result);
+    assert_eq!(one["activation"], "activation_pending");
+    let id = one["target_session_id"].as_str().unwrap();
+    let root = f.creator.store.load_session(id).await.unwrap().unwrap();
+    assert_eq!(root.kind, bamboo_domain::SessionKind::Root);
+    assert!(root.parent_session_id.is_none());
+    assert_eq!(root.session_version, Some(2));
+    assert_eq!(
+        root.workspace_path_meta().as_deref(),
+        Some(f.request.workspace_path.as_str())
+    );
+    let after = serde_json::to_value(
+        f.creator
+            .store
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    for key in [
+        "messages",
+        "model",
+        "authority_identity",
+        "session_version",
+        "root_orchestration_only",
+    ] {
+        assert_eq!(
+            after[key], original[key],
+            "Supervisor {key} must not be inherited or overwritten"
+        );
+    }
+    let (reopened, inbox, activation) = Fixture::open(f.home.path()).await;
+    let replay_tool = SpawnSessionTool::new(
+        Arc::new(reopened.clone()),
+        reopened.store.clone(),
+        reopened.config.clone(),
+    );
+    let ToolOutcome::Completed(result) = replay_tool
+        .invoke(
+            serde_json::to_value(&f.request).unwrap(),
+            v2_context(&session),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("bounded recovery receipt")
+    };
+    let recovered = accepted(result);
+    assert_eq!(recovered["target_session_id"], one["target_session_id"]);
+    assert_eq!(recovered["receipt_id"], one["receipt_id"]);
+    assert_eq!(recovered["generation"], one["generation"]);
+    assert_eq!(inbox.inspect(id).await.unwrap().generation, 1);
+    assert_eq!(activation.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn versioned_spawn_disabled_stale_and_invalid_scope_refusals_have_no_side_effects() {
+    use bamboo_server_tools::session_control::versioned::SpawnSessionTool;
+    let f = Fixture::new().await;
+    let canonical = f
+        .creator
+        .store
+        .load_session(&f.supervisor.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let original = serde_json::to_value(&canonical).unwrap();
+    let tool = SpawnSessionTool::new(
+        Arc::new(f.creator.clone()),
+        f.creator.store.clone(),
+        f.creator.config.clone(),
+    );
+    for case in [
+        "ordinary",
+        "child",
+        "stale",
+        "plan",
+        "disabled",
+        "foreign_project",
+        "unbound_workspace",
+        "scope_cas",
+    ] {
+        let mut ctx = v2_context(&canonical);
+        let mut request = f.request.clone();
+        match case {
+            "ordinary" | "child" => ctx.executing_supervisor = None,
+            "stale" => {
+                let mut stale = canonical.clone();
+                stale.authority_identity = bamboo_domain::SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: uuid::Uuid::new_v4(),
+                };
+                ctx = v2_context(&stale);
+            }
+            "plan" => ctx.plan_read_only = true,
+            "disabled" => {
+                f.creator.config.write().await.tools.disabled = vec!["default::spawnSession".into()]
+            }
+            "foreign_project" => request.project_id = "foreign-project".parse().unwrap(),
+            "unbound_workspace" => {
+                request.workspace_path = f
+                    .home
+                    .path()
+                    .join("workspaces/unbound")
+                    .to_string_lossy()
+                    .into_owned()
+            }
+            "scope_cas" => request.expected_state_revision = 0,
+            _ => unreachable!(),
+        }
+        let outcome = tool
+            .invoke(serde_json::to_value(request).unwrap(), ctx)
+            .await;
+        assert!(
+            match outcome {
+                Err(_) => true,
+                Ok(ToolOutcome::Completed(r)) => !r.success,
+                _ => false,
+            },
+            "{case}"
+        );
+        f.creator.config.write().await.tools.disabled.clear();
+        assert_eq!(f.count().await, 1, "{case}");
+        assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0, "{case}");
+        assert_eq!(
+            serde_json::to_value(
+                f.creator
+                    .store
+                    .load_session(&canonical.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            original,
+            "{case}"
+        );
+    }
+}

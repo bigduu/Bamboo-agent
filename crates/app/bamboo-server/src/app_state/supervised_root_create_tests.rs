@@ -147,6 +147,10 @@ impl Fixture {
     }
 
     async fn invoke(&self, args: Value) -> Value {
+        self.invoke_named("session_control", args).await
+    }
+
+    async fn invoke_named(&self, name: &str, args: Value) -> Value {
         let executing = self
             .state
             .storage
@@ -158,7 +162,7 @@ impl Fixture {
             id: "supervised-root-create".into(),
             tool_type: "function".into(),
             function: FunctionCall {
-                name: "session_control".into(),
+                name: name.into(),
                 arguments: args.to_string(),
             },
         };
@@ -259,4 +263,67 @@ async fn supervisor_standard_creates_independent_root_and_retries_once() {
 #[actix_web::test]
 async fn supervisor_ultra_creates_independent_root_and_retries_once() {
     assert_create_is_independent_and_exact_retry(true).await;
+}
+
+async fn assert_v2_spawn_uses_root_port_in_both_modes(ultra: bool) {
+    let f = Fixture::new(ultra).await;
+    let request = f.request(uuid::Uuid::new_v4())["request"].clone();
+    let created = f.invoke_named("spawn_session", request.clone()).await;
+    assert_eq!(created["admitted"], true);
+    let id = created["target_session_id"].as_str().unwrap();
+    let root = f.state.storage.load_session(id).await.unwrap().unwrap();
+    assert_eq!(root.kind, SessionKind::Root);
+    assert_eq!(root.session_version, Some(2));
+    assert_eq!(root.root_session_id, id);
+    assert!(root.parent_session_id.is_none() && root.authority_identity.is_ordinary());
+    assert_eq!(
+        root.workspace_path_meta().as_deref(),
+        Some(f.workspace.as_str())
+    );
+    let replay = f.invoke_named("default::spawnSession", request).await;
+    assert_eq!(replay["target_session_id"], created["target_session_id"]);
+    assert_eq!(replay["receipt_id"], created["receipt_id"]);
+    assert_eq!(
+        f.state.session_inbox.inspect(id).await.unwrap().generation,
+        1
+    );
+    let canonical = f
+        .state
+        .storage
+        .load_session(&f.supervisor.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let bound = f
+        .state
+        .tools_for(crate::tools::ToolSurface::Root)
+        .for_session(&canonical)
+        .unwrap();
+    assert!(bound.owns_exact_tool("spawn_session"));
+    assert!(bound.owns_exact_tool("SubAgent"));
+    assert_eq!(
+        bound
+            .resolve_reference_for_session(&canonical, "default::spawnSession")
+            .as_deref(),
+        Some("spawn_session")
+    );
+    assert!(
+        f.state
+            .storage
+            .inspect_supervisor_link(&f.supervisor, id)
+            .await
+            .unwrap()
+            .authorized
+    );
+    f.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn supervisor_v2_standard_spawn_uses_real_root_creation_and_exact_retry() {
+    assert_v2_spawn_uses_root_port_in_both_modes(false).await;
+}
+
+#[actix_web::test]
+async fn supervisor_v2_ultra_spawn_uses_real_root_creation_and_exact_retry() {
+    assert_v2_spawn_uses_root_port_in_both_modes(true).await;
 }

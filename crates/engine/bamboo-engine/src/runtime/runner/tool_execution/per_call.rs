@@ -4848,4 +4848,192 @@ mod hook_tests {
             );
         }
     }
+    #[tokio::test]
+    async fn versioned_spawn_final_gate_matrix_has_no_child_fallback_or_ordinary_root_authority() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for version in [None, Some(1), Some(2)] {
+            for ultra in [false, true] {
+                for identity in ["ordinary", "supervisor", "child"] {
+                    let mut session = Session::new(
+                        if identity == "supervisor" {
+                            DEFAULT_SUPERVISOR_SESSION_ID
+                        } else {
+                            "ordinary"
+                        },
+                        "model",
+                    );
+                    session.session_version = version;
+                    session.set_root_orchestration_only(ultra).unwrap();
+                    if identity == "supervisor" {
+                        session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                            incarnation_id: uuid::Uuid::new_v4(),
+                        };
+                    } else if identity == "child" {
+                        session = Session::new_child_of("child", &session, "model", "worker");
+                        session.session_version = version;
+                    }
+                    let names: &[&str] = if version == Some(2) {
+                        &["spawn_session", "SubAgent"]
+                    } else {
+                        &["SubAgent"]
+                    };
+                    let callable = effective_callable_set(
+                        names,
+                        CapabilityLoadingMode::LegacyFullCatalog,
+                        &[],
+                    );
+                    for name in ["spawn_session", "spawnSession", "default::spawn_session"] {
+                        let concrete = Arc::new(NameRecordingExecutor::new(names));
+                        let tools: Arc<dyn ToolExecutor> = concrete.clone();
+                        let call = probe_call(name);
+                        let original = call.clone();
+                        let (tx, mut rx) = mpsc::channel(64);
+                        let outcome = execute_model_requested_tool_call_only(
+                            &callable,
+                            ToolExecutionOnlyContext {
+                                session_behavior_version: version,
+                                vision_support: true,
+                                output_cap: None,
+                                executing_supervisor:
+                                    ExecutingSupervisorObservation::capture_from_executing_session(
+                                        &session,
+                                    ),
+                                tool_call: &call,
+                                event_tx: &tx,
+                                metrics_collector: None,
+                                session_id: &session.id,
+                                root_session_id: &session.root_session_id,
+                                root_orchestration_only: session.root_orchestration_only_enabled(),
+                                round_id: "versioned-root",
+                                round: 0,
+                                tools: &tools,
+                                config: &AgentLoopConfig::default(),
+                                hook_session: None,
+                                hook_runtime_state: None,
+                                session_flags: ToolExecutionSessionFlags::from_session(&session),
+                                available_tool_schemas: &[],
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        let allowed = version != Some(2) || identity == "supervisor";
+                        assert_eq!(
+                            outcome.result.is_ok(),
+                            allowed,
+                            "{version:?}/{ultra}/{identity}/{name}"
+                        );
+                        assert_eq!(call, original, "history keeps the caller spelling");
+                        let selected = if version == Some(2) {
+                            "spawn_session"
+                        } else {
+                            "SubAgent"
+                        };
+                        assert_eq!(
+                            concrete.entered(),
+                            if allowed {
+                                vec![selected.to_owned()]
+                            } else {
+                                vec![]
+                            }
+                        );
+                        assert_eq!(
+                            std::iter::from_fn(|| rx.try_recv().ok())
+                                .filter(|event| matches!(event, AgentEvent::ToolStart { .. }))
+                                .count(),
+                            usize::from(allowed)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn versioned_spawn_missing_disabled_unloaded_and_shadowed_owners_refuse_before_toolstart()
+    {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        session.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        let concrete = Arc::new(NameRecordingExecutor::new(&[
+            "SubAgent",
+            "spawn_session",
+            "vendor::spawn_session",
+        ]));
+        let tools: Arc<dyn ToolExecutor> = concrete.clone();
+        for (names, mode, loaded, reference, allowed) in [
+            (
+                vec!["SubAgent"],
+                CapabilityLoadingMode::LegacyFullCatalog,
+                vec![],
+                "spawn_session",
+                false,
+            ),
+            (
+                vec!["SubAgent", "spawn_session"],
+                CapabilityLoadingMode::Progressive,
+                vec!["SubAgent"],
+                "spawnSession",
+                false,
+            ),
+            (
+                vec!["SubAgent", "spawn_session"],
+                CapabilityLoadingMode::Progressive,
+                vec!["spawn_session"],
+                "spawnSession",
+                true,
+            ),
+            (
+                vec!["SubAgent", "spawn_session"],
+                CapabilityLoadingMode::LegacyFullCatalog,
+                vec![],
+                "vendor::spawn_session",
+                false,
+            ),
+        ] {
+            let callable = effective_callable_set(&names, mode, &loaded);
+            let call = probe_call(reference);
+            let (tx, mut rx) = mpsc::channel(64);
+            let before = concrete.entered().len();
+            let outcome = execute_model_requested_tool_call_only(
+                &callable,
+                ToolExecutionOnlyContext {
+                    session_behavior_version: Some(2),
+                    vision_support: true,
+                    output_cap: None,
+                    executing_supervisor:
+                        ExecutingSupervisorObservation::capture_from_executing_session(&session),
+                    tool_call: &call,
+                    event_tx: &tx,
+                    metrics_collector: None,
+                    session_id: &session.id,
+                    root_session_id: &session.root_session_id,
+                    root_orchestration_only: false,
+                    round_id: "versioned-missing",
+                    round: 0,
+                    tools: &tools,
+                    config: &AgentLoopConfig::default(),
+                    hook_session: None,
+                    hook_runtime_state: None,
+                    session_flags: ToolExecutionSessionFlags::from_session(&session),
+                    available_tool_schemas: &[],
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.result.is_ok(), allowed, "{reference}/{loaded:?}");
+            assert_eq!(concrete.entered().len() - before, usize::from(allowed));
+            assert_eq!(
+                std::iter::from_fn(|| rx.try_recv().ok())
+                    .filter(|event| matches!(event, AgentEvent::ToolStart { .. }))
+                    .count(),
+                usize::from(allowed)
+            );
+        }
+        assert!(concrete
+            .entered()
+            .iter()
+            .all(|name| name == "spawn_session"));
+    }
 }

@@ -1504,3 +1504,6 @@ async fn output_repark_and_plan_save_failures_stop_provider_and_success_events()
         );
     }
 }
+
+#[path = "versioned_spawn_replay_tests.rs"]
+mod versioned_spawn;
