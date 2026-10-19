@@ -37,6 +37,7 @@ pub use patrol_adapter::PatrolCheckpointStore;
 mod ready_retry_store;
 mod resolution;
 mod scheduling;
+mod sprints;
 pub use bamboo_orchestration::{ReadyBlockKind, ReadyReconcile, ReadyWorkGrant, ReadyWorkPolicy};
 pub use ready_retry_store::{FileReadyRetryStore, ReadyRetryFilePhase, ReadyRetryPublicationFault};
 #[cfg(test)]
