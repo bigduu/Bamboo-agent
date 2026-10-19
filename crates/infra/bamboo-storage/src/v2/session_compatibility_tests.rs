@@ -1412,19 +1412,36 @@ async fn versioned_spawn_legacy_full_checkpoint_uses_the_current_sidecar_control
         let mut stale_main = session.clone();
         stale_main.agent_runtime_state.as_mut().unwrap().version = 99;
         let directory = home.path().join("sessions").join(&session.id);
-        tokio::fs::write(directory.join("session.json"), serde_json::to_vec(&stale_main).unwrap()).await.unwrap();
+        tokio::fs::write(
+            directory.join("session.json"),
+            serde_json::to_vec(&stale_main).unwrap(),
+        )
+        .await
+        .unwrap();
         let fresh = SessionStoreV2::new(home.path().into()).await.unwrap();
         let mut loaded = fresh.load_session(&session.id).await.unwrap().unwrap();
-        assert!(loaded.execution_compatibility().execution_allowed, "{version:?}");
-        assert_eq!(loaded.agent_runtime_state.as_ref().unwrap().version, bamboo_domain::AGENT_RUNTIME_STATE_VERSION);
+        assert!(
+            loaded.execution_compatibility().execution_allowed,
+            "{version:?}"
+        );
+        assert_eq!(
+            loaded.agent_runtime_state.as_ref().unwrap().version,
+            bamboo_domain::AGENT_RUNTIME_STATE_VERSION
+        );
         loaded.title = "current canonical control".into();
         fresh.save_runtime_state(&loaded).await.unwrap();
-        fresh.save_session(&loaded).await.expect("a supported v1 Main is not fresher control authority than its valid sidecar");
+        fresh
+            .save_session(&loaded)
+            .await
+            .expect("a supported v1 Main is not fresher control authority than its valid sidecar");
         let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
         let final_session = reopened.load_session(&session.id).await.unwrap().unwrap();
         assert_eq!(final_session.session_version, version);
         assert_eq!(final_session.title, "current canonical control");
-        assert_eq!(final_session.messages[0].content, session.messages[0].content);
+        assert_eq!(
+            final_session.messages[0].content,
+            session.messages[0].content
+        );
         assert!(final_session.execution_compatibility().execution_allowed);
     }
 }

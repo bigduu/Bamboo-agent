@@ -595,10 +595,8 @@ fn reject_session_version_change(incoming: &Session, durable: &Session) -> io::R
     // the current state when a valid, compatible sidecar exists.
     // Self-comparison rejects unsupported behavior stamps only. The current
     // sidecar control schema is checked separately before either file is saved.
-    if !bamboo_domain::same_session_tool_contract(
-        durable.session_version,
-        durable.session_version,
-    ) {
+    if !bamboo_domain::same_session_tool_contract(durable.session_version, durable.session_version)
+    {
         reject_incompatible_session_write(durable)?;
     }
     if incoming.created_at == durable.created_at
