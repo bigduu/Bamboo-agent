@@ -158,3 +158,62 @@ async fn session_version_store_rejected_checkpoint_does_not_publish_cache_snapsh
         assert_eq!(pair(home.path(), "future-cache").await, before);
     }
 }
+
+
+async fn rejected_context_merge(runtime_only: bool, durable_conflict: bool, stamp: Option<u32>) {
+    use crate::session_merge::LockedSessionStore;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    let home = tempfile::tempdir().unwrap();
+    let storage = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+    let mut incoming = Session::new("context-merge", "model");
+    incoming.session_version = stamp;
+    incoming.model_context_state = Some(bamboo_domain::ModelContextState {
+        state_revision: 7, ..Default::default()
+    });
+    storage.save_session(&incoming).await.unwrap();
+    if durable_conflict {
+        let path = home.path().join("sessions/context-merge/runtime.json");
+        let mut raw: Value = serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        raw["model_context_state"]["schema_version"] = json!(99);
+        tokio::fs::write(path, serde_json::to_vec_pretty(&raw).unwrap()).await.unwrap();
+    } else {
+        incoming.model_context_state.as_mut().unwrap().schema_version = 99;
+    }
+    let before_memory = serde_json::to_value(&incoming).unwrap();
+    let before_disk = pair(home.path(), &incoming.id).await;
+    let locked = LockedSessionStore::new(storage);
+    let published = AtomicBool::new(false);
+    let result = if runtime_only {
+        locked.save_runtime_only_and_publish(&mut incoming, |_| {
+            published.store(true, Ordering::SeqCst);
+        }).await
+    } else {
+        locked.merge_save_runtime_and_publish(&mut incoming, |_, _| {
+            published.store(true, Ordering::SeqCst);
+        }).await
+    };
+    let error = result.expect_err("merge must reject incompatible input before adopting any fields");
+    assert!(error.to_string().contains("unsupported_model_context_version"), "{error}");
+    assert_eq!(serde_json::to_value(&incoming).unwrap(), before_memory);
+    assert_eq!(pair(home.path(), &incoming.id).await, before_disk);
+    assert!(!published.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn session_version_merge_cannot_adopt_over_an_unknown_incoming_schema() {
+    for runtime_only in [false, true] {
+        for stamp in [None, Some(1)] {
+            rejected_context_merge(runtime_only, false, stamp).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn session_version_merge_rejects_unknown_durable_schema_before_mutating_the_caller() {
+    for runtime_only in [false, true] {
+        for stamp in [None, Some(1)] {
+            rejected_context_merge(runtime_only, true, stamp).await;
+        }
+    }
+}
