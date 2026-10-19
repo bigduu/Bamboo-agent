@@ -373,6 +373,23 @@ impl SessionStoreV2 {
         })
     }
 
+    /// A write-only compatibility preflight under the existing physical locks.
+    /// Keep bounded authority/history observations readable. Publications also
+    /// inspect Main's behavior stamp; a compatible sidecar cannot override it.
+    async fn check_management_session_compatibility(&self, current: &Session) -> io::Result<()> {
+        reject_incompatible_session_write(current)?;
+        let canonical = self
+            .load_session_from_dir_strict(
+                &self.sessions_dir.join(&current.id),
+                &current.id,
+                SessionKind::Root,
+                &current.id,
+            )
+            .await?
+            .ok_or_else(|| denied("Supervisor disappeared before management publication"))?;
+        reject_incompatible_session_write(&canonical)
+    }
+
     async fn publish_management_state(
         &self,
         current: &mut Session,
@@ -380,6 +397,7 @@ impl SessionStoreV2 {
         guards: &Arc<SupervisorManagementGuards>,
     ) -> io::Result<()> {
         state.validate(state.incarnation_id).map_err(invalid)?;
+        reject_incompatible_session_write(current)?;
         current.supervisor_management = Some(state.clone());
         // The only writer that may change this field. Revalidation above
         // and the complete lock set remain live through atomic publication.
@@ -443,6 +461,8 @@ impl SessionStoreV2 {
             _lifecycle: lifecycle,
         });
         let mut current = self.management_supervisor_locked(supervisor).await?;
+        self.check_management_session_compatibility(&current)
+            .await?;
         let mut state = current
             .supervisor_management
             .clone()
@@ -565,6 +585,8 @@ impl SessionStoreV2 {
         });
         let mut current = self
             .management_supervisor_locked(&request.supervisor)
+            .await?;
+        self.check_management_session_compatibility(&current)
             .await?;
         let mut state = current
             .supervisor_management

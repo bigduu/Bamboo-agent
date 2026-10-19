@@ -5,6 +5,7 @@ pub mod actor_snapshot;
 pub mod admission;
 pub mod authority;
 pub mod budget_types;
+pub mod compatibility;
 pub mod composition;
 pub mod context_block;
 pub mod hook_types;
@@ -40,6 +41,7 @@ pub use authority::*;
 pub use budget_types::{
     BudgetStrategy, ProviderPromptUsage, TokenBudget, TokenBudgetUsage, TokenUsageBreakdown,
 };
+pub use compatibility::*;
 pub use composition::*;
 pub use context_block::*;
 pub use hook_types::*;
@@ -65,3 +67,6 @@ pub use task::*;
 pub use tool_authority::*;
 pub use tool_types::{FunctionCall, ToolCall};
 pub use types::*;
+
+#[cfg(test)]
+mod compatibility_boundary_tests;
