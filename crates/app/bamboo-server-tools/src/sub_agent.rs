@@ -1262,10 +1262,7 @@ impl SubAgentTool {
                         }
                     };
                 let (workspace, workspace_source) = if compact {
-                    // Chat stores its workspace on the typed metadata plane.
-                    // Use the same canonical resolver as Plan before creation.
-                    self.sessions
-                        .resolve_child_workspace(&parent, workspace.as_deref())
+                    child_session::resolve_shared_child_workspace(self.sessions.as_ref(), &parent)
                         .await
                         .map_err(tool_error_from_child_session)?
                 } else {
@@ -1614,9 +1611,7 @@ impl SubAgentTool {
                             runtime_metadata.insert(bamboo_domain::CHILD_PACKET_INPUT_KEY.into(),
                                 serde_json::to_string(packet).map_err(|_| ToolError::InvalidArguments(bamboo_domain::ChildContextPacketError::Invalid.to_string()))?);
                         }
-                        let result = Box::pin(child_session::create_child_action(
-                            self.sessions.as_ref(),
-                            CreateChildInput {
+                        let input = CreateChildInput {
                                 parent_session: parent.clone(),
                                 child_id: child_id.clone(),
                                 title: title.clone(),
@@ -1642,10 +1637,12 @@ impl SubAgentTool {
                                 // Phase 3: model-controllable context fork — carry
                                 // the last N parent messages into the child's brief.
                                 context_fork: fork_last_messages.filter(|n| *n > 0),
-                            },
-                        ))
-                        .await
-                        .map_err(tool_error_from_child_session)?;
+                            };
+                        let result = if compact {
+                            Box::pin(child_session::create_shared_child_action(self.sessions.as_ref(), input)).await
+                        } else {
+                            Box::pin(child_session::create_child_action(self.sessions.as_ref(), input)).await
+                        }.map_err(tool_error_from_child_session)?;
                         {
                             let child = self.sessions.load_child_for_parent(&parent.id, &result.child_session_id)
                                 .await.map_err(tool_error_from_child_session)?;
