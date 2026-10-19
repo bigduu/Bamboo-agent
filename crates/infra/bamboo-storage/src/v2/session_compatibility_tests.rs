@@ -1456,7 +1456,8 @@ async fn versioned_spawn_legacy_full_checkpoint_uses_the_current_sidecar_control
 }
 
 #[tokio::test]
-async fn versioned_spawn_runtime_checkpoint_without_sidecar_refuses_root_and_child_without_writes() {
+async fn versioned_spawn_runtime_checkpoint_without_sidecar_refuses_root_and_child_without_writes()
+{
     for child in [false, true] {
         for (retained, incoming) in [
             (None, Some(2)),
@@ -1477,14 +1478,18 @@ async fn versioned_spawn_runtime_checkpoint_without_sidecar_refuses_root_and_chi
                 Session::new("main-without-sidecar", "model")
             };
             original.session_version = retained;
-            original.add_message(Message::user("Keep the retained Main contract and instruction"));
+            original.add_message(Message::user(
+                "Keep the retained Main contract and instruction",
+            ));
             storage.save_session(&original).await.unwrap();
             let directory = task_member_directory(&storage, &original.id).await;
             let main_path = directory.join("session.json");
             let runtime_path = directory.join("runtime.json");
             // Model retained pre-split Main bytes, not an invented writer exemption.
             let main_bytes = serde_json::to_vec_pretty(&original).unwrap();
-            assert!(super::compact_main::validate_full_main(&main_bytes).unwrap().is_none());
+            assert!(super::compact_main::validate_full_main(&main_bytes)
+                .unwrap()
+                .is_none());
             tokio::fs::write(&main_path, &main_bytes).await.unwrap();
             tokio::fs::remove_file(&runtime_path).await.unwrap();
             let index_before = tokio::fs::read(storage.index_path()).await.unwrap();
@@ -1499,15 +1504,27 @@ async fn versioned_spawn_runtime_checkpoint_without_sidecar_refuses_root_and_chi
             } else {
                 "Root context changed or unavailable: canonical runtime file is missing"
             };
-            for store in [storage, SessionStoreV2::new(home.path().into()).await.unwrap()] {
+            for store in [
+                storage,
+                SessionStoreV2::new(home.path().into()).await.unwrap(),
+            ] {
                 let error = store.save_runtime_state(&checkpoint).await.expect_err(
                     "missing runtime authority must refuse before contract comparison or publication",
                 );
                 assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-                assert!(error.to_string().contains(expected_guard), "{child}/{retained:?}->{incoming:?}: {error}");
-                assert!(!runtime_path.exists(), "a refused checkpoint cannot reconstruct runtime authority");
+                assert!(
+                    error.to_string().contains(expected_guard),
+                    "{child}/{retained:?}->{incoming:?}: {error}"
+                );
+                assert!(
+                    !runtime_path.exists(),
+                    "a refused checkpoint cannot reconstruct runtime authority"
+                );
                 assert_eq!(tokio::fs::read(&main_path).await.unwrap(), main_bytes);
-                assert_eq!(tokio::fs::read(store.index_path()).await.unwrap(), index_before);
+                assert_eq!(
+                    tokio::fs::read(store.index_path()).await.unwrap(),
+                    index_before
+                );
                 assert_eq!(pair(home.path(), &parent.id).await, parent_before);
             }
         }
