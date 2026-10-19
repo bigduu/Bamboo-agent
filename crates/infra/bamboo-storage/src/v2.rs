@@ -100,6 +100,8 @@ mod child_deletion_tests;
 mod child_project;
 mod compact_main;
 #[cfg(test)]
+mod session_compatibility_tests;
+#[cfg(test)]
 mod compact_main_tests;
 mod default_actor_context;
 mod host_registry;
