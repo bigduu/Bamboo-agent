@@ -8,10 +8,13 @@ async fn unindexed_child_fixture() -> (tempfile::TempDir, SessionStoreV2, Sessio
     let child = Session::new_child_of("canonical-deletion-child", &root, "model", "child");
     store.save_session(&root).await.unwrap();
     store.save_session(&child).await.unwrap();
-    store.update_index(|index| {
-        index.sessions.remove(&child.id);
-        Ok(())
-    }).await.unwrap();
+    store
+        .update_index(|index| {
+            index.sessions.remove(&child.id);
+            Ok(())
+        })
+        .await
+        .unwrap();
     assert!(store.get_index_entry(&child.id).await.is_none());
     assert!(store.load_session(&child.id).await.unwrap().is_none());
     (home, store, root, child)
@@ -20,7 +23,10 @@ async fn unindexed_child_fixture() -> (tempfile::TempDir, SessionStoreV2, Sessio
 #[tokio::test]
 async fn root_deletion_progress_includes_canonical_children_missing_from_index() {
     let (home, store, root, child) = unindexed_child_fixture().await;
-    let result = store.delete_session_recursive_with_progress(&root.id, true).await.unwrap();
+    let result = store
+        .delete_session_recursive_with_progress(&root.id, true)
+        .await
+        .unwrap();
     assert!(result.deleted);
     assert!(!home.path().join("sessions").join(&root.id).exists());
     let mut expected = vec![root.id, child.id];
@@ -31,7 +37,10 @@ async fn root_deletion_progress_includes_canonical_children_missing_from_index()
 #[tokio::test]
 async fn root_cleanup_progress_includes_canonical_children_missing_from_index() {
     let (home, store, root, child) = unindexed_child_fixture().await;
-    let result = store.cleanup_with_progress(CleanupMode::All, false).await.unwrap();
+    let result = store
+        .cleanup_with_progress(CleanupMode::All, false)
+        .await
+        .unwrap();
     assert!(!home.path().join("sessions").join(&root.id).exists());
     let mut expected = vec![root.id, child.id];
     expected.sort();
@@ -52,12 +61,17 @@ async fn root_deletion_progress_rejects_a_linked_sessions_container() {
     let before = std::fs::read(sessions.join(&root.id).join("session.json")).unwrap();
     std::fs::rename(&sessions, &outside).unwrap();
     std::os::unix::fs::symlink(&outside, &sessions).unwrap();
-    let result = store.delete_session_recursive_with_progress(&root.id, true).await;
+    let result = store
+        .delete_session_recursive_with_progress(&root.id, true)
+        .await;
     let preserved = std::fs::read(outside.join(&root.id).join("session.json")).ok();
     // Restore this fixture's container before asserting, including on RED.
     std::fs::remove_file(&sessions).unwrap();
     std::fs::rename(&outside, &sessions).unwrap();
-    assert!(result.is_err(), "linked canonical containers must fail closed");
+    assert!(
+        result.is_err(),
+        "linked canonical containers must fail closed"
+    );
     assert_eq!(preserved, Some(before));
 }
 

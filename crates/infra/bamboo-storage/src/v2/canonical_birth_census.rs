@@ -371,9 +371,12 @@ impl SessionStoreV2 {
         let id = id.to_owned();
         let location = Self::default_writer_job(&guards, move || {
             collector.locate(&id).map_err(|error| {
-                other_io_error(format!("canonical cleanup observation unavailable: {error:?}"))
+                other_io_error(format!(
+                    "canonical cleanup observation unavailable: {error:?}"
+                ))
             })
-        }).await?;
+        })
+        .await?;
         match location {
             None => Ok(true),
             Some((_, root, _)) => self.root_directory_is_revoked(&root).await,

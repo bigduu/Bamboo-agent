@@ -216,7 +216,10 @@ pub async fn cleanup_sessions(
     let outcome = tokio::spawn(cleanup_owned(state, mode, req.keep_pinned))
         .await
         .map_err(|_| crate::error::json_internal_server_error("Session cleanup interrupted"))?;
-    if outcome.storage_error.is_some() || !outcome.browser_cleanup_pending.is_empty() || !outcome.unconfirmed_session_ids.is_empty() {
+    if outcome.storage_error.is_some()
+        || !outcome.browser_cleanup_pending.is_empty()
+        || !outcome.unconfirmed_session_ids.is_empty()
+    {
         return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
             "error": crate::error::error_value("Session cleanup incomplete. Check the reported session IDs before retrying deletion."),
             "storage_cleanup_error": outcome.storage_error,
@@ -272,10 +275,14 @@ async fn finish_cleanup(
     for session_id in candidates.deleted_session_ids {
         // Even a successful legacy result may only have removed an index row
         // after a failed Child directory unlink. Never purge surviving state.
-        match state.session_store.session_is_canonically_absent(&session_id).await {
+        match state
+            .session_store
+            .session_is_canonically_absent(&session_id)
+            .await
+        {
             Ok(true) => deleted_session_ids.push(session_id),
             Ok(false) if storage_error.is_none() => unconfirmed_session_ids.push(session_id),
-            Ok(false) => {},
+            Ok(false) => {}
             Err(_) => unconfirmed_session_ids.push(session_id),
         }
     }
@@ -369,12 +376,27 @@ mod tests {
         let mut root = Session::new("legacy-profile-root", "model");
         root.root_session_id.clear();
         state.session_store.save_session(&root).await.unwrap();
-        assert!(state.session_store.get_index_entry(&root.id).await.unwrap().root_session_id.is_empty());
-        state.sessions.insert(root.id.clone(), Arc::new(bamboo_engine::SessionSnapshot::new(root.clone())));
-        let profile = crate::browser::test_profile_directory(&home.path().join("browser-profiles"), &root.id);
+        assert!(state
+            .session_store
+            .get_index_entry(&root.id)
+            .await
+            .unwrap()
+            .root_session_id
+            .is_empty());
+        state.sessions.insert(
+            root.id.clone(),
+            Arc::new(bamboo_engine::SessionSnapshot::new(root.clone())),
+        );
+        let profile =
+            crate::browser::test_profile_directory(&home.path().join("browser-profiles"), &root.id);
         std::fs::write(profile.join("Cookies"), b"synthetic legacy state").unwrap();
         let outcome = cleanup_owned(state.clone(), CleanupMode::All, false).await;
-        assert!(state.storage.load_session(&root.id).await.unwrap().is_none());
+        assert!(state
+            .storage
+            .load_session(&root.id)
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(outcome.deleted.deleted_session_ids, vec![root.id.clone()]);
         assert_eq!(outcome.deleted.deleted_count, 1);
         assert!(outcome.unconfirmed_session_ids.is_empty());
@@ -394,11 +416,22 @@ mod tests {
         state.session_store.save_session(&root).await.unwrap();
         state.session_store.save_session(&child).await.unwrap();
         state.session_store.flush_search_index().await;
-        state.sessions.insert(child.id.clone(), Arc::new(bamboo_engine::SessionSnapshot::new(child.clone())));
-        let directory = home.path().join("sessions").join(&root.id).join("children").join(&child.id);
+        state.sessions.insert(
+            child.id.clone(),
+            Arc::new(bamboo_engine::SessionSnapshot::new(child.clone())),
+        );
+        let directory = home
+            .path()
+            .join("sessions")
+            .join(&root.id)
+            .join("children")
+            .join(&child.id);
         let main = directory.join("session.json");
         let before = std::fs::read(&main).unwrap();
-        let profile = crate::browser::test_profile_directory(&home.path().join("browser-profiles"), &child.id);
+        let profile = crate::browser::test_profile_directory(
+            &home.path().join("browser-profiles"),
+            &child.id,
+        );
         std::fs::write(profile.join("Cookies"), b"preserve synthetic state").unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
         let outcome = cleanup_owned(state.clone(), CleanupMode::Children, false).await;
@@ -406,7 +439,10 @@ mod tests {
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         assert_eq!(std::fs::read(&main).unwrap(), before);
-        assert_eq!(std::fs::read(profile.join("Cookies")).unwrap(), b"preserve synthetic state");
+        assert_eq!(
+            std::fs::read(profile.join("Cookies")).unwrap(),
+            b"preserve synthetic state"
+        );
         assert!(state.sessions.contains_key(&child.id));
         assert!(outcome.deleted.deleted_session_ids.is_empty());
         assert_eq!(outcome.unconfirmed_session_ids, vec![child.id]);

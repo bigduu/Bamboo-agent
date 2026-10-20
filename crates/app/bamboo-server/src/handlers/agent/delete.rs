@@ -272,7 +272,9 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let root = Session::new("canonical-profile-root", "model");
         let child = Session::new_child_of("canonical-profile-child", &root, "model", "child");
-        let store = bamboo_storage::v2::SessionStoreV2::new(home.path().into()).await.unwrap();
+        let store = bamboo_storage::v2::SessionStoreV2::new(home.path().into())
+            .await
+            .unwrap();
         store.save_session(&root).await.unwrap();
         store.save_session(&child).await.unwrap();
         store.flush_search_index().await;
@@ -280,12 +282,26 @@ mod tests {
         // Fault only the rebuildable index in this isolated fixture, then open
         // the normal AppState against the unchanged canonical Session tree.
         let index_path = home.path().join("sessions.json");
-        let mut index: serde_json::Value = serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
-        assert!(index["sessions"].as_object_mut().unwrap().remove(&child.id).is_some());
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+        assert!(index["sessions"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&child.id)
+            .is_some());
         std::fs::write(index_path, serde_json::to_vec(&index).unwrap()).unwrap();
         let state = web::Data::new(AppState::new(home.path().into()).await.unwrap());
-        assert!(state.session_store.get_index_entry(&child.id).await.is_none());
-        assert!(state.storage.load_session(&child.id).await.unwrap().is_none());
+        assert!(state
+            .session_store
+            .get_index_entry(&child.id)
+            .await
+            .is_none());
+        assert!(state
+            .storage
+            .load_session(&child.id)
+            .await
+            .unwrap()
+            .is_none());
         (home, state, root, child)
     }
 
@@ -293,11 +309,14 @@ mod tests {
     async fn deleting_root_purges_profiles_for_canonical_children_missing_from_index() {
         let (home, state, root, child) = unindexed_child_state().await;
         let profiles = [&root.id, &child.id].map(|id| {
-            let path = crate::browser::test_profile_directory(&home.path().join("browser-profiles"), id);
+            let path =
+                crate::browser::test_profile_directory(&home.path().join("browser-profiles"), id);
             std::fs::write(path.join("Cookies"), b"synthetic state").unwrap();
             path
         });
-        let response = handler(state, web::Path::from(root.id.clone())).await.unwrap();
+        let response = handler(state, web::Path::from(root.id.clone()))
+            .await
+            .unwrap();
         assert_eq!(response.status(), actix_web::http::StatusCode::OK);
         assert!(!home.path().join("sessions").join(root.id).exists());
         assert!(profiles.iter().all(|path| !path.exists()));
@@ -306,18 +325,44 @@ mod tests {
     #[tokio::test]
     async fn deleting_unindexed_live_child_preserves_its_profile_and_cached_session() {
         let (home, state, root, child) = unindexed_child_state().await;
-        let main = home.path().join("sessions").join(&root.id).join("children").join(&child.id).join("session.json");
+        let main = home
+            .path()
+            .join("sessions")
+            .join(&root.id)
+            .join("children")
+            .join(&child.id)
+            .join("session.json");
         let before = std::fs::read(&main).unwrap();
-        let profile = crate::browser::test_profile_directory(&home.path().join("browser-profiles"), &child.id);
+        let profile = crate::browser::test_profile_directory(
+            &home.path().join("browser-profiles"),
+            &child.id,
+        );
         std::fs::write(profile.join("Cookies"), b"preserve synthetic state").unwrap();
-        state.sessions.insert(child.id.clone(), std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(child.clone())));
-        let response = handler(state.clone(), web::Path::from(child.id.clone())).await.unwrap();
+        state.sessions.insert(
+            child.id.clone(),
+            std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(child.clone())),
+        );
+        let response = handler(state.clone(), web::Path::from(child.id.clone()))
+            .await
+            .unwrap();
         assert_eq!(std::fs::read(&main).unwrap(), before);
-        assert_eq!(std::fs::read(profile.join("Cookies")).unwrap(), b"preserve synthetic state");
+        assert_eq!(
+            std::fs::read(profile.join("Cookies")).unwrap(),
+            b"preserve synthetic state"
+        );
         assert!(state.sessions.contains_key(&child.id));
         assert_eq!(response.status(), actix_web::http::StatusCode::NOT_FOUND);
         state.session_store.rebuild_index_from_disk().await.unwrap();
-        assert_eq!(state.storage.load_session(&child.id).await.unwrap().unwrap().id, child.id);
+        assert_eq!(
+            state
+                .storage
+                .load_session(&child.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            child.id
+        );
     }
 
     #[tokio::test]

@@ -5616,7 +5616,10 @@ impl SessionStoreV2 {
                 Err(error) => {
                     let mut candidate_session_ids: Vec<_> = deleted_ids.into_iter().collect();
                     candidate_session_ids.sort();
-                    return Err(CleanupFailure { error, candidate_session_ids });
+                    return Err(CleanupFailure {
+                        error,
+                        candidate_session_ids,
+                    });
                 }
             }
         }
@@ -5741,14 +5744,21 @@ impl SessionStoreV2 {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
                 Err(error) => return Err(error),
                 Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-                Ok(_) => return Err(other_io_error("canonical session tree is not a real directory")),
+                Ok(_) => {
+                    return Err(other_io_error(
+                        "canonical session tree is not a real directory",
+                    ))
+                }
             }
         }
         let mut entries = fs::read_dir(children).await?;
         let mut ids = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             if entry.file_type().await?.is_dir() {
-                let id = entry.file_name().into_string().map_err(|_| other_io_error("invalid canonical Child directory name"))?;
+                let id = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| other_io_error("invalid canonical Child directory name"))?;
                 validate_session_id(&id)?;
                 ids.push(id);
             }
@@ -5786,7 +5796,12 @@ impl SessionStoreV2 {
         candidate_session_ids.push(session_id.to_string());
         match self.canonical_root_child_ids(session_id).await {
             Ok(children) => candidate_session_ids.extend(children),
-            Err(error) => return Err(CleanupFailure { error, candidate_session_ids }),
+            Err(error) => {
+                return Err(CleanupFailure {
+                    error,
+                    candidate_session_ids,
+                })
+            }
         }
         candidate_session_ids.sort();
         candidate_session_ids.dedup();
