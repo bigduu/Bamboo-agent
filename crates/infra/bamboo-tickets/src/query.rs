@@ -465,8 +465,9 @@ impl TicketService {
         if !(1..=100).contains(&limit) {
             return Err(Error::InvalidTransition("changes limit 1..100".into()));
         }
+        // Old cursor offsets cannot survive adding Sprint rows to historical commits.
         let hash = content_hash(&canonical_bytes(
-            &serde_json::json!({"changes_since":since_seq}),
+            &serde_json::json!({"changes_since":since_seq,"changes_projection":2}),
         )?);
         let (commit, snapshot) = self.query_snapshot(authority, &hash, cursor, None)?;
         if since_seq > snapshot.seq {
