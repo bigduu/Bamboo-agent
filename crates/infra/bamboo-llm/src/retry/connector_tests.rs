@@ -304,7 +304,11 @@ async fn incomplete_error_server(status: u16) -> (String, tokio::task::JoinHandl
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut request = [0; 4096];
-        socket.read(&mut request).await.unwrap();
+        let read = socket.read(&mut request).await.unwrap();
+        assert!(
+            read > 0,
+            "a fixture request must arrive before its response"
+        );
         socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Length: 65536\r\nContent-Type: application/json\r\n\r\n{{").as_bytes()).await.unwrap();
         while socket.read(&mut request).await.unwrap_or(0) != 0 {}
     });
