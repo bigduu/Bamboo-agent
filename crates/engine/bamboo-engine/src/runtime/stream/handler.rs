@@ -65,6 +65,10 @@ impl StreamTimeoutContext {
         self
     }
 
+    pub(crate) fn disable_turn_retry(&mut self) {
+        self.turn_retry_eligible = false;
+    }
+
     fn timeout_error(
         &self,
         session_id: &str,
@@ -131,13 +135,31 @@ pub(crate) async fn await_stream_bootstrap<F, T>(
 where
     F: Future<Output = T>,
 {
+    await_stream_bootstrap_observed(
+        future,
+        cancel_token,
+        session_id,
+        timeout_context,
+        Arc::new(InitialHttpRetryObserver::default()),
+    )
+    .await
+}
+
+pub(crate) async fn await_stream_bootstrap_observed<F, T>(
+    future: F,
+    cancel_token: &CancellationToken,
+    session_id: &str,
+    timeout_context: &StreamTimeoutContext,
+    http_retry_observer: Arc<InitialHttpRetryObserver>,
+) -> Result<T, AgentError>
+where
+    F: Future<Output = T>,
+{
     let started_at = timeout_context
         .request_started_at
         .unwrap_or_else(Instant::now);
     let deadline = Duration::from_secs(timeout_context.policy.transport_idle_timeout_secs);
     let expires_at = started_at + deadline;
-    let http_retry_observer = Arc::new(InitialHttpRetryObserver::default());
-
     bamboo_llm::retry::observe_initial_http_retries(http_retry_observer.clone(), async {
         tokio::select! {
             biased;
@@ -145,7 +167,11 @@ where
             result = future => Ok(result),
             _ = tokio::time::sleep_until(expires_at) => {
                 let now = Instant::now();
-                Err(timeout_context.timeout_error_with_http_retry(
+                let mut context = timeout_context.clone();
+                // An inner bounded request policy owns this attempt budget.
+                // A shorter outer watchdog must not reset it through turn retry.
+                context.turn_retry_eligible &= !http_retry_observer.request_budget_managed();
+                Err(context.timeout_error_with_http_retry(
                     session_id,
                     StreamTimeoutPhase::Bootstrap,
                     deadline,

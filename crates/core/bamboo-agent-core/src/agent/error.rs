@@ -149,6 +149,11 @@ pub enum AgentError {
     #[error("LLM error: {0}")]
     LLM(String),
 
+    /// A provider exhausted its request budget, or a stream failed after
+    /// semantic output. Replaying the turn would reset that budget or output.
+    #[error("LLM error: {0}")]
+    LLMNonRetryable(String),
+
     /// The provider completed an assistant response without visible content or
     /// tool calls. Kept distinct from transient provider failures so turn-level
     /// retry logic cannot replay the same billable empty response.

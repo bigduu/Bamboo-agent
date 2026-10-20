@@ -48,6 +48,7 @@ pub(crate) fn llm_error_kind(error: &LLMError) -> &'static str {
         LLMError::Stream(_) => "stream",
         LLMError::Api(_) => "api",
         LLMError::Auth(_) => "auth",
+        LLMError::RequestFailed(_) => "request_failed",
         LLMError::Protocol(_) => "protocol",
     }
 }
