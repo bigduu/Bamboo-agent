@@ -394,7 +394,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
+          import base64
           import datetime
+          import hashlib
           import json
           import os
           import re
@@ -488,6 +490,7 @@ jobs:
                   assert job["status"] == "completed" and job["conclusion"] == "success", name
                   if before is not None:
                       assert instant(job["completed_at"]) < before, "Release CI must finish before merge"
+              return jobs
 
           assert type(run["id"]) is int and run["id"] > 0
           ci = api(f"actions/runs/{run['id']}")
@@ -501,7 +504,7 @@ jobs:
           full_jobs(ci)
 
           # Match the actual server-recorded normal merge, never a caller-provided PR,
-          # a release description, an artifact, a forged status or parsed workflow log.
+          # a release description, an artifact or a caller-provided status/log.
           associated = pages(f"commits/{source}/pulls")
           candidates = [pr for pr in associated if pr.get("merge_commit_sha") == source
                         and pr.get("base", {}).get("ref") == "main"]
@@ -537,22 +540,99 @@ jobs:
                          and item["head"].get("repo", {}).get("id") == pr["head"]["repo"]["id"]
                          for item in candidate.get("pull_requests", []))
 
+          # GitHub's live PR association can become empty after merge. Only in that
+          # case accept the historical snapshot emitted by this reviewed producer.
+          # Pin the complete definition (including global env and the checkout-free
+          # source job), not merely a job name or arbitrary repository-authored log.
+          PRODUCER_V1 = "64ced424ec999ec332cbc926d52f1d541721a2f05c2a6361b59cdbb869973f24"
+          SUITE_QUERY = ("query($suite:ID!){node(id:$suite){... on CheckSuite{databaseId "
+                         "repository{databaseId nameWithOwner} app{databaseId slug} commit{oid} "
+                         "workflowRun{databaseId event runAttempt workflow{databaseId name} "
+                         "file{path repositoryName repositoryFileUrl}}}}}")
+
+          def producer_definition(revision):
+              data = api(f"contents/.github/workflows/ci.yml?ref={revision}")
+              assert data["encoding"] == "base64" and len(data["content"]) <= 180000
+              raw = base64.b64decode(data["content"], validate=False)
+              assert len(raw) <= 128000 and hashlib.sha256(raw).hexdigest() == PRODUCER_V1, "Unknown source-admission producer"
+
+          def historical_binding(pre, jobs):
+              assert pre.get("pull_requests") == [], "Historical proof is only for an empty association"
+              assert type(pre["workflow_id"]) is int and pre["workflow_id"] > 0
+              assert type(pre["check_suite_id"]) is int and pre["check_suite_id"] > 0
+              assert re.fullmatch(r"[A-Za-z0-9_=-]{1,128}", pre["check_suite_node_id"])
+              # Fixed, read-only GraphQL query authenticates the executed definition;
+              # REST metadata/content/log requests remain GET-only. No new permissions.
+              response = json.loads(subprocess.check_output(
+                  ["gh", "api", "--hostname", "github.com", "graphql", "-f", f"query={SUITE_QUERY}",
+                   "-f", f"suite={pre['check_suite_node_id']}"], text=True, timeout=30))
+              assert not response.get("errors")
+              suite = response["data"]["node"]
+              assert suite["databaseId"] == pre["check_suite_id"]
+              assert suite["repository"] == {"databaseId": pr["base"]["repo"]["id"], "nameWithOwner": repository}
+              assert suite["app"]["databaseId"] == 15368 and suite["app"]["slug"] == "github-actions"
+              assert suite["commit"]["oid"] == head
+              official = suite["workflowRun"]
+              assert official["databaseId"] == pre["id"] and official["event"] == "pull_request"
+              assert official["runAttempt"] == pre["run_attempt"]
+              assert official["workflow"] == {"databaseId": pre["workflow_id"], "name": "CI"}
+              assert official["file"] == {"path": ".github/workflows/ci.yml", "repositoryName": repository,
+                  "repositoryFileUrl": f"https://github.com/{repository}/blob/{head}/.github/workflows/ci.yml"}
+              producer_definition(head)
+              job = next(item for item in jobs if item["name"] == "Validation Source")
+              job_id, attempt = job["id"], job["run_attempt"]
+              assert type(job_id) is int and job_id > 0
+              assert type(attempt) is int and 1 <= attempt <= pre["run_attempt"]
+              # latest is per job; authenticate its actual original attempt even when
+              # another job was rerun later. Never pretend it ran in the latest attempt.
+              members = pages(f"actions/runs/{pre['id']}/attempts/{attempt}/jobs", "jobs")
+              members = [item for item in members if item.get("id") == job_id]
+              assert len(members) == 1 and members[0] == job
+              assert api(f"actions/jobs/{job_id}") == job, "Source job changed"
+              assert job["head_sha"] == head and job["head_branch"] == pr["head"]["ref"]
+              assert [step["name"] for step in job["steps"]] == [
+                  "Set up job", "Bind full validation to the actual event snapshot", "Complete job"]
+              assert all(step["status"] == "completed" and step["conclusion"] == "success" for step in job["steps"])
+              log = subprocess.check_output(
+                  ["gh", "api", "--hostname", "github.com", "--allow-escape-sequences",
+                   f"repos/{repository}/actions/jobs/{job_id}/logs"],
+                  timeout=30)
+              assert len(log) <= 262144, "Source log exceeds bound"
+              lines = log.decode("utf-8").splitlines()
+              records = [line for line in lines if re.match(r"^\d{4}-\d\d-\d\dT\S+Z Event source:", line)]
+              assert len(records) == 1, "Missing or duplicate source-admission record"
+              match = re.fullmatch(r"\d{4}-\d\d-\d\dT\S+Z Event source: (" + SHA + r"); full validation: true", records[0])
+              assert match, "Malformed or non-full source admission"
+              snapshot = match.group(1)
+              tested = api(f"git/commits/{snapshot}")
+              assert tested["sha"] == snapshot
+              assert [parent["sha"] for parent in tested["parents"]] == [base, head], "Tested merge has wrong head/base"
+              assert tested["tree"]["sha"] == commit["tree"]["sha"], "Tested tree differs from normal merge"
+              producer_definition(snapshot)
+              return (pre["id"], pre["run_attempt"], pre["workflow_id"], pre["check_suite_id"], pre["check_suite_node_id"])
+
           runs = pages(f"actions/workflows/ci.yml/runs?event=pull_request&head_sha={head}", "workflow_runs")
-          bound = [candidate for candidate in runs if candidate.get("head_sha") == head and binds_pr(candidate)]
+          bound = [candidate for candidate in runs if candidate.get("head_sha") == head
+                   and (binds_pr(candidate) or candidate.get("pull_requests") == [])]
           assert bound, "Missing exact pre-merge release CI head/base evidence"
           # Never skip a newer failed exact-input run to select an older green result.
           pre = max(bound, key=lambda item: item["id"])
           pre = api(f"actions/runs/{pre['id']}")
           ci_identity(pre, "pull_request", head, pr["head"]["ref"])
-          assert binds_pr(pre)
-          full_jobs(pre, promotion=True, before=instant(pr["merged_at"]))
+          jobs = full_jobs(pre, promotion=True, before=instant(pr["merged_at"]))
+          historical = None if binds_pr(pre) else historical_binding(pre, jobs)
 
           current_dev = branch("dev", protected=True)
           if current_dev != dev:
               ancestor(dev, current_dev)
           fresh_pre = api(f"actions/runs/{pre['id']}")
           ci_identity(fresh_pre, "pull_request", head, pr["head"]["ref"])
-          assert binds_pr(fresh_pre) and fresh_pre["run_attempt"] == pre["run_attempt"], "Release CI changed during proof"
+          assert fresh_pre["run_attempt"] == pre["run_attempt"], "Release CI changed during proof"
+          if historical is None:
+              assert binds_pr(fresh_pre), "Release association changed during proof"
+          else:
+              assert fresh_pre.get("pull_requests") == [] or binds_pr(fresh_pre)
+              assert tuple(fresh_pre[key] for key in ("id", "run_attempt", "workflow_id", "check_suite_id", "check_suite_node_id")) == historical
           fresh_ci = api(f"actions/runs/{ci['id']}")
           ci_identity(fresh_ci, "push", source, "main")
           for key in ("id", "run_attempt", "name", "event", "head_sha", "head_branch", "conclusion"):
