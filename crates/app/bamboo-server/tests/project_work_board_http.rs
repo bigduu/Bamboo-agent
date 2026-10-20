@@ -2,6 +2,157 @@ use actix_web::{http::StatusCode, web};
 use bamboo_server::AppState;
 
 #[actix_web::test]
+async fn review_create_revalidates_inherited_project_and_keeps_exact_replays() {
+    use bamboo_tickets::*;
+    use std::{collections::BTreeSet, sync::Arc};
+
+    fn create(temp_id: &str, kind: TicketKind, parent: Option<String>) -> Operation {
+        Operation::Create {
+            temp_id: temp_id.into(),
+            kind,
+            parent,
+            depends_on: BTreeSet::new(),
+            contract: Contract {
+                title: temp_id.into(),
+                objective: "Synthetic membership validation".into(),
+                constraints: vec!["No provider execution".into()],
+                acceptance: vec!["Fresh Project observation".into()],
+                user_acceptance_required: true,
+                allowed_tools: BTreeSet::from(["Task".into()]),
+            },
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let mut state = AppState::new_with_memory_store(
+        root.path().to_path_buf(),
+        bamboo_memory::memory_store::MemoryStore::new(root.path().join("jiandu")),
+    )
+    .await
+    .unwrap();
+    *state.config.write().await = serde_json::from_value(serde_json::json!({
+        "provider":"openai","features":{"ticket_mutation":true,"ticket_dispatch":false},
+        "providers":{"openai":{"api_key":"fixture-unused","model":"fixture-unused"}}
+    }))
+    .unwrap();
+    state.tickets = Arc::new(
+        bamboo_server::app_state::ticket_application::TicketApplication::open(
+            root.path(),
+            state.storage.clone(),
+            state.config.clone(),
+        )
+        .await,
+    );
+    let project = state
+        .project_store
+        .create("Inherited membership", None)
+        .unwrap();
+    // The caller is an already verified typed Host owner, not HTTP-derived authority.
+    let principal = Principal::User {
+        user_id: "host-owner".into(),
+    };
+    let (service, owner) = state.tickets.authority(principal.clone()).await.unwrap();
+    let seed = service
+        .prepare_command(
+            &owner,
+            "existing-parent",
+            vec![
+                create("parent", TicketKind::Goal, None),
+                Operation::AssociateProject {
+                    ticket_id: "parent".into(),
+                    project_id: project.id.clone(),
+                },
+            ],
+        )
+        .unwrap();
+    let seeded = state.tickets.update(principal.clone(), &seed).await.unwrap();
+    let parent = seeded.ids["parent"].clone();
+    let chain = service
+        .prepare_command(
+            &owner,
+            "active-temp-chain",
+            vec![
+                create("root", TicketKind::Goal, None),
+                Operation::AssociateProject {
+                    ticket_id: "root".into(),
+                    project_id: project.id.clone(),
+                },
+                create("nested", TicketKind::Goal, Some("root".into())),
+                create("work", TicketKind::Work, Some("nested".into())),
+            ],
+        )
+        .unwrap();
+    let receipt = state.tickets.update(principal.clone(), &chain).await.unwrap();
+    let snapshot = service.published().unwrap().1;
+    for temp in ["root", "nested", "work"] {
+        assert_eq!(snapshot.project.links[&receipt.ids[temp]], project.id);
+    }
+    state
+        .project_store
+        .archive(&project.id, project.revision)
+        .unwrap();
+    let before = service.published().unwrap();
+    assert_eq!(
+        state.tickets.update(principal.clone(), &chain).await.unwrap(),
+        receipt
+    );
+    assert_eq!(service.published().unwrap().0, before.0);
+
+    for (operation_id, operations) in [
+        (
+            "archived-existing-parent",
+            vec![create("child", TicketKind::Work, Some(parent.clone()))],
+        ),
+        (
+            "archived-nested-parent",
+            vec![
+                create(
+                    "new-goal",
+                    TicketKind::Goal,
+                    Some(receipt.ids["nested"].clone()),
+                ),
+                create("child", TicketKind::Work, Some("new-goal".into())),
+            ],
+        ),
+    ] {
+        let command = service
+            .prepare_command(&owner, operation_id, operations)
+            .unwrap();
+        let result = state.tickets.update(principal.clone(), &command).await;
+        assert!(
+            matches!(&result, Err(Error::InvalidTransition(reason)) if reason.contains("archived")),
+            "Create must revalidate inherited Project membership before publication: {result:?}"
+        );
+        let after = service.published().unwrap();
+        assert_eq!(after.0, before.0);
+        assert_eq!(
+            canonical_bytes(&after.1).unwrap(),
+            canonical_bytes(&before.1).unwrap()
+        );
+    }
+
+    // A temporary ID shadows the old canonical spelling, exactly as core allocation does.
+    // This new unlinked Goal and its child do not inherit the archived original Goal's link.
+    let unlinked = service
+        .prepare_command(
+            &owner,
+            "unlinked-shadowed-parent",
+            vec![
+                create(&parent, TicketKind::Goal, None),
+                create("child", TicketKind::Work, Some(parent.clone())),
+            ],
+        )
+        .unwrap();
+    let unlinked = state.tickets.update(principal, &unlinked).await.unwrap();
+    let after = service.published().unwrap().1;
+    assert!(!after.project.links.contains_key(&unlinked.ids[&parent]));
+    assert!(!after.project.links.contains_key(&unlinked.ids["child"]));
+    assert_eq!(after.project.links[&parent], project.id);
+    assert!(after.assignments.is_empty());
+    assert!(after.intents.is_empty());
+}
+
+#[actix_web::test]
 async fn project_board_owner_route_uses_explicit_membership_and_rejects_unknown_project() {
     use actix_web::{test, App};
     use std::sync::Arc;
