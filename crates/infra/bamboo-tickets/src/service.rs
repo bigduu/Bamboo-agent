@@ -1900,7 +1900,7 @@ pub(crate) fn validate_new_assignment_contexts(
 }
 
 /// Known answers and candidate Project context must fit the next generation's
-/// is permanently closed. Reuse the existing packet builder and artifact budget.
+/// complete packet before either is published. Reuse its builder/artifact budget.
 pub(crate) fn validate_answer_contexts(
     before: &Snapshot,
     next: &Snapshot,
