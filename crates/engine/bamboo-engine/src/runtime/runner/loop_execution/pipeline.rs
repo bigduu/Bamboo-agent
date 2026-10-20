@@ -11249,6 +11249,8 @@ mod tests {
         }
     }
 
+    include!("child_index_observation_tests.rs");
+
     #[tokio::test]
     async fn safety_net_suspends_on_orphaned_active_children() {
         let inner = Arc::new(TestStorage::default());
