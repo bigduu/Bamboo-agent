@@ -192,6 +192,101 @@ fn contract(title: &str) -> Contract {
 }
 
 #[test]
+fn review_context_adoption_rechecks_existing_answers_before_publication() {
+    for replace_existing in [false, true] {
+        let f = Fixture::new();
+        let work = f.create("context-after-answer", true);
+        if replace_existing {
+            f.exec(
+                "initial-context",
+                vec![Operation::SetProjectContext {
+                    work_id: work.clone(),
+                    context: f.context(&work),
+                }],
+            );
+        }
+        let request = f
+            .exec(
+                "context-capacity-question",
+                vec![Operation::Ask {
+                    work_id: work.clone(),
+                    temp_id: "question".into(),
+                    prompt: "Provide the bounded input".into(),
+                    action: None,
+                }],
+            )
+            .ids["question"]
+            .clone();
+        f.exec(
+            "context-capacity-answer",
+            vec![Operation::Answer {
+                request_id: request.clone(),
+                prompt_revision: 1,
+                answer: "a".repeat(56000),
+            }],
+        );
+        let before = f.service.published().unwrap();
+        assert_eq!(before.1.requests[&request].status, RequestStatus::Answered);
+        let mut oversized = f.context(&work);
+        oversized.sources = BTreeMap::from([("large-source".into(), "v".repeat(12000))]);
+        assert!(canonical_bytes(&oversized).unwrap().len() < 16 * 1024);
+        let result = f.service.execute(
+            &f.authority,
+            &f.command(
+                "oversized-context-after-answer",
+                vec![Operation::SetProjectContext {
+                    work_id: work.clone(),
+                    context: oversized,
+                }],
+            ),
+        );
+        assert!(
+            matches!(result, Err(Error::ContextBudgetExceeded)),
+            "Context adoption must include existing answers before publication (replace={replace_existing}): {result:?}"
+        );
+        assert_eq!(
+            canonical_bytes(&f.service.published().unwrap()).unwrap(),
+            canonical_bytes(&before).unwrap()
+        );
+        let mut bounded = f.context(&work);
+        bounded.sources = BTreeMap::from([("bounded-source".into(), "v".repeat(1024))]);
+        let command = f.command(
+            "bounded-context-after-answer",
+            vec![Operation::SetProjectContext {
+                work_id: work.clone(),
+                context: bounded.clone(),
+            }],
+        );
+        let receipt = f.service.execute(&f.authority, &command).unwrap();
+        let committed = f.service.published().unwrap();
+        assert_eq!(f.service.execute(&f.authority, &command).unwrap(), receipt);
+        assert_eq!(f.service.published().unwrap().0, committed.0);
+        assert!(committed.1.assignments.is_empty());
+        assert!(committed.1.project.assignment_contexts.is_empty());
+        let started = f.exec(
+            "context-after-answer-start",
+            vec![
+                Operation::Ready { work_id: work.clone() },
+                Operation::Start {
+                    work_id: work,
+                    temp_id: "assignment".into(),
+                    workspace: Some(f.execution()),
+                },
+            ],
+        );
+        let packet = f.service.child_context_packet(
+            &f.authority,
+            &started.ids["assignment"],
+            WORK_CONTEXT_BYTES_LIMIT,
+        ).unwrap();
+        assert_eq!(packet.project_context, Some(bounded));
+        assert_eq!(packet.answers.len(), 1);
+        assert_eq!(packet.answers[0].answer.len(), 56000);
+        assert!(canonical_bytes(&packet).unwrap().len() <= WORK_CONTEXT_BYTES_LIMIT);
+    }
+}
+
+#[test]
 fn review_answer_budget_includes_the_next_project_context_without_adopting_it() {
     let f = Fixture::new();
     let work = f.create("answer-context-budget", true);
