@@ -1,6 +1,8 @@
 //! Process-owned browser sessions shared by HTTP workbench requests and agent tools.
 //! Each chat session has one isolated Playwright context in a child Node process.
 
+#[cfg(test)]
+mod persistence_tests;
 mod profile;
 
 use std::collections::{HashMap, HashSet};
@@ -21,6 +23,9 @@ const BROWSER_IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const BROWSER_COMMAND_DEADLINE: Duration = Duration::from_secs(30);
 const BROWSER_EVAL_DEADLINE: Duration = Duration::from_secs(5);
 const BROWSER_REAP_DEADLINE: Duration = Duration::from_secs(2);
+// Playwright's browser-process close has its own 30-second bound. Leave time
+// for that close and Node's final cleanup; command cancellation stays separate.
+const BROWSER_CLOSE_DEADLINE: Duration = Duration::from_secs(35);
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserError {
@@ -60,19 +65,21 @@ pub struct BrowserManager {
 }
 
 struct BrowserSession {
-    child: Mutex<Child>,
+    child: Arc<Mutex<Child>>,
     profile_lease: Mutex<Option<profile::Lease>>,
     /// Owns the host's TMPDIR, including Chromium's download scratch files.
     temp_dir: Mutex<Option<tempfile::TempDir>>,
     #[cfg(unix)]
     process_group: Option<i32>,
-    stdin: AsyncMutex<ChildStdin>,
+    stdin: AsyncMutex<Option<ChildStdin>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, BrowserError>>>>,
     next_id: AtomicU64,
     frames: watch::Sender<Option<Arc<BrowserFrame>>>,
     shutdown: watch::Sender<bool>,
     termination: AsyncMutex<()>,
     kill_issued: AtomicBool,
+    retiring: AtomicBool,
+    close_confirmed: AtomicBool,
     reaped: AtomicBool,
     frame_epoch: AtomicU64,
     active_tab_id: Mutex<Option<String>>,
@@ -82,9 +89,119 @@ struct BrowserSession {
 
 impl Drop for BrowserSession {
     fn drop(&mut self) {
-        if !self.reaped.load(Ordering::Acquire) {
-            self.signal_stop();
+        if self.reaped.load(Ordering::Acquire) && self.profile_lease.get_mut().unwrap().is_none() {
+            return;
         }
+        let lease = self.profile_lease.get_mut().unwrap().take();
+        let graceful = lease.is_some()
+            && !self.kill_issued.load(Ordering::Acquire)
+            && !self.reaped.load(Ordering::Acquire);
+        // Establish the replay fence before returning from Drop, not after a
+        // new thread happens to be scheduled (the process can exit meanwhile).
+        let marked = lease
+            .as_ref()
+            .is_some_and(|lease| lease.begin_close().is_ok());
+        let can_detach = lease.is_none() || marked;
+        let resources = BrowserReaper {
+            child: self.child.clone(),
+            lease,
+            temp_dir: self.temp_dir.get_mut().unwrap().take(),
+            stdin: self.stdin.get_mut().take(),
+            #[cfg(unix)]
+            process_group: self.process_group,
+            graceful,
+            marked,
+        };
+        if !can_detach {
+            // With no durable fence, Drop cannot safely return and let process
+            // exit release the only remaining lease. Wait for clean exit or I/O
+            // recovery. This path is only for a failed profile marker write.
+            resources.reap();
+            return;
+        }
+        let resources = Arc::new(Mutex::new(Some(resources)));
+        let worker = resources.clone();
+        if std::thread::Builder::new()
+            .name("browser-host-reaper".into())
+            .spawn(move || {
+                let resources = worker.lock().unwrap().take().unwrap();
+                resources.reap();
+            })
+            .is_err()
+        {
+            // A failed thread spawn must not drop the lease before the child.
+            let resources = resources.lock().unwrap().take().unwrap();
+            resources.reap();
+        }
+    }
+}
+
+/// Outlives the async runtime and every manager/session Arc. In particular,
+/// signalling a process is not evidence that it has stopped using its profile.
+struct BrowserReaper {
+    child: Arc<Mutex<Child>>,
+    lease: Option<profile::Lease>,
+    temp_dir: Option<tempfile::TempDir>,
+    stdin: Option<ChildStdin>,
+    #[cfg(unix)]
+    process_group: Option<i32>,
+    graceful: bool,
+    marked: bool,
+}
+
+impl BrowserReaper {
+    fn reap(mut self) {
+        let mut marked = self.marked;
+        drop(self.stdin.take());
+        let deadline = Instant::now()
+            + if self.graceful {
+                BROWSER_CLOSE_DEADLINE
+            } else {
+                Duration::ZERO
+            };
+        let mut killed = false;
+        let clean = loop {
+            if let Ok(Some(status)) = self.child.lock().unwrap().try_wait() {
+                break self.graceful && !killed && status.success();
+            }
+            if !killed && Instant::now() >= deadline {
+                #[cfg(unix)]
+                if let Some(group) = self.process_group {
+                    kill_browser_process_group(group);
+                }
+                let _ = self.child.lock().unwrap().start_kill();
+                killed = true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if let Some(lease) = &self.lease {
+            if clean {
+                let _ = lease.finish_close();
+            } else {
+                // If disk I/O prevented the marker, retaining the lease is the
+                // replay fence. Do not release an unmarked, unconfirmed profile.
+                while !marked {
+                    marked = lease.begin_close().is_ok();
+                    if !marked {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+            }
+        }
+        if let Some(directory) = self.temp_dir.take() {
+            let path = directory.path().to_path_buf();
+            if directory.close().is_err() {
+                for _ in 0..10 {
+                    std::thread::sleep(Duration::from_millis(25));
+                    match std::fs::remove_dir_all(&path) {
+                        Ok(()) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+        // self.lease remains alive through actual wait + owned scratch cleanup.
     }
 }
 
@@ -142,8 +259,10 @@ impl Drop for BrowserCallAbortGuard {
         if !self.armed {
             return;
         }
-        self.session.mark_dead("browser command cancelled");
-        self.session.signal_stop();
+        if !self.session.retiring.load(Ordering::Acquire) {
+            self.session.mark_dead("browser command cancelled");
+            self.session.signal_stop();
+        }
         let session = self.session.clone();
         let managed = self.managed.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -250,18 +369,20 @@ impl BrowserSession {
         let (frames, _) = watch::channel(None);
         let (shutdown, _) = watch::channel(false);
         let session = Arc::new(Self {
-            child: Mutex::new(child),
+            child: Arc::new(Mutex::new(child)),
             profile_lease: Mutex::new(None),
             temp_dir: Mutex::new(temp_dir),
             #[cfg(unix)]
             process_group,
-            stdin: AsyncMutex::new(stdin),
+            stdin: AsyncMutex::new(Some(stdin)),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             frames,
             shutdown,
             termination: AsyncMutex::new(()),
             kill_issued: AtomicBool::new(false),
+            retiring: AtomicBool::new(false),
+            close_confirmed: AtomicBool::new(false),
             reaped: AtomicBool::new(false),
             frame_epoch: AtomicU64::new(0),
             active_tab_id: Mutex::new(None),
@@ -276,9 +397,14 @@ impl BrowserSession {
     async fn read_messages(weak: Weak<Self>, stdout: tokio::process::ChildStdout) {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let Some(session) = weak.upgrade() else { break };
+            let Some(session) = weak.upgrade() else {
+                continue;
+            };
             if !session.alive.load(Ordering::Acquire) {
-                break;
+                // Keep draining until EOF while controlled retirement flushes
+                // and closes Chromium. Closing stdout early can disrupt that
+                // shutdown; no late frame/reply is published to retired Arcs.
+                continue;
             }
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
                 tracing::warn!("browser host sent malformed JSON");
@@ -411,6 +537,12 @@ impl BrowserSession {
     }
 
     fn signal_stop(&self) {
+        if let Some(lease) = self.profile_lease.lock().unwrap().as_ref() {
+            self.retiring.store(true, Ordering::Release);
+            // Forced deadlines/cancellation cannot promise a final checkpoint.
+            // release_profile retains the lease if even this marker cannot be written.
+            let _ = lease.begin_close();
+        }
         if self.kill_issued.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -425,13 +557,76 @@ impl BrowserSession {
         }
     }
 
+    fn begin_retirement(&self, reason: &'static str) -> Result<(), BrowserError> {
+        if let Some(lease) = self.profile_lease.lock().unwrap().as_ref() {
+            lease.begin_close()?;
+            self.retiring.store(true, Ordering::Release);
+        }
+        self.mark_dead(reason);
+        Ok(())
+    }
+
+    fn release_profile(&self) {
+        let mut lease = self.profile_lease.lock().unwrap();
+        if self.retiring.load(Ordering::Acquire)
+            && !self.close_confirmed.load(Ordering::Acquire)
+            && lease
+                .as_ref()
+                .is_some_and(|lease| lease.begin_close().is_err())
+        {
+            return;
+        }
+        lease.take();
+    }
+
     async fn terminate(&self, reason: &'static str) {
         self.mark_dead(reason);
         let _guard = self.termination.lock().await;
         if self.reaped.load(Ordering::Acquire) {
             self.cleanup_temp_dir().await;
-            self.profile_lease.lock().unwrap().take();
+            self.release_profile();
             return;
+        }
+        if self.retiring.load(Ordering::Acquire) && !self.kill_issued.load(Ordering::Acquire) {
+            if let Some(lease) = self.profile_lease.lock().unwrap().as_ref() {
+                let _ = lease.begin_close();
+            }
+            // A blocked write end must not consume the Chromium flush budget.
+            // The alive fence has already prevented all later writes.
+            let eof_sent = tokio::time::timeout(BROWSER_REAP_DEADLINE, async {
+                self.stdin.lock().await.take();
+            })
+            .await
+            .is_ok();
+            let graceful = if eof_sent {
+                tokio::time::timeout(BROWSER_CLOSE_DEADLINE, async {
+                    loop {
+                        if let Some(status) = self.child.lock().unwrap().try_wait().ok().flatten() {
+                            return status.success();
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .ok()
+            } else {
+                None
+            };
+            if let Some(clean) = graceful {
+                self.reaped.store(true, Ordering::Release);
+                let confirmed = clean
+                    && self
+                        .profile_lease
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|lease| lease.finish_close().is_ok());
+                self.close_confirmed.store(confirmed, Ordering::Release);
+                self.cleanup_temp_dir().await;
+                self.release_profile();
+                return;
+            }
+            // The marker intentionally survives an unconfirmed/forced close.
         }
         self.signal_stop();
         let reaped = tokio::time::timeout(BROWSER_REAP_DEADLINE, async {
@@ -455,7 +650,7 @@ impl BrowserSession {
         }
         self.cleanup_temp_dir().await;
         if self.reaped.load(Ordering::Acquire) {
-            self.profile_lease.lock().unwrap().take();
+            self.release_profile();
         }
     }
 
@@ -515,10 +710,13 @@ impl BrowserSession {
         }
         let _pending_guard = BrowserPendingCallGuard { session: self, id };
         let exchange = async {
-            let mut stdin = self.stdin.lock().await;
+            let mut owned_stdin = self.stdin.lock().await;
             if !self.alive.load(Ordering::Acquire) {
                 return Err(BrowserError::Unavailable("browser host exited".into()));
             }
+            let stdin = owned_stdin
+                .as_mut()
+                .ok_or_else(|| BrowserError::Unavailable("browser host exited".into()))?;
             stdin
                 .write_all(&line)
                 .await
@@ -531,7 +729,7 @@ impl BrowserSession {
                 .flush()
                 .await
                 .map_err(|error| BrowserError::Unavailable(error.to_string()))?;
-            drop(stdin);
+            drop(owned_stdin);
             receiver
                 .await
                 .map_err(|_| BrowserError::Unavailable("browser host exited".into()))?
@@ -605,17 +803,19 @@ mod tests {
         let (frames, _) = watch::channel(None);
         let (shutdown, _) = watch::channel(!alive);
         Arc::new(BrowserSession {
-            child: Mutex::new(child),
+            child: Arc::new(Mutex::new(child)),
             profile_lease: Mutex::new(None),
             temp_dir: Mutex::new(None),
             process_group,
-            stdin: AsyncMutex::new(stdin),
+            stdin: AsyncMutex::new(Some(stdin)),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             frames,
             shutdown,
             termination: AsyncMutex::new(()),
             kill_issued: AtomicBool::new(false),
+            retiring: AtomicBool::new(false),
+            close_confirmed: AtomicBool::new(false),
             reaped: AtomicBool::new(false),
             frame_epoch: AtomicU64::new(0),
             active_tab_id: Mutex::new(None),
@@ -1423,7 +1623,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("browser-profiles");
         let browser = BrowserManager::with_profile_root(root.clone());
-        let session = stub_session(Duration::ZERO, true);
+        let session = fake_host("cat >/dev/null", &[]);
         *session.profile_lease.lock().unwrap() = Some(profile::acquire(&root, "chat-a").unwrap());
         browser
             .sessions
@@ -1453,7 +1653,8 @@ mod tests {
         let path = lease.path.clone();
         let sentinel = path.join("synthetic-site-data");
         std::fs::write(&sentinel, b"synthetic durable state").unwrap();
-        let session = stub_session(BROWSER_IDLE_TTL + Duration::from_secs(1), true);
+        let session = fake_host("cat >/dev/null", &[]);
+        *session.last_used.lock().unwrap() = Instant::now() - BROWSER_IDLE_TTL;
         *session.profile_lease.lock().unwrap() = Some(lease);
         browser
             .sessions
@@ -1863,23 +2064,29 @@ impl BrowserManager {
     async fn close_locked(&self, session_id: &str) -> Result<(), BrowserError> {
         let session = {
             let mut sessions = self.sessions.lock().await;
-            let session = sessions.remove(session_id);
-            if let Some(session) = &session {
-                session.mark_dead("browser session closed");
+            if let Some(session) = sessions.get(session_id) {
+                session.begin_retirement("browser session closed")?;
             }
-            session
+            sessions.remove(session_id)
         };
         if let Some(session) = session {
-            Self::stop_session(session).await;
+            Self::stop_session(session).await?;
         }
         Ok(())
     }
 
-    async fn stop_session(session: Arc<BrowserSession>) {
-        // The map entry is already gone. Do not enqueue a graceful `close`
-        // behind an in-flight command: callers that hold this Arc must be
-        // stopped before they can write another action to the retired page.
+    async fn stop_session(session: Arc<BrowserSession>) -> Result<(), BrowserError> {
+        // The map entry is gone and old Arcs cannot write. Persistent hosts
+        // receive EOF for bounded final checkpointing, not a queued RPC.
         session.terminate("browser session closed").await;
+        if session.retiring.load(Ordering::Acquire)
+            && !session.close_confirmed.load(Ordering::Acquire)
+        {
+            return Err(BrowserError::Unavailable(
+                "browser profile close unconfirmed".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn sweep_idle(&self, ttl: Duration) -> usize {
@@ -1904,17 +2111,22 @@ impl BrowserManager {
                     .get(&session_id)
                     .is_some_and(|session| session.idle_for(ttl))
                 {
-                    let session = sessions.remove(&session_id);
-                    if let Some(session) = &session {
-                        session.mark_dead("browser session idle");
+                    let session = sessions.get(&session_id).unwrap();
+                    match session.begin_retirement("browser session idle") {
+                        Ok(()) => sessions.remove(&session_id),
+                        Err(error) => {
+                            tracing::warn!(%error, "browser idle retirement could not mark its profile");
+                            None
+                        }
                     }
-                    session
                 } else {
                     None
                 }
             };
             if let Some(session) = session {
-                Self::stop_session(session).await;
+                if let Err(error) = Self::stop_session(session).await {
+                    tracing::warn!(%error, "browser idle retirement did not confirm persistence");
+                }
                 reaped += 1;
             }
         }

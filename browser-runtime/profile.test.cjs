@@ -64,7 +64,12 @@ async function fixture(t) {
   fs.chmodSync(root, 0o700);
   const home = path.join(root, 'home'); fs.mkdirSync(home, { mode: 0o700 });
   const children = new Set();
+  let clearGate;
+  let markGateReady; const gateReady = new Promise(resolve => { markGateReady = resolve; });
+  let markCleared; const cleared = new Promise(resolve => { markCleared = resolve; });
   const server = http.createServer((request, response) => {
+    if (request.url === '/clear-gate') { clearGate = response; markGateReady(); return; }
+    if (request.url === '/clear-observed') { markCleared(!(request.headers.cookie || '').includes('fixture-session=')); }
     if (request.url === '/download') {
       response.setHeader('content-type', 'application/octet-stream');
       response.setHeader('content-disposition', 'attachment; filename="synthetic.bin"');
@@ -136,6 +141,8 @@ async function fixture(t) {
       async visit() { const state = await call('state'); return call('navigate', { expected_epoch: state.page_epoch, url }); },
       async evaluate(code) { const state = await call('state'); return (await call('eval', { expected_epoch: state.page_epoch, expected_url: state.url, code })).value; },
       async close() { if (child.exitCode !== null || child.signalCode !== null) return exit; await call('close'); return exit; },
+      async disconnect() { child.stdin.end(); return exit; },
+      async disconnectOutput() { child.stdout.destroy(); return exit; },
       async kill() { if (child.exitCode === null && child.signalCode === null) {
         // Only this newly spawned, detached child's process group is signalled.
         if (process.platform === 'win32') child.kill('SIGKILL'); else process.kill(-child.pid, 'SIGKILL');
@@ -143,8 +150,31 @@ async function fixture(t) {
     };
     children.add(client); return client;
   };
-  return { root, profile, start };
+  return { root, profile, start, cleared, async releaseClear() { await gateReady; clearGate.end('release synthetic logout'); } };
 }
+
+test('stdout EPIPE alone finishes a streaming profile and its final logout checkpoint', async t => {
+  const f = await fixture(t); const directory = f.profile('streaming-chat');
+  const browser = f.start(directory); await browser.visit(); await browser.evaluate('window.seed()');
+  await browser.evaluate(`setInterval(() => { document.body.style.backgroundColor = Date.now() % 2 ? 'red' : 'blue'; }, 16);
+    void fetch('/clear-gate').then(() => fetch('/clear-cookies')).then(() => fetch('/clear-observed')); true`);
+  await f.releaseClear(); assert.equal(await f.cleared, true);
+  const checkpoint = path.join(directory, '.bamboo-session-cookies-v1.json');
+  assert.equal(JSON.parse(fs.readFileSync(checkpoint)).cookies.some(cookie => cookie.name === 'fixture-session'), true,
+    'the fixture must lose its output reader before the background checkpoint');
+  assert.equal((await browser.disconnectOutput()).code, 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(checkpoint)).cookies, []);
+});
+
+test('an empty persistent host closes on stdin EOF and reopens without a shutdown tab', async t => {
+  const f = await fixture(t); const directory = f.profile('empty-chat');
+  const first = f.start(directory);
+  assert.equal((await first.call('state')).active_tab_id, null);
+  assert.equal((await first.disconnect()).code, 0);
+  const reopened = f.start(directory);
+  assert.equal((await reopened.call('state')).active_tab_id, null);
+  assert.equal((await reopened.close()).code, 0);
+});
 
 test('persistent profile restores login cookies, localStorage and IndexedDB after host process restart', async t => {
   const f = await fixture(t); const directory = f.profile('chat-A');

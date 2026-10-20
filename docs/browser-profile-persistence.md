@@ -14,6 +14,8 @@ remain isolated. Reopening a live chat browser reuses its context; idle
 reclamation and application/process restart reuse its on-disk profile.
 The Rust manager holds an operating-system file lease until its owned host has
 been reaped; another manager cannot concurrently open the same chat profile.
+Dropping the manager transfers the child, scratch directory and lease to a
+reaper that can finish even after the async runtime has shut down.
 
 Chromium persists cookies, localStorage and IndexedDB. The bundled headless shell
 does not restore session-only cookies by itself, so those cookies have a private,
@@ -23,6 +25,17 @@ Checkpoint failure is reported instead of silently claiming persistence or
 falling back to a fresh context. No cookie values are returned in browser state
 or logs. Normal website expiry, logout and explicit site-data clearing still
 apply; clearing does not restore older saved cookies on the next launch.
+Normal close, idle reclamation and manager drop stop new commands and send EOF
+outside the command queue. The host closes pages before its final checkpoint,
+then closes Chromium. Shutdown has a bounded grace period. If final persistence
+cannot be confirmed by a clean host exit, a private close-pending marker blocks
+reopening that profile instead of importing a potentially stale cookie snapshot.
+Its existing site data is retained; an unconfirmed close is reported as such.
+Controlled command timeouts and cancellation also mark a persistent profile
+unconfirmed before killing the host. They do not replay a checkpoint that may
+precede a logout. If the marker itself cannot be written, ordinary close keeps
+the live owner attached. Destruction must retain the lease and wait for clean
+exit or filesystem recovery before it can return without that durable fence.
 
 This does not serialize page JavaScript, active DOM, sessionStorage or an open
 tab list. A new tab or process starts a fresh document. Profile persistence is
@@ -35,4 +48,7 @@ profiles. It covers host restart, forced retirement after confirmed commands,
 last-tab reconstruction, repeated reads, cross-chat isolation, explicit site
 clearing, corrupt state rejection and bounded downloads. Rust tests separately
 cover stable directory selection, symlink rejection and profile lease conflicts.
+The close regressions also cover background HttpOnly cookie deletion immediately
+before close/idle/drop, blocked queued writes, unconfirmed exits and lease
+ownership while a previously signalled host is still alive.
 No installed browser, real account cookies or user credentials are used.

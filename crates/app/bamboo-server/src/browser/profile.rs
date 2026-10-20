@@ -6,9 +6,52 @@ use sha2::{Digest, Sha256};
 
 use super::BrowserError;
 
+const CLOSE_PENDING: &str = ".bamboo-profile-close-pending";
+
 pub(super) struct Lease {
     pub(super) path: PathBuf,
     _lock: std::fs::File,
+}
+
+impl Lease {
+    // A forced fallback must never replay the checkpoint from before logout.
+    // Keep the marker on any unconfirmed close; do not delete site data.
+    pub(super) fn begin_close(&self) -> Result<(), BrowserError> {
+        let marker = self.path.join(CLOSE_PENDING);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(&marker) {
+            Ok(file) => file.sync_all().map_err(|_| unavailable()),
+            // The same leased host may resume closing after caller cancellation.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NOFOLLOW);
+                }
+                options
+                    .open(marker)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|_| unavailable())
+            }
+            Err(_) => Err(unavailable()),
+        }
+    }
+
+    pub(super) fn finish_close(&self) -> Result<(), BrowserError> {
+        match std::fs::remove_file(self.path.join(CLOSE_PENDING)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(unavailable()),
+        }
+    }
 }
 
 fn unavailable() -> BrowserError {
@@ -75,6 +118,10 @@ pub(super) fn acquire(root: &Path, session_id: &str) -> Result<Lease, BrowserErr
     }
     let lock = options.open(lock_path).map_err(|_| unavailable())?;
     fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| unavailable())?;
+    match std::fs::symlink_metadata(path.join(CLOSE_PENDING)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(unavailable()),
+    }
     Ok(Lease { path, _lock: lock })
 }
 

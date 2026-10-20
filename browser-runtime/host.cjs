@@ -78,6 +78,7 @@ let lastFrameAt = 0;
 let closing = false;
 let shuttingDown = false;
 let browserClosed = false;
+let hostClose;
 let pendingDialog;
 let inFlightAction;
 const dialogWaiters = new Set();
@@ -3142,9 +3143,14 @@ async function command(action, args = {}) {
   }
 }
 
-async function closeHost() {
-  if (browserClosed) return;
+function closeHost() {
+  if (hostClose) return hostClose;
   shuttingDown = true;
+  hostClose = finishCloseHost();
+  return hostClose;
+}
+
+async function finishCloseHost() {
   clearCaptureTimer();
   captureGeneration++;
   desiredCapture = undefined;
@@ -3153,9 +3159,14 @@ async function closeHost() {
   clearTimeout(profileTimer);
   clearInterval(profileInterval);
   let checkpointError;
+  // Stop document timers/network writers before taking the final snapshot.
+  // Do not run beforeunload handlers or enqueue a close behind a hung action.
+  try {
+    if (context) await Promise.all(context.pages().map(page => page.close()));
+  } catch (error) { checkpointError = error; }
   try { await checkpointProfile(); } catch (error) { checkpointError = error; }
-  await context?.close().catch(() => {});
-  await browser?.close().catch(() => {});
+  try { await context?.close(); } catch (error) { checkpointError ||= error; }
+  try { await browser?.close(); } catch (error) { checkpointError ||= error; }
   browserClosed = true;
   downloadCdp = undefined;
   downloadContextId = undefined;
@@ -3262,7 +3273,23 @@ async function main() {
   await captureTask;
 
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  // EOF is a separate lifecycle fence, even when dispatch is still waiting.
+  // Rust first rejects new calls, then closes its owned write end of the pipe.
+  const disconnected = () => {
+    closing = true;
+    lines.close();
+    process.stdin.pause();
+    void closeHost().catch(() => { process.exitCode = 1; });
+  };
+  process.stdin.once('end', disconnected);
+  process.stdout.on('error', error => {
+    // The Rust runtime can disappear before its stdout reader drains. A lost
+    // owner is a shutdown signal, not an unhandled EPIPE that skips persistence.
+    if (error.code !== 'EPIPE') process.exitCode = 1;
+    disconnected();
+  });
   for await (const line of lines) {
+    if (shuttingDown) break;
     let request;
     try {
       request = JSON.parse(line);
@@ -3298,7 +3325,7 @@ async function main() {
 
 if (require.main === module) {
   main().catch(async error => {
-    await closeHost();
+    await closeHost().catch(() => {});
     process.stderr.write(`browser host failed: ${error.message || error}\n`);
     process.exitCode = 1;
   });
