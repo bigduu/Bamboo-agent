@@ -263,6 +263,17 @@ async fn owner_http_planning_is_cas_idempotent_and_never_changes_work_or_dispatc
     let changes: Value = test::read_body_json(changes).await;
     assert_eq!(changes["snapshot"]["seq"], after.seq);
     assert_eq!(changes["data"], json!(expected_changes));
+    let legacy = ReadCursor {
+        commit: changes["snapshot"]["commit"].as_str().unwrap().into(),
+        query_hash: content_hash(&canonical_bytes(&json!({"changes_since":before.seq})).unwrap()),
+        offset: 1,
+    };
+    let stale_page = post!(
+        app,
+        "/api/v1/tickets/changes",
+        json!({"since_seq":before.seq,"limit":1,"cursor":legacy})
+    );
+    assert_eq!(stale_page.status(), StatusCode::GONE);
 }
 
 #[actix_web::test]
