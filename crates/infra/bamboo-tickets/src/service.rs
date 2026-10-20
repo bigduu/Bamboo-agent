@@ -1899,7 +1899,7 @@ pub(crate) fn validate_new_assignment_contexts(
     Ok(())
 }
 
-/// An Answer must fit the next generation's complete packet before the request
+/// Known answers and candidate Project context must fit the next generation's
 /// is permanently closed. Reuse the existing packet builder and artifact budget.
 pub(crate) fn validate_answer_contexts(
     before: &Snapshot,
@@ -1912,10 +1912,15 @@ pub(crate) fn validate_answer_contexts(
         .filter(|request| {
             request.kind == RequestKind::Question
                 && request.status == RequestStatus::Answered
-                && before
+                && (before
                     .requests
                     .get(&request.id)
                     .is_none_or(|old| old.answer != request.answer)
+                    || (before.project.work_contexts.get(&request.work_id)
+                        != next.project.work_contexts.get(&request.work_id)
+                        && next.tickets.get(&request.work_id).is_some_and(|work| {
+                            work.contract_revision == request.contract_revision
+                        })))
         })
         .map(|request| request.work_id.clone())
         .collect::<BTreeSet<_>>();
