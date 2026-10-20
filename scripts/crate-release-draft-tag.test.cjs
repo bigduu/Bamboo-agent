@@ -41,7 +41,9 @@ const statePath = process.env.FIXTURE_STATE
 const state = JSON.parse(fs.readFileSync(statePath))
 const route = args.find(value => value.startsWith('repos/'))
 const save = () => fs.writeFileSync(statePath, JSON.stringify(state))
-if (args[0] === 'api' && route?.endsWith('/releases?per_page=100')) {
+if (args[0] === 'api' && route?.endsWith('/branches/main')) {
+  process.stdout.write(JSON.stringify({name: 'main', protected: false, commit: {sha: state.main || state.source}}))
+} else if (args[0] === 'api' && route?.endsWith('/releases?per_page=100')) {
   process.stdout.write(JSON.stringify([[state.release]]))
 } else if (args[0] === 'api' && route?.endsWith('/tags?per_page=100')) {
   process.stdout.write(JSON.stringify([[{name: state.release.tag_name}]]))
@@ -142,6 +144,14 @@ if (args[0] === 'api' && route?.endsWith('/releases?per_page=100')) {
     assert.equal(receipt.version, version)
     assert.deepEqual(receipt.identity, initial.identity)
     assert.deepEqual(receipt.packageChecksums, {'bamboo-agent': 'd'.repeat(64)})
+    // The real API adapters must recheck authority after planning, not cache it.
+    state.main = 'b'.repeat(40)
+    fs.writeFileSync(stateFile, JSON.stringify(state))
+    for (const write of [() => context.reserve(receipt), () => context.saveReceipt(state.release, receipt),
+      () => context.complete(state.release, receipt, false)]) {
+      await assert.rejects(write(), /no longer current main/)
+      assert.deepEqual(JSON.parse(fs.readFileSync(stateFile)), state)
+    }
   } finally {
     process.env = previousEnv
     process.chdir(previousCwd)

@@ -9,7 +9,7 @@ const { assertVersion, assertManualVersion, validateSource, validateReceipt, nex
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend,
   shouldMakeLatest, gitIsAncestor, canonicalJson, signReceipt, authenticateReceipt,
   readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration, verifyRegistrySource, highestStableVersion,
-  command, spawnCommand } = require('./crate-release.cjs')
+  command, spawnCommand, assertCurrentMain, currentMainWrite } = require('./crate-release.cjs')
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 const sourceRevision = 'a'.repeat(40)
@@ -39,6 +39,7 @@ function fixture(extra = {}) {
     readReceipt: async (entry, options) => readAuthenticatedReceipt(entry, signingKey, options),
     verifyReceipt: (receipt) => authenticateReceipt(receipt, signingKey),
     assertSigningKey: () => assertSigningConfiguration(signingKey, signingKeyDigest),
+    assertCurrentMain: async () => {},
     tagSource: async () => sourceRevision,
     registryFrontier: async () => [],
     isAncestor: async () => { throw new Error('Unexpected source ancestry lookup') },
@@ -901,7 +902,7 @@ test('trusted manual publication and automatic receipts share a queue while dry 
   assert.doesNotMatch(automatic, /inputs\.version/)
   assert.doesNotMatch(automatic, /workflow_dispatch|inputs\.complete_release|accepted_ci_run|SOURCE_VALIDATION/)
   for (const name of ['BAMBOO_RELEASE_TOKEN', 'BAMBOO_RELEASE_SIGNING_KEY']) {
-    assert.equal(automatic.split(`secrets.${name}`).length - 1, name === 'BAMBOO_RELEASE_TOKEN' ? 3 : 2)
+    assert.equal(automatic.split(`secrets.${name}`).length - 1, 2)
   }
   assert.doesNotMatch(workflow, /VERSION="\$\{\{ github.event.inputs.version/)
   const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8')
@@ -1154,95 +1155,8 @@ print(json.dumps(result))
   assert.notEqual(run().status, 0, 'A real moved annotated tag must fail')
 })
 
-test('automatic inline bootstrap authorizes the exact successful CI source and protected historical workflow before checkout', (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-release-bootstrap-'))
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
-  const git = (...args) => {
-    const result = spawnSync('git', args, { cwd: directory, encoding: 'utf8' })
-    assert.equal(result.status, 0, result.stderr)
-    return result.stdout.trim()
-  }
-  git('init', '-q')
-  const commit = (value) => {
-    fs.writeFileSync(path.join(directory, 'source'), value)
-    git('add', 'source')
-    git('-c', 'user.name=Bootstrap fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', value)
-    return git('rev-parse', 'HEAD')
-  }
-  const historical = commit('historical')
-  const main = commit('main')
-  const dev = commit('dev')
-  git('checkout', '--detach', historical)
-  const feature = commit('feature')
-  const bin = path.join(directory, 'bin')
-  fs.mkdirSync(bin)
-  const calls = path.join(directory, 'api-calls')
-  fs.writeFileSync(path.join(bin, 'gh'), `#!/usr/bin/env python3
-import json, os, pathlib, subprocess, sys
-route = sys.argv[2]
-with open(os.environ['FIXTURE_CALLS'], 'a') as stream: stream.write(route + '\\n')
-if os.environ.get('FIXTURE_API_FAILURE') == 'true': sys.exit(1)
-if '/branches/' in route:
-    name = route.rsplit('/', 1)[-1]
-    print(json.dumps({'name': name, 'protected': os.environ.get('FIXTURE_UNPROTECTED') != 'true', 'commit': {'sha': json.loads(os.environ['FIXTURE_TIPS'])[name]}}))
-else:
-    source, tip = route.rsplit('/', 1)[-1].split('...')
-    base = subprocess.check_output(['git', 'merge-base', source, tip], cwd=os.environ['FIXTURE_REPOSITORY'], text=True).strip()
-    status = 'identical' if source == tip else 'ahead' if base == source else 'behind' if base == tip else 'diverged'
-    print(json.dumps({'status': status, 'merge_base_commit': {'sha': base}}))
-`, { mode: 0o755 })
-  const eventPath = path.join(directory, 'event.json')
-  const output = path.join(directory, 'output')
-  const bootstrap = workflowPython('Authorize the exact source before checkout')
-  const event = { workflow_run: { name: 'CI', event: 'push', conclusion: 'success', head_branch: 'main', head_sha: historical,
-    repository: { full_name: 'bigduu/Bamboo-agent' }, head_repository: { full_name: 'bigduu/Bamboo-agent' } } }
-  const run = (overrides = {}, payload = event) => {
-    fs.writeFileSync(eventPath, JSON.stringify(payload))
-    fs.writeFileSync(output, '')
-    fs.writeFileSync(calls, '')
-    const result = spawnSync('python3', ['-c', bootstrap], { encoding: 'utf8', env: { ...process.env,
-      PATH: `${bin}:${process.env.PATH}`, GITHUB_REPOSITORY: 'bigduu/Bamboo-agent', GITHUB_EVENT_NAME: 'workflow_run',
-      GITHUB_EVENT_PATH: eventPath, GITHUB_SHA: historical, GITHUB_OUTPUT: output, GITHUB_REF: 'refs/heads/dev',
-      GITHUB_REF_PROTECTED: 'true', GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/publish-crate.yml@refs/heads/dev',
-      GITHUB_WORKFLOW_SHA: dev, FIXTURE_REPOSITORY: directory, FIXTURE_CALLS: calls,
-      FIXTURE_TIPS: JSON.stringify({ dev, main }), ...overrides } })
-    return { ...result, output: fs.readFileSync(output, 'utf8'), calls: fs.readFileSync(calls, 'utf8') }
-  }
-  for (const source of [historical, dev, main]) {
-    const payload = clone(event)
-    payload.workflow_run.head_sha = source
-    const result = run({}, payload)
-    assert.equal(result.status, 0, result.stderr)
-    assert.equal(result.output, `revision=${source}\n`)
-  }
-  for (const invalid of [feature, 'f'.repeat(40), 'invalid']) {
-    const payload = clone(event)
-    payload.workflow_run.head_sha = invalid
-    const result = run({}, payload)
-    assert.notEqual(result.status, 0)
-    assert.equal(result.output, '')
-  }
-  for (const overrides of [{ GITHUB_WORKFLOW_SHA: feature }, { FIXTURE_UNPROTECTED: 'true' }, { FIXTURE_API_FAILURE: 'true' },
-    { GITHUB_REF: 'refs/heads/feature' }, { GITHUB_REF_PROTECTED: 'false' },
-    { GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/publish-crate.yml@refs/heads/feature' }]) {
-    const result = run(overrides)
-    assert.notEqual(result.status, 0)
-    assert.equal(result.output, '', 'Untrusted source cannot be handed to checkout or repository code')
-  }
-  const automatic = run({ GITHUB_SHA: dev })
-  assert.equal(automatic.status, 0, automatic.stderr)
-  assert.equal(automatic.output, `revision=${historical}\n`, 'workflow SHA cannot replace the tested CI source')
-  for (const [key, value] of [['name', 'Other'], ['head_repository', { full_name: 'foreign/repository' }],
-    ['event', 'pull_request'], ['conclusion', 'failure'], ['head_branch', 'dev']]) {
-    const changed = clone(event)
-    changed.workflow_run[key] = value
-    assert.notEqual(run({}, changed).status, 0)
-  }
-  const manual = run({ GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_REF: 'refs/tags/frozen-source' })
-  assert.notEqual(manual.status, 0)
-  assert.equal(manual.output, '')
-  assert.equal(manual.calls, '')
-
+test('automatic inline bootstrap requires actual normal merge and CI evidence without main protection', async (t) => {
+  await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t, workflowPython('Authorize the exact source before checkout'))
 })
 
 test('temporary manifest stamping uses exact internal dependency versions and real package versions', (t) => {
@@ -1344,3 +1258,43 @@ require('./crate-release-draft-tag.test.cjs')
 
 // Bound recovery replays the original successful main CI without a new reservation.
 require('./crate-release-recover.test.cjs')
+
+
+test('automatic current-main guard fails closed before allocation, credentials or writes', async () => {
+  const read = (sha) => async () => ({ name: 'main', protected: false, commit: { sha } })
+  await assertCurrentMain(identity.repository, sourceRevision, read(sourceRevision))
+  for (const branch of [null, {}, { name: 'dev', commit: { sha: sourceRevision } },
+    { name: 'main', commit: { sha: 'b'.repeat(40) } }]) {
+    await assert.rejects(assertCurrentMain(identity.repository, sourceRevision, async () => branch))
+  }
+  await assert.rejects(assertCurrentMain('other/repo', sourceRevision, read(sourceRevision)))
+  await assert.rejects(assertCurrentMain(identity.repository, sourceRevision, async () => { throw Error('transport') }))
+  let touched = false
+  const stale = async () => { throw Error('stale main') }
+  const { context } = fixture({ assertCurrentMain: stale,
+    assertSigningKey: () => { touched = true }, releases: async () => { touched = true; return [] } })
+  await assert.rejects(plan(context), /stale main/)
+  await assert.rejects(publish(context, release(makeReceipt()), makeReceipt()), /stale main/)
+  assert.equal(touched, false)
+  for (const boundary of ['reservation', 'tag', 'receipt', 'frontend', 'cargo retry', 'complete upload', 'complete patch', 'native asset']) {
+    let writes = 0
+    let current = sourceRevision
+    const guard = () => assertCurrentMain(identity.repository, sourceRevision, read(current))
+    await currentMainWrite(guard, () => { writes++ })
+    current = 'b'.repeat(40)
+    await assert.rejects(currentMainWrite(guard, () => { writes++ }), /no longer current main/, boundary)
+    assert.equal(writes, 1, boundary)
+  }
+})
+
+test('automatic adapters guard every write and keep historical recovery on its existing path', () => {
+  const code = fs.readFileSync('scripts/crate-release.cjs', 'utf8')
+  assert.match(code, /makeVerifiedContext\(env, repository, sourceRevision, validation\?\.ciRun \|\| event.workflow_run, automatic, true\)/)
+  assert.match(code, /makeVerifiedContext\(env, env.GITHUB_REPOSITORY, source, run, true\)/)
+  for (const fragment of ["write(() => github(repository, 'releases'", "write(() => github(repository, 'git/refs'",
+    "write(() => github(repository, `releases/${release.id}`", "write(() => command(['gh', 'release', 'upload'",
+    "write(() => spawnCommand(['cargo', 'publish'"]) assert.ok(code.includes(fragment), fragment)
+  const sidecar = fs.readFileSync('scripts/sidecar-release.cjs', 'utf8')
+  assert.ok(sidecar.indexOf('await guard()') < sidecar.indexOf('const { release, receipt } = publishedRelease'))
+  assert.match(sidecar, /upload: \(file\) => currentMainWrite\(guard,/)
+})
