@@ -51,10 +51,19 @@ async fn reject_corrupt_main(store: &SessionStoreV2, snapshot: &Session) {
             store.save_session(snapshot).await
         }
         .unwrap_err();
-        // Strict Main parsing rejects corruption before lifetime comparison.
-        // Keep the typed lifetime-conflict oracle in `reject` unchanged.
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error:?}");
-        assert_eq!(error.to_string(), "invalid compact Main authority");
+        // Full saves report strict Main parsing directly. Runtime writes keep
+        // the typed Root context refusal; neither path may repair corruption.
+        // The lifetime-conflict oracle in `reject` remains unchanged.
+        if runtime {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error:?}");
+            assert!(error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
+            assert!(error.to_string().contains("invalid compact Main authority"));
+        } else {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error:?}");
+            assert_eq!(error.to_string(), "invalid compact Main authority");
+        }
         assert_eq!(
             fs::read(directory.join("session.json")).await.unwrap(),
             main
