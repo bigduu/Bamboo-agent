@@ -6,7 +6,10 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
+const { once } = require('node:events');
+const { promisify } = require('node:util');
+const vm = require('node:vm');
 const { randomUUID } = require('node:crypto');
 const d = require('./supervisor-native-acceptance.cjs');
 const BIRTH = '2026-10-21T01:02:03.123456789Z';
@@ -312,4 +315,63 @@ test('OS COMPONENT ONLY: bind the test process/listener and reject changed proce
   const config = { binary: { path: process.execPath }, cases: [{ host_pid: process.pid, host_started_at: started.stdout.trim(), api_base: 'http://127.0.0.1:' + port }] };
   await d.verifyProcess(config);
   await assert.rejects(d.verifyProcess({ ...config, cases: [{ ...config.cases[0], host_started_at: 'old process' }] }), e => e.code === 'host_process_changed');
+});
+test('OS COMPONENT ONLY: an IPv6 owner cannot attest a different IPv4 listener on the same port', { timeout: 5000 }, async t => {
+  if (!['darwin', 'linux'].includes(process.platform)) {
+    await assert.rejects(d.verifyProcess({ cases: [] }), e => e.code === 'native_process_binding_unsupported'); return;
+  }
+  const child = spawn(process.execPath, ['-e', `
+    const server = require('node:http').createServer((req, res) => res.end('{}'));
+    server.listen({ host: '::1', port: 0, ipv6Only: true }, () => process.stdout.write(String(server.address().port) + '\\n'));
+    process.stdin.on('end', () => server.close()); process.stdin.resume();
+  `], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const exited = once(child, 'exit');
+  t.after(async () => { child.stdin.end(); const [code] = await exited; assert.equal(code, 0); });
+  const [bytes] = await Promise.race([once(child.stdout, 'data'), exited.then(() => { throw new Error('own listener fixture did not start'); })]);
+  const port = Number(bytes.toString().trim()); assert.ok(port >= 1024);
+  const decoy = http.createServer((req, res) => res.end('{}'));
+  await new Promise((resolve, reject) => { decoy.once('error', reject); decoy.listen(port, '127.0.0.1', resolve); });
+  t.after(() => new Promise(resolve => decoy.close(resolve)));
+  const started = spawnSync('ps', ['-p', String(child.pid), '-o', 'lstart='], { encoding: 'utf8' }); assert.equal(started.status, 0);
+  const config = { binary: { path: process.execPath }, cases: [{ host_pid: child.pid, host_started_at: started.stdout.trim(), api_base: 'http://[::1]:' + port }] };
+  await d.verifyProcess(config);
+  await assert.rejects(d.verifyProcess({ ...config, cases: [{ ...config.cases[0], api_base: 'http://127.0.0.1:' + port }] }), e => e.code === 'host_listener_unverified');
+});
+test('LINUX SOURCE MODEL ONLY: verify socket inode, address family and network namespace without lsof', async () => {
+  const source = await fs.readFile(path.join(__dirname, 'supervisor-native-acceptance.cjs'), 'utf8');
+  const state = { namespace: 'net:[1]', inode: '123', table: '', calls: [] };
+  const modelFs = { ...fs,
+    realpath: async file => file === '/proc/123/exe' ? fs.realpath(process.execPath) : fs.realpath(file),
+    readlink: async file => file === '/proc/self/ns/net' ? 'net:[1]' : file === '/proc/123/ns/net' ? state.namespace : 'socket:[' + state.inode + ']',
+    readdir: async file => { assert.equal(file, '/proc/123/fd'); return ['9']; },
+    open: async file => {
+      assert.ok(['/proc/123/net/tcp', '/proc/123/net/tcp6'].includes(file));
+      const bytes = Buffer.from(state.table); let position = 0;
+      return { stat: async () => ({ isFile: () => true, size: bytes.length }), close: async () => {},
+        read: async (buffer, offset, length) => { const bytesRead = bytes.copy(buffer, offset, position, position + length); position += bytesRead; return { bytesRead }; } };
+    }
+  };
+  const execFile = () => {};
+  execFile[promisify.custom] = async command => {
+    state.calls.push(command);
+    if (command !== 'ps') throw Object.assign(new Error('optional executable absent'), { code: 'ENOENT' });
+    return { stdout: 'fixture-start' };
+  };
+  const box = { module: { exports: {} }, process: { platform: 'linux' }, Buffer, URL, console,
+    require: name => name === 'node:fs/promises' ? modelFs : name === 'node:child_process' ? { execFile } : require(name) };
+  vm.runInNewContext(source, box, { filename: 'actual-driver-linux-source-model.cjs' });
+  const probe = box.module.exports;
+  const config = { binary: { path: process.execPath }, cases: [{ host_pid: 123, host_started_at: 'fixture-start', api_base: 'http://127.0.0.1:39001' }] };
+  const row = (address, inode = '123', status = '0A') => `0: ${address}:9859 00000000:0000 ${status} 0:0 00:0 0 1000 0 ${inode}\n`;
+  const ipv4 = os.endianness() === 'LE' ? '0100007F' : '7F000001';
+  const ipv6 = '000000000000000000000000' + (os.endianness() === 'LE' ? '01000000' : '00000001');
+  state.table = row(ipv4); await probe.verifyProcess(config); assert.deepEqual(state.calls, ['ps']);
+  for (const table of [row('00000000'), row(ipv6), row(ipv4, '999'), row(ipv4, '123', '01')]) {
+    state.table = table; await assert.rejects(probe.verifyProcess(config), e => e.code === 'host_listener_unverified');
+  }
+  state.table = row(ipv4); state.inode = '999'; await assert.rejects(probe.verifyProcess(config), e => e.code === 'host_listener_unverified');
+  state.inode = '123'; state.namespace = 'net:[2]'; await assert.rejects(probe.verifyProcess(config), e => e.code === 'host_network_namespace_changed');
+  state.namespace = 'net:[1]'; state.table = row(ipv6);
+  await probe.verifyProcess({ ...config, cases: [{ ...config.cases[0], api_base: 'http://[::1]:39001' }] });
+  assert.ok(state.calls.every(command => command === 'ps'));
 });
