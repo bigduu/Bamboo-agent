@@ -183,7 +183,12 @@ impl BrowserReaper {
         };
         if let Some(lease) = &self.lease {
             if clean {
-                let _ = lease.finish_close();
+                // Unlink may succeed before its directory barrier fails. Keep
+                // the lease until that barrier is confirmed, even if a retry
+                // finds the marker already absent.
+                while lease.finish_close().is_err() {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
             } else {
                 // If disk I/O prevented the marker, retaining the lease is the
                 // replay fence. Do not release an unmarked, unconfirmed profile.

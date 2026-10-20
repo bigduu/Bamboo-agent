@@ -4,6 +4,76 @@ use super::*;
 
 #[cfg(unix)]
 #[tokio::test]
+async fn clean_reaper_holds_lease_until_close_directory_barrier_recovers() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("profiles");
+    let lease = profile::acquire(&root, "chat").unwrap();
+    let path = lease.path.clone();
+    lease.begin_close().unwrap();
+    let marker = path.join(".bamboo-profile-close-pending");
+    let competing = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.join(".bamboo-profile.lock"))
+        .unwrap();
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("cat >/dev/null")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .kill_on_drop(true);
+    command.process_group(0);
+    let mut child = command.spawn().unwrap();
+    let process_group = child.id().and_then(|id| i32::try_from(id).ok());
+    let stdin = child.stdin.take();
+    let reaper = BrowserReaper {
+        child: Arc::new(Mutex::new(child)),
+        lease: Some(lease),
+        temp_dir: None,
+        stdin,
+        process_group,
+        graceful: true,
+        marked: true,
+    };
+    // The fence was established before the clean host exit. Unlink can now
+    // succeed, while opening the directory to confirm it must fail.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let (finished, receiver) = std::sync::mpsc::channel();
+    let owner = std::thread::spawn(move || {
+        reaper.reap();
+        finished.send(()).unwrap();
+    });
+    let started = Instant::now();
+    while marker.exists() && started.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let marker_unlinked = !marker.exists();
+    let released_before_barrier = receiver.recv_timeout(Duration::from_millis(300)).is_ok();
+    let still_leased = fs2::FileExt::try_lock_exclusive(&competing).is_err();
+    // Restore permissions and join before assertions, including on RED.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    owner.join().unwrap();
+    assert!(
+        marker_unlinked,
+        "fixture must reach unlink before the barrier fails"
+    );
+    assert!(
+        !released_before_barrier,
+        "a clean reaper must wait for confirmation of the directory barrier"
+    );
+    assert!(
+        still_leased,
+        "an unconfirmed unlink must retain its profile lease"
+    );
+    assert!(fs2::FileExt::try_lock_exclusive(&competing).is_ok());
+    drop(competing);
+    assert!(profile::acquire(&root, "chat").is_ok());
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn marker_io_failure_keeps_the_live_owner_until_close_can_be_fenced() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
