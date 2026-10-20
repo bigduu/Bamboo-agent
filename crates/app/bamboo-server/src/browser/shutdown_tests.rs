@@ -37,7 +37,9 @@ time.sleep(0.4)
 "#,
     )
     .unwrap();
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    let log_path = directory.path().join("fixture.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "browser::shutdown_tests::browser_shutdown_process_fixture",
             "--exact",
@@ -47,7 +49,11 @@ time.sleep(0.4)
         .env(MODE, mode)
         .env("BAMBOO_BROWSER_NODE", "/usr/bin/python3")
         .env("BAMBOO_BROWSER_HOST_SCRIPT", script)
-        .output()
+        // A pipe reader would also wait for a descendant retaining stderr,
+        // concealing an executable that exits before its browser host does.
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .status()
         .unwrap();
     let root = data.join("browser-profiles");
     let path = profile::directory(&root, "shutdown-chat").unwrap();
@@ -70,17 +76,16 @@ time.sleep(0.4)
         kill_browser_process_group(pid);
     }
     assert!(
-        output.status.success(),
-        "fixture failed: {} {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        status.success(),
+        "fixture failed: {}",
+        std::fs::read_to_string(log_path).unwrap()
     );
-    assert!(checkpoint_at_exit, "shutdown must await the host's EOF checkpoint");
-    assert!(exited_at_return, "shutdown must reap its host before executable exit");
-    assert!(profile_reusable_at_exit, "clean shutdown must leave a reusable profile");
     if mode == "reopen" {
         assert!(reopen_refused, "shutdown must fence new browser opens");
     }
+    assert!(checkpoint_at_exit, "shutdown must await the host's EOF checkpoint");
+    assert!(exited_at_return, "shutdown must reap its host before executable exit");
+    assert!(profile_reusable_at_exit, "clean shutdown must leave a reusable profile");
 }
 
 #[test]
@@ -110,9 +115,8 @@ fn browser_shutdown_process_fixture() {
         if mode == "reopen" && state.browser.open("shutdown-chat").await.is_err() {
             std::fs::write(data.join("reopen-refused"), b"refused").unwrap();
         }
-        drop(state);
+        // Do not let unrelated AppState destructors or runtime teardown give
+        // detached cleanup extra time after the production shutdown returned.
+        std::process::exit(0);
     });
-    // A normal executable must not depend on a detached thread finishing after
-    // its last AppState/runtime returns. Do not let libtest wait hide that bug.
-    std::process::exit(0);
 }
