@@ -1993,6 +1993,14 @@ pub(crate) fn validate_answer_contexts(
             updated_seq: next.seq,
         };
         let mut projected = next.clone();
+        // Count the context the next real Start will adopt; never publish this projection.
+        projected.project.assignment_contexts.remove(&assignment_id);
+        if let Some(context_hash) = next.project.work_contexts.get(&work_id) {
+            projected
+                .project
+                .assignment_contexts
+                .insert(assignment_id.clone(), context_hash.clone());
+        }
         let projected_work = projected.tickets.get_mut(&work_id).expect("answer Work");
         projected_work.generation = assignment.generation;
         projected_work.state = WorkState::Active;
