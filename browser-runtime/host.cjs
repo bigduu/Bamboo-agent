@@ -3,7 +3,7 @@
 // only client: newline-delimited JSON over stdio never exposes a CDP port.
 const { chromium } = require('playwright-core');
 const { createHash, randomBytes } = require('node:crypto');
-const { rmSync } = require('node:fs');
+const { rmSync, constants: fsConstants } = require('node:fs');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -166,6 +166,13 @@ function checkpointProfile() {
       const file = await fs.open(temporary, 'wx', 0o600);
       try { await file.writeFile(bytes); await file.sync(); } finally { await file.close(); }
       await fs.rename(temporary, target);
+      if (process.platform !== 'win32') {
+        // The renamed cookie checkpoint must survive alongside its directory
+        // entry before a successful logout reply or in-memory cache advance.
+        const directory = await fs.open(profileDirectory,
+          fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+        try { await directory.sync(); } finally { await directory.close(); }
+      }
       profileCookieState = bytes;
     } finally {
       await fs.rm(temporary, { force: true }).catch(() => {});
