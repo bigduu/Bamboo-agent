@@ -1,8 +1,7 @@
-//! OS-native desktop notification sink (`notify-rust`).
+//! OS-native desktop notification sink.
 //!
-//! Delivery is best-effort: `notify_rust::Notification::show` is a
-//! synchronous, potentially-blocking call (it drives D-Bus/mac APIs
-//! internally), so it always runs on `spawn_blocking`, and every failure is
+//! Delivery is best-effort: the synchronous notification call drives D-Bus
+//! or native macOS/Windows APIs, so it always runs on `spawn_blocking`, and every failure is
 //! logged and swallowed — a missing D-Bus session (headless Linux) or a
 //! transient mac API error must never break a run.
 
@@ -71,15 +70,14 @@ fn ensure_mac_application_set() {
     });
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
 fn ensure_mac_application_set() {}
 
-/// Maps [`SinkNotification::priority`] to `notify_rust::Urgency` on the
-/// platforms that support it (Linux/BSD via XDG, Windows). `notify-rust`
-/// 4.18 with default features has no urgency mapping on macOS (that needs
+/// Maps [`SinkNotification::priority`] to Windows' native urgency. `notify-rust`
+/// 4.18 has no urgency mapping on macOS (that needs
 /// the `preview-macos-un` feature, which this crate doesn't enable) — a
 /// no-op there.
-#[cfg(any(all(unix, not(target_os = "macos")), target_os = "windows"))]
+#[cfg(target_os = "windows")]
 fn apply_urgency(notification: &mut notify_rust::Notification, priority: &str) {
     let urgency = if priority == "high" {
         notify_rust::Urgency::Critical
@@ -89,7 +87,7 @@ fn apply_urgency(notification: &mut notify_rust::Notification, priority: &str) {
     notification.urgency(urgency);
 }
 
-#[cfg(not(any(all(unix, not(target_os = "macos")), target_os = "windows")))]
+#[cfg(target_os = "macos")]
 fn apply_urgency(_notification: &mut notify_rust::Notification, _priority: &str) {}
 
 /// Rate-limits the failure log: the first failure in this process's lifetime
@@ -98,7 +96,7 @@ fn apply_urgency(_notification: &mut notify_rust::Notification, _priority: &str)
 /// would otherwise warn on every single notification, forever).
 static WARNED_ONCE: AtomicBool = AtomicBool::new(false);
 
-fn log_failure(error: &notify_rust::error::Error) {
+fn log_failure(error: &impl std::fmt::Display) {
     if !WARNED_ONCE.swap(true, Ordering::Relaxed) {
         tracing::warn!(
             %error,
@@ -111,12 +109,90 @@ fn log_failure(error: &notify_rust::error::Error) {
 
 /// The synchronous `notify-rust` call, factored out so the gating/mapping
 /// logic above can be unit-tested without ever firing a real OS notification.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn fire_desktop_notification(title: &str, body: &str, priority: &str) {
     ensure_mac_application_set();
     let mut notification = notify_rust::Notification::new();
     notification.summary(title).body(body);
     apply_urgency(&mut notification, priority);
     if let Err(error) = notification.show() {
+        log_failure(&error);
+    }
+}
+
+#[cfg(all(unix, any(not(target_os = "macos"), test)))]
+type XdgNotifyPayload<'a> = (
+    String,
+    u32,
+    &'static str,
+    &'a str,
+    &'a str,
+    Vec<String>,
+    std::collections::HashMap<&'static str, zbus::Variant<'static>>,
+    i32,
+);
+
+/// Preserve notify-rust's existing XDG Notify fields while using maintained
+/// zbus 6 wire types. No actions, icon, replacement ID or custom timeout were
+/// configured by this sink; only high priority maps to critical urgency.
+#[cfg(all(unix, any(not(target_os = "macos"), test)))]
+fn xdg_notify_payload<'a>(
+    app_name: String,
+    title: &'a str,
+    body: &'a str,
+    priority: &str,
+) -> XdgNotifyPayload<'a> {
+    (
+        app_name,
+        0,
+        "",
+        title,
+        body,
+        Vec::new(),
+        std::collections::HashMap::from([(
+            "urgency",
+            zbus::Variant::U8(if priority == "high" { 2 } else { 1 }),
+        )]),
+        -1,
+    )
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn show_xdg_notification(title: &str, body: &str, priority: &str) -> zbus::Result<()> {
+    // Match notify-rust's executable basename, independently of argv[0].
+    let executable = std::env::current_exe()?;
+    let app_name = executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "desktop notification executable has no UTF-8 basename",
+            )
+        })?
+        .to_owned();
+    let payload = xdg_notify_payload(app_name, title, body, priority);
+    zbus::block_on(async {
+        let connection = zbus::Connection::session().await?;
+        let reply = connection
+            .call_method(
+                Some("org.freedesktop.Notifications"),
+                "/org/freedesktop/Notifications",
+                Some("org.freedesktop.Notifications"),
+                "Notify",
+                &payload,
+            )
+            .await?;
+        // The previous sink also required an unsigned notification ID and
+        // immediately dropped its handle, leaving the desktop's timeout intact.
+        let _notification_id: u32 = reply.body().deserialize()?;
+        Ok(())
+    })
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn fire_desktop_notification(title: &str, body: &str, priority: &str) {
+    if let Err(error) = show_xdg_notification(title, body, priority) {
         log_failure(&error);
     }
 }
@@ -134,7 +210,7 @@ impl NotificationSink for DesktopSink {
         let body = n.body.clone();
         let priority = n.priority.clone();
         tokio::spawn(async move {
-            // `Notification::show()` blocks the calling thread (it drives
+            // The notification call blocks the calling thread (it drives
             // D-Bus/mac APIs synchronously internally) — never call it
             // directly on a tokio worker thread.
             if let Err(error) = tokio::task::spawn_blocking(move || {
@@ -184,5 +260,38 @@ mod tests {
         assert!(!suppressed_by_watcher("subagent_completed", true));
         assert!(!suppressed_by_watcher("background_task_completed", true));
         assert!(!suppressed_by_watcher("custom", true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_notify_wire_preserves_original_desktop_contract() {
+        type DecodedPayload = (
+            String,
+            u32,
+            String,
+            String,
+            String,
+            Vec<String>,
+            std::collections::HashMap<String, zbus::OwnedVariant>,
+            i32,
+        );
+        for (priority, urgency) in [("high", 2), ("normal", 1), ("low", 1), ("HIGH", 1), ("", 1)] {
+            let payload = xdg_notify_payload("bamboo".into(), "任务完成", "body\n<text>", priority);
+            use zbus::DynamicType;
+            let context = zbus::wire::serialized::Context::new(zbus::wire::LE, 0);
+            let encoded = zbus::wire::to_bytes(context, &payload).unwrap();
+            assert_eq!(payload.signature().to_string_no_parens(), "susssasa{sv}i");
+            let (decoded, consumed): (DecodedPayload, usize) = encoded.deserialize().unwrap();
+            assert_eq!(consumed, encoded.bytes().len());
+            assert_eq!(decoded.0, "bamboo");
+            assert_eq!(decoded.1, 0);
+            assert!(decoded.2.is_empty());
+            assert_eq!(decoded.3, "任务完成");
+            assert_eq!(decoded.4, "body\n<text>");
+            assert!(decoded.5.is_empty());
+            assert_eq!(decoded.6.len(), 1);
+            assert_eq!(u8::try_from(&decoded.6["urgency"]).unwrap(), urgency);
+            assert_eq!(decoded.7, -1);
+        }
     }
 }

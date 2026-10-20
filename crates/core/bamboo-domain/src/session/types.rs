@@ -483,6 +483,8 @@ pub enum CompressionTriggerType {
 pub enum CompressionEventKind {
     #[default]
     Summary,
+    /// Only user/assistant message text was summarized; tool context was archived.
+    MessageSummary,
     RetrievalWindow,
 }
 
@@ -747,6 +749,14 @@ pub struct PromptSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
+    /// Behavior contract selected at creation. Missing is supported legacy data,
+    /// never an automatic upgrade or a permission grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_version: Option<u32>,
+    /// Storage-only observation; Main remains the canonical behavior stamp.
+    /// Retaining a conflicting sidecar version prevents a silent downgrade.
+    #[serde(skip)]
+    pub observed_runtime_session_version: Option<Option<u32>>,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -788,6 +798,10 @@ pub struct Session {
     pub supervisor_management: Option<SupervisorManagementState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// Exact direct-parent birth captured at creation, never inferred on activation.
+    /// Legacy / ID-only children lack this proof; Roots leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_created_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub root_session_id: String,
     #[serde(default)]
@@ -914,6 +928,8 @@ impl Session {
         let id = id.into();
         Self {
             id: id.clone(),
+            session_version: Some(super::compatibility::CURRENT_SESSION_VERSION),
+            observed_runtime_session_version: None,
             title: "New Session".to_string(),
             pinned: false,
             title_version: 0,
@@ -927,6 +943,7 @@ impl Session {
             authority_identity: SessionAuthorityIdentity::Ordinary,
             supervisor_management: None,
             parent_session_id: None,
+            parent_created_at: None,
             root_session_id: id,
             spawn_depth: 0,
             messages: Vec::new(),
@@ -984,14 +1001,16 @@ impl Session {
         model: impl Into<String>,
         title: impl Into<String>,
     ) -> Self {
-        Self::new_child_inner(
+        let mut child = Self::new_child_inner(
             id,
             parent.id.clone(),
             parent.root_session_id.clone(),
             parent.spawn_depth.saturating_add(1),
             model,
             title,
-        )
+        );
+        child.parent_created_at = Some(parent.created_at);
+        child
     }
 
     fn new_child_inner(
@@ -1006,6 +1025,8 @@ impl Session {
         let id = id.into();
         Self {
             id: id.clone(),
+            session_version: Some(super::compatibility::CURRENT_SESSION_VERSION),
+            observed_runtime_session_version: None,
             title: title.into(),
             pinned: false,
             title_version: 0,
@@ -1019,6 +1040,7 @@ impl Session {
             authority_identity: SessionAuthorityIdentity::Ordinary,
             supervisor_management: None,
             parent_session_id: Some(parent_session_id),
+            parent_created_at: None,
             root_session_id,
             spawn_depth,
             messages: Vec::new(),
@@ -2028,6 +2050,16 @@ mod tests {
     /// #520: the reasoning signature round-trips through serde and stays
     /// absent from the wire when unset (so pre-existing session files and
     /// consumers are untouched).
+    #[test]
+    fn message_summary_compression_kind_has_a_distinct_durable_discriminator() {
+        let value = serde_json::to_value(CompressionEventKind::MessageSummary).unwrap();
+        assert_eq!(value, serde_json::json!("message_summary"));
+        assert_eq!(
+            serde_json::from_value::<CompressionEventKind>(value).unwrap(),
+            CompressionEventKind::MessageSummary
+        );
+    }
+
     #[test]
     fn reasoning_signature_serde_round_trip_and_backward_compat() {
         let signed =

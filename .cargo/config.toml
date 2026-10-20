@@ -16,7 +16,17 @@ debug = "line-tables-only"
 opt-level = 0
 debug = false
 
+# The server's monolithic lib-test needs more headroom below macOS's 16MiB
+# DWARF unwind-offset limit. Keep size optimization local to this crate.
+[profile.dev.package.bamboo-server]
+opt-level = "z"
+
 # Keep the full test suite's fast, unoptimized builds. The macOS link guard
 # explicitly selects the development profile to verify its unwind tables.
 [profile.test]
+opt-level = 0
+
+# Package overrides are inherited from dev and take precedence over the test
+# profile's opt-level, so explicitly retain unoptimized ordinary server tests.
+[profile.test.package.bamboo-server]
 opt-level = 0

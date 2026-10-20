@@ -14,11 +14,14 @@
 pub mod agent;
 
 // Mirror the public facade re-exports the root crate previously exposed.
-pub use agent::ExecuteRequestBuilder;
+pub use agent::{
+    inspect_loop, CountedLoopConfig, ExecuteRequestBuilder, LoopControlConfig, LoopControlReceipt,
+    LoopStatusSnapshot,
+};
 pub use agent::{
     Agent, AgentBuilder, AgentHook, AgentHookPoint, HookPayload, HookResult, HookRunner,
     HookToolOutcome, LifecycleHookEvent, LifecycleHookTestOutput, LifecycleScriptRunner,
-    PermissionMode, RuntimeAgent, RuntimeAgentBuilder, ScriptHook, SdkError,
+    PermissionMode, RuntimeAgent, RuntimeAgentBuilder, ScriptHook, SdkError, SdkSkillInput,
     SessionActivationDisposition, SessionActivationError, SessionActivationLaunch,
     SessionActivationPolicy, SessionActivationPort, SessionActivationReserveOutcome,
     SessionActivationRouter, SessionActivationSpawner, SessionChildOutcome, SessionInboxBacklog,

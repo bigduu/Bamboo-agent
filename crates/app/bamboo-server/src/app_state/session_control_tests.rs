@@ -287,13 +287,13 @@ impl Fixture {
             tool_type: "function".into(),
             function: FunctionCall {
                 name: if permission {
-                    "Bash"
+                    "exec_command"
                 } else {
                     "fixture_clarification"
                 }
                 .into(),
                 arguments: if permission {
-                    json!({"command":"echo followup-permission-probe"})
+                    json!({"cmd":"echo followup-permission-probe"})
                 } else {
                     json!({"question":"Which original option?", "options":["A","B"]})
                 }
@@ -336,6 +336,61 @@ impl Fixture {
             .unwrap_or_else(|| self.state.tools_for(ToolSurface::Root))
             .execute_with_context_outcome(&call, ctx)
             .await
+    }
+
+    async fn model_followup(&self, operation: &str, ultra: bool) -> String {
+        let mut supervisor = self
+            .state
+            .storage
+            .load_session(&self.reference.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let workspace = self._home.path().join("supervisor-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        supervisor.set_workspace_path_meta(workspace.to_string_lossy());
+        self.state.storage.save_session(&supervisor).await.unwrap();
+        *self.probe.next.lock().unwrap() = Some(ToolCall {
+            id: operation.into(), tool_type: "function".into(),
+            function: FunctionCall {
+                name: "session_control".into(),
+                arguments: json!({"action":"followup", "target_session_id":TARGET, "operation_id":operation, "message":STEER}).to_string(),
+            },
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        self.state
+            .agent
+            .execute_direct(
+                &mut supervisor,
+                bamboo_engine::ExecuteRequestBuilder::new(
+                    "Continue the explicitly attached Root",
+                    tx,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .tools(self.state.tools_for(ToolSurface::Root))
+                .provider_override(self.probe.clone())
+                .model("supervisor-model")
+                .build(),
+            )
+            .await
+            .unwrap();
+        drain.await.unwrap();
+        let durable = self
+            .state
+            .storage
+            .load_session(&self.reference.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        durable
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(operation))
+            .expect("actual native model dispatch must commit a tool result")
+            .content
+            .clone()
     }
 
     async fn followup(&self, operation: &str, message: &str) -> Value {
@@ -476,6 +531,83 @@ impl Fixture {
                 && messages
                     .iter()
                     .any(|message| message.content.contains("original target context marker"))));
+    }
+}
+
+#[actix_web::test]
+async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_detached_target() {
+    for ultra in [false, true] {
+        let f = Box::pin(Fixture::new()).await;
+        let content = Box::pin(f.model_followup("native-attached-followup", ultra)).await;
+        let receipt: Value = serde_json::from_str(&content).expect(&content);
+        assert_eq!(receipt["admitted"], true);
+        f.settled(3).await;
+        let after = f.reload().await;
+        assert_eq!(after.project_id_meta(), f.original.project_id_meta());
+        assert_eq!(
+            after.workspace_path_meta(),
+            f.original.workspace_path_meta()
+        );
+        assert_eq!(after.model, f.original.model);
+        assert_eq!(
+            after.metadata.get("provider"),
+            f.original.metadata.get("provider")
+        );
+        for original in &f.original.messages {
+            assert!(after
+                .messages
+                .iter()
+                .any(|message| message.id == original.id && message.content == original.content));
+        }
+        assert_eq!(
+            after
+                .messages
+                .iter()
+                .filter(|message| message.content == STEER)
+                .count(),
+            1
+        );
+        let before = f.state.session_inbox.inspect(TARGET).await.unwrap();
+        let target_calls = f
+            .probe
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(model, _)| model == "original-target-model")
+            .count();
+        let service = SupervisorSessionService::new(f.state.session_store.clone());
+        let scope = service.inspect_scope(&f.reference).await.unwrap();
+        service
+            .detach(&f.reference, scope.state_revision, TARGET)
+            .await
+            .unwrap();
+        let denied = Box::pin(f.model_followup("native-detached-followup", ultra)).await;
+        assert!(serde_json::from_str::<Value>(&denied).is_err(), "{denied}");
+        assert_eq!(
+            f.state
+                .session_inbox
+                .inspect(TARGET)
+                .await
+                .unwrap()
+                .generation,
+            before.generation
+        );
+        assert_eq!(
+            f.probe
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(model, _)| model == "original-target-model")
+                .count(),
+            target_calls
+        );
+        assert_eq!(
+            serde_json::to_value(&f.reload().await.messages).unwrap(),
+            serde_json::to_value(&after.messages).unwrap()
+        );
+        f.state.shutdown().await;
     }
 }
 

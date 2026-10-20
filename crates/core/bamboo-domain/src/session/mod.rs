@@ -5,11 +5,13 @@ pub mod actor_snapshot;
 pub mod admission;
 pub mod authority;
 pub mod budget_types;
+pub mod compatibility;
 pub mod composition;
 pub mod context_block;
 pub mod hook_types;
 pub mod host_registry;
 pub mod inbox;
+pub mod loop_control_request;
 pub mod message_part;
 pub mod model_context;
 pub mod parent_question;
@@ -24,6 +26,7 @@ pub mod root_mode_transition;
 pub mod runtime_metadata;
 pub mod runtime_metadata_access;
 pub mod runtime_state;
+pub mod scoped_loop_control;
 pub mod supervisor_management;
 pub mod task;
 pub mod tool_authority;
@@ -38,11 +41,13 @@ pub use authority::*;
 pub use budget_types::{
     BudgetStrategy, ProviderPromptUsage, TokenBudget, TokenBudgetUsage, TokenUsageBreakdown,
 };
+pub use compatibility::*;
 pub use composition::*;
 pub use context_block::*;
 pub use hook_types::*;
 pub use host_registry::*;
 pub use inbox::*;
+pub use loop_control_request::{parse_loop_control_request, LoopControlRequest};
 pub use message_part::{ImageUrlRef, MessagePart};
 pub use model_context::*;
 pub use parent_question::*;
@@ -56,8 +61,12 @@ pub use response_control::*;
 pub use root_mode_transition::*;
 pub use runtime_metadata::SessionRuntimeMetadata;
 pub use runtime_state::*;
+pub use scoped_loop_control::*;
 pub use supervisor_management::*;
 pub use task::*;
 pub use tool_authority::*;
 pub use tool_types::{FunctionCall, ToolCall};
 pub use types::*;
+
+#[cfg(test)]
+mod compatibility_boundary_tests;

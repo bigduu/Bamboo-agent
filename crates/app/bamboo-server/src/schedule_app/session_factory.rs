@@ -41,7 +41,19 @@ pub fn create_schedule_session(
     );
 
     let mut session = Session::new(session_id.clone(), model.to_string());
-    apply_unattended_permission_posture(&mut session);
+    if job.run_config.workflow_target.is_some() {
+        // Readonly Workflow admission needs no Auto/bypass permission request.
+        session
+            .agent_runtime_state
+            .get_or_insert_default()
+            .no_human_approver = true;
+        session.metadata.insert(
+            bamboo_skills::WORKFLOW_ORCHESTRATION_OPT_IN_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    } else {
+        apply_unattended_permission_posture(&mut session);
+    }
     session.metadata.insert(
         bamboo_engine::session_app::chat::SESSION_START_SOURCE_METADATA_KEY.to_string(),
         "startup".to_string(),
@@ -297,5 +309,48 @@ mod tests {
         assert!(workspace_context.contains(relocated.to_string_lossy().as_ref()));
         assert!(workspace_context.contains("Workspace source: explicit"));
         assert!(workspace_context.contains("Binding status: unregistered"));
+    }
+}
+
+#[cfg(test)]
+mod workflow_session_tests {
+    use super::*;
+
+    #[test]
+    fn workflow_schedule_opts_in_without_auto_or_bypass_permission() {
+        let config: bamboo_domain::ScheduleRunConfig = serde_json::from_value(serde_json::json!({
+            "auto_execute":true,"workflow_target":{"workflow_id":"read-once","revision":1,"args":{}}
+        }))
+        .unwrap();
+        let job = ScheduleRunJob {
+            run_id: "occurrence".into(),
+            schedule_id: "schedule".into(),
+            schedule_name: "read".into(),
+            run_config: config,
+            scheduled_for: chrono::Utc::now(),
+            claimed_at: chrono::Utc::now(),
+            was_catch_up: false,
+        };
+        let session = create_schedule_session(
+            &job,
+            "model",
+            "system",
+            "base",
+            None,
+            None,
+            &bamboo_agent_core::workspace_state::WorkspaceResolver::from_process_globals(),
+        );
+        let runtime = session.agent_runtime_state.as_ref().unwrap();
+        assert_eq!(runtime.permission_mode, SessionPermissionMode::Default);
+        assert!(!runtime.bypass_permissions);
+        assert!(runtime.no_human_approver);
+        assert_eq!(
+            session.metadata[bamboo_skills::WORKFLOW_ORCHESTRATION_OPT_IN_METADATA_KEY],
+            "true"
+        );
+        assert!(session
+            .messages
+            .iter()
+            .all(|message| message.role != bamboo_domain::Role::User));
     }
 }

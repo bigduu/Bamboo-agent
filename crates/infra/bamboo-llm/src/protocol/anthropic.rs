@@ -2,6 +2,7 @@
 
 use crate::protocol::{FromProvider, ProtocolError, ProtocolResult, ToProvider};
 use crate::providers::anthropic::api_types::*;
+use crate::providers::common::log_identity;
 use bamboo_domain::{FunctionSchema, ToolSchema};
 use bamboo_domain::{Message, Role};
 use serde_json::Value;
@@ -70,21 +71,6 @@ impl FromProvider<AnthropicTool> for ToolSchema {
 pub struct AnthropicRequest {
     pub system: Option<String>,
     pub messages: Vec<AnthropicMessage>,
-}
-
-fn preview_for_log(value: &str, max_chars: usize) -> String {
-    let mut iter = value.chars();
-    let mut preview = String::new();
-    for _ in 0..max_chars {
-        match iter.next() {
-            Some(ch) => preview.push(ch),
-            None => break,
-        }
-    }
-    if iter.next().is_some() {
-        preview.push_str("...");
-    }
-    preview.replace('\n', "\\n").replace('\r', "\\r")
 }
 
 impl ToProvider<AnthropicRequest> for Vec<Message> {
@@ -164,12 +150,11 @@ impl ToProvider<AnthropicMessage> for Message {
                             Ok(parsed) => parsed,
                             Err(error) => {
                                 tracing::warn!(
-                                    "Anthropic protocol conversion fallback to string input due to invalid JSON arguments: tool_call_id={}, tool_name={}, args_len={}, args_preview=\"{}\", error={}",
-                                    tc.id,
-                                    tc.function.name,
+                                    "Anthropic protocol conversion fallback to string input due to invalid JSON arguments: tool_call_hash={}, tool_name_hash={}, args_len={}, error_kind={:?}",
+                                    log_identity(&tc.id),
+                                    log_identity(&tc.function.name),
                                     raw_arguments.len(),
-                                    preview_for_log(raw_arguments, 180),
-                                    error
+                                    error.classify()
                                 );
                                 Value::String(tc.function.arguments.clone())
                             }

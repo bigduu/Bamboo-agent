@@ -45,21 +45,32 @@ fn request_tool_schemas_for_loading_mode<'a>(
     mode: bamboo_domain::CapabilityLoadingMode,
     required_tool: Option<&str>,
 ) -> Cow<'a, [ToolSchema]> {
-    if session.root_orchestration_only_enabled() {
-        // The full bounded catalog is already selected for this Root. A
-        // provider-specific discovery gateway must not reintroduce an
-        // unapproved tenth tool after that selection.
-        return Cow::Owned(
-            tool_schemas
-                .iter()
-                .filter(|schema| {
-                    bamboo_domain::ClassifiedToolSchema::new((**schema).clone()).is_some_and(
-                        |entry| session.allows_model_tool_execution(entry.execution_name()),
-                    )
+    if session.model_orchestration_only_enabled() {
+        // Preserve exact model authority in every provider projection. The
+        // trusted Supervisor may use the existing read-only loading gateway
+        // to discover only its bounded orchestration catalog.
+        let mut bounded = tool_schemas
+            .iter()
+            .filter(|schema| {
+                bamboo_domain::ClassifiedToolSchema::new((**schema).clone()).is_some_and(|entry| {
+                    session.allows_model_tool_execution(entry.execution_name())
                 })
-                .cloned()
-                .collect(),
-        );
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if session.supervisor_incarnation_id().is_some()
+            && mode == bamboo_domain::CapabilityLoadingMode::StickyFallback
+        {
+            // The existing read-only control gateway loads only this bounded
+            // catalog. Never force a named delegation tool or expose a shell.
+            bounded.retain(|schema| {
+                bamboo_domain::ClassifiedToolSchema::new(schema.clone()).is_some_and(|entry| {
+                    entry.loading_class() == bamboo_domain::CapabilityLoadingClass::Core
+                })
+            });
+            bounded.push(bamboo_domain::discovery_control_fallback_schema());
+        }
+        return Cow::Owned(bounded);
     }
     if mode == bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog {
         // Legacy providers keep every other Deferred function unchanged. Only
@@ -126,6 +137,31 @@ pub(crate) async fn request_tool_schemas_for_session<'a>(
     )
 }
 
+/// Keep the complete approved Supervisor catalog for host observations and
+/// validated loading state. Its provider wire projection is applied later,
+/// identically for footprint measurement and actual dispatch.
+pub(crate) async fn context_tool_schemas_for_session<'a>(
+    session: &Session,
+    llm: &Arc<dyn LLMProvider>,
+    model_name: &str,
+    tool_schemas: &'a [ToolSchema],
+) -> Cow<'a, [ToolSchema]> {
+    if session.supervisor_incarnation_id().is_some() {
+        return Cow::Owned(
+            tool_schemas
+                .iter()
+                .filter(|schema| {
+                    bamboo_domain::ClassifiedToolSchema::new((**schema).clone()).is_some_and(
+                        |entry| session.allows_model_tool_execution(entry.execution_name()),
+                    )
+                })
+                .cloned()
+                .collect(),
+        );
+    }
+    request_tool_schemas_for_session(session, llm, model_name, tool_schemas).await
+}
+
 pub(crate) struct RoundLlmExecutionOutput {
     pub stream_output: StreamHandlingOutput,
     pub prompt_tokens: u64,
@@ -164,15 +200,29 @@ pub(crate) fn canonical_attempt_usage(
     estimated_prompt_tokens: u64,
     estimated_completion_tokens: u64,
 ) -> MetricsTokenUsage {
-    let prompt_tokens = stream_output
-        .provider_usage
+    canonical_token_usage(
+        stream_output.provider_usage,
+        stream_output.input_tokens,
+        stream_output.output_tokens,
+        estimated_prompt_tokens,
+        estimated_completion_tokens,
+    )
+}
+
+pub(crate) fn canonical_token_usage(
+    provider_usage: Option<crate::runtime::stream::handler::ProviderUsageSnapshot>,
+    legacy_prompt_tokens: u64,
+    legacy_completion_tokens: u64,
+    estimated_prompt_tokens: u64,
+    estimated_completion_tokens: u64,
+) -> MetricsTokenUsage {
+    let prompt_tokens = provider_usage
         .and_then(|usage| usage.input_tokens)
-        .or_else(|| (stream_output.input_tokens > 0).then_some(stream_output.input_tokens))
+        .or_else(|| (legacy_prompt_tokens > 0).then_some(legacy_prompt_tokens))
         .unwrap_or(estimated_prompt_tokens);
-    let completion_tokens = stream_output
-        .provider_usage
+    let completion_tokens = provider_usage
         .and_then(|usage| usage.output_tokens)
-        .or_else(|| (stream_output.output_tokens > 0).then_some(stream_output.output_tokens))
+        .or_else(|| (legacy_completion_tokens > 0).then_some(legacy_completion_tokens))
         .unwrap_or(estimated_completion_tokens);
 
     MetricsTokenUsage {
@@ -193,10 +243,11 @@ pub(crate) async fn execute_llm_round(
     session_id: &str,
     model_name: &str,
     tool_schemas: &[ToolSchema],
+    observation_progress_hint: Option<&str>,
     prompt_memory_exposure: Option<PromptMemoryExposureFrame<'_>>,
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
     let request_tool_schemas =
-        request_tool_schemas_for_session(session, llm, model_name, tool_schemas).await;
+        context_tool_schemas_for_session(session, llm, model_name, tool_schemas).await;
     let tool_schemas = request_tool_schemas.as_ref();
     let prepared = context_preparation::prepare_round_context(
         session,
@@ -225,6 +276,7 @@ pub(crate) async fn execute_llm_round(
         reasoning_effort: config.reasoning_effort,
         max_context_tokens: prepared.budget.max_context_tokens,
         max_output_tokens: prepared.budget.max_output_tokens,
+        observation_progress_hint,
         prompt_memory_exposure,
     };
 
@@ -395,6 +447,51 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_delegation_first_provider_projection_keeps_only_bounded_tools_and_readonly_loading(
+    ) {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        let schemas = [
+            "Read",
+            "SubAgent",
+            "session_control",
+            "session_history",
+            "browser",
+            "exec_command",
+            "discover_capabilities",
+        ]
+        .into_iter()
+        .map(schema)
+        .collect::<Vec<_>>();
+        for ultra in [false, true] {
+            supervisor.set_root_orchestration_only(ultra).unwrap();
+            for mode in [
+                CapabilityLoadingMode::LegacyFullCatalog,
+                CapabilityLoadingMode::StickyFallback,
+                CapabilityLoadingMode::Progressive,
+            ] {
+                let offered =
+                    request_tool_schemas_for_loading_mode(&supervisor, &schemas, mode, None);
+                let expected = if mode == CapabilityLoadingMode::StickyFallback {
+                    vec!["Read", "discover_capabilities"]
+                } else {
+                    vec!["Read", "SubAgent", "session_control", "session_history"]
+                };
+                assert_eq!(
+                    offered
+                        .iter()
+                        .map(|s| s.function.name.as_str())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
     fn legacy_browser_projection_is_browser_only_and_explicit_required_tool_bypasses_it() {
         let session = Session::new("legacy-browser", "chat-model");
         let mut browser = schema("browser");
@@ -491,7 +588,7 @@ mod tests {
             schema("Read"),
             schema("ReadArchive"),
             schema("Workspace"),
-            schema("Bash"),
+            schema("exec_command"),
         ];
 
         let request_tools =
@@ -502,7 +599,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.function.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Read", "Bash", "discover_capabilities"]
+            vec!["Read", "exec_command", "discover_capabilities"]
         );
         assert!(request_tools.iter().all(|tool| {
             tool.function.name != "ReadArchive" && tool.function.name != "Workspace"
@@ -527,7 +624,7 @@ mod tests {
             schema("SubAgent"),
             schema("Plan"),
             schema("Task"),
-            schema("Bash"),
+            schema("exec_command"),
             schema("discover_capabilities"),
         ];
         let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
@@ -540,6 +637,7 @@ mod tests {
             "selected-root-tools",
             "chat-model",
             &tools,
+            None,
             None,
         )
         .await
@@ -569,7 +667,7 @@ mod tests {
             schema("Read"),
             schema("ReadArchive"),
             schema("Workspace"),
-            schema("Bash"),
+            schema("exec_command"),
         ];
         let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
         let cancel = CancellationToken::new();
@@ -583,6 +681,7 @@ mod tests {
             "sticky-round-tools",
             "chat-model",
             &tools,
+            None,
             None,
         )
         .await
@@ -630,6 +729,7 @@ mod tests {
             "chat-model",
             &tools,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -646,7 +746,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.function.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Read", "Bash", "discover_capabilities"]
+            vec!["Read", "exec_command", "discover_capabilities"]
         );
         assert_eq!(
             requests[0][2].function.parameters["properties"]["query"]["maxLength"],

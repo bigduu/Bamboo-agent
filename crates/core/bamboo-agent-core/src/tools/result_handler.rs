@@ -19,7 +19,7 @@ pub enum ToolHandlingOutcome {
     WaitingForChildren,
 }
 
-fn is_waiting_for_children_control(result: &ToolResult) -> bool {
+pub fn is_waiting_for_children_control(result: &ToolResult) -> bool {
     if result.display_preference.as_deref() == Some("runtime_control:waiting_for_children") {
         return true;
     }
@@ -242,6 +242,17 @@ pub fn try_parse_agentic_result(result: &ToolResult) -> Option<AgenticToolResult
     }
 }
 
+/// True only for a successful tool result requesting a durable wait.
+/// This is a pure classifier; it changes neither state nor authority.
+pub fn tool_result_requires_suspension(result: &ToolResult) -> bool {
+    result.success
+        && (is_waiting_for_children_control(result)
+            || matches!(
+                try_parse_agentic_result(result),
+                Some(AgenticToolResult::NeedClarification { .. })
+            ))
+}
+
 pub async fn handle_tool_result_with_agentic_support(
     result: &ToolResult,
     tool_call: &ToolCall,
@@ -264,6 +275,25 @@ pub async fn handle_tool_result_with_agentic_support(
     .await
 }
 
+async fn refuse_suspension_result(
+    session: &mut Session,
+    tool_call: &ToolCall,
+    event_tx: &mpsc::Sender<AgentEvent>,
+) {
+    let error = "suspension_disabled: this execution cannot wait for a user or child".to_string();
+    session.add_message(Message::tool_result_with_status(
+        tool_call.id.clone(),
+        error.clone(),
+        false,
+    ));
+    let _ = event_tx
+        .send(AgentEvent::ToolError {
+            tool_call_id: tool_call.id.clone(),
+            error,
+        })
+        .await;
+}
+
 /// Engine integration variant that makes an agentic clarification durable
 /// before publishing `NeedClarification`. The compatibility wrapper above is
 /// retained for in-process callers without a persistence adapter.
@@ -278,14 +308,24 @@ pub async fn handle_tool_result_with_agentic_support_and_persistence(
     composition_executor: Option<Arc<CompositionExecutor>>,
     clarification_persistence: Option<&Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
 ) -> ToolHandlingOutcome {
-    let should_wait_for_children = is_waiting_for_children_control(result);
+    if !crate::tools::suspension_allowed() && tool_result_requires_suspension(result) {
+        refuse_suspension_result(session, tool_call, event_tx).await;
+        return ToolHandlingOutcome::Continue;
+    }
+    let should_wait_for_children = is_waiting_for_children_control(result)
+        && (result.success || crate::tools::suspension_allowed());
     if should_wait_for_children {
         session.metadata.insert(
             "runtime.suspend_reason".to_string(),
             "waiting_for_children".to_string(),
         );
     }
-    let Some(agentic_result) = try_parse_agentic_result(result) else {
+    let parsed = if !crate::tools::suspension_allowed() && !result.success {
+        None
+    } else {
+        try_parse_agentic_result(result)
+    };
+    let Some(agentic_result) = parsed else {
         // Image-producing tools (e.g. MCP `screenshot`) carry the picture in
         // `images`; route those into content_parts so the model actually sees
         // them. Text-only results keep the original (cheaper) path.
@@ -491,6 +531,9 @@ async fn execute_sub_actions_with_persistence(
     let available_tools = tools.list_tools();
 
     while let Some(action) = pending.pop_front() {
+        if crate::tools::suspension_running_violated() {
+            break;
+        }
         if processed >= MAX_SUB_ACTIONS {
             let error = format!("Reached max sub-action limit ({MAX_SUB_ACTIONS})");
             let _ = event_tx
@@ -508,6 +551,41 @@ async fn execute_sub_actions_with_persistence(
         }
 
         processed += 1;
+
+        // Agentic results may enqueue further model actions. Apply the same
+        // exact authority as the outer catalog before ToolStart and pin that
+        // owner through dispatch; a composition or alias must not reselect it.
+        let execution_name = if session.model_orchestration_only_enabled() {
+            let selected = tools.resolve_reference_for_session(session, &action.function.name);
+            if selected
+                .as_deref()
+                .is_none_or(|name| !session.allows_model_tool_execution(name))
+            {
+                let error = if executing_supervisor.is_some() {
+                    format!("supervisor_delegation_required: {} is outside Supervisor orchestration authority; delegate to an authorized worker or report the recoverable blocker", action.function.name)
+                } else {
+                    format!(
+                        "Tool '{}' is outside orchestration-only Root authority",
+                        action.function.name
+                    )
+                };
+                let _ = event_tx
+                    .send(AgentEvent::ToolError {
+                        tool_call_id: action.id.clone(),
+                        error: error.clone(),
+                    })
+                    .await;
+                session.add_message(Message::tool_result_with_status(
+                    action.id.clone(),
+                    error,
+                    false,
+                ));
+                continue;
+            }
+            selected
+        } else {
+            None
+        };
 
         if session_flags.plan_read_only && !plan_mode_allows_tool(&action.function.name) {
             let error = format!(
@@ -570,13 +648,55 @@ async fn execute_sub_actions_with_persistence(
         )
         .with_executing_supervisor(executing_supervisor);
 
-        match super::context::with_root_actor_tool_writer(
-            None,
-            execute_tool_call_with_context(&action, tools, composition_executor.clone(), tool_ctx),
-        )
+        match super::context::with_root_actor_tool_writer(None, async {
+            if let Some(execution_name) = execution_name.as_deref() {
+                tools
+                    .execute_exact_with_context_outcome(&action, execution_name, tool_ctx)
+                    .await
+                    .map(crate::tools::ToolOutcome::into_tool_result)
+            } else if crate::tools::capture_suspension_restriction().is_some() {
+                crate::tools::executor::execute_tool_call_with_context_outcome(
+                    &action,
+                    tools,
+                    composition_executor.clone(),
+                    tool_ctx,
+                )
+                .await
+                .map(crate::tools::ToolOutcome::into_tool_result)
+            } else {
+                execute_tool_call_with_context(
+                    &action,
+                    tools,
+                    composition_executor.clone(),
+                    tool_ctx,
+                )
+                .await
+            }
+        })
         .await
         {
             Ok(result) => {
+                if crate::tools::suspension_running_violated() {
+                    let error =
+                        "suspension_disabled: detached Running outcome refused; stop unconfirmed"
+                            .to_string();
+                    session.add_message(Message::tool_result_with_status(
+                        action.id.clone(),
+                        error.clone(),
+                        false,
+                    ));
+                    let _ = event_tx
+                        .send(AgentEvent::ToolError {
+                            tool_call_id: action.id.clone(),
+                            error,
+                        })
+                        .await;
+                    break;
+                }
+                if !crate::tools::suspension_allowed() && tool_result_requires_suspension(&result) {
+                    refuse_suspension_result(session, &action, event_tx).await;
+                    continue;
+                }
                 let _ = event_tx
                     .send(AgentEvent::ToolComplete {
                         tool_call_id: action.id.clone(),
@@ -584,7 +704,12 @@ async fn execute_sub_actions_with_persistence(
                     })
                     .await;
 
-                match try_parse_agentic_result(&result) {
+                let parsed = if !crate::tools::suspension_allowed() && !result.success {
+                    None
+                } else {
+                    try_parse_agentic_result(&result)
+                };
+                match parsed {
                     Some(AgenticToolResult::Success { result }) => {
                         session.add_message(Message::tool_result(action.id.clone(), result));
                     }
@@ -650,6 +775,9 @@ async fn execute_sub_actions_with_persistence(
                 ));
             }
         }
+        if crate::tools::suspension_running_violated() {
+            break;
+        }
     }
 
     ToolHandlingOutcome::Continue
@@ -662,7 +790,9 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    use crate::tools::{FunctionCall, ToolSchema};
+    use crate::tools::{
+        observed_tool_output_cap, scope_tool_output_cap, FunctionCall, ToolCtx, ToolSchema,
+    };
 
     use super::*;
 
@@ -800,6 +930,310 @@ mod tests {
                 name: name.to_string(),
                 arguments: arguments.to_string(),
             },
+        }
+    }
+
+    struct NestedOwnerRecorder {
+        installed_root: bool,
+        entered: std::sync::Mutex<Vec<(String, ToolCall, bool)>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for NestedOwnerRecorder {
+        async fn execute(&self, _call: &ToolCall) -> crate::tools::executor::Result<ToolResult> {
+            panic!("orchestration actions must retain their selected exact owner")
+        }
+
+        async fn execute_exact_with_context_outcome(
+            &self,
+            call: &ToolCall,
+            execution_name: &str,
+            ctx: ToolExecutionContext<'_>,
+        ) -> crate::tools::executor::Result<crate::tools::ToolOutcome> {
+            let original_supervisor = ctx
+                .session_id
+                .is_some_and(|id| ctx.to_tool_ctx().executing_supervisor_for(id).is_some());
+            self.entered.lock().unwrap().push((
+                execution_name.to_string(),
+                call.clone(),
+                original_supervisor,
+            ));
+            Ok(crate::tools::ToolOutcome::Completed(ToolResult::text(
+                true,
+                "selected-owner-completed",
+            )))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            ["SubAgent", "spawn_session"]
+                .into_iter()
+                .filter(|name| *name != "spawn_session" || self.installed_root)
+                .map(|name| ToolSchema {
+                    schema_type: "function".into(),
+                    function: crate::tools::FunctionSchema {
+                        name: name.into(),
+                        description: "installed owner probe".into(),
+                        parameters: serde_json::json!({"type":"object"}),
+                    },
+                })
+                .collect()
+        }
+    }
+
+    fn nested_owner_result(action: ToolCall) -> ToolResult {
+        ToolResult::text(
+            true,
+            serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                actions: vec![action],
+                reason: "explicit additional action".into(),
+            })
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn versioned_nested_spawn_uses_session_owner_and_preserves_legacy_aliases() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for version in [None, Some(1), Some(2)] {
+            for ultra in [false, true] {
+                for reference in [
+                    "spawn_session",
+                    "spawnSession",
+                    "default::spawn_session",
+                    "default::spawnSession",
+                ] {
+                    let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+                    session.session_version = version;
+                    session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                        incarnation_id: uuid::Uuid::new_v4(),
+                    };
+                    session.set_root_orchestration_only(ultra).unwrap();
+                    let action = make_tool_call(
+                        "nested-original",
+                        reference,
+                        r#"{"message":"explicit nested input","keep":{"original":true}}"#,
+                    );
+                    let original = action.clone();
+                    let tools = NestedOwnerRecorder {
+                        installed_root: version == Some(2),
+                        entered: Default::default(),
+                    };
+                    let flags = ToolExecutionSessionFlags::from_session(&session);
+                    let (tx, mut rx) = mpsc::channel(16);
+                    let outcome = handle_tool_result_with_agentic_support(
+                        &nested_owner_result(action),
+                        &make_tool_call("parent", "Read", "{}"),
+                        &tx,
+                        &mut session,
+                        &tools,
+                        flags,
+                        None,
+                    )
+                    .await;
+                    assert_eq!(outcome, ToolHandlingOutcome::Continue);
+                    let expected = if version == Some(2) {
+                        "spawn_session"
+                    } else {
+                        "SubAgent"
+                    };
+                    assert_eq!(
+                        *tools.entered.lock().unwrap(),
+                        vec![(expected.into(), original.clone(), true)],
+                        "version={version:?} ultra={ultra} reference={reference}"
+                    );
+                    assert!(session
+                        .messages
+                        .iter()
+                        .any(
+                            |message| message.tool_call_id.as_deref() == Some("nested-original")
+                                && message.tool_success == Some(true)
+                                && message.content == "selected-owner-completed"
+                        ));
+                    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|e| matches!(e, AgentEvent::ToolStart { .. }))
+                            .count(),
+                        1
+                    );
+                    assert!(!events
+                        .iter()
+                        .any(|e| matches!(e, AgentEvent::ToolError { .. })));
+                    assert_eq!(original.function.name, reference);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn versioned_nested_spawn_missing_owner_or_ordinary_ultra_refuses_without_child_fallback()
+    {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for (supervisor, ultra, installed_root) in [
+            (true, false, false),
+            (true, true, false),
+            (false, true, true),
+        ] {
+            for reference in [
+                "spawn_session",
+                "spawnSession",
+                "default::spawn_session",
+                "default::spawnSession",
+            ] {
+                let mut session = Session::new(
+                    if supervisor {
+                        DEFAULT_SUPERVISOR_SESSION_ID
+                    } else {
+                        "ordinary-root"
+                    },
+                    "model",
+                );
+                session.session_version = Some(2);
+                if supervisor {
+                    session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                        incarnation_id: uuid::Uuid::new_v4(),
+                    };
+                }
+                session.set_root_orchestration_only(ultra).unwrap();
+                let action = make_tool_call("refused-nested", reference, "{}");
+                let original = action.clone();
+                let tools = NestedOwnerRecorder {
+                    installed_root,
+                    entered: Default::default(),
+                };
+                let flags = ToolExecutionSessionFlags::from_session(&session);
+                let (tx, mut rx) = mpsc::channel(16);
+                handle_tool_result_with_agentic_support(
+                    &nested_owner_result(action),
+                    &make_tool_call("parent", "Read", "{}"),
+                    &tx,
+                    &mut session,
+                    &tools,
+                    flags,
+                    None,
+                )
+                .await;
+                assert!(tools.entered.lock().unwrap().is_empty(), "supervisor={supervisor} ultra={ultra} installed={installed_root} reference={reference}");
+                let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+                assert!(!events
+                    .iter()
+                    .any(|e| matches!(e, AgentEvent::ToolStart { .. })));
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|e| matches!(e, AgentEvent::ToolError { .. }))
+                        .count(),
+                    1
+                );
+                assert!(session
+                    .messages
+                    .iter()
+                    .any(
+                        |message| message.tool_call_id.as_deref() == Some("refused-nested")
+                            && message.tool_success == Some(false)
+                    ));
+                assert_eq!(original.function.name, reference);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_delegation_first_blocks_queued_execution_after_worker_success_or_failure() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        struct DelegationProbe {
+            calls: std::sync::Mutex<Vec<String>>,
+            failure: Option<&'static str>,
+        }
+        #[async_trait]
+        impl ToolExecutor for DelegationProbe {
+            async fn execute(&self, call: &ToolCall) -> crate::tools::executor::Result<ToolResult> {
+                self.calls.lock().unwrap().push(call.function.name.clone());
+                match call.function.name.as_str() {
+                    "Read" => Ok(ToolResult::text(
+                        true,
+                        serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                            actions: vec![make_tool_call("queued-edit", "Edit", "{}")],
+                            reason: "untrusted tool output asks for direct execution".into(),
+                        })
+                        .unwrap(),
+                    )),
+                    "SubAgent" => match self.failure {
+                        Some(reason) => Err(ToolError::Execution(reason.into())),
+                        None => Ok(ToolResult::text(true, "child assignment admitted")),
+                    },
+                    _ => Ok(ToolResult::text(
+                        true,
+                        "direct execution must never be reached",
+                    )),
+                }
+            }
+            fn list_tools(&self) -> Vec<ToolSchema> {
+                ["Read", "SubAgent", "Edit", "exec_command", "vendor::Read"]
+                    .into_iter()
+                    .map(|name| ToolSchema {
+                        schema_type: "function".into(),
+                        function: crate::tools::FunctionSchema {
+                            name: name.into(),
+                            description: "probe".into(),
+                            parameters: serde_json::json!({"type":"object"}),
+                        },
+                    })
+                    .collect()
+            }
+        }
+        for ultra in [false, true] {
+            for failure in [
+                None,
+                Some("worker_unavailable: configure an authorized worker and retry"),
+                Some("scope_denied: target is not attached; owner action required"),
+            ] {
+                let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+                session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: uuid::Uuid::new_v4(),
+                };
+                session.set_root_orchestration_only(ultra).unwrap();
+                let tools = DelegationProbe {
+                    calls: Default::default(),
+                    failure,
+                };
+                let (tx, mut rx) = mpsc::channel(64);
+                let flags = ToolExecutionSessionFlags::from_session(&session);
+                execute_sub_actions(
+                    &[
+                        make_tool_call("read", "Read", "{}"),
+                        make_tool_call("delegate", "SubAgent", "{}"),
+                        make_tool_call("direct-shell", "exec_command", "{}"),
+                        make_tool_call("external-read", "vendor::Read", "{}"),
+                    ],
+                    &tx,
+                    &mut session,
+                    &tools,
+                    flags,
+                    None,
+                )
+                .await;
+                assert_eq!(
+                    *tools.calls.lock().unwrap(),
+                    ["Read", "SubAgent"],
+                    "ultra={ultra}, failure={failure:?}"
+                );
+                if let Some(reason) = failure {
+                    assert!(session
+                        .messages
+                        .iter()
+                        .any(|m| m.tool_call_id.as_deref() == Some("delegate")
+                            && m.tool_success == Some(false)
+                            && m.content.contains(reason)));
+                }
+                let started = std::iter::from_fn(|| rx.try_recv().ok())
+                    .filter_map(|event| match event {
+                        AgentEvent::ToolStart { tool_call_id, .. } => Some(tool_call_id),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(started, ["read", "delegate"]);
+            }
         }
     }
 
@@ -959,6 +1393,115 @@ mod tests {
 
         assert!(saw_sub_start);
         assert!(saw_sub_complete);
+    }
+
+    #[derive(Default)]
+    struct SubActionCapProbe {
+        observations: std::sync::Mutex<Vec<(String, Option<u32>)>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for SubActionCapProbe {
+        async fn execute(&self, _call: &ToolCall) -> crate::tools::executor::Result<ToolResult> {
+            panic!("nested cap probe requires the actual dispatch context")
+        }
+
+        async fn execute_with_context(
+            &self,
+            call: &ToolCall,
+            ctx: ToolExecutionContext<'_>,
+        ) -> crate::tools::executor::Result<ToolResult> {
+            let tool_ctx = ctx.to_tool_ctx();
+            assert_eq!(tool_ctx.session_id.as_deref(), Some("nested-cap"));
+            assert_eq!(tool_ctx.tool_call_id.as_ref(), call.id);
+            let before = observed_tool_output_cap(&tool_ctx);
+            tokio::task::yield_now().await;
+            assert_eq!(observed_tool_output_cap(&tool_ctx), before);
+            self.observations
+                .lock()
+                .unwrap()
+                .push((call.id.clone(), before));
+            let result = if call.id == "call_child" {
+                serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                    actions: vec![make_tool_call("call_grandchild", "nested_probe", "{}")],
+                    reason: "continue after the awaited child".into(),
+                })
+                .unwrap()
+            } else {
+                "grandchild complete".into()
+            };
+            Ok(ToolResult::text(true, result))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_new_call_sub_actions_do_not_inherit_parent_output_cap() {
+        for cap in [None, Some(0), Some(37)] {
+            let (event_tx, mut event_rx) = mpsc::channel(16);
+            let tools = SubActionCapProbe::default();
+            let mut session = Session::new("nested-cap", "test-model");
+            let parent = make_tool_call("call_parent", "parent_probe", "{}");
+            let mut parent_ctx = ToolCtx::none(parent.id.as_str());
+            parent_ctx.session_id = Some(Arc::from(session.id.as_str()));
+            let result = ToolResult::text(
+                true,
+                serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                    actions: vec![make_tool_call("call_child", "nested_probe", "{}")],
+                    reason: "start the nested queue".into(),
+                })
+                .unwrap(),
+            );
+            let outcome = scope_tool_output_cap("nested-cap", &parent.id, cap, async {
+                assert_eq!(observed_tool_output_cap(&parent_ctx), cap);
+                let outcome = handle_tool_result_with_agentic_support(
+                    &result,
+                    &parent,
+                    &event_tx,
+                    &mut session,
+                    &tools,
+                    ToolExecutionSessionFlags::default(),
+                    None,
+                )
+                .await;
+                assert_eq!(observed_tool_output_cap(&parent_ctx), cap);
+                outcome
+            })
+            .await;
+            assert_eq!(outcome, ToolHandlingOutcome::Continue);
+            assert_eq!(observed_tool_output_cap(&parent_ctx), None);
+            assert_eq!(
+                *tools.observations.lock().unwrap(),
+                vec![
+                    ("call_child".into(), None),
+                    ("call_grandchild".into(), None)
+                ]
+            );
+            let last = session.messages.last().unwrap();
+            assert_eq!(last.tool_call_id.as_deref(), Some("call_grandchild"));
+            assert_eq!(last.content, "grandchild complete");
+            let mut starts = Vec::new();
+            let mut completions = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                match event {
+                    AgentEvent::ToolStart { tool_call_id, .. } => starts.push(tool_call_id),
+                    AgentEvent::ToolComplete {
+                        tool_call_id,
+                        result,
+                    } => {
+                        assert!(result.success);
+                        completions.push(tool_call_id);
+                    }
+                    AgentEvent::ToolError { error, .. } => panic!("{error}"),
+                    _ => {}
+                }
+            }
+            assert_eq!(starts, ["call_child", "call_grandchild"]);
+            assert_eq!(completions, starts);
+        }
     }
 
     #[tokio::test]
@@ -1286,5 +1829,248 @@ mod tests {
 
         assert_eq!(parsed, serde_json::json!({}));
         assert!(warning.is_some());
+    }
+    mod suspension_contract_tests {
+        use super::*;
+        use crate::tools::with_suspension_disabled;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn question() -> ToolResult {
+            ToolResult::text(
+                true,
+                serde_json::to_string(&AgenticToolResult::NeedClarification {
+                    question: "Choose a direction".into(),
+                    options: None,
+                })
+                .unwrap(),
+            )
+        }
+        fn waiting() -> ToolResult {
+            let mut result =
+                ToolResult::text(true, "{\"runtime_control\":\"waiting_for_children\"}");
+            result.display_preference = Some("runtime_control:waiting_for_children".into());
+            result
+        }
+        struct NoClarificationSave(AtomicUsize);
+        #[async_trait]
+        impl bamboo_domain::RuntimeSessionPersistence for NoClarificationSave {
+            async fn save_runtime_session(&self, _: &mut Session) -> std::io::Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        fn assert_not_waiting(session: &Session) {
+            assert!(session.pending_question.is_none());
+            assert!(!session.metadata.contains_key("runtime.suspend_reason"));
+        }
+        fn assert_refusal_pair(session: &Session, id: &str) {
+            let pairs = session
+                .messages
+                .iter()
+                .filter(|message| message.tool_call_id.as_deref() == Some(id))
+                .collect::<Vec<_>>();
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(pairs[0].tool_success, Some(false));
+            assert!(pairs[0].content.contains("suspension_disabled"));
+        }
+
+        #[test]
+        fn pure_suspension_classifier_only_accepts_successful_wait_requests() {
+            for mut result in [question(), waiting()] {
+                assert!(tool_result_requires_suspension(&result));
+                result.success = false;
+                assert!(!tool_result_requires_suspension(&result));
+            }
+            assert!(!tool_result_requires_suspension(&ToolResult::text(
+                true, "ordinary"
+            )));
+        }
+
+        #[tokio::test]
+        async fn disabled_suspension_refuses_before_wait_metadata_or_clarification_persistence() {
+            for result in [question(), waiting()] {
+                let mut session = Session::new("no-wait", "synthetic-only");
+                let call = make_tool_call("denied-question", "custom_question", "{}");
+                let tools = StaticExecutor::new(HashMap::new());
+                let saves = Arc::new(NoClarificationSave(AtomicUsize::new(0)));
+                let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = saves.clone();
+                let (tx, mut rx) = mpsc::channel(32);
+                let outcome = with_suspension_disabled(
+                    handle_tool_result_with_agentic_support_and_persistence(
+                        &result,
+                        &call,
+                        &tx,
+                        &mut session,
+                        &tools,
+                        ToolExecutionSessionFlags::default(),
+                        None,
+                        Some(&persistence),
+                    ),
+                )
+                .await;
+                assert_eq!(outcome, ToolHandlingOutcome::Continue);
+                assert_refusal_pair(&session, "denied-question");
+                assert_not_waiting(&session);
+                assert_eq!(saves.0.load(Ordering::SeqCst), 0);
+                let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+                assert_eq!(events.iter().filter(|event|matches!(event,AgentEvent::ToolError{tool_call_id,..} if tool_call_id=="denied-question")).count(),1);
+                assert!(!events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::NeedClarification { .. })));
+            }
+        }
+
+        struct NestedQuestions {
+            entered: std::sync::Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl ToolExecutor for NestedQuestions {
+            async fn execute(&self, call: &ToolCall) -> crate::tools::executor::Result<ToolResult> {
+                self.entered
+                    .lock()
+                    .unwrap()
+                    .push(call.function.name.clone());
+                assert!(
+                    !crate::tools::suspension_allowed(),
+                    "the nested queue must retain the host scope"
+                );
+                Ok(match call.function.name.as_str() {
+                    "outer" => ToolResult::text(
+                        true,
+                        serde_json::to_string(&AgenticToolResult::NeedMoreActions {
+                            actions: vec![
+                                make_tool_call("nested-question", "nested", "{}"),
+                                make_tool_call("nested-wait", "wait", "{}"),
+                                make_tool_call("ordinary-after", "ordinary", "{}"),
+                            ],
+                            reason: "nested work".into(),
+                        })
+                        .unwrap(),
+                    ),
+                    "nested" => question(),
+                    "wait" => waiting(),
+                    _ => ToolResult::text(true, "ordinary completed"),
+                })
+            }
+            fn list_tools(&self) -> Vec<ToolSchema> {
+                Vec::new()
+            }
+        }
+        #[tokio::test]
+        async fn disabled_suspension_reaches_recursive_subactions_without_relaxing_other_dispatch()
+        {
+            let tools = NestedQuestions {
+                entered: std::sync::Mutex::new(Vec::new()),
+            };
+            let mut session = Session::new("nested-no-wait", "synthetic-only");
+            let (tx, mut rx) = mpsc::channel(64);
+            let outcome = with_suspension_disabled(execute_sub_actions(
+                &[make_tool_call("outer-call", "outer", "{}")],
+                &tx,
+                &mut session,
+                &tools,
+                ToolExecutionSessionFlags::default(),
+                None,
+            ))
+            .await;
+            assert_eq!(outcome, ToolHandlingOutcome::Continue);
+            assert_eq!(
+                *tools.entered.lock().unwrap(),
+                ["outer", "nested", "wait", "ordinary"]
+            );
+            assert_refusal_pair(&session, "nested-question");
+            assert_refusal_pair(&session, "nested-wait");
+            assert_not_waiting(&session);
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::NeedClarification { .. })));
+            assert!(!events.iter().any(|event|matches!(event,AgentEvent::ToolComplete{tool_call_id,result} if ["nested-question","nested-wait"].contains(&tool_call_id.as_str()) && result.success)));
+        }
+    }
+
+    mod running_scope_queue_tests {
+        use super::*;
+        use crate::tools::{
+            with_suspension_disabled, AsyncWaitKind, RunningCompletion, RunningHandle, ToolOutcome,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Executor {
+            calls: std::sync::Mutex<Vec<String>>,
+            kills: Arc<AtomicUsize>,
+        }
+        impl Executor {
+            fn dispatch(&self, call: &ToolCall) -> ToolOutcome {
+                self.calls.lock().unwrap().push(call.function.name.clone());
+                if call.function.name == "running" {
+                    let kills = self.kills.clone();
+                    ToolOutcome::Running(RunningHandle {
+                        tool_call_id: call.id.clone(),
+                        ack: ToolResult::text(true, "running ack"),
+                        completion: RunningCompletion::Detached,
+                        wait_kind: AsyncWaitKind::AsyncTools,
+                        kill: Box::new(move || {
+                            kills.fetch_add(1, Ordering::SeqCst);
+                        }),
+                    })
+                } else {
+                    ToolOutcome::Completed(ToolResult::text(true, "later action"))
+                }
+            }
+        }
+        #[async_trait]
+        impl ToolExecutor for Executor {
+            async fn execute(&self, call: &ToolCall) -> crate::tools::executor::Result<ToolResult> {
+                Ok(self.dispatch(call).into_tool_result())
+            }
+            async fn execute_with_context_outcome(
+                &self,
+                call: &ToolCall,
+                _: ToolExecutionContext<'_>,
+            ) -> crate::tools::executor::Result<ToolOutcome> {
+                Ok(self.dispatch(call))
+            }
+            fn list_tools(&self) -> Vec<ToolSchema> {
+                vec![]
+            }
+        }
+        #[tokio::test]
+        async fn restricted_recursive_queue_refuses_running_and_stops_before_later_dispatch() {
+            let kills = Arc::new(AtomicUsize::new(0));
+            let tools = Executor {
+                calls: std::sync::Mutex::new(vec![]),
+                kills: kills.clone(),
+            };
+            let mut session = Session::new("restricted-running-queue", "synthetic-only");
+            let (tx, mut rx) = mpsc::channel(32);
+            let outcome = with_suspension_disabled(execute_sub_actions(
+                &[
+                    make_tool_call("nested-running", "running", "{}"),
+                    make_tool_call("not-dispatched", "later", "{}"),
+                ],
+                &tx,
+                &mut session,
+                &tools,
+                ToolExecutionSessionFlags::default(),
+                None,
+            ))
+            .await;
+            assert_eq!(outcome, ToolHandlingOutcome::Continue);
+            assert_eq!(*tools.calls.lock().unwrap(), ["running"]);
+            assert_eq!(kills.load(Ordering::SeqCst), 1);
+            let pairs = session
+                .messages
+                .iter()
+                .filter(|m| m.tool_call_id.as_deref() == Some("nested-running"))
+                .collect::<Vec<_>>();
+            assert_eq!(pairs.len(), 1);
+            assert_eq!(pairs[0].tool_success, Some(false));
+            assert!(!session
+                .messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("not-dispatched")));
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(!events.iter().any(|e|matches!(e,AgentEvent::ToolComplete{tool_call_id,result} if tool_call_id=="nested-running" && result.success)));
+        }
     }
 }

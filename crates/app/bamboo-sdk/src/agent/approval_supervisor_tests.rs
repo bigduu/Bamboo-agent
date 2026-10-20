@@ -5,6 +5,28 @@ use bamboo_agent_core::tools::ExecutingSupervisorObservation;
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 
 const TARGET: &str = "transport-target";
+
+// The fixture exercises identity/permission transport using an admitted
+// management identity. Direct shell execution is tested as a refusal below.
+// Its strict durable link write is a probe, not the production followup API.
+fn management_call() -> ToolCall {
+    ToolCall {
+        id: CALL.into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "default::session_control".into(),
+            arguments: json!({"action":"followup", "target_session_id":TARGET,
+                "operation_id":"transport-operation", "message":"continue the authorized work"})
+            .to_string(),
+        },
+    }
+}
+
+fn management_config() -> Arc<PermissionConfig> {
+    let config = Arc::new(PermissionConfig::new());
+    config.set_ask_rules(["session_control".into(), "default::session_control".into()]);
+    config
+}
 const AUTHORITY: &str = ExecutingSupervisorObservation::PERMISSION_REPLAY_METADATA_KEY;
 type WriteBarrier = (
     tokio::sync::mpsc::UnboundedSender<ExecutingSupervisorObservation>,
@@ -32,13 +54,16 @@ impl Tool for ProtectedTool {
         "Exercise strict Supervisor management after the real permission gate"
     }
     fn parameters_schema(&self) -> Value {
-        json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]})
+        json!({"type":"object","properties":{"action":{"type":"string"},"target_session_id":{"type":"string"},"operation_id":{"type":"string"},"message":{"type":"string"}},"required":["action","target_session_id","operation_id","message"]})
     }
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
         assert!(!ctx.bypass_permissions && !ctx.auto_approve_permissions && !ctx.plan_read_only);
         let mut gates = Vec::new();
-        if self.name == "execute_command" {
-            gates.push((PermissionType::ExecuteCommand, "current-command"));
+        if self.name == "default::session_control" {
+            gates.push((
+                PermissionType::ExecuteCommand,
+                "session_control followup transport-target",
+            ));
         }
         if self.second_context {
             gates.push((PermissionType::WriteFile, "second-resource"));
@@ -106,7 +131,13 @@ impl Tool for ProtectedTool {
 }
 
 fn protected_agent(fixture: &Fixture) -> Agent {
-    protected_agent_with(fixture, alias_config(), &["Bash"], false, None)
+    protected_agent_with(
+        fixture,
+        management_config(),
+        &["session_control"],
+        false,
+        None,
+    )
 }
 
 fn protected_agent_with(
@@ -137,7 +168,7 @@ fn protected_agent_with(
 }
 
 async fn protected_pending() -> (Fixture, Session, bamboo_domain::SupervisorReference) {
-    protected_pending_with(&["Bash"]).await
+    protected_pending_with(&["session_control"]).await
 }
 
 async fn setup_supervisor(fixture: &Fixture) -> bamboo_domain::SupervisorReference {
@@ -163,9 +194,9 @@ async fn protected_pending_with(
     let fixture = Fixture::new().await;
     let original = setup_supervisor(&fixture).await;
     let session = fixture.reload(&original.session_id).await;
-    *fixture.probe.next_call.lock().unwrap() = Some(alias_call());
+    *fixture.probe.next_call.lock().unwrap() = Some(management_call());
     let initial = events(
-        protected_agent_with(&fixture, alias_config(), names, false, None)
+        protected_agent_with(&fixture, management_config(), names, false, None)
             .run_stream(session, "attach the permitted Root"),
     )
     .await;
@@ -284,7 +315,7 @@ async fn supervisor_replay_rejects_corrupted_native_bindings_before_protected_wr
             }
             "record_owner" => {
                 approved.messages[index].metadata.as_mut().unwrap()[AUTHORITY]["execution_name"] =
-                    json!("execute_command")
+                    json!("default::session_control")
             }
             "record_generation" => {
                 approved.messages[index].metadata.as_mut().unwrap()[AUTHORITY]
@@ -451,14 +482,17 @@ async fn supervisor_shared_validation_rejects_an_old_same_id_occurrence_without_
         find_permission_replay_target(&session, CALL, Some(&request.request_generation)).unwrap();
     session.add_message(Message::assistant(
         "new operation",
-        Some(vec![alias_call()]),
+        Some(vec![management_call()]),
     ));
     let mut newer = Message::tool_result(CALL, "new waiting occurrence");
     newer.metadata = Some(json!({"permission_request":{"request_generation":"new-generation"}}));
     session.add_message(newer);
-    assert!(validate_permission_replay_authority(&session, &old, "Bash").is_err());
-    let config = alias_config();
-    assert!(restore_permission_replay_authorization(&config, &session, &old, "Bash").is_err());
+    assert!(validate_permission_replay_authority(&session, &old, "session_control").is_err());
+    let config = management_config();
+    assert!(
+        restore_permission_replay_authorization(&config, &session, &old, "session_control")
+            .is_err()
+    );
     assert!(!config.consume_once_for_generation(
         &session.id,
         CALL,
@@ -475,8 +509,8 @@ async fn supervisor_exact_custom_owner_and_builtin_alias_remain_distinct() {
     events(
         protected_agent_with(
             &fixture,
-            alias_config(),
-            &["Bash", "execute_command"],
+            management_config(),
+            &["session_control", "default::session_control"],
             false,
             None,
         )
@@ -493,29 +527,40 @@ async fn supervisor_exact_custom_owner_and_builtin_alias_remain_distinct() {
         1
     );
 
-    let (fixture, pending, original) =
-        Box::pin(protected_pending_with(&["Bash", "execute_command"])).await;
-    assert_eq!(current_request(&pending).tool_name, "execute_command");
-    let approved = fixture.approve(&current_request(&pending)).await;
-    events(
-        protected_agent_with(
-            &fixture,
-            alias_config(),
-            &["Bash", "execute_command"],
-            false,
-            None,
+    for ultra in [false, true] {
+        // A separately registered namespaced owner is not the canonical
+        // management identity, and cannot enter approval as an alias shortcut.
+        let fixture = Fixture::new().await;
+        let original = setup_supervisor(&fixture).await;
+        let mut session = fixture.reload(&original.session_id).await;
+        session.set_root_orchestration_only(ultra).unwrap();
+        fixture.repo.save(&mut session).await.unwrap();
+        *fixture.probe.next_call.lock().unwrap() = Some(management_call());
+        let denied = events(
+            protected_agent_with(
+                &fixture,
+                management_config(),
+                &["session_control", "default::session_control"],
+                false,
+                None,
+            )
+            .run_stream(session, "attempt exact custom owner"),
         )
-        .resume_stream(approved),
-    )
-    .await;
-    assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 1);
-    assert!(
-        SupervisorSessionService::new(fixture.store.clone())
-            .inspect_link(&original, TARGET)
-            .await
-            .unwrap()
-            .authorized
-    );
+        .await;
+        assert!(!denied
+            .iter()
+            .any(|event| matches!(event, AgentEvent::NeedClarification { .. })));
+        assert!(fixture.probe.calls.lock().unwrap().is_empty());
+        assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            SupervisorSessionService::new(fixture.store.clone())
+                .inspect_scope(&original)
+                .await
+                .unwrap()
+                .state_revision,
+            1
+        );
+    }
 }
 
 #[tokio::test]
@@ -550,8 +595,8 @@ async fn supervisor_recreated_after_restoration_is_rejected_at_the_final_writer(
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let stream = protected_agent_with(
         &fixture,
-        alias_config(),
-        &["Bash"],
+        management_config(),
+        &["session_control"],
         false,
         Some((entered_tx, release.clone())),
     )
@@ -644,7 +689,7 @@ async fn ordinary_child_and_synthetic_callers_do_not_acquire_supervisor_authorit
             Session::new("ordinary-root", "test-model")
         };
         let id = session.id.clone();
-        *fixture.probe.next_call.lock().unwrap() = Some(alias_call());
+        *fixture.probe.next_call.lock().unwrap() = Some(management_call());
         events(protected_agent(&fixture).run_stream(session, "attempt attach")).await;
         let pending = fixture.reload(&id).await;
         assert!(pending.messages[result_index(&pending)]
@@ -659,7 +704,7 @@ async fn ordinary_child_and_synthetic_callers_do_not_acquire_supervisor_authorit
             name: "Bash".into(),
             service: SupervisorSessionService::new(fixture.store.clone()),
             probe: fixture.probe.clone(),
-            config: alias_config(),
+            config: management_config(),
             second_context: false,
             barrier: None,
         }
@@ -675,5 +720,53 @@ async fn ordinary_child_and_synthetic_callers_do_not_acquire_supervisor_authorit
                 .state_revision,
             1
         );
+    }
+}
+
+#[tokio::test]
+async fn supervisor_delegation_first_sdk_shell_never_enters_approval_or_protected_write() {
+    for ultra in [false, true] {
+        let fixture = Fixture::new().await;
+        let original = setup_supervisor(&fixture).await;
+        let mut session = fixture.reload(&original.session_id).await;
+        session.set_root_orchestration_only(ultra).unwrap();
+        fixture.repo.save(&mut session).await.unwrap();
+        let target_before = serde_json::to_value(fixture.reload(TARGET).await).unwrap();
+        // The old shell-based fixture call must stay rejected, even when a
+        // registered tool and its native Ask policy are both present.
+        *fixture.probe.next_call.lock().unwrap() = Some(super::alias_call());
+        let output = events(
+            protected_agent_with(
+                &fixture,
+                super::alias_config(),
+                &["exec_command"],
+                false,
+                None,
+            )
+            .run_stream(session, "direct execution must be delegated"),
+        )
+        .await;
+        assert!(!output
+            .iter()
+            .any(|event| matches!(event, AgentEvent::NeedClarification { .. })));
+        assert!(fixture.probe.calls.lock().unwrap().is_empty());
+        assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            serde_json::to_value(fixture.reload(TARGET).await).unwrap(),
+            target_before
+        );
+        assert_eq!(
+            SupervisorSessionService::new(fixture.store.clone())
+                .inspect_scope(&original)
+                .await
+                .unwrap()
+                .state_revision,
+            1
+        );
+        assert!(fixture
+            .reload(&original.session_id)
+            .await
+            .pending_question
+            .is_none());
     }
 }

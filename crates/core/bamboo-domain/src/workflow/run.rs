@@ -123,6 +123,11 @@ pub enum WorkflowPlan {
         item: String,
         body: Box<WorkflowPlan>,
     },
+    Choice {
+        condition: ValueRef,
+        then_branch: Box<WorkflowPlan>,
+        else_branch: Box<WorkflowPlan>,
+    },
     Retry {
         node: Box<WorkflowPlan>,
         max_attempts: u32,
@@ -231,13 +236,26 @@ pub enum WorkflowStepStatus {
     Skipped,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowBudgetUsage {
     pub steps: u32,
     pub retries: u32,
     pub agents: u32,
     pub tokens: u64,
-    pub cost_micros: u64,
+    /// None means the execution has no monetary measurement.
+    pub cost_micros: Option<u64>,
+}
+
+impl Default for WorkflowBudgetUsage {
+    fn default() -> Self {
+        Self {
+            steps: 0,
+            retries: 0,
+            agents: 0,
+            tokens: 0,
+            cost_micros: Some(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -267,9 +285,81 @@ pub enum WorkflowFailureCode {
     Storage,
 }
 
+/// Stable metadata locating one runtime step within its pinned definition.
+/// `plan_node_path` starts at the root (`[]`); Sequence/Parallel use child
+/// ordinals, Choice uses then=0/else=1, and Map.body/Retry.node use 0.
+/// Map indices are outermost first, never item values or names. Unexpanded
+/// skipped/timeout placeholders retain only the already-entered outer prefix.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowStepTopology {
+    pub planned_step_id: String,
+    pub plan_node_path: Vec<usize>,
+    pub map_index_path: Vec<usize>,
+}
+
+impl WorkflowPlan {
+    /// Locate exactly one leaf, refusing unknown or repeated step references
+    /// and impossible Map depths instead of guessing from runtime IDs.
+    pub fn step_topology(
+        &self,
+        step_id: &str,
+        map_index_path: Vec<usize>,
+    ) -> Option<WorkflowStepTopology> {
+        fn locate(
+            plan: &WorkflowPlan,
+            step_id: &str,
+            path: &mut Vec<usize>,
+            map_depth: usize,
+            found: &mut Vec<(Vec<usize>, usize)>,
+        ) {
+            let mut child = |node: &WorkflowPlan, index, depth| {
+                path.push(index);
+                locate(node, step_id, path, depth, found);
+                path.pop();
+            };
+            match plan {
+                WorkflowPlan::Step { step } => {
+                    if step == step_id {
+                        found.push((path.clone(), map_depth));
+                    }
+                }
+                WorkflowPlan::Sequence { nodes } | WorkflowPlan::Parallel { nodes } => {
+                    for (index, node) in nodes.iter().enumerate() {
+                        child(node, index, map_depth);
+                    }
+                }
+                WorkflowPlan::Choice {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    child(then_branch, 0, map_depth);
+                    child(else_branch, 1, map_depth);
+                }
+                WorkflowPlan::Map { body, .. } => child(body, 0, map_depth + 1),
+                WorkflowPlan::Retry { node, .. } => child(node, 0, map_depth),
+            }
+        }
+        let mut found = Vec::new();
+        locate(self, step_id, &mut Vec::new(), 0, &mut found);
+        if found.len() != 1 {
+            return None;
+        }
+        let (plan_node_path, map_depth) = found.pop()?;
+        (map_index_path.len() <= map_depth).then(|| WorkflowStepTopology {
+            planned_step_id: step_id.to_owned(),
+            plan_node_path,
+            map_index_path,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkflowStepSnapshot {
     pub id: String,
+    /// Absent in historical snapshots; clients must treat those as unmapped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<WorkflowStepTopology>,
     pub status: WorkflowStepStatus,
     pub input_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -375,4 +465,63 @@ fn default_empty_object() -> Value {
 pub struct WorkflowProgress {
     pub snapshot: WorkflowRunSnapshot,
     pub events: Vec<WorkflowRunEvent>,
+}
+
+#[cfg(test)]
+mod usage_compatibility_tests {
+    use super::*;
+    #[test]
+    fn workflow_agent_unknown_cost_is_null_and_old_numeric_usage_still_loads() {
+        let mut usage = WorkflowBudgetUsage::default();
+        assert_eq!(serde_json::to_value(&usage).unwrap()["cost_micros"], 0);
+        usage.cost_micros = None;
+        let unknown = serde_json::to_value(&usage).unwrap();
+        assert!(unknown["cost_micros"].is_null());
+        assert_eq!(
+            serde_json::from_value::<WorkflowBudgetUsage>(unknown).unwrap(),
+            usage
+        );
+        let old = serde_json::json!({"steps":1,"retries":0,"agents":1,"tokens":12,"cost_micros":2});
+        assert_eq!(
+            serde_json::from_value::<WorkflowBudgetUsage>(old)
+                .unwrap()
+                .cost_micros,
+            Some(2)
+        );
+    }
+}
+
+#[cfg(test)]
+mod topology_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn workflow_topology_rejects_ambiguous_refs_and_impossible_map_depths() {
+        let leaf = WorkflowPlan::Step {
+            step: "opaque@root[9]/leaf".into(),
+        };
+        assert_eq!(
+            leaf.step_topology("opaque@root[9]/leaf", vec![])
+                .unwrap()
+                .plan_node_path,
+            Vec::<usize>::new()
+        );
+        assert!(leaf.step_topology("missing", vec![]).is_none());
+        assert!(leaf.step_topology("opaque@root[9]/leaf", vec![0]).is_none());
+        let duplicate = WorkflowPlan::Sequence {
+            nodes: vec![leaf.clone(), leaf],
+        };
+        assert!(duplicate
+            .step_topology("opaque@root[9]/leaf", vec![])
+            .is_none());
+    }
+
+    #[test]
+    fn workflow_topology_loads_historical_steps_without_inventing_mapping() {
+        let historical = json!({"id":"step@root[9]", "status":"succeeded", "input_hash":"private", "attempts":1});
+        let step: WorkflowStepSnapshot = serde_json::from_value(historical.clone()).unwrap();
+        assert_eq!(step.topology, None);
+        assert_eq!(serde_json::to_value(step).unwrap(), historical);
+    }
 }

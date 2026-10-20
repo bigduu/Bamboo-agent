@@ -211,6 +211,36 @@ impl VisibleMessageIdentity {
     }
 }
 
+/// Publish an already consumed response through the existing visible-message
+/// protocol. Final-answer checks use this after deciding which text to keep.
+pub(crate) async fn publish_buffered_response(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    identity: &VisibleMessageIdentity,
+    content: &str,
+    reasoning: Option<&str>,
+) {
+    let _ = event_tx
+        .send(AgentEvent::VisibleMessageStart {
+            message_id: identity.message_id.clone(),
+            created_at: identity.created_at,
+        })
+        .await;
+    if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
+        let _ = event_tx
+            .send(AgentEvent::ReasoningToken {
+                content: reasoning.to_string(),
+            })
+            .await;
+    }
+    if !content.is_empty() {
+        let _ = event_tx
+            .send(AgentEvent::Token {
+                content: content.to_string(),
+            })
+            .await;
+    }
+}
+
 pub struct StreamHandlingOutput {
     pub response_id: Option<String>,
     /// Stable identity shared by the safe realtime text and persisted message.
@@ -259,6 +289,9 @@ pub(crate) struct InterruptedStreamOutput {
     pub content: String,
     pub reasoning_content: String,
     pub partial_tool_calls: Vec<PartialToolCallSnapshot>,
+    pub provider_usage: Option<ProviderUsageSnapshot>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 impl From<&bamboo_agent_core::tools::PartialToolCall> for PartialToolCallSnapshot {

@@ -12,6 +12,51 @@ enum ResponseEndpoint {
     TypedPermission,
 }
 
+fn response_expected_tool_call_id(
+    session: &bamboo_agent_core::Session,
+    pending: &bamboo_agent_core::PendingQuestion,
+    requested: Option<&str>,
+) -> Option<String> {
+    requested.map(str::to_owned).or_else(|| {
+        bamboo_engine::session_app::no_progress::is_no_progress_question(session, pending)
+            .then(|| pending.tool_call_id.clone())
+    })
+}
+
+async fn publish_progress_stop(
+    state: web::Data<AppState>,
+    session_id: String,
+    message: bamboo_agent_core::Message,
+    handoff: bamboo_engine::session_app::resume::ResponseResumeHandoff,
+) -> bool {
+    let (reservation, event_sender) = handoff.into_parts();
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(4);
+    let mut history_commit =
+        crate::handlers::agent::execute::runtime::spawn_event_forwarder_with_root_actor(
+            state,
+            session_id.clone(),
+            reservation.run_id().to_string(),
+            event_rx,
+            event_sender,
+            None,
+            reservation.root_actor_writer(),
+        );
+    let published = event_tx
+        .send(AgentEvent::message_appended(&session_id, &message))
+        .await
+        .is_ok()
+        && event_tx
+            .send(AgentEvent::Cancelled {
+                message: Some("Stopped by the user.".into()),
+            })
+            .await
+            .is_ok()
+        && history_commit.send_and_wait(&event_tx, session_id).await;
+    drop(event_tx);
+    reservation.abandon().await;
+    published
+}
+
 /// Submit a user response to a pending question from the `conclusion_with_options` tool.
 ///
 /// When the agent calls the `conclusion_with_options` tool, it pauses execution and waits
@@ -74,6 +119,20 @@ async fn submit_response_inner(
         .or(acquired_response_guard.as_ref())
         .expect("a response guard is supplied or acquired");
 
+    // A warm cache must not hide a future canonical contract or translate its
+    // explicit refusal into a generic storage failure. This read grants no
+    // reservation; the existing response CAS still owns consumption.
+    match state.storage.load_session(&session_id).await {
+        Ok(Some(session)) => {
+            if let Some(response) = crate::handlers::agent::sessions::SessionSummary::execution_conflict(&session) {
+                return Ok(response);
+            }
+        }
+        Ok(None) => {},
+        Err(error) => return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": crate::error::error_value(format!("Failed to inspect Session compatibility: {error}")),
+        }))),
+    }
     // Reload using the same durable-consumption rules as the response CAS
     // before creating a long-lived sender or reserving a successor runner.
     let preflight = match bamboo_engine::session_app::respond::inspect_pending_response_guarded(
@@ -97,11 +156,23 @@ async fn submit_response_inner(
             })));
         }
     };
+    if let Some(response) =
+        crate::handlers::agent::sessions::SessionSummary::execution_conflict(&preflight)
+    {
+        return Ok(response);
+    }
     let Some(pending) = preflight.pending_question.as_ref() else {
         return Ok(HttpResponse::BadRequest().json(serde_json::json!({
             "error": crate::error::error_value("No pending question waiting for response")
         })));
     };
+    let stop_progress_pause =
+        bamboo_engine::session_app::no_progress::is_no_progress_question(&preflight, pending)
+            && user_response == bamboo_engine::session_app::no_progress::STOP_OPTION;
+    // Bind runtime control to the exact preflight question even when an older
+    // client omits its expected ID. A replacement before CAS must stay pending.
+    let expected_tool_call_id =
+        response_expected_tool_call_id(&preflight, pending, req.expected_tool_call_id.as_deref());
     if let Some(expected) = req.expected_tool_call_id.as_deref() {
         if expected != pending.tool_call_id {
             return Ok(HttpResponse::Conflict().json(serde_json::json!({
@@ -194,7 +265,7 @@ async fn submit_response_inner(
         bamboo_engine::session_app::respond::submit_pending_permission_response_checked_guarded(
             response_access,
             input,
-            req.expected_tool_call_id.clone(),
+            expected_tool_call_id,
             permission_receipt,
             response_guard,
         )
@@ -203,7 +274,7 @@ async fn submit_response_inner(
         bamboo_engine::session_app::respond::submit_pending_response_checked_guarded(
             response_access,
             input,
-            req.expected_tool_call_id.clone(),
+            expected_tool_call_id,
             response_guard,
         )
         .await
@@ -247,6 +318,37 @@ async fn submit_response_inner(
             };
         }
     };
+
+    if stop_progress_pause {
+        // The same guarded CAS consumed the runtime question and saved the
+        // stopped session. A detached owner publishes through the existing
+        // fenced forwarder/barrier before releasing its unused successor.
+        let message = session
+            .messages
+            .last()
+            .expect("Stop acknowledgement")
+            .clone();
+        if !tokio::spawn(publish_progress_stop(
+            state.clone(),
+            session_id.clone(),
+            message,
+            handoff,
+        ))
+        .await
+        .unwrap_or(false)
+        {
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": crate::error::error_value("Stop was saved but its event publication failed")
+            })));
+        }
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "success": true,
+            "message": "Run stopped.",
+            "response": user_response,
+            "auto_resume_status": "completed",
+            "stopped": true,
+        })));
+    }
 
     // Record session grants for any permission prompt the user approved, so the
     // resumed run's re-attempt of the gated operation passes the checker without
@@ -340,6 +442,9 @@ async fn submit_response_inner(
         "run_id": auto_resume_outcome.run_id()
     })))
 }
+
+#[cfg(test)]
+mod no_progress_tests;
 
 #[cfg(test)]
 mod tests {

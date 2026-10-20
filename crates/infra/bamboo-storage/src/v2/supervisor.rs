@@ -159,6 +159,59 @@ struct MainIdentity {
 }
 
 impl SessionStoreV2 {
+    /// Caller holds lifecycle/task/session read guards. Admission needs the
+    /// strict canonical Root proof and full history; never repair its index.
+    pub(super) async fn load_execution_admission_unchecked(
+        &self,
+        id: &str,
+    ) -> io::Result<Option<Session>> {
+        if !real_directory(&self.sessions_dir).await? {
+            return Err(invalid("sessions directory is missing"));
+        }
+        let directory = self.sessions_dir.join(id);
+        if !real_directory(&directory).await? {
+            // Children retain the indexed, full-history reader. A genuinely
+            // absent ordinary Session must still allow its first execution.
+            return self.load_session_unlocked(id).await;
+        }
+        let Some(side) = self.load_root_authority_unchecked(id).await? else {
+            return Ok(None);
+        };
+        let main_bytes = read_regular(&directory.join("session.json")).await?;
+        compact_main::validate_full_main(&main_bytes)?;
+        let main: Session = serde_json::from_slice(&main_bytes)
+            .map_err(|_| invalid("invalid canonical session.json"))?;
+        let main_root = if main.root_session_id.is_empty() {
+            id
+        } else {
+            &main.root_session_id
+        };
+        if main.id != id
+            || main.kind != SessionKind::Root
+            || main_root != id
+            || main.parent_session_id.is_some()
+            || main.spawn_depth != 0
+            || main.created_at != side.created_at
+            || main.authority_identity != side.authority_identity
+            || (main.root_orchestration_only && main.root_tool_authority_revision == 0)
+            || side.root_tool_authority_revision < main.root_tool_authority_revision
+            || (side.root_tool_authority_revision == main.root_tool_authority_revision
+                && side.root_orchestration_only != main.root_orchestration_only)
+            || side.root_mode_transition_epoch != main.root_mode_transition_epoch
+            || side.root_mode_operations != main.root_mode_operations
+        {
+            return Err(invalid("canonical Root identity mismatch"));
+        }
+        validate_overlay(&main, Some(&side))?;
+        self.validate_root_tool_authority_overlay(id, &main, Some(&side))
+            .await?;
+        // overlay_runtime_sidecar preserves main messages and provider history,
+        // while taking current control state from the proven runtime sidecar.
+        let mut full = overlay_runtime_sidecar(main, Some(side));
+        full.clear_stale_root_token_budget();
+        Ok(Some(full))
+    }
+
     /// Caller owns the guards for its storage operation. Never consult the
     /// rebuildable index, and never recover a runtime authority from main.
     pub(super) async fn load_root_authority_unchecked(
@@ -341,12 +394,9 @@ impl SessionStoreV2 {
                 ));
             }
         }
-        if initial_model.trim().is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a model is required to bootstrap the default Supervisor",
-            ));
-        }
+        // Identity exists before model setup or the first message. An empty
+        // model leaves this idle Session unbound; normal chat admission still
+        // resolves/validates the configured model before it can execute.
         let incarnation_id = Uuid::new_v4();
         let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, initial_model.trim());
         session.created_at = self.fresh_root_birth(DEFAULT_SUPERVISOR_SESSION_ID).await?;

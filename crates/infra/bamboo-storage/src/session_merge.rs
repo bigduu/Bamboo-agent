@@ -33,6 +33,9 @@
 //! Bare [`Storage::save_session`] is reserved for first-write paths (e.g. new
 //! session creation) where there is no prior on-disk copy to merge against.
 
+#[path = "session_merge_child_actor.rs"]
+mod child_actor;
+
 use std::sync::Arc;
 
 use bamboo_domain::session::types::Session;
@@ -86,7 +89,7 @@ const ACTOR_PARENT_QUESTION_HANDOFF_KEY: &str = "runtime.actor_parent_question_h
 /// and a direct-parent answer that may have followed it, own the transcript
 /// and question control plane. Reconcile under the same lock as the final save
 /// so an old runner cannot erase the question or undo a fast answer.
-fn adopt_durable_actor_parent_question_handoff(
+pub(crate) fn adopt_durable_actor_parent_question_handoff(
     session: &mut Session,
     durable: &Session,
 ) -> std::io::Result<()> {
@@ -172,6 +175,33 @@ fn adopt_durable_actor_parent_question_handoff(
         .clone_from(&durable.agent_runtime_state);
     session.updated_at = session.updated_at.max(durable.updated_at);
     session.metadata.remove(ACTOR_PARENT_QUESTION_HANDOFF_KEY);
+    Ok(())
+}
+
+/// A failed scoped checkpoint whose strict reload also failed cannot enter
+/// ordinary merge/cache publication. Keep the volatile fence in the caller;
+/// only a separately observed canonical snapshot may replace it.
+fn ensure_session_execution_compatible(session: &Session) -> std::io::Result<()> {
+    session.check_execution_compatibility().map_err(|error| {
+        // Use the existing rejected-snapshot publication fence. Refusal must
+        // not turn an unknown schema into an adopted or cached replacement.
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            bamboo_domain::SessionAuthorityConflict(error.to_string()),
+        )
+    })
+}
+
+fn ensure_scoped_loop_checkpoint_known(session: &Session) -> std::io::Result<()> {
+    if session
+        .metadata
+        .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "scoped Loop checkpoint outcome is uncertain; strict canonical reload required",
+        ));
+    }
     Ok(())
 }
 
@@ -556,6 +586,11 @@ fn unconditional_task_patch_would_regress(
 pub struct LockedSessionStore {
     storage: Arc<dyn Storage>,
     inherited_child_wait: Option<bamboo_domain::InheritedChildWait>,
+    child_actor_writer: Option<(
+        bamboo_domain::ChildActorRuntimeWrite,
+        Arc<dyn bamboo_domain::ActorDirectoryPort>,
+        bamboo_domain::RootActorRuntimePublisher,
+    )>,
     root_actor_writer: Option<(
         bamboo_domain::RootActorRuntimeWrite,
         bamboo_domain::RootActorRuntimePublisher,
@@ -613,6 +648,7 @@ impl LockedSessionStore {
             storage,
             inherited_child_wait: None,
             root_actor_writer: None,
+            child_actor_writer: None,
             locks: Arc::new(DashMap::new()),
             task_pair_transaction_lock: Arc::new(Mutex::new(())),
         }
@@ -635,6 +671,7 @@ impl LockedSessionStore {
             storage: self.storage.clone(),
             inherited_child_wait: self.inherited_child_wait.clone(),
             root_actor_writer: Some((owner, publish)),
+            child_actor_writer: None,
             locks: self.locks.clone(),
             task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),
         })
@@ -647,6 +684,7 @@ impl LockedSessionStore {
             storage: self.storage.clone(),
             inherited_child_wait: Some(inherited),
             root_actor_writer: self.root_actor_writer.clone(),
+            child_actor_writer: self.child_actor_writer.clone(),
             locks: self.locks.clone(),
             task_pair_transaction_lock: self.task_pair_transaction_lock.clone(),
         }
@@ -666,6 +704,12 @@ impl LockedSessionStore {
         session: &mut Session,
         runtime_only: bool,
     ) -> std::io::Result<()> {
+        ensure_scoped_loop_checkpoint_known(session)?;
+        if self.child_actor_writer.is_some() {
+            return self
+                .save_child_snapshot(session, runtime_only, None, None)
+                .await;
+        }
         if let Some(inherited) = self.inherited_for_session(session) {
             self.storage
                 .save_runtime_with_inherited_child_wait(
@@ -725,6 +769,22 @@ impl LockedSessionStore {
         guard
     }
 
+    /// Check a borrowed process-serialization owner without acquiring another lock.
+    /// Bound writer views share this lock map; independent stores do not. This
+    /// proves no durable writer fence, current caller or Skill/Source authority.
+    pub fn validate_lock(&self, owner: &SessionLockGuard, session_id: &str) -> std::io::Result<()> {
+        if owner.guard.is_none()
+            || owner.session_id != session_id
+            || !Arc::ptr_eq(&owner.locks, &self.locks)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Session persistence owner does not match this coordinator and session",
+            ));
+        }
+        Ok(())
+    }
+
     /// Save a full snapshot while preserving Task generations advanced by an
     /// independent store instance. V2 rejects such a stale write before any
     /// mutation; reloading and adopting only Task-owned fields makes the retry,
@@ -750,7 +810,10 @@ impl LockedSessionStore {
             if let Some(provenance) = self.inherited_for_session(session) {
                 provenance.validate_session(session)?;
             }
-            let result = if inherited.is_none() && self.inherited_for_session(session).is_some() {
+            let result = if self.child_actor_writer.is_some() {
+                self.save_child_snapshot(session, false, input.cloned(), inherited)
+                    .await
+            } else if inherited.is_none() && self.inherited_for_session(session).is_some() {
                 self.storage
                     .save_runtime_with_inherited_child_wait(
                         session,
@@ -959,8 +1022,17 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session) + Send,
     {
+        ensure_session_execution_compatible(session)?;
+        ensure_scoped_loop_checkpoint_known(session)?;
         let _guard = self.acquire_lock(&session.id).await;
+        // A compatible sidecar can coexist with a future Main. Merge into a
+        // private candidate so the physical writer's strict refusal cannot
+        // first replace fields in the caller's older compatible snapshot.
+        let original = session;
+        let mut candidate = original.clone();
+        let session = &mut candidate;
         if let Some(latest) = self.storage.load_runtime_control_plane(&session.id).await? {
+            ensure_session_execution_compatible(&latest)?;
             apply_authoritative_metadata(session, &latest);
             // The control-plane sidecar carries `agent_runtime_state`, so a
             // concurrent mid-run bypass flip is here too — don't revert it. #540.
@@ -974,8 +1046,11 @@ impl LockedSessionStore {
         let result = self
             .save_runtime_state_rebasing_task_conflicts(session)
             .await;
-        if result.is_ok() || (publish_on_failure && may_publish_runtime_result(&result)) {
-            publish(session);
+        if may_publish_runtime_result(&result) {
+            *original = candidate;
+            if result.is_ok() || publish_on_failure {
+                publish(original);
+            }
         }
         result
     }
@@ -1417,6 +1492,7 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
+        ensure_scoped_loop_checkpoint_known(session)?;
         let _guard = self.acquire_lock(&session.id).await;
         let latest = self.storage.load_session(&session.id).await?;
 
@@ -1514,7 +1590,7 @@ impl LockedSessionStore {
         result
     }
 
-    /// Commit a retrieval-window rewrite without passing its message mutations
+    /// Commit an archive rewrite without passing its message mutations
     /// through the ordinary append-only reconciliation path.
     ///
     /// A concurrent durable transcript change returns a clean rebased Session
@@ -1528,7 +1604,15 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session) + Send,
     {
-        validate_staged_retrieval_window_transition(expected_base, staged)?;
+        if staged
+            .compression_events
+            .last()
+            .is_some_and(|event| event.kind == bamboo_domain::CompressionEventKind::MessageSummary)
+        {
+            validate_staged_message_summary_transition(expected_base, staged)?;
+        } else {
+            validate_staged_retrieval_window_transition(expected_base, staged)?;
+        }
         let _guard = self.acquire_lock(&staged.id).await;
         let latest = self.storage.load_session(&staged.id).await?;
 
@@ -1686,7 +1770,12 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
+        ensure_session_execution_compatible(session)?;
+        ensure_scoped_loop_checkpoint_known(session)?;
         let _guard = self.acquire_lock(&session.id).await;
+        let original = session;
+        let mut candidate = original.clone();
+        let session = &mut candidate;
 
         // Single disk read serves BOTH the SHRINK diagnostic and the
         // authoritative-metadata merge below. Previously this path loaded the
@@ -1695,6 +1784,9 @@ impl LockedSessionStore {
         // deserialization cost of every runtime save, which is the hot path
         // during sub-agent spawn.
         let latest = self.storage.load_session(&session.id).await?;
+        if let Some(latest) = latest.as_ref() {
+            ensure_session_execution_compatible(latest)?;
+        }
 
         // DIAGNOSTIC: merge_save_runtime overwrites the whole `messages` array
         // (it only merges authoritative metadata, not messages). If the incoming
@@ -1756,7 +1848,8 @@ impl LockedSessionStore {
             .save_session_rebasing_task_conflicts_with_input(session, None, inherited)
             .await;
         if may_publish_runtime_result(&result) {
-            publish(session, result.is_ok());
+            *original = candidate;
+            publish(original, result.is_ok());
         }
         result
     }
@@ -1778,6 +1871,7 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
+        ensure_scoped_loop_checkpoint_known(session)?;
         let _guard = self.acquire_lock(&session.id).await;
         let mut incoming_audit = PermissionAuditSnapshot::from_metadata(&session.metadata)
             .ok_or_else(|| {
@@ -2003,6 +2097,12 @@ impl LockedSessionStore {
     {
         let cached_candidate = load_cached();
         let durable = self.storage.load_session(session_id).await?;
+        if let Some(cached) = cached_candidate.as_ref() {
+            ensure_session_execution_compatible(cached)?;
+        }
+        if let Some(durable) = durable.as_ref() {
+            ensure_session_execution_compatible(durable)?;
+        }
         let Some(mut session) = (match (cached_candidate, durable.as_ref()) {
             (Some(cached), Some(durable)) => {
                 let prefer_durable = durable.updated_at > cached.updated_at
@@ -2129,6 +2229,91 @@ impl LockedSessionStore {
 /// not define a separate adapter layer for the same behavior.
 #[async_trait::async_trait]
 impl RuntimeSessionPersistence for LockedSessionStore {
+    async fn claim_scoped_loop_controls(
+        &self,
+        session: &Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        active_run_id: &str,
+        limit: usize,
+    ) -> std::io::Result<Vec<bamboo_domain::ScopedLoopControlClaim>> {
+        use bamboo_domain::ScopedLoopControlClaim;
+        if let Some((owner, _)) = self.root_actor_writer.as_ref() {
+            let inbox = self.storage.bind_root_actor_inbox(owner, inbox)?;
+            let request = bamboo_domain::SessionInboxLeaseRequest {
+                consumer: bamboo_domain::SessionInboxConsumerId::new(),
+                now: chrono::Utc::now(),
+                duration: chrono::Duration::seconds(5),
+            };
+            return inbox
+                .claim_owned_scoped_loop_controls(&session.id, limit, Some(active_run_id), &request)
+                .await
+                .map(|claims| {
+                    claims
+                        .into_iter()
+                        .map(ScopedLoopControlClaim::Owned)
+                        .collect()
+                })
+                .map_err(std::io::Error::other);
+        }
+        inbox
+            .claim_scoped_loop_controls(&session.id, limit, Some(active_run_id))
+            .await
+            .map(|claims| {
+                claims
+                    .into_iter()
+                    .map(ScopedLoopControlClaim::Legacy)
+                    .collect()
+            })
+            .map_err(std::io::Error::other)
+    }
+
+    async fn checkpoint_scoped_loop_control(
+        &self,
+        session: &mut Session,
+        bindings: &[bamboo_domain::ScopedLoopControlBinding],
+        activation: Arc<dyn bamboo_domain::SessionActivationPort>,
+        input: Option<(
+            Arc<dyn bamboo_domain::SessionInboxPort>,
+            bamboo_domain::ScopedLoopControlClaim,
+        )>,
+    ) -> std::io::Result<()> {
+        let _guard = self.acquire_lock(&session.id).await;
+        let publish = self
+            .root_actor_writer
+            .as_ref()
+            .map(|(_, publish)| publish.clone())
+            .unwrap_or_else(|| Arc::new(|_: &Session| {}));
+        self.storage
+            .checkpoint_scoped_loop(bamboo_domain::ScopedLoopControlCheckpoint {
+                session,
+                bindings,
+                activation,
+                owner: self.root_actor_writer.as_ref().map(|(owner, _)| owner),
+                input,
+                publish,
+            })
+            .await
+    }
+
+    async fn load_loop_control_checkpoint(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        self.storage
+            .load_execution_admission_snapshot(session_id)
+            .await
+    }
+
+    async fn admit_root_inbox(
+        &self,
+        session: &mut Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        active_run_id: Option<&str>,
+    ) -> std::io::Result<Option<bamboo_domain::RootInboxAdmission>> {
+        self.admit_owned_child_inbox(session, inbox, active_run_id)
+            .await
+    }
+
     fn inherited_child_wait(&self) -> Option<bamboo_domain::InheritedChildWait> {
         self.inherited_child_wait.clone()
     }
@@ -2185,7 +2370,7 @@ impl RuntimeSessionPersistence for LockedSessionStore {
         &self,
         session_id: &str,
     ) -> std::io::Result<Option<Session>> {
-        self.storage.load_runtime_control_plane(session_id).await
+        self.load_child_runtime_control_plane(session_id).await
     }
 
     async fn update_task_list_control_plane(
@@ -2279,7 +2464,25 @@ impl RuntimeSessionPersistence for LockedSessionStore {
     }
 
     async fn load_runtime_session(&self, session_id: &str) -> std::io::Result<Option<Session>> {
-        self.storage.load_session(session_id).await
+        self.validate_child_runtime_read(session_id).await?;
+        let session = self.storage.load_session(session_id).await?;
+        self.validate_child_runtime_readback(session_id, session.as_ref())
+            .await?;
+        Ok(session)
+    }
+
+    async fn load_runtime_admission_snapshot(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        self.validate_child_runtime_read(session_id).await?;
+        let session = self
+            .storage
+            .load_execution_admission_snapshot(session_id)
+            .await?;
+        self.validate_child_runtime_readback(session_id, session.as_ref())
+            .await?;
+        Ok(session)
     }
 
     async fn clear_legacy_pending_messages(
@@ -2807,6 +3010,154 @@ fn validate_staged_retrieval_window_transition(
     Ok(())
 }
 
+/// Message-only summaries share the existing archive CAS/publication boundary.
+/// Validate their narrower projection separately: raw history is immutable,
+/// every completed tool exchange leaves the active view, and only derived
+/// compression state may change with the provider-continuation reset.
+fn validate_staged_message_summary_transition(
+    expected: &Session,
+    staged: &Session,
+) -> std::io::Result<()> {
+    use bamboo_domain::{CompressionEventKind, ModelContextResetReason, Role};
+
+    if expected.id != staged.id || expected.messages.len() != staged.messages.len() {
+        return Err(invalid_retrieval_window_checkpoint(
+            "message-summary checkpoint must preserve the Session ID and raw message array",
+        ));
+    }
+    if staged.compression_events.len() != expected.compression_events.len().saturating_add(1) {
+        return Err(invalid_retrieval_window_checkpoint(
+            "message-summary checkpoint must append exactly one compression event",
+        ));
+    }
+    let event = staged
+        .compression_events
+        .last()
+        .expect("validated event count");
+    if event.kind != CompressionEventKind::MessageSummary
+        || event.id.is_empty()
+        || expected
+            .compression_events
+            .iter()
+            .any(|prior| prior.id == event.id)
+    {
+        return Err(invalid_retrieval_window_checkpoint(
+            "message-summary checkpoint has an invalid archive event",
+        ));
+    }
+    let latest_user_id = expected
+        .messages
+        .iter()
+        .rev()
+        .find(|message| !message.compressed && message.role == Role::User)
+        .map(|message| message.id.as_str());
+    let mut canonical = expected.clone();
+    let mut newly_archived = 0usize;
+    let mut calls = std::collections::HashSet::new();
+    let mut results = std::collections::HashSet::new();
+    for (before, canonical_message) in expected.messages.iter().zip(&mut canonical.messages) {
+        if before.compressed {
+            continue;
+        }
+        let has_calls = before
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+        let has_tool_protocol =
+            has_calls || before.tool_call_id.is_some() || before.role == Role::Tool;
+        let generated_recovery = before.role == Role::Assistant
+            && before.content.starts_with("[post-compaction-recovery]\n");
+        let should_archive = before.role != Role::System
+            && Some(before.id.as_str()) != latest_user_id
+            && (!before.never_compress || generated_recovery);
+        if has_tool_protocol && (before.never_compress || !should_archive) {
+            return Err(invalid_retrieval_window_checkpoint(
+                "message-summary checkpoint cannot retain active tool protocol",
+            ));
+        }
+        if has_calls {
+            if before.role != Role::Assistant {
+                return Err(invalid_retrieval_window_checkpoint(
+                    "message-summary checkpoint has tool calls outside an assistant message",
+                ));
+            }
+            for call in before.tool_calls.iter().flatten() {
+                if call.id.is_empty() || !calls.insert(call.id.as_str()) {
+                    return Err(invalid_retrieval_window_checkpoint(
+                        "message-summary checkpoint has empty or duplicate tool call identifiers",
+                    ));
+                }
+            }
+        }
+        if before.role == Role::Tool {
+            let id = before
+                .tool_call_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    invalid_retrieval_window_checkpoint(
+                        "message-summary checkpoint has an uncorrelated tool result",
+                    )
+                })?;
+            if !results.insert(id) {
+                return Err(invalid_retrieval_window_checkpoint(
+                    "message-summary checkpoint has duplicate tool results",
+                ));
+            }
+        } else if before.tool_call_id.is_some() {
+            return Err(invalid_retrieval_window_checkpoint(
+                "message-summary checkpoint has a tool result identifier outside a tool message",
+            ));
+        }
+        if should_archive {
+            if before.compressed_by_event_id.is_some() {
+                return Err(invalid_retrieval_window_checkpoint(
+                    "message-summary checkpoint has a pre-existing active archive correlation",
+                ));
+            }
+            canonical_message.compressed = true;
+            canonical_message.compressed_by_event_id = Some(event.id.clone());
+            newly_archived += 1;
+        }
+    }
+    if calls != results || newly_archived == 0 || event.messages_compressed != newly_archived {
+        return Err(invalid_retrieval_window_checkpoint(
+            "message-summary checkpoint must archive complete tool chains with an exact event count",
+        ));
+    }
+    if let Some(summary) = staged.conversation_summary.as_ref() {
+        if summary.content.trim().is_empty()
+            || summary.message_count != newly_archived
+            || summary.token_count != event.summary_tokens
+        {
+            return Err(invalid_retrieval_window_checkpoint(
+                "message-summary checkpoint has inconsistent summary metadata",
+            ));
+        }
+    }
+    canonical.compression_events.push(event.clone());
+    canonical
+        .conversation_summary
+        .clone_from(&staged.conversation_summary);
+    canonical.token_usage.clone_from(&staged.token_usage);
+    canonical.updated_at = staged.updated_at;
+    canonical.force_manual_compression = None;
+    canonical
+        .metadata
+        .remove(RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    canonical.reset_model_context_epoch(ModelContextResetReason::Compression);
+    let canonical = serde_json::to_vec(&canonical)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let staged = serde_json::to_vec(staged)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if canonical != staged {
+        return Err(invalid_retrieval_window_checkpoint(
+            "message-summary checkpoint changed raw history, protected anchors, or state outside the compression projection and provider reset",
+        ));
+    }
+    Ok(())
+}
+
 fn retrieval_window_base_matches(expected: &Session, durable: &Session) -> std::io::Result<bool> {
     if expected.id != durable.id || durable.messages.len() > expected.messages.len() {
         return Ok(false);
@@ -3097,6 +3448,7 @@ pub async fn merge_save_session(
     storage: &Arc<dyn Storage>,
     session: &mut Session,
 ) -> std::io::Result<()> {
+    ensure_scoped_loop_checkpoint_known(session)?;
     merge_authoritative_metadata_into_stale(storage, session).await?;
     storage.save_session(session).await
 }
@@ -3109,6 +3461,75 @@ mod tests {
     use crate::v2::{RuntimeTaskTransactionFault, SessionStoreV2};
     use bamboo_domain::{session::types::Session, PermissionMode};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn scoped_unknown_checkpoint_cannot_enter_generic_merge_or_publish_callbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(
+            SessionStoreV2::new(dir.path().join("sessions"))
+                .await
+                .unwrap(),
+        );
+        let canonical = Session::new("scoped-unknown-merge", "model");
+        storage.save_session(&canonical).await.unwrap();
+        let before =
+            serde_json::to_value(storage.load_session(&canonical.id).await.unwrap().unwrap())
+                .unwrap();
+        let store = LockedSessionStore::new(storage.clone());
+        let published = AtomicUsize::new(0);
+        for mode in 0..4 {
+            let mut uncertain = canonical.clone();
+            uncertain.add_message(bamboo_domain::Message::user(
+                "Unconfirmed proposal must not be published.",
+            ));
+            uncertain.metadata.insert(
+                bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY.into(),
+                "strict reload failed".into(),
+            );
+            let result = match mode {
+                0 => {
+                    store
+                        .merge_save_runtime_and_publish(&mut uncertain, |_, _| {
+                            published.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .await
+                }
+                1 => {
+                    store
+                        .save_runtime_only_and_publish(&mut uncertain, |_| {
+                            published.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .await
+                }
+                2 => {
+                    store
+                        .checkpoint_runtime_session_and_publish(&mut uncertain, |_, _| {
+                            published.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .await
+                }
+                _ => {
+                    store
+                        .merge_save_finalized_runtime_and_publish(&mut uncertain, |_, _| {
+                            published.fetch_add(1, Ordering::SeqCst);
+                        })
+                        .await
+                }
+            };
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            assert!(uncertain
+                .metadata
+                .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY));
+            assert_eq!(published.load(Ordering::SeqCst), 0);
+            let after =
+                serde_json::to_value(storage.load_session(&canonical.id).await.unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(
+                after, before,
+                "mode {mode} wrote or projected an unknown candidate"
+            );
+        }
+    }
 
     #[test]
     fn authority_merge_updates_ordinary_cache_but_does_not_hide_stale_incarnation() {
@@ -4000,6 +4421,102 @@ mod tests {
         staged.compression_events.push(event);
         staged.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
         staged
+    }
+
+    fn message_summary_fixture(id: &str) -> (Session, Session) {
+        use bamboo_domain::{
+            CompressionEvent, CompressionEventKind, CompressionTriggerType, ConversationSummary,
+            FunctionCall, Message, ModelContextResetReason, ToolCall,
+        };
+
+        let mut expected = fresh(id);
+        expected.add_message(Message::system("Keep system policy"));
+        expected.add_message(Message::user("Historical request"));
+        let mut assistant = Message::assistant("Historical assistant prose", None);
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "summary-tool-call".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "skills_read".into(),
+                arguments: "{\"path\":\"skill.md\"}".into(),
+            },
+        }]);
+        expected.add_message(assistant);
+        expected.add_message(Message::tool_result("summary-tool-call", "Raw tool output"));
+        let mut recovery = Message::assistant(
+            "[post-compaction-recovery]\nOld tool-derived recovery",
+            None,
+        );
+        recovery.never_compress = true;
+        expected.add_message(recovery);
+        let mut anchor = Message::assistant("Protected prose anchor", None);
+        anchor.never_compress = true;
+        expected.add_message(anchor);
+        expected.add_message(Message::user("Current user request"));
+        expected.force_manual_compression = Some("Keep the user intent".into());
+        expected.metadata.insert(
+            RESPONSES_PREVIOUS_RESPONSE_ID_KEY.into(),
+            "response-before-summary".into(),
+        );
+        let boundary =
+            bamboo_domain::provider_transcript_boundary_sha256(Some("test"), Some("openai"))
+                .unwrap();
+        expected
+            .activate_provider_transcript_route(
+                bamboo_domain::ProviderFamily::OpenAi,
+                bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                &boundary,
+            )
+            .unwrap();
+
+        let mut staged = expected.clone();
+        let mut event = CompressionEvent::new(
+            4,
+            1,
+            85.0,
+            40.0,
+            20,
+            CompressionTriggerType::Manual,
+            2.0,
+            None,
+            0,
+        );
+        event.kind = CompressionEventKind::MessageSummary;
+        for message in &mut staged.messages[1..5] {
+            message.compressed = true;
+            message.compressed_by_event_id = Some(event.id.clone());
+        }
+        staged.compression_events.push(event);
+        staged.conversation_summary = Some(ConversationSummary::new(
+            "User and assistant prose summary",
+            4,
+            20,
+        ));
+        staged.force_manual_compression = None;
+        staged.metadata.remove(RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+        staged.reset_model_context_epoch(ModelContextResetReason::Compression);
+        (expected, staged)
+    }
+
+    struct FailingMessageSummaryStorage {
+        inner: Arc<dyn Storage>,
+        attempted_saves: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for FailingMessageSummaryStorage {
+        async fn save_session(&self, _: &Session) -> std::io::Result<()> {
+            self.attempted_saves.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("injected archive save failure"))
+        }
+
+        async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.inner.load_session(id).await
+        }
+
+        async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(id).await
+        }
     }
 
     fn typed_permission_result(
@@ -5967,6 +6484,202 @@ mod tests {
             saved.metadata.get(LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY),
             Some(&serde_json::to_string(&occurrence).unwrap())
         );
+    }
+
+    #[tokio::test]
+    async fn message_summary_checkpoint_commits_raw_history_and_publishes_only_after_save() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let (expected, mut staged) = message_summary_fixture("message-summary-checkpoint");
+        storage.save_session(&expected).await.unwrap();
+        let published = std::sync::Mutex::new(None);
+
+        let outcome = store
+            .checkpoint_retrieval_window_and_publish(&expected, &mut staged, |saved| {
+                *published.lock().unwrap() = Some(saved.clone());
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Committed);
+        let saved = storage.load_session(&expected.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(published.lock().unwrap().as_ref().unwrap()).unwrap()
+        );
+        for (before, after) in expected.messages.iter().zip(&saved.messages) {
+            let mut original = after.clone();
+            original.compressed = before.compressed;
+            original
+                .compressed_by_event_id
+                .clone_from(&before.compressed_by_event_id);
+            assert_eq!(
+                serde_json::to_value(before).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+        }
+        assert!(saved.messages[1..5]
+            .iter()
+            .all(|message| message.compressed));
+        assert!(
+            !saved.messages[5].compressed,
+            "explicit prose anchor stays active"
+        );
+        assert!(
+            !saved.messages[6].compressed,
+            "current user request stays active"
+        );
+        assert_eq!(
+            saved.provider_transcript.last_reset_reason(),
+            Some(bamboo_domain::ProviderTranscriptResetReason::Compression)
+        );
+        assert!(!saved
+            .metadata
+            .contains_key(RESPONSES_PREVIOUS_RESPONSE_ID_KEY));
+    }
+
+    #[tokio::test]
+    async fn message_summary_checkpoint_accepts_an_unpersisted_midturn_suffix() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let (expected, mut staged) = message_summary_fixture("message-summary-local-suffix");
+        let mut durable_prefix = expected.clone();
+        durable_prefix.messages.truncate(2);
+        storage.save_session(&durable_prefix).await.unwrap();
+
+        let outcome = store
+            .checkpoint_retrieval_window_and_publish(&expected, &mut staged, |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Committed);
+        let saved = storage.load_session(&expected.id).await.unwrap().unwrap();
+        assert_eq!(saved.messages.len(), expected.messages.len());
+        assert!(saved.messages[1..5]
+            .iter()
+            .all(|message| message.compressed));
+        assert_eq!(saved.messages[6].content, "Current user request");
+        assert!(!saved.messages[6].compressed);
+    }
+
+    #[tokio::test]
+    async fn message_summary_checkpoint_failed_save_keeps_durable_history_and_cached_projection() {
+        let (_temp, storage) = make_storage().await;
+        let (expected, mut staged) = message_summary_fixture("message-summary-failed-save");
+        storage.save_session(&expected).await.unwrap();
+        let failing = Arc::new(FailingMessageSummaryStorage {
+            inner: storage.clone(),
+            attempted_saves: AtomicUsize::new(0),
+        });
+        let store = LockedSessionStore::new(failing.clone());
+        let cached = std::sync::Mutex::new(expected.clone());
+
+        let error = store
+            .checkpoint_retrieval_window_and_publish(&expected, &mut staged, |saved| {
+                *cached.lock().unwrap() = saved.clone();
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "injected archive save failure");
+        assert_eq!(failing.attempted_saves.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            serde_json::to_value(&*cached.lock().unwrap()).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let saved = storage.load_session(&expected.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn message_summary_checkpoint_rebases_concurrent_durable_changes_without_writing_or_publishing(
+    ) {
+        for append in [false, true] {
+            let (_temp, storage) = make_storage().await;
+            let store = LockedSessionStore::new(storage.clone());
+            let (expected, mut staged) = message_summary_fixture("message-summary-concurrent-base");
+            storage.save_session(&expected).await.unwrap();
+            let mut durable = expected.clone();
+            if append {
+                durable.add_message(bamboo_domain::Message::user("Concurrent current request"));
+            } else {
+                durable.messages[3].content = "Concurrent corrected tool output".into();
+            }
+            storage.save_session(&durable).await.unwrap();
+            let published = AtomicBool::new(false);
+
+            let outcome = store
+                .checkpoint_retrieval_window_and_publish(&expected, &mut staged, |_| {
+                    published.store(true, Ordering::SeqCst);
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(outcome, RetrievalWindowCheckpointOutcome::Rebased);
+            assert!(!published.load(Ordering::SeqCst));
+            assert_eq!(
+                serde_json::to_value(&staged).unwrap(),
+                serde_json::to_value(&durable).unwrap()
+            );
+            let saved = storage.load_session(&expected.id).await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(&saved).unwrap(),
+                serde_json::to_value(&durable).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn message_summary_checkpoint_rejects_raw_rewrites_and_incomplete_or_retained_tool_protocol() {
+        let (expected, valid) = message_summary_fixture("message-summary-invalid-projection");
+        validate_staged_message_summary_transition(&expected, &valid).unwrap();
+        for mutation in 0..9 {
+            let mut staged = valid.clone();
+            match mutation {
+                0 => staged.messages[3].content = "Rewritten raw tool output".into(),
+                1 => {
+                    staged.messages[3].compressed = false;
+                    staged.messages[3].compressed_by_event_id = None;
+                }
+                2 | 3 => {
+                    let index = if mutation == 2 { 5 } else { 6 };
+                    staged.messages[index].compressed = true;
+                    staged.messages[index].compressed_by_event_id =
+                        Some(staged.compression_events[0].id.clone());
+                    staged.compression_events[0].messages_compressed += 1;
+                }
+                4 => staged
+                    .messages
+                    .push(bamboo_domain::Message::assistant("Injected recovery", None)),
+                5 => {
+                    staged.metadata.insert(
+                        RESPONSES_PREVIOUS_RESPONSE_ID_KEY.into(),
+                        "stale-response".into(),
+                    );
+                }
+                6 => staged.provider_transcript = expected.provider_transcript.clone(),
+                7 => staged.compression_events[0].messages_compressed = 3,
+                8 => staged.messages[0].content = "Rewritten system policy".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                validate_staged_message_summary_transition(&expected, &staged).is_err(),
+                "accepted forbidden projection mutation {mutation}"
+            );
+        }
+        let mut incomplete = expected.clone();
+        incomplete.messages[3].tool_call_id = Some("orphan-result".into());
+        let mut staged = valid.clone();
+        staged.messages[3].tool_call_id = Some("orphan-result".into());
+        assert!(validate_staged_message_summary_transition(&incomplete, &staged).is_err());
+        let mut protected = expected.clone();
+        protected.messages[3].never_compress = true;
+        let mut staged = valid;
+        staged.messages[3].never_compress = true;
+        assert!(validate_staged_message_summary_transition(&protected, &staged).is_err());
     }
 
     #[tokio::test]
@@ -8163,6 +8876,52 @@ mod tests {
     }
 
     // ── Self-cleaning per-session lock (issue #346) ─────────────────
+
+    #[tokio::test]
+    async fn validate_lock_requires_active_same_session_same_map_and_accepts_bound_view() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let independent = LockedSessionStore::new(storage);
+        let owner = store.acquire_lock("owned").await;
+        assert!(store.validate_lock(&owner, "owned").is_ok());
+        assert!(store.validate_lock(&owner, "other").is_err());
+        assert!(independent.validate_lock(&owner, "owned").is_err());
+        let mut session = fresh("owned");
+        let mut runtime = bamboo_domain::AgentRuntimeState::new("owned");
+        runtime.waiting_for_children = Some(bamboo_domain::WaitingForChildrenState::for_children(
+            vec!["child".into()],
+            Default::default(),
+            chrono::Utc::now(),
+        ));
+        session.agent_runtime_state = Some(runtime);
+        let bound = store.bind_inherited_child_wait(
+            bamboo_domain::InheritedChildWait::capture(&session).unwrap(),
+        );
+        assert!(bound.validate_lock(&owner, "owned").is_ok());
+        let inactive = SessionLockGuard {
+            guard: None,
+            locks: store.locks.clone(),
+            session_id: "owned".into(),
+        };
+        assert!(store.validate_lock(&inactive, "owned").is_err());
+        drop(inactive);
+        let mut waiter = Box::pin(bound.acquire_lock("owned"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiter)
+                .await
+                .is_err()
+        );
+        drop(waiter);
+        drop(owner);
+        assert_eq!(store.locks.len(), 0);
+        let successor = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            bound.acquire_lock("owned"),
+        )
+        .await
+        .unwrap();
+        assert!(store.validate_lock(&successor, "owned").is_ok());
+    }
 
     #[tokio::test]
     async fn acquire_lock_self_evicts_when_no_other_holder() {

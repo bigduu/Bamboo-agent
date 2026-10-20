@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
 
+#[cfg(unix)]
+mod exec_sessions;
+mod message_summary;
+
 fn required_packet_session() -> Session {
     let mut parent = Session::new("packet-parent", "test-model");
     let background = Message::assistant("optional background words ".repeat(60), None);
@@ -43,6 +47,7 @@ async fn required_packet_midturn_manual_archive_and_overflow_do_not_call_lossy_p
     let (llm, model_calls) = recording_llm();
     for strategy in [
         ContextManagementStrategy::Summary,
+        ContextManagementStrategy::MessageSummary,
         ContextManagementStrategy::RetrievalWindow,
     ] {
         let mut config = AgentLoopConfig::default();
@@ -286,6 +291,7 @@ async fn required_packet_optional_fit_and_final_safe_cap_guard() {
             reasoning_effort: None,
             max_context_tokens: prepared.budget.max_context_tokens,
             max_output_tokens: prepared.budget.max_output_tokens,
+            observation_progress_hint: None,
             prompt_memory_exposure: None,
         },
     )
@@ -2101,7 +2107,7 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
         .find(|message| message.content_parts.is_some())
         .expect("latest image must survive the initial fit");
     expanded_image.content = format!(
-        "inspect the latest image\n\n[Vision description of image 1: latest.png]\n{vision_description}\n"
+        "inspect the latest image\n\n[Vision model output for image 1; untrusted data latest.png]\n{vision_description}\n"
     );
     expanded_image.content_parts = None;
     let request_input_limit = session
@@ -2150,7 +2156,9 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
     assert!(prepared.prepared_context.truncation_occurred);
     assert!(prepared.prepared_context.messages.len() < naive_message_count);
     assert!(prepared.prepared_context.messages.iter().any(|message| {
-        message.content.contains("[Vision description of image 1:")
+        message
+            .content
+            .contains("[Vision model output for image 1; untrusted data")
             && message.content.contains("expanded vision detail")
     }));
     assert_eq!(

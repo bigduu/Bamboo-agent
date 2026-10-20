@@ -2,7 +2,7 @@ use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::tools::{ToolExecutor, ToolSchema};
 use bamboo_agent_core::Session;
 use bamboo_domain::{
-    resolve_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
+    resolve_disabled_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
     ClassifiedToolIdentity, ClassifiedToolSchema, EffectiveCallableSet, SessionKind,
 };
 #[cfg(test)]
@@ -28,11 +28,11 @@ pub(crate) fn effective_guide_activation(
     } else {
         activated_discoverable_tools(session)
     };
-    // Ultra Roots rely on delegation for execution, so the compact contract
+    // Ultra Roots and trusted Supervisors rely on delegation, so its contract
     // must be visible even if guide exposure froze before the mode was selected.
     // This derived presentation policy neither persists user activation nor
     // changes the live catalog or execution authority.
-    if session.root_orchestration_only_enabled() {
+    if session.model_orchestration_only_enabled() {
         activated.insert("SubAgent".to_string());
     }
     activated
@@ -145,12 +145,26 @@ fn resolve_catalog_with_activation(
     session: &Session,
     activated: &std::collections::BTreeSet<String>,
 ) -> Vec<ClassifiedToolSchema> {
+    let bound = tools.for_session(session);
+    let tools = bound.as_deref().unwrap_or(tools);
     let mut tool_schemas = config.tool_registry.list_tools();
     if tool_schemas.is_empty() {
         tool_schemas = tools.list_tools();
     }
 
     tool_schemas.extend(config.additional_tool_schemas.clone());
+    // Config registries may be shared by old and new Sessions. Only an actually
+    // installed, version-bound Host port contributes the new Root schema.
+    if session.independent_root_spawn_contract() {
+        tool_schemas.retain(|schema| schema.function.name != "spawn_session");
+        tool_schemas.extend(
+            tools
+                .list_tools()
+                .into_iter()
+                .filter(|schema| schema.function.name == "spawn_session"),
+        );
+    }
+
     tool_schemas.sort_by(|left, right| left.function.name.cmp(&right.function.name));
     tool_schemas.dedup_by(|left, right| left.function.name == right.function.name);
     if config.ticket_worker_plan.is_some() {
@@ -170,6 +184,12 @@ fn resolve_catalog_with_activation(
     // round, because this list is rebuilt unfiltered every round; with no resolver
     // (SDK/tests) this is the frozen per-run snapshot (#44), unchanged.
     let (disabled_tools, _disabled_skill_ids) = config.resolve_disabled_filters();
+    // Self control is host-opt-in and uses ordinary authority filtering below.
+    if config.loop_control.is_none() {
+        tool_schemas.retain(|schema| {
+            schema.function.name != bamboo_tools::tools::loop_control::LOOP_CONTROL_TOOL_NAME
+        });
+    }
     // The `update_goal` self-report tool is only meaningful while the autonomous
     // goal loop is active; hide it from every ordinary session so it never
     // tempts the model when no goal is set.
@@ -187,6 +207,12 @@ fn resolve_catalog_with_activation(
         let Some(identity) = ClassifiedToolIdentity::from_schema_name(&schema.function.name) else {
             continue;
         };
+        // The guide shortener also canonicalizes legacy aliases internally.
+        // Keep the complete Root contract instead of turning its description
+        // back into the old Child-spawn guide through that compatibility path.
+        if session.independent_root_spawn_contract() && schema.function.name == "spawn_session" {
+            continue;
+        }
         let guide_name = identity.alias_fallback_name();
         if identity.loading_class() == CapabilityLoadingClass::Deferred
             && !activated.contains(guide_name)
@@ -195,6 +221,26 @@ fn resolve_catalog_with_activation(
                 schema.function.description =
                     format!("[Discoverable — not fully activated] {}", short);
             }
+        }
+    }
+
+    if session.supervisor_incarnation_id().is_some() {
+        for schema in tool_schemas
+            .iter_mut()
+            .filter(|schema| schema.function.name == "SubAgent")
+        {
+            schema.function.description = format!(
+                "Supervisor: delegate execution, including simple implementation tasks; retain only necessary dedicated read-only acquisition and orchestration here. If no suitable authorized worker is available, report the actual recoverable blocker instead of self-executing or repeatedly creating children. {}",
+                schema.function.description,
+            );
+        }
+        for schema in tool_schemas
+            .iter_mut()
+            .filter(|schema| schema.function.name == "session_history")
+        {
+            schema.function.description = "Bounded history/metadata readback for this Supervisor or an explicitly attached independent Root in its current valid Project/lifetime scope. Use read_messages/get_meta. Global list/search is not available; use session_history_current for current-turn paging.".into();
+            schema.function.parameters["properties"]["action"]["enum"] =
+                serde_json::json!(["read_messages", "get_meta"]);
         }
     }
 
@@ -214,7 +260,23 @@ fn resolve_catalog_with_activation(
     let disabled_execution_names = disabled_tools
         .iter()
         .filter_map(|reference| {
-            resolve_tool_reference_name(reference, |name| by_execution_name.contains_key(name))
+            if session.independent_root_spawn_contract()
+                && bamboo_domain::independent_root_spawn_reference(reference)
+            {
+                bamboo_domain::resolve_session_tool_reference(
+                    session.session_version,
+                    reference,
+                    |name| by_execution_name.contains_key(name),
+                )
+            } else {
+                resolve_disabled_tool_reference_name(reference, |name| {
+                    by_execution_name.contains_key(name)
+                })
+            }
+        })
+        .flat_map(|name| {
+            let replacement = bamboo_domain::legacy_shell_replacement(&name).map(str::to_owned);
+            std::iter::once(name).chain(replacement)
         })
         .collect::<std::collections::BTreeSet<_>>();
     by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
@@ -333,10 +395,19 @@ mod live_disabled_tests {
             self.execute(call).await
         }
         fn list_tools(&self) -> Vec<ToolSchema> {
-            ["alpha_tool", "beta_tool", "load_skill"]
-                .into_iter()
-                .map(schema)
-                .collect()
+            [
+                "alpha_tool",
+                "beta_tool",
+                "load_skill",
+                "Bash",
+                "BashOutput",
+                "exec_command",
+                "write_stdin",
+                "vendor::Bash",
+            ]
+            .into_iter()
+            .map(schema)
+            .collect()
         }
     }
 
@@ -377,6 +448,184 @@ mod live_disabled_tests {
     }
 
     #[test]
+    fn legacy_disabled_shell_names_filter_replacements_without_foreign_suffix_fallback() {
+        let tools = TwoTools;
+        let session = Session::new("shell-policy", "m");
+        let mut config = AgentLoopConfig::default();
+        let present = |config: &AgentLoopConfig, name: &str| {
+            resolve_classified_tool_catalog_for_session(config, &tools, &session)
+                .iter()
+                .any(|entry| entry.execution_name() == name)
+        };
+        config.disabled_tools = BTreeSet::from(["Bash".into(), "BashOutput".into()]);
+        assert!(!present(&config, "exec_command"));
+        assert!(!present(&config, "write_stdin"));
+
+        config.disabled_tools = BTreeSet::from(["vendor::Bash".into()]);
+        assert!(present(&config, "exec_command"));
+        assert!(present(&config, "write_stdin"));
+    }
+
+    struct CanonicalShellTools;
+    #[async_trait::async_trait]
+    impl ToolExecutor for CanonicalShellTools {
+        async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+            unreachable!("catalog projection only")
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            ["exec_command", "write_stdin", "vendor::Bash"]
+                .into_iter()
+                .map(schema)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn exact_legacy_denials_constrain_a_canonical_only_catalog() {
+        let tools = CanonicalShellTools;
+        let session = Session::new("canonical-shell-policy", "m");
+        for (denied, exec_allowed, stdin_allowed, foreign_allowed) in [
+            ("Bash", false, true, true),
+            ("BashInput", true, false, true),
+            ("BashOutput", true, false, true),
+            ("KillShell", true, false, true),
+            ("vendor::Bash", true, true, false),
+            ("default::Bash", true, true, true),
+            ("unregistered::Bash", true, true, true),
+        ] {
+            let mut config = AgentLoopConfig::default();
+            config.disabled_tools = BTreeSet::from([denied.to_owned()]);
+            let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
+            let present = |name| catalog.iter().any(|entry| entry.execution_name() == name);
+            assert_eq!(present("exec_command"), exec_allowed, "{denied}");
+            assert_eq!(present("write_stdin"), stdin_allowed, "{denied}");
+            assert_eq!(present("vendor::Bash"), foreign_allowed, "{denied}");
+        }
+    }
+
+    struct PositiveShellCatalog(&'static [&'static str]);
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for PositiveShellCatalog {
+        async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+            unreachable!("catalog projection only")
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            self.0.iter().map(|name| schema(name)).collect()
+        }
+    }
+
+    fn shell_policy_catalog(
+        tools: &dyn ToolExecutor,
+        denied: &str,
+    ) -> (BTreeSet<String>, EffectiveCallableSet) {
+        let config = AgentLoopConfig {
+            disabled_tools: BTreeSet::from([denied.to_owned()]),
+            ..Default::default()
+        };
+        let session = Session::new("positive-shell-policy", "m");
+        let catalog = resolve_classified_tool_catalog_for_session(&config, tools, &session);
+        let callable = EffectiveCallableSet::from_catalog(
+            &catalog,
+            CapabilityLoadingMode::LegacyFullCatalog,
+            std::iter::empty::<&str>(),
+        );
+        let names = catalog
+            .iter()
+            .map(|entry| entry.execution_name().to_owned())
+            .collect();
+        (names, callable)
+    }
+
+    #[test]
+    fn supported_unqualified_legacy_alias_denials_constrain_pair_only_catalog_and_admission() {
+        let tools = PositiveShellCatalog(&["exec_command", "write_stdin", "Read"]);
+        for (denied, legacy, replacement) in [
+            ("bash", "Bash", "exec_command"),
+            ("bAsH", "Bash", "exec_command"),
+            ("execute_command", "Bash", "exec_command"),
+            ("bashinput", "BashInput", "write_stdin"),
+            ("bAsHiNpUt", "BashInput", "write_stdin"),
+            ("bashoutput", "BashOutput", "write_stdin"),
+            ("bAsHoUtPuT", "BashOutput", "write_stdin"),
+            ("killshell", "KillShell", "write_stdin"),
+            ("kIlLsHeLl", "KillShell", "write_stdin"),
+        ] {
+            // These references are already accepted by the shared resolver;
+            // compatibility must not invent an additional alias vocabulary.
+            assert_eq!(
+                bamboo_domain::resolve_tool_reference_name(denied, |name| name == legacy),
+                Some(legacy.to_owned()),
+                "unsupported test reference {denied}",
+            );
+            let (names, callable) = shell_policy_catalog(&tools, denied);
+            assert!(!names.contains(replacement), "{denied}: {names:?}");
+            assert!(
+                callable.resolve_callable_reference(replacement).is_none(),
+                "{denied} left {replacement} callable",
+            );
+            let other = if replacement == "exec_command" {
+                "write_stdin"
+            } else {
+                "exec_command"
+            };
+            assert!(names.contains(other), "{denied} also disabled {other}");
+            assert!(names.contains("Read"));
+        }
+    }
+
+    #[test]
+    fn missing_qualified_legacy_references_do_not_disable_pair_only_catalog_by_suffix() {
+        let tools = PositiveShellCatalog(&["exec_command", "write_stdin", "Read"]);
+        for denied in [
+            "vendor::Bash",
+            "vendor::bash",
+            "vendor::execute_command",
+            "default::Bash",
+            "default::bashoutput",
+            "vendor::KillShell",
+            "EXECUTE_COMMAND",
+        ] {
+            let (names, _) = shell_policy_catalog(&tools, denied);
+            for name in ["exec_command", "write_stdin", "Read"] {
+                assert!(names.contains(name), "{denied} disabled {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn exact_custom_legacy_spellings_win_over_disabled_alias_fallback() {
+        let tools = PositiveShellCatalog(&[
+            "exec_command",
+            "write_stdin",
+            "Read",
+            "bash",
+            "execute_command",
+            "vendor::Bash",
+            "default::Bash",
+            "default::execute_command",
+        ]);
+        for denied in [
+            "bash",
+            "execute_command",
+            "vendor::Bash",
+            "default::Bash",
+            "default::execute_command",
+        ] {
+            let (names, _) = shell_policy_catalog(&tools, denied);
+            assert!(
+                !names.contains(denied),
+                "exact denial was ignored: {denied}"
+            );
+            for name in ["exec_command", "write_stdin", "Read"] {
+                assert!(names.contains(name), "{denied} disabled {name}");
+            }
+        }
+    }
+
+    #[test]
     fn explicit_degraded_activation_hides_load_skill_after_one_attempt() {
         let config = AgentLoopConfig::default();
         let tools = TwoTools;
@@ -399,5 +648,84 @@ mod live_disabled_tests {
         assert!(!super::super::skill_context::explicit_activation_pending(
             &session
         ));
+    }
+    struct VersionedCatalog {
+        v2: bool,
+    }
+    #[async_trait::async_trait]
+    impl ToolExecutor for VersionedCatalog {
+        async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
+            unreachable!()
+        }
+        fn for_session(&self, session: &Session) -> Option<Arc<dyn ToolExecutor>> {
+            Some(Arc::new(Self {
+                v2: session.independent_root_spawn_contract(),
+            }))
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            let mut names = vec!["SubAgent", "session_control", "work_dispatch"];
+            if self.v2 {
+                names.push("spawn_session");
+            }
+            names
+                .into_iter()
+                .map(|name| {
+                    let mut s = schema(name);
+                    s.function.description = format!("actual {name} owner contract");
+                    s
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn versioned_spawn_catalog_keeps_root_schema_separate_and_native_disabled_exact() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let tools = VersionedCatalog { v2: false };
+        for version in [None, Some(1), Some(2)] {
+            for ultra in [false, true] {
+                for supervisor in [false, true] {
+                    let mut session = Session::new(
+                        if supervisor {
+                            DEFAULT_SUPERVISOR_SESSION_ID
+                        } else {
+                            "ordinary"
+                        },
+                        "model",
+                    );
+                    session.session_version = version;
+                    session.set_root_orchestration_only(ultra).unwrap();
+                    if supervisor {
+                        session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                            incarnation_id: uuid::Uuid::new_v4(),
+                        };
+                    }
+                    let config = AgentLoopConfig::default();
+                    let schemas =
+                        resolve_available_tool_schemas_for_session(&config, &tools, &session);
+                    let root = schemas.iter().find(|s| s.function.name == "spawn_session");
+                    assert_eq!(root.is_some(), version == Some(2) && supervisor);
+                    if let Some(root) = root {
+                        assert_eq!(
+                            root.function.description,
+                            "actual spawn_session owner contract"
+                        );
+                    }
+                    for reference in ["spawn_session", "spawnSession", "default::spawn_session"] {
+                        let config = AgentLoopConfig {
+                            disabled_tools: BTreeSet::from([reference.to_owned()]),
+                            ..Default::default()
+                        };
+                        let schemas =
+                            resolve_available_tool_schemas_for_session(&config, &tools, &session);
+                        assert!(schemas.iter().all(|s| s.function.name != "spawn_session"));
+                        assert_eq!(
+                            schemas.iter().any(|s| s.function.name == "SubAgent"),
+                            version == Some(2)
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -234,3 +234,179 @@ async fn catalog_projection_tracks_mode_and_current_workspace_winner() {
         "invalid winning overlay cannot fall back to valid global or LKG"
     );
 }
+
+async fn input_store_fixture() -> (
+    tempfile::TempDir,
+    std::sync::Arc<crate::SkillStore>,
+    crate::WorkflowSelection,
+    SkillCatalogEligibility,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("skills");
+    write_skill(&root, "current-input");
+    std::fs::write(root.join("current-input/aux.txt"), "PRIVATE AUXILIARY").unwrap();
+    let store = std::sync::Arc::new(crate::SkillStore::new(crate::SkillStoreConfig {
+        skills_dir: root,
+        ..Default::default()
+    }));
+    store.initialize().await.unwrap();
+    let catalog = store.skill_catalog_snapshot().await;
+    let entry = catalog
+        .entries
+        .iter()
+        .find(|entry| entry.id == "current-input")
+        .unwrap();
+    let selection = crate::WorkflowSelection {
+        id: entry.id.clone(),
+        source: entry.source,
+        revision: entry.revision,
+        args: serde_json::json!({}),
+    };
+    let mut access = access("current-input");
+    access.explicit.insert("current-input".into());
+    (directory, store, selection, access)
+}
+
+#[tokio::test]
+async fn current_input_borrows_correlated_publication_and_releases_all_source_charges() {
+    let (_directory, store, selection, access) = input_store_fixture().await;
+    let pool = store.source_pool();
+    let handles = pool.counts();
+    let budget = store.selected_budget();
+    let before = store.skill_catalog_snapshot().await;
+    for _ in 0..3 {
+        let prepared = store.prepare_current_input_store(None).await.unwrap();
+        let expected_revision = before.revision;
+        let result = prepared
+            .with_current_inputs(
+                &access,
+                std::slice::from_ref(&selection),
+                move |publication| {
+                    Box::pin(async move {
+                        publication.validate_current()?;
+                        let input = &publication.inputs()[0];
+                        assert_eq!(input.catalog_revision, expected_revision);
+                        assert_eq!(input.mode, None);
+                        assert_eq!(input.definition.id, input.selection.id);
+                        assert_eq!(input.catalog_entry.revision, input.revision);
+                        assert_eq!(input.catalog_entry.source, input.selection.source);
+                        assert!(input.main_resource.ends_with("current-input/SKILL.md"));
+                        Ok(input.definition.prompt.clone())
+                    })
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("PRIVATE INSTRUCTIONS"));
+        assert!(!result.contains("PRIVATE AUXILIARY"));
+        assert_eq!(pool.counts(), handles);
+        assert_eq!(budget.usage(), (0, 0, 0));
+    }
+    assert_eq!(
+        store.skill_catalog_snapshot().await.revision,
+        before.revision,
+        "no-op refresh retains generation"
+    );
+}
+
+#[tokio::test]
+async fn current_input_final_source_check_denies_raw_physical_auxiliary_and_policy_changes() {
+    for change in [
+        "raw",
+        "physical",
+        "auxiliary",
+        "auxiliary-physical",
+        "policy",
+    ] {
+        let (directory, store, selection, access) = input_store_fixture().await;
+        let prepared = store.prepare_current_input_store(None).await.unwrap();
+        let path = directory.path().join("skills/current-input");
+        let result = prepared
+            .with_current_inputs(
+                &access,
+                std::slice::from_ref(&selection),
+                move |publication| {
+                    Box::pin(async move {
+                        publication.validate_current()?;
+                        match change {
+                            "raw" => {
+                                let main = path.join("SKILL.md");
+                                let text = std::fs::read_to_string(&main).unwrap();
+                                std::fs::write(main, format!("{text}\n ")).unwrap();
+                            }
+                            "physical" => {
+                                let main = path.join("SKILL.md");
+                                let text = std::fs::read_to_string(&main).unwrap();
+                                std::fs::rename(&main, path.join("previous.txt")).unwrap();
+                                std::fs::write(main, text).unwrap();
+                            }
+                            "auxiliary" => {
+                                std::fs::write(path.join("aux.txt"), "OTHER RAW AUXILIARY").unwrap()
+                            }
+                            "auxiliary-physical" => {
+                                let aux = path.join("aux.txt");
+                                let bytes = std::fs::read(&aux).unwrap();
+                                std::fs::rename(&aux, path.join("old-aux.txt")).unwrap();
+                                std::fs::write(aux, bytes).unwrap();
+                            }
+                            "policy" => {
+                                std::fs::create_dir_all(path.join("agents")).unwrap();
+                                std::fs::write(
+                                    path.join("agents/openai.yaml"),
+                                    "policy:\n  allow_implicit_invocation: false\n",
+                                )
+                                .unwrap();
+                            }
+                            _ => unreachable!(),
+                        }
+                        Ok("must not escape")
+                    })
+                },
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "{change}: final raw Source revalidation is mandatory"
+        );
+        assert_eq!(store.selected_budget().usage(), (0, 0, 0));
+    }
+}
+
+#[tokio::test]
+async fn current_input_all_selection_validation_denies_lkg_and_rejected_generation() {
+    let (directory, store, selection, access) = input_store_fixture().await;
+    let path = directory.path().join("skills/current-input/SKILL.md");
+    std::fs::write(
+        &path,
+        "---\nname: current-input\nallowed-tools: [broken\n---\nBROKEN",
+    )
+    .unwrap();
+    store.reload().await.unwrap();
+    assert!(
+        store.get_skill("current-input").await.is_ok(),
+        "management retains LKG"
+    );
+    let prepared = store.prepare_current_input_store(None).await.unwrap();
+    let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback_called = called.clone();
+    assert!(prepared
+        .with_current_inputs(
+            &access,
+            std::slice::from_ref(&selection),
+            move |_| Box::pin(async move {
+                callback_called.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        )
+        .await
+        .is_err());
+    assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+    write_skill(&directory.path().join("skills"), "current-input");
+    std::fs::write(
+        directory.path().join("skills/current-input/oversized.txt"),
+        vec![b'x'; 8 * 1024 * 1024 + 1],
+    )
+    .unwrap();
+    assert!(store.prepare_current_input_store(None).await.is_err());
+    assert_eq!(store.selected_budget().usage(), (0, 0, 0));
+}

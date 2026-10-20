@@ -197,6 +197,11 @@ enum Commands {
         /// independent of the async runtime and of how the parent wired our stdio.
         #[arg(long)]
         parent_pid: Option<u32>,
+
+        /// Let Bamboo request its own native confirmation for each exact Supervisor
+        /// Project scope change over stdio. Does not grant consent or enable HTTP writes.
+        #[arg(long)]
+        supervisor_scope_native_confirmation: bool,
     },
 
     /// Full-screen terminal client (TUI) over a running server: chat,
@@ -1246,6 +1251,11 @@ fn subagent_worker_process_action(
 }
 
 fn main() {
+    // AppKit's views run on the initial main thread in a UI-only own-executable
+    // helper. It cannot initialize configuration, AppState, sockets or model work.
+    if let Some(code) = bamboo_agent::server::native_scope_confirmation_helper_entry() {
+        std::process::exit(code);
+    }
     // Session deserialization can run on Actix's own Rust worker threads as
     // well as Tokio workers. Establish one process-wide thread-stack floor
     // before either runtime can spawn threads, preserving a larger operator
@@ -1263,15 +1273,34 @@ fn main() {
     // opens any application sockets/files). The adjustment is best-effort and
     // reports failures directly to stderr because logging is not initialized yet.
     nofile_limit::raise_nofile_limit_best_effort();
+    // Explicitly enabled export is independent of logging. Failure is fail-open
+    // and diagnostics never include the endpoint or exporter error payload.
+    let mut telemetry = bamboo_infrastructure::telemetry::init_from_env().unwrap_or_else(|error| {
+        eprintln!("warning: telemetry disabled: {error}");
+        Default::default()
+    });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(thread_stack)
         .enable_all()
         .build()
         .expect("build Bamboo Tokio runtime");
-    runtime.block_on(run());
+    runtime.block_on(run(&mut telemetry));
+    // Flush before runtime teardown: unrelated blocking tasks can delay Tokio's
+    // Drop. The exporter has its own worker and a fixed shutdown budget.
+    let _ = telemetry.shutdown();
 }
 
-async fn run() {
+fn exit_after_telemetry(
+    telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard,
+    code: i32,
+) -> ! {
+    // Ordinary command errors use process::exit, which does not run destructors.
+    // Preserve the exit status while giving completed spans a bounded flush.
+    let _ = telemetry.shutdown();
+    std::process::exit(code)
+}
+
+async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
     let cli = Cli::parse();
 
     // `--config <path>` seeds `BAMBOO_DATA_DIR` (only when unset) with the data
@@ -1295,7 +1324,7 @@ async fn run() {
             }
             Err(e) => {
                 eprintln!("invalid --config '{}': {e}", path.display());
-                std::process::exit(2);
+                exit_after_telemetry(telemetry, 2);
             }
         }
     }
@@ -1313,7 +1342,7 @@ async fn run() {
                 "invalid --log-level '{level}' (expected: {})",
                 LEVELS.join(" | ")
             );
-            std::process::exit(2);
+            exit_after_telemetry(telemetry, 2);
         }
     }
     if let Some(level) =
@@ -1332,11 +1361,19 @@ async fn run() {
     // owns its quiet-by-default policy; embedding applications do not need to
     // pass a log-level argument based on how the binary was built.
     match &cli.command {
-        Some(Commands::Serve { data_dir, .. }) => {
+        Some(Commands::Serve {
+            data_dir,
+            supervisor_scope_native_confirmation,
+            ..
+        }) => {
             let home = data_dir
                 .clone()
                 .unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
-            bamboo_agent::server::logging::init_server_logging_with_home(&home);
+            if *supervisor_scope_native_confirmation {
+                bamboo_agent::server::logging::init_server_logging_with_home_to_stderr(&home);
+            } else {
+                bamboo_agent::server::logging::init_server_logging_with_home(&home);
+            }
         }
         Some(Commands::Config { .. }) => {
             // No file logging for config subcommand; stdout only.
@@ -1396,7 +1433,7 @@ async fn run() {
             let Some(prompt) = cli.prompt else {
                 use clap::CommandFactory;
                 let _ = Cli::command().print_help();
-                std::process::exit(2);
+                exit_after_telemetry(telemetry, 2);
             };
 
             // `bamboo -p -` reads the prompt from stdin (pipe-friendly).
@@ -1405,12 +1442,12 @@ async fn run() {
                 let mut buf = String::new();
                 if std::io::stdin().read_to_string(&mut buf).is_err() {
                     eprintln!("failed to read prompt from stdin");
-                    std::process::exit(1);
+                    exit_after_telemetry(telemetry, 1);
                 }
                 let trimmed = buf.trim().to_string();
                 if trimmed.is_empty() {
                     eprintln!("empty prompt on stdin");
-                    std::process::exit(1);
+                    exit_after_telemetry(telemetry, 1);
                 }
                 trimmed
             } else {
@@ -1430,7 +1467,7 @@ async fn run() {
                 };
                 if let Err(e) = bamboo_agent::actor_cli::run(args).await {
                     eprintln!("run failed: {e}");
-                    std::process::exit(1);
+                    exit_after_telemetry(telemetry, 1);
                 }
                 return;
             }
@@ -1462,7 +1499,7 @@ async fn run() {
             };
             if let Err(e) = bamboo_agent::headless::run(args).await {
                 eprintln!("run failed: {e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
             return;
         }
@@ -1476,6 +1513,7 @@ async fn run() {
             static_dir,
             workers,
             parent_pid,
+            supervisor_scope_native_confirmation,
         } => {
             let bamboo_home_dir = data_dir
                 .clone()
@@ -1534,11 +1572,24 @@ async fn run() {
             bamboo_agent::server::notify_sinks::set_sidecar_mode(parent_pid.is_some());
 
             // Start server using the unified config
-            println!("Starting Bamboo server at {}", config.server_addr());
+            if supervisor_scope_native_confirmation {
+                eprintln!("Starting Bamboo server at {}", config.server_addr());
+            } else {
+                println!("Starting Bamboo server at {}", config.server_addr());
+            }
             // v2-P1 (#181): honor `server.tls` for in-process TLS termination
             // (fail-fast on bad/missing certs); absent → unchanged plaintext.
             let tls = config.server.tls.clone();
-            let result = if config.server.static_dir.is_some() {
+            let result = if supervisor_scope_native_confirmation {
+                bamboo_agent::server::run_with_native_scope_confirmation(
+                    bamboo_home_dir,
+                    config.server.port,
+                    &config.server.bind,
+                    config.server.static_dir.clone(),
+                    tls,
+                )
+                .await
+            } else if config.server.static_dir.is_some() {
                 bamboo_agent::server::run_with_bind_and_static_tls(
                     bamboo_home_dir,
                     config.server.port,
@@ -1559,7 +1610,7 @@ async fn run() {
 
             if let Err(e) = result {
                 eprintln!("Failed to start server: {}", e);
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
@@ -1593,7 +1644,7 @@ async fn run() {
             .await;
             if let Err(e) = result {
                 eprintln!("{e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
@@ -1630,7 +1681,7 @@ async fn run() {
                 Ok(token) => println!("{token}"),
                 Err(error) => {
                     eprintln!("{error}");
-                    std::process::exit(1);
+                    exit_after_telemetry(telemetry, 1);
                 }
             }
         }
@@ -1638,7 +1689,7 @@ async fn run() {
         Commands::Tickets { command } => {
             if let Err(error) = bamboo_agent::ticket_cli::run(command).await {
                 eprintln!("{error:#}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
         Commands::Actor { command } => {
@@ -1703,7 +1754,7 @@ async fn run() {
             };
             if let Err(e) = result {
                 eprintln!("actor command failed: {e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
@@ -1731,15 +1782,15 @@ async fn run() {
                     .and_then(|_| bamboo_broker::PeerPolicy::from_json(&bytes).ok());
                 let Some(policy) = parsed else {
                     eprintln!("broker: invalid scoped peer policy");
-                    std::process::exit(2);
+                    exit_after_telemetry(telemetry, 2);
                 };
                 let Ok(address) = bind.parse::<std::net::SocketAddr>() else {
                     eprintln!("broker: scoped mode requires a numeric bind address");
-                    std::process::exit(2);
+                    exit_after_telemetry(telemetry, 2);
                 };
                 if !address.ip().is_loopback() && cert.is_none() {
                     eprintln!("broker: scoped non-loopback listener requires TLS");
-                    std::process::exit(2);
+                    exit_after_telemetry(telemetry, 2);
                 }
                 Some(policy)
             } else {
@@ -1757,7 +1808,7 @@ async fn run() {
                         eprintln!(
                         "broker: a Bearer token is required (pass --token or set BAMBOO_BROKER_TOKEN)"
                     );
-                        std::process::exit(1);
+                        exit_after_telemetry(telemetry, 1);
                     }
                 }
             };
@@ -1767,7 +1818,7 @@ async fn run() {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("broker: failed to bind {bind}: {e}");
-                    std::process::exit(1);
+                    exit_after_telemetry(telemetry, 1);
                 }
             };
             let addr = listener
@@ -1825,14 +1876,14 @@ async fn run() {
                         } else {
                             eprintln!("broker: failed to load TLS cert/key: {e}");
                         }
-                        std::process::exit(1);
+                        exit_after_telemetry(telemetry, 1);
                     }
                 };
             }
             let server = std::sync::Arc::new(server);
             if let Err(e) = server.serve(listener).await {
                 eprintln!("broker server failed: {e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
@@ -1856,7 +1907,7 @@ async fn run() {
                     eprintln!(
                         "broker-agent capability probe requires --spec-stdin and forbids --spec-file"
                     );
-                    std::process::exit(2);
+                    exit_after_telemetry(telemetry, 2);
                 }
                 let report = bamboo_subagent::WorkerCapabilityReport::current();
                 println!(
@@ -1875,7 +1926,7 @@ async fn run() {
                     eprintln!(
                         "broker-agent: a Bearer token is required (pass --token or set BAMBOO_BROKER_TOKEN)"
                     );
-                    std::process::exit(1);
+                    exit_after_telemetry(telemetry, 1);
                 }
             };
             let result =
@@ -1895,7 +1946,7 @@ async fn run() {
                 .await;
             if let Err(e) = result {
                 eprintln!("broker-agent failed: {e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
@@ -1917,17 +1968,17 @@ async fn run() {
             });
             if let Err(e) = res {
                 eprintln!("init failed: {e:#}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
         Commands::Doctor { data_dir } => {
             match bamboo_agent::setup_cli::run_doctor(data_dir).await {
                 Ok(true) => {}
-                Ok(false) => std::process::exit(1),
+                Ok(false) => exit_after_telemetry(telemetry, 1),
                 Err(e) => {
                     eprintln!("doctor failed: {e:#}");
-                    std::process::exit(1);
+                    exit_after_telemetry(telemetry, 1);
                 }
             }
         }
@@ -1948,7 +1999,7 @@ async fn run() {
                     bamboo_agent::setup_cli::run_config_set(&key, &value, data_dir, dry_run)
                 {
                     eprintln!("config set failed: {e:#}");
-                    std::process::exit(1);
+                    exit_after_telemetry(telemetry, 1);
                 }
             } else if path {
                 println!("{}", bamboo_config::paths::config_json_path().display());
@@ -1959,7 +2010,7 @@ async fn run() {
                     Ok(value) => value,
                     Err(e) => {
                         eprintln!("Failed to serialize config: {}", e);
-                        std::process::exit(1);
+                        exit_after_telemetry(telemetry, 1);
                     }
                 };
 
@@ -1967,7 +2018,7 @@ async fn run() {
                     Ok(json) => println!("{}", json),
                     Err(e) => {
                         eprintln!("Failed to render config as JSON: {}", e);
-                        std::process::exit(1);
+                        exit_after_telemetry(telemetry, 1);
                     }
                 }
             }
@@ -1976,28 +2027,28 @@ async fn run() {
         Commands::Health { conn } => {
             if let Err(e) = bamboo_agent::admin_cli::health(conn.into()).await {
                 eprintln!("{e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
         Commands::Status { conn } => {
             if let Err(e) = bamboo_agent::admin_cli::status(conn.into()).await {
                 eprintln!("{e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
         Commands::Sessions { conn } => {
             if let Err(e) = bamboo_agent::admin_cli::sessions_list(conn.into()).await {
                 eprintln!("{e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
         Commands::Stop { session_id, conn } => {
             if let Err(e) = bamboo_agent::admin_cli::stop(conn.into(), &session_id).await {
                 eprintln!("{e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
@@ -2017,7 +2068,7 @@ async fn run() {
             };
             if let Err(e) = result {
                 eprintln!("{e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
@@ -2036,14 +2087,14 @@ async fn run() {
             };
             if let Err(e) = result {
                 eprintln!("{e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
         Commands::History { session_id, conn } => {
             if let Err(e) = bamboo_agent::admin_cli::history(conn.into(), &session_id).await {
                 eprintln!("{e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
@@ -2104,7 +2155,7 @@ async fn run() {
             };
             if let Err(e) = result {
                 eprintln!("{e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
@@ -2112,7 +2163,7 @@ async fn run() {
             let SkillsCommands::List { data_dir } = command;
             if let Err(e) = bamboo_agent::read_cli::skills_list(data_dir).await {
                 eprintln!("{e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
@@ -2145,7 +2196,7 @@ async fn run() {
             };
             if let Err(e) = result {
                 eprintln!("{e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
 
@@ -2202,7 +2253,7 @@ async fn run() {
             };
             if let Err(e) = result {
                 eprintln!("{e}");
-                std::process::exit(1);
+                exit_after_telemetry(telemetry, 1);
             }
         }
     }
@@ -2227,6 +2278,27 @@ fn serialize_config_for_cli(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_supervisor_confirmation_is_explicit_serve_only_opt_in() {
+        use clap::Parser;
+        for (argv, expected) in [
+            (vec!["bamboo", "serve"], false),
+            (
+                vec!["bamboo", "serve", "--supervisor-scope-native-confirmation"],
+                true,
+            ),
+        ] {
+            let parsed = super::Cli::try_parse_from(argv).unwrap();
+            assert!(
+                matches!(parsed.command, Some(super::Commands::Serve {supervisor_scope_native_confirmation, ..}) if supervisor_scope_native_confirmation == expected)
+            );
+        }
+        assert!(
+            super::Cli::try_parse_from(["bamboo", "--supervisor-scope-native-confirmation"])
+                .is_err()
+        );
+    }
+
     use super::{
         log_level_to_seed, requested_log_level, resolve_config_data_dir, serialize_config_for_cli,
         subagent_worker_process_action, SubagentWorkerProcessAction,

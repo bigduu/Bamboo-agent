@@ -37,7 +37,7 @@ layers**, secure by default:
    `plugin_trust.trusted_hosts` (config.json; defaults to
    `github.com/bigduu/`) unless you pass `--allow-untrusted-host`.
 2. **Signature** — the bundle's `<url>.sig` must verify against a key in
-   `plugin_trust.trusted_keys` (defaults trust nova's and magpie's official
+   `plugin_trust.trusted_keys` (defaults trust Jiandu's, Nova's and Magpie's official
    signing keys) unless you pass `--allow-unsigned`.
 3. **Checksum** — `--sha256 <hex>` pins the downloaded bundle. Without it, a
    `url` install is refused unless you pass `--allow-unverified` — **or** the
@@ -78,6 +78,97 @@ bamboo config set plugin_trust.enforcement off
 This makes every `url` install/update behave as if `--insecure` were passed,
 with no per-install flag needed. It's an explicit opt-in (`enforcement`
 defaults to `"strict"`) and the server logs a startup warning while it's set.
+
+## Optional Jiandu connector
+
+Bamboo/Bodhi's built-in memory remains enabled without installing the standalone
+Jiandu plugin. The optional connector lets another MCP client use the same
+canonical store. It registers no additional memory MCP inside Bamboo.
+
+`GET /api/v1/plugins/jiandu/setup` is passive. It reports the **server process**
+OS/architecture and runtime glibc compatibility, publisher/source trust, accepted
+immutable release, installed state, and optional `external_client` configuration.
+The producer supports macOS x86_64/aarch64, Windows x86_64, and Linux x86_64 with
+glibc 2.35 or newer. Unknown hosts and unavailable artifacts stay unavailable.
+
+`POST /api/v1/plugins/official/jiandu/install` takes exactly `{}`. The server
+selects the reviewed source and checksum, requires the Jiandu publisher key,
+and uses the existing installer with strict trust, even if generic manual plugin
+enforcement was switched off. It does not add a key to a custom trust list or
+accept caller URLs, paths, commands or bypass flags.
+
+Only a completed, verified managed installation exposes `external_client`:
+an absolute `command` and `args: ["--data-dir", "<active canonical root>"]`.
+The root comes from the running MemoryStore, including an explicitly selected
+root. The server checks provenance, exact manifest/executable digests and managed
+paths before export. Incomplete, tampered, symlinked or untrusted installations
+do not provide a command. Do not add an `mcp` subcommand or fabricate Project or
+Session identities; those identities are authorized by the external MCP host.
+
+Wrap that object as `{"mcpServers":{"jiandu": <external_client>}}` for clients
+using that configuration shape. Removal uses the existing plugin delete action;
+it removes the connector without deleting canonical memory.
+
+The active memory root must be outside the managed `plugins/jiandu` directory.
+Setup and installation refuse an equal or nested root with
+`memory_root_overlaps_plugin`; paths that cannot be resolved safely report
+`memory_root_unavailable`. Existing filesystem aliases are resolved without
+creating a store. If a later server selects a root inside an installed Jiandu
+connector, removal also refuses before changing capabilities, provenance or
+files. Select an independent memory root before retrying; this check never moves
+memory automatically. Sibling directories and a shared ancestor do not count
+as an overlapping memory root.
+On macOS, missing path components with only ASCII case differences are treated
+as potentially overlapping until their real filesystem identity is established.
+
+## Nova.app setup
+
+`GET /api/v1/plugins/nova/app` passively reports host support, the verified
+connector, its structured app-setup capability, the app report and installation
+availability. macOS Apple Silicon and Intel use the separate app. Windows uses
+the packaged MCP server directly (`app_not_required`); Linux is unsupported.
+The server never searches `PATH` or launches an app while inspecting status.
+
+Only an installed official connector with accepted source, publisher trust,
+manifest and executable digests can run `app status`. A known older connector
+that actually rejects the app command reports `legacy_cli_unavailable`.
+Malformed output, process failure and timeout report `invalid_report`,
+`status_failed` and `status_timeout` respectively, with no inferred app state.
+`app.success: true` with `app.state: "missing"` means the query succeeded.
+Neither an installed app nor an MCP connection proves privacy permissions;
+`desktop_readiness` remains `not_tested`.
+
+`POST /api/v1/plugins/nova/app/install` is an explicit user action. Send `{}` or
+the exact `artifact_id` returned by the current status response. The server
+selects the immutable reviewed release archive, downloads it into a private
+bounded temporary directory, verifies SHA-256 and runs only the verified
+package-owned CLI:
+
+```text
+<absolute managed nova> app install --archive <private zip> --sha256 <accepted hash> --local-sign
+```
+
+Caller commands, paths, URLs, destination, force and trust-bypass flags are
+rejected. Existing apps are not overwritten. Managed bytes, trust and passive
+app status are checked again after download. Success requires a fresh structured
+status confirming the matching version, local self signature and connector
+compatibility. A lost HTTP response does not cancel the bounded owned operation;
+refresh status before retrying.
+
+The downloaded development archive is ad-hoc signed (`artifact.signing:
+"ad_hoc"`). Installation removes quarantine and applies a local ad-hoc signature
+in the verified private stage (`artifact.install_mode: "local_ad_hoc"`); it does
+not access or create keychain identities, certificates or trust settings. This
+is not an Apple Developer ID or notarized distribution and does not guarantee
+privacy permission continuity across upgrades. Setup does not launch Nova.app
+or grant Accessibility or Screen Recording permission. Open the app and grant
+permissions yourself after installation.
+
+`desktop_server_id` is returned only when the installed manifest, registration
+record and live configuration prove the exact desktop `nova` stdio command and
+`["mcp"]` arguments. Reconnect only that returned ID when the user requests it;
+never reconnect every `nova*` server or the separate Chrome DevTools connector.
+An unpublished or unaccepted archive leaves installation unavailable.
 
 ## List, update, remove
 

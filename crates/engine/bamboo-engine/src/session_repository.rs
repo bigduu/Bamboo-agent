@@ -29,6 +29,10 @@ mod parent_outcome;
 pub use parent_outcome::{ParentOutcomeRoute, ParentOutcomeWriter};
 
 #[cfg(test)]
+#[path = "session_repository_admission_tests.rs"]
+mod admission_tests;
+
+#[cfg(test)]
 type PostDurableHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// Framework-owned coordinator over a session's cache / storage / persistence
@@ -43,6 +47,7 @@ pub struct SessionRepository {
         Arc<dyn bamboo_domain::ActorDirectoryPort>,
         Arc<bamboo_domain::RootActorRuntimeWrite>,
     )>,
+    root_inbox_receipt: Option<bamboo_domain::SessionInboxReceipt>,
     root_actor_writers:
         Arc<dashmap::DashMap<String, std::sync::Weak<bamboo_domain::RootActorRuntimeWrite>>>,
     #[cfg(test)]
@@ -61,6 +66,7 @@ impl SessionRepository {
             persistence,
             root_actor_directory: None,
             root_actor_owner: None,
+            root_inbox_receipt: None,
             root_actor_writers: Arc::new(Default::default()),
             #[cfg(test)]
             post_durable_hook: None,
@@ -571,6 +577,30 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .map(|(_, owner)| (**owner).clone())
     }
 
+    fn bind_root_inbox_receipt(
+        &self,
+        receipt: bamboo_domain::SessionInboxReceipt,
+    ) -> std::io::Result<Arc<dyn bamboo_domain::RuntimeSessionPersistence>> {
+        if self.root_actor_owner.is_none()
+            || receipt.generation == 0
+            || self
+                .root_inbox_receipt
+                .as_ref()
+                .is_some_and(|current| current != &receipt)
+        {
+            return Err(root_actor_binding_error(
+                "Root receipt requires its unchanged execution writer",
+            ));
+        }
+        let mut bound = self.clone();
+        bound.root_inbox_receipt = Some(receipt);
+        Ok(Arc::new(bound))
+    }
+
+    fn root_inbox_receipt(&self) -> Option<&bamboo_domain::SessionInboxReceipt> {
+        self.root_inbox_receipt.as_ref()
+    }
+
     fn root_actor_execution_required(&self, session: &Session) -> bool {
         self.root_actor_directory.is_some()
             && session.kind == bamboo_domain::SessionKind::Root
@@ -846,6 +876,83 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .await
     }
 
+    async fn claim_scoped_loop_controls(
+        &self,
+        session: &Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        active_run_id: &str,
+        limit: usize,
+    ) -> std::io::Result<Vec<bamboo_domain::ScopedLoopControlClaim>> {
+        use bamboo_domain::ScopedLoopControlClaim;
+        if let Some((directory, owner)) = self.root_actor_owner.as_ref() {
+            let inbox = self.storage.bind_root_actor_inbox(owner, inbox)?;
+            let consumer = bamboo_domain::SessionInboxConsumerId::new();
+            let request = root_inbox::lease_request(directory.as_ref(), owner, &consumer).await?;
+            return inbox
+                .claim_owned_scoped_loop_controls(&session.id, limit, Some(active_run_id), &request)
+                .await
+                .map(|claims| {
+                    claims
+                        .into_iter()
+                        .map(ScopedLoopControlClaim::Owned)
+                        .collect()
+                })
+                .map_err(std::io::Error::other);
+        }
+        inbox
+            .claim_scoped_loop_controls(&session.id, limit, Some(active_run_id))
+            .await
+            .map(|claims| {
+                claims
+                    .into_iter()
+                    .map(ScopedLoopControlClaim::Legacy)
+                    .collect()
+            })
+            .map_err(std::io::Error::other)
+    }
+
+    async fn checkpoint_scoped_loop_control(
+        &self,
+        session: &mut Session,
+        bindings: &[bamboo_domain::ScopedLoopControlBinding],
+        activation: Arc<dyn bamboo_domain::SessionActivationPort>,
+        input: Option<(
+            Arc<dyn bamboo_domain::SessionInboxPort>,
+            bamboo_domain::ScopedLoopControlClaim,
+        )>,
+    ) -> std::io::Result<()> {
+        let _guard = self.persistence.acquire_lock(&session.id).await;
+        let cache = self.cache.clone();
+        let publish: bamboo_domain::RootActorRuntimePublisher = Arc::new(move |saved| {
+            cache.insert(
+                saved.id.clone(),
+                Arc::new(crate::SessionSnapshot::new(saved.clone())),
+            );
+        });
+        self.storage
+            .checkpoint_scoped_loop(bamboo_domain::ScopedLoopControlCheckpoint {
+                session,
+                bindings,
+                activation,
+                owner: self
+                    .root_actor_owner
+                    .as_ref()
+                    .map(|(_, owner)| owner.as_ref()),
+                input,
+                publish,
+            })
+            .await
+    }
+
+    async fn load_loop_control_checkpoint(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        self.storage
+            .load_execution_admission_snapshot(session_id)
+            .await
+    }
+
     async fn admit_root_inbox(
         &self,
         session: &mut Session,
@@ -938,6 +1045,51 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             return self.storage.load_session(session_id).await;
         }
         self.try_load(session_id).await
+    }
+
+    async fn load_runtime_admission_snapshot(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        if let Some((directory, owner)) = self.root_actor_owner.as_ref() {
+            if session_id != owner.fence.actor_id {
+                return Err(root_actor_binding_error(
+                    "bound execution cannot admit another Root",
+                ));
+            }
+            directory
+                .validate_fence(&owner.fence, chrono::Utc::now())
+                .await
+                .map_err(root_actor_binding_error)?;
+            let loaded = self
+                .storage
+                .load_execution_admission_snapshot(session_id)
+                .await?;
+            let Some(snapshot) = loaded.as_ref() else {
+                return Err(root_actor_binding_error("bound Root no longer exists"));
+            };
+            if snapshot.id != owner.fence.actor_id
+                || snapshot.created_at != owner.created_at
+                || snapshot.kind != bamboo_domain::SessionKind::Root
+                || !snapshot.authority_identity.is_ordinary()
+            {
+                return Err(root_actor_binding_error("bound Root identity changed"));
+            }
+            // A takeover or delete/rebirth during the full durable read cannot
+            // release even a previously materialized snapshot to this owner.
+            directory
+                .validate_fence(&owner.fence, chrono::Utc::now())
+                .await
+                .map_err(root_actor_binding_error)?;
+            return Ok(loaded);
+        }
+        // Runtime/tool reads remain cache-first. An execution admission must
+        // observe durable facts without publishing a stale or rejected clone.
+        bamboo_domain::RuntimeSessionPersistence::load_runtime_admission_snapshot(
+            self.persistence.as_ref(),
+            session_id,
+        )
+        .await
     }
 
     async fn clear_legacy_pending_messages(

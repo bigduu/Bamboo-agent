@@ -913,6 +913,13 @@ async fn receipt_before_remove_failure_is_terminal_and_never_reclaimed() {
     inbox.owned_ack_after_receipt_failure = true;
     assert!(inbox.ack_owned("target", &claim, first.now).await.is_err());
     assert!(inbox.was_admitted("target", &envelope.id).await.unwrap());
+    assert!(!inbox.inspect("target").await.unwrap().activation_pending());
+    assert!(inbox
+        .inspect_wake_readiness("target", first.now)
+        .await
+        .unwrap()
+        .ready
+        .is_none());
     let other = reopen(&temp).await;
     let successor = request(claim.lease.expires_at);
     assert!(other

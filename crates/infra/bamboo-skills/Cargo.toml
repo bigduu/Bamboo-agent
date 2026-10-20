@@ -12,7 +12,7 @@ bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
 bamboo-config = { path = "../../infra/bamboo-config" }
 serde = { workspace = true }
 serde_json = "1"
-serde_yaml = "0.9"
+serde_yaml = { package = "serde_norway", version = "=0.9.42" }
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -32,3 +32,8 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+hex = "0.4"
+serde_json = "1"
+sha2 = "0.11"

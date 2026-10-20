@@ -395,7 +395,14 @@ impl LoadSkillTool {
                 Duration::from_millis(timeout_ms),
                 tools.execute_with_context_outcome(&call, execution_context),
             )
-            .await;
+            .await
+            .map(|outcome| outcome.map(ToolOutcome::enforce_suspension_restriction));
+            if bamboo_agent_core::tools::suspension_running_violated() {
+                return Err(ToolError::Execution(
+                    "suspension_disabled: dynamic context returned Running; stop unconfirmed"
+                        .into(),
+                ));
+            }
             let block = match result {
                 Ok(Ok(ToolOutcome::Completed(result)))
                     if result.success && !tool_result_requires_approval(&result) =>

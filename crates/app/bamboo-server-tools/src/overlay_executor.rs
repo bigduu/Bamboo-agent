@@ -21,11 +21,49 @@ enum OverlayRoute {
 pub struct OverlayToolExecutor {
     base: std::sync::Arc<dyn ToolExecutor>,
     overlay: std::sync::Arc<dyn Tool>,
+    additional_permission_gate: Option<std::sync::Arc<dyn ToolExecutor>>,
+    session_behavior_version: Option<Option<u32>>,
 }
 
 impl OverlayToolExecutor {
     pub fn new(base: std::sync::Arc<dyn ToolExecutor>, overlay: std::sync::Arc<dyn Tool>) -> Self {
-        Self { base, overlay }
+        Self {
+            base,
+            overlay,
+            additional_permission_gate: None,
+            session_behavior_version: None,
+        }
+    }
+
+    /// Add an owner-specific operation gate while retaining every base gate.
+    pub fn with_additional_permission_gate(
+        mut self,
+        gate: std::sync::Arc<dyn ToolExecutor>,
+    ) -> Self {
+        self.additional_permission_gate = Some(gate);
+        self
+    }
+
+    async fn check_overlay_permissions(
+        &self,
+        call: &ToolCall,
+        args: &serde_json::Value,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        if let Some(outcome) = self
+            .base
+            .check_permissions_for_resolved(call, self.overlay.name(), args, ctx)
+            .await?
+        {
+            return Ok(Some(outcome));
+        }
+        match &self.additional_permission_gate {
+            Some(gate) => {
+                gate.check_permissions_for_resolved(call, self.overlay.name(), args, ctx)
+                    .await
+            }
+            None => Ok(None),
+        }
     }
 
     /// Resolve the args to hand the overlay tool, parsing the raw JSON at most
@@ -48,6 +86,8 @@ impl OverlayToolExecutor {
             let private_arguments = [
                 "browser",
                 "browser_eval",
+                "session_message",
+                "spawn_session",
                 "work_overview",
                 "work_search",
                 "work_inspect",
@@ -77,9 +117,23 @@ impl OverlayToolExecutor {
     /// identities are considered before any compatibility alias can select the
     /// overlay; an intentional same-name overlay replacement retains precedence.
     fn route(&self, reference: &str) -> OverlayRoute {
-        let resolved = resolve_tool_reference_name(reference, |candidate| {
+        let contains = |candidate: &str| {
             candidate == self.overlay.name() || self.base.owns_exact_tool(candidate)
-        });
+        };
+        let resolved = match self.session_behavior_version {
+            Some(version) => {
+                bamboo_domain::resolve_session_tool_reference(version, reference, contains)
+            }
+            None => resolve_tool_reference_name(reference, contains),
+        };
+        if resolved.is_none()
+            && self.session_behavior_version == Some(Some(2))
+            && bamboo_domain::independent_root_spawn_reference(reference)
+        {
+            // Keep an unavailable v2 Root reference exact on the way down. Raw
+            // fallback would let a lower legacy executor reinterpret it as Child.
+            return OverlayRoute::BaseExact("spawn_session".into());
+        }
         match resolved {
             Some(execution_name) if execution_name == self.overlay.name() => OverlayRoute::Overlay,
             Some(execution_name) => OverlayRoute::BaseExact(execution_name),
@@ -95,11 +149,7 @@ impl OverlayToolExecutor {
         check_raw_tool_input(self.overlay.name(), &call.function.arguments)?;
         let args = self.resolve_args(call, &ctx);
         check_parsed_tool_input(self.overlay.name(), &args)?;
-        if let Some(outcome) = self
-            .base
-            .check_permissions_for_resolved(call, self.overlay.name(), &args, &ctx)
-            .await?
-        {
+        if let Some(outcome) = self.check_overlay_permissions(call, &args, &ctx).await? {
             return Ok(outcome);
         }
         self.overlay.invoke(args, ctx.to_tool_ctx()).await
@@ -108,6 +158,20 @@ impl OverlayToolExecutor {
 
 #[async_trait]
 impl ToolExecutor for OverlayToolExecutor {
+    fn for_session(
+        &self,
+        session: &bamboo_domain::Session,
+    ) -> Option<std::sync::Arc<dyn ToolExecutor>> {
+        self.base.for_session(session).map(|base| {
+            std::sync::Arc::new(Self {
+                base,
+                overlay: self.overlay.clone(),
+                additional_permission_gate: self.additional_permission_gate.clone(),
+                session_behavior_version: Some(session.session_version),
+            }) as std::sync::Arc<dyn ToolExecutor>
+        })
+    }
+
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
         self.execute_with_context(call, ToolExecutionContext::none(&call.id))
             .await
@@ -173,9 +237,7 @@ impl ToolExecutor for OverlayToolExecutor {
                     .pre_parsed_args
                     .cloned()
                     .unwrap_or_else(|| parse_tool_args_best_effort(&call.function.arguments).0);
-                self.base
-                    .check_permissions_for_resolved(call, self.overlay.name(), &args, ctx)
-                    .await
+                self.check_overlay_permissions(call, &args, ctx).await
             }
             OverlayRoute::BaseExact(execution_name) => {
                 self.base
@@ -197,9 +259,7 @@ impl ToolExecutor for OverlayToolExecutor {
                 .pre_parsed_args
                 .cloned()
                 .unwrap_or_else(|| parse_tool_args_best_effort(&call.function.arguments).0);
-            self.base
-                .check_permissions_for_resolved(call, execution_name, &args, ctx)
-                .await
+            self.check_overlay_permissions(call, &args, ctx).await
         } else if self.base.owns_exact_tool(execution_name) {
             self.base
                 .check_permissions_for_exact(call, execution_name, ctx)
@@ -219,9 +279,13 @@ impl ToolExecutor for OverlayToolExecutor {
         args: &serde_json::Value,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
-        self.base
-            .check_permissions_for_resolved(call, execution_name, args, ctx)
-            .await
+        if execution_name == self.overlay.name() {
+            self.check_overlay_permissions(call, args, ctx).await
+        } else {
+            self.base
+                .check_permissions_for_resolved(call, execution_name, args, ctx)
+                .await
+        }
     }
 
     fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
@@ -1157,14 +1221,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_eval_overlay_reparse_warning_hides_page_source_and_url() {
+    async fn private_overlay_reparse_warning_hides_page_source_and_peer_text() {
         let raw = r#"{"code":"private-page-source","expected_url":"https://example.test/?token=private-query","expected_epoch":1"#;
-        for name in ["browser_eval", "default::browser_eval"] {
+        for (tool_name, name, raw, field, private_text) in [
+            (
+                "browser_eval",
+                "browser_eval",
+                raw,
+                "code",
+                "private-page-source",
+            ),
+            (
+                "browser_eval",
+                "default::browser_eval",
+                raw,
+                "code",
+                "private-page-source",
+            ),
+            (
+                "session_message",
+                "session_message",
+                r#"{"action":"send","message":"private-peer-text""#,
+                "message",
+                "private-peer-text",
+            ),
+            (
+                "session_message",
+                "default::session_message",
+                r#"{"action":"send","message":"private-peer-text""#,
+                "message",
+                "private-peer-text",
+            ),
+        ] {
             let seen = std::sync::Arc::new(StdMutex::new(None));
             let overlay = OverlayToolExecutor::new(
                 std::sync::Arc::new(BaseExecutor),
                 std::sync::Arc::new(ArgsRecordingOverlayTool {
-                    name: "browser_eval",
+                    name: tool_name,
                     seen: seen.clone(),
                 }),
             );
@@ -1178,13 +1271,10 @@ mod tests {
                     .await
                     .expect("repaired overlay call should run");
             }
-            assert_eq!(
-                seen.lock().unwrap().as_ref().unwrap()["code"],
-                "private-page-source"
-            );
+            assert_eq!(seen.lock().unwrap().as_ref().unwrap()[field], private_text);
             let event = events.lock().unwrap().join("\n");
             assert!(event.contains("warning=[redacted]"), "{event}");
-            assert!(!event.contains("private-page-source"), "{event}");
+            assert!(!event.contains(private_text), "{event}");
             assert!(!event.contains("private-query"), "{event}");
         }
     }
@@ -1276,5 +1366,108 @@ mod tests {
             seen.lock().unwrap().as_ref().unwrap()["data_base64"],
             valid["data_base64"]
         );
+    }
+    #[derive(Clone)]
+    struct VersionedOwnerBase {
+        installed: bool,
+        version: Option<u32>,
+        entered: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl ToolExecutor for VersionedOwnerBase {
+        fn for_session(
+            &self,
+            session: &bamboo_domain::Session,
+        ) -> Option<std::sync::Arc<dyn ToolExecutor>> {
+            Some(std::sync::Arc::new(Self {
+                version: session.session_version,
+                ..self.clone()
+            }))
+        }
+        async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+            if !self.owns_exact_tool(&call.function.name) {
+                return Err(ToolError::NotFound(call.function.name.clone()));
+            }
+            self.entered
+                .lock()
+                .unwrap()
+                .push(call.function.name.clone());
+            Ok(ToolResult::text(true, call.function.name.clone()))
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            let mut schemas = vec![NamedOverlayTool("SubAgent").to_schema()];
+            if self.installed && self.version == Some(2) {
+                schemas.push(NamedOverlayTool("spawn_session").to_schema());
+            }
+            schemas
+        }
+        fn call_parallel_classification(
+            &self,
+            call: &ToolCall,
+        ) -> (bamboo_agent_core::ToolMutability, bool) {
+            if call.function.name == "spawn_session" {
+                (bamboo_agent_core::ToolMutability::Mutating, false)
+            } else {
+                (bamboo_agent_core::ToolMutability::ReadOnly, true)
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn versioned_spawn_stacked_overlay_keeps_root_owner_classification_and_missing_port_refusal(
+    ) {
+        for version in [None, Some(1), Some(2)] {
+            for installed in [false, true] {
+                let entered = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+                let base: std::sync::Arc<dyn ToolExecutor> =
+                    std::sync::Arc::new(VersionedOwnerBase {
+                        installed,
+                        version: None,
+                        entered: entered.clone(),
+                    });
+                let first: std::sync::Arc<dyn ToolExecutor> = std::sync::Arc::new(
+                    OverlayToolExecutor::new(base, std::sync::Arc::new(NamedOverlayTool("memory"))),
+                );
+                let outer = OverlayToolExecutor::new(
+                    first,
+                    std::sync::Arc::new(NamedOverlayTool("work_dispatch")),
+                );
+                let mut session = bamboo_domain::Session::new("owned-session", "model");
+                session.session_version = version;
+                let bound = outer.for_session(&session).unwrap();
+                assert!(bound.owns_exact_tool("memory") && bound.owns_exact_tool("work_dispatch"));
+                for name in ["spawn_session", "spawnSession", "default::spawnSession"] {
+                    let call = make_call(name);
+                    let original = call.clone();
+                    let result = bound
+                        .execute_with_context_outcome(&call, ToolExecutionContext::none(&call.id))
+                        .await;
+                    if version == Some(2) && !installed {
+                        assert!(result.is_err());
+                        continue;
+                    }
+                    let ToolOutcome::Completed(result) = result.unwrap() else {
+                        panic!("completed owner result")
+                    };
+                    let expected = if version == Some(2) {
+                        "spawn_session"
+                    } else {
+                        "SubAgent"
+                    };
+                    assert_eq!(result.result, expected);
+                    assert_eq!(call, original);
+                    assert_eq!(
+                        bound.call_parallel_classification(&call).1,
+                        version != Some(2)
+                    );
+                }
+                assert!(entered.lock().unwrap().iter().all(|name| name
+                    == if version == Some(2) {
+                        "spawn_session"
+                    } else {
+                        "SubAgent"
+                    }));
+            }
+        }
     }
 }

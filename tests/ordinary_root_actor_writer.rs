@@ -20,7 +20,6 @@ use std::{
     time::Duration,
 };
 
-const ROOT: &str = "ordinary-root-actor-writer";
 const INPUT: &str = "ROOT_WRITER_INPUT: return one plain answer, without tools.";
 const OLD_REPLY: &str = "OLD_ROOT_PROVIDER_OUTPUT_MUST_NOT_COMMIT";
 const NEW_REPLY: &str = "REPLACEMENT_ROOT_PROVIDER_OUTPUT_COMMITTED";
@@ -135,6 +134,34 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         .streaming(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
+// Nonblocking probes close each independent descriptor immediately. They
+// never create lock files, retain authority, or change a production lease.
+fn blocked_file_locks(locks: &[(PathBuf, bool)]) -> std::io::Result<Vec<PathBuf>> {
+    let mut blocked = Vec::new();
+    for (path, shared) in locks {
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let result = if *shared {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        };
+        match result {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => blocked.push(path.clone()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+    Ok(blocked)
+}
+
 struct Host {
     child: Child,
     base: String,
@@ -193,6 +220,53 @@ impl Host {
             "signal only the exact fixture-owned Host PID"
         );
         self.stopped = signal == "-STOP";
+    }
+
+    async fn stop_clear_of_file_locks(
+        &mut self,
+        locks: &[(PathBuf, bool)],
+        mut on_blocked: impl FnMut(&[PathBuf]),
+    ) -> Result<usize, String> {
+        let mut rejected = 0;
+        let mut last_blocked = Vec::new();
+        // A lease cannot release an OS file lock held by a SIGSTOPed process.
+        // Pause only between the same physical boundaries B must cross. The
+        // original total 2s stop budget includes every resumed retry.
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                self.signal("-STOP");
+                loop {
+                    let status = Command::new("ps")
+                        .args(["-o", "stat=", "-p", &self.child.id().to_string()])
+                        .output()
+                        .unwrap();
+                    if String::from_utf8_lossy(&status.stdout)
+                        .trim()
+                        .starts_with('T')
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                last_blocked = blocked_file_locks(locks).map_err(|error| error.to_string())?;
+                if last_blocked.is_empty() {
+                    return Ok(rejected);
+                }
+                rejected += 1;
+                on_blocked(&last_blocked);
+                self.signal("-CONT");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if !matches!(result, Ok(Ok(_))) && self.stopped {
+            self.signal("-CONT");
+        }
+        result.map_err(|_| {
+            format!(
+                "fixture-owned Host cannot pause clear of file locks within 2s: {last_blocked:?}"
+            )
+        })?
     }
 
     fn tail(&self) -> String {
@@ -276,6 +350,7 @@ impl Drop for EventTap {
 }
 
 struct Fixture {
+    root: String,
     data: PathBuf,
     a: Host,
     b: Host,
@@ -342,12 +417,69 @@ impl Fixture {
             .unwrap();
         let mut a = Host::start(&data, "a");
         Self::healthy(&client, &mut a).await;
+        // A bare Root has no eligible input. Check real independent Host
+        // startup before Native chat publishes its durable Inbox intent.
+        let response = client
+            .post(format!("{}/sessions", a.base))
+            .json(&json!({
+                "title":"ordinary-root-actor-writer","model":"writer-root",
+                "provider":"openai","model_ref":{"provider":"openai","model":"writer-root"},
+                "permission_mode":"default","workspace_path":workspace
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let created: Value = response.json().await.unwrap();
+        assert!(status.is_success(), "create bare Root: {status}: {created}");
+        let root = created["session"]["id"].as_str().unwrap().to_string();
+        let mut b = Host::start(&data, "b");
+        Self::healthy(&client, &mut b).await;
+        let store = SessionStoreV2::new(data.clone()).await.unwrap();
+        assert_eq!(
+            probe.calls.load(Ordering::SeqCst),
+            0,
+            "Host startup must not execute a newly created Root without eligible input"
+        );
+        assert!(
+            probe
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|request| request["model"] != "writer-root"),
+            "bare Root startup must not even attempt a foreground provider request"
+        );
+        let empty = store.load_session(&root).await.unwrap().unwrap();
+        assert_eq!(empty.kind, bamboo_domain::SessionKind::Root);
+        assert!(!empty.root_orchestration_only);
+        assert_eq!(
+            empty
+                .messages
+                .iter()
+                .filter(|message| message.role == Role::User)
+                .count(),
+            0
+        );
+        let authority = data
+            .join("sessions")
+            .join(&root)
+            .join("actor-authority.json");
+        if authority.exists() {
+            let entry: ActorDirectoryEntry =
+                serde_json::from_slice(&std::fs::read(authority).unwrap()).unwrap();
+            entry.validate().unwrap();
+            assert!(
+                entry.activation.is_none(),
+                "bare Root startup cannot create an Actor activation: {entry:?}"
+            );
+        }
         let response = client
             .post(format!("{}/chat", a.base))
             .json(&json!({
-                "session_id":ROOT,"message":INPUT,"model":"writer-root","provider":"openai",
-                "model_ref":{"provider":"openai","model":"writer-root"},"thinking_mode":"standard",
-                "permission_mode":"default","root_orchestration_only":false,"workspace_path":workspace
+                "session_id":root,"message":INPUT,"model":"writer-root","provider":"openai",
+                "model_ref":{"provider":"openai","model":"writer-root"},
+                "permission_mode":"default","workspace_path":workspace
             }))
             .send()
             .await
@@ -360,20 +492,12 @@ impl Fixture {
         assert_eq!(
             probe.calls.load(Ordering::SeqCst),
             0,
-            "first-create /chat must persist Root without automatically executing it"
+            "Native /chat itself must not start a foreground execution"
         );
-        // Both B and the read-only observer discover the persisted Root during
-        // their normal initialization. B starts before A has any live attempt,
-        // so B's startup cannot act as A's loss/recovery event.
-        let mut b = Host::start(&data, "b");
-        Self::healthy(&client, &mut b).await;
-        let store = SessionStoreV2::new(data.clone()).await.unwrap();
-        assert_eq!(
-            probe.calls.load(Ordering::SeqCst),
-            0,
-            "Host startup must not execute the newly created Root before /execute"
-        );
+        // Both Hosts are already healthy. A takes the actual execution owner
+        // below; Native's intent does not add a client-execute-only barrier.
         let fixture = Self {
+            root,
             _temp: temp,
             data,
             a,
@@ -388,13 +512,6 @@ impl Fixture {
         assert!(
             !root.root_orchestration_only,
             "ordinary Root, not Supervisor"
-        );
-        assert_eq!(
-            root.messages
-                .iter()
-                .filter(|message| message.role == Role::User && message.content == INPUT)
-                .count(),
-            1
         );
         fixture
     }
@@ -419,14 +536,64 @@ impl Fixture {
         .expect("real independent Host becomes healthy");
     }
 
+    fn pause_boundary_locks(&self) -> Vec<(PathBuf, bool)> {
+        let mut locks = vec![
+            (self.data.join(".session-lifecycle.lock"), true),
+            (self.data.join(".runtime-task-transactions.lock"), true),
+            (self.data.join(".sessions-index.lock"), false),
+            (self.data.join("events/.account-journal.lock"), false),
+            (
+                self.data
+                    .join("sessions")
+                    .join(&self.root)
+                    .join("inbox/.session-inbox.lock"),
+                false,
+            ),
+        ];
+        for name in [".session-write-locks", ".actor-tree-locks"] {
+            let entries = match std::fs::read_dir(self.data.join(name)) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("fixture lock inventory: {error}"),
+            };
+            for entry in entries {
+                let entry = entry.unwrap();
+                if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "lock")
+                {
+                    assert!(entry.file_type().unwrap().is_file());
+                    locks.push((entry.path(), false));
+                }
+            }
+        }
+        locks.sort();
+        assert!(
+            locks.len() <= 32,
+            "bounded disposable fixture lock inventory"
+        );
+        locks
+    }
+
     async fn execute(&self, host: &Host) -> Value {
         let response = self
             .client
-            .post(format!("{}/execute/{ROOT}", host.base))
+            .post(format!("{}/execute/{}", host.base, self.root))
             .json(&json!({}))
             .send()
             .await
-            .unwrap();
+            .unwrap_or_else(|error| {
+                panic!(
+                    "fixture execute request failed: {error:?}; target {}; A {}; B {}; blocked locks {:?}; authority {:?}; requests {:?}",
+                    host.tail(),
+                    self.a.tail(),
+                    self.b.tail(),
+                    blocked_file_locks(&self.pause_boundary_locks()),
+                    self.authority(),
+                    self.probe.requests.lock().unwrap()
+                )
+            });
         let status = response.status();
         let body: Value = response.json().await.unwrap();
         assert!(
@@ -438,7 +605,7 @@ impl Fixture {
     }
 
     async fn canonical(&self) -> Session {
-        self.store.load_session(ROOT).await.unwrap().unwrap()
+        self.store.load_session(&self.root).await.unwrap().unwrap()
     }
 
     fn account_terminal_history(&self) -> Vec<Value> {
@@ -446,7 +613,7 @@ impl Fixture {
             .unwrap()
             .into_iter()
             .filter(|frame| {
-                frame.session_id.as_deref() == Some(ROOT)
+                frame.session_id.as_deref() == Some(self.root.as_str())
                     && matches!(
                         frame.event,
                         AgentEvent::Complete { .. }
@@ -462,7 +629,7 @@ impl Fixture {
     async fn history(&self, host: &Host) -> Option<Value> {
         let response = self
             .client
-            .get(format!("{}/history/{ROOT}", host.base))
+            .get(format!("{}/history/{}", host.base, self.root))
             .send()
             .await
             .unwrap();
@@ -480,7 +647,7 @@ impl Fixture {
         let path = self
             .data
             .join("sessions")
-            .join(ROOT)
+            .join(&self.root)
             .join("actor-authority.json");
         let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!(
             "production /execute must create Running Actor authority before the provider; {error}; requests={:?}; A log={}; B log={}",
@@ -510,11 +677,18 @@ impl Fixture {
             .expect("production Root must claim, without external fixture claims");
         assert_eq!(activation.status, ActorActivationStatus::Running);
         assert_eq!(activation.run_id, response["run_id"].as_str().unwrap());
-        assert_eq!(entry.actor.actor_id, ROOT);
+        assert_eq!(entry.actor.actor_id, self.root);
+        // Checked admission has checkpointed and ACKed the real User before
+        // the foreground provider can reach its controlled stream barrier.
+        let root = self.canonical().await;
         assert_eq!(
-            entry.actor.session_created_at,
-            self.canonical().await.created_at
+            root.messages
+                .iter()
+                .filter(|message| message.role == Role::User && message.content == INPUT)
+                .count(),
+            1
         );
+        assert_eq!(entry.actor.session_created_at, root.created_at);
         assert!(activation.lease_expires_at > Utc::now());
         assert!(!self.probe.a_response_sent.load(Ordering::SeqCst));
         entry
@@ -591,30 +765,65 @@ async fn ordinary_root_execution_claims_and_finishes_its_production_actor() {
 }
 
 #[actix_web::test]
+async fn pause_boundary_rejects_a_real_conflicting_file_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let lock_path = temp.path().join("fixture-writer.lock");
+    let mut held = Some(std::fs::File::create(&lock_path).unwrap());
+    held.as_ref().unwrap().lock().unwrap();
+    let mut host = Host {
+        child: Command::new("sleep").arg("30").spawn().unwrap(),
+        base: String::new(),
+        log: temp.path().join("unused-host.log"),
+        stopped: false,
+    };
+    let rejected = host
+        .stop_clear_of_file_locks(&[(lock_path.clone(), false)], |blocked| {
+            assert_eq!(blocked, [lock_path.clone()]);
+            drop(held.take());
+        })
+        .await
+        .unwrap();
+    assert!(
+        rejected > 0 && held.is_none(),
+        "the pause must reject a conflicting physical writer before accepting STOP"
+    );
+    let replacement = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    replacement.try_lock().unwrap();
+    assert!(host.stopped);
+}
+
+#[actix_web::test]
 async fn surviving_root_writer_rejects_old_output_after_real_host_lease_reclaim() {
     let mut fixture = Fixture::new().await;
     let a = fixture.start_a().await;
-    let events = EventTap::open(&fixture.client, &fixture.a, &format!("/events/{ROOT}")).await;
+    let events = EventTap::open(
+        &fixture.client,
+        &fixture.a,
+        &format!("/events/{}", fixture.root),
+    )
+    .await;
     // The account feed stays open after the token stream's terminal event.
     let account = EventTap::open(&fixture.client, &fixture.a, "/stream").await;
-    fixture.a.signal("-STOP");
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let status = Command::new("ps")
-                .args(["-o", "stat=", "-p", &fixture.a.child.id().to_string()])
-                .output()
-                .unwrap();
-            if String::from_utf8_lossy(&status.stdout)
-                .trim()
-                .starts_with('T')
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("fixture-owned A is stopped, not exited or cancelled");
+    let locks = fixture.pause_boundary_locks();
+    let rejected = fixture
+        .a
+        .stop_clear_of_file_locks(&locks, |_| {})
+        .await
+        .unwrap_or_else(|reason| {
+            panic!(
+                "{reason}; A {}; B {}; authority {:?}",
+                fixture.a.tail(),
+                fixture.b.tail(),
+                fixture.authority()
+            )
+        });
+    if rejected > 0 {
+        eprintln!("fixture rejected {rejected} pauses inside physical writer boundaries");
+    }
     // Actual wall time and the persisted lease decide expiry. No future `now`,
     // shortened sidecar, A finish, or external A claim substitutes for it.
     tokio::time::timeout(WAIT, async {
@@ -706,7 +915,7 @@ async fn surviving_root_writer_rejects_old_output_after_real_host_lease_reclaim(
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|entry| entry["session_id"] == ROOT)
+                .any(|entry| entry["session_id"] == fixture.root)
             {
                 break;
             }

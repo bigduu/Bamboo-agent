@@ -31,7 +31,7 @@ pub(super) struct ActorWriteHook {
 }
 
 impl ActorWriteHook {
-    fn install(
+    pub(super) fn install(
         store: &SessionStoreV2,
         file: &'static str,
         phase: DurableWritePhase,
@@ -69,7 +69,7 @@ impl ActorWriteHook {
         }
     }
 
-    fn wait_entered(&self) {
+    pub(super) fn wait_entered(&self) {
         let state = self.state.lock().unwrap();
         let (state, timeout) = self
             .wake
@@ -81,7 +81,7 @@ impl ActorWriteHook {
         );
     }
 
-    fn release(&self) {
+    pub(super) fn release(&self) {
         self.state.lock().unwrap().released = true;
         self.wake.notify_all();
     }

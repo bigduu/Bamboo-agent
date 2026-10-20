@@ -1,11 +1,103 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use bamboo_agent_core::tools::{
     normalize_tool_name, parse_tool_args, parse_tool_args_best_effort, ToolCall, ToolResult,
 };
+use sha2::{Digest, Sha256};
 
 const MAX_TOOL_CALLS_PER_ROUND: usize = 80;
 const MAX_CONSECUTIVE_FAILURES_PER_TOOL: usize = 3;
+const UNCHANGED_OBSERVATION_ROUNDS: usize = 3;
+const MAX_TRACKED_OBSERVATIONS: usize = 80;
+
+/// Compare complete successful filesystem-observation rounds.
+/// Keep fingerprints, not arguments or output, and forget everything at run end.
+#[derive(Debug, Clone, Default)]
+struct ObservationProgress {
+    current: Option<BTreeSet<[u8; 32]>>,
+    previous: Option<BTreeSet<[u8; 32]>>,
+    unchanged_rounds: usize,
+    last_round: Option<usize>,
+    last_call_ids: Vec<String>,
+    made_progress: bool,
+}
+
+impl ObservationProgress {
+    fn begin_round(&mut self, round: usize) {
+        if self
+            .last_round
+            .is_some_and(|last| last.checked_add(1) != Some(round))
+        {
+            self.previous = None;
+            self.unchanged_rounds = 0;
+        }
+        self.last_round = Some(round);
+        self.current = Some(BTreeSet::new());
+        self.last_call_ids.clear();
+        self.made_progress = false;
+    }
+
+    fn observe(&mut self, call: &ToolCall, outcome: &Result<ToolResult, String>) {
+        let Some(current) = self.current.as_mut() else {
+            return;
+        };
+        // Polling, waits, browser/MCP tools and mutations are deliberately outside
+        // this small allowlist. Do not infer observation semantics from a name suffix.
+        let Some(name) = ["Read", "GetFileInfo", "Glob", "Grep"]
+            .into_iter()
+            .find(|name| name.eq_ignore_ascii_case(call.function.name.trim()))
+        else {
+            self.current = None;
+            return;
+        };
+        let Ok(result) = outcome else {
+            self.current = None;
+            return;
+        };
+        if !result.success || !result.images.is_empty() || current.len() >= MAX_TRACKED_OBSERVATIONS
+        {
+            self.current = None;
+            return;
+        }
+        let Ok(mut arguments) = parse_tool_args(&call.function.arguments) else {
+            self.current = None;
+            return;
+        };
+        arguments.sort_all_objects();
+        let Ok(arguments) = serde_json::to_vec(&arguments) else {
+            self.current = None;
+            return;
+        };
+        let mut fingerprint = Sha256::new();
+        fingerprint.update(name.as_bytes());
+        fingerprint.update([0u8]);
+        fingerprint.update(arguments);
+        fingerprint.update([0u8]);
+        fingerprint.update(result.result.as_bytes());
+        current.insert(fingerprint.finalize().into());
+        if self.last_call_ids.len() < 8 {
+            self.last_call_ids.push(call.id.chars().take(129).collect());
+        }
+    }
+
+    fn finish_round(&mut self) -> Option<&'static str> {
+        let current = self.current.take().filter(|round| !round.is_empty());
+        self.made_progress = current
+            .as_ref()
+            .is_some_and(|round| self.previous.as_ref() != Some(round));
+        self.unchanged_rounds = match &current {
+            Some(round) if self.previous.as_ref() == Some(round) => {
+                self.unchanged_rounds.saturating_add(1)
+            }
+            Some(_) => 1,
+            None => 0,
+        };
+        self.previous = current;
+        (self.unchanged_rounds == UNCHANGED_OBSERVATION_ROUNDS).then_some(
+            "The same successful file observations returned unchanged information for three consecutive rounds. Use the evidence already collected, change your approach, or explain a concrete blocker. For intentional polling, wait between checks or use the appropriate status tool.",
+        )
+    }
+}
 
 const STRICT_ARGUMENT_TOOL_NAMES: [&str; 11] = [
     "Write",
@@ -21,9 +113,20 @@ const STRICT_ARGUMENT_TOOL_NAMES: [&str; 11] = [
     "memory_note",
 ];
 
-fn normalize_tool_for_policy(raw_tool_name: &str) -> String {
-    let name = bamboo_tools::normalize_tool_ref(raw_tool_name)
-        .unwrap_or_else(|| normalize_tool_name(raw_tool_name).trim().to_string());
+fn normalize_tool_for_policy(raw_tool_name: &str, admitted_execution_name: Option<&str>) -> String {
+    if let Some(execution_name) = admitted_execution_name {
+        // Admission already selected an exact registered owner. Legacy alias
+        // normalization here would charge a Root/custom failure to SubAgent.
+        return execution_name.to_owned();
+    }
+    let selected = raw_tool_name.trim();
+    let name = bamboo_tools::normalize_tool_ref(selected)
+        .unwrap_or_else(|| normalize_tool_name(selected).trim().to_string());
+    if matches!(name.as_str(), "exec_command" | "write_stdin") {
+        // Only the admitted exact identity can share a shell circuit. An exact
+        // custom vendor::exec_command keeps its ordinary outcome and own key.
+        return selected.to_owned();
+    }
     if bamboo_tools::resolve_alias(&name)
         .unwrap_or(&name)
         .eq_ignore_ascii_case("SubAgent")
@@ -34,11 +137,25 @@ fn normalize_tool_for_policy(raw_tool_name: &str) -> String {
     }
 }
 
+#[cfg(test)]
 pub(super) fn validate_tool_call_arguments(tool_call: &ToolCall) -> Result<(), String> {
-    let normalized_tool_name = normalize_tool_for_policy(&tool_call.function.name);
-    if !STRICT_ARGUMENT_TOOL_NAMES
-        .iter()
-        .any(|name| name.eq_ignore_ascii_case(&normalized_tool_name))
+    validate_tool_call_arguments_for_execution(tool_call, "")
+}
+
+pub(super) fn validate_tool_call_arguments_for_execution(
+    tool_call: &ToolCall,
+    execution_name: &str,
+) -> Result<(), String> {
+    let exact_shell = matches!(execution_name, "exec_command" | "write_stdin");
+    let normalized_tool_name = if exact_shell {
+        execution_name.to_owned()
+    } else {
+        normalize_tool_for_policy(&tool_call.function.name, None)
+    };
+    if !exact_shell
+        && !STRICT_ARGUMENT_TOOL_NAMES
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&normalized_tool_name))
     {
         return Ok(());
     }
@@ -120,6 +237,9 @@ pub(crate) struct ToolPolicyGuard {
     max_consecutive_failures_per_tool: usize,
     executed_calls: usize,
     consecutive_failures: HashMap<String, usize>,
+    observation_progress: ObservationProgress,
+    pub(super) quiet_polls: super::quiet_poll::QuietPollGuard,
+    progress_feedback: super::progress_feedback::ProgressFeedbackBudget,
 }
 
 impl ToolPolicyGuard {
@@ -132,6 +252,9 @@ impl ToolPolicyGuard {
             max_consecutive_failures_per_tool,
             executed_calls: 0,
             consecutive_failures: HashMap::new(),
+            observation_progress: ObservationProgress::default(),
+            quiet_polls: super::quiet_poll::QuietPollGuard::default(),
+            progress_feedback: super::progress_feedback::ProgressFeedbackBudget::default(),
         }
     }
 
@@ -161,12 +284,76 @@ impl ToolPolicyGuard {
         ))
     }
 
+    pub(super) fn observe_raw_observation(
+        &mut self,
+        tool_call: &ToolCall,
+        outcome: &Result<ToolResult, String>,
+    ) {
+        self.observation_progress.observe(tool_call, outcome);
+    }
+
+    pub(super) fn begin_observation_round(&mut self, round: usize) {
+        self.observation_progress.begin_round(round);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observation_progress_hint(&mut self) -> Option<&'static str> {
+        self.observation_progress.finish_round()
+    }
+
+    /// Consume one completed batch. Only actual raw evidence can end a recovery
+    /// episode; hidden wakeups and model claims cannot refund its finite budget.
+    pub(crate) fn feedback_for_next_round(
+        &mut self,
+        active: bool,
+    ) -> super::progress_feedback::FeedbackDecision {
+        use super::progress_feedback::{FeedbackDecision, ProgressEvidence};
+        let legacy_hint = self.observation_progress.finish_round();
+        if !active {
+            return FeedbackDecision::Continue(legacy_hint.map(str::to_owned));
+        }
+        let quiet_evidence = self.quiet_polls.take_feedback_evidence();
+        let made_progress =
+            self.observation_progress.made_progress || self.quiet_polls.take_observed_progress();
+        let evidence = quiet_evidence.or_else(|| {
+            (self.observation_progress.unchanged_rounds >= UNCHANGED_OBSERVATION_ROUNDS).then(
+                || ProgressEvidence::UnchangedFiles {
+                    consecutive_rounds: self.observation_progress.unchanged_rounds,
+                    observation_count: self
+                        .observation_progress
+                        .previous
+                        .as_ref()
+                        .map_or(0, BTreeSet::len),
+                    tool_call_ids: self.observation_progress.last_call_ids.clone(),
+                },
+            )
+        });
+        self.progress_feedback.next_round(evidence, made_progress)
+    }
+
+    pub(crate) fn reset_observation_progress(&mut self) {
+        self.observation_progress = ObservationProgress::default();
+        self.quiet_polls = super::quiet_poll::QuietPollGuard::default();
+        self.progress_feedback.reset_for_human_input();
+    }
+
+    #[cfg(test)]
     pub(super) fn check_before_execution(
         &self,
         tool_call: &ToolCall,
         reserved_calls: usize,
     ) -> Result<(), ToolPolicyPrecheckViolation> {
-        let normalized_tool_name = normalize_tool_for_policy(&tool_call.function.name);
+        self.check_before_execution_for_name(tool_call, reserved_calls, None)
+    }
+
+    pub(super) fn check_before_execution_for_name(
+        &self,
+        tool_call: &ToolCall,
+        reserved_calls: usize,
+        admitted_execution_name: Option<&str>,
+    ) -> Result<(), ToolPolicyPrecheckViolation> {
+        let normalized_tool_name =
+            normalize_tool_for_policy(&tool_call.function.name, admitted_execution_name);
         let projected_executions = self.executed_calls.saturating_add(reserved_calls);
 
         if projected_executions >= self.max_tool_calls_per_round {
@@ -192,16 +379,62 @@ impl ToolPolicyGuard {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn observe_outcome(
         &mut self,
         tool_call: &ToolCall,
         outcome: &Result<ToolResult, String>,
     ) {
+        self.observe_accounted_outcome(
+            tool_call,
+            outcome,
+            None,
+            super::per_call::ShellAccountingOutcome::Ordinary,
+        );
+    }
+
+    pub(super) fn observe_execution_outcome(
+        &mut self,
+        tool_call: &ToolCall,
+        outcome: &super::per_call::ToolExecutionOutcome,
+        admitted_execution_name: Option<&str>,
+    ) {
+        self.observe_accounted_outcome(
+            tool_call,
+            &outcome.result,
+            admitted_execution_name,
+            super::per_call::shell_accounting_outcome(outcome, admitted_execution_name),
+        );
+    }
+
+    fn observe_accounted_outcome(
+        &mut self,
+        tool_call: &ToolCall,
+        outcome: &Result<ToolResult, String>,
+        admitted_execution_name: Option<&str>,
+        shell_accounting: super::per_call::ShellAccountingOutcome,
+    ) {
         self.executed_calls = self.executed_calls.saturating_add(1);
 
-        let normalized_tool_name = normalize_tool_for_policy(&tool_call.function.name);
+        let normalized_tool_name =
+            normalize_tool_for_policy(&tool_call.function.name, admitted_execution_name);
 
-        let succeeded = matches!(outcome, Ok(result) if result.success);
+        let succeeded = match shell_accounting {
+            super::per_call::ShellAccountingOutcome::Ordinary => {
+                matches!(outcome, Ok(result) if result.success)
+            }
+            super::per_call::ShellAccountingOutcome::Pending => {
+                self.observation_progress.current = None;
+                return;
+            }
+            super::per_call::ShellAccountingOutcome::Terminal(success) => success,
+        };
+
+        // Compression/budget enforcement can turn raw success into failure.
+        // Such a round must not produce a successful-observation advisory.
+        if !succeeded {
+            self.observation_progress.current = None;
+        }
 
         if succeeded {
             self.consecutive_failures.remove(&normalized_tool_name);
@@ -331,6 +564,62 @@ mod tests {
     }
 
     #[test]
+    fn pending_shell_calls_consume_round_allowance_without_resetting_failure_streaks() {
+        let call = tool_call("default::exec_command", "{}");
+        let outcome =
+            |status: &str, needs_human: bool| super::super::per_call::ToolExecutionOutcome {
+                output_cap: None,
+                portable_tool: None,
+                permission_replay_origin: None,
+                result: Ok(ToolResult::text(
+                    true,
+                    serde_json::json!({"status":status, "exit_code":7, "output":""}).to_string(),
+                )),
+                needs_human: needs_human.then(|| bamboo_agent_core::PendingQuestion {
+                    tool_call_id: call.id.clone(),
+                    tool_name: call.function.name.clone(),
+                    question: "Approve?".into(),
+                    options: vec![],
+                    allow_custom: false,
+                    source: bamboo_agent_core::PendingQuestionSource::PauseTool,
+                }),
+                post_tool_hook_eligible: false,
+                managed_running_violation: false,
+                tool_duration: std::time::Duration::ZERO,
+            };
+        let mut guard = ToolPolicyGuard::new(4, 3);
+        for _ in 0..2 {
+            guard.observe_execution_outcome(
+                &call,
+                &outcome("completed", false),
+                Some("exec_command"),
+            );
+        }
+        guard.begin_observation_round(0);
+        guard.observe_raw_observation(
+            &tool_call("Read", "{}"),
+            &Ok(ToolResult::text(true, "same file")),
+        );
+        assert!(guard.observation_progress.current.is_some());
+        guard.observe_execution_outcome(&call, &outcome("running", false), Some("exec_command"));
+        assert!(guard.observation_progress.current.is_none());
+        guard.observe_execution_outcome(&call, &outcome("completed", true), Some("exec_command"));
+        assert_eq!(guard.consecutive_failures.get("exec_command"), Some(&2));
+        assert!(matches!(
+            guard.check_before_execution_for_name(&call, 0, Some("exec_command")),
+            Err(ToolPolicyPrecheckViolation::RoundToolLimit { .. })
+        ));
+        let mut error = outcome("completed", false);
+        error.result = Err("transport failed before dispatch".into());
+        guard.observe_execution_outcome(&call, &error, Some("exec_command"));
+        guard.max_tool_calls_per_round = 80;
+        assert!(matches!(
+            guard.check_before_execution_for_name(&call, 0, Some("exec_command")),
+            Err(ToolPolicyPrecheckViolation::ToolCircuitOpen { .. })
+        ));
+    }
+
+    #[test]
     fn only_delegation_failures_survive_round_boundaries() {
         let mut guard = ToolPolicyGuard::new(2, 3);
         let delegation = tool_call("SubAgent", "{}");
@@ -380,5 +669,187 @@ mod tests {
             guard.observe_outcome(&tool_call(name, "{}"), &Err("invalid arguments".into()));
         }
         assert!(guard.delegation_failure_message().is_some());
+    }
+
+    fn observation_round(
+        guard: &mut ToolPolicyGuard,
+        round: usize,
+        calls: &[(&str, &str, Result<ToolResult, String>)],
+    ) -> bool {
+        guard.begin_round(80, 3);
+        guard.begin_observation_round(round);
+        for (name, args, result) in calls {
+            let call = tool_call(name, args);
+            guard.observe_raw_observation(&call, result);
+            guard.observe_outcome(&call, result);
+        }
+        guard.observation_progress_hint().is_some()
+    }
+
+    #[test]
+    fn observation_progress_hints_once_per_streak_and_resets_for_new_run() {
+        let calls = [(
+            "Read",
+            r#"{"path":"file"}"#,
+            Ok(ToolResult::text(true, "same")),
+        )];
+        let mut guard = ToolPolicyGuard::default();
+        for round in 0..8 {
+            assert_eq!(observation_round(&mut guard, round, &calls), round == 2);
+            assert!(guard
+                .check_before_execution(&tool_call("Read", "{}"), 0)
+                .is_ok());
+        }
+        let mut fresh = ToolPolicyGuard::default();
+        assert!(!observation_round(&mut fresh, 0, &calls));
+        assert!(!observation_round(&mut fresh, 1, &calls));
+        assert!(observation_round(&mut fresh, 2, &calls));
+        fresh.reset_observation_progress();
+        assert!(!observation_round(&mut fresh, 3, &calls));
+    }
+
+    #[test]
+    fn observation_progress_canonicalizes_object_keys_and_counts_batches_once() {
+        let mut guard = ToolPolicyGuard::default();
+        for round in 0..3 {
+            let args = if round == 1 {
+                r#"{"range":{"end":3,"start":1},"path":"file"}"#
+            } else {
+                r#"{"path":"file","range":{"start":1,"end":3}}"#
+            };
+            let calls = (0..8)
+                .map(|_| ("Read", args, Ok(ToolResult::text(true, "same"))))
+                .collect::<Vec<_>>();
+            assert_eq!(observation_round(&mut guard, round, &calls), round == 2);
+        }
+    }
+
+    #[test]
+    fn observation_progress_changed_evidence_arguments_and_round_gaps_reset_streak() {
+        for (before, after, output) in [
+            (r#"{"path":"file"}"#, r#"{"path":"file"}"#, "changed"),
+            (r#"{"path":"file"}"#, r#"{"path":"other"}"#, "same"),
+            (r#"{"paths":["a","b"]}"#, r#"{"paths":["b","a"]}"#, "same"),
+        ] {
+            let baseline = [("Read", before, Ok(ToolResult::text(true, "same")))];
+            let changed = ("Read", after, Ok(ToolResult::text(true, output)));
+            let mut guard = ToolPolicyGuard::default();
+            assert!(!observation_round(&mut guard, 0, &baseline));
+            assert!(!observation_round(&mut guard, 1, &baseline));
+            assert!(!observation_round(&mut guard, 2, &[changed]));
+            assert!(!observation_round(&mut guard, 3, &baseline));
+            assert!(!observation_round(&mut guard, 4, &baseline));
+            assert!(observation_round(&mut guard, 5, &baseline));
+            assert!(!observation_round(&mut guard, 7, &baseline));
+        }
+    }
+
+    #[test]
+    fn observation_progress_failures_mutations_and_polling_reset_streak() {
+        let observation = ("Read", "{}", Ok(ToolResult::text(true, "same")));
+        for breaker in [
+            ("Read", "{}", Err("missing".to_string())),
+            ("Read", "{}", Ok(ToolResult::text(false, "failed"))),
+            ("Write", "{}", Ok(ToolResult::text(true, "same"))),
+            ("BashOutput", "{}", Ok(ToolResult::text(true, "same"))),
+            ("Sleep", "{}", Ok(ToolResult::text(true, "same"))),
+            ("mcp::Read", "{}", Ok(ToolResult::text(true, "same"))),
+        ] {
+            let mut guard = ToolPolicyGuard::default();
+            assert!(!observation_round(&mut guard, 0, &[observation.clone()]));
+            assert!(!observation_round(&mut guard, 1, &[observation.clone()]));
+            assert!(!observation_round(
+                &mut guard,
+                2,
+                &[observation.clone(), breaker]
+            ));
+            assert!(!observation_round(&mut guard, 3, &[observation.clone()]));
+            assert!(!observation_round(&mut guard, 4, &[observation.clone()]));
+            assert!(observation_round(&mut guard, 5, &[observation.clone()]));
+        }
+    }
+    #[test]
+    fn versioned_spawn_policy_accounting_keeps_root_and_child_failure_circuits_independent() {
+        for (owner, reference) in [
+            ("spawn_session", "default::spawnSession"),
+            ("vendor::spawn_session", "vendor::spawn_session"),
+            ("spawnSession", "spawnSession"),
+        ] {
+            let call = tool_call(reference, "{}");
+            let child = tool_call("SubAgent", "{}");
+            let mut guard = ToolPolicyGuard::default();
+            for _ in 0..3 {
+                guard.begin_round(80, 3);
+                guard.observe_accounted_outcome(
+                    &call,
+                    &Err("correctable Project/workspace input".into()),
+                    Some(owner),
+                    super::super::per_call::ShellAccountingOutcome::Ordinary,
+                );
+                assert!(
+                    guard
+                        .check_before_execution_for_name(&child, 0, Some("SubAgent"))
+                        .is_ok(),
+                    "{owner}"
+                );
+            }
+            assert!(guard.delegation_failure_message().is_none(), "{owner}");
+            guard.begin_round(80, 3);
+            assert!(
+                guard
+                    .check_before_execution_for_name(&call, 0, Some(owner))
+                    .is_ok(),
+                "{owner}"
+            );
+            for _ in 0..3 {
+                guard.observe_accounted_outcome(
+                    &call,
+                    &Err("same exact owner failed again".into()),
+                    Some(owner),
+                    super::super::per_call::ShellAccountingOutcome::Ordinary,
+                );
+            }
+            assert!(guard
+                .check_before_execution_for_name(&call, 0, Some(owner))
+                .is_err());
+            for other_owner in ["spawn_session", "vendor::spawn_session", "spawnSession"] {
+                if other_owner != owner {
+                    let other = tool_call(other_owner, "{}");
+                    assert!(
+                        guard.check_before_execution_for_name(&other, 0, Some(other_owner)).is_ok(),
+                        "{owner} failures must not open the distinct exact owner {other_owner} circuit"
+                    );
+                }
+            }
+            assert!(guard
+                .check_before_execution_for_name(&child, 0, Some("SubAgent"))
+                .is_ok());
+            guard.begin_round(80, 3);
+            assert!(
+                guard
+                    .check_before_execution_for_name(&call, 0, Some(owner))
+                    .is_ok(),
+                "{owner}"
+            );
+            for _ in 0..3 {
+                guard.observe_accounted_outcome(
+                    &child,
+                    &Err("actual Child delegation failed".into()),
+                    Some("SubAgent"),
+                    super::super::per_call::ShellAccountingOutcome::Ordinary,
+                );
+            }
+            guard.begin_round(80, 3);
+            assert!(guard
+                .check_before_execution_for_name(&child, 0, Some("SubAgent"))
+                .is_err());
+            assert!(
+                guard
+                    .check_before_execution_for_name(&call, 0, Some(owner))
+                    .is_ok(),
+                "{owner}"
+            );
+            assert!(guard.delegation_failure_message().is_some());
+        }
     }
 }

@@ -72,11 +72,13 @@ impl GuideBuildContext {
                 "For multi-step or non-trivial work, use Task to maintain a shared task list and keep statuses updated continuously.",
                 "Keep exactly one Task item in in_progress whenever possible; mark items completed immediately after finishing.",
                 "Read existing files before editing them. Use Edit for targeted replacements and Write only for full-file writes.",
-                "Use Glob for file discovery and Grep for content search. Do not use Bash for find/grep/cat/head/tail/sed/awk/echo style file operations when dedicated tools exist.",
+                "Use Glob for file discovery and Grep for content search. Do not use exec_command for find/grep/cat/head/tail/sed/awk/echo style file operations when dedicated tools exist.",
                 "For code search, narrow scope first: Glob -> Grep(files_with_matches) -> Read -> Grep(content/multiline).",
                 "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
-                "Use Bash only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
-                "When multiple Bash commands are independent, run them in parallel tool calls. For dependent commands, chain with &&.",
+                "Use exec_command only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
+                "When multiple exec_command calls are independent, run them in parallel. For dependent commands, chain with &&.",
+                "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms to bound each wait; completion does not send an automatic user notification. Unread completed results expire five minutes after completion, including during a diagnostic pause; handles do not survive Host restart. Poll required commands to a terminal result before finishing the task.",
+                "When polling reports sustained silence and repeated empty readouts, follow its advisory: do useful work or check one command-owned progress signal before polling again. Quiet output or an existing report does not prove completion; keep the handle, continue waiting when appropriate, and report a concrete blocker if progress cannot be established. A Human-controlled Root can pause polling after the reminder is repeatedly ignored, retaining the command handle for continuation. Do not stop/restart a command only because it is quiet.",
                 "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
                 "For commit requests: inspect git status, git diff, and recent git log first; commit only when explicitly requested; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
                 "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
@@ -88,11 +90,13 @@ impl GuideBuildContext {
                 "For multi-step or non-trivial work, use Task to maintain a shared task list and keep statuses updated continuously.",
                 "Keep exactly one Task item in in_progress whenever possible; mark items completed immediately after finishing.",
                 "Read existing files before editing them. Use Edit for targeted replacements and Write only for full-file writes.",
-                "Use Glob for file discovery and Grep for content search. Do not use Bash for find/grep/cat/head/tail/sed/awk/echo style file operations when dedicated tools exist.",
+                "Use Glob for file discovery and Grep for content search. Do not use exec_command for find/grep/cat/head/tail/sed/awk/echo style file operations when dedicated tools exist.",
                 "For code search, narrow scope first: Glob -> Grep(files_with_matches) -> Read -> Grep(content/multiline).",
                 "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
-                "Use Bash only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
-                "When multiple Bash commands are independent, run them in parallel tool calls. For dependent commands, chain with &&.",
+                "Use exec_command only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
+                "When multiple exec_command calls are independent, run them in parallel. For dependent commands, chain with &&.",
+                "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms to bound each wait; completion does not send an automatic user notification. Unread completed results expire five minutes after completion, including during a diagnostic pause; handles do not survive Host restart. Poll required commands to a terminal result before finishing the task.",
+                "When polling reports sustained silence and repeated empty readouts, follow its advisory: do useful work or check one command-owned progress signal before polling again. Quiet output or an existing report does not prove completion; keep the handle, continue waiting when appropriate, and report a concrete blocker if progress cannot be established. A Human-controlled Root can pause polling after the reminder is repeatedly ignored, retaining the command handle for continuation. Do not stop/restart a command only because it is quiet.",
                 "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
                 "For commit requests: inspect git status, git diff, and recent git log first; commit only when explicitly requested; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
                 "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
@@ -132,6 +136,23 @@ mod tests {
             let guidance = context.best_practices().join("\n");
             assert!(guidance.contains("delegate planning to its read-only child"));
             assert!(guidance.contains("already-active legacy plan-mode session"));
+        }
+    }
+
+    #[test]
+    fn best_practices_teach_model_owned_exec_polling() {
+        for language in [GuideLanguage::Chinese, GuideLanguage::English] {
+            let context = GuideBuildContext {
+                language,
+                ..GuideBuildContext::default()
+            };
+            let guidance = context.best_practices().join("\n");
+            assert!(guidance.contains("exec_command"));
+            assert!(guidance.contains("write_stdin with empty chars"));
+            assert!(guidance.contains("does not send an automatic user notification"));
+            assert!(guidance.contains("follow its advisory"));
+            assert!(guidance.contains("does not prove completion"));
+            assert!(!guidance.contains("Bash"));
         }
     }
 

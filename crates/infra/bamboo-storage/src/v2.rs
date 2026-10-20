@@ -74,7 +74,10 @@ pub use actor_model_context::{
 pub use actor_transcript::{
     ActorTranscriptAppend, ActorTranscriptAppendError, ActorTranscriptGroupAppend,
 };
-pub use broker_receipt::{BrokerTerminalReceipt, BrokerTerminalRoute, HostToolYield};
+pub use broker_receipt::{
+    BrokerTerminalCompleteness, BrokerTerminalReceipt, BrokerTerminalRoute,
+    HostTerminalCompleteness, HostToolYield,
+};
 #[cfg(test)]
 mod actor_directory_lifetime_tests;
 mod actor_snapshot;
@@ -89,6 +92,9 @@ mod actor_snapshot_tests;
 mod actor_snapshot_windows_tests;
 #[cfg(test)]
 mod actor_transcript_tests;
+mod child_actor_runtime;
+#[cfg(test)]
+mod child_actor_runtime_tests;
 #[cfg(test)]
 mod child_deletion_tests;
 mod child_project;
@@ -101,12 +107,19 @@ mod root_actor_input;
 #[cfg(test)]
 mod root_actor_input_tests;
 mod root_actor_runtime;
+mod scoped_loop_control;
+#[cfg(test)]
+mod scoped_loop_control_tests;
+pub(crate) mod scoped_transport_expiry;
+#[cfg(test)]
+mod session_compatibility_tests;
 mod title_observations;
 pub use host_registry::FileHostRegistry;
 #[cfg(test)]
 mod default_actor_context_tests;
 #[cfg(test)]
 mod host_registry_tests;
+mod parent_question_answer_proof;
 mod parent_question_checkpoint;
 #[cfg(test)]
 mod startup_sidecar_tests;
@@ -524,6 +537,22 @@ impl Drop for SessionLifecycleReadGuard {
     }
 }
 
+/// Existing authority locks retained by one peer Inbox admission.
+pub(crate) struct PeerDeliveryGuard {
+    pub(crate) inbox_dir: PathBuf,
+    tree: Option<ActorTreeWriteGuard>,
+    sessions: Vec<SessionWriteGuard>,
+    _task: RuntimeTaskTransactionReadGuard,
+    _lifecycle: SessionLifecycleReadGuard,
+}
+
+impl Drop for PeerDeliveryGuard {
+    fn drop(&mut self) {
+        drop(self.tree.take());
+        while let Some(_guard) = self.sessions.pop() {}
+    }
+}
+
 pub(crate) struct SessionLifecycleWriteGuard {
     _process: OwnedRwLockWriteGuard<()>,
     file: std::fs::File,
@@ -547,6 +576,37 @@ struct SessionDeletionGuards {
 pub struct SessionCopyProjectionGuard {
     _lifecycle: SessionLifecycleWriteGuard,
     _runtime_task: RuntimeTaskTransactionWriteGuard,
+}
+
+fn reject_incompatible_session_write(session: &Session) -> io::Result<()> {
+    session.check_execution_compatibility().map_err(|error| {
+        // Existing publisher fences already suppress cache publication of a
+        // rejected Session snapshot; do not turn this refusal into a checkpoint.
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            bamboo_domain::SessionAuthorityConflict(error.to_string()),
+        )
+    })
+}
+
+fn reject_session_version_change(incoming: &Session, durable: &Session) -> io::Result<()> {
+    // Main owns the behavior stamp, while the runtime sidecar owns the latest
+    // retained control state. Do not mistake Main's older control snapshot for
+    // the current state when a valid, compatible sidecar exists.
+    // Self-comparison rejects unsupported behavior stamps only. The current
+    // sidecar control schema is checked separately before either file is saved.
+    if !bamboo_domain::same_session_tool_contract(durable.session_version, durable.session_version)
+    {
+        reject_incompatible_session_write(durable)?;
+    }
+    if incoming.created_at == durable.created_at
+        && incoming.session_version != durable.session_version
+    {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, bamboo_domain::SessionAuthorityConflict(
+            "session_version_change_requires_new_session: existing behavior stamps are not migrated by ordinary saves".into(),
+        )));
+    }
+    Ok(())
 }
 
 /// Build the sidecar snapshot: the full session minus its `messages` history.
@@ -578,6 +638,7 @@ pub(crate) fn runtime_sidecar_snapshot(session: &Session) -> Session {
 fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
     match sidecar {
         Some(mut side) => {
+            side.observe_main_session_version(main.session_version);
             let admission = main
                 .runtime_metadata
                 .as_ref()
@@ -633,6 +694,20 @@ fn actor_tree_session_projection(session: &Session) -> serde_json::Value {
         "project_id": session.project_id_meta(),
         "authority_identity": session.authority_identity,
         "root_tool_authority_revision": session.root_tool_authority_revision,
+        // Narrow diagnostic evidence changes wake existing at1 subscribers.
+        // No private payload, resource instance or query-time expiry is a
+        // public event; this tuple is only an internal equality comparison.
+        "local_task": [
+            session.metadata.get("runtime.local_task.state"),
+            session.metadata.get("runtime.local_task.run_id"),
+            session.metadata.get("runtime.local_task.child_birth"),
+            session.metadata.get("runtime.local_task.observed_at"),
+            session.metadata.get("runtime.local_task.reason"),
+            session.metadata.get("runtime.local_task.instance"),
+            session.metadata.get("runtime.kind"),
+            session.metadata.get("external.agent_id"),
+            session.metadata.get("external.protocol"),
+        ],
     })
 }
 
@@ -1452,11 +1527,14 @@ const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
 fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     let now = Utc::now();
     let mut copy = source.clone();
+    copy.session_version = Some(bamboo_domain::CURRENT_SESSION_VERSION);
+    copy.observed_runtime_session_version = None;
     copy.authority_identity = SessionAuthorityIdentity::Ordinary;
     copy.supervisor_management = None;
     copy.id = new_id.to_string();
     copy.kind = SessionKind::Root;
     copy.parent_session_id = None;
+    copy.parent_created_at = None;
     copy.root_session_id = new_id.to_string();
     copy.spawn_depth = 0;
     copy.title = format!("{} (copy)", source.title.trim_end());
@@ -2083,6 +2161,7 @@ impl SessionStoreV2 {
                     || sidecar.kind != main.kind
                     || sidecar.root_session_id != main.root_session_id
                     || sidecar.parent_session_id != main.parent_session_id
+                    || sidecar.parent_created_at != main.parent_created_at
                     || sidecar.spawn_depth != main.spawn_depth
                     || sidecar.created_at != main.created_at
                 {
@@ -2553,6 +2632,160 @@ impl SessionStoreV2 {
             _process: process,
             file,
         })
+    }
+
+    /// Validate both observations under the locks held through Inbox commit.
+    /// Private canonical reads avoid reentering Task or Session locks.
+    pub(crate) async fn lock_peer_delivery(
+        &self,
+        source: &bamboo_domain::ActorSession,
+        target: &bamboo_domain::ActorSession,
+        reply_to: Option<&SessionMessageEnvelope>,
+    ) -> io::Result<PeerDeliveryGuard> {
+        let denied = || other_io_error("peer Session identity or tree changed");
+        if source.actor_id == target.actor_id
+            || source.root_actor_id != target.root_actor_id
+            || source.project_id != target.project_id
+        {
+            return Err(denied());
+        }
+        for id in [&source.actor_id, &target.actor_id, &source.root_actor_id] {
+            validate_session_id(id)?;
+        }
+        let matches = |current: &bamboo_domain::ActorSession,
+                       expected: &bamboo_domain::ActorSession| {
+            current.schema_version == expected.schema_version
+                && current.actor_id == expected.actor_id
+                && current.session_created_at == expected.session_created_at
+                && current.parent_actor_id == expected.parent_actor_id
+                && current.root_actor_id == expected.root_actor_id
+                && current.spawn_depth == expected.spawn_depth
+                && current.project_id == expected.project_id
+        };
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let mut ids = vec![(0, source.root_actor_id.as_str())];
+        for expected in [source, target] {
+            let current = self
+                .peer_delivery_actor(&expected.actor_id, &expected.root_actor_id)
+                .await?;
+            if !matches(&current, expected) {
+                return Err(denied());
+            }
+            ids.push((current.spawn_depth, expected.actor_id.as_str()));
+        }
+        // ParentQuestion also locks ancestor before child. Canonical depths
+        // prevent forged observations from selecting a conflicting order.
+        ids.sort_unstable();
+        ids.dedup();
+        let mut sessions = Vec::with_capacity(ids.len());
+        for (_, id) in ids {
+            sessions.push(self.acquire_session_maintenance_lock(id).await?);
+        }
+        // Writers take the same tree lock after their Session lock. It freezes
+        // ancestor context without acquiring ancestor Session locks out of order.
+        let tree = self
+            .acquire_actor_tree_write_guard(&source.root_actor_id)
+            .await?;
+        let guard = PeerDeliveryGuard {
+            inbox_dir: self
+                .abs_path_from_rel(&if target.actor_id == target.root_actor_id {
+                    Self::root_rel_path(&target.actor_id)
+                } else {
+                    Self::child_rel_path(&target.root_actor_id, &target.actor_id)
+                })
+                .join("inbox"),
+            tree: Some(tree),
+            sessions,
+            _task: task,
+            _lifecycle: lifecycle,
+        };
+        for expected in [source, target] {
+            let mut current = self
+                .peer_delivery_actor(&expected.actor_id, &expected.root_actor_id)
+                .await?;
+            if !matches(&current, expected) {
+                return Err(denied());
+            }
+            let mut seen = HashSet::from([current.actor_id.clone()]);
+            while let Some(parent_id) = &current.parent_actor_id {
+                if !seen.insert(parent_id.clone()) || seen.len() > 5000 {
+                    return Err(denied());
+                }
+                let parent = self
+                    .peer_delivery_actor(parent_id, &expected.root_actor_id)
+                    .await?;
+                // Preserve the existing owned-tree reader's legacy semantics:
+                // no new parent_created_at or Actor-ledger prerequisite.
+                if parent.project_id != expected.project_id
+                    || parent.spawn_depth.checked_add(1) != Some(current.spawn_depth)
+                    || parent.session_created_at > current.session_created_at
+                {
+                    return Err(denied());
+                }
+                current = parent;
+            }
+            if current.actor_id != expected.root_actor_id
+                || current.spawn_depth != 0
+                || seen.len() != expected.spawn_depth as usize + 1
+            {
+                return Err(denied());
+            }
+        }
+        if let Some(proof) = reply_to {
+            // Use a private canonical read while the source Session writer and
+            // lifecycle locks are retained. Reentering the public loader could
+            // deadlock behind a queued lifecycle writer. The same guard keeps
+            // this received proof present through the physical Inbox commit.
+            let current = self
+                .peer_delivery_session(&source.actor_id, &source.root_actor_id)
+                .await?;
+            if !current
+                .messages
+                .iter()
+                .any(|message| is_matching_session_message(message, proof))
+            {
+                return Err(other_io_error("peer reply proof changed before admission"));
+            }
+        }
+        Ok(guard)
+    }
+
+    async fn peer_delivery_actor(
+        &self,
+        id: &str,
+        root_id: &str,
+    ) -> io::Result<bamboo_domain::ActorSession> {
+        let session = self.peer_delivery_session(id, root_id).await?;
+        bamboo_domain::ActorSession::from_session(&session)
+            .map_err(|error| other_io_error(error.to_string()))
+    }
+
+    async fn peer_delivery_session(&self, id: &str, root_id: &str) -> io::Result<Session> {
+        let kind = if id == root_id {
+            SessionKind::Root
+        } else {
+            SessionKind::Child
+        };
+        let rel = if kind == SessionKind::Root {
+            Self::root_rel_path(id)
+        } else {
+            Self::child_rel_path(root_id, id)
+        };
+        let session = self
+            .load_session_from_dir_strict(&self.abs_path_from_rel(&rel), id, kind, root_id)
+            .await?
+            .ok_or_else(|| other_io_error("peer Session no longer exists"))?;
+        if session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|m| m.project_id.as_ref())
+            .zip(session.metadata.get("project_id"))
+            .is_some_and(|(typed, legacy)| typed != legacy)
+        {
+            return Err(other_io_error("peer Session Project mirror changed"));
+        }
+        Ok(session)
     }
 
     async fn lock_session_lifecycle_exclusive(&self) -> io::Result<SessionLifecycleWriteGuard> {
@@ -3033,15 +3266,25 @@ impl SessionStoreV2 {
         &self,
         session_id: &str,
     ) -> io::Result<Option<Session>> {
+        Ok(self
+            .load_runtime_control_plane_boxed_unchecked(session_id)
+            .await?
+            .map(|session| *session))
+    }
+
+    async fn load_runtime_control_plane_boxed_unchecked(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Box<Session>>> {
         validate_session_id(session_id)?;
         if session_id == DEFAULT_SUPERVISOR_SESSION_ID {
             if let Some(root) = self.load_root_authority_unchecked(session_id).await? {
-                return Ok(Some(root));
+                return Ok(Some(Box::new(root)));
             }
             // An Ordinary Child may already own this ID in another tree.
             // Only canonical Root absence permits its normal control-plane read.
         }
-        if let Some(side) = self.read_runtime_sidecar(session_id).await? {
+        if let Some(side) = self.read_runtime_sidecar_boxed(session_id).await? {
             self.validate_root_tool_authority_against_proof(session_id, &side)
                 .await?;
             return Ok(self.session_lifetime_is_live(&side).await?.then_some(side));
@@ -3059,7 +3302,7 @@ impl SessionStoreV2 {
             Err(error) => return Err(error),
         };
         compact_main::validate_full_main(raw.as_bytes())?;
-        let mut session: Session = serde_json::from_str(&raw)
+        let mut session: Box<Session> = serde_json::from_str(&raw)
             .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
         supervisor::validate_identity(&session)?;
         self.validate_root_tool_authority_overlay(session_id, &session, None)
@@ -3341,7 +3584,9 @@ impl SessionStoreV2 {
                 ),
             ));
         };
-        if main.parent_session_id != current.parent_session_id {
+        if main.parent_session_id != current.parent_session_id
+            || main.parent_created_at != current.parent_created_at
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -3377,7 +3622,9 @@ impl SessionStoreV2 {
                 main.kind,
                 &main.root_session_id,
             )?;
-            if sidecar.parent_session_id != main.parent_session_id {
+            if sidecar.parent_session_id != main.parent_session_id
+                || sidecar.parent_created_at != main.parent_created_at
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("runtime Task recovery parent identity mismatch for {session_id}"),
@@ -3558,13 +3805,10 @@ impl SessionStoreV2 {
             .map_err(RuntimeTaskJournalFinalizeError::RecoveryRequired)
     }
 
-    async fn restore_runtime_task_undo(
+    async fn prepare_runtime_task_undo(
         &self,
         undo: &TaskControlPlaneUndo,
-        fault: RuntimeTaskTransactionFault,
-        guard: &RuntimeTaskTransactionWriteGuard,
-    ) -> io::Result<()> {
-        self.maybe_fail_runtime_task_transaction(fault)?;
+    ) -> io::Result<(PathBuf, Session)> {
         let Some((abs_dir, mut current)) = self
             .load_runtime_task_recovery_control_plane(&undo.session_id)
             .await?
@@ -3574,8 +3818,22 @@ impl SessionStoreV2 {
                 format!("cannot recover missing session {}", undo.session_id),
             ));
         };
+        reject_incompatible_session_write(&current)?;
         current.task_list = undo.task_list.clone();
         current.set_task_list_version_meta(undo.task_list_version.clone());
+        self.validate_runtime_task_recovery_write_target(&abs_dir, &current)
+            .await?;
+        Ok((abs_dir, current))
+    }
+
+    async fn restore_runtime_task_undo(
+        &self,
+        prepared: &(PathBuf, Session),
+        fault: RuntimeTaskTransactionFault,
+        guard: &RuntimeTaskTransactionWriteGuard,
+    ) -> io::Result<()> {
+        self.maybe_fail_runtime_task_transaction(fault)?;
+        let (abs_dir, current) = prepared;
         let event = match fault {
             RuntimeTaskTransactionFault::FirstRollbackWrite => {
                 RuntimeTaskDurabilityEvent::FirstRollbackSidecarPublished
@@ -3585,9 +3843,9 @@ impl SessionStoreV2 {
             }
             _ => unreachable!("rollback helper only accepts rollback write faults"),
         };
-        self.validate_runtime_task_recovery_write_target(&abs_dir, &current)
+        self.validate_runtime_task_recovery_write_target(abs_dir, current)
             .await?;
-        self.write_runtime_sidecar_durable(&abs_dir, &current, guard)
+        self.write_runtime_sidecar_durable(abs_dir, current, guard)
             .await?;
         self.record_runtime_task_durability_event(event);
         Ok(())
@@ -3598,10 +3856,14 @@ impl SessionStoreV2 {
         journal: &RuntimeTaskTransactionJournal,
         guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
+        // Preflight the entire undo before either publication. A guard only
+        // inside each physical write would still permit a partial rollback.
+        let first = self.prepare_runtime_task_undo(&journal.first).await?;
+        let second = self.prepare_runtime_task_undo(&journal.second).await?;
         let mut errors = Vec::new();
         if let Err(error) = self
             .restore_runtime_task_undo(
-                &journal.first,
+                &first,
                 RuntimeTaskTransactionFault::FirstRollbackWrite,
                 guard,
             )
@@ -3611,7 +3873,7 @@ impl SessionStoreV2 {
         }
         if let Err(error) = self
             .restore_runtime_task_undo(
-                &journal.second,
+                &second,
                 RuntimeTaskTransactionFault::SecondRollbackWrite,
                 guard,
             )
@@ -3983,6 +4245,31 @@ impl SessionStoreV2 {
         }
     }
 
+    /// Assess canonical Main and retained runtime under the caller's existing
+    /// exclusive Task guard. Keep the side-only snapshot as the narrow commit
+    /// source: reading history for this fence must not copy it into Task state
+    /// or change a compatible legacy sidecar's behavior-stamp encoding.
+    async fn validate_runtime_task_execution_contract(&self, current: &Session) -> io::Result<()> {
+        reject_incompatible_session_write(current)?;
+        let rel = self.resolve_rel_path(&current.id).await.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Task target has no canonical path")
+        })?;
+        let (kind, root_id) = Self::copy_source_identity_from_rel(&current.id, &rel)?;
+        // The public admission reader would reenter the Task shared lock.
+        let durable = self
+            .load_session_from_dir_strict(
+                &self.abs_path_from_rel(&rel),
+                &current.id,
+                kind,
+                &root_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Task target has no live Main")
+            })?;
+        reject_incompatible_session_write(&durable)
+    }
+
     async fn save_runtime_task_control_plane_if_matches(
         &self,
         original: &Session,
@@ -3997,6 +4284,8 @@ impl SessionStoreV2 {
                 "single Task snapshots must preserve the session id",
             ));
         }
+        reject_incompatible_session_write(original)?;
+        reject_incompatible_session_write(updated)?;
         if Self::runtime_task_non_task_snapshot(original)?
             != Self::runtime_task_non_task_snapshot(updated)?
         {
@@ -4017,6 +4306,8 @@ impl SessionStoreV2 {
         else {
             return Ok(false);
         };
+        self.validate_runtime_task_execution_contract(&current)
+            .await?;
         self.validate_root_context_for_save(&current).await?;
         if current.authority_identity != original.authority_identity
             || current.supervisor_management != original.supervisor_management
@@ -4055,6 +4346,7 @@ impl SessionStoreV2 {
             second_updated,
         ] {
             validate_session_id(&session.id)?;
+            reject_incompatible_session_write(session)?;
         }
         if first_original.id != first_updated.id
             || second_original.id != second_updated.id
@@ -4111,6 +4403,11 @@ impl SessionStoreV2 {
         else {
             return Ok(false);
         };
+        // Both members must pass before the journal or first sidecar exists.
+        self.validate_runtime_task_execution_contract(&current_first)
+            .await?;
+        self.validate_runtime_task_execution_contract(&current_second)
+            .await?;
         self.validate_root_context_for_save(&current_first).await?;
         self.validate_root_context_for_save(&current_second).await?;
         if current_first.authority_identity != first_original.authority_identity
@@ -4306,8 +4603,9 @@ impl SessionStoreV2 {
                 &incoming.id,
             )
             .await?
+            .map(Box::new)
         } else {
-            self.load_runtime_control_plane_unchecked(&incoming.id)
+            self.load_runtime_control_plane_boxed_unchecked(&incoming.id)
                 .await?
         };
         if let Some(durable) = durable {
@@ -4353,6 +4651,7 @@ impl SessionStoreV2 {
         session: &Session,
         guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
+        reject_incompatible_session_write(session)?;
         self.validate_root_context_for_save(session).await?;
         let path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let snapshot = runtime_sidecar_snapshot(session);
@@ -4530,6 +4829,7 @@ impl SessionStoreV2 {
         self.validate_root_context_for_save(&session).await?;
         self.check_actor_reconstruction(&session, &directory)
             .await?;
+        reject_incompatible_session_write(&session)?;
         let bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(&session))
             .map_err(|error| other_io_error(error.to_string()))?;
         self.write_default_bytes(&path, bytes, &guards).await?;
@@ -4540,10 +4840,20 @@ impl SessionStoreV2 {
     /// exists. Returns `None` when the session has no sidecar yet (e.g. legacy
     /// sessions not yet migrated). Path is resolved through the index.
     async fn read_runtime_sidecar(&self, session_id: &str) -> io::Result<Option<Session>> {
+        Ok(self
+            .read_runtime_sidecar_boxed(session_id)
+            .await?
+            .map(|session| *session))
+    }
+
+    async fn read_runtime_sidecar_boxed(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Box<Session>>> {
         let Some(path) = self.runtime_json_path(session_id).await? else {
             return Ok(None);
         };
-        Self::read_runtime_sidecar_at(&path, session_id).await
+        Self::read_runtime_sidecar_boxed_at(&path, session_id).await
     }
 
     /// Read + deserialize a runtime sidecar (`runtime.json`) from a known path.
@@ -4553,11 +4863,20 @@ impl SessionStoreV2 {
     /// [`Self::read_runtime_sidecar`] (index-resolved path) and the index
     /// rebuild (directory-scanned path) so both overlay the sidecar identically.
     async fn read_runtime_sidecar_at(path: &Path, id: &str) -> io::Result<Option<Session>> {
+        Ok(Self::read_runtime_sidecar_boxed_at(path, id)
+            .await?
+            .map(|session| *session))
+    }
+
+    async fn read_runtime_sidecar_boxed_at(
+        path: &Path,
+        id: &str,
+    ) -> io::Result<Option<Box<Session>>> {
         if !path.exists() {
             return Ok(None);
         }
         let raw = fs::read_to_string(path).await?;
-        match serde_json::from_str::<Session>(&raw) {
+        match serde_json::from_str::<Box<Session>>(&raw) {
             Ok(mut side) => {
                 supervisor::validate_identity(&side)?;
                 // The control-plane path (`load_runtime_control_plane`) returns
@@ -5145,6 +5464,7 @@ impl SessionStoreV2 {
             return Ok(false);
         };
 
+        reject_incompatible_session_write(&session)?;
         self.validate_root_context_for_save(&session).await?;
 
         // Keep only the first System message if present; drop all other messages.
@@ -5488,6 +5808,13 @@ impl SessionStoreV2 {
                 {
                     self.bump_actor_tree_revision(&root).await?;
                 }
+                self.cancel_descendant_activations_before_child_delete(
+                    &entry.root_session_id,
+                    session_id,
+                    guards,
+                    &tree,
+                )
+                .await?;
                 let abs_dir = self.abs_path_from_rel(&entry.rel_path);
                 let _ = self.remove_child_directory(&abs_dir, guards, &tree).await;
                 self.update_index(|index| {
@@ -5910,6 +6237,17 @@ impl SessionStoreV2 {
         publish: Option<bamboo_domain::RootActorRuntimePublisher>,
         inherited: Option<&bamboo_domain::InheritedChildWait>,
     ) -> io::Result<Option<Session>> {
+        reject_incompatible_session_write(session)?;
+        if session
+            .metadata
+            .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "scoped Loop checkpoint outcome is uncertain; strict canonical reload required",
+            ));
+        }
+
         let reconciled = match inherited {
             Some(inherited) => Some(
                 self.reconcile_inherited_runtime_snapshot(session, inherited, true)
@@ -5930,6 +6268,49 @@ impl SessionStoreV2 {
         self.validate_child_project_for_write(session, false, Some(rel))
             .await?;
         self.reject_regressing_runtime_task(session).await?;
+        // Keep existing Actor/authority refusals typed before the additional
+        // strict read. Compatibility still precedes all physical/index writes.
+        // Main owns the behavior contract. A stale compatible caller and
+        // sidecar cannot authorize a checkpoint over a future Main. Reuse the
+        // internal strict reader while these physical writer guards are held;
+        // the public admission reader would acquire the same locks again.
+        // Legacy runtime-only saves now inspect Main too: this correctness
+        // check reads/decodes history and is not an O(1) checkpoint promise.
+        let expected_root_id = if session.kind == SessionKind::Root {
+            session.id.as_str()
+        } else {
+            session.root_session_id.as_str()
+        };
+        if let Some(durable) = self
+            .load_session_from_dir_strict(
+                &self.abs_path_from_rel(rel),
+                &session.id,
+                session.kind,
+                expected_root_id,
+            )
+            .await?
+        {
+            reject_incompatible_session_write(&durable)?;
+        }
+        if let Some(previous) = Self::read_runtime_sidecar_at(
+            &self.abs_path_from_rel(rel).join(RUNTIME_SIDECAR_FILE),
+            &session.id,
+        )
+        .await?
+        {
+            reject_incompatible_session_write(&previous)?;
+            // Runtime does not own Main's stamp. Legacy absence and v1 have
+            // identical semantics; never turn this compatible pair into a
+            // false conflict or rewrite Main from the runtime-only path.
+            if session.session_version != previous.session_version
+                && !bamboo_domain::same_session_tool_contract(
+                    session.session_version,
+                    previous.session_version,
+                )
+            {
+                reject_session_version_change(session, &previous)?;
+            }
+        }
         if session.kind == SessionKind::Root && self.get_index_entry(&session.id).await.is_none() {
             let index_bytes = fs::read(&self.index_path).await?;
             let global_index: SessionsIndex = serde_json::from_slice(&index_bytes)
@@ -6097,6 +6478,17 @@ impl SessionStoreV2 {
         answer_permit: Option<&ParentQuestion>,
         manual_title: bool,
     ) -> io::Result<()> {
+        reject_incompatible_session_write(session)?;
+        if session
+            .metadata
+            .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "scoped Loop checkpoint outcome is uncertain; strict canonical reload required",
+            ));
+        }
+
         let intended_rel = Self::default_writer_rel_path(session)?;
         self.check_default_or_root_actor_context(
             session,
@@ -6123,6 +6515,21 @@ impl SessionStoreV2 {
                 compact_main::validate_full_main(raw.as_bytes())?;
                 let durable: Session = serde_json::from_str(&raw)
                     .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
+                reject_session_version_change(session, &durable)?;
+                if let Some(mut previous_runtime) = Self::read_runtime_sidecar_at(
+                    &current_main
+                        .parent()
+                        .expect("session.json has a parent")
+                        .join(RUNTIME_SIDECAR_FILE),
+                    &session.id,
+                )
+                .await?
+                {
+                    previous_runtime.observe_main_session_version(durable.session_version);
+                    reject_incompatible_session_write(&previous_runtime)?;
+                } else {
+                    reject_incompatible_session_write(&durable)?;
+                }
                 reject_regressing_direct_parent_terminals(session, &durable)?;
                 self.reject_rewriting_broker_receipts(
                     session,
@@ -6138,6 +6545,20 @@ impl SessionStoreV2 {
                     current_main.parent().expect("session.json has a parent"),
                 )
                 .await?;
+                // Repairing an interrupted Main creation may reuse this exact
+                // Root context, but cannot reset a future contract retained in
+                // the runtime sidecar just because Main is absent.
+                if let Some(previous_runtime) = Self::read_runtime_sidecar_at(
+                    &current_main
+                        .parent()
+                        .expect("session.json has a parent")
+                        .join(RUNTIME_SIDECAR_FILE),
+                    &session.id,
+                )
+                .await?
+                {
+                    reject_incompatible_session_write(&previous_runtime)?;
+                }
                 None
             }
             Err(error) => return Err(error),
@@ -6300,6 +6721,34 @@ impl Storage for SessionStoreV2 {
         self.validate_unchanged_title(expected).await
     }
 
+    fn supports_child_actor_runtime_write(&self) -> bool {
+        true
+    }
+
+    fn bind_child_actor_inbox(
+        &self,
+        owner: &bamboo_domain::ChildActorRuntimeWrite,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+    ) -> io::Result<Arc<dyn bamboo_domain::SessionInboxPort>> {
+        Ok(Arc::new(self.bound_child_inbox(owner, &inbox)?))
+    }
+
+    async fn save_child_actor_runtime(
+        &self,
+        request: bamboo_domain::ChildActorRuntimeSave<'_>,
+    ) -> io::Result<()> {
+        self.save_child_actor_runtime_impl(request).await
+    }
+
+    async fn publish_child_actor_runtime_event(
+        &self,
+        owner: &bamboo_domain::ChildActorRuntimeWrite,
+        publish: bamboo_domain::RootActorRuntimeEventPublisher,
+    ) -> io::Result<()> {
+        self.publish_child_actor_runtime_event_impl(owner, publish)
+            .await
+    }
+
     fn bind_root_actor_inbox(
         &self,
         owner: &bamboo_domain::RootActorRuntimeWrite,
@@ -6319,6 +6768,33 @@ impl Storage for SessionStoreV2 {
     ) -> io::Result<()> {
         self.save_root_actor_input_impl(owner, &mut session.clone(), inbox, claim, publish, None)
             .await
+    }
+
+    async fn load_scoped_loop_session(
+        &self,
+        binding: &bamboo_domain::ScopedLoopControlBinding,
+        activation: Arc<dyn bamboo_domain::SessionActivationPort>,
+    ) -> io::Result<Option<Session>> {
+        self.load_scoped_loop_session_impl(binding, activation)
+            .await
+    }
+
+    fn supports_scoped_loop_transport_retirement(&self) -> bool {
+        true
+    }
+
+    async fn retire_scoped_loop_transport(
+        &self,
+        request: bamboo_domain::storage::ScopedLoopTransportRetirement<'_>,
+    ) -> io::Result<()> {
+        self.retire_scoped_loop_transport_impl(request).await
+    }
+
+    async fn checkpoint_scoped_loop(
+        &self,
+        request: bamboo_domain::ScopedLoopControlCheckpoint<'_>,
+    ) -> io::Result<()> {
+        self.checkpoint_scoped_loop_impl(request).await
     }
 
     fn supports_root_actor_runtime_write(&self) -> bool {
@@ -6488,6 +6964,16 @@ impl Storage for SessionStoreV2 {
         self.bootstrap_default_supervisor(initial_model).await
     }
 
+    async fn with_supervisor_orchestration_authority(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        expected_revision: u64,
+        operation: Box<dyn FnOnce() -> io::Result<()> + Send>,
+    ) -> io::Result<()> {
+        self.supervisor_orchestration_job(supervisor, expected_revision, operation)
+            .await
+    }
+
     async fn load_root_authority(&self, session_id: &str) -> io::Result<Option<Session>> {
         let _lifecycle = self.lock_session_lifecycle_shared().await?;
         let _task = self.lock_runtime_task_sidecar_shared().await?;
@@ -6515,6 +7001,14 @@ impl Storage for SessionStoreV2 {
         target_session_id: &str,
     ) -> io::Result<bamboo_domain::SupervisorLinkObservation> {
         self.management_link(supervisor, target_session_id).await
+    }
+
+    async fn load_supervisor_managed_session(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target_session_id: &str,
+    ) -> io::Result<Option<Session>> {
+        self.management_history(supervisor, target_session_id).await
     }
 
     async fn save_session(&self, session: &Session) -> io::Result<()> {
@@ -6658,6 +7152,17 @@ impl Storage for SessionStoreV2 {
     async fn load_session(&self, session_id: &str) -> io::Result<Option<Session>> {
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         self.load_session_unlocked(session_id).await
+    }
+
+    async fn load_execution_admission_snapshot(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Session>> {
+        validate_session_id(session_id)?;
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session = self.acquire_session_maintenance_lock(session_id).await?;
+        self.load_execution_admission_unchecked(session_id).await
     }
 
     async fn delete_session(&self, session_id: &str) -> io::Result<bool> {
@@ -6961,7 +7466,7 @@ mod tests {
         root.set_task_list_version_meta("1");
         storage.save_session(&root).await?;
 
-        let mut child = Session::new_child(child_id, root_id, "model", "child");
+        let mut child = Session::new_child_of(child_id, &root, "model", "child");
         child.add_message(Message::user("child transcript secret"));
         child.metadata.insert(
             "unrelated.child".to_string(),
@@ -8390,6 +8895,60 @@ mod tests {
             Some("run-after-full")
         );
         assert!(storage.session_write_locks.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_delivery_waits_for_ancestor_without_holding_reverse_lexical_child(
+    ) -> io::Result<()> {
+        use std::future::Future;
+        let (store, _temp) = create_temp_storage().await?;
+        let root = Session::new("z-root", "model");
+        let child = Session::new_child_of("a-child", &root, "model", "child");
+        store.save_session(&root).await?;
+        store.save_session(&child).await?;
+        let source = bamboo_domain::ActorSession::from_session(&child).unwrap();
+        let target = bamboo_domain::ActorSession::from_session(&root).unwrap();
+        // ParentQuestion acquires the ancestor Session before its child.
+        let ancestor = store.acquire_session_maintenance_lock(&root.id).await?;
+        let root_lock = store
+            .session_write_locks
+            .get(&root.id)
+            .unwrap()
+            .value()
+            .clone();
+        let owners = Arc::strong_count(&root_lock);
+        let mut peer = Box::pin(store.lock_peer_delivery(&source, &target, None));
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            std::future::poll_fn(|cx| {
+                assert!(peer.as_mut().poll(cx).is_pending());
+                // The owned Mutex waiter retains an Arc as soon as it queues.
+                if Arc::strong_count(&root_lock) > owners {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("peer must reach the held ancestor lock");
+        // Once peer is waiting for the ancestor, the answer writer must still
+        // acquire the child. Child-first ordering would deadlock this step.
+        let descendant = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.acquire_session_maintenance_lock(&child.id),
+        )
+        .await
+        .expect("peer must not hold child while waiting for ancestor")?;
+        drop(descendant);
+        drop(ancestor);
+        drop(root_lock);
+        drop(
+            tokio::time::timeout(Duration::from_secs(10), peer)
+                .await
+                .expect("peer must proceed after the answer writer releases")?,
+        );
         Ok(())
     }
 

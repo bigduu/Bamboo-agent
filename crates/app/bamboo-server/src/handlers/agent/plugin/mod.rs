@@ -25,6 +25,8 @@
 mod api_types;
 mod errors;
 mod handlers;
+mod official_jiandu;
+mod official_nova;
 #[cfg(test)]
 mod tests;
 
@@ -32,3 +34,5 @@ pub use api_types::{InstallPluginRequest, InstalledPluginView, PluginListRespons
 pub use handlers::{
     install_plugin, list_plugins, plugin_hooks, remove_plugin, review_plugin_hooks, update_plugin,
 };
+pub use official_jiandu::{install_official_jiandu, jiandu_setup};
+pub use official_nova::{install_nova_app, nova_app, start_nova_app};

@@ -17,7 +17,7 @@ use bamboo_agent::server::handlers;
 use bamboo_agent::server::handlers::agent::sessions;
 use bamboo_agent_core::Session;
 use bamboo_domain::reasoning::ReasoningEffort;
-use bamboo_domain::session::types::Message;
+use bamboo_domain::session::types::{Message, Role};
 use serde_json::json;
 
 /// A config-only PATCH over a session that already has conversation history
@@ -91,7 +91,7 @@ async fn test_patch_after_chat_append_keeps_user_message() {
     )
     .await;
 
-    // Build history through the real chat handler (chat only persists; no LLM).
+    // Admit through the real chat handler, then consume without running an LLM.
     for message in ["first message", "the brand new question"] {
         let chat_req = test::TestRequest::post()
             .uri("/api/v1/chat")
@@ -104,10 +104,35 @@ async fn test_patch_after_chat_append_keeps_user_message() {
         let chat_resp = test::call_service(&app, chat_req).await;
         assert!(
             chat_resp.status().is_success(),
-            "chat should persist the user message, got {}",
+            "chat should accept the user message, got {}",
             chat_resp.status()
         );
     }
+
+    // Cross the real checkpoint/ACK boundary before checking canonical history.
+    let mut session = state
+        .storage
+        .load_session(&session_id)
+        .await
+        .expect("load before consumption")
+        .expect("session exists before consumption");
+    let persistence: std::sync::Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+        state.persistence.clone();
+    let (refresh, _) =
+        bamboo_engine::config::UntrustedExecutionInputs::admit_with_startup_observation(
+            &mut session,
+            Some(&state.storage),
+            Some(&persistence),
+            Some(&state.session_inbox),
+        )
+        .await;
+    assert!(refresh.admission_error.is_none(), "consumer must succeed");
+    let backlog = state
+        .session_inbox
+        .inspect(&session_id)
+        .await
+        .expect("inspect after consumption");
+    assert_eq!((backlog.pending, backlog.claimed), (0, 0));
 
     let after_chat = state
         .storage
@@ -115,6 +140,15 @@ async fn test_patch_after_chat_append_keeps_user_message() {
         .await
         .expect("load")
         .expect("exists");
+    assert_eq!(
+        after_chat
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .count(),
+        2,
+        "cold canonical history must contain both user messages"
+    );
     let baseline = after_chat.messages.len();
     assert!(
         baseline >= 2,

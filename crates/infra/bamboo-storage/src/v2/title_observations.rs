@@ -163,10 +163,6 @@ impl SessionStoreV2 {
                 .ok_or_else(|| conflict("title observation Session is missing"))?;
             let mut expected =
                 ActorSession::from_session(&current).map_err(|e| conflict(&e.to_string()))?;
-            expected.ancestor_observations = self
-                .validate_actor_lineage(&expected)
-                .await
-                .map_err(|e| conflict(&e.to_string()))?;
             let project = expected
                 .project_id
                 .as_deref()
@@ -181,6 +177,10 @@ impl SessionStoreV2 {
             )?;
             let row: ActorDirectoryEntry = serde_json::from_slice(&record)
                 .map_err(|_| conflict("invalid title observation Actor row"))?;
+            expected.ancestor_observations = self
+                .validate_actor_lineage_with_record(&expected, Some(&row.actor))
+                .await
+                .map_err(|e| conflict(&e.to_string()))?;
             if row.actor.project_id != current.project_id_meta()
                 || row.actor.observed_metadata_version != current.metadata_version
                 || row.actor.ancestor_observations != expected.ancestor_observations

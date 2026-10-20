@@ -14,6 +14,7 @@ use tokio::process::Command;
 use tokio::time::{Duration, Instant};
 
 use super::{bash_runtime, workspace_state};
+use crate::local_task_resources::ManagedBashChild;
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -279,17 +280,14 @@ impl BashTool {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = cmd
-            .spawn()
+        let mut child = ManagedBashChild::spawn(&mut cmd)
             .map_err(|e| ToolError::Execution(format!("Failed to execute command: {}", e)))?;
 
         let stdout = child
-            .stdout
-            .take()
+            .take_stdout()
             .ok_or_else(|| ToolError::Execution("Failed to capture stdout".to_string()))?;
         let stderr = child
-            .stderr
-            .take()
+            .take_stderr()
             .ok_or_else(|| ToolError::Execution("Failed to capture stderr".to_string()))?;
 
         let mut stdout_reader = BufReader::new(stdout);
@@ -422,7 +420,7 @@ impl BashTool {
                 }
             }
 
-            let session = bash_runtime::adopt_running_child(
+            let session = bash_runtime::adopt_managed_child(
                 child,
                 stdout_reader,
                 stderr_reader,
@@ -555,6 +553,13 @@ impl Tool for BashTool {
             ));
         }
 
+        if !bamboo_agent_core::tools::suspension_allowed()
+            && (parsed.interactive == Some(true) || parsed.run_in_background == Some(true))
+        {
+            return Err(ToolError::Execution(
+                "suspension_disabled: background or interactive Bash is unavailable in this execution".into(),
+            ));
+        }
         let _ = parsed.description;
         let timeout_ms = Self::effective_timeout_ms(parsed.timeout);
         let session_workspace = workspace_state::workspace_or_process_cwd(ctx.session_id());
@@ -659,11 +664,12 @@ impl Tool for BashTool {
                 // for and self-resume a backgrounded shell (`can_async_resume`):
                 // on hook-less paths (schedule / external-child loops) it stays
                 // purely synchronous so a long command's output is never orphaned.
-                let promote_after_ms = if ctx.can_async_resume {
-                    Some(PROMOTE_TO_BACKGROUND_AFTER_MS)
-                } else {
-                    None
-                };
+                let promote_after_ms =
+                    if ctx.can_async_resume && bamboo_agent_core::tools::suspension_allowed() {
+                        Some(PROMOTE_TO_BACKGROUND_AFTER_MS)
+                    } else {
+                        None
+                    };
                 self.run_streaming_command(command, timeout_ms, promote_after_ms, &cwd, ctx)
                     .await
                     .map(ToolOutcome::Completed)
@@ -1792,5 +1798,105 @@ mod tests {
         );
 
         let _ = super::bash_runtime::remove_shell(&shell.id);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_task_resources_promoted_bash_is_drained_with_its_pumps() {
+        let _command_environment = test_command_environment();
+        let resources = crate::LocalTaskResources::new(
+            "promotion-session",
+            "promotion-run",
+            chrono::Utc::now(),
+        );
+        let tool = BashTool::new();
+        let mut ctx = ToolCtx::none("promotion-call");
+        ctx.session_id = Some(std::sync::Arc::from("promotion-session"));
+        let cwd = std::env::current_dir().unwrap();
+        let result = resources
+            .scope(tool.run_streaming_command(
+                "printf before; sleep 30",
+                60_000,
+                Some(20),
+                &cwd,
+                ctx,
+            ))
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_str(&result.result).unwrap();
+        let id = payload["bash_id"].as_str().unwrap();
+        let shell = super::bash_runtime::get_shell(id).unwrap();
+        assert_eq!(shell.status(), "running");
+        tokio::time::timeout(Duration::from_secs(6), resources.close_and_drain())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(shell.status(), "completed");
+        assert!(super::bash_runtime::get_shell(id).is_none());
+        let (lines, _, _) = shell.read_output_since(0, None).await;
+        assert!(lines.iter().any(|line| line.contains("before")));
+    }
+    mod suspension_contract_tests {
+        use super::*;
+        use bamboo_agent_core::tools::{suspension_allowed, with_suspension_disabled};
+
+        #[tokio::test]
+        async fn disabled_suspension_rejects_explicit_background_and_interactive_before_spawn() {
+            let _environment = test_command_environment();
+            for args in [
+                json!({"command":mixed_output_command(),"run_in_background":true}),
+                json!({"command":mixed_output_command(),"interactive":true}),
+            ] {
+                let tool = BashTool::new();
+                let (tx, mut rx) = mpsc::channel(32);
+                let mut ctx = ToolCtx::none("disabled-background");
+                ctx.event_tx = Some(tx);
+                let outcome = with_suspension_disabled(tool.invoke(args, ctx)).await;
+                // A RED baseline may create this test's own short shell. Clean
+                // only the exact returned handle, never a shared inventory.
+                if let Ok(ToolOutcome::Completed(result)) = &outcome {
+                    if let Some(id) = serde_json::from_str::<Value>(&result.result)
+                        .ok()
+                        .and_then(|value| value["bash_id"].as_str().map(str::to_owned))
+                    {
+                        if let Some(shell) = super::super::bash_runtime::get_shell(&id) {
+                            let _ = shell.kill().await;
+                        }
+                    }
+                }
+                assert!(
+                    matches!(outcome,Err(ToolError::Execution(ref reason)) if reason.contains("suspension_disabled")),
+                    "{outcome:?}"
+                );
+                assert!(
+                    rx.try_recv().is_err(),
+                    "must not emit a background shell token/event"
+                );
+                assert!(suspension_allowed());
+            }
+        }
+
+        #[tokio::test]
+        async fn disabled_suspension_auto_and_foreground_keep_synchronous_results() {
+            let _environment = test_command_environment();
+            for explicit_foreground in [false, true] {
+                let mut args = json!({"command":mixed_output_command()});
+                if explicit_foreground {
+                    args["run_in_background"] = json!(false);
+                }
+                let mut ctx = ToolCtx::none("disabled-foreground");
+                ctx.can_async_resume = true;
+                let outcome = with_suspension_disabled(BashTool::new().invoke(args, ctx))
+                    .await
+                    .unwrap();
+                let ToolOutcome::Completed(result) = outcome else {
+                    panic!("foreground result")
+                };
+                let body: Value = serde_json::from_str(&result.result).unwrap();
+                assert!(result.success);
+                assert!(body.get("bash_id").is_none());
+                assert_eq!(body["exit_code"], 0);
+                assert!(body["stdout"].as_str().unwrap().contains("out"));
+            }
+        }
     }
 }

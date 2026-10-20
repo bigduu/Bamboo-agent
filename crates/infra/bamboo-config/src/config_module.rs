@@ -108,9 +108,40 @@ pub(crate) fn load_sidecar<T: DeserializeOwned>(path: &Path) -> Result<Option<T>
 }
 
 pub(crate) fn save_sidecar<T: Serialize + DeserializeOwned>(path: &Path, value: &T) -> Result<()> {
-    crate::config_store::AtomicFileStore::new(path)
-        .backup_generations(1)
-        .write_json(value)?;
+    with_legacy_module_write(path.parent().unwrap_or_else(|| Path::new(".")), || {
+        crate::config_store::AtomicFileStore::new(path)
+            .backup_generations(1)
+            .write_json(value)?;
+        Ok(())
+    })
+}
+
+/// Serialize the authority check and the physical legacy write with layout
+/// activation. Checking only before acquiring the lock would let a waiting
+/// writer replace a newly activated revisioned section with a raw sidecar.
+pub(crate) fn with_legacy_module_write<T>(
+    data_dir: &Path,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    crate::credential_migration::with_provider_mcp_migration_lock(data_dir, || {
+        ensure_legacy_module_layout(data_dir)?;
+        // Preserve the operation's original error without turning an I/O or
+        // serialization failure into an unrelated validation diagnostic.
+        Ok(operation())
+    })?
+}
+
+/// Read-only early rejection, before validation/encryption/migration can create
+/// files. Physical writes must additionally call `with_legacy_module_write`.
+pub(crate) fn ensure_legacy_module_layout(data_dir: &Path) -> crate::ConfigStoreResult<()> {
+    // A committed initial split may not have installed the marker or quorum
+    // yet. The existing transaction guard also fences that pending interval.
+    crate::ensure_provider_mcp_migration_ready(data_dir)?;
+    if crate::modular_authority_boundary_present(data_dir)? {
+        return Err(crate::ConfigStoreError::Validation(
+            "legacy module writes are unavailable after modular configuration activation; use the revisioned section API".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -118,6 +149,8 @@ pub(crate) fn save_sidecar<T: Serialize + DeserializeOwned>(path: &Path, value: 
 /// fields (for example provider plaintext API keys). The previous generation
 /// is parsed and reserialized before becoming the backup so a hand-written
 /// plaintext secret is never copied verbatim into `*.json.bak`.
+/// The provider caller holds `with_legacy_module_write` across its complete
+/// read/merge/write operation; this helper must not reacquire that lock.
 pub(crate) fn save_sidecar_with_sanitized_backup<T: Serialize + DeserializeOwned>(
     path: &Path,
     value: &T,
@@ -136,7 +169,8 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        Config, ConfigRegistry, MemoryConfig, OpenAIConfig, ProviderConfigs, ProviderConfigsModule,
+        Config, ConfigFacade, ConfigRegistry, MemoryConfig, MemoryConfigModule, OpenAIConfig,
+        ProviderConfigs, ProviderConfigsModule, SubagentsConfigModule,
     };
 
     fn write_json(path: &Path, value: serde_json::Value) {
@@ -144,6 +178,135 @@ mod tests {
     }
 
     use std::path::Path;
+
+    #[test]
+    fn modular_layout_rejects_legacy_module_writes_without_touching_sections() {
+        let _key = crate::encryption::set_test_encryption_key([203; 32]);
+        let dir = TempDir::new().unwrap();
+        write_json(
+            &dir.path().join("config.json"),
+            json!({
+                "provider": "openai",
+                "providers": {"openai": {"api_key": "module-guard-test-secret", "model": "gpt-test"}},
+                "memory": {"background_model": "memory-before"},
+                "subagents": {"max_concurrent": 3}
+            }),
+        );
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let mut candidate = facade.effective_config();
+        let provider = facade
+            .registry()
+            .envelope_value(crate::SectionId::Providers)
+            .unwrap();
+        assert_eq!(provider.data["default_provider_instance"], "openai");
+        assert_eq!(
+            provider.data["provider_instances"]["openai"]["model"],
+            "gpt-test"
+        );
+        let paths = [
+            "memory.json",
+            "subagents.json",
+            "providers.json",
+            "credentials.json",
+            crate::SECTION_LAYOUT_FILE,
+        ];
+        let before: Vec<_> = paths
+            .iter()
+            .map(|name| std::fs::read(dir.path().join(name)).unwrap())
+            .collect();
+        candidate.memory.0 = Some(MemoryConfig {
+            background_model: Some("must-not-publish".into()),
+            ..MemoryConfig::default()
+        });
+        candidate.subagents.max_concurrent = Some(99);
+        for result in [
+            candidate.save_memory_to_dir(dir.path()),
+            candidate.save_subagents_to_dir(dir.path()),
+            candidate.save_providers_to_dir(dir.path()),
+        ] {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("revisioned section API"));
+        }
+
+        // ConfigRegistry/ConfigModule callers are public SDK entry points too.
+        let mut registry = ConfigRegistry::new();
+        registry.register(MemoryConfigModule(candidate.memory.0.clone()));
+        registry.register(SubagentsConfigModule(candidate.subagents.0.clone()));
+        registry.register(ProviderConfigsModule(candidate.providers.0.clone()));
+        for name in ["memory", "subagents", "providers"] {
+            let error =
+                futures::executor::block_on(registry.save_module(name, dir.path())).unwrap_err();
+            assert!(error.to_string().contains("revisioned section API"));
+        }
+        assert!(futures::executor::block_on(registry.save_all(dir.path())).is_err());
+        for (name, bytes) in paths.iter().zip(before) {
+            assert_eq!(
+                std::fs::read(dir.path().join(name)).unwrap(),
+                bytes,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            ConfigFacade::open(dir.path())
+                .unwrap()
+                .registry()
+                .envelope_value(crate::SectionId::Providers)
+                .unwrap()
+                .revision,
+            provider.revision
+        );
+    }
+
+    #[test]
+    fn incomplete_modular_authority_never_reopens_legacy_module_writes() {
+        for evidence in ["corrupt-marker", "completion-ledger", "section-quorum"] {
+            let dir = TempDir::new().unwrap();
+            let config = Config::default();
+            config.save_to_dir(dir.path().to_path_buf()).unwrap();
+            let paths = ["memory.json", "subagents.json", "providers.json"];
+            let before: Vec<_> = paths
+                .iter()
+                .map(|name| std::fs::read(dir.path().join(name)).unwrap())
+                .collect();
+            match evidence {
+                "corrupt-marker" => {
+                    std::fs::write(dir.path().join(crate::SECTION_LAYOUT_FILE), b"{broken")
+                        .unwrap();
+                }
+                "completion-ledger" => {
+                    std::fs::write(
+                        dir.path()
+                            .join(crate::credential_migration::SECTION_LAYOUT_COMPLETION_FILE),
+                        b"{broken",
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    write_json(&dir.path().join("core.json"), json!({}));
+                    write_json(&dir.path().join("hooks.json"), json!({}));
+                }
+            }
+            assert!(crate::modular_authority_boundary_present(dir.path()).unwrap());
+            assert!(config.save_memory_to_dir(dir.path()).is_err(), "{evidence}");
+            assert!(
+                config.save_subagents_to_dir(dir.path()).is_err(),
+                "{evidence}"
+            );
+            assert!(
+                config.save_providers_to_dir(dir.path()).is_err(),
+                "{evidence}"
+            );
+            for (name, bytes) in paths.iter().zip(before) {
+                assert_eq!(
+                    std::fs::read(dir.path().join(name)).unwrap(),
+                    bytes,
+                    "{evidence}: {name}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn legacy_inline_sections_load_and_migrate_to_sidecars() {

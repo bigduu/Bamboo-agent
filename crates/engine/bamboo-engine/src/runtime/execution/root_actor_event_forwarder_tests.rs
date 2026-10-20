@@ -305,6 +305,12 @@ async fn reclaimed_generic_root_rejects_critical_cache_and_history_ack_without_l
         .await
         .unwrap()
         .unwrap();
+    assert_frame(
+        &session_event(&mut critical.session).await,
+        &AgentEvent::Error {
+            message: ROOT_AUTHORITY_LOST.into(),
+        },
+    );
     assert!(matches!(
         critical.session.try_recv(),
         Err(TryRecvError::Empty)
@@ -331,6 +337,12 @@ async fn reclaimed_generic_root_rejects_critical_cache_and_history_ack_without_l
         .await
         .unwrap()
         .unwrap();
+    assert_frame(
+        &session_event(&mut history.session).await,
+        &AgentEvent::Error {
+            message: ROOT_AUTHORITY_LOST.into(),
+        },
+    );
     assert!(matches!(
         history.session.try_recv(),
         Err(TryRecvError::Empty)
@@ -397,6 +409,239 @@ async fn reclaimed_generic_root_rejects_critical_cache_and_history_ack_without_l
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_root_authority_interrupts_live_run_without_publishing_rejected_state() {
+    let fixture = Fixture::new().await;
+    let binding = fixture.bind(fixture.a.clone(), "lost-run").await;
+    let mut live = fixture.sink.subscribe();
+    let mut forwarder = Forwarder::new(&fixture, fixture.a.clone(), &binding, "lost-run");
+    assert!(matches!(
+        session_event(&mut forwarder.session).await,
+        AgentEvent::ExecutionStarted { .. }
+    ));
+    assert_eq!(account_event(&mut live).await.seq, 1);
+    let (cancel, publication, visible) = {
+        let guard = forwarder.runners.read().await;
+        let runner = guard.get(ROOT).unwrap();
+        (
+            runner.cancel_token.clone(),
+            runner.event_publication.clone(),
+            runner.visible_messages.clone(),
+        )
+    };
+    let (mut message_events, _) = visible.subscribe_with_snapshot();
+    // Revoke the real issued fence without a wall-clock lease-expiry race.
+    fixture
+        .a
+        .finish_activation(
+            &binding.owner.fence,
+            Utc::now(),
+            bamboo_domain::ActorActivationFinish::Failed,
+        )
+        .await
+        .unwrap();
+    let session_path = fixture
+        ._temp
+        .path()
+        .join("bamboo/sessions")
+        .join(ROOT)
+        .join("session.json");
+    let persisted = std::fs::read(&session_path).unwrap();
+    forwarder
+        .input
+        .send(clarification("rejected private content"))
+        .await
+        .unwrap();
+    assert_frame(
+        &session_event(&mut forwarder.session).await,
+        &AgentEvent::Error {
+            message: ROOT_AUTHORITY_LOST.into(),
+        },
+    );
+    tokio::time::timeout(WAIT, forwarder.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(cancel.is_cancelled());
+    assert!(matches!(
+        message_events.recv().await.unwrap().kind,
+        super::super::visible_messages::VisibleMessageEventKind::Terminal { reason }
+        if reason == "error"
+    ));
+    assert!(!publication.publish(|| panic!("obsolete token was published")));
+    assert!(matches!(
+        forwarder.session.try_recv(),
+        Err(TryRecvError::Empty)
+    ));
+    assert!(matches!(live.try_recv(), Err(TryRecvError::Empty)));
+    assert_eq!(std::fs::read(session_path).unwrap(), persisted);
+    assert_eq!(fixture.sink.latest_seq(), 1);
+    assert!(forwarder.runners.read().await[ROOT]
+        .last_critical_events
+        .is_empty());
+    assert!(
+        !forwarder
+            .history
+            .send_and_wait(&forwarder.input, ROOT.into())
+            .await
+    );
+}
+
+#[tokio::test]
+async fn obsolete_root_interruption_cannot_terminalize_local_successor_on_shared_channel() {
+    let (sender, mut receiver) = broadcast::channel(16);
+    let mut old = AgentRunner::new();
+    old.event_sender = sender.clone();
+    let old_id = old.run_id.clone();
+    let old_cancel = old.cancel_token.clone();
+    let old_publication = old.event_publication.clone();
+    let old_visible = old.visible_messages.clone();
+    old.status = super::super::runner_state::AgentStatus::Completed;
+    let runners = Arc::new(RwLock::new(HashMap::from([(ROOT.into(), old)])));
+    let senders = Arc::default();
+    let successor =
+        super::super::runner_lifecycle::try_reserve_runner(&runners, &senders, ROOT, &sender)
+            .await
+            .unwrap();
+    let started = AgentEvent::ExecutionStarted {
+        session_id: ROOT.into(),
+        run_id: successor.run_id.clone(),
+        started_at: Utc::now().to_rfc3339(),
+    };
+    sender.send(started.clone()).unwrap();
+    let error = std::io::Error::other(bamboo_domain::SessionAuthorityConflict(
+        "obsolete fence".into(),
+    ));
+    interrupt_root_on_authority_loss(
+        &error,
+        ROOT,
+        &old_id,
+        &runners,
+        &old_publication,
+        &old_visible,
+        &old_cancel,
+    )
+    .await;
+    assert!(old_cancel.is_cancelled());
+    assert!(!successor.cancel_token.is_cancelled());
+    assert_frame(&session_event(&mut receiver).await, &started);
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    assert!(
+        !super::super::runner_lifecycle::finalize_runner_exact(
+            &runners,
+            ROOT,
+            &old_id,
+            &Err(bamboo_agent_core::AgentError::Cancelled),
+        )
+        .await
+    );
+    let guard = runners.read().await;
+    let current = &guard[ROOT];
+    assert_eq!(current.run_id, successor.run_id);
+    assert!(matches!(
+        current.status,
+        super::super::runner_state::AgentStatus::Running
+    ));
+    assert!(current.event_publication.publish(|| {}));
+    assert_eq!(
+        current
+            .visible_messages
+            .subscribe_with_snapshot()
+            .1
+            .terminal,
+        None
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_root_authority_before_account_receipt_still_interrupts_live_transport() {
+    let fixture = Fixture::new().await;
+    let binding = fixture.bind(fixture.a.clone(), "queued-started").await;
+    let claim = JournalClaim::acquire(fixture.sink.events_dir());
+    let mut live = fixture.sink.subscribe();
+    let mut forwarder = Forwarder::new(&fixture, fixture.a.clone(), &binding, "queued-started");
+    // The per-session callback has run, but the account receipt is blocked by
+    // the real journal claim. Its physical Root guards are already released.
+    assert!(matches!(
+        session_event(&mut forwarder.session).await,
+        AgentEvent::ExecutionStarted { .. }
+    ));
+    let (cancel, visible) = {
+        let guard = forwarder.runners.read().await;
+        let runner = guard.get(ROOT).unwrap();
+        (runner.cancel_token.clone(), runner.visible_messages.clone())
+    };
+    let (mut messages, _) = visible.subscribe_with_snapshot();
+    fixture
+        .a
+        .finish_activation(
+            &binding.owner.fence,
+            Utc::now(),
+            bamboo_domain::ActorActivationFinish::Failed,
+        )
+        .await
+        .unwrap();
+    drop(claim);
+    assert_frame(
+        &session_event(&mut forwarder.session).await,
+        &AgentEvent::Error {
+            message: ROOT_AUTHORITY_LOST.into(),
+        },
+    );
+    tokio::time::timeout(WAIT, forwarder.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(cancel.is_cancelled());
+    assert!(matches!(
+        messages.recv().await.unwrap().kind,
+        super::super::visible_messages::VisibleMessageEventKind::Terminal { reason }
+        if reason == "error"
+    ));
+    assert!(matches!(live.try_recv(), Err(TryRecvError::Empty)));
+    assert!(journal::read_since(fixture.sink.events_dir(), 0)
+        .unwrap()
+        .is_empty());
+    assert!(
+        !forwarder
+            .history
+            .send_and_wait(&forwarder.input, ROOT.into())
+            .await
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_root_authority_before_started_still_closes_subscribed_transport() {
+    let fixture = Fixture::new().await;
+    let binding = fixture.bind(fixture.a.clone(), "not-started").await;
+    fixture
+        .a
+        .finish_activation(
+            &binding.owner.fence,
+            Utc::now(),
+            bamboo_domain::ActorActivationFinish::Failed,
+        )
+        .await
+        .unwrap();
+    let mut forwarder = Forwarder::new(&fixture, fixture.a.clone(), &binding, "not-started");
+    assert_frame(
+        &session_event(&mut forwarder.session).await,
+        &AgentEvent::Error {
+            message: ROOT_AUTHORITY_LOST.into(),
+        },
+    );
+    tokio::time::timeout(WAIT, forwarder.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(forwarder.runners.read().await[ROOT]
+        .cancel_token
+        .is_cancelled());
+    assert!(journal::read_since(fixture.sink.events_dir(), 0)
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

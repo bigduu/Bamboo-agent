@@ -310,6 +310,52 @@ fn producer_gen_int_act_jobs_keep_existing_holes_and_partial_monotonic_authority
 }
 
 #[test]
+fn exact_promotion_retains_physical_authority_through_abort_and_shutdown() {
+    for shutdown in [false, true] {
+        let f = Fixture::new();
+        enable(&f);
+        let message = SessionMessageEnvelope::user_input("target", "staged completion");
+        let receipt = f.runtime.block_on(f.inbox.deliver(&message)).unwrap();
+        let mut parked = Parked::start(
+            f.inbox.clone(),
+            "replace",
+            message_path(&f, &message, receipt.generation),
+            move |inbox| async move {
+                inbox
+                    .mark_message_activation_eligible(
+                        "target",
+                        &receipt,
+                        SessionActivationPolicy::InterruptSpecificWait,
+                    )
+                    .await
+            },
+        );
+        if shutdown {
+            parked.shutdown();
+        } else {
+            parked.caller.abort();
+        }
+        f.assert_physical_locks(true);
+        let waiter = f.process_waiter();
+        f.assert_waiting(&waiter);
+        parked.barrier.release();
+        f.finish(waiter);
+        let backlog = f.runtime.block_on(f.other.inspect("target")).unwrap();
+        assert_eq!(backlog.coordinator_generation, 0);
+        assert!(backlog.interrupt_pending());
+        let claims = f
+            .runtime
+            .block_on(f.other.claim_owned("target", 1, None, &f.request(0)))
+            .unwrap();
+        assert_eq!(claims[0].claim.envelope, message);
+        assert_eq!(
+            claims[0].claim.activation_policy,
+            SessionActivationPolicy::InterruptSpecificWait
+        );
+    }
+}
+
+#[test]
 fn guidance_cancel_and_each_producer_visible_quarantine_retain_actual_scope() {
     for action in [
         "cancel",

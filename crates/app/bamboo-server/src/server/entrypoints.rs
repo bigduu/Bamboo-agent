@@ -25,8 +25,8 @@ use bamboo_config::TlsConfig;
 /// Whether `path` belongs to bamboo's API surface (as opposed to a SPA
 /// frontend route the static-file fallback should serve `index.html` for).
 ///
-/// Shared by both SPA-fallback closures below (desktop + production/Docker
-/// serve paths) so the allow-list can't drift between them — previously each
+/// Used by the shared SPA fallback for desktop and production/Docker serve
+/// paths so the allow-list can't drift between them — previously each
 /// closure hand-duplicated this list and neither included `/v2/` (the pairing/
 /// device/WS-multiplex prefix), so an unmatched `/v2/*` path would silently
 /// fall through to `index.html` instead of a real 404. #251 (finding 7).
@@ -37,6 +37,38 @@ fn is_api_path(path: &str) -> bool {
         || path.starts_with("/openai/")
         || path.starts_with("/anthropic/")
         || path.starts_with("/gemini/")
+}
+
+/// Static assets and SPA fallback shared by desktop and production servers.
+fn frontend_files(static_path: &Path) -> fs::Files {
+    let index_file = static_path.join("index.html");
+    fs::Files::new("/", static_path)
+        .index_file("index.html")
+        .prefer_utf8(true)
+        .disable_content_disposition()
+        .default_handler(fn_service(move |req: ServiceRequest| {
+            let index_file = index_file.clone();
+            async move {
+                if is_api_path(req.path()) {
+                    return Ok(ServiceResponse::new(
+                        req.into_parts().0,
+                        HttpResponse::NotFound().finish(),
+                    ));
+                }
+
+                let (http_req, _) = req.into_parts();
+                match fs::NamedFile::open(index_file) {
+                    Ok(file) => Ok(ServiceResponse::new(
+                        http_req.clone(),
+                        file.into_response(&http_req),
+                    )),
+                    Err(_) => Ok(ServiceResponse::new(
+                        http_req,
+                        HttpResponse::NotFound().finish(),
+                    )),
+                }
+            }
+        }))
 }
 
 fn canonicalize_static_dir(path: &Path) -> Result<PathBuf, String> {
@@ -150,36 +182,8 @@ pub async fn run_with_tls(
             .configure(configure_routes); // No rate limiting for desktop mode
 
         if let Some(static_path) = &static_dir {
-            let index_file = static_path.join("index.html");
             info!("Serving static files from: {:?}", static_path);
-            app = app.service(
-                fs::Files::new("/", static_path)
-                    .index_file("index.html")
-                    .prefer_utf8(true)
-                    .disable_content_disposition()
-                    .default_handler(fn_service(move |req: ServiceRequest| {
-                        let index_file = index_file.clone();
-                        async move {
-                            let path = req.path().to_string();
-                            if is_api_path(&path) {
-                                let response = HttpResponse::NotFound().finish();
-                                return Ok(ServiceResponse::new(req.into_parts().0, response));
-                            }
-
-                            let (http_req, _) = req.into_parts();
-                            match actix_files::NamedFile::open_async(index_file).await {
-                                Ok(file) => Ok(ServiceResponse::new(
-                                    http_req.clone(),
-                                    file.into_response(&http_req),
-                                )),
-                                Err(_) => Ok(ServiceResponse::new(
-                                    http_req,
-                                    HttpResponse::NotFound().finish(),
-                                )),
-                            }
-                        }
-                    })),
-            );
+            app = app.service(frontend_files(static_path));
         }
 
         app
@@ -287,6 +291,33 @@ pub async fn run_with_bind_and_static_tls(
     static_dir: Option<PathBuf>,
     tls: Option<TlsConfig>,
 ) -> Result<(), String> {
+    run_with_static_options(bamboo_home_dir, port, bind, static_dir, tls, false).await
+}
+
+/// Explicit native UI channel for desktop hosts. This enables requests for
+/// Bamboo's own per-intent confirmation; it never installs an HTTP verifier.
+/// Ordinary serve, WebService and SDK entry points remain disabled.
+pub async fn run_with_native_scope_confirmation(
+    bamboo_home_dir: PathBuf,
+    port: u16,
+    bind: &str,
+    static_dir: Option<PathBuf>,
+    tls: Option<TlsConfig>,
+) -> Result<(), String> {
+    if !is_loopback_bind(bind) {
+        return Err("Native Supervisor confirmation requires a loopback desktop bind".into());
+    }
+    run_with_static_options(bamboo_home_dir, port, bind, static_dir, tls, true).await
+}
+
+async fn run_with_static_options(
+    bamboo_home_dir: PathBuf,
+    port: u16,
+    bind: &str,
+    static_dir: Option<PathBuf>,
+    tls: Option<TlsConfig>,
+    native_scope: bool,
+) -> Result<(), String> {
     info!("Starting unified server on {}:{}...", bind, port);
 
     // Loopback/desktop binds skip the limiter (see is_loopback_bind): the local
@@ -341,36 +372,8 @@ pub async fn run_with_bind_and_static_tls(
         .configure(configure_routes_with_rate_limiting);
 
         if let Some(static_path) = &static_dir {
-            let index_file = static_path.join("index.html");
             info!("Serving static files from: {:?}", static_path);
-            app = app.service(
-                fs::Files::new("/", static_path)
-                    .index_file("index.html")
-                    .prefer_utf8(true)
-                    .disable_content_disposition()
-                    .default_handler(fn_service(move |req: ServiceRequest| {
-                        let index_file = index_file.clone();
-                        async move {
-                            let path = req.path().to_string();
-                            if is_api_path(&path) {
-                                let response = HttpResponse::NotFound().finish();
-                                return Ok(ServiceResponse::new(req.into_parts().0, response));
-                            }
-
-                            let (http_req, _) = req.into_parts();
-                            match actix_files::NamedFile::open_async(index_file).await {
-                                Ok(file) => Ok(ServiceResponse::new(
-                                    http_req.clone(),
-                                    file.into_response(&http_req),
-                                )),
-                                Err(_) => Ok(ServiceResponse::new(
-                                    http_req,
-                                    HttpResponse::NotFound().finish(),
-                                )),
-                            }
-                        }
-                    })),
-            );
+            app = app.service(frontend_files(static_path));
         }
 
         app
@@ -395,8 +398,19 @@ pub async fn run_with_bind_and_static_tls(
         "http"
     };
     info!("Unified server running on {scheme}://{}:{}", bind, port);
+    let native_channel = if native_scope {
+        Some(
+            super::supervisor_host_protocol::NativeChannel::start(app_state_for_shutdown.clone())
+                .map_err(|e| format!("Native Supervisor channel unavailable: {e}"))?,
+        )
+    } else {
+        None
+    };
 
     let result = server.await;
+    if let Some(channel) = native_channel {
+        channel.shutdown().await;
+    }
 
     // Gracefully stop AppState-owned background tasks (the #47 MCP-proxy reconnect
     // supervisor + MCP servers) once the server stops, instead of leaking them
@@ -415,6 +429,16 @@ pub async fn run_with_bind_and_static_tls(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn native_confirmation_routable_bind_is_rejected_before_appstate_or_stdio() {
+        let home = tempdir().unwrap();
+        let absent = home.path().join("must-not-be-created");
+        let result =
+            run_with_native_scope_confirmation(absent.clone(), 0, "0.0.0.0", None, None).await;
+        assert!(result.is_err());
+        assert!(!absent.exists());
+    }
 
     #[test]
     fn resolve_runtime_static_dir_uses_configured_dir_when_present() {
@@ -454,6 +478,114 @@ mod tests {
         }
     }
 
+    #[actix_web::test]
+    async fn frontend_files_preserves_asset_ranges_and_conditional_cache_responses() {
+        use actix_web::http::{header, StatusCode};
+        use actix_web::test;
+
+        let static_dir = tempdir().unwrap();
+        let index = b"<html>spa-fallback-marker</html>";
+        let asset = b"console.log('asset');";
+        std::fs::write(static_dir.path().join("index.html"), index).unwrap();
+        std::fs::create_dir(static_dir.path().join("assets")).unwrap();
+        std::fs::write(static_dir.path().join("assets/app-abcdef.js"), asset).unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .wrap(actix_web::middleware::from_fn(
+                    crate::config::add_asset_cache_headers,
+                ))
+                .configure(crate::routes::configure_routes)
+                .service(frontend_files(static_dir.path())),
+        )
+        .await;
+        let uri = "/assets/app-abcdef.js";
+        let resp = test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+        assert!(resp.headers().get(header::CONTENT_DISPOSITION).is_none());
+        let etag = resp.headers().get(header::ETAG).unwrap().clone();
+        let etag_for_head = etag.clone();
+        let last_modified = resp.headers().get(header::LAST_MODIFIED).unwrap().clone();
+        assert_eq!(test::read_body(resp).await.as_ref(), asset);
+
+        let ranged = test::TestRequest::get()
+            .uri(uri)
+            .insert_header((header::RANGE, "bytes=1-5"))
+            .to_request();
+        let resp = test::call_service(&app, ranged).await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_RANGE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes 1-5/{}", asset.len())
+        );
+        assert_eq!(test::read_body(resp).await.as_ref(), &asset[1..=5]);
+
+        let open_ended = test::TestRequest::get()
+            .uri(uri)
+            .insert_header((header::RANGE, "bytes=0-"))
+            .to_request();
+        let resp = test::call_service(&app, open_ended).await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(test::read_body(resp).await.as_ref(), asset);
+
+        for conditional in [
+            (header::IF_NONE_MATCH, etag),
+            (header::IF_MODIFIED_SINCE, last_modified),
+        ] {
+            let req = test::TestRequest::get()
+                .uri(uri)
+                .insert_header(conditional)
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+            assert_eq!(
+                resp.headers().get(header::CACHE_CONTROL).unwrap(),
+                "public, max-age=31536000, immutable"
+            );
+            assert!(test::read_body(resp).await.is_empty());
+        }
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::default()
+                .method(actix_web::http::Method::HEAD)
+                .uri(uri)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get(header::ETAG), Some(&etag_for_head));
+
+        let req = test::TestRequest::get().uri("/chat/deep-link").to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(header::CACHE_CONTROL).is_none());
+        assert_eq!(test::read_body(resp).await.as_ref(), index);
+    }
+
+    #[actix_web::test]
+    async fn frontend_files_returns_not_found_when_spa_index_is_missing() {
+        use actix_web::http::StatusCode;
+        use actix_web::test;
+
+        let static_dir = tempdir().unwrap();
+        let app = test::init_service(App::new().service(frontend_files(static_dir.path()))).await;
+        for uri in ["/", "/chat/deep-link", "/api/v1/missing", "/v2/missing"] {
+            let req = test::TestRequest::get().uri(uri).to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert!(test::read_body(resp).await.is_empty(), "{uri}");
+        }
+    }
+
     /// #512: every prior route/allow-list test (`routes::tests`,
     /// `is_api_path_covers_every_registered_version_prefix` above) exercises
     /// `configure_routes`/`is_api_path` in isolation — never together, and
@@ -465,12 +597,11 @@ mod tests {
     /// and the SPA `index.html`. A route-table assertion can't see that
     /// interaction; only a real `test::call_service` against the exact same
     /// composed `App` can. This test builds that composition (routes +
-    /// Files-with-`is_api_path`-gated-fallback, mirroring the closures in
+    /// Files-with-`is_api_path`-gated-fallback, using the shared service in
     /// `run_with_tls`/`run_with_bind_and_static_tls` above) and drives every
     /// native-API prefix plus the SPA fallback through it end-to-end.
     #[actix_web::test]
     async fn full_app_assembly_forwards_every_api_prefix_and_still_serves_spa_fallback() {
-        use actix_web::dev::{fn_service, ServiceRequest, ServiceResponse};
         use actix_web::http::StatusCode;
         use actix_web::{test, App};
 
@@ -481,31 +612,7 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .configure(crate::routes::configure_routes)
-                .service(
-                    fs::Files::new("/", static_dir.path())
-                        .index_file("index.html")
-                        .default_handler(fn_service(move |req: ServiceRequest| {
-                            let index_file = index_file.clone();
-                            async move {
-                                let path = req.path().to_string();
-                                if is_api_path(&path) {
-                                    let response = HttpResponse::NotFound().finish();
-                                    return Ok(ServiceResponse::new(req.into_parts().0, response));
-                                }
-                                let (http_req, _) = req.into_parts();
-                                match actix_files::NamedFile::open_async(index_file).await {
-                                    Ok(file) => Ok(ServiceResponse::new(
-                                        http_req.clone(),
-                                        file.into_response(&http_req),
-                                    )),
-                                    Err(_) => Ok(ServiceResponse::new(
-                                        http_req,
-                                        HttpResponse::NotFound().finish(),
-                                    )),
-                                }
-                            }
-                        })),
-                ),
+                .service(frontend_files(static_dir.path())),
         )
         .await;
 
@@ -552,15 +659,16 @@ mod tests {
 
         // An unmatched path UNDER a real API prefix must 404 for real — it must
         // NOT fall through to index.html just because Files is mounted at "/".
-        let bogus_api_req = test::TestRequest::get()
-            .uri("/api/v1/totally-not-a-real-route")
-            .to_request();
-        let bogus_api_resp = test::call_service(&app, bogus_api_req).await;
-        assert_eq!(
-            bogus_api_resp.status(),
-            StatusCode::NOT_FOUND,
-            "an unmatched /api/v1/* path must 404, not silently serve the SPA"
-        );
+        for prefix in ["/api", "/v1", "/v2", "/openai", "/anthropic", "/gemini"] {
+            let uri = format!("{prefix}/totally-not-a-real-route");
+            let req = test::TestRequest::get().uri(&uri).to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "an unmatched {uri} must 404, not silently serve the SPA"
+            );
+        }
 
         // A genuine frontend deep-link (not under any API prefix) must serve
         // index.html via the SPA fallback, proving the fallback still works

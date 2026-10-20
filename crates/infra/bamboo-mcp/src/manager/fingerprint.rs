@@ -1,6 +1,5 @@
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use super::*;
 
@@ -99,18 +98,4 @@ pub(super) fn proxy_fingerprint(config: &Config) -> Option<String> {
     hasher.update(b"\0");
     hasher.update(password.as_bytes());
     Some(hex::encode(hasher.finalize()))
-}
-
-pub(super) async fn manager_proxy_fingerprint(
-    cfg_handle: Option<&Arc<tokio::sync::RwLock<Config>>>,
-) -> Option<String> {
-    let handle = cfg_handle?;
-    let cfg = handle.read().await.clone();
-    proxy_fingerprint(&cfg)
-}
-
-pub(super) async fn desired_proxy_fingerprint(
-    cfg_handle: Option<&Arc<tokio::sync::RwLock<Config>>>,
-) -> Option<String> {
-    manager_proxy_fingerprint(cfg_handle).await
 }

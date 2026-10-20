@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tracing::{debug, error, warn};
 
 use crate::error::McpError;
+use crate::manager::log_privacy::{diagnostic_id, error_kind, error_text_len};
 use crate::manager::McpServerManager;
 use crate::tool_index::ToolIndex;
 use crate::types::{McpContentItem, McpContentMetadata, McpStructuredContent};
@@ -34,21 +35,6 @@ impl McpToolExecutor {
             manager,
             authority_matches: true,
         }
-    }
-
-    fn preview_for_log(value: &str, max_chars: usize) -> String {
-        let mut iter = value.chars();
-        let mut preview = String::new();
-        for _ in 0..max_chars {
-            match iter.next() {
-                Some(ch) => preview.push(ch),
-                None => break,
-            }
-        }
-        if iter.next().is_some() {
-            preview.push_str("...");
-        }
-        preview.replace('\n', "\\n").replace('\r', "\\r")
     }
 
     /// Convert MCP result content into a text string plus any returned images.
@@ -169,26 +155,21 @@ impl ToolExecutor for McpToolExecutor {
             }
         };
 
-        debug!(
-            "Executing MCP tool: {} (server: {}, original: {})",
-            tool_name,
-            resolved.server_id(),
-            resolved.original_name()
-        );
+        let server_id = diagnostic_id("server", &[resolved.server_id()]);
+        let owner_id = diagnostic_id("owner", &[resolved.server_id(), resolved.original_name()]);
+        let call_id = diagnostic_id("call", &[&call.id]);
+        debug!(%server_id, %owner_id, %call_id, phase = "execute", "Executing MCP tool");
 
         check_raw_tool_input(resolved.canonical_name(), &call.function.arguments)?;
         // Parse arguments
         let args_raw = call.function.arguments.trim();
         let (mut args, parse_warning) = parse_tool_args_best_effort(&call.function.arguments);
-        if let Some(warning) = parse_warning {
+        if parse_warning.is_some() {
             warn!(
-                "MCP tool argument parsing fallback applied: tool_call_id={}, tool_name={}, server_id={}, args_len={}, args_preview=\"{}\", warning={}",
-                call.id,
-                tool_name,
-                resolved.server_id(),
-                args_raw.len(),
-                Self::preview_for_log(args_raw, 180),
-                warning
+                %server_id, %owner_id, %call_id,
+                phase = "parse_arguments", error_kind = "argument_parse_fallback",
+                args_len = args_raw.len(),
+                "MCP tool argument parsing fallback applied"
             );
         }
 
@@ -226,7 +207,11 @@ impl ToolExecutor for McpToolExecutor {
                 Err(ToolError::NotFound(format!("Tool '{}' not found", name)))
             }
             Err(e) => {
-                error!("MCP tool execution failed: {}", e);
+                error!(
+                    %server_id, %owner_id, %call_id, phase = "execute",
+                    error_kind = error_kind(&e), error_text_len = error_text_len(&e),
+                    "MCP tool execution failed"
+                );
                 Err(ToolError::Execution(format!("MCP error: {}", e)))
             }
         }

@@ -8,8 +8,9 @@ use std::future::poll_fn;
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum State {
+    #[default]
     Pending,
     Cancelled,
     Committed,
@@ -30,12 +31,6 @@ struct AdmissionState {
 
 #[derive(Debug, Clone, Default)]
 pub struct AdmissionGate(Arc<Mutex<AdmissionState>>);
-
-impl Default for State {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 impl AdmissionGate {
     pub fn cancel_if_pending(&self) {

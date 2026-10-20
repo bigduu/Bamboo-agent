@@ -1,3 +1,4 @@
+use crate::error::ResponseResult;
 use actix_web::{web, HttpRequest, HttpResponse, ResponseError};
 
 use super::{ChatRequest, ChatResponse};
@@ -10,6 +11,16 @@ use bamboo_engine::session_app::chat::{parse_goal_command, GoalCommand};
 use bamboo_engine::session_app::metadata::SessionMetadataService;
 
 mod images;
+mod legacy_selection;
+#[cfg(test)]
+use legacy_selection::{
+    install_workflow_commit_test_barrier, pin_explicit_workflow_candidate,
+    wait_at_workflow_commit_test_barrier,
+};
+use legacy_selection::{
+    workflow_activation_running_conflict_response, workflow_runner_is_active,
+    WorkflowMetadataCheckpoint,
+};
 mod ingress;
 pub(crate) use ingress::admit_for_execute;
 mod request;
@@ -61,15 +72,17 @@ async fn persist_and_cache_session_locked(
 async fn save_and_cache_session_locked(
     state: &AppState,
     session: &bamboo_agent_core::Session,
-) -> Result<(), HttpResponse> {
+) -> ResponseResult<()> {
     persist_and_cache_session_locked(state, session)
         .await
         .map_err(|error| {
-            HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": crate::error::error_value(format!(
-                    "Failed to persist chat session: {error}"
-                ))
-            }))
+            HttpResponse::InternalServerError()
+                .json(serde_json::json!({
+                    "error": crate::error::error_value(format!(
+                        "Failed to persist chat session: {error}"
+                    ))
+                }))
+                .into()
         })
 }
 
@@ -190,266 +203,6 @@ fn project_context_error_response(
     }
 }
 
-fn workflow_selection_error_response(
-    diagnostic: bamboo_skills::WorkflowActivationDiagnostic,
-) -> HttpResponse {
-    use bamboo_skills::WorkflowActivationErrorCode;
-
-    let (status, code) = match diagnostic.code {
-        WorkflowActivationErrorCode::RevisionMissing => (
-            actix_web::http::StatusCode::CONFLICT,
-            "workflow_revision_missing",
-        ),
-        WorkflowActivationErrorCode::RevisionMismatch => (
-            actix_web::http::StatusCode::CONFLICT,
-            "workflow_revision_mismatch",
-        ),
-        WorkflowActivationErrorCode::SourceMismatch => (
-            actix_web::http::StatusCode::CONFLICT,
-            "workflow_source_mismatch",
-        ),
-        WorkflowActivationErrorCode::ManualOnly => (
-            actix_web::http::StatusCode::UNPROCESSABLE_ENTITY,
-            "workflow_manual_only",
-        ),
-        WorkflowActivationErrorCode::InvalidSelection => (
-            actix_web::http::StatusCode::UNPROCESSABLE_ENTITY,
-            "workflow_selection_invalid",
-        ),
-        WorkflowActivationErrorCode::SnapshotUnavailable => (
-            actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
-            "workflow_snapshot_unavailable",
-        ),
-        WorkflowActivationErrorCode::SnapshotTooLarge => (
-            actix_web::http::StatusCode::PAYLOAD_TOO_LARGE,
-            "workflow_snapshot_too_large",
-        ),
-        WorkflowActivationErrorCode::ProviderFailed
-        | WorkflowActivationErrorCode::ProviderOutputInvalid => (
-            actix_web::http::StatusCode::UNPROCESSABLE_ENTITY,
-            "workflow_context_invalid",
-        ),
-    };
-    HttpResponse::build(status).json(serde_json::json!({
-        "error": {
-            "type": "api_error",
-            "code": code,
-            "message": diagnostic.message,
-            "recoverable": diagnostic.recoverable
-        }
-    }))
-}
-
-fn workflow_catalog_unavailable_response(error: &bamboo_skills::SkillError) -> HttpResponse {
-    tracing::error!(%error, "failed to pin typed workflow catalog revision");
-    workflow_selection_error_response(bamboo_skills::WorkflowActivationDiagnostic {
-        code: bamboo_skills::WorkflowActivationErrorCode::SnapshotUnavailable,
-        message: "Workflow catalog is temporarily unavailable; retry the request".to_string(),
-        recoverable: true,
-    })
-}
-
-async fn pin_explicit_workflow_candidate(
-    state: &AppState,
-    session: &mut bamboo_agent_core::Session,
-    selection: &bamboo_skills::WorkflowSelection,
-    disabled_skill_ids: &std::collections::BTreeSet<String>,
-) -> Result<String, HttpResponse> {
-    let selected_ids = [selection.id.clone()];
-    // Resolve into an isolated staging activation. A stale/invalid request must
-    // never replace or release the activation currently serving this session.
-    // The staged bytes become durable authority only after the session save;
-    // execute then restores them under the canonical session id.
-    let staging_activation_id = format!("{}:chat-candidate:{}", session.id, uuid::Uuid::new_v4());
-    let workspace = session.workspace_path_meta().map(std::path::PathBuf::from);
-    let resolved_project = state
-        .project_context_resolver
-        .resolve(session, workspace.as_deref())
-        .await
-        .map_err(project_context_error_response)?;
-    let (store, activation) = if let Some(context) = resolved_project {
-        let store = state
-            .skill_manager
-            .store_for_project_workspace(
-                &context.project.id,
-                &context.project.home,
-                context.workspace.as_deref(),
-            )
-            .await
-            .map_err(|error| workflow_catalog_unavailable_response(&error))?;
-        let activation = state
-            .skill_manager
-            .resolve_and_pin_activation_in_project_workspace_with_mode_and_budget(
-                &context.project.id,
-                &context.project.home,
-                context.workspace.as_deref(),
-                &staging_activation_id,
-                disabled_skill_ids,
-                Some(&selected_ids),
-                None,
-                None,
-                bamboo_skills::DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
-            )
-            .await;
-        (store, activation)
-    } else if let Some(workspace) = workspace.as_deref() {
-        // A session-scoped fallback is previewed without filesystem mutation.
-        // Materialize it before opening the workspace catalog, but do not
-        // publish it into runtime state until the base session checkpoint is
-        // durable below. The resolver refuses to recreate missing paths
-        // outside its authoritative root.
-        state
-            .workspace_resolver
-            .materialize_resolved_workspace(workspace)
-            .map_err(|error| {
-                workflow_catalog_unavailable_response(&bamboo_skills::SkillError::Io(error))
-            })?;
-        let store = state
-            .skill_manager
-            .store_for_workspace(Some(workspace))
-            .await
-            .map_err(|error| workflow_catalog_unavailable_response(&error))?;
-        let activation = state
-            .skill_manager
-            .resolve_and_pin_activation_in_workspace_with_mode_and_budget(
-                workspace,
-                &staging_activation_id,
-                disabled_skill_ids,
-                Some(&selected_ids),
-                None,
-                None,
-                bamboo_skills::DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
-            )
-            .await;
-        (store, activation)
-    } else {
-        let store = state
-            .skill_manager
-            .store_for_workspace(None)
-            .await
-            .map_err(|error| workflow_catalog_unavailable_response(&error))?;
-        let activation = state
-            .skill_manager
-            .resolve_and_pin_activation_for_request_with_mode_and_budget(
-                &staging_activation_id,
-                disabled_skill_ids,
-                Some(&selected_ids),
-                None,
-                None,
-                bamboo_skills::DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
-            )
-            .await;
-        (store, activation)
-    };
-    let activation = match activation {
-        Ok(activation) => activation,
-        Err(error) => {
-            let _ = state
-                .skill_manager
-                .release_activation_for_workspace(&staging_activation_id, workspace.as_deref())
-                .await;
-            return Err(workflow_catalog_unavailable_response(&error));
-        }
-    };
-    let snapshot = match store
-        .export_activation_snapshot(&staging_activation_id)
-        .await
-    {
-        Some(snapshot) => snapshot,
-        None => {
-            let _ = state
-                .skill_manager
-                .release_activation_for_workspace(&staging_activation_id, workspace.as_deref())
-                .await;
-            return Err(workflow_selection_error_response(
-                bamboo_skills::WorkflowActivationDiagnostic {
-                    code: bamboo_skills::WorkflowActivationErrorCode::SnapshotUnavailable,
-                    message: "selected workflow snapshot could not be retained".to_string(),
-                    recoverable: true,
-                },
-            ));
-        }
-    };
-    if let Err(diagnostic) = bamboo_skills::persist_explicit_workflow_candidate(
-        &mut session.metadata,
-        selection,
-        &activation,
-        &snapshot,
-    ) {
-        let _ = state
-            .skill_manager
-            .release_activation_for_workspace(&staging_activation_id, workspace.as_deref())
-            .await;
-        return Err(workflow_selection_error_response(diagnostic));
-    }
-    Ok(staging_activation_id)
-}
-
-struct StagedWorkflowActivation {
-    activation_id: String,
-    metadata_upserts: Vec<(String, String)>,
-    metadata_removals: Vec<String>,
-    skill_manager: std::sync::Arc<bamboo_skills::SkillManager>,
-    cleanup_armed: bool,
-}
-
-impl Drop for StagedWorkflowActivation {
-    fn drop(&mut self) {
-        if !self.cleanup_armed {
-            return;
-        }
-        let skill_manager = self.skill_manager.clone();
-        let activation_id = self.activation_id.clone();
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                let _cleanup = handle.spawn(async move {
-                    if let Err(error) = skill_manager
-                        .release_activation_for_workspace(&activation_id, None)
-                        .await
-                    {
-                        tracing::error!(
-                            %activation_id,
-                            %error,
-                            "failed to release abandoned staged Workflow activation"
-                        );
-                    }
-                });
-            }
-            Err(error) => {
-                tracing::error!(
-                    activation_id = %self.activation_id,
-                    %error,
-                    "runtime unavailable while releasing staged Workflow activation"
-                );
-            }
-        }
-    }
-}
-
-#[derive(Default)]
-struct WorkflowMetadataCheckpoint {
-    entries: std::collections::HashMap<String, String>,
-}
-
-impl WorkflowMetadataCheckpoint {
-    fn capture(session: Option<&bamboo_agent_core::Session>) -> Self {
-        let entries = session
-            .into_iter()
-            .flat_map(|session| session.metadata.iter())
-            .filter(|(key, _)| workflow_transaction_metadata_key(key))
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        Self { entries }
-    }
-
-    fn restore(&self, session: &mut bamboo_agent_core::Session) {
-        session
-            .metadata
-            .retain(|key, _| !workflow_transaction_metadata_key(key));
-        session.metadata.extend(self.entries.clone());
-    }
-}
-
 /// A requested Root tool policy is part of the user turn, not the early
 /// session checkpoint. Preserve its previous durable value until the message
 /// and any attachments pass validation and the final turn is saved.
@@ -477,172 +230,6 @@ impl RootToolAuthorityCheckpoint {
             session
                 .model_context_state
                 .clone_from(&self.model_context_state);
-        }
-    }
-}
-
-fn workflow_transaction_metadata_key(key: &str) -> bool {
-    key.starts_with("workflow.")
-        || key.starts_with("skill_runtime_")
-        || matches!(key, "selected_skill_ids" | "skill_mode")
-}
-
-fn workflow_runner_is_active(runner: Option<&crate::app_state::AgentRunner>) -> bool {
-    runner.is_some_and(|runner| {
-        matches!(
-            runner.status,
-            crate::app_state::AgentStatus::Pending | crate::app_state::AgentStatus::Running
-        )
-    })
-}
-
-fn workflow_activation_running_conflict_response(session_id: &str) -> HttpResponse {
-    HttpResponse::Conflict().json(serde_json::json!({
-        "error": {
-            "type": "api_error",
-            "code": "workflow_activation_running_conflict",
-            "message": "A running or starting session cannot replace its active Workflow"
-        },
-        "session_id": session_id,
-    }))
-}
-
-#[cfg(test)]
-struct WorkflowCommitTestBarrier {
-    reached: tokio::sync::Semaphore,
-    resume: tokio::sync::Semaphore,
-}
-
-#[cfg(test)]
-impl Default for WorkflowCommitTestBarrier {
-    fn default() -> Self {
-        Self {
-            reached: tokio::sync::Semaphore::new(0),
-            resume: tokio::sync::Semaphore::new(0),
-        }
-    }
-}
-
-#[cfg(test)]
-static WORKFLOW_COMMIT_TEST_BARRIERS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<WorkflowCommitTestBarrier>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-#[cfg(test)]
-static WORKFLOW_POST_SAVE_TEST_BARRIERS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<WorkflowCommitTestBarrier>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-#[cfg(test)]
-fn install_workflow_commit_test_barrier(
-    session_id: &str,
-) -> std::sync::Arc<WorkflowCommitTestBarrier> {
-    let barrier = std::sync::Arc::new(WorkflowCommitTestBarrier::default());
-    WORKFLOW_COMMIT_TEST_BARRIERS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(session_id.to_string(), barrier.clone());
-    barrier
-}
-
-#[cfg(test)]
-async fn wait_at_workflow_commit_test_barrier(session_id: &str) {
-    let barrier = WORKFLOW_COMMIT_TEST_BARRIERS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(session_id);
-    if let Some(barrier) = barrier {
-        barrier.reached.add_permits(1);
-        barrier
-            .resume
-            .acquire()
-            .await
-            .expect("workflow commit test barrier remains open")
-            .forget();
-    }
-}
-
-#[cfg(test)]
-fn install_workflow_post_save_test_barrier(
-    session_id: &str,
-) -> std::sync::Arc<WorkflowCommitTestBarrier> {
-    let barrier = std::sync::Arc::new(WorkflowCommitTestBarrier::default());
-    WORKFLOW_POST_SAVE_TEST_BARRIERS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(session_id.to_string(), barrier.clone());
-    barrier
-}
-
-#[cfg(test)]
-async fn wait_at_workflow_post_save_test_barrier(session_id: &str) {
-    let barrier = WORKFLOW_POST_SAVE_TEST_BARRIERS
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(session_id);
-    if let Some(barrier) = barrier {
-        barrier.reached.add_permits(1);
-        barrier
-            .resume
-            .acquire()
-            .await
-            .expect("workflow post-save test barrier remains open")
-            .forget();
-    }
-}
-
-impl StagedWorkflowActivation {
-    fn between(
-        activation_id: String,
-        current: &std::collections::HashMap<String, String>,
-        candidate: &std::collections::HashMap<String, String>,
-        skill_manager: std::sync::Arc<bamboo_skills::SkillManager>,
-    ) -> Self {
-        let metadata_upserts = candidate
-            .iter()
-            .filter(|(key, value)| {
-                workflow_transaction_metadata_key(key) && current.get(*key) != Some(*value)
-            })
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        let metadata_removals = current
-            .keys()
-            .filter(|key| workflow_transaction_metadata_key(key) && !candidate.contains_key(*key))
-            .cloned()
-            .collect();
-        Self {
-            activation_id,
-            metadata_upserts,
-            metadata_removals,
-            skill_manager,
-            cleanup_armed: true,
-        }
-    }
-
-    fn apply(&self, metadata: &mut std::collections::HashMap<String, String>) {
-        for key in &self.metadata_removals {
-            metadata.remove(key);
-        }
-        for (key, value) in &self.metadata_upserts {
-            metadata.insert(key.clone(), value.clone());
-        }
-    }
-
-    async fn release(&mut self) {
-        if !self.cleanup_armed {
-            return;
-        }
-        match self
-            .skill_manager
-            .release_activation_for_workspace(&self.activation_id, None)
-            .await
-        {
-            Ok(()) => self.cleanup_armed = false,
-            Err(error) => tracing::error!(
-                activation_id = %self.activation_id,
-                %error,
-                "failed to release staged Workflow activation"
-            ),
         }
     }
 }
@@ -677,7 +264,7 @@ pub async fn handler(
         &*req,
     ) {
         Ok(prepared) => prepared,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let Some(prepared) = prepared else {
         return handle_chat(state, req, &http_request).await;
@@ -716,6 +303,11 @@ async fn handle_chat(
         existing_workspace_source,
     ) = match state.storage.load_session(&session_id).await {
         Ok(Some(existing)) => {
+            if let Some(response) =
+                crate::handlers::agent::sessions::SessionSummary::execution_conflict(&existing)
+            {
+                return response;
+            }
             let project_id = match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&existing) {
                     bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => Some(project_id),
                     bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
@@ -801,68 +393,71 @@ async fn handle_chat(
             .flatten()
         })
     };
-    let workspace_validation = if let Some(requested_workspace) = requested_workspace {
-        crate::project_context::validate_explicit_session_workspace_with_resolver(
-            &state.project_store,
-            effective_project_id.as_ref(),
-            requested_workspace,
-            &state.workspace_resolver,
-        )
-        .map(Some)
-        .map_err(crate::project_context::session_workspace_error_response)
-    } else {
-        crate::project_context::validate_workspace_assignment_with_resolver(
-            &state.project_store,
-            effective_project_id.as_ref(),
-            fallback_workspace(),
-            &state.workspace_resolver,
-        )
-        .map_err(|error| match error {
-            crate::project_context::ProjectWorkspaceValidationError::Invalid {
-                code,
-                workspace,
-                message,
-            } => {
-                let mut response = if code.starts_with("project_path_") {
-                    HttpResponse::Conflict()
-                } else {
-                    HttpResponse::BadRequest()
-                };
-                response.json(serde_json::json!({
-                    "error": {
-                        "type": "api_error",
-                        "code": code,
-                        "message": message
-                    },
-                    "workspace": workspace,
-                }))
-            }
-            crate::project_context::ProjectWorkspaceValidationError::Conflict {
-                workspace,
-                owner_project_id,
-                session_project_id,
-            } => HttpResponse::Conflict().json(serde_json::json!({
-                "error": {
-                    "type": "api_error",
-                    "code": "project_workspace_conflict",
-                    "message": "Workspace belongs to another Project"
-                },
-                "workspace": workspace,
-                "owner_project_id": owner_project_id,
-                "session_project_id": session_project_id,
-            })),
-            crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
-                tracing::error!(%error, "failed to validate workspace Project ownership");
-                crate::error::json_error(
-                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to validate workspace Project ownership",
-                )
-            }
-        })
-    };
+    let workspace_validation: ResponseResult<_> =
+        if let Some(requested_workspace) = requested_workspace {
+            crate::project_context::validate_explicit_session_workspace_with_resolver(
+                &state.project_store,
+                effective_project_id.as_ref(),
+                requested_workspace,
+                &state.workspace_resolver,
+            )
+            .map(Some)
+            .map_err(|error| crate::project_context::session_workspace_error_response(error).into())
+        } else {
+            crate::project_context::validate_workspace_assignment_with_resolver(
+                &state.project_store,
+                effective_project_id.as_ref(),
+                fallback_workspace(),
+                &state.workspace_resolver,
+            )
+            .map_err(|error| {
+                Box::new(match error {
+                    crate::project_context::ProjectWorkspaceValidationError::Invalid {
+                        code,
+                        workspace,
+                        message,
+                    } => {
+                        let mut response = if code.starts_with("project_path_") {
+                            HttpResponse::Conflict()
+                        } else {
+                            HttpResponse::BadRequest()
+                        };
+                        response.json(serde_json::json!({
+                            "error": {
+                                "type": "api_error",
+                                "code": code,
+                                "message": message
+                            },
+                            "workspace": workspace,
+                        }))
+                    }
+                    crate::project_context::ProjectWorkspaceValidationError::Conflict {
+                        workspace,
+                        owner_project_id,
+                        session_project_id,
+                    } => HttpResponse::Conflict().json(serde_json::json!({
+                        "error": {
+                            "type": "api_error",
+                            "code": "project_workspace_conflict",
+                            "message": "Workspace belongs to another Project"
+                        },
+                        "workspace": workspace,
+                        "owner_project_id": owner_project_id,
+                        "session_project_id": session_project_id,
+                    })),
+                    crate::project_context::ProjectWorkspaceValidationError::Store(error) => {
+                        tracing::error!(%error, "failed to validate workspace Project ownership");
+                        crate::error::json_error(
+                            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to validate workspace Project ownership",
+                        )
+                    }
+                })
+            })
+        };
     let final_workspace = match workspace_validation {
         Ok(workspace) => workspace,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let final_workspace_display = final_workspace
         .as_deref()
@@ -892,7 +487,7 @@ async fn handle_chat(
     };
     let model = match request::resolve_model(req.model.as_deref(), default_model.as_deref()) {
         Ok(model) => model,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let global_default_prompt =
@@ -946,6 +541,9 @@ async fn handle_chat(
         return project_context_error_response(error);
     }
     let workspace_was_explicit = req.workspace_path.is_some();
+    if let Err(response) = ingress::validate_skill_request(&req) {
+        return *response;
+    }
     let requested_workflow_selection = req.workflow_selection.clone();
     // An explicit request value wins; otherwise stamp the durable
     // permission-policy seed for a NEW session. The engine applies this only
@@ -1023,6 +621,12 @@ async fn handle_chat(
     // An existing Root changes tool authority through the recoverable
     // mode-only operation. Keeping an unfenced inline path would allow a late
     // chat POST to undo a recovery result after the client has read detail.
+    if let Some(response) = authoritative_session
+        .as_ref()
+        .and_then(crate::handlers::agent::sessions::SessionSummary::execution_conflict)
+    {
+        return response;
+    }
     let existing_root = authoritative_session.as_ref().is_some_and(|session| {
         session.kind == bamboo_domain::SessionKind::Root && session.parent_session_id.is_none()
     });
@@ -1245,40 +849,19 @@ async fn handle_chat(
     {
         return project_context_error_response(error);
     }
-    let mut staged_workflow_activation =
-        if let Some(selection) = requested_workflow_selection.as_ref() {
-            let mut candidate = session.clone();
-            if let Err(error) = bamboo_engine::session_app::chat::resolve_workflow_selection(
-                &mut candidate,
-                Some(selection),
-                req.selected_skill_ids.as_deref(),
-                &req.message,
-            ) {
-                return HttpResponse::BadRequest().json(serde_json::json!({
-                    "error": crate::error::error_value(error.to_string())
-                }));
-            }
-            let disabled_skill_ids = config_snapshot.disabled_skill_ids();
-            let staging_id = match pin_explicit_workflow_candidate(
-                state.as_ref(),
-                &mut candidate,
-                selection,
-                &disabled_skill_ids,
-            )
-            .await
-            {
-                Ok(staging_id) => staging_id,
-                Err(response) => return response,
-            };
-            Some(StagedWorkflowActivation::between(
-                staging_id,
-                &session.metadata,
-                &candidate.metadata,
-                state.skill_manager.clone(),
-            ))
-        } else {
-            None
-        };
+    let mut staged_workflow_activation = match legacy_selection::stage_selection(
+        state.as_ref(),
+        &session,
+        requested_workflow_selection.as_ref(),
+        req.selected_skill_ids.as_deref(),
+        &req.message,
+        &config_snapshot,
+    )
+    .await
+    {
+        Ok(staging) => staging,
+        Err(response) => return *response,
+    };
     // Publish the prepared checkpoint without any speculative Workflow
     // normalization. The in-memory turn keeps those changes for a successful
     // final commit, while every rejected/failing path continues to expose the
@@ -1293,7 +876,7 @@ async fn handle_chat(
         if let Some(staging) = staged_workflow_activation.as_mut() {
             staging.release().await;
         }
-        return response;
+        return *response;
     }
     sync_runtime_workspace(
         state.as_ref(),
@@ -1334,7 +917,7 @@ async fn handle_chat(
                 session.messages = messages.clone();
             }
             if let Err(response) = save_and_cache_session_locked(state.as_ref(), &session).await {
-                return response;
+                return *response;
             }
             return HttpResponse::BadRequest().json(serde_json::json!({
                 "error": crate::error::error_value(reason),
@@ -1387,18 +970,28 @@ async fn handle_chat(
         None
     };
 
+    let native_skills = crate::skill_runtime::registered_main(&session)
+        && [
+            &req.message_id,
+            &req.thread_id,
+            &req.in_reply_to,
+            &req.correlation_id,
+        ]
+        .into_iter()
+        .all(Option::is_none);
     let queue_root_input = root_input_messages.is_some();
     let metadata_before_input = session.metadata.clone();
     let runtime_metadata_before_input = session.runtime_metadata.clone();
     // Image handling stays in the handler layer (depends on AppState attachment reader).
-    let ingress_receipt =
+    let mut native_input = None;
+    let mut ingress_receipt =
         match ingress::queue(&state, &session, &req, &effective_message, http_request).await {
             Ok(receipt) => receipt,
             Err(response) => {
                 if let Some(staging) = staged_workflow_activation.as_mut() {
                     staging.release().await;
                 }
-                return response;
+                return *response;
             }
         };
     let queued = ingress_receipt.is_some();
@@ -1423,6 +1016,16 @@ async fn handle_chat(
                 )
             }
         }
+    } else if !queue_root_input {
+        match images::construct_native_envelope(&state, &session, &req, &effective_message).await {
+            Ok(envelope) => native_input = Some(envelope),
+            Err(response) => {
+                if let Some(staging) = staged_workflow_activation.as_mut() {
+                    staging.release().await;
+                }
+                return *response;
+            }
+        }
     } else if let Err(response) = images::append_user_message(
         &state,
         &mut session,
@@ -1434,10 +1037,14 @@ async fn handle_chat(
         if let Some(staging) = staged_workflow_activation.as_mut() {
             staging.release().await;
         }
-        return response;
+        return *response;
     }
 
     let mut queued_input = if queue_root_input && !queued {
+        let skill_request = match ingress::skill_request(&req) {
+            Ok(data) => data,
+            Err(response) => return *response,
+        };
         let message = session
             .messages
             .pop()
@@ -1468,11 +1075,71 @@ async fn handle_chat(
                     _ => unreachable!(),
                 },
                 parts: message.content_parts.unwrap_or_default(),
+                skill_request,
             });
         Some(envelope)
     } else {
         None
     };
+
+    if native_skills {
+        // Keep the real durable checkpoint and only the permitted post-hook
+        // observations in F; staged Workflow authority is committed afterwards.
+        let checkpoint = match state.persistence.storage().load_session(&session_id).await {
+            Ok(Some(checkpoint)) => checkpoint,
+            Ok(None) => {
+                return crate::error::json_error(
+                    actix_web::http::StatusCode::CONFLICT,
+                    "Native Skill checkpoint is missing",
+                )
+            }
+            Err(error) => {
+                return crate::error::json_error(
+                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    error.to_string(),
+                )
+            }
+        };
+        let mut candidate = checkpoint.clone();
+        if let Some(observed) = session.agent_runtime_state.as_ref() {
+            let runtime = candidate
+                .agent_runtime_state
+                .get_or_insert_with(|| bamboo_domain::AgentRuntimeState::new(&checkpoint.id));
+            runtime.checkpoints = observed.checkpoints.clone();
+            runtime.hook_contexts = observed.hook_contexts.clone();
+            runtime.stop_hook_forced_continuations = observed.stop_hook_forced_continuations;
+        }
+        const PRECHECK: &str = "runtime.plugin_prompt_prechecked";
+        match session.metadata.get(PRECHECK) {
+            Some(value) => {
+                candidate.metadata.insert(PRECHECK.into(), value.clone());
+            }
+            None => {
+                candidate.metadata.remove(PRECHECK);
+            }
+        }
+        let envelope = native_input.as_mut().or(queued_input.as_mut());
+        if let Some(envelope) = envelope {
+            if let Err(error) = crate::skill_runtime::prepare_envelope(
+                state.clone(),
+                &candidate,
+                &checkpoint,
+                &persistence_guard,
+                envelope,
+                requested_workflow_selection.as_ref(),
+            )
+            .await
+            {
+                if let Some(staging) = staged_workflow_activation.as_mut() {
+                    staging.release().await;
+                }
+                return crate::error::json_error(
+                    actix_web::http::StatusCode::BAD_REQUEST,
+                    error.to_string(),
+                );
+            }
+        }
+    }
 
     if retire_workflow {
         // The old candidate can otherwise be restored on the next execute,
@@ -1491,7 +1158,23 @@ async fn handle_chat(
         bamboo_engine::runner::refresh_prompt_snapshot(&mut session);
     }
 
-    if staged_workflow_activation.is_some() || retire_workflow || queued_input.is_some() {
+    if let Some(envelope) = native_input {
+        let workflow_changed = staged_workflow_activation.is_some() || retire_workflow;
+        ingress_receipt = match ingress::commit_native_input(
+            state.clone(),
+            session,
+            staged_workflow_activation,
+            workflow_changed,
+            envelope,
+            persistence_guard,
+            workflow_commit_guard,
+        )
+        .await
+        {
+            Ok(receipt) => Some(receipt),
+            Err(response) => return *response,
+        };
+    } else if staged_workflow_activation.is_some() || retire_workflow || queued_input.is_some() {
         let workflow_changed = staged_workflow_activation.is_some() || retire_workflow;
         let mut staging = staged_workflow_activation;
         if let Some(staging) = staging.as_ref() {
@@ -1537,103 +1220,29 @@ async fn handle_chat(
             // consumer publishes prompt + typed turn + cursor together.
             session.messages = original.clone();
         }
-        let commit_state = state.clone();
-        let commit_session_id = session_id.clone();
-        let commit = tokio::spawn(async move {
-            // Keep final save -> old pin release cancellation-resistant for
-            // replacement, retirement, and the first-chat Root switch.
-            let _persistence_guard = persistence_guard;
-            let _workflow_commit_guard = workflow_commit_guard;
-            if let Err(error) =
-                persist_and_cache_session_locked(commit_state.as_ref(), &session).await
-            {
-                if let Some(staging) = staging.as_mut() {
-                    staging.release().await;
-                }
-                return Err(error.to_string());
-            }
-            let admission = if let Some(envelope) = queued_input {
-                match commit_state
-                    .session_messenger
-                    .admit_with_activation_intent(
-                        envelope,
-                        bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
-                        None,
-                    )
-                    .await
-                {
-                    Ok(admission) => Some(admission),
-                    Err(error) => {
-                        if let Some(staging) = staging.as_mut() {
-                            staging.release().await;
-                        }
-                        return Err(error.to_string());
-                    }
-                }
-            } else {
-                None
-            };
-            #[cfg(test)]
-            wait_at_workflow_post_save_test_barrier(&commit_session_id).await;
-
-            // The durable user turn and exact snapshot now own the next
-            // execution. Only now may the prior live activation be released.
-            if workflow_changed {
-                if let Err(error) = commit_state
-                    .skill_manager
-                    .release_activation_for_workspace(&commit_session_id, None)
-                    .await
-                {
-                    tracing::error!(
-                        session_id = %commit_session_id,
-                        %error,
-                        "failed to release prior Workflow activation after commit"
-                    );
-                }
-            }
-            if let Some(staging) = staging.as_mut() {
-                staging.release().await;
-            }
-            // Activation startup acquires the same Host lock. The complete
-            // metadata/pin/admission transaction must release it first.
-            drop(_workflow_commit_guard);
-            drop(_persistence_guard);
-            if let Some(admission) = admission {
-                if let Err(error) = commit_state
-                    .session_messenger
-                    .activate_prepared(&admission)
-                    .await
-                {
-                    // Body and immediate eligibility are already durable. The
-                    // existing activation recovery can retry this same input.
-                    tracing::warn!(session_id = %commit_session_id, %error, "Root chat input awaits activation");
-                }
-            } else if !queued {
-                publish_committed_chat(&commit_state, &session);
-            }
-            Ok::<(), String>(())
-        });
-        match commit.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                return HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": crate::error::error_value(format!(
-                        "Failed to persist chat session: {error}"
-                    ))
-                }));
-            }
-            Err(error) => {
-                tracing::error!(%error, "Workflow authority chat commit task failed");
-                return crate::error::json_error(
-                    actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    "Failed to commit Workflow authority chat",
-                );
-            }
+        match legacy_selection::commit_selected_input(
+            state.clone(),
+            session,
+            session_id.clone(),
+            staging,
+            workflow_changed,
+            queued_input,
+            queued,
+            persistence_guard,
+            workflow_commit_guard,
+        )
+        .await
+        {
+            Ok(Some(receipt)) => ingress_receipt = Some(receipt),
+            // Referenced ingress may already own its receipt; metadata-only
+            // commits must preserve it rather than fabricate or erase one.
+            Ok(None) => {}
+            Err(response) => return *response,
         }
     } else {
         // Re-save to persist image attachments (if any).
         if let Err(response) = save_and_cache_session_locked(state.as_ref(), &session).await {
-            return response;
+            return *response;
         }
         drop(workflow_commit_guard);
         if !queued {

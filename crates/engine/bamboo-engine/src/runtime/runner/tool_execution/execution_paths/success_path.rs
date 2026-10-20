@@ -61,15 +61,17 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
     // workflow activation namespace into the runner's live Session before the
     // next round and before any later runtime save can overwrite those changes.
     refresh_workflow_tool_side_effects(&mut ctx).await;
-    task::track_task_progress(
-        ctx.task_context,
-        ctx.event_tx,
-        ctx.session_id,
-        ctx.tool_call,
-        result,
-        ctx.round,
-    )
-    .await;
+    if let Some(progress_result) = ctx.task_progress_result.result(result) {
+        task::track_task_progress(
+            ctx.task_context,
+            ctx.event_tx,
+            ctx.session_id,
+            ctx.tool_call,
+            progress_result,
+            ctx.round,
+        )
+        .await;
+    }
 
     task::maybe_handle_taskwrite(
         ctx.tool_call,
@@ -149,6 +151,12 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
             "success": result.success,
         })
     );
+
+    if ctx.loop_result_checkpointed {
+        // The owner checkpointed this immutable pair, then any bounded native
+        // feedback in the existing hook-context plane. Never rewrite the pair.
+        return false;
+    }
 
     let outcome = handle_tool_result_with_agentic_support_and_persistence(
         result,

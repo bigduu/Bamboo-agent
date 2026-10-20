@@ -18,7 +18,11 @@ use bamboo_domain::{
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
+pub(crate) use no_progress::{
+    finish_exhausted_progress, quiet_poll_guard_active as progress_feedback_active,
+};
 pub(crate) use policy::ToolPolicyGuard;
+pub(crate) use progress_feedback::{is_required_progress_feedback, FeedbackDecision};
 
 fn build_context_pressure(session: &Session) -> Option<output_compressor::ContextPressure> {
     let usage = session.token_usage.as_ref()?;
@@ -57,9 +61,16 @@ mod clarification;
 mod events;
 mod execution_paths;
 mod loop_state;
+#[cfg(test)]
+mod model_progress_feedback_tests;
+mod no_progress;
 mod output_compressor;
 mod per_call;
 mod policy;
+mod progress_feedback;
+#[cfg(test)]
+mod progress_hint_tests;
+mod quiet_poll;
 #[cfg(test)]
 mod supervisor_dispatch_tests;
 mod task;
@@ -127,6 +138,7 @@ struct SingleToolExecutionControl {
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_and_apply_single_tool_call(
+    vision_support: bool,
     tool_call: &ToolCall,
     event_tx: &mpsc::Sender<AgentEvent>,
     metrics_collector: Option<&MetricsCollector>,
@@ -164,6 +176,12 @@ async fn execute_and_apply_single_tool_call(
     let executing_supervisor =
         ExecutingSupervisorObservation::capture_from_executing_session(session);
     let root_orchestration_only = session.root_orchestration_only_enabled();
+    let session_behavior_version = session.session_version;
+    let admitted_execution_name = per_call::resolve_callable_for_session(
+        session_behavior_version,
+        effective_callable_set,
+        &tool_call.function.name,
+    );
     // Plan mode gate: block mutating tools (except pause/clarification tools)
     if session_flags.plan_read_only {
         let tool_name = tool_call.function.name.trim();
@@ -176,14 +194,15 @@ async fn execute_and_apply_single_tool_call(
                 tool_name
             );
             let outcome = per_call::ToolExecutionOutcome {
+                output_cap: None,
                 permission_replay_origin: None,
                 needs_human: None,
                 portable_tool: None,
                 post_tool_hook_eligible: false,
+                managed_running_violation: false,
                 result: Err(format!("Plan mode: {} operation blocked", tool_name)),
                 tool_duration: std::time::Duration::ZERO,
             };
-            policy_guard.observe_outcome(tool_call, &outcome.result);
             let task_hint = build_task_compression_hint(task_context);
             let outcome = output_compressor::maybe_compress(
                 &tool_call.function.name,
@@ -200,6 +219,8 @@ async fn execute_and_apply_single_tool_call(
             .await;
             let should_break = per_call::apply_tool_execution_outcome(
                 per_call::ToolExecutionApplyContext {
+                    policy_guard,
+                    admitted_execution_name: admitted_execution_name.as_deref(),
                     tool_call,
                     event_tx,
                     metrics_collector,
@@ -224,12 +245,49 @@ async fn execute_and_apply_single_tool_call(
         }
     }
 
+    let quiet_guard_active = no_progress::quiet_poll_guard_active(session, runtime_state, config);
+    if quiet_guard_active && policy_guard.quiet_polls.pending() {
+        policy_guard.quiet_polls.retain_owned_handles(
+            &bamboo_tools::tools::bash_runtime::uncollected_polled_shells_for_session(session_id),
+        );
+    }
+    let suppressed = quiet_guard_active
+        .then(|| {
+            policy_guard
+                .quiet_polls
+                .suppress(tool_call, admitted_execution_name.as_deref())
+        })
+        .flatten();
     let mut stop_round = false;
-    let outcome = match policy_guard.check_before_execution(tool_call, reserved_calls) {
+    let outcome = match policy_guard.check_before_execution_for_name(
+        tool_call,
+        reserved_calls,
+        admitted_execution_name.as_deref(),
+    ) {
+        Ok(()) if suppressed.is_some() => per_call::ToolExecutionOutcome {
+            output_cap: None,
+            permission_replay_origin: None,
+            needs_human: None,
+            portable_tool: per_call::portable_tool_for_admitted_call(
+                session_behavior_version,
+                effective_callable_set,
+                tool_call,
+            ),
+            post_tool_hook_eligible: false,
+            managed_running_violation: false,
+            result: Ok(suppressed.expect("checked suppression")),
+            tool_duration: std::time::Duration::ZERO,
+        },
         Ok(()) => {
-            per_call::execute_model_requested_tool_call_only(
+            let managed_parallel_call = crate::runtime::loop_control::suspension::active(config)
+                && scheduling_mode_for_tool_call(tool_call, tools)
+                    == ToolSchedulingMode::ParallelSafe;
+            let dispatch = per_call::execute_model_requested_tool_call_only(
                 effective_callable_set,
                 per_call::ToolExecutionOnlyContext {
+                    session_behavior_version,
+                    vision_support,
+                    output_cap: None,
                     tool_call,
                     event_tx,
                     metrics_collector,
@@ -249,8 +307,52 @@ async fn execute_and_apply_single_tool_call(
                     session_flags,
                     available_tool_schemas,
                 },
-            )
-            .await?
+            );
+            if managed_parallel_call {
+                // Routing an active managed call through the sequential apply
+                // boundary must retain the old parallel path's finite limits.
+                let timeout = std::time::Duration::from_secs(
+                    config
+                        .per_tool_timeout_secs
+                        .min(config.parallel_batch_timeout_secs),
+                );
+                match bamboo_infrastructure::telemetry::with_timeout(timeout, dispatch).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        let violation = bamboo_agent_core::tools::suspension_running_violated();
+                        if violation {
+                            if let Some(resources) = bamboo_tools::LocalTaskResources::current() {
+                                resources.record_unconfirmed(
+                                    crate::runtime::loop_control::suspension::RUNNING_REFUSAL,
+                                );
+                            }
+                        }
+                        per_call::ToolExecutionOutcome {
+                            output_cap: None,
+                            permission_replay_origin: None,
+                            needs_human: None,
+                            portable_tool: per_call::portable_tool_for_admitted_call(
+                                session_behavior_version,
+                                effective_callable_set,
+                                tool_call,
+                            ),
+                            post_tool_hook_eligible: !violation,
+                            managed_running_violation: violation,
+                            result: Err(if violation {
+                                crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into()
+                            } else {
+                                format!(
+                                    "Tool '{}' timed out after {:?}",
+                                    tool_call.function.name, timeout
+                                )
+                            }),
+                            tool_duration: timeout,
+                        }
+                    }
+                }
+            } else {
+                dispatch.await?
+            }
         }
         Err(violation) => {
             stop_round = violation.should_stop_round();
@@ -264,16 +366,41 @@ async fn execute_and_apply_single_tool_call(
                 message
             );
             per_call::ToolExecutionOutcome {
+                output_cap: None,
                 permission_replay_origin: None,
                 needs_human: None,
                 portable_tool: None,
                 post_tool_hook_eligible: false,
+                managed_running_violation: false,
                 result: Err(message),
                 tool_duration: std::time::Duration::ZERO,
             }
         }
     };
 
+    // Compare raw output: changing evidence hidden by compression is still progress.
+    policy_guard.observe_raw_observation(tool_call, &outcome.result);
+    if quiet_guard_active {
+        policy_guard
+            .quiet_polls
+            .observe(tool_call, &outcome, admitted_execution_name.as_deref());
+        // Foreign implementations under the reserved spelling cannot retain
+        // evidence for an absent handle or another owner's command. Expired
+        // handles must not permanently occupy the bounded policy capacity.
+        policy_guard.quiet_polls.retain_owned_handles(
+            &bamboo_tools::tools::bash_runtime::uncollected_polled_shells_for_session(session_id),
+        );
+    }
+    // Use exactly the scalar observed by this dispatch, including unknown/zero.
+    // Pre-dispatch failures retain the original local projection.
+    let max_tool_tokens = outcome
+        .output_cap
+        .unwrap_or_else(|| {
+            session
+                .effective_token_budget()
+                .map(|budget| budget.max_tool_output_tokens)
+        })
+        .unwrap_or(0);
     // Compress tool output before applying
     let task_hint = build_task_compression_hint(task_context);
     let outcome = output_compressor::maybe_compress(
@@ -281,20 +408,15 @@ async fn execute_and_apply_single_tool_call(
         &tool_call.function.arguments,
         session_id,
         outcome,
-        session
-            .effective_token_budget()
-            .map(|b| b.max_tool_output_tokens)
-            .unwrap_or(0),
+        max_tool_tokens,
         build_context_pressure(session),
         task_hint.as_ref(),
     )
     .await;
-    // The output budget may turn an otherwise successful browser download
-    // into a bounded failure. Count the result the model actually receives.
-    policy_guard.observe_outcome(tool_call, &outcome.result);
-
     let should_break = per_call::apply_tool_execution_outcome(
         per_call::ToolExecutionApplyContext {
+            policy_guard,
+            admitted_execution_name: admitted_execution_name.as_deref(),
             tool_call,
             event_tx,
             metrics_collector,
@@ -454,6 +576,62 @@ pub(crate) struct RoundToolExecution<'a, 'frame> {
 pub(crate) async fn execute_round_tool_calls(
     execution: RoundToolExecution<'_, '_>,
 ) -> Result<RoundToolExecutionResult, AgentError> {
+    // Retain observation outside the pre-Start parallel timeouts. Per-call
+    // observers share this token, even if their futures are dropped.
+    let control = execution.frame.config.loop_control.as_ref();
+    let session_id = execution.session.id.clone();
+    let reader = super::image_fallback::round_needs_image_references(
+        execution.tool_calls,
+        execution.effective_callable_set,
+        execution
+            .frame
+            .config
+            .hook_runner
+            .has_hooks_for(AgentHookPoint::BeforeToolExecution),
+    )
+    .then(|| {
+        super::image_fallback::image_reference_reader(
+            &*execution.session,
+            execution.frame.config.attachment_reader.clone(),
+        )
+    });
+    let dispatch = async move {
+        if let Some(reader) = reader {
+            bamboo_tools::tools::view_image::with_image_reference_reader(
+                &session_id,
+                reader,
+                execute_round_tool_calls_inner(execution),
+            )
+            .await
+        } else {
+            execute_round_tool_calls_inner(execution).await
+        }
+    };
+    if let Some(control) = control {
+        let (result, observation) =
+            bamboo_agent_core::tools::observe_tool_suspension(false, dispatch).await;
+        if observation.running_seen {
+            control.record_running_observed();
+        }
+        if observation.forbidden_running_seen {
+            if let Some(resources) = bamboo_tools::LocalTaskResources::current() {
+                resources
+                    .record_unconfirmed(crate::runtime::loop_control::suspension::RUNNING_REFUSAL);
+            }
+            result?;
+            return Err(AgentError::Tool(
+                crate::runtime::loop_control::suspension::RUNNING_REFUSAL.into(),
+            ));
+        }
+        result
+    } else {
+        dispatch.await
+    }
+}
+
+async fn execute_round_tool_calls_inner(
+    execution: RoundToolExecution<'_, '_>,
+) -> Result<RoundToolExecutionResult, AgentError> {
     let RoundToolExecution {
         tool_calls,
         frame,
@@ -476,6 +654,7 @@ pub(crate) async fn execute_round_tool_calls(
     let tools = frame.tools;
     let config = frame.config;
     let llm = frame.llm;
+    let vision_support = frame.vision_support;
 
     // Build the executor's full tool-schema list ONCE for this round instead of
     // on every individual tool call (the per-call path previously called
@@ -496,6 +675,7 @@ pub(crate) async fn execute_round_tool_calls(
         config.max_tool_calls_per_round,
         config.max_consecutive_failures_per_tool,
     );
+    policy_guard.begin_observation_round(round);
 
     // Pre-classify all tool calls to avoid repeated normalization.
     let scheduling_modes: Vec<ToolSchedulingMode> = if config
@@ -506,7 +686,21 @@ pub(crate) async fn execute_round_tool_calls(
     } else {
         tool_calls
             .iter()
-            .map(|tc| scheduling_mode_for_tool_call(tc, tools))
+            .map(|tc| {
+                if no_progress::quiet_poll_guard_active(session, runtime_state, config)
+                    && per_call::resolve_callable_for_session(
+                        session.session_version,
+                        effective_callable_set,
+                        &tc.function.name,
+                    )
+                    .as_deref()
+                        == Some("write_stdin")
+                {
+                    ToolSchedulingMode::Sequential
+                } else {
+                    scheduling_mode_for_tool_call(tc, tools)
+                }
+            })
             .collect()
     };
 
@@ -514,7 +708,11 @@ pub(crate) async fn execute_round_tool_calls(
     'tool_calls: while next_index < tool_calls.len() {
         let tool_call = &tool_calls[next_index];
 
-        if scheduling_modes[next_index] == ToolSchedulingMode::ParallelSafe {
+        // Managed calls must retain one owned cleanup/apply boundary. Re-read
+        // after each call: Start may have activated within this same batch.
+        if scheduling_modes[next_index] == ToolSchedulingMode::ParallelSafe
+            && !crate::runtime::loop_control::suspension::active(config)
+        {
             let batch_start = next_index;
             while next_index < tool_calls.len()
                 && scheduling_modes[next_index] == ToolSchedulingMode::ParallelSafe
@@ -524,14 +722,25 @@ pub(crate) async fn execute_round_tool_calls(
 
             let batch = &tool_calls[batch_start..next_index];
 
-            let policy_precheck_error = batch
-                .iter()
-                .enumerate()
-                .find_map(|(offset, call)| policy_guard.check_before_execution(call, offset).err());
+            let policy_precheck_error = batch.iter().enumerate().find_map(|(offset, call)| {
+                policy_guard
+                    .check_before_execution_for_name(
+                        call,
+                        offset,
+                        per_call::resolve_callable_for_session(
+                            session.session_version,
+                            effective_callable_set,
+                            &call.function.name,
+                        )
+                        .as_deref(),
+                    )
+                    .err()
+            });
 
             if policy_precheck_error.is_some() {
                 for batch_call in batch {
                     let control = execute_and_apply_single_tool_call(
+                        vision_support,
                         batch_call,
                         event_tx,
                         metrics_collector,
@@ -573,6 +782,7 @@ pub(crate) async fn execute_round_tool_calls(
             // Single parallel-safe tool: execute directly, skip join_all overhead
             if batch.len() == 1 {
                 let control = execute_and_apply_single_tool_call(
+                    vision_support,
                     &batch[0],
                     event_tx,
                     metrics_collector,
@@ -646,16 +856,23 @@ pub(crate) async fn execute_round_tool_calls(
             let executing_supervisor =
                 ExecutingSupervisorObservation::capture_from_executing_session(session);
             let root_orchestration_only = session.root_orchestration_only_enabled();
-            let outcomes = tokio::time::timeout(
+            let session_behavior_version = session.session_version;
+            let output_cap = session
+                .effective_token_budget()
+                .map(|budget| budget.max_tool_output_tokens);
+            let outcomes = bamboo_infrastructure::telemetry::with_timeout(
                 batch_timeout,
                 join_all(batch.iter().map(|tool_call| {
                     let timeout = per_tool_timeout;
                     async move {
-                        tokio::time::timeout(
+                        bamboo_infrastructure::telemetry::with_timeout(
                             timeout,
                             per_call::execute_model_requested_tool_call_only(
                                 effective_callable_set,
                                 per_call::ToolExecutionOnlyContext {
+                                    session_behavior_version,
+                                    vision_support,
+                                    output_cap,
                                     tool_call,
                                     event_tx,
                                     metrics_collector,
@@ -677,13 +894,16 @@ pub(crate) async fn execute_round_tool_calls(
                         .await
                         .unwrap_or_else(|_| {
                             Ok(per_call::ToolExecutionOutcome {
+                                output_cap: None,
                                 permission_replay_origin: None,
                                 needs_human: None,
                                 portable_tool: per_call::portable_tool_for_admitted_call(
+                                    session_behavior_version,
                                     effective_callable_set,
                                     tool_call,
                                 ),
                                 post_tool_hook_eligible: true,
+                                managed_running_violation: false,
                                 result: Err(format!(
                                     "Tool '{}' timed out after {:?}",
                                     tool_call.function.name, timeout
@@ -706,13 +926,16 @@ pub(crate) async fn execute_round_tool_calls(
                     .iter()
                     .map(|batch_call| {
                         Ok(per_call::ToolExecutionOutcome {
+                            output_cap: None,
                             permission_replay_origin: None,
                             needs_human: None,
                             portable_tool: per_call::portable_tool_for_admitted_call(
+                                session_behavior_version,
                                 effective_callable_set,
                                 batch_call,
                             ),
                             post_tool_hook_eligible: true,
+                            managed_running_violation: false,
                             result: Err(format!(
                                 "Parallel batch timed out after {:?}",
                                 batch_timeout
@@ -749,6 +972,9 @@ pub(crate) async fn execute_round_tool_calls(
                 individual_durations.join(", ")
             );
 
+            for (batch_call, outcome) in batch.iter().zip(&outcomes) {
+                policy_guard.observe_raw_observation(batch_call, &outcome.result);
+            }
             // Compress all outcomes in parallel before applying sequentially.
             let max_tool_tokens = session
                 .effective_token_budget()
@@ -769,6 +995,10 @@ pub(crate) async fn execute_round_tool_calls(
                         });
                     let task_hint = task_hint.clone();
                     async move {
+                        let max_tool_tokens = outcome
+                            .output_cap
+                            .map(|cap| cap.unwrap_or(0))
+                            .unwrap_or(max_tool_tokens);
                         output_compressor::maybe_compress(
                             &tool_name,
                             &args,
@@ -784,10 +1014,16 @@ pub(crate) async fn execute_round_tool_calls(
                 .await;
 
             for (batch_call, outcome) in batch.iter().zip(compressed) {
-                policy_guard.observe_outcome(batch_call, &outcome.result);
+                let admitted_execution_name = per_call::resolve_callable_for_session(
+                    session.session_version,
+                    effective_callable_set,
+                    &batch_call.function.name,
+                );
 
                 let should_break = per_call::apply_tool_execution_outcome(
                     per_call::ToolExecutionApplyContext {
+                        policy_guard,
+                        admitted_execution_name: admitted_execution_name.as_deref(),
                         tool_call: batch_call,
                         event_tx,
                         metrics_collector,
@@ -827,6 +1063,7 @@ pub(crate) async fn execute_round_tool_calls(
         }
 
         let control = execute_and_apply_single_tool_call(
+            vision_support,
             tool_call,
             event_tx,
             metrics_collector,
@@ -910,6 +1147,190 @@ mod tests {
 
     fn builtin_tools() -> Arc<dyn ToolExecutor> {
         Arc::new(BuiltinToolExecutor::new())
+    }
+
+    #[derive(Default)]
+    struct ShellPolicyExecutor(Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for ShellPolicyExecutor {
+        async fn execute(
+            &self,
+            call: &ToolCall,
+        ) -> Result<ToolResult, bamboo_agent_core::ToolError> {
+            self.0.lock().unwrap().push(call.function.name.clone());
+            let args: serde_json::Value = serde_json::from_str(&call.function.arguments).unwrap();
+            let case = args["test_case"].as_str().unwrap();
+            if case == "transport_error" {
+                return Err(bamboo_agent_core::ToolError::Execution(
+                    "test failure".into(),
+                ));
+            }
+            let (status, exit_code) = match case {
+                "ok" => ("completed", Some(0)),
+                "failed" => ("completed", Some(7)),
+                "running" => ("running", None),
+                "error" => ("error", None),
+                "killed" => ("killed", None),
+                _ => unreachable!(),
+            };
+            Ok(ToolResult::text(
+                true,
+                json!({"status":status, "exit_code":exit_code, "output":""}).to_string(),
+            ))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            [
+                "exec_command",
+                "write_stdin",
+                "vendor::exec_command",
+                "vendor::write_stdin",
+            ]
+            .into_iter()
+            .map(|name| ToolSchema {
+                schema_type: "function".into(),
+                function: FunctionSchema {
+                    name: name.into(),
+                    description: "shell policy test".into(),
+                    parameters: json!({"type":"object"}),
+                },
+            })
+            .collect()
+        }
+    }
+
+    async fn run_shell_policy_cases(cases: &[(&str, &str)]) -> (Session, Vec<String>) {
+        let mut session = Session::new("shell-policy", "model");
+        let executor = Arc::new(ShellPolicyExecutor::default());
+        let tools: Arc<dyn ToolExecutor> = executor.clone();
+        let schemas = tools.list_tools();
+        let callable = legacy_effective_callable_set(&schemas);
+        let config = crate::runtime::config::AgentLoopConfig::default();
+        let (event_tx, _event_rx) = mpsc::channel(256);
+        let mut runtime = AgentRuntimeState::new("shell-policy");
+        let mut state = super::loop_state::RoundExecutionState::default();
+        let mut policy = super::ToolPolicyGuard::new(80, 3);
+        for (index, (name, case)) in cases.iter().enumerate() {
+            let mut call = tool_call_with_args(name, json!({"test_case":case}));
+            call.id = format!("shell-policy-{index}");
+            super::execute_and_apply_single_tool_call(
+                true,
+                &call,
+                &event_tx,
+                None,
+                "shell-policy",
+                "round",
+                0,
+                &mut session,
+                &tools,
+                &config,
+                &callable,
+                &schemas,
+                &mut runtime,
+                &mut None,
+                &mut state,
+                &mut policy,
+                0,
+            )
+            .await
+            .unwrap();
+        }
+        let entered = executor.0.lock().unwrap().clone();
+        (session, entered)
+    }
+
+    #[tokio::test]
+    async fn shell_terminal_failures_open_the_existing_round_circuit_across_aliases() {
+        for name in ["exec_command", "write_stdin"] {
+            let alias = format!("default::{name}");
+            for failed in ["failed", "error", "killed"] {
+                let (session, entered) = run_shell_policy_cases(&[
+                    (name, failed),
+                    (&alias, failed),
+                    (name, failed),
+                    (&alias, "ok"),
+                ])
+                .await;
+                assert_eq!(entered, [name, name, name]);
+                let results: Vec<_> = session
+                    .messages
+                    .iter()
+                    .filter(|message| message.tool_call_id.is_some())
+                    .collect();
+                assert!(results[..3]
+                    .iter()
+                    .all(|result| result.tool_success == Some(true)));
+                assert_eq!(results[3].tool_success, Some(false));
+                assert!(results[3].content.contains("circuit limit (3)"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn running_shell_results_preserve_failures_and_exit_zero_resets_them() {
+        for name in ["exec_command", "write_stdin"] {
+            let (session, entered) = run_shell_policy_cases(&[
+                (name, "failed"),
+                (name, "running"),
+                (name, "failed"),
+                (name, "running"),
+                (name, "failed"),
+                (name, "ok"),
+            ])
+            .await;
+            assert_eq!(entered.len(), 5);
+            assert!(session
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("circuit limit (3)"));
+            let (session, entered) = run_shell_policy_cases(&[
+                (name, "failed"),
+                (name, "failed"),
+                (name, "ok"),
+                (name, "failed"),
+                (name, "failed"),
+                (name, "ok"),
+            ])
+            .await;
+            assert_eq!(entered.len(), 6);
+            assert_eq!(session.messages.last().unwrap().tool_success, Some(true));
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_foreign_shell_names_keep_boolean_outcomes_and_separate_circuits() {
+        for name in ["exec_command", "write_stdin"] {
+            let foreign = format!("vendor::{name}");
+            let (session, entered) = run_shell_policy_cases(&[
+                (name, "failed"),
+                (name, "failed"),
+                (&foreign, "failed"),
+                (name, "failed"),
+                (name, "ok"),
+            ])
+            .await;
+            assert_eq!(entered, [name, name, &foreign, name]);
+            assert!(session
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("circuit limit (3)"));
+            let (session, entered) = run_shell_policy_cases(&[
+                (&foreign, "transport_error"),
+                (&foreign, "transport_error"),
+                (&foreign, "failed"),
+                (&foreign, "transport_error"),
+                (&foreign, "transport_error"),
+                (&foreign, "failed"),
+            ])
+            .await;
+            assert_eq!(entered.len(), 6);
+            assert_eq!(session.messages.last().unwrap().tool_success, Some(true));
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -1100,7 +1521,7 @@ mod tests {
         fn list_tools(&self) -> Vec<ToolSchema> {
             [
                 "Read",
-                "Bash",
+                "exec_command",
                 "prepare",
                 "mutation",
                 "parallel_a",
@@ -1225,6 +1646,7 @@ mod tests {
         let llm: Arc<dyn LLMProvider> = Arc::new(BoundaryNoopProvider);
         let session_id = session.id.clone();
         let frame = crate::runtime::runner::round_frame::RoundFrame {
+            vision_support: true,
             session_id: &session_id,
             round_id: "permission-boundary-round",
             turn: 0,
@@ -1393,7 +1815,7 @@ mod tests {
         ));
         let calls = [
             named_call("read-first", "Read"),
-            named_call("bash-stale", "Bash"),
+            named_call("exec-stale", "exec_command"),
         ];
 
         let (result, running, _, events) =
@@ -1403,12 +1825,12 @@ mod tests {
         assert!(running.root_orchestration_only_enabled());
         assert_eq!(running.root_tool_authority_revision, 1);
         assert!(executor.entered("Read"));
-        assert!(!executor.entered("Bash"));
+        assert!(!executor.entered("exec_command"));
         assert!(events.iter().all(|event| {
-            !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "bash-stale")
+            !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "exec-stale")
         }));
         assert!(running.messages.iter().any(|message| {
-            message.tool_call_id.as_deref() == Some("bash-stale")
+            message.tool_call_id.as_deref() == Some("exec-stale")
                 && message
                     .content
                     .contains("outside orchestration-only Root authority")
@@ -1839,6 +2261,7 @@ mod tests {
         );
 
         let control = execute_and_apply_single_tool_call(
+            true,
             &tool_call,
             &event_tx,
             None,
@@ -1902,6 +2325,7 @@ mod tests {
             tool_call_with_args("Read", json!({"file_path": file_path.to_str().unwrap()}));
 
         let control = execute_and_apply_single_tool_call(
+            true,
             &tool_call,
             &event_tx,
             None,
@@ -1958,6 +2382,7 @@ mod tests {
         let tool_call = tool_call_with_args("request_permissions", json!({}));
 
         let control = execute_and_apply_single_tool_call(
+            true,
             &tool_call,
             &event_tx,
             None,
@@ -2018,6 +2443,7 @@ mod tests {
         );
 
         let control = execute_and_apply_single_tool_call(
+            true,
             &tool_call,
             &event_tx,
             None,
@@ -2075,6 +2501,7 @@ mod tests {
         let tool_call = tool_call_with_args("ExitPlanMode", json!({"plan": "test plan"}));
 
         let control = execute_and_apply_single_tool_call(
+            true,
             &tool_call,
             &event_tx,
             None,
@@ -2133,6 +2560,7 @@ mod tests {
         );
 
         let control = execute_and_apply_single_tool_call(
+            true,
             &tool_call,
             &event_tx,
             None,
@@ -2362,5 +2790,354 @@ mod tests {
             session.force_manual_compression.as_deref(),
             Some("preserve error traces")
         );
+    }
+    struct CapRecordingExecutor {
+        parallel: bool,
+        rendezvous: tokio::sync::Barrier,
+        seen: Mutex<Vec<(String, Option<u32>)>>,
+        pending: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for CapRecordingExecutor {
+        async fn execute(
+            &self,
+            _: &ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
+            panic!("cap fixture requires actual context forwarding")
+        }
+        async fn execute_with_context_outcome(
+            &self,
+            call: &ToolCall,
+            ctx: ToolExecutionContext<'_>,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolOutcome> {
+            let owned = ctx.to_tool_ctx();
+            let cap = bamboo_agent_core::tools::observed_tool_output_cap(&owned);
+            self.seen.lock().unwrap().push((call.id.clone(), cap));
+            if self.parallel {
+                self.rendezvous.wait().await;
+            }
+            if self.pending {
+                std::future::pending::<()>().await;
+            }
+            tokio::task::yield_now().await;
+            assert_eq!(
+                bamboo_agent_core::tools::observed_tool_output_cap(&owned),
+                cap
+            );
+            Ok(ToolOutcome::Completed(ToolResult::text(
+                true,
+                cap_fixture_text(),
+            )))
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            vec![ToolSchema {
+                schema_type: "function".into(),
+                function: FunctionSchema {
+                    name: "cap_probe".into(),
+                    description: "output parity fixture".into(),
+                    parameters: json!({"type":"object"}),
+                },
+            }]
+        }
+        fn call_parallel_classification(
+            &self,
+            _: &ToolCall,
+        ) -> (bamboo_agent_core::tools::ToolMutability, bool) {
+            (
+                bamboo_agent_core::tools::ToolMutability::ReadOnly,
+                self.parallel,
+            )
+        }
+    }
+
+    fn cap_fixture_text() -> String {
+        (0..600)
+            .map(|n| format!("value-{n}: 界🦀 escaped \\\"\n"))
+            .collect()
+    }
+
+    fn cap_budget(cap: u32) -> bamboo_domain::TokenBudget {
+        bamboo_domain::TokenBudget {
+            max_tool_output_tokens: cap,
+            ..Default::default()
+        }
+    }
+
+    async fn cap_fixture_round(
+        session: &mut Session,
+        concrete: Arc<CapRecordingExecutor>,
+        config: crate::runtime::config::AgentLoopConfig,
+    ) -> Vec<AgentEvent> {
+        let calls = [
+            named_call("cap-a", "cap_probe"),
+            named_call("cap-b", "cap_probe"),
+        ];
+        let tools: Arc<dyn ToolExecutor> = concrete;
+        let schemas = tools.list_tools();
+        let callable = legacy_effective_callable_set(&schemas);
+        let llm: Arc<dyn LLMProvider> = Arc::new(BoundaryNoopProvider);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let sid = session.id.clone();
+        let frame = crate::runtime::runner::round_frame::RoundFrame {
+            vision_support: true,
+            session_id: &sid,
+            round_id: "cap-round",
+            turn: 0,
+            debug_enabled: false,
+            event_tx: &event_tx,
+            metrics_collector: None,
+            config: &config,
+            llm: &llm,
+            tools: &tools,
+        };
+        let result = execute_round_tool_calls(RoundToolExecution {
+            tool_calls: &calls,
+            frame: &frame,
+            session,
+            runtime_state: &mut AgentRuntimeState::new(&sid),
+            policy_guard: &mut super::ToolPolicyGuard::default(),
+            task_context: &mut None,
+            compression_model_name: None,
+            compression_model_provider: None,
+            tool_schemas: &schemas,
+            effective_callable_set: &callable,
+        })
+        .await
+        .unwrap();
+        assert!(!result.awaiting_clarification);
+        std::iter::from_fn(|| event_rx.try_recv().ok()).collect()
+    }
+
+    fn cap_executor(parallel: bool, pending: bool) -> Arc<CapRecordingExecutor> {
+        Arc::new(CapRecordingExecutor {
+            parallel,
+            pending,
+            rendezvous: tokio::sync::Barrier::new(2),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    // Run unchanged before and after adding the Engine producer. Both execution
+    // schedules feed the real generic compressor and same-ID result application.
+    #[tokio::test]
+    async fn original_engine_sequential_parallel_output_cap_parity() {
+        for parallel in [false, true] {
+            for cap in [None, Some(0), Some(64), Some(512)] {
+                let mut session = Session::new("cap-parity", "model");
+                session.token_budget = cap.map(cap_budget);
+                let executor = cap_executor(parallel, false);
+                let events =
+                    cap_fixture_round(&mut session, executor.clone(), Default::default()).await;
+                assert_eq!(executor.seen.lock().unwrap().len(), 2);
+                for id in ["cap-a", "cap-b"] {
+                    let replies: Vec<_> = session
+                        .messages
+                        .iter()
+                        .filter(|m| m.tool_call_id.as_deref() == Some(id))
+                        .collect();
+                    assert_eq!(replies.len(), 1);
+                    assert_eq!(replies[0].tool_success, Some(true));
+                    if cap.unwrap_or(0) == 0 {
+                        assert_eq!(replies[0].content, cap_fixture_text());
+                    } else {
+                        assert!(replies[0].content.contains("tool output truncated"));
+                        assert_ne!(replies[0].content, cap_fixture_text());
+                    }
+                    println!(
+                        "parity parallel={parallel} cap={cap:?} id={id} bytes={} content={:?}",
+                        replies[0].content.len(),
+                        replies[0].content
+                    );
+                    assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == id)));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_cap_tracks_host_replacement_fallback_and_actual_unknown_single_dispatch() {
+        let mut session = Session::new("cap-single", "model");
+        let sid = session.id.clone();
+        let executor = cap_executor(false, false);
+        let tools: Arc<dyn ToolExecutor> = executor.clone();
+        let schemas = tools.list_tools();
+        let callable = legacy_effective_callable_set(&schemas);
+        let config = crate::runtime::config::AgentLoopConfig::default();
+        let (event_tx, _event_rx) = mpsc::channel(128);
+        let mut runtime = AgentRuntimeState::new(&sid);
+        let mut state = super::loop_state::RoundExecutionState::default();
+        let mut policy = super::policy::ToolPolicyGuard::default();
+        let cases = [
+            (Some(64), Some(512), Some(64)),
+            (Some(128), Some(512), Some(128)),
+            (None, Some(512), Some(512)),
+            (None, None, None),
+            (Some(0), Some(512), Some(0)),
+        ];
+        for (index, (override_cap, resolved, expected)) in cases.into_iter().enumerate() {
+            session.token_budget = override_cap.map(cap_budget);
+            session.resolved_token_budget = resolved.map(|n| ("model".into(), cap_budget(n)));
+            let call = named_call(&format!("host-call-{index}"), "cap_probe");
+            let control = super::execute_and_apply_single_tool_call(
+                true,
+                &call,
+                &event_tx,
+                None,
+                &sid,
+                "host-round",
+                index,
+                &mut session,
+                &tools,
+                &config,
+                &callable,
+                &schemas,
+                &mut runtime,
+                &mut None,
+                &mut state,
+                &mut policy,
+                0,
+            )
+            .await
+            .unwrap();
+            assert!(!control.should_break && !control.stop_round);
+            assert_eq!(
+                executor.seen.lock().unwrap().last(),
+                Some(&(call.id.clone(), expected))
+            );
+            let result = session.messages.last().unwrap();
+            assert_eq!(result.tool_call_id.as_deref(), Some(call.id.as_str()));
+            assert_eq!(result.tool_success, Some(true));
+            assert_eq!(
+                result.content.contains("tool output truncated"),
+                expected.unwrap_or(0) > 0
+            );
+            if expected.unwrap_or(0) == 0 {
+                assert_eq!(result.content, cap_fixture_text());
+            }
+            assert_eq!(
+                session
+                    .effective_token_budget()
+                    .map(|b| b.max_tool_output_tokens),
+                expected
+            );
+            let mut ctx = bamboo_agent_core::tools::ToolCtx::none(call.id);
+            ctx.session_id = Some(sid.clone().into());
+            assert_eq!(
+                bamboo_agent_core::tools::observed_tool_output_cap(&ctx),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_cap_parallel_dispatches_keep_exact_ids_and_scalar_through_pending_polls() {
+        for cap in [None, Some(0), Some(64)] {
+            let mut session = Session::new("cap-parallel", "model");
+            session.token_budget = cap.map(cap_budget);
+            let executor = cap_executor(true, false);
+            cap_fixture_round(&mut session, executor.clone(), Default::default()).await;
+            let mut seen = executor.seen.lock().unwrap().clone();
+            seen.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(seen, vec![("cap-a".into(), cap), ("cap-b".into(), cap)]);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scoped_cap_actual_per_tool_and_batch_timeout_leave_only_same_id_errors() {
+        for batch_timeout in [false, true] {
+            let mut session = Session::new("cap-timeout", "model");
+            session.token_budget = Some(cap_budget(43));
+            let executor = cap_executor(true, true);
+            let config = crate::runtime::config::AgentLoopConfig {
+                per_tool_timeout_secs: if batch_timeout { 10 } else { 1 },
+                parallel_batch_timeout_secs: if batch_timeout { 1 } else { 10 },
+                ..Default::default()
+            };
+            let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+            trace
+                .scope(cap_fixture_round(&mut session, executor.clone(), config))
+                .await;
+            let spans = trace.spans();
+            assert_eq!(spans.len(), 2);
+            assert_eq!(
+                executor.seen.lock().unwrap().len(),
+                2,
+                "both actual dispatch scopes started"
+            );
+            for id in ["cap-a", "cap-b"] {
+                let matching = spans
+                    .iter()
+                    .filter(|span| {
+                        span.attributes.iter().any(|kv| {
+                            kv.key.as_str() == "gen_ai.tool.call.id" && kv.value.to_string() == id
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(matching.len(), 1);
+                assert_eq!(matching[0].name, "execute_tool cap_probe");
+                for (key, value) in [("error.type", "timeout"), ("bamboo.outcome", "error")] {
+                    assert!(matching[0]
+                        .attributes
+                        .iter()
+                        .any(|kv| kv.key.as_str() == key && kv.value.to_string() == value));
+                }
+                let replies: Vec<_> = session
+                    .messages
+                    .iter()
+                    .filter(|m| m.tool_call_id.as_deref() == Some(id))
+                    .collect();
+                assert_eq!(replies.len(), 1);
+                assert_eq!(replies[0].tool_success, Some(false));
+                assert!(replies[0].content.contains(if batch_timeout {
+                    "Parallel batch timed out"
+                } else {
+                    "Tool 'cap_probe' timed out"
+                }));
+                let mut ctx = bamboo_agent_core::tools::ToolCtx::none(id);
+                ctx.session_id = Some(session.id.clone().into());
+                assert_eq!(
+                    bamboo_agent_core::tools::observed_tool_output_cap(&ctx),
+                    None
+                );
+            }
+            let healthy = cap_executor(true, false);
+            session.messages.clear();
+            session.token_budget = Some(cap_budget(0));
+            cap_fixture_round(&mut session, healthy.clone(), Default::default()).await;
+            assert!(healthy
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, cap)| *cap == Some(0)));
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_cancelled_tool_dispatches_are_not_timeouts() {
+        for parallel in [false, true] {
+            let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+            let mut session = Session::new("cap-cancelled", "model");
+            let executor = cap_executor(parallel, true);
+            let mut run = Box::pin(trace.scope(cap_fixture_round(
+                &mut session,
+                executor.clone(),
+                Default::default(),
+            )));
+            assert!(futures::poll!(run.as_mut()).is_pending());
+            let expected = if parallel { 2 } else { 1 };
+            assert_eq!(executor.seen.lock().unwrap().len(), expected);
+            drop(run);
+            let spans = trace.spans();
+            assert_eq!(spans.len(), expected);
+            for span in spans {
+                for key in ["error.type", "bamboo.outcome"] {
+                    assert!(span
+                        .attributes
+                        .iter()
+                        .any(|kv| kv.key.as_str() == key && kv.value.to_string() == "cancelled"));
+                }
+            }
+        }
     }
 }

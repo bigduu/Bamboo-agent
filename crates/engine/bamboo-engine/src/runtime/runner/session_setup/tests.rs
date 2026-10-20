@@ -1122,6 +1122,11 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
     let tools = StaticToolExecutor {
         schemas: [
             "Bash",
+            "BashInput",
+            "BashOutput",
+            "KillShell",
+            "exec_command",
+            "write_stdin",
             "Read",
             "Grep",
             "Edit",
@@ -1148,7 +1153,14 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
         .map(|entry| (entry.execution_name(), entry.loading_class()))
         .collect::<std::collections::BTreeMap<_, _>>();
 
-    for name in ["Bash", "Read", "Grep", "Edit", "Write"] {
+    for name in [
+        "exec_command",
+        "write_stdin",
+        "Read",
+        "Grep",
+        "Edit",
+        "Write",
+    ] {
         assert_eq!(classes[name], CapabilityLoadingClass::Core, "{name}");
     }
     for name in [
@@ -1162,7 +1174,14 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
     ] {
         assert_eq!(classes[name], CapabilityLoadingClass::Deferred, "{name}");
     }
-    for name in ["Workspace", "request_permissions"] {
+    for name in [
+        "Workspace",
+        "request_permissions",
+        "Bash",
+        "BashInput",
+        "BashOutput",
+        "KillShell",
+    ] {
         assert_eq!(classes[name], CapabilityLoadingClass::HostOnly, "{name}");
     }
 
@@ -1181,7 +1200,14 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
     ] {
         assert!(model_names.contains(name), "legacy projection lost {name}");
     }
-    for name in ["Workspace", "request_permissions"] {
+    for name in [
+        "Workspace",
+        "request_permissions",
+        "Bash",
+        "BashInput",
+        "BashOutput",
+        "KillShell",
+    ] {
         assert!(!model_names.contains(name), "HostOnly leaked: {name}");
     }
 
@@ -1235,6 +1261,7 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
             "Plan",
             "Task",
             "session_history_current",
+            "session_message",
             "work_overview",
             "work_search",
             "work_inspect",
@@ -1247,6 +1274,8 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
             "GetFileInfo",
             "ViewImage",
             "Bash",
+            "exec_command",
+            "write_stdin",
             "Edit",
             "Write",
             "load_skill",
@@ -1296,9 +1325,215 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
         .map(|entry| entry.execution_name().to_string())
         .collect::<std::collections::BTreeSet<_>>();
     assert!(child_names.contains("Bash"));
+    assert!(child_names.contains("exec_command"));
+    assert!(child_names.contains("write_stdin"));
     assert!(child_names.contains("Edit"));
     assert!(child_names.contains("load_skill"));
     assert!(child_names.contains("mcp__external__read"));
+    let child_provider_names = resolve_available_tool_schemas_for_session(&config, &tools, &child)
+        .into_iter()
+        .map(|entry| entry.function.name)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(child_provider_names.contains("exec_command"));
+    assert!(child_provider_names.contains("write_stdin"));
+    assert!(!child_provider_names.contains("Bash"));
+}
+
+#[test]
+fn supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standard_and_ultra() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let tools = StaticToolExecutor {
+        schemas: bamboo_domain::ROOT_ORCHESTRATION_TOOLS
+            .into_iter()
+            .chain(bamboo_domain::SUPERVISOR_ORCHESTRATION_TOOLS)
+            .chain([
+                "exec_command",
+                "write_stdin",
+                "Edit",
+                "Write",
+                "load_skill",
+                "workflow_run",
+                "loop_control",
+                "vendor::Read",
+                "default::Read",
+                "vendor::session_control",
+            ])
+            .map(schema)
+            .collect(),
+    };
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    for ultra in [false, true] {
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &supervisor);
+        let names = catalog
+            .iter()
+            .map(|entry| entry.execution_name().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = bamboo_domain::ROOT_ORCHESTRATION_TOOLS
+            .into_iter()
+            .chain(bamboo_domain::SUPERVISOR_ORCHESTRATION_TOOLS)
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(names, expected, "Supervisor ultra={ultra}");
+        let provider = resolve_available_tool_schemas_for_session(&config, &tools, &supervisor)
+            .into_iter()
+            .map(|entry| entry.function.name)
+            .collect();
+        let discovery =
+            crate::capability_discovery::project_classified_tool_capability_metadata(&catalog)
+                .into_iter()
+                .map(|entry| entry.canonical_name)
+                .collect();
+        assert_eq!(names, provider);
+        assert_eq!(names, discovery);
+        assert!(
+            super::tool_schemas::effective_guide_activation(&config, &supervisor)
+                .contains("SubAgent")
+        );
+    }
+}
+
+#[test]
+fn supervisor_delegation_first_freezes_full_guide_without_user_activation_or_disabled_tool_leak() {
+    use super::tool_schemas::{effective_guide_activation, resolve_tool_schemas_for_round};
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    let tools = StaticToolExecutor {
+        schemas: ["Read", "SubAgent", "exec_command"]
+            .into_iter()
+            .map(schema)
+            .collect(),
+    };
+    let config = crate::runtime::config::AgentLoopConfig {
+        freeze_tool_exposure_for_cache: true,
+        ..Default::default()
+    };
+    for ultra in [false, true, false] {
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let schemas = resolve_tool_schemas_for_round(&config, &tools, &mut supervisor);
+        assert_eq!(supervisor.metadata["prompt_tool_exposure_activated"], "[]");
+        let subagent = schemas
+            .iter()
+            .find(|s| s.function.name == "SubAgent")
+            .unwrap();
+        assert!(subagent
+            .function
+            .description
+            .contains("Supervisor: delegate execution"));
+        let guide = super::prompt_setup::build_tool_guide_context(
+            &config,
+            &schemas,
+            "base",
+            &supervisor.id,
+            &effective_guide_activation(&config, &supervisor),
+        );
+        assert!(guide.contains("**SubAgent**"));
+        assert!(guide.contains("A trusted Supervisor delegates execution even for simple tasks"));
+        assert!(guide.contains("From a child session"));
+    }
+    let config = crate::runtime::config::AgentLoopConfig {
+        disabled_tools: ["SubAgent".into()].into(),
+        ..Default::default()
+    };
+    let schemas = resolve_tool_schemas_for_round(&config, &tools, &mut supervisor);
+    assert_eq!(
+        schemas
+            .iter()
+            .map(|s| s.function.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Read"]
+    );
+}
+
+#[test]
+fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let tools = StaticToolExecutor {
+        schemas: [
+            "Read",
+            "session_control",
+            "session_history",
+            "exec_command",
+            "vendor::session_control",
+            "default::session_control",
+        ]
+        .into_iter()
+        .map(schema)
+        .collect(),
+    };
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    for ultra in [false, true] {
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &supervisor);
+        let names = catalog
+            .iter()
+            .map(|entry| entry.execution_name().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(names.contains("session_control"));
+        let history = catalog
+            .iter()
+            .find(|entry| entry.execution_name() == "session_history")
+            .unwrap();
+        assert_eq!(
+            history.schema().function.parameters["properties"]["action"]["enum"],
+            serde_json::json!(["read_messages", "get_meta"])
+        );
+        assert!(history
+            .schema()
+            .function
+            .description
+            .contains("explicitly attached"));
+        if ultra {
+            assert_eq!(
+                names,
+                [
+                    "Read".into(),
+                    "session_control".into(),
+                    "session_history".into()
+                ]
+                .into()
+            );
+        }
+        let provider = resolve_available_tool_schemas_for_session(&config, &tools, &supervisor)
+            .into_iter()
+            .map(|entry| entry.function.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let discovery =
+            crate::capability_discovery::project_classified_tool_capability_metadata(&catalog)
+                .into_iter()
+                .map(|entry| entry.canonical_name)
+                .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names, provider);
+        assert_eq!(names, discovery);
+        let mut disabled = crate::runtime::config::AgentLoopConfig::default();
+        disabled.disabled_tools.insert("session_control".into());
+        assert!(
+            !resolve_classified_tool_catalog_for_session(&disabled, &tools, &supervisor)
+                .iter()
+                .any(|entry| entry.execution_name() == "session_control")
+        );
+    }
+    let mut ordinary = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    ordinary.metadata.insert("role".into(), "supervisor".into());
+    ordinary.set_root_orchestration_only(true).unwrap();
+    assert_eq!(
+        resolve_classified_tool_catalog_for_session(&config, &tools, &ordinary)
+            .iter()
+            .map(|entry| entry.execution_name())
+            .collect::<Vec<_>>(),
+        vec!["Read"]
+    );
 }
 
 #[test]
@@ -1365,7 +1600,13 @@ fn automatic_ultra_subagent_guide_preserves_disabled_and_child_tool_authority() 
         ..Default::default()
     };
     let tools = StaticToolExecutor {
-        schemas: vec![schema("SubAgent"), schema("Read"), schema("Bash")],
+        schemas: vec![
+            schema("SubAgent"),
+            schema("Read"),
+            schema("Bash"),
+            schema("exec_command"),
+            schema("write_stdin"),
+        ],
     };
     let mut root = Session::new("disabled-ultra-guide", "model");
     root.set_root_orchestration_only(true).unwrap();
@@ -1392,6 +1633,12 @@ fn automatic_ultra_subagent_guide_preserves_disabled_and_child_tool_authority() 
     let child_schemas =
         resolve_available_tool_schemas_for_session(&ordinary_config, &tools, &child);
     assert!(child_schemas
+        .iter()
+        .any(|schema| schema.function.name == "exec_command"));
+    assert!(child_schemas
+        .iter()
+        .any(|schema| schema.function.name == "write_stdin"));
+    assert!(!child_schemas
         .iter()
         .any(|schema| schema.function.name == "Bash"));
     assert!(child_schemas
@@ -1441,7 +1688,8 @@ async fn root_and_child_model_catalogs_use_subagent_without_physical_deployment_
             "default::deploy_agent",
             "default::cluster",
             "Plan",
-            "Bash",
+            "exec_command",
+            "write_stdin",
             "load_skill",
             "mcp__external__read",
         ]
@@ -1466,7 +1714,13 @@ async fn root_and_child_model_catalogs_use_subagent_without_physical_deployment_
     ] {
         assert!(!names.contains(hidden), "{hidden}");
     }
-    for ordinary in ["Plan", "Bash", "load_skill", "mcp__external__read"] {
+    for ordinary in [
+        "Plan",
+        "exec_command",
+        "write_stdin",
+        "load_skill",
+        "mcp__external__read",
+    ] {
         assert!(names.contains(ordinary), "{ordinary}");
     }
     assert_eq!(
@@ -1522,6 +1776,8 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
         schemas: [
             "Read",
             "Bash",
+            "exec_command",
+            "write_stdin",
             "Edit",
             "read_file",
             "apply_patch",
@@ -1540,6 +1796,9 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
         [
             "Bash",
             "default::Bash",
+            "exec_command",
+            "default::exec_command",
+            "write_stdin",
             "apply_patch",
             "read_file",
             "mcp__x__run",
@@ -1553,6 +1812,9 @@ fn progressive_loading_cannot_reintroduce_denied_root_aliases() {
     for denied in [
         "Bash",
         "default::Bash",
+        "exec_command",
+        "default::exec_command",
+        "write_stdin",
         "Edit",
         "apply_patch",
         "mcp__x__run",
@@ -1622,8 +1884,8 @@ fn exact_custom_alias_registrations_remain_deferred_and_keep_execution_names() {
             schema("Edit"),
             schema("apply_patch"),
             schema("read_file"),
-            schema("execute_command"),
-            schema("bash"),
+            schema("default::exec_command"),
+            schema("Exec_Command"),
             schema("a::custom_tool"),
             schema("custom_tool"),
         ],
@@ -1650,6 +1912,11 @@ fn exact_custom_alias_registrations_remain_deferred_and_keep_execution_names() {
                 CapabilityLoadingClass::Core
             ),
             (
+                "Exec_Command".to_string(),
+                "Exec_Command".to_string(),
+                CapabilityLoadingClass::Deferred
+            ),
+            (
                 "a::custom_tool".to_string(),
                 "a::custom_tool".to_string(),
                 CapabilityLoadingClass::Deferred
@@ -1660,18 +1927,13 @@ fn exact_custom_alias_registrations_remain_deferred_and_keep_execution_names() {
                 CapabilityLoadingClass::Deferred
             ),
             (
-                "bash".to_string(),
-                "bash".to_string(),
-                CapabilityLoadingClass::Deferred
-            ),
-            (
                 "custom_tool".to_string(),
                 "custom_tool".to_string(),
                 CapabilityLoadingClass::Deferred
             ),
             (
-                "execute_command".to_string(),
-                "execute_command".to_string(),
+                "default::exec_command".to_string(),
+                "default::exec_command".to_string(),
                 CapabilityLoadingClass::Deferred
             ),
             (
@@ -1690,11 +1952,11 @@ fn exact_custom_alias_registrations_remain_deferred_and_keep_execution_names() {
         model_names,
         vec![
             "Edit",
+            "Exec_Command",
             "a::custom_tool",
             "apply_patch",
-            "bash",
             "custom_tool",
-            "execute_command",
+            "default::exec_command",
             "read_file"
         ]
     );
@@ -2772,4 +3034,79 @@ fn disabling_cache_freeze_restores_live_guide_expansion() {
     assert!(!session
         .metadata
         .contains_key("prompt_tool_exposure_activated"));
+}
+
+#[tokio::test]
+async fn supervisor_delegation_first_legacy_selection_refuses_before_setup_side_effects() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    for (trusted_supervisor, ultra) in [(true, false), (true, true), (false, true)] {
+        for key in [
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY,
+            bamboo_skills::ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
+            bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY,
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY,
+        ] {
+            let mut session = if trusted_supervisor {
+                let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+                session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: uuid::Uuid::new_v4(),
+                };
+                session
+            } else {
+                Session::new("ordinary-ultra-old-activation", "model")
+            };
+            session.set_root_orchestration_only(ultra).unwrap();
+            session.metadata.insert(key.into(), "{}".into());
+            session.metadata.insert(
+                bamboo_skills::WORKFLOW_ACTIVATION_EVENT_METADATA_KEY.into(),
+                serde_json::json!({"type":"workflow.activated", "workflow_id":"old", "revision":1})
+                    .to_string(),
+            );
+            session.add_message(Message::system("Original system\n<!-- BAMBOO_SKILL_CONTEXT_START -->old execution instructions<!-- BAMBOO_SKILL_CONTEXT_END -->"));
+            let before = serde_json::to_value(&session).unwrap();
+            let persistence = Arc::new(RecordingPersistence::default());
+            let config = crate::runtime::config::AgentLoopConfig {
+                persistence: Some(persistence.clone()),
+                ..Default::default()
+            };
+            let tools = RecordingToolExecutor::default();
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+            let session_id = session.id.clone();
+            let result = super::prepare_session_for_loop(
+                &mut session,
+                "must not append this User",
+                &config,
+                &tools,
+                None,
+                &session_id,
+                &crate::runtime::runner::logging::DebugLogger::new(false),
+                false,
+                &event_tx,
+            )
+            .await;
+            assert!(result.unwrap_err().to_string().contains("delegat"));
+            assert_eq!(serde_json::to_value(&session).unwrap(), before);
+            assert!(persistence.sessions.lock().unwrap().is_empty());
+            assert!(tools.calls.lock().unwrap().is_empty());
+            assert!(event_rx.try_recv().is_err());
+        }
+    }
+
+    // A legacy checkpoint does not invent either Supervisor identity or Ultra.
+    let mut ordinary = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    ordinary.metadata.insert("role".into(), "supervisor".into());
+    ordinary.metadata.insert(
+        bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.into(),
+        "{}".into(),
+    );
+    let child = Session::new_child_of("legacy-worker", &ordinary, "model", "worker");
+    for mut session in [ordinary, child] {
+        session.metadata.insert(
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.into(),
+            "{}".into(),
+        );
+        let before = serde_json::to_value(&session).unwrap();
+        super::legacy_instruction::validate_execution_selection(&session).unwrap();
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+    }
 }

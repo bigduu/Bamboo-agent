@@ -10,14 +10,13 @@ license = "MIT"
 bamboo-domain = { path = "../../core/bamboo-domain" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = "0.9"
 chrono = { workspace = true }
 thiserror = { workspace = true }
 anyhow = "1"
 tracing = "0.1"
 async-trait = "0.1"
 regex = "1"
-dirs = "6"
+dirs = "7"
 aes-gcm = "0.11"
 rand = "0.10"
 sha2 = "0.11"

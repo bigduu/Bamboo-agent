@@ -3,6 +3,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+#[path = "build/product_manual.rs"]
+mod product_manual;
+
 const BUILTIN_SKILL_WHITELIST: &[&str] = &[
     "debug",
     "personal-assistant",
@@ -11,6 +14,18 @@ const BUILTIN_SKILL_WHITELIST: &[&str] = &[
     "review",
     "simplify",
     "skill-creator",
+];
+
+// Git executable bits are unreliable in Windows checkouts. Keep this explicit
+// source contract portable; Unix fixtures compare it with the tracked files.
+const BUILTIN_EXECUTABLE_FILES: &[&str] = &[
+    "skill-creator/scripts/aggregate_benchmark.py",
+    "skill-creator/scripts/generate_report.py",
+    "skill-creator/scripts/improve_description.py",
+    "skill-creator/scripts/package_skill.py",
+    "skill-creator/scripts/quick_validate.py",
+    "skill-creator/scripts/run_eval.py",
+    "skill-creator/scripts/run_loop.py",
 ];
 
 fn is_builtin_skill_enabled(name: &str) -> bool {
@@ -79,18 +94,43 @@ fn main() -> io::Result<()> {
     }
 
     files.sort();
+    if builtin_root.exists() {
+        for executable in BUILTIN_EXECUTABLE_FILES {
+            if !files.iter().any(|path| to_unix_path(path) == *executable) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("builtin executable manifest references missing file '{executable}'"),
+                ));
+            }
+        }
+    }
 
     writeln!(
         file,
         "pub static BUILTIN_SKILL_FILES: &[(&str, &[u8])] = &["
     )?;
-    for relative in files {
-        let relative_unix = to_unix_path(&relative);
+    for relative in &files {
+        let relative_unix = to_unix_path(relative);
         writeln!(
             file,
             "    (\"{relative}\", include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../../builtin_skills/{relative}\"))),",
             relative = relative_unix
         )?;
+    }
+    // These canonical, crate-local resources also survive `cargo package`.
+    // They join the same builtin table and existing permission-aware reader.
+    product_manual::embed(&manifest_dir, &out_dir, &mut file)?;
+    writeln!(file, "];")?;
+    // Preserve the existing public byte-table shape; modes are a companion.
+    writeln!(
+        file,
+        "pub static BUILTIN_SKILL_EXECUTABLE_FILES: &[&str] = &["
+    )?;
+    for relative in &files {
+        let relative = to_unix_path(relative);
+        if BUILTIN_EXECUTABLE_FILES.contains(&relative.as_str()) {
+            writeln!(file, "    {relative:?},")?;
+        }
     }
     writeln!(file, "];")?;
 

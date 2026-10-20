@@ -24,8 +24,8 @@ use crate::runtime::config::{
 use crate::runtime::execution::child_completion::ChildCompletion;
 use crate::runtime::execution::event_forwarder::HistoryCommitBarrier;
 use crate::runtime::execution::runner_lifecycle::{
-    finalize_rejected_runner_if_distinct, finalize_runner, finalize_runner_exact,
-    reserve_runner_core, ReserveOutcome, RunnerReservation,
+    finalize_rejected_runner_if_distinct, finalize_runner_exact, reserve_runner_core,
+    ReserveOutcome, RunnerReservation,
 };
 use crate::runtime::execution::runner_state::AgentRunner;
 use crate::runtime::model_roster::ModelRoster;
@@ -50,7 +50,7 @@ enum SessionExecutionActivationOwnership {
     RegistrationPending(Arc<SessionActivationRouter>),
     /// Manual/server reservation acquired router ownership before any
     /// execution-specific mutation or external side effect.
-    Registered(SessionRunRegistration),
+    Registered(Box<SessionRunRegistration>),
 }
 
 /// One exact runner reservation plus its logical-session activation ownership.
@@ -67,6 +67,7 @@ pub struct SessionExecutionReservation {
     root_actor: Option<Box<RootActorExecution>>,
     execution_persistence: Option<Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
     persistence_bound: bool,
+    selected_input: bool,
     armed: bool,
 }
 
@@ -144,6 +145,59 @@ impl SessionExecutionReservation {
         self.execution_persistence.clone()
     }
 
+    /// Retain one exact input selector in the same private persistence view
+    /// moved through admission, Ready and spawn. This cannot mint a writer.
+    pub fn bind_root_inbox_receipt(
+        &mut self,
+        receipt: bamboo_domain::SessionInboxReceipt,
+    ) -> std::io::Result<()> {
+        if !self.selected_input || self.root_actor.is_none() || self.cancel_token.is_cancelled() {
+            return Err(std::io::Error::other(
+                "Root receipt requires a live bound reservation",
+            ));
+        }
+        let persistence = self
+            .execution_persistence
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("Root execution persistence unavailable"))?;
+        self.execution_persistence = Some(persistence.bind_root_inbox_receipt(receipt)?);
+        Ok(())
+    }
+
+    /// Opt only a selected, actual Root execution into finite visible output
+    /// replay. No public request data can supply its writer or runner identity.
+    pub async fn retain_selected_run_output(&self) -> std::io::Result<bool> {
+        if !self.selected_input {
+            return Ok(false);
+        }
+        let owner = self
+            .root_actor_writer()
+            .ok_or_else(|| std::io::Error::other("Selected output requires its Root writer"))?;
+        let receipt = self
+            .execution_persistence
+            .as_ref()
+            .and_then(|p| p.root_inbox_receipt())
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("Selected output requires its bound receipt"))?;
+        if owner.fence.actor_id != self.session_id
+            || owner.fence.run_id != self.run_id
+            || self.cancel_token.is_cancelled()
+        {
+            return Err(std::io::Error::other(
+                "Selected output reservation is not live",
+            ));
+        }
+        let runners = self.runners.read().await;
+        let runner = runners
+            .get(&self.session_id)
+            .filter(|r| r.run_id == self.run_id && !r.cancel_token.is_cancelled())
+            .ok_or_else(|| std::io::Error::other("Selected output runner is unavailable"))?;
+        runner
+            .visible_messages
+            .retain_selected_output(&owner, receipt)?;
+        Ok(true)
+    }
+
     pub fn root_actor_writer(&self) -> Option<bamboo_domain::RootActorRuntimeWrite> {
         self.root_actor
             .as_ref()
@@ -195,6 +249,7 @@ impl SessionExecutionReservation {
             root_actor: None,
             execution_persistence: None,
             persistence_bound: false,
+            selected_input: false,
             armed: true,
         }
     }
@@ -221,6 +276,7 @@ impl SessionExecutionReservation {
             root_actor: None,
             execution_persistence: None,
             persistence_bound: false,
+            selected_input: false,
             armed: true,
         }
     }
@@ -274,11 +330,18 @@ impl SessionExecutionReservation {
             SessionExecutionActivationOwnership::Unrouted
             | SessionExecutionActivationOwnership::Registered(_) => return Ok(()),
         };
-        match register_reserved_activation(router, &self.runners, &self.session_id, &self.run_id)
-            .await
+        match register_reserved_activation(
+            router,
+            &self.runners,
+            &self.session_id,
+            &self.run_id,
+            self.selected_input,
+        )
+        .await
         {
             Ok(registration) => {
-                self.activation = SessionExecutionActivationOwnership::Registered(registration);
+                self.activation =
+                    SessionExecutionActivationOwnership::Registered(Box::new(registration));
                 Ok(())
             }
             Err(error) => {
@@ -312,9 +375,16 @@ impl SessionExecutionReservation {
         let run_id = self.run_id.clone();
         let cleanup_session_id = session_id.clone();
         let cleanup_run_id = run_id.clone();
+        let selected_input = self.selected_input;
         let cleanup = tokio::spawn(async move {
-            cleanup_execution_reservation(activation, runners, cleanup_session_id, cleanup_run_id)
-                .await;
+            cleanup_execution_reservation(
+                activation,
+                runners,
+                cleanup_session_id,
+                cleanup_run_id,
+                selected_input,
+            )
+            .await;
         });
         if let Err(error) = cleanup.await {
             tracing::error!(
@@ -352,7 +422,7 @@ impl SessionExecutionReservation {
             &mut self.activation,
             SessionExecutionActivationOwnership::Unrouted,
         ) {
-            SessionExecutionActivationOwnership::Registered(registration) => Some(registration),
+            SessionExecutionActivationOwnership::Registered(registration) => Some(*registration),
             SessionExecutionActivationOwnership::Unrouted => None,
             SessionExecutionActivationOwnership::UnpublishedActivation(_) => {
                 unreachable!("unpublished activation cannot transfer to execution")
@@ -379,9 +449,17 @@ impl Drop for SessionExecutionReservation {
         let runners = self.runners.clone();
         let session_id = self.session_id.clone();
         let run_id = self.run_id.clone();
+        let selected_input = self.selected_input;
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                cleanup_execution_reservation(activation, runners, session_id, run_id).await;
+                cleanup_execution_reservation(
+                    activation,
+                    runners,
+                    session_id,
+                    run_id,
+                    selected_input,
+                )
+                .await;
             });
         }
     }
@@ -398,6 +476,7 @@ async fn register_reserved_activation(
     runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_id: &str,
     run_id: &str,
+    selected_input: bool,
 ) -> Result<SessionRunRegistration, SessionRunRegistrationError> {
     let mut registration = match router.register_run(session_id, run_id).await {
         Ok(registration) => registration,
@@ -414,6 +493,9 @@ async fn register_reserved_activation(
             return Err(error);
         }
     };
+    if selected_input {
+        registration.restrict_to_selected_input();
+    }
     let cleanup_runners = runners.clone();
     let cleanup_session_id = session_id.to_string();
     let cleanup_run_id = run_id.to_string();
@@ -435,13 +517,22 @@ async fn cleanup_execution_reservation(
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_id: String,
     run_id: String,
+    selected_input: bool,
 ) {
     match activation {
         SessionExecutionActivationOwnership::Registered(registration) => {
-            registration.abandon().await;
+            (*registration).abandon().await;
         }
         SessionExecutionActivationOwnership::RegistrationPending(router) => {
-            match register_reserved_activation(router, &runners, &session_id, &run_id).await {
+            match register_reserved_activation(
+                router,
+                &runners,
+                &session_id,
+                &run_id,
+                selected_input,
+            )
+            .await
+            {
                 Ok(registration) => registration.abandon().await,
                 Err(error) => {
                     tracing::debug!(
@@ -494,6 +585,29 @@ pub async fn reserve_session_execution(
     session_id: &str,
     event_sender: &broadcast::Sender<AgentEvent>,
 ) -> SessionExecutionReserveOutcome {
+    reserve_session_execution_inner(agent, runners, senders, session_id, event_sender, false).await
+}
+
+/// Selected Native input activation uses the same reservation protocol, while
+/// its release only inherits explicitly requested producer wakeups.
+pub async fn reserve_selected_input_execution(
+    agent: &Arc<Agent>,
+    runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    senders: &Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+    session_id: &str,
+    event_sender: &broadcast::Sender<AgentEvent>,
+) -> SessionExecutionReserveOutcome {
+    reserve_session_execution_inner(agent, runners, senders, session_id, event_sender, true).await
+}
+
+async fn reserve_session_execution_inner(
+    agent: &Arc<Agent>,
+    runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    senders: &Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+    session_id: &str,
+    event_sender: &broadcast::Sender<AgentEvent>,
+    selected_input: bool,
+) -> SessionExecutionReserveOutcome {
     let reservation = match reserve_runner_core(runners, senders, session_id, event_sender).await {
         ReserveOutcome::AlreadyRunning(run_id) => {
             return SessionExecutionReserveOutcome::AlreadyRunning { run_id };
@@ -515,6 +629,7 @@ pub async fn reserve_session_execution(
         root_actor: None,
         execution_persistence: None,
         persistence_bound: false,
+        selected_input,
         armed: true,
     };
 
@@ -801,6 +916,15 @@ fn build_execute_request(
 /// 4. Persists the session via merge-save (preserves concurrent UI title/pin edits)
 /// 5. Updates the in-memory session cache
 pub fn spawn_session_execution(args: SessionExecutionArgs) {
+    spawn_session_execution_with_inputs(args, None);
+}
+
+/// Forward only explicitly supplied caller data through the existing spawned
+/// body. The reservation and public argument layout remain unchanged.
+pub fn spawn_session_execution_with_inputs(
+    args: SessionExecutionArgs,
+    inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+) {
     let span_session_id = args.session_id.clone();
     let session_span = tracing::info_span!("agent_execution", session_id = %span_session_id);
 
@@ -876,6 +1000,41 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // Bind before disarming: every pre-spawn and runtime checkpoint
             // uses one private view, and binding failure abandons this runner.
             if let Err(error) = execution_reservation.bind_execution_persistence(&agent, &session) {
+                let _ = mpsc_tx
+                    .send(AgentEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                execution_reservation.abandon().await;
+                return;
+            }
+            let ownership = match &execution_reservation.activation {
+                SessionExecutionActivationOwnership::Registered(run) => Some(run.ownership()),
+                _ => None,
+            };
+            let admission_persistence = execution_reservation
+                .execution_persistence()
+                .unwrap_or_else(|| agent.persistence().clone());
+            if let (Some(router), Some(ownership)) = (agent.activation_router(), ownership.as_ref())
+            {
+                if !router.bind_run_lifetime(ownership, &session).await {
+                    let _ = mpsc_tx
+                        .send(AgentEvent::Error {
+                            message: "registered run Session lifetime differs".into(),
+                        })
+                        .await;
+                    execution_reservation.abandon().await;
+                    return;
+                }
+            }
+            if let Err(error) = crate::runtime::counted_loop::admit_registered(
+                &mut session,
+                ownership.as_ref(),
+                agent.activation_router(),
+                admission_persistence.as_ref(),
+            )
+            .await
+            {
                 let _ = mpsc_tx
                     .send(AgentEvent::Error {
                         message: error.to_string(),
@@ -971,9 +1130,13 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // waiting parent. Map a panic to a terminal error instead.
             let result = {
                 use futures::FutureExt;
-                match std::panic::AssertUnwindSafe(agent.execute(&mut session, execute_request))
-                    .catch_unwind()
-                    .await
+                match std::panic::AssertUnwindSafe(agent.execute_with_inputs(
+                    &mut session,
+                    execute_request,
+                    inputs,
+                ))
+                .catch_unwind()
+                .await
                 {
                     Ok(result) => result,
                     Err(panic) => {
@@ -1167,7 +1330,7 @@ pub fn spawn_session_execution(args: SessionExecutionArgs) {
             // persisted above, so `is_running` and `last_run_status` become
             // visible together and the frontend settles immediately instead of
             // lingering in its optimistic-settle window.
-            finalize_runner(&runners, &session_id, &result).await;
+            finalize_runner_exact(&runners, &session_id, &activation_run_id, &result).await;
 
             if let Some(owner) = root_actor.take() {
                 let outcome = if result.as_ref().is_err_and(|error| error.is_cancelled()) {
@@ -1449,6 +1612,10 @@ impl Drop for RootActorExecution {
         // started filesystem job: its actual physical guards own its lifetime.
     }
 }
+
+#[cfg(test)]
+#[path = "agent_spawn_peer_privacy_tests.rs"]
+mod peer_privacy_tests;
 
 #[cfg(test)]
 mod reservation_tests {
@@ -1734,6 +1901,7 @@ mod reservation_tests {
             root_actor: None,
             execution_persistence: None,
             persistence_bound: false,
+            selected_input: false,
             armed: true,
         };
 
@@ -1767,6 +1935,7 @@ mod reservation_tests {
             root_actor: None,
             execution_persistence: None,
             persistence_bound: false,
+            selected_input: false,
             armed: true,
         };
 

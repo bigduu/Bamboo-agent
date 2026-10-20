@@ -44,8 +44,9 @@ pub enum CapabilityLoadingMode {
 /// Core guarantees exact current-Session recall after older activation traces
 /// leave the active context without making the broad Root `session_history`
 /// viewer Core.
-pub const CORE_TOOL_NAMES: [&str; 12] = [
-    "Bash",
+pub const CORE_TOOL_NAMES: [&str; 13] = [
+    "exec_command",
+    "write_stdin",
     "Read",
     "Grep",
     "Edit",
@@ -61,16 +62,25 @@ pub const CORE_TOOL_NAMES: [&str; 12] = [
 ];
 
 /// Host protocol helpers that must not enter model catalogs or discovery.
-pub const HOST_ONLY_TOOL_NAMES: [&str; 2] = ["Workspace", "request_permissions"];
+pub const HOST_ONLY_TOOL_NAMES: [&str; 6] = [
+    "Workspace",
+    "request_permissions",
+    "Bash",
+    "BashInput",
+    "BashOutput",
+    "KillShell",
+];
 
 /// Examples whose deferred status is part of the public migration contract.
-pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 6] = [
+pub const EXPLICIT_DEFERRED_TOOL_NAMES: [&str; 8] = [
     "Glob",
     "GetFileInfo",
     "ViewImage",
     "load_skill",
     "workflow_run",
     "update_goal",
+    "loop_control",
+    "session_message",
 ];
 
 /// Reserved provider-safe function name used only by Bamboo's compatibility
@@ -456,7 +466,8 @@ mod tests {
         assert_eq!(
             CORE_TOOL_NAMES,
             [
-                "Bash",
+                "exec_command",
+                "write_stdin",
                 "Read",
                 "Grep",
                 "Edit",
@@ -636,9 +647,8 @@ mod tests {
             "apply_patch",
             "applyPatch",
             "read_file",
-            "execute_command",
-            "bash",
-            "default::Bash",
+            "Exec_Command",
+            "default::exec_command",
         ] {
             let identity = ClassifiedToolIdentity::from_schema_name(name)
                 .expect("exact custom registration remains catalogued");
@@ -654,7 +664,7 @@ mod tests {
         assert_eq!(host_alias.execution_name(), "GetCurrentDir");
         assert_eq!(host_alias.loading_class(), CapabilityLoadingClass::HostOnly);
         assert_eq!(
-            ClassifiedToolIdentity::from_schema_name("Bash")
+            ClassifiedToolIdentity::from_schema_name("exec_command")
                 .expect("canonical builtin")
                 .loading_class(),
             CapabilityLoadingClass::Core
@@ -672,6 +682,34 @@ mod tests {
             CapabilityLoadingClass::Deferred,
             "only the exact registered framework identity may inherit Core policy"
         );
+    }
+
+    #[test]
+    fn legacy_shell_tools_remain_host_only_and_new_terminal_tools_are_core() {
+        for name in [
+            "Bash",
+            "BashInput",
+            "BashOutput",
+            "KillShell",
+            "execute_command",
+            "bash",
+            "default::Bash",
+        ] {
+            let identity = ClassifiedToolIdentity::from_schema_name(name).unwrap();
+            assert_eq!(
+                identity.loading_class(),
+                CapabilityLoadingClass::HostOnly,
+                "{name}"
+            );
+            assert!(!ClassifiedToolSchema::new(schema(name))
+                .unwrap()
+                .is_model_visible());
+        }
+        for name in ["exec_command", "write_stdin"] {
+            let identity = ClassifiedToolIdentity::from_schema_name(name).unwrap();
+            assert_eq!(identity.execution_name(), name);
+            assert_eq!(identity.loading_class(), CapabilityLoadingClass::Core);
+        }
     }
 
     #[test]

@@ -14,6 +14,136 @@ http://localhost:9562/api/v1
 
 ## API Endpoints
 
+### Open the Default Supervisor
+
+```http
+POST /api/v1/supervisor/default
+```
+
+Open the persistent, independent `bamboo-default-supervisor` Session without
+appending a message or starting a run. No request body is required. This owner
+endpoint uses the atomic Supervisor bootstrap port; concurrent clicks and
+reopening after restart return the same `session_id` and `incarnation_id`.
+Existing messages, model selection and birth identity are preserved. Clients
+can then read the normal Session detail and history endpoints.
+
+```json
+{
+  "session_id": "bamboo-default-supervisor",
+  "incarnation_id": "550e8400-e29b-41d4-a716-446655440000",
+  "created": true
+}
+```
+
+`created` is false when the authority already exists. First creation uses the
+configured default model when available, otherwise it remains unbound until
+the user configures/selects a model for normal chat admission. An Ordinary or
+Child occupying the reserved identity returns HTTP 409 and is never promoted
+or replaced. Unverifiable authority returns HTTP 503. Verified owner access is
+required, including on an otherwise open remote instance; Worker run
+credentials cannot create or open this authority.
+
+This endpoint is independent of `ticket_mutation` and `ticket_dispatch`: it
+does not change either flag or attach/import a Ticket scope. Session-list GETs
+remain read-only and include the real empty Supervisor after it is opened.
+
+### Responses Tool Limit
+
+Ordinary forwarding through `POST /openai/v1/responses` accepts at most
+**128 top-level `tools` entries** per request, including unsupported or malformed
+entries. Both Responses route registrations use this same bound. For otherwise
+valid forwarding requests, a larger collection returns HTTP 400 with
+`error.type: "api_error"` and
+`error.message: "Bad request: Responses tools[] supports at most 128 entries"`
+before reserving conversion output or processing any tool, with no provider call.
+
+Within the limit, flat Responses function declarations and legacy nested
+function declarations retain their existing behavior. Existing skips for
+unsupported types and errors for malformed function declarations or missing
+string `type` fields are unchanged, as are provider routing and wire protocol
+selection.
+
+This bound limits tool conversion work and output reservation after parsing.
+Initial JSON deserialization still relies on the shared **25 MiB** request-body
+limit; the count guard does not bound total request memory.
+
+### User Worktree Management
+
+All routes below use the existing `/api/v1` access gate. Git is the only
+worktree registry; Core configuration stores directory preferences only.
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /worktrees/preferences` | Read `default_root` and `project_roots` |
+| `PUT /worktrees/preferences` | Set or clear one directory scope |
+| `GET /projects/{project_id}/worktrees` | Discover bound repositories and native Git worktrees |
+| `POST /projects/{project_id}/worktrees` | Create a new branch and user worktree |
+
+A preference write is `{"root":"/Volumes/External/worktrees"}` for the global
+scope, or includes `"project_id":"<id>"` for one Project override. `root` is
+required; explicit `null` clears only that scope. The directory must already
+exist, be readable and writable, and be outside any Git checkout, bare repository,
+or Git metadata directory. Broken `.git` markers and unexpected Git discovery
+errors are rejected; they are never treated as proof of an outside directory.
+The existing configuration transaction persists the change before publication;
+other Project overrides and unrelated configuration remain intact.
+
+Creation accepts:
+
+```json
+{
+  "repository": "/existing/bound/repository",
+  "root": "/Volumes/External/worktrees",
+  "name": "task-42",
+  "branch": "feature/task-42"
+}
+```
+
+`root` may be omitted to use the Project override or global default, in that
+order. An absent default is an error. `repository` must exactly match a canonical
+Project source path. The new branch starts at that checkout's current `HEAD`.
+Folder names accept 1–80 ASCII letters, digits, hyphens or underscores.
+Success returns HTTP 201 with `{"path":"<canonical-root>/task-42"}`.
+
+Listing returns `project_id`, effective `default_root`, and `repositories`.
+Each repository includes `path`, `common_dir` when available, `error`, and
+`worktrees`. A worktree contains `path`, `branch` (null for detached HEAD),
+`head`, `dirty` (null when inspection fails), `locked`, `prunable`, `occupied`,
+`error`, and observed `sessions` (`id`, `title`, `active`). Occupancy is an
+observation of Bamboo Sessions/Git locks, not a cross-application lease.
+Unavailable paths are reported rather than dropped or pruned.
+Path-bearing Git output is parsed as raw OS bytes. `path_encoding` is `utf-8`
+for actionable paths. An existing Unix checkout with non-UTF-8 bytes is retained
+as an escaped display label with `path_encoding: "escaped"`, unknown dirty state
+and an explicit diagnostic; consumers must disable opening that label. Its
+native Git lock/prunable facts remain unchanged, and other checkouts remain
+available. Raw filenames inside a Unicode checkout do not prevent dirty/clean
+inspection. Creation/preferences require Unicode paths because their authority
+is JSON; no raw-byte path is silently replaced or migrated.
+
+Offline volumes, unwritable paths, existing destinations/branches, traversal,
+creation locks and boundary violations return explicit errors. There is no
+fallback directory or automatic retry. Creation uses a nonblocking OS advisory
+lock whose file is retained without truncation or deletion. An exiting process
+releases ownership; an active owner or unavailable locking returns an error.
+Preferences do not migrate checkouts.
+
+Manager Git calls disable fsmonitor, hooks, recursive submodule inspection,
+automatic maintenance and lazy fetching. Configured clean/smudge/process filters
+are suppressed per command without changing repository configuration. When
+conversion is needed, the operation fails explicitly instead of materializing
+raw content or silently bypassing a required filter. Registration uses `--no-checkout`;
+initial materialization re-reads configuration in the new branch/gitdir context
+and uses Git's protected two-tree merge from an empty tree. It refuses untracked
+collisions, carries forward staged/unstaged content, and never uses reset/force
+cleanup. Filter errors explain the boundary and suggest a trusted Git client. Existing CLI-created
+checkouts remain discoverable/openable. Submodule working-copy changes are not
+inspected: known parent/Gitlink changes remain dirty, otherwise a checkout with
+Gitlinks reports unknown dirty state and an explicit diagnostic.
+Opening an existing checkout uses the normal revisioned Project workspace binding
+API before Session selection; creation itself does not add another registry.
+No delete/prune/force operation or runtime-child GC is invoked by these endpoints.
+
 ### Chat Operations
 
 #### Create Chat Message
@@ -51,14 +181,32 @@ covers child planning, progress checks, correction, scope control, and final
 evidence. Child sessions do not receive it. This prompt choice does not change
 tool permissions.
 
+The `session_message` tool accepts optional `delivery_intent` on send/reply:
+`queue_only` admits durable input without starting an idle/finalizing receiver;
+`trigger_turn` permits activation through the existing router. Both explicit
+intents respect existing waits. Omission keeps legacy behavior. See the
+[delivery and receipt contract](SESSION_MESSAGING.md); an accepted message or
+activation receipt is not terminal completion.
+
 Root sessions can also select `"root_orchestration_only": true`. This durable
 execution mode supplies the same delegation guidance even when
-`root_orchestration_prompt` is unset. It limits the Root to these nine exact
-tool execution identities: `SubAgent`, `Plan`, `Task`,
-`session_history_current`, `Read`, `Grep`, `Glob`, `GetFileInfo`, and
-`ViewImage`. Other tools, including shell and editing tools, are unavailable
-to that Root; delegated children retain their own tool authority. The mode and
-the prompt-only choice are independent.
+`root_orchestration_prompt` is unset. It limits the Root to these exact tool
+execution identities: `SubAgent`, `Plan`, `Task`, `session_history_current`,
+`session_message`, `Read`, `Grep`, `Glob`, `GetFileInfo`, `ViewImage`,
+`work_overview`, `work_search`, `work_inspect`, `work_changes`, `work_update`,
+and `work_dispatch`. Exposure still follows configuration and each tool's live
+authorization checks. Shell and editing tools are unavailable to that Root;
+delegated children retain their own tool authority. The mode and the prompt-only
+choice are independent.
+
+The trusted default Supervisor uses this bounded orchestration posture in both
+Standard and Ultra, with `session_control` and scoped `session_history` admitted
+only through their existing Supervisor checks. Its independent-Root followup
+requires an explicitly attached target in current authorized Project/lifetime
+scope. Ordinary Ultra Roots do not gain that exception. Neither mode nor tool
+exposure initializes Work, enables its feature flags, or proves worker readiness.
+Unavailable delegation is a recoverable blocker; the Supervisor does not switch
+to direct implementation. See [Supervisor role and scope](../supervisor-identity.md#model-role-and-thinking-mode).
 
 The first chat request for a new Root may select this mode with
 `root_orchestration_only`. For an **existing** Root, omit that field from

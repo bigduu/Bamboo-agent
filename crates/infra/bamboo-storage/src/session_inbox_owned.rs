@@ -64,6 +64,12 @@ pub(super) struct StoredLease {
 }
 
 impl StoredLease {
+    /// Structural evidence only. Retirement does not mint or renew a lease.
+    pub(super) fn matches_transport_name(&self, generation: u64, name: &str) -> bool {
+        FileSessionInbox::owned_name(generation, &self.token) == name
+            && self.policy == SessionActivationPolicy::RespectSpecificWait
+    }
+
     fn reclaim_count(&self) -> u64 {
         self.reclaim_count.unwrap_or(self.token.epoch - 1)
     }
@@ -139,6 +145,9 @@ pub(crate) enum InboxAuthority {
     Supervisor {
         _guard: crate::v2::SupervisorFollowupGuard,
     },
+    Peer {
+        _guard: crate::v2::PeerDeliveryGuard,
+    },
 }
 struct OwnedScope {
     _process: OwnedMutexGuard<()>,
@@ -152,11 +161,15 @@ struct OwnedGuards {
 #[cfg(test)]
 pub(super) type FilesystemHook = Arc<dyn Fn(&str, &Path) -> std::io::Result<()> + Send + Sync>;
 
+type RuntimeRetainer =
+    Arc<dyn Fn() -> std::io::Result<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>> + Send + Sync>;
+
 /// Private mutation capability: constructed only from the actual acquired guards.
 #[derive(Clone)]
 pub(crate) struct OwnedFilesystem {
     guards: Arc<OwnedGuards>,
     check: Option<Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>>,
+    runtime: Option<(RuntimeRetainer, bamboo_domain::ScopedLoopControlBinding)>,
     #[cfg(test)]
     hook: Option<FilesystemHook>,
 }
@@ -168,10 +181,26 @@ impl OwnedFilesystem {
         path: &Path,
         job: impl FnOnce(&Self, &Path) -> std::io::Result<T> + Send + 'static,
     ) -> std::io::Result<T> {
-        let filesystem = self.clone();
+        let mut filesystem = self.clone();
         let path = path.to_owned();
         tokio::task::spawn_blocking(move || {
             // This capture outlives cancellation of the async transaction itself.
+            if let Some((retain, binding)) = filesystem.runtime.clone() {
+                let guard = retain()?;
+                filesystem = filesystem.with_check(Arc::new(move || {
+                    if guard.matches(
+                        &binding.target_session_id,
+                        binding.target_created_at,
+                        &binding.owner_run_id,
+                    ) {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::other(
+                            "scoped Loop owner stopped before Inbox publication",
+                        ))
+                    }
+                }));
+            }
             let _guards = &filesystem.guards;
             filesystem.observe(event, &path)?;
             filesystem.validate()?;
@@ -200,6 +229,15 @@ impl OwnedFilesystem {
             }
             check()
         }));
+        self
+    }
+
+    pub(crate) fn with_runtime_retainer(
+        mut self,
+        retain: RuntimeRetainer,
+        binding: bamboo_domain::ScopedLoopControlBinding,
+    ) -> Self {
+        self.runtime = Some((retain, binding));
         self
     }
 
@@ -251,17 +289,68 @@ impl OwnedFilesystem {
         dir: &Path,
         wrapper: &InboxMessage,
         gate: Option<&bamboo_domain::AdmissionGate>,
-    ) -> std::io::Result<bamboo_domain::AdmissionCommit<MsgId>> {
+        expected: Option<ExpectedRunAdmission>,
+        generation: u64,
+    ) -> Result<(bamboo_domain::AdmissionCommit<MsgId>, bool), SessionInboxError> {
         let wrapper = wrapper.clone();
         let gate = gate.cloned();
         self.job("maildir", dir, move |filesystem, dir| {
-            Mailbox::at(dir)
-                .deliver_blocking(&wrapper, gate.as_ref(), |phase, path| {
-                    filesystem.observe(phase, path)
-                })
-                .map_err(std::io::Error::other)
+            // Local to this started job: async cancellation cannot drop the
+            // exact owner while the final rename is still able to commit.
+            let retained =
+                std::cell::RefCell::new(None::<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>>);
+            let conflict = std::cell::RefCell::new(None::<SessionInboxError>);
+            let result =
+                Mailbox::at(dir).deliver_blocking(&wrapper, gate.as_ref(), |phase, path| {
+                    filesystem.observe(phase, path)?;
+                    if phase == "maildir_replace" {
+                        if let Some(expected) = &expected {
+                            match expected.retain() {
+                                Ok(guard) => *retained.borrow_mut() = Some(guard),
+                                Err(error) => {
+                                    *conflict.borrow_mut() = Some(error);
+                                    return Err(std::io::Error::other(
+                                        "expected run admission rejected",
+                                    ));
+                                }
+                            }
+                            filesystem.observe("expected_run_matched", path)?;
+                            if retained.borrow().as_ref().is_none_or(|guard| {
+                                !guard.matches(
+                                    &expected.target_session_id,
+                                    expected.target_created_at,
+                                    &expected.expected_run_id,
+                                )
+                            }) {
+                                *conflict.borrow_mut() = Some(SessionInboxError::InvalidClaim(
+                                    "Loop owner stopped before delivery publication".into(),
+                                ));
+                                return Err(std::io::Error::other(
+                                    "expected run publication stopped",
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+            if let Some(error) = conflict.into_inner() {
+                return Ok(Err(error));
+            }
+            let committed = match result {
+                Ok(committed) => committed,
+                Err(error) => return Ok(Err(SessionInboxError::Storage(error.to_string()))),
+            };
+            let notified = matches!(&committed, bamboo_domain::AdmissionCommit::Committed(_))
+                && retained
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|guard| guard.notify_committed_delivery(generation));
+            // The retained guard and original filesystem/authority guards all
+            // remain live until this synchronous job returns.
+            Ok(Ok((committed, notified)))
         })
         .await
+        .map_err(|error| SessionInboxError::Storage(error.to_string()))?
     }
 
     pub(super) async fn cancel(&self, dir: &Path, path: &Path, name: &str) -> std::io::Result<()> {
@@ -269,6 +358,33 @@ impl OwnedFilesystem {
         let to = cancelled.join(name);
         self.job("cancel", path, move |_, path| {
             std::fs::create_dir_all(cancelled)?;
+            std::fs::rename(path, to)
+        })
+        .await
+    }
+
+    /// Same cancelled tombstone, while preserving any existing evidence.
+    /// Caller and this job retain the original exclusive Inbox operation lock.
+    pub(super) async fn cancel_if_absent(
+        &self,
+        dir: &Path,
+        path: &Path,
+        name: &str,
+    ) -> std::io::Result<()> {
+        let cancelled = dir.join("cancelled");
+        let to = cancelled.join(name);
+        self.job("cancel", path, move |_, path| {
+            std::fs::create_dir_all(cancelled)?;
+            match std::fs::symlink_metadata(&to) {
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "scoped Loop cancellation tombstone already exists",
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
             std::fs::rename(path, to)
         })
         .await
@@ -338,6 +454,7 @@ fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
 /// The exact owned lease cannot be dispatched without its actual mutation scope.
 pub(super) enum AckAuthority<'a> {
     Legacy,
+    ScopedLegacy(&'a OwnedFilesystem),
     Owned {
         lease: &'a StoredLease,
         filesystem: &'a OwnedFilesystem,
@@ -346,26 +463,32 @@ pub(super) enum AckAuthority<'a> {
 impl AckAuthority<'_> {
     pub(super) fn lease(&self) -> Option<&StoredLease> {
         match self {
-            Self::Legacy => None,
+            Self::Legacy | Self::ScopedLegacy(_) => None,
             Self::Owned { lease, .. } => Some(lease),
         }
     }
     pub(super) async fn create_dir(&self, path: &Path) -> std::io::Result<()> {
         match self {
             Self::Legacy => tokio::fs::create_dir_all(path).await,
-            Self::Owned { filesystem, .. } => filesystem.create_dir(path).await,
+            Self::ScopedLegacy(filesystem) | Self::Owned { filesystem, .. } => {
+                filesystem.create_dir(path).await
+            }
         }
     }
     pub(super) async fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         match self {
             Self::Legacy => atomic_write(path, bytes).await,
-            Self::Owned { filesystem, .. } => filesystem.write(path, bytes).await,
+            Self::ScopedLegacy(filesystem) | Self::Owned { filesystem, .. } => {
+                filesystem.write(path, bytes).await
+            }
         }
     }
     pub(super) async fn remove(&self, path: &Path) -> std::io::Result<()> {
         match self {
             Self::Legacy => tokio::fs::remove_file(path).await,
-            Self::Owned { filesystem, .. } => filesystem.remove(path).await,
+            Self::ScopedLegacy(filesystem) | Self::Owned { filesystem, .. } => {
+                filesystem.remove(path).await
+            }
         }
     }
 }
@@ -467,6 +590,13 @@ impl FileSessionInbox {
                 .await
                 .map_err(|error| SessionInboxError::Storage(error.to_string()));
         }
+        if let Some(owner) = &self.child_owner {
+            return self
+                .sessions
+                .child_owned_inbox_filesystem(self, target, owner)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()));
+        }
         let lifecycle = self.lock_lifecycle().await?;
         self.filesystem_with_authority(target, InboxAuthority::Lifecycle { _guard: lifecycle })
             .await
@@ -477,7 +607,10 @@ impl FileSessionInbox {
         target: &str,
         authority: InboxAuthority,
     ) -> Result<(PathBuf, OwnedFilesystem), SessionInboxError> {
-        let dir = self.inbox_dir(target).await?;
+        let dir = match &authority {
+            InboxAuthority::Peer { _guard } => _guard.inbox_dir.clone(),
+            _ => self.inbox_dir(target).await?,
+        };
         let process = self.lock_process(&dir).await;
         let scope = Arc::new(OwnedScope {
             _process: process,
@@ -516,6 +649,7 @@ impl FileSessionInbox {
             OwnedFilesystem {
                 guards,
                 check: None,
+                runtime: None,
                 #[cfg(test)]
                 hook: self.owned_fs_hook.clone(),
             },
@@ -694,6 +828,189 @@ impl FileSessionInbox {
         Self::decode_owned_wrapper(&bytes)
     }
 
+    pub(super) async fn pending_child_outcomes_impl(
+        &self,
+        target: &str,
+        child: &str,
+    ) -> Result<Vec<SessionMessageEnvelope>, SessionInboxError> {
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
+        let (_, versioned) = Self::read_activation_watermark(&dir).await?;
+        let mut entries = Self::queue_entries(&dir, "new", Some(&filesystem), false).await?;
+        entries.extend(Self::queue_entries(&dir, "cur", Some(&filesystem), false).await?);
+        entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        let mut result = Vec::new();
+        for (generation, _, path) in entries {
+            let (wrapper, lease) = self.read_owned_transport(&path).await?;
+            if wrapper.kind != InboxKind::SessionEnvelope
+                || (lease.is_some() && !Self::owned_enabled(&dir).await?)
+            {
+                return Err(invalid("invalid Inbox child lookup transport"));
+            }
+            // This read-only search supplies reuse evidence, not admission.
+            // An unrelated invalid body cannot supply that evidence and must
+            // remain untouched for the normal consumer's corruption handling.
+            let Ok(envelope) =
+                serde_json::from_value::<SessionMessageEnvelope>(wrapper.body.clone())
+            else {
+                continue;
+            };
+            if envelope.validate().is_err() {
+                continue;
+            }
+            let intent = Self::activation_intent(&wrapper.body)?;
+            if Self::message_activation_intent(&wrapper.body)?.is_some() && !versioned {
+                return Err(invalid("activation intent requires its v2 watermark"));
+            }
+            if envelope.target_session_id != target {
+                return Err(invalid("Inbox target mismatch"));
+            }
+            if !matches!(&envelope.body, bamboo_domain::SessionMessageBody::ChildOutcome(outcome)
+                if outcome.child_session_id == child)
+            {
+                continue;
+            }
+            if let Some(receipt) = Self::admitted_receipt(&dir, &envelope).await? {
+                if receipt.delivery.generation != generation
+                    || receipt.intent != intent
+                    || !StoredLease::same_optional_identity(receipt.lease.as_ref(), lease.as_ref())
+                {
+                    return Err(invalid("Inbox terminal lease mismatch"));
+                }
+                continue;
+            }
+            result.push(envelope);
+        }
+        Ok(result)
+    }
+
+    fn validate_explicit_message_promotion(
+        intent: Option<SessionInboxActivationIntent>,
+        policy: SessionActivationPolicy,
+    ) -> Result<(), SessionInboxError> {
+        if intent.is_some_and(|intent| {
+            intent.delivery().is_some()
+                && (intent.is_queue_only()
+                    || policy == SessionActivationPolicy::InterruptSpecificWait)
+        }) {
+            return Err(invalid("explicit peer delivery intent cannot be promoted"));
+        }
+        Ok(())
+    }
+
+    pub(super) async fn mark_message_activation_eligible_impl(
+        &self,
+        target: &str,
+        receipt: &SessionInboxReceipt,
+        policy: SessionActivationPolicy,
+    ) -> Result<(), SessionInboxError> {
+        #[cfg(test)]
+        let _scope_drop = ScopeDrop(self.owned_scope_drop.clone());
+        let (dir, filesystem) = self.owned_filesystem(target).await?;
+        if receipt.generation == 0 {
+            return Err(invalid(
+                "message activation requires a delivered generation",
+            ));
+        }
+        // A permanent receipt wins even when cur still exists after an ACK
+        // crash. Promotion must never create work over that terminal proof.
+        match tokio::fs::read(Self::admitted_path(&dir, &receipt.id)).await {
+            Ok(bytes) => {
+                let terminal: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|_| invalid("invalid Inbox admitted receipt"))?;
+                if terminal["id"].as_str() != Some(receipt.id.as_str())
+                    || terminal["generation"].as_u64() != Some(receipt.generation)
+                {
+                    return Err(invalid("message activation receipt identity mismatch"));
+                }
+                Self::validate_explicit_message_promotion(
+                    Self::activation_intent(&terminal)?,
+                    policy,
+                )?;
+                return Ok(());
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(SessionInboxError::Storage(error.to_string())),
+        }
+        for queue in ["new", "cur"] {
+            for (generation, _, path) in Self::owned_queue_entries(&dir, queue, &filesystem).await?
+            {
+                if generation != receipt.generation {
+                    continue;
+                }
+                let (mut wrapper, lease) = self.read_owned_transport(&path).await?;
+                if wrapper.kind != InboxKind::SessionEnvelope
+                    || (lease.is_some() && !Self::owned_enabled(&dir).await?)
+                {
+                    return Err(invalid("invalid Inbox activation transport"));
+                }
+                let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
+                    .map_err(|_| invalid("invalid Inbox activation envelope"))?;
+                envelope
+                    .validate()
+                    .map_err(|_| invalid("invalid Inbox activation envelope"))?;
+                if envelope.id != receipt.id || envelope.target_session_id != target {
+                    continue;
+                }
+                let current = Self::message_activation_intent(&wrapper.body)?;
+                let (prefix, versioned) = Self::read_activation_watermark(&dir).await?;
+                if current.is_some() && !versioned {
+                    return Err(invalid("activation intent requires its v2 watermark"));
+                }
+                if let Some(intent) = current
+                    .as_ref()
+                    .filter(|intent| intent.delivery().is_some())
+                {
+                    Self::validate_explicit_message_promotion(Some(intent.clone()), policy)?;
+                    return Ok(());
+                }
+                if current.is_some_and(|intent| {
+                    intent.policy().ok().is_some_and(|current| {
+                        current == policy
+                            || current == SessionActivationPolicy::InterruptSpecificWait
+                    })
+                }) {
+                    return Ok(());
+                }
+                wrapper
+                    .body
+                    .as_object_mut()
+                    .ok_or_else(|| invalid("invalid Inbox activation envelope"))?
+                    .insert(
+                        COORDINATOR_INTENT_KEY.into(),
+                        serde_json::to_value(SessionInboxActivationIntent::new(policy))
+                            .map_err(|_| invalid("encode Inbox activation intent"))?,
+                    );
+                if !versioned {
+                    // Fence legacy readers before a per-message permission is
+                    // published. Preserve the existing prefix exactly.
+                    Self::write_activation_watermark(&dir, prefix, true, &filesystem).await?;
+                }
+                // Keep an existing lease's policy and identity pinned. A live
+                // consumer's original claim/ACK remains valid after promotion.
+                return match lease {
+                    Some(lease) => {
+                        self.write_owned_transport(&path, &wrapper, &lease, &filesystem)
+                            .await
+                    }
+                    None => {
+                        let bytes = serde_json::to_vec_pretty(&wrapper)
+                            .map_err(|_| invalid("encode Inbox activation transport"))?;
+                        if bytes.len() > self.max_transport_bytes() {
+                            return Err(invalid("Inbox activation transport exceeds byte limit"));
+                        }
+                        filesystem
+                            .write(&path, &bytes)
+                            .await
+                            .map_err(|error| SessionInboxError::Storage(error.to_string()))
+                    }
+                };
+            }
+        }
+        Err(invalid(
+            "message activation receipt is not pending or admitted",
+        ))
+    }
+
     async fn write_owned_transport(
         &self,
         path: &Path,
@@ -758,14 +1075,38 @@ impl FileSessionInbox {
         limit: usize,
         run: Option<&str>,
         request: &SessionInboxLeaseRequest,
+        receipt: Option<&SessionInboxReceipt>,
+        scoped_only: bool,
     ) -> Result<Vec<SessionInboxOwnedClaim>, SessionInboxError> {
+        if receipt.is_some_and(|receipt| receipt.generation == 0) {
+            return Err(invalid("Inbox receipt generation must be nonzero"));
+        }
+        if receipt.is_some()
+            && self
+                .root_owner
+                .as_ref()
+                .is_some_and(|owner| run != Some(owner.fence.run_id.as_str()))
+        {
+            return Err(invalid(
+                "Root Inbox run differs from its execution capability",
+            ));
+        }
+        if self
+            .child_owner
+            .as_ref()
+            .is_some_and(|owner| run != Some(owner.fence.run_id.as_str()))
+        {
+            return Err(invalid(
+                "Child Inbox run differs from its execution capability",
+            ));
+        }
         let expires_at = request.expires_at()?;
         #[cfg(test)]
         let _scope_drop = ScopeDrop(self.owned_scope_drop.clone());
         let (dir, filesystem) = self.owned_filesystem(target).await?;
         let filesystem = self.root_lease_filesystem(filesystem, expires_at)?;
         let actual_request;
-        let request = if self.root_owner.is_some() {
+        let request = if self.root_owner.is_some() || self.child_owner.is_some() {
             let now = Utc::now();
             actual_request = SessionInboxLeaseRequest {
                 consumer: request.consumer.clone(),
@@ -796,9 +1137,22 @@ impl FileSessionInbox {
             if result.len() >= limit.min(self.limits.max_claim_batch) {
                 break;
             }
+            // Select while retaining the exact same lifecycle/Actor, process
+            // and filesystem guards as the lease CAS. No inspection result
+            // authorizes a later generic claim or cleanup of a sibling.
+            if receipt.is_some_and(|receipt| receipt.generation != generation) {
+                continue;
+            }
             let (wrapper, stored) = self.read_owned_transport(&path).await?;
             let intent = Self::activation_intent(&wrapper.body)?;
-            if !Self::eligible(generation, prefix, intent) {
+            let activation = Self::message_activation_intent(&wrapper.body)?;
+            if intent
+                .as_ref()
+                .is_some_and(|intent| !intent.admits_run(run))
+            {
+                continue;
+            }
+            if !Self::eligible(generation, prefix, activation.clone()) {
                 continue;
             }
             let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
@@ -808,6 +1162,12 @@ impl FileSessionInbox {
                 .map_err(|_| invalid("invalid Inbox envelope"))?;
             if envelope.target_session_id != target {
                 return Err(invalid("Inbox target mismatch"));
+            }
+            if receipt.is_some_and(|receipt| receipt.id != envelope.id) {
+                continue;
+            }
+            if bamboo_domain::is_scoped_loop_control(&envelope) != scoped_only {
+                continue;
             }
             // Receipt publication is terminal even if a process stopped before
             // removing cur. Never mint a successor over this admitted input.
@@ -821,6 +1181,10 @@ impl FileSessionInbox {
                 let terminal_filesystem = if let Some(owner) = &self.root_owner {
                     let proof = self.sessions.root_inbox_terminal_check(owner, &envelope);
                     filesystem.clone().with_check(proof)
+                } else if let Some(owner) = &self.child_owner {
+                    filesystem
+                        .clone()
+                        .with_check(self.sessions.child_inbox_terminal_check(owner, &envelope))
                 } else {
                     filesystem.clone()
                 };
@@ -864,7 +1228,7 @@ impl FileSessionInbox {
                     policy: match previous.as_ref() {
                         Some(lease) => lease.policy,
                         None => Self::effective_activation_policy(
-                            generation, prefix, interrupt, intent,
+                            generation, prefix, interrupt, activation,
                         )?,
                     },
                     token: SessionInboxLeaseToken {
@@ -1001,11 +1365,16 @@ impl FileSessionInbox {
             Self::decode_owned_wrapper(&read(&dir.join("cur").join(&claim.claim.claim_id))?)?;
         let stored = stored.ok_or_else(|| invalid("Inbox lease missing"))?;
         let intent = Self::activation_intent(&wrapper.body)?;
+        let activation_intent = Self::message_activation_intent(&wrapper.body)?;
         if !stored.same_identity(&claim.lease)
             || stored.policy != claim.claim.activation_policy
             || stored.token.expires_at <= now
             || Self::owned_name(claim.claim.generation, &stored.token) != claim.claim.claim_id
-            || !Self::eligible(claim.claim.generation, activation.generation, intent)
+            || !Self::eligible(
+                claim.claim.generation,
+                activation.generation,
+                activation_intent,
+            )
         {
             return Err(invalid("Inbox claim lost, expired or ineligible"));
         }
@@ -1080,12 +1449,12 @@ impl FileSessionInbox {
         let _scope_drop = ScopeDrop(self.owned_scope_drop.clone());
         let (dir, filesystem) = self.owned_filesystem(target).await?;
         let filesystem = self.root_lease_filesystem(filesystem, expires_at)?;
-        let filesystem = if self.root_owner.is_some() {
+        let filesystem = if self.root_owner.is_some() || self.child_owner.is_some() {
             self.exact_claim_filesystem(filesystem, &dir, target, claim, false)
         } else {
             filesystem
         };
-        let now = if self.root_owner.is_some() {
+        let now = if self.root_owner.is_some() || self.child_owner.is_some() {
             Utc::now()
         } else {
             request.now
@@ -1120,6 +1489,9 @@ impl FileSessionInbox {
         claim: &SessionInboxOwnedClaim,
         now: DateTime<Utc>,
     ) -> Result<(), SessionInboxError> {
+        if bamboo_domain::is_scoped_loop_control(&claim.claim.envelope) {
+            return Err(invalid("Loop controls require checkpoint-before-ACK"));
+        }
         Self::validate_claim_name(&claim.claim.claim_id)?;
         if claim.claim.envelope.target_session_id != target {
             return Err(invalid("Inbox target mismatch"));
@@ -1157,6 +1529,11 @@ impl FileSessionInbox {
                 self.sessions
                     .root_inbox_terminal_check(owner, &claim.claim.envelope),
             )
+        } else if let Some(owner) = &self.child_owner {
+            filesystem.with_check(
+                self.sessions
+                    .child_inbox_terminal_check(owner, &claim.claim.envelope),
+            )
         } else {
             filesystem
         };
@@ -1172,12 +1549,12 @@ impl FileSessionInbox {
         now: DateTime<Utc>,
         filesystem: OwnedFilesystem,
     ) -> Result<(), SessionInboxError> {
-        let filesystem = if self.root_owner.is_some() {
+        let filesystem = if self.root_owner.is_some() || self.child_owner.is_some() {
             self.exact_claim_filesystem(filesystem, dir, target, claim, true)
         } else {
             filesystem
         };
-        let now = if self.root_owner.is_some() {
+        let now = if self.root_owner.is_some() || self.child_owner.is_some() {
             Utc::now()
         } else {
             now
@@ -1207,6 +1584,8 @@ impl FileSessionInbox {
     ) -> Result<OwnedFilesystem, SessionInboxError> {
         Ok(if let Some(owner) = &self.root_owner {
             filesystem.with_check(self.sessions.root_inbox_lease_check(owner, deadline))
+        } else if let Some(owner) = &self.child_owner {
+            filesystem.with_check(self.sessions.child_inbox_lease_check(owner, deadline))
         } else {
             filesystem
         })
@@ -1511,7 +1890,8 @@ impl FileSessionInbox {
         for (generation, _, path) in entries {
             let (wrapper, stored) = self.read_owned_transport(&path).await?;
             let intent = Self::activation_intent(&wrapper.body)?;
-            if !Self::eligible(generation, prefix, intent) {
+            let activation = Self::message_activation_intent(&wrapper.body)?;
+            if !Self::wake_eligible(generation, prefix, activation.clone()) {
                 continue;
             }
             let envelope: SessionMessageEnvelope = serde_json::from_value(wrapper.body.clone())
@@ -1549,7 +1929,7 @@ impl FileSessionInbox {
                     (lease.policy, Some(lease.token.epoch), Some(ready_after))
                 }
                 None => (
-                    Self::effective_activation_policy(generation, prefix, interrupt, intent)?,
+                    Self::effective_activation_policy(generation, prefix, interrupt, activation)?,
                     None,
                     None,
                 ),
@@ -1558,15 +1938,30 @@ impl FileSessionInbox {
                 result.next_due_at = Some(result.next_due_at.map_or(due, |old| old.min(due)));
                 continue;
             }
-            result.ready = Some(SessionInboxWakeCandidate {
+            let candidate = SessionInboxWakeCandidate {
                 id: envelope.id,
                 generation,
                 activation_policy: policy,
                 coordinator_generation: prefix,
+                coordinator_message_policy: Self::activation_intent_field(
+                    &wrapper.body,
+                    COORDINATOR_INTENT_KEY,
+                )?
+                .map(|intent| intent.policy())
+                .transpose()?,
                 lease_epoch,
                 ready_after,
-            });
-            break;
+            };
+            // An older Respect item can remain blocked by a specific wait.
+            // Prefer an exact coordinator Interrupt for this wake hint while
+            // leaving the consumer's ordered claim protocol unchanged.
+            if candidate.coordinator_message_policy
+                == Some(SessionActivationPolicy::InterruptSpecificWait)
+            {
+                result.ready = Some(candidate);
+                break;
+            }
+            result.ready.get_or_insert(candidate);
         }
         Ok(result)
     }

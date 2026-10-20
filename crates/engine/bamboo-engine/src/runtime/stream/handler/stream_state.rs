@@ -265,6 +265,9 @@ impl StreamAccumulationState {
                 .iter()
                 .map(PartialToolCallSnapshot::from)
                 .collect(),
+            provider_usage: self.provider_usage,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
         }
     }
 }

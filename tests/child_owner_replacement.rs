@@ -1,4 +1,5 @@
-//! Independent live Hosts replace expired zero-tool Child owners.
+//! Independent same-machine Hosts replace expired zero-tool legacy Worker owners.
+//! The fixture explicitly selects the retained process backend.
 //! Fixtures pause an initial owner or delay its real pre-ACK release requests.
 #![cfg(unix)]
 use actix_web::{web, App, HttpResponse, HttpServer};
@@ -240,6 +241,86 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
     answer(json!({"content":format!("ROOT_DONE_{stage}")}), "stop")
 }
 
+// Nonblocking probes close each independent descriptor immediately. They
+// never create lock files, retain authority, or change a production lease.
+fn blocked_file_locks(locks: &[(PathBuf, bool)]) -> std::io::Result<Vec<PathBuf>> {
+    let mut blocked = Vec::new();
+    for (path, shared) in locks {
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let result = if *shared {
+            file.try_lock_shared()
+        } else {
+            file.try_lock()
+        };
+        match result {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => blocked.push(path.clone()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+    Ok(blocked)
+}
+
+fn pause_boundary_locks(data: &Path, child_id: &str) -> Vec<(PathBuf, bool)> {
+    let mut locks = vec![
+        // root_settled constructs a Store whose recovery takes both gates
+        // exclusively, so a paused shared writer is unsafe here too.
+        (data.join(".session-lifecycle.lock"), false),
+        (data.join(".runtime-task-transactions.lock"), false),
+        (data.join(".sessions-index.lock"), false),
+        (data.join("events/.account-journal.lock"), false),
+        (
+            data.join("sessions")
+                .join(ROOT)
+                .join("inbox/.session-inbox.lock"),
+            false,
+        ),
+    ];
+    let child_inbox = data
+        .join("sessions")
+        .join(ROOT)
+        .join("children")
+        .join(child_id)
+        .join("inbox/.session-inbox.lock");
+    assert!(
+        child_inbox.is_file(),
+        "canonical Child Inbox claim exists before pausing its owner"
+    );
+    locks.push((child_inbox, false));
+    for name in [".session-write-locks", ".actor-tree-locks"] {
+        let entries = match std::fs::read_dir(data.join(name)) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("fixture lock inventory: {error}"),
+        };
+        for entry in entries {
+            let entry = entry.unwrap();
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "lock")
+            {
+                assert!(entry.file_type().unwrap().is_file());
+                locks.push((entry.path(), false));
+            }
+        }
+    }
+    locks.sort();
+    assert!(
+        locks.len() <= 32,
+        "bounded disposable fixture lock inventory"
+    );
+    locks
+}
+
 struct Host {
     child: Child,
     base: String,
@@ -299,6 +380,53 @@ impl Host {
             "signal only the exact fixture-owned Host PID"
         );
         self.stopped = signal == "-STOP";
+    }
+
+    async fn stop_clear_of_file_locks(
+        &mut self,
+        locks: &[(PathBuf, bool)],
+        mut on_blocked: impl FnMut(&[PathBuf]),
+    ) -> Result<usize, String> {
+        let mut rejected = 0;
+        let mut last_blocked = Vec::new();
+        // A lease cannot release an OS file lock held by a SIGSTOPed process.
+        // Pause only between the same physical boundaries B must cross. The
+        // reused 2s pause budget includes every resumed retry.
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                self.signal("-STOP");
+                loop {
+                    let status = Command::new("ps")
+                        .args(["-o", "stat=", "-p", &self.child.id().to_string()])
+                        .output()
+                        .unwrap();
+                    if String::from_utf8_lossy(&status.stdout)
+                        .trim()
+                        .starts_with('T')
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                last_blocked = blocked_file_locks(locks).map_err(|error| error.to_string())?;
+                if last_blocked.is_empty() {
+                    return Ok(rejected);
+                }
+                rejected += 1;
+                on_blocked(&last_blocked);
+                self.signal("-CONT");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if !matches!(result, Ok(Ok(_))) && self.stopped {
+            self.signal("-CONT");
+        }
+        result.map_err(|_| {
+            format!(
+                "fixture-owned Host cannot pause clear of file locks within 2s: {last_blocked:?}"
+            )
+        })?
     }
 
     fn plain_rejections(&self) -> String {
@@ -591,7 +719,7 @@ async fn replacement_fixture(delayed_release: bool) {
     let running = server.run();
     let provider_handle = running.handle();
     actix_web::rt::spawn(running);
-    std::fs::write(data.join("config.json"),serde_json::to_vec(&json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture","base_url":url,"model":"replacement-root","fast_model":"replacement-auxiliary","runtime_models":["replacement-root","replacement-child","replacement-auxiliary"]}},"defaults":{"chat":{"provider":"openai","model":"replacement-root"},"fast":{"provider":"openai","model":"replacement-auxiliary"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1,"fabric_dir":data.join("subagents")},"stream_timeout":{"transport_idle_timeout_secs":120,"first_semantic_timeout_secs":120,"semantic_idle_timeout_secs":120}})).unwrap()).unwrap();
+    std::fs::write(data.join("config.json"),serde_json::to_vec(&json!({"provider":"openai","features":{"provider_model_ref":true},"providers":{"openai":{"api_key":"fixture","base_url":url,"model":"replacement-root","fast_model":"replacement-auxiliary","runtime_models":["replacement-root","replacement-child","replacement-auxiliary"]}},"defaults":{"chat":{"provider":"openai","model":"replacement-root"},"fast":{"provider":"openai","model":"replacement-auxiliary"}},"subagents":{"runtime":"actor","executor":"bamboo_runtime","worker_bin":env!("CARGO_BIN_EXE_bamboo"),"worker_args":["subagent-worker"],"max_concurrent":1,"fabric_dir":data.join("subagents")},"stream_timeout":{"transport_idle_timeout_secs":120,"first_semantic_timeout_secs":120,"semantic_idle_timeout_secs":120}})).unwrap()).unwrap();
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(150))
@@ -745,7 +873,14 @@ async fn replacement_fixture(delayed_release: bool) {
     // feed, not the Child token stream. Keep that feed open across Root turns.
     let account = EventTap::open(&client, &a, "/stream").await;
     if !delayed_release {
-        a.signal("-STOP");
+        let locks = pause_boundary_locks(&data, &id);
+        let rejected = a
+            .stop_clear_of_file_locks(&locks, |_| {})
+            .await
+            .unwrap_or_else(|reason| panic!("{reason}; A {}; B {}", a.tail(), b.tail()));
+        eprintln!(
+            "paused initial owner clear of physical locks; rejected unsafe pauses={rejected}"
+        );
     }
     let deadline = old_activation.lease_expires_at;
     eprintln!(
@@ -991,4 +1126,56 @@ async fn replacement_fixture(delayed_release: bool) {
     drop(b);
     drop(a);
     provider_handle.stop(true).await;
+}
+
+#[actix_web::test]
+async fn child_owner_pause_rejects_real_physical_claims() {
+    let temp = tempfile::tempdir().unwrap();
+    // Only negative filesystem claims, never a fabricated Actor or receipt.
+    let child_inbox = temp
+        .path()
+        .join("sessions")
+        .join(ROOT)
+        .join("children/boundary-child/inbox/.session-inbox.lock");
+    std::fs::create_dir_all(child_inbox.parent().unwrap()).unwrap();
+    std::fs::File::create(child_inbox).unwrap();
+    for (relative, shared_claim) in [
+        (".session-lifecycle.lock", true),
+        (".runtime-task-transactions.lock", true),
+        ("events/.account-journal.lock", false),
+    ] {
+        let lock_path = temp.path().join(relative);
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let mut held = Some(std::fs::File::create(&lock_path).unwrap());
+        if shared_claim {
+            held.as_ref().unwrap().lock_shared().unwrap();
+        } else {
+            held.as_ref().unwrap().lock().unwrap();
+        }
+        let mut host = Host {
+            child: Command::new("sleep").arg("30").spawn().unwrap(),
+            base: String::new(),
+            log: temp.path().join("unused-host.log"),
+            stopped: false,
+        };
+        let locks = pause_boundary_locks(temp.path(), "boundary-child");
+        let rejected = host
+            .stop_clear_of_file_locks(&locks, |blocked| {
+                assert_eq!(blocked, [lock_path.clone()]);
+                drop(held.take());
+            })
+            .await
+            .unwrap();
+        assert!(
+            rejected > 0 && held.is_none(),
+            "the pause must reject a conflicting physical claim before accepting STOP: {relative}"
+        );
+        let replacement = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        replacement.try_lock().unwrap();
+        assert!(host.stopped);
+    }
 }

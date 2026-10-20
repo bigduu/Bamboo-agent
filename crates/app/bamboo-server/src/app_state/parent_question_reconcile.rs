@@ -146,21 +146,19 @@ impl ParentQuestionCoordinator {
             .await
             .map_err(|_| "ParentQuestion Root control completion is unconfirmed")?;
         match state {
-            State::Terminal(ParentQuestionResolution {
-                outcome: ParentQuestionOutcome::Answer { text },
-                ..
-            }) => Ok(ParentQuestionReplyReceipt {
-                answer: text,
-                state: if recorded {
-                    ParentRequestReplyState::Recorded
-                } else {
-                    ParentRequestReplyState::AlreadyResolved
-                },
-            }),
-            State::Terminal(ParentQuestionResolution {
-                outcome: ParentQuestionOutcome::Expired,
-                ..
-            }) => Err("ParentQuestion deadline won the resolution race".into()),
+            State::Terminal(resolution) => match resolution.outcome {
+                ParentQuestionOutcome::Answer { text } => Ok(ParentQuestionReplyReceipt {
+                    answer: text,
+                    state: if recorded {
+                        ParentRequestReplyState::Recorded
+                    } else {
+                        ParentRequestReplyState::AlreadyResolved
+                    },
+                }),
+                ParentQuestionOutcome::Expired => {
+                    Err("ParentQuestion deadline won the resolution race".into())
+                }
+            },
             State::Pending => Err("ParentQuestion terminal persistence is unconfirmed".into()),
         }
     }
@@ -297,7 +295,7 @@ impl ParentQuestionCoordinator {
                 .await
                 .map_err(|_| "ParentQuestion expiration CAS is unconfirmed")?;
             terminal = match state {
-                State::Terminal(resolution) => Some(resolution),
+                State::Terminal(resolution) => Some(*resolution),
                 State::Pending => None,
             };
         }

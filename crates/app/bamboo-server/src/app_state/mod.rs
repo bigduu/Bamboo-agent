@@ -195,6 +195,10 @@ pub struct AppState {
     /// unblocked during a write's disk I/O. #126.
     pub config_io_lock: Arc<tokio::sync::Mutex<()>>,
 
+    /// Process-local consumer publication receipts; never a configuration writer.
+    pub(crate) config_application:
+        Arc<std::sync::RwLock<config_application::ConfigApplicationState>>,
+
     /// Server-owned live configuration watcher and its health envelope.
     /// The runtime handle keeps the directory watcher tasks alive.
     pub config_live_health: Arc<std::sync::RwLock<config_runtime::ConfigLiveHealth>>,
@@ -214,9 +218,9 @@ pub struct AppState {
     /// HTTP operator handlers and the `cluster` agent tool).
     pub fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,
 
-    /// In-process mailbox bus (broker), when not externally configured. Held so
-    /// it lives for the server's lifetime (dropping it aborts the bus). `None`
-    /// when an external broker is configured or the bus couldn't bind. Never read
+    /// Legacy mailbox bus, enabled only for explicit process/remote routes.
+    /// Held for the server lifetime (dropping it aborts the bus). `None` for
+    /// native Tokio Children, an external broker, or a bind failure. Never read
     /// — its only job is to keep the bus task alive until AppState drops.
     #[allow(dead_code)]
     embedded_broker: Option<builder::EmbeddedBroker>,
@@ -251,6 +255,11 @@ pub struct AppState {
 
     /// Concrete session store implementation (for index/list/cleanup APIs).
     pub session_store: Arc<SessionStoreV2>,
+
+    /// Optional trusted embedding-host consent verifier. Never set by HTTP,
+    /// model arguments, access configuration, locality or credential fallback.
+    pub(crate) supervisor_project_scope_owner_authorizer:
+        Option<Arc<dyn supervisor_owner_authorization::SupervisorProjectScopeOwnerAuthorizer>>,
 
     /// Durable, Bamboo-home-scoped idempotency receipts for root-session
     /// creation. Kept outside each target session directory so deleting a
@@ -298,6 +307,10 @@ pub struct AppState {
 
     /// Background scheduler for async sub-session spawning.
     pub spawn_scheduler: Arc<SpawnScheduler>,
+
+    /// Owning Child runtime handle, retained so graceful shutdown cancels and
+    /// joins same-process child tasks before their shared MCP tools are stopped.
+    pub(crate) external_child_runner: Arc<dyn bamboo_engine::execution::ExternalChildRunner>,
 
     /// One Host-owned Ticket authority; records survive disabling dispatch.
     pub tickets: Arc<ticket_application::TicketApplication>,
@@ -510,6 +523,51 @@ impl AppState {
         self.title_gen_in_flight.remove(session_id);
     }
 
+    /// The compatibility API has no caller-provided revision. Serialize its
+    /// snapshot read with the commit so overlapping requests keep their
+    /// established last-writer-wins behavior without weakening typed CAS.
+    pub(crate) async fn replace_compatibility_model_limits(
+        &self,
+        rows: Vec<serde_json::Value>,
+    ) -> Result<(), ConfigSectionMutationError> {
+        let io = self.config_io_lock.clone().lock_owned().await;
+        let app_data_dir = self.app_data_dir.clone();
+        let facade = self.config_facade.clone();
+        let account_sink = self.account_sink.clone();
+        // The owner survives request cancellation and retains serialization
+        // through both durable publication and the account event. File locks
+        // and fsync belong on a blocking worker, never the HTTP worker.
+        let transaction = tokio::spawn(async move {
+            let _io = io;
+            let event = tokio::task::spawn_blocking(move || {
+                bamboo_config::ensure_provider_mcp_migration_ready(&app_data_dir)
+                    .map_err(ConfigSectionMutationError::Store)?;
+                let facade = facade.as_ref().ok_or_else(|| {
+                    ConfigSectionMutationError::Invalid(
+                        "model-limit section writes require the modular configuration facade"
+                            .to_string(),
+                    )
+                })?;
+                facade
+                    .replace_compatibility_model_limits(bamboo_config::ModelLimitsSection(rows))
+                    .map_err(ConfigSectionMutationError::Store)
+            })
+            .await
+            .map_err(|_| {
+                ConfigSectionMutationError::Runtime(
+                    "model-limit persistence task failed".to_string(),
+                )
+            })??;
+            if let Some(event) = event {
+                config_runtime::publish_registry_event(&account_sink, &event).await;
+            }
+            Ok(())
+        });
+        transaction.await.map_err(|_| {
+            ConfigSectionMutationError::Runtime("model-limit transaction task failed".to_string())
+        })?
+    }
+
     /// Test-only synchronization point (see
     /// [`boot_reconcile_services_handle`](Self::boot_reconcile_services_handle)'s
     /// doc comment): wait for the background boot-time service reconcile
@@ -527,6 +585,8 @@ impl AppState {
 pub(crate) mod actor_events;
 mod agent_session_context;
 mod builder;
+mod config_application;
+pub(crate) use config_application::ConfigApplicationState;
 mod config_runtime;
 pub(crate) use config_runtime::ConfigLiveHealth;
 pub(crate) use config_runtime::ConfigSectionMutationError;
@@ -553,12 +613,16 @@ pub(crate) mod mutation_idempotency;
 pub(crate) mod session_create_operations;
 pub mod session_events;
 mod session_loader;
+pub mod supervisor_owner_authorization;
 pub mod ticket_application;
 mod tools;
 pub mod watchers;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod model_limit_snapshot_tests;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConfigUpdateEffects {
@@ -574,3 +638,14 @@ impl Default for ConfigUpdateEffects {
         }
     }
 }
+
+#[cfg(test)]
+mod local_task_assembly_tests;
+
+#[cfg(test)]
+mod local_task_conversation_tests;
+
+#[cfg(test)]
+mod supervised_root_create_tests;
+
+pub(super) mod supervised_root_create;

@@ -13,9 +13,10 @@ use bamboo_domain::{canonical_tool_name, resolve_tool_reference_name};
 use crate::guide::{context::GuideBuildContext, EnhancedPromptBuilder, ToolGuide};
 use crate::permission::{check_permissions, PermissionChecker, PermissionError};
 use crate::tools::{
-    BashInputTool, BashOutputTool, BashTool, EditTool, ExitPlanModeTool, GetFileInfoTool, GlobTool,
-    GrepTool, KillShellTool, ReadTool, RequestPermissionsTool, SessionNoteTool, SleepTool,
-    TaskTool, ToolRegistry, UpdateGoalTool, ViewImageTool, WebFetchTool, WorkspaceTool, WriteTool,
+    BashInputTool, BashOutputTool, BashTool, EditTool, ExecCommandTool, ExitPlanModeTool,
+    GetFileInfoTool, GlobTool, GrepTool, KillShellTool, LoopControlTool, ReadTool,
+    RequestPermissionsTool, SessionNoteTool, SleepTool, TaskTool, ToolRegistry, UpdateGoalTool,
+    ViewImageTool, WebFetchTool, WorkspaceTool, WriteStdinTool, WriteTool,
 };
 use bamboo_llm::Config;
 use bamboo_plugin_protocol::{
@@ -44,9 +45,12 @@ fn parse_warning_log_details<'a>(
     warning: &'a str,
 ) -> (String, &'a str) {
     let canonical = canonical_tool_name(execution_name);
-    if canonical.eq_ignore_ascii_case("browser") || canonical.eq_ignore_ascii_case("browser_eval") {
+    if ["browser", "browser_eval", "session_message"]
+        .iter()
+        .any(|name| canonical.eq_ignore_ascii_case(name))
+    {
         // A repaired JSON warning embeds its own preview, so both strings
-        // must be hidden when browser input may contain focused typed text.
+        // must be hidden for private browser input or peer message text.
         ("[redacted]".to_string(), "[redacted]")
     } else {
         (preview_for_log(args_raw, 180), warning)
@@ -71,6 +75,11 @@ fn approval_tool_name_for_display(tool_name: &str) -> String {
 }
 
 fn approval_parameters_for_display(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
+    if canonical_tool_name(tool_name).eq_ignore_ascii_case("session_message") {
+        // Peer text and routing identifiers must not enter approval display
+        // events. Classification has already validated the exact action.
+        return serde_json::json!({"action": args.get("action")});
+    }
     if canonical_tool_name(tool_name).eq_ignore_ascii_case("browser_eval") {
         return serde_json::json!({
             "code":"[redacted]",
@@ -330,6 +339,12 @@ impl BuiltinToolExecutor {
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, BashTool::new()) {
             framework_tools.insert(name, tool);
         }
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ExecCommandTool::new()) {
+            framework_tools.insert(name, tool);
+        }
+        if let Ok((name, tool)) = Self::register_tracked_builtin(registry, WriteStdinTool::new()) {
+            framework_tools.insert(name, tool);
+        }
         let _ = registry.register(BashInputTool::new());
         let _ = registry.register(BashOutputTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, EditTool::new()) {
@@ -344,6 +359,7 @@ impl BuiltinToolExecutor {
         let _ = registry.register(GrepTool::new());
         let _ = registry.register(UpdateGoalTool::new());
         let _ = registry.register(KillShellTool::new());
+        let _ = registry.register(LoopControlTool::new());
         let _ = registry.register(SessionNoteTool::new());
         if let Ok((name, tool)) = Self::register_tracked_builtin(registry, ReadTool::new()) {
             framework_tools.insert(name, tool);
@@ -381,9 +397,22 @@ impl BuiltinToolExecutor {
             .is_some_and(|builtin| Arc::ptr_eq(builtin, tool))
     }
 
+    // Kept in sync with the startup wire's NativeToolCeiling::NAMES. This crate
+    // intentionally does not depend on the sub-agent transport crate.
+    const NATIVE_TOOL_NAMES: [&'static str; 8] = [
+        "Bash",
+        "Edit",
+        "Glob",
+        "Read",
+        "Task",
+        "Write",
+        "exec_command",
+        "write_stdin",
+    ];
+
     /// Observe the registered Arc, not a same-name custom replacement.
     pub fn eligible_native_tool(&self, name: &str) -> bool {
-        matches!(name, "Bash" | "Edit" | "Glob" | "Read" | "Task" | "Write")
+        Self::NATIVE_TOOL_NAMES.contains(&name)
             && self.registry.get(name).is_some_and(|tool| {
                 self.is_framework_builtin_instance(name, &tool)
                     && self
@@ -397,7 +426,7 @@ impl BuiltinToolExecutor {
     pub fn with_native_tool_ceiling(mut self, names: Vec<String>) -> Result<Self, ToolError> {
         let set: BTreeSet<_> = names.iter().cloned().collect();
         if set.len() != names.len()
-            || names.len() > 6
+            || names.len() > Self::NATIVE_TOOL_NAMES.len()
             || names.iter().any(|name| !self.eligible_native_tool(name))
         {
             return Err(ToolError::Execution("native_tool_ceiling_invalid".into()));
@@ -522,7 +551,69 @@ impl BuiltinToolExecutor {
             .then(|| self.pending_file_changed(execution_name, &tool, &args))
             .flatten();
 
-        let outcome = tool.invoke(args, ctx.to_tool_ctx()).await?;
+        // Native in-process runs keep mutating builtin invocations alive when
+        // their awaiter is cancelled. Tokio filesystem work cannot be aborted
+        // safely merely by dropping its future. Custom/plugin tools stay inline:
+        // their private task-local capability scopes must not be lost.
+        let owned_resources = crate::LocalTaskResources::current().filter(|_| {
+            matches!(execution_name, "Write" | "Edit" | "Bash" | "exec_command")
+                && self.is_framework_builtin_instance(execution_name, &tool)
+        });
+        let outcome = if let Some(resources) = owned_resources {
+            let tool_ctx = ctx.to_tool_ctx();
+            let output_cap = bamboo_agent_core::tools::observed_tool_output_cap(&tool_ctx);
+            let approval = crate::current_approval_proxy();
+            let permission_override = crate::current_hook_permission_override(&call.id);
+            let root_writer = bamboo_agent_core::tools::context::root_actor_tool_writer();
+            let call_id = call.id.clone();
+            let session_id = ctx.session_id.unwrap_or_default().to_owned();
+            let suspension = bamboo_agent_core::tools::capture_suspension_restriction();
+            let invoke = async move {
+                let invoke = async move {
+                    let future = tool.invoke(args, tool_ctx);
+                    let future = crate::with_approval_proxy(approval, future);
+                    let future =
+                        crate::with_hook_permission_override(permission_override, &call_id, future);
+                    let future = bamboo_agent_core::tools::scope_tool_output_cap(
+                        &session_id,
+                        &call_id,
+                        output_cap,
+                        future,
+                    );
+                    // Preserve absent Host scope versus a present unbound scope.
+                    let result = match root_writer {
+                        Some(writer) => {
+                            bamboo_agent_core::tools::context::with_root_actor_tool_writer(
+                                writer, future,
+                            )
+                            .await
+                        }
+                        None => future.await,
+                    };
+                    enforce_registered_tool_suspension(result)
+                };
+                // Normalize while the child still owns the captured token and
+                // LocalTaskResources, even after its registered awaiter drops.
+                match suspension {
+                    Some(scope) => scope.scope(invoke).await,
+                    None => invoke.await,
+                }
+            };
+            let registered = resources
+                .spawn_owned(invoke)
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            crate::local_task_resources::mark_current_invocation_owned();
+            registered.await.map_err(|_| {
+                ToolError::Execution(
+                    "owned tool invocation panicked; stop remains unconfirmed".into(),
+                )
+            })?
+        } else {
+            tool.invoke(args, ctx.to_tool_ctx()).await
+        };
+        // Inline/custom tools also normalize here. An already normalized
+        // Completed outcome is idempotent and never requests a second kill.
+        let outcome = enforce_registered_tool_suspension(outcome)?;
         if matches!(
             &outcome,
             ToolOutcome::Completed(result) if result.success
@@ -534,10 +625,405 @@ impl BuiltinToolExecutor {
         Ok(outcome)
     }
 
+    /// Host-side permission entry used only by the installed v2 Root owner.
+    /// Classification is explicit while the typed request retains the actual
+    /// spawn_session identity, original argument bytes and existing once gates.
+    pub async fn check_framework_root_spawn_permissions(
+        &self,
+        call: &ToolCall,
+        args: &serde_json::Value,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        self.check_owned_permissions(call, "spawn_session", args, ctx, true)
+            .await
+    }
+
+    async fn check_owned_permissions(
+        &self,
+        call: &ToolCall,
+        execution_name: &str,
+        resolved_args: &serde_json::Value,
+        ctx: &ToolExecutionContext<'_>,
+        framework_root_spawn: bool,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        if self.native_tool_ceiling.is_some() {
+            let tool = self
+                .registry
+                .get(execution_name)
+                .ok_or_else(|| ToolError::Execution("native_tool_ceiling_denied".into()))?;
+            self.check_native_ceiling(execution_name, &tool)?;
+        }
+        let tool_name = execution_name.to_string();
+        let args = resolved_args.clone();
+        if ctx.auto_approve_permissions && tool_name.eq_ignore_ascii_case("request_permissions") {
+            return Err(ToolError::Execution(
+                "Auto mode cannot request expanded permissions; operate within existing hard boundaries"
+                    .to_string(),
+            ));
+        }
+        if ctx.plan_read_only
+            && (!crate::orchestrator::plan_mode_allows_tool(&tool_name)
+                || (tool_name == "session_message"
+                    && args.get("action").and_then(serde_json::Value::as_str)
+                        != Some("list_targets")))
+        {
+            return Err(ToolError::Execution(format!(
+                "Plan mode: {tool_name} operation blocked"
+            )));
+        }
+        let Some(permission_checker) = &self.permission_checker else {
+            return Ok(None);
+        };
+        let hook_permission_override = crate::current_hook_permission_override(&call.id);
+
+        let contexts = if framework_root_spawn {
+            crate::permission::tool_permissions::framework_root_spawn_permissions(&args)
+        } else {
+            check_permissions(&tool_name, &args)
+        }
+        .map_err(permission_error_to_tool_error)?;
+        if let Some(contexts) = contexts {
+            let proactive_permission_request =
+                tool_name.eq_ignore_ascii_case("request_permissions");
+            for context in contexts {
+                let resource = context.resource.clone();
+                let operation_summary = context.operation_description.clone();
+                let risk_level = context.risk_level();
+                let permission_type = context.permission_type;
+                let focused_browser_input =
+                    crate::permission::is_focused_browser_input(&tool_name, &args);
+                let native_browser_select =
+                    crate::permission::is_native_browser_select(&tool_name, &args);
+                let browser_eval =
+                    canonical_tool_name(&tool_name).eq_ignore_ascii_case("browser_eval");
+                let browser_download = is_browser_download_action(&tool_name, &args);
+                let private_browser_file_input = !browser_download
+                    && crate::permission::is_private_browser_file_input(&tool_name, &args);
+                let private_browser_display = focused_browser_input
+                    || native_browser_select
+                    || browser_eval
+                    || browser_download
+                    || private_browser_file_input;
+                let denied_message = if browser_eval {
+                    "Browser page script denied by policy"
+                } else if private_browser_file_input {
+                    "Browser file input denied by policy"
+                } else if native_browser_select {
+                    "Browser selection denied by policy"
+                } else if browser_download {
+                    "Browser download denied by policy"
+                } else {
+                    "Browser input denied by policy"
+                };
+                let check_failed_message = if browser_eval {
+                    "Browser page script permission check failed"
+                } else if private_browser_file_input {
+                    "Browser file input permission check failed"
+                } else if native_browser_select {
+                    "Browser selection permission check failed"
+                } else if browser_download {
+                    "Browser download permission check failed"
+                } else {
+                    "Browser input permission check failed"
+                };
+                let approval_display_resource = if browser_eval {
+                    "Execute browser page JavaScript".to_string()
+                } else if private_browser_display {
+                    operation_summary.clone()
+                } else {
+                    resource.clone()
+                };
+                let platform_hard_deny = permission_checker.hard_deny_reason(&context);
+                let config = permission_checker.permission_config();
+                let proxy = crate::approval::current_approval_proxy();
+                let request = if let Some(config) = config.as_ref() {
+                    if proactive_permission_request && proxy.is_some() {
+                        return Err(ToolError::Execution(
+                            "request_permissions requires the local typed decision protocol; a boolean approval relay cannot create remembered authority"
+                                .to_string(),
+                        ));
+                    }
+                    // A boolean approval relay can only honor one-shot choices.
+                    // Interactive local sessions support all typed scopes; the
+                    // evaluator omits workspace when no stable identity is known.
+                    let mut supported_decisions = if proxy.is_some() {
+                        crate::permission::PermissionRequest::forced_decisions()
+                    } else {
+                        crate::permission::PermissionRequest::ordinary_decisions(true)
+                    };
+                    if proactive_permission_request {
+                        // AllowOnce is bound to the request_permissions call,
+                        // not the later target operation, so offering it would
+                        // falsely claim authority was granted. Remembered
+                        // scopes remain exact matcher-bound and are replay-safe.
+                        supported_decisions.retain(|decision| {
+                            *decision != crate::permission::PermissionDecisionKind::AllowOnce
+                        });
+                    }
+                    // Workspace-scoped policy is an authority boundary. Tool
+                    // arguments are model-controlled resources and must never
+                    // choose that scope identity; only the workspace registered
+                    // for this stable session may enable AllowWorkspace.
+                    let workspace_path = ctx
+                        .session_id
+                        .and_then(|session_id| config.session_workspace(session_id));
+                    let evaluation = crate::permission::PermissionEvaluation {
+                        request_id: call.id.clone(),
+                        session_id: ctx.session_id.unwrap_or_default().to_string(),
+                        workspace_path,
+                        tool_name: tool_name.clone(),
+                        tool_args: args.clone(),
+                        permission_type,
+                        resource: resource.clone(),
+                        operation_summary: operation_summary.clone(),
+                        risk_level,
+                        bypass_requested: ctx.bypass_permissions,
+                        auto_approve_requested: ctx.auto_approve_permissions,
+                        platform_hard_deny,
+                        consume_once: true,
+                        supported_decisions,
+                    };
+                    let outcome = if framework_root_spawn {
+                        config.evaluate_framework_root_spawn(evaluation)
+                    } else {
+                        config.evaluate(evaluation)
+                    };
+                    match outcome {
+                        crate::permission::PermissionOutcome::Allow { .. } => continue,
+                        crate::permission::PermissionOutcome::Deny { reason, .. } => {
+                            return Err(ToolError::Execution(if private_browser_display {
+                                denied_message.to_string()
+                            } else {
+                                reason.message
+                            }));
+                        }
+                        crate::permission::PermissionOutcome::Ask(request)
+                            if matches!(
+                                hook_permission_override,
+                                Some(crate::HookPermissionOverride::Allow)
+                            ) && !proactive_permission_request
+                                && request.reason_code
+                                    != crate::permission::PermissionReasonCode::HardDangerous =>
+                        {
+                            continue;
+                        }
+                        crate::permission::PermissionOutcome::Ask(request) => request,
+                    }
+                } else {
+                    if proactive_permission_request {
+                        return Err(ToolError::Execution(
+                            "request_permissions requires a typed PermissionConfig and cannot fall back to a display-string approval"
+                                .to_string(),
+                        ));
+                    }
+                    // Compatibility path for custom checkers that do not expose a
+                    // typed config. It remains one-shot only and fail-closed.
+                    if let Some(reason) = platform_hard_deny {
+                        return Err(ToolError::Execution(if private_browser_display {
+                            denied_message.to_string()
+                        } else {
+                            reason
+                        }));
+                    }
+                    let force_ask = focused_browser_input
+                        || permission_checker.requires_forced_confirmation(&tool_name, &args)
+                        || (framework_root_spawn
+                            && permission_checker.requires_forced_confirmation(
+                                "session_control",
+                                &serde_json::json!({"action":"create", "request": args}),
+                            ));
+                    let hook_allows = matches!(
+                        hook_permission_override,
+                        Some(crate::HookPermissionOverride::Allow)
+                    );
+                    if ctx.auto_approve_permissions
+                        || ((ctx.bypass_permissions || hook_allows) && !force_ask)
+                    {
+                        continue;
+                    }
+                    if !bamboo_agent_core::tools::suspension_allowed() {
+                        // A configless custom checker may prompt inside these
+                        // methods. Do not replace its full gate with is_granted
+                        // or infer an approval: fail closed before calling it.
+                        return Err(ToolError::Execution(
+                            "suspension_disabled: permission approval is unavailable in this execution".into(),
+                        ));
+                    }
+                    let decision = if focused_browser_input {
+                        // Configless checkers may have cached grants, and the
+                        // trait's default forced path checks that cache first.
+                        // A focused action must ask again for this occurrence.
+                        permission_checker.request_confirmation(context).await
+                    } else if force_ask {
+                        permission_checker.check_or_request_forced(context).await
+                    } else if let Some(session_id) = ctx.session_id {
+                        permission_checker
+                            .check_or_request_for_session(session_id, context)
+                            .await
+                    } else {
+                        permission_checker.check_or_request(context).await
+                    };
+                    match decision {
+                        Ok(true) => continue,
+                        Ok(false) => {
+                            return Err(ToolError::Execution(format!(
+                                "Permission denied for: {}",
+                                approval_display_resource
+                            )));
+                        }
+                        Err(PermissionError::ConfirmationRequired { .. }) => {
+                            crate::permission::PermissionRequest {
+                                request_id: call.id.clone(),
+                                request_generation:
+                                    crate::permission::PermissionRequest::fresh_generation(),
+                                session_id: ctx.session_id.unwrap_or_default().to_string(),
+                                workspace_path: None,
+                                tool_name: tool_name.clone(),
+                                permission_type,
+                                resource: resource.clone(),
+                                operation_summary: operation_summary.clone(),
+                                risk_level,
+                                reason_code: if force_ask {
+                                    crate::permission::PermissionReasonCode::ConfiguredAlwaysAsk
+                                } else {
+                                    crate::permission::PermissionReasonCode::RiskThreshold
+                                },
+                                effective_mode: bamboo_config::settings::PermissionMode::Default,
+                                bypass_requested: ctx.bypass_permissions,
+                                auto_approve_requested: ctx.auto_approve_permissions,
+                                policy_revision: 0,
+                                matched_rule: None,
+                                allowed_decisions:
+                                    crate::permission::PermissionRequest::forced_decisions(),
+                                suggested_matchers: if focused_browser_input {
+                                    Vec::new()
+                                } else {
+                                    crate::permission::conservative_matchers(
+                                        permission_type,
+                                        &resource,
+                                    )
+                                },
+                            }
+                        }
+                        Err(other) => {
+                            return Err(if private_browser_display {
+                                ToolError::Execution(check_failed_message.to_string())
+                            } else {
+                                permission_error_to_tool_error(other)
+                            });
+                        }
+                    }
+                };
+
+                if !bamboo_agent_core::tools::suspension_allowed() {
+                    return Err(ToolError::Execution(
+                        "suspension_disabled: permission approval is unavailable in this execution"
+                            .into(),
+                    ));
+                }
+
+                // A worker/external relay gets the same typed request but only
+                // one-shot decisions are advertised until its protocol supports
+                // a stronger scope. No boolean downgrade can create a grant.
+                if let Some(proxy) = proxy {
+                    let mut display_request = request.clone();
+                    if canonical_tool_name(&tool_name).eq_ignore_ascii_case("browser") {
+                        display_request.tool_name = "browser".to_string();
+                    }
+                    if private_browser_display {
+                        display_request.resource = "[redacted]".to_string();
+                        display_request.matched_rule = None;
+                        display_request.suggested_matchers.clear();
+                        if browser_eval {
+                            display_request.operation_summary =
+                                "Execute browser page JavaScript".to_string();
+                        }
+                    }
+                    let approved = proxy
+                        .request_approval(crate::approval::ApprovalAsk {
+                            tool_name: approval_tool_name_for_display(&tool_name),
+                            permission: permission_type.description().to_string(),
+                            resource: approval_display_resource.clone(),
+                            permission_request: Some(display_request),
+                        })
+                        .await;
+                    if approved {
+                        continue;
+                    }
+                    return Err(ToolError::Execution(format!(
+                        "Permission denied by host for: {}",
+                        approval_display_resource
+                    )));
+                }
+
+                // Interactive sessions pause through the legacy question shape
+                // while carrying the complete typed request alongside it.
+                if let Some(tx) = ctx.event_tx {
+                    let approval_parameters = approval_parameters_for_display(&tool_name, &args);
+                    let _ = tx
+                        .send(bamboo_agent_core::AgentEvent::ToolApprovalRequested {
+                            tool_call_id: call.id.clone(),
+                            tool_name: approval_tool_name_for_display(&tool_name),
+                            parameters: approval_parameters,
+                        })
+                        .await;
+
+                    let question = format!(
+                        "**Permission required**\n\nThe `{}` tool needs approval to {} on:\n\n`{}`",
+                        approval_tool_name_for_display(&tool_name),
+                        permission_type.description(),
+                        approval_display_resource
+                    );
+                    if let Some(config) = config {
+                        config.register_pending_request(request.clone());
+                    }
+                    let payload = serde_json::json!({
+                        "status": "awaiting_permission_approval",
+                        "question": question,
+                        "permission_type": permission_type,
+                        "resource": approval_display_resource,
+                        "options": ["Approve", "Deny"],
+                        "allow_custom": false,
+                        "permission_request": request,
+                    });
+                    return Ok(Some(ToolOutcome::Completed(ToolResult {
+                        success: true,
+                        result: payload.to_string(),
+                        display_preference: Some("request_permissions".to_string()),
+                        images: Vec::new(),
+                    })));
+                }
+
+                return Err(ToolError::Execution(format!(
+                    "Permission approval required for: {}",
+                    approval_display_resource
+                )));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Build enhanced prompt for all registered tools
     pub fn build_enhanced_prompt(&self, context: GuideBuildContext) -> String {
         EnhancedPromptBuilder::build(Some(&self.registry), &self.list_tools(), &context)
     }
+}
+
+/// Keep this inside an owned child's captured scope, before sending its
+/// result; the awaiting parent may already have timed out or been dropped.
+fn enforce_registered_tool_suspension(
+    outcome: Result<ToolOutcome, ToolError>,
+) -> Result<ToolOutcome, ToolError> {
+    let outcome = outcome.map(ToolOutcome::enforce_suspension_restriction);
+    if bamboo_agent_core::tools::suspension_running_violated() {
+        if let Some(resources) = crate::LocalTaskResources::current() {
+            resources.record_unconfirmed(
+                "restricted tool returned Running; cooperative kill has no stop receipt",
+            );
+        }
+    }
+    outcome
 }
 
 fn permission_error_to_tool_error(error: PermissionError) -> ToolError {
@@ -669,327 +1155,8 @@ impl ToolExecutor for BuiltinToolExecutor {
         resolved_args: &serde_json::Value,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
-        if self.native_tool_ceiling.is_some() {
-            let tool = self
-                .registry
-                .get(execution_name)
-                .ok_or_else(|| ToolError::Execution("native_tool_ceiling_denied".into()))?;
-            self.check_native_ceiling(execution_name, &tool)?;
-        }
-        let tool_name = execution_name.to_string();
-        let args = resolved_args.clone();
-        if ctx.auto_approve_permissions && tool_name.eq_ignore_ascii_case("request_permissions") {
-            return Err(ToolError::Execution(
-                "Auto mode cannot request expanded permissions; operate within existing hard boundaries"
-                    .to_string(),
-            ));
-        }
-        if ctx.plan_read_only && !crate::orchestrator::plan_mode_allows_tool(&tool_name) {
-            return Err(ToolError::Execution(format!(
-                "Plan mode: {tool_name} operation blocked"
-            )));
-        }
-        let Some(permission_checker) = &self.permission_checker else {
-            return Ok(None);
-        };
-        let hook_permission_override = crate::current_hook_permission_override(&call.id);
-
-        if let Some(contexts) =
-            check_permissions(&tool_name, &args).map_err(permission_error_to_tool_error)?
-        {
-            let proactive_permission_request =
-                tool_name.eq_ignore_ascii_case("request_permissions");
-            for context in contexts {
-                let resource = context.resource.clone();
-                let operation_summary = context.operation_description.clone();
-                let risk_level = context.risk_level();
-                let permission_type = context.permission_type;
-                let focused_browser_input =
-                    crate::permission::is_focused_browser_input(&tool_name, &args);
-                let native_browser_select =
-                    crate::permission::is_native_browser_select(&tool_name, &args);
-                let browser_eval =
-                    canonical_tool_name(&tool_name).eq_ignore_ascii_case("browser_eval");
-                let browser_download = is_browser_download_action(&tool_name, &args);
-                let private_browser_file_input = !browser_download
-                    && crate::permission::is_private_browser_file_input(&tool_name, &args);
-                let private_browser_display = focused_browser_input
-                    || native_browser_select
-                    || browser_eval
-                    || browser_download
-                    || private_browser_file_input;
-                let denied_message = if browser_eval {
-                    "Browser page script denied by policy"
-                } else if private_browser_file_input {
-                    "Browser file input denied by policy"
-                } else if native_browser_select {
-                    "Browser selection denied by policy"
-                } else if browser_download {
-                    "Browser download denied by policy"
-                } else {
-                    "Browser input denied by policy"
-                };
-                let check_failed_message = if browser_eval {
-                    "Browser page script permission check failed"
-                } else if private_browser_file_input {
-                    "Browser file input permission check failed"
-                } else if native_browser_select {
-                    "Browser selection permission check failed"
-                } else if browser_download {
-                    "Browser download permission check failed"
-                } else {
-                    "Browser input permission check failed"
-                };
-                let approval_display_resource = if browser_eval {
-                    "Execute browser page JavaScript".to_string()
-                } else if private_browser_display {
-                    operation_summary.clone()
-                } else {
-                    resource.clone()
-                };
-                let platform_hard_deny = permission_checker.hard_deny_reason(&context);
-                let config = permission_checker.permission_config();
-                let proxy = crate::approval::current_approval_proxy();
-                let request = if let Some(config) = config.as_ref() {
-                    if proactive_permission_request && proxy.is_some() {
-                        return Err(ToolError::Execution(
-                            "request_permissions requires the local typed decision protocol; a boolean approval relay cannot create remembered authority"
-                                .to_string(),
-                        ));
-                    }
-                    // A boolean approval relay can only honor one-shot choices.
-                    // Interactive local sessions support all typed scopes; the
-                    // evaluator omits workspace when no stable identity is known.
-                    let mut supported_decisions = if proxy.is_some() {
-                        crate::permission::PermissionRequest::forced_decisions()
-                    } else {
-                        crate::permission::PermissionRequest::ordinary_decisions(true)
-                    };
-                    if proactive_permission_request {
-                        // AllowOnce is bound to the request_permissions call,
-                        // not the later target operation, so offering it would
-                        // falsely claim authority was granted. Remembered
-                        // scopes remain exact matcher-bound and are replay-safe.
-                        supported_decisions.retain(|decision| {
-                            *decision != crate::permission::PermissionDecisionKind::AllowOnce
-                        });
-                    }
-                    // Workspace-scoped policy is an authority boundary. Tool
-                    // arguments are model-controlled resources and must never
-                    // choose that scope identity; only the workspace registered
-                    // for this stable session may enable AllowWorkspace.
-                    let workspace_path = ctx
-                        .session_id
-                        .and_then(|session_id| config.session_workspace(session_id));
-                    match config.evaluate(crate::permission::PermissionEvaluation {
-                        request_id: call.id.clone(),
-                        session_id: ctx.session_id.unwrap_or_default().to_string(),
-                        workspace_path,
-                        tool_name: tool_name.clone(),
-                        tool_args: args.clone(),
-                        permission_type,
-                        resource: resource.clone(),
-                        operation_summary: operation_summary.clone(),
-                        risk_level,
-                        bypass_requested: ctx.bypass_permissions,
-                        auto_approve_requested: ctx.auto_approve_permissions,
-                        platform_hard_deny,
-                        consume_once: true,
-                        supported_decisions,
-                    }) {
-                        crate::permission::PermissionOutcome::Allow { .. } => continue,
-                        crate::permission::PermissionOutcome::Deny { reason, .. } => {
-                            return Err(ToolError::Execution(if private_browser_display {
-                                denied_message.to_string()
-                            } else {
-                                reason.message
-                            }));
-                        }
-                        crate::permission::PermissionOutcome::Ask(request)
-                            if matches!(
-                                hook_permission_override,
-                                Some(crate::HookPermissionOverride::Allow)
-                            ) && !proactive_permission_request
-                                && request.reason_code
-                                    != crate::permission::PermissionReasonCode::HardDangerous =>
-                        {
-                            continue;
-                        }
-                        crate::permission::PermissionOutcome::Ask(request) => request,
-                    }
-                } else {
-                    if proactive_permission_request {
-                        return Err(ToolError::Execution(
-                            "request_permissions requires a typed PermissionConfig and cannot fall back to a display-string approval"
-                                .to_string(),
-                        ));
-                    }
-                    // Compatibility path for custom checkers that do not expose a
-                    // typed config. It remains one-shot only and fail-closed.
-                    if let Some(reason) = platform_hard_deny {
-                        return Err(ToolError::Execution(if private_browser_display {
-                            denied_message.to_string()
-                        } else {
-                            reason
-                        }));
-                    }
-                    let force_ask = focused_browser_input
-                        || permission_checker.requires_forced_confirmation(&tool_name, &args);
-                    let hook_allows = matches!(
-                        hook_permission_override,
-                        Some(crate::HookPermissionOverride::Allow)
-                    );
-                    if ctx.auto_approve_permissions
-                        || ((ctx.bypass_permissions || hook_allows) && !force_ask)
-                    {
-                        continue;
-                    }
-                    let decision = if focused_browser_input {
-                        // Configless checkers may have cached grants, and the
-                        // trait's default forced path checks that cache first.
-                        // A focused action must ask again for this occurrence.
-                        permission_checker.request_confirmation(context).await
-                    } else if force_ask {
-                        permission_checker.check_or_request_forced(context).await
-                    } else if let Some(session_id) = ctx.session_id {
-                        permission_checker
-                            .check_or_request_for_session(session_id, context)
-                            .await
-                    } else {
-                        permission_checker.check_or_request(context).await
-                    };
-                    match decision {
-                        Ok(true) => continue,
-                        Ok(false) => {
-                            return Err(ToolError::Execution(format!(
-                                "Permission denied for: {}",
-                                approval_display_resource
-                            )));
-                        }
-                        Err(PermissionError::ConfirmationRequired { .. }) => {
-                            crate::permission::PermissionRequest {
-                                request_id: call.id.clone(),
-                                request_generation:
-                                    crate::permission::PermissionRequest::fresh_generation(),
-                                session_id: ctx.session_id.unwrap_or_default().to_string(),
-                                workspace_path: None,
-                                tool_name: tool_name.clone(),
-                                permission_type,
-                                resource: resource.clone(),
-                                operation_summary: operation_summary.clone(),
-                                risk_level,
-                                reason_code: if force_ask {
-                                    crate::permission::PermissionReasonCode::ConfiguredAlwaysAsk
-                                } else {
-                                    crate::permission::PermissionReasonCode::RiskThreshold
-                                },
-                                effective_mode: bamboo_config::settings::PermissionMode::Default,
-                                bypass_requested: ctx.bypass_permissions,
-                                auto_approve_requested: ctx.auto_approve_permissions,
-                                policy_revision: 0,
-                                matched_rule: None,
-                                allowed_decisions:
-                                    crate::permission::PermissionRequest::forced_decisions(),
-                                suggested_matchers: if focused_browser_input {
-                                    Vec::new()
-                                } else {
-                                    crate::permission::conservative_matchers(
-                                        permission_type,
-                                        &resource,
-                                    )
-                                },
-                            }
-                        }
-                        Err(other) => {
-                            return Err(if private_browser_display {
-                                ToolError::Execution(check_failed_message.to_string())
-                            } else {
-                                permission_error_to_tool_error(other)
-                            });
-                        }
-                    }
-                };
-
-                // A worker/external relay gets the same typed request but only
-                // one-shot decisions are advertised until its protocol supports
-                // a stronger scope. No boolean downgrade can create a grant.
-                if let Some(proxy) = proxy {
-                    let mut display_request = request.clone();
-                    if canonical_tool_name(&tool_name).eq_ignore_ascii_case("browser") {
-                        display_request.tool_name = "browser".to_string();
-                    }
-                    if private_browser_display {
-                        display_request.resource = "[redacted]".to_string();
-                        display_request.matched_rule = None;
-                        display_request.suggested_matchers.clear();
-                        if browser_eval {
-                            display_request.operation_summary =
-                                "Execute browser page JavaScript".to_string();
-                        }
-                    }
-                    let approved = proxy
-                        .request_approval(crate::approval::ApprovalAsk {
-                            tool_name: approval_tool_name_for_display(&tool_name),
-                            permission: permission_type.description().to_string(),
-                            resource: approval_display_resource.clone(),
-                            permission_request: Some(display_request),
-                        })
-                        .await;
-                    if approved {
-                        continue;
-                    }
-                    return Err(ToolError::Execution(format!(
-                        "Permission denied by host for: {}",
-                        approval_display_resource
-                    )));
-                }
-
-                // Interactive sessions pause through the legacy question shape
-                // while carrying the complete typed request alongside it.
-                if let Some(tx) = ctx.event_tx {
-                    let approval_parameters = approval_parameters_for_display(&tool_name, &args);
-                    let _ = tx
-                        .send(bamboo_agent_core::AgentEvent::ToolApprovalRequested {
-                            tool_call_id: call.id.clone(),
-                            tool_name: approval_tool_name_for_display(&tool_name),
-                            parameters: approval_parameters,
-                        })
-                        .await;
-
-                    let question = format!(
-                        "**Permission required**\n\nThe `{}` tool needs approval to {} on:\n\n`{}`",
-                        approval_tool_name_for_display(&tool_name),
-                        permission_type.description(),
-                        approval_display_resource
-                    );
-                    if let Some(config) = config {
-                        config.register_pending_request(request.clone());
-                    }
-                    let payload = serde_json::json!({
-                        "status": "awaiting_permission_approval",
-                        "question": question,
-                        "permission_type": permission_type,
-                        "resource": approval_display_resource,
-                        "options": ["Approve", "Deny"],
-                        "allow_custom": false,
-                        "permission_request": request,
-                    });
-                    return Ok(Some(ToolOutcome::Completed(ToolResult {
-                        success: true,
-                        result: payload.to_string(),
-                        display_preference: Some("request_permissions".to_string()),
-                        images: Vec::new(),
-                    })));
-                }
-
-                return Err(ToolError::Execution(format!(
-                    "Permission approval required for: {}",
-                    approval_display_resource
-                )));
-            }
-        }
-
-        Ok(None)
+        self.check_owned_permissions(call, execution_name, resolved_args, ctx, false)
+            .await
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
@@ -1134,13 +1301,21 @@ impl BuiltinToolExecutorBuilder {
 
     /// Registers a specific command tool by name
     pub fn with_command_tool(mut self, name: &str) -> Result<Self, ToolError> {
-        if name == "Bash" {
-            let (name, tool) =
-                BuiltinToolExecutor::register_tracked_builtin(&self.registry, BashTool::new())?;
+        if name == "Bash" || name == "exec_command" {
+            let (name, tool) = if name == "Bash" {
+                BuiltinToolExecutor::register_tracked_builtin(&self.registry, BashTool::new())?
+            } else {
+                BuiltinToolExecutor::register_tracked_builtin(
+                    &self.registry,
+                    ExecCommandTool::new(),
+                )?
+            };
             self.framework_builtin_tools.insert(name, tool);
             return Ok(self);
         }
         match name {
+            "write_stdin" => self.registry.register(WriteStdinTool::new()),
+            "BashInput" => self.registry.register(BashInputTool::new()),
             "BashOutput" => self.registry.register(BashOutputTool::new()),
             "KillShell" => self.registry.register(KillShellTool::new()),
             "Task" => self.registry.register(TaskTool::new()),
@@ -1213,7 +1388,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_browser_arguments_redact_both_log_previews() {
+    fn malformed_private_arguments_redact_both_log_previews() {
         for (tool_name, raw) in [
             (
                 "browser",
@@ -1225,6 +1400,14 @@ mod tests {
             ),
             ("browser_eval", r#"{"code":"private page source"#),
             ("default::browser_eval", r#"{"code":"private page source"#),
+            (
+                "session_message",
+                r#"{"action":"send","message":"private peer text"#,
+            ),
+            (
+                "default::session_message",
+                r#"{"action":"send","message":"private peer text"#,
+            ),
         ] {
             let (_, warning) = parse_tool_args_best_effort(raw);
             let warning = warning.expect("malformed JSON must have a warning");
@@ -1237,6 +1420,24 @@ mod tests {
             assert!(ordinary_preview.contains("private"));
             assert_eq!(ordinary_warning, warning);
         }
+    }
+
+    #[test]
+    fn peer_approval_event_hides_message_and_routing_without_changing_execution_args() {
+        let args = json!({
+            "action":"send", "target_session_id":"private-target",
+            "operation_id":"private-operation", "message":"private-message",
+            "reply_to":"private-received-id", "extra":{"secret":"private-extra"},
+        });
+        let original = args.clone();
+        for name in ["session_message", "default::session_message"] {
+            assert_eq!(
+                approval_parameters_for_display(name, &args),
+                json!({"action":"send"})
+            );
+        }
+        assert_eq!(args, original);
+        assert_eq!(approval_parameters_for_display("Write", &args), args);
     }
 
     #[test]
@@ -1914,6 +2115,9 @@ mod tests {
                 json!({"file_path": "/tmp/par_cls.txt", "content": "y"}),
             ),
             ("Bash", json!({"command": "echo hi"})),
+            ("exec_command", json!({"cmd": "echo hi"})),
+            ("write_stdin", json!({"session_id": "exec", "chars": ""})),
+            ("write_stdin", json!({"session_id": "exec", "chars": "y\n"})),
             ("Workspace", json!({})),
             ("Workspace", json!({"path": "/tmp"})),
         ];
@@ -3357,6 +3561,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_session_tools_preserve_plan_and_read_only_hard_boundaries() {
+        let readonly = Arc::new(crate::permission::ReadOnlyCommandChecker::new(Arc::new(
+            crate::permission::AllowAllPermissionChecker,
+        )));
+        let restricted = BuiltinToolExecutorBuilder::new()
+            .with_default_tools()
+            .with_permission_checker(readonly)
+            .build();
+        let ordinary = BuiltinToolExecutor::new();
+        for (name, args) in [
+            ("exec_command", json!({"cmd":"cargo test"})),
+            ("write_stdin", json!({"session_id":"exec", "chars":""})),
+            ("write_stdin", json!({"session_id":"exec", "chars":"yes\n"})),
+        ] {
+            let call = make_tool_call(name, args);
+            for (bypass, auto) in [(false, false), (true, false), (false, true)] {
+                let mut ctx = ToolExecutionContext::none(&call.id);
+                ctx.bypass_permissions = bypass;
+                ctx.auto_approve_permissions = auto;
+                let denied = restricted
+                    .check_permissions_for_exact(&call, name, &ctx)
+                    .await;
+                assert!(
+                    matches!(denied, Err(ToolError::Execution(ref message)) if message.contains("Read-only child")),
+                    "{name}: {denied:?}"
+                );
+                ctx.plan_read_only = true;
+                let denied = ordinary
+                    .check_permissions_for_exact(&call, name, &ctx)
+                    .await;
+                assert!(
+                    matches!(denied, Err(ToolError::Execution(ref message)) if message.contains("Plan mode")),
+                    "{name}: {denied:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_command_preserves_explicit_delete_deny_under_auto_and_bypass() {
+        let config = Arc::new(crate::permission::PermissionConfig::new());
+        config.add_rule(crate::permission::PermissionRule::new(
+            crate::permission::PermissionType::DeleteOperation,
+            "rm child-to-preserve",
+            false,
+        ));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_default_tools()
+            .with_permission_checker(Arc::new(crate::permission::ConfigPermissionChecker::new(
+                config,
+            )))
+            .build();
+        let call = make_tool_call("exec_command", json!({"cmd":"rm child-to-preserve"}));
+        for (bypass, auto) in [(false, false), (true, false), (false, true)] {
+            let mut ctx = ToolExecutionContext::none(&call.id);
+            ctx.bypass_permissions = bypass;
+            ctx.auto_approve_permissions = auto;
+            let denied = executor
+                .check_permissions_for_exact(&call, "exec_command", &ctx)
+                .await;
+            assert!(
+                matches!(denied, Err(ToolError::Execution(ref message)) if message.contains("explicit policy")),
+                "{denied:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn plan_auto_denies_mutation_but_allows_read_without_a_checker() {
         let executor = BuiltinToolExecutor::new();
         let dir = tempfile::tempdir().unwrap();
@@ -3925,6 +4197,338 @@ mod tests {
             let result = executor.execute(&call).await;
             assert!(matches!(result, Err(ToolError::NotFound(_))));
         }
+    }
+
+    #[tokio::test]
+    async fn framework_root_spawn_preserves_legacy_ask_and_typed_once_identity() {
+        use crate::permission::{
+            ConfigPermissionChecker, PermissionConfig, PermissionMode, PermissionReasonCode,
+            PermissionRequest,
+        };
+        let args = json!({"project_id":"explicit-project", "workspace_path":"/not-opened/authorized-root", "message":"explicit first instruction"});
+        let legacy_args = json!({"action":"create", "request":args.clone()});
+        for rule in [
+            "session_control",
+            "session_control(*)",
+            r#"session_control(*"action":"create"*)"#,
+            "spawn_session",
+        ] {
+            for reference in ["spawn_session", "spawnSession", "default::spawn_session"] {
+                let config = Arc::new(PermissionConfig::new());
+                config.set_mode(PermissionMode::BypassPermissions);
+                config.set_ask_rules([rule.to_string()]);
+                let executor = BuiltinToolExecutorBuilder::new()
+                    .with_permission_checker(Arc::new(ConfigPermissionChecker::new(config.clone())))
+                    .build();
+                let call = make_tool_call_with_id("root-policy-request", reference, args.clone());
+                let original = call.clone();
+                let (tx, mut rx) = mpsc::channel(16);
+                let ctx = ToolExecutionContext {
+                    session_id: Some("explicit-root-caller"),
+                    event_tx: Some(&tx),
+                    bypass_permissions: true,
+                    ..ToolExecutionContext::none(&call.id)
+                };
+                if rule.starts_with("session_control") {
+                    let legacy_call = make_tool_call_with_id(
+                        "legacy-create-request",
+                        "session_control",
+                        legacy_args.clone(),
+                    );
+                    let legacy = executor
+                        .check_permissions_for(&legacy_call, &ctx)
+                        .await
+                        .unwrap();
+                    assert!(
+                        legacy.is_some(),
+                        "the original create gate must still force Ask: {rule}"
+                    );
+                    while rx.try_recv().is_ok() {}
+                }
+                let decision = executor
+                    .check_framework_root_spawn_permissions(&call, &args, &ctx)
+                    .await
+                    .unwrap();
+                let Some(ToolOutcome::Completed(result)) = decision else {
+                    panic!("legacy create Ask must survive Bypass for {rule}/{reference}: {decision:?}")
+                };
+                assert_eq!(
+                    result.display_preference.as_deref(),
+                    Some("request_permissions")
+                );
+                let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+                let request: PermissionRequest =
+                    serde_json::from_value(payload["permission_request"].clone()).unwrap();
+                assert_eq!(request.tool_name, "spawn_session");
+                assert_eq!(request.request_id, call.id);
+                assert_eq!(request.session_id, "explicit-root-caller");
+                assert_eq!(
+                    request.reason_code,
+                    PermissionReasonCode::ConfiguredAlwaysAsk
+                );
+                assert_eq!(
+                    request.resource,
+                    "session_control create explicit-project /not-opened/authorized-root"
+                );
+                assert!(!request.request_generation.is_empty());
+                assert_eq!(
+                    config.pending_request(&request.session_id, &call.id),
+                    Some(request.clone())
+                );
+                assert_eq!(call, original);
+                assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|e| matches!(e, AgentEvent::ToolApprovalRequested { tool_name, .. } if tool_name == "spawn_session")));
+                config
+                    .grant_once_for_generation(
+                        &request.session_id,
+                        &call.id,
+                        &request.request_generation,
+                        request.permission_type,
+                        request.resource.clone(),
+                    )
+                    .unwrap();
+                let approved = crate::permission::with_permission_replay_generation(
+                    &request.session_id,
+                    &call.id,
+                    Some(&request.request_generation),
+                    executor.check_framework_root_spawn_permissions(&call, &args, &ctx),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    approved.is_none(),
+                    "exact approved generation must consume once"
+                );
+                assert!(rx.try_recv().is_err());
+                let replayed = crate::permission::with_permission_replay_generation(
+                    &request.session_id,
+                    &call.id,
+                    Some(&request.request_generation),
+                    executor.check_framework_root_spawn_permissions(&call, &args, &ctx),
+                )
+                .await
+                .unwrap();
+                let Some(ToolOutcome::Completed(result)) = replayed else {
+                    panic!("consumed approval cannot be reused")
+                };
+                let next: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+                assert_ne!(
+                    next["permission_request"]["request_generation"],
+                    request.request_generation
+                );
+            }
+        }
+        // The additional legacy restriction must preserve all existing mode and deny precedence.
+        for (label, plan, auto, denied, expect_deny) in [
+            ("plan", true, false, false, true),
+            ("explicit-deny", false, false, true, true),
+            ("auto-deny", false, true, true, true),
+            ("auto", false, true, false, false),
+        ] {
+            let config = Arc::new(PermissionConfig::new());
+            config.set_mode(PermissionMode::BypassPermissions);
+            config.set_ask_rules(["session_control".into()]);
+            if denied {
+                config.deny_scoped_session_permission(
+                    "root-policy-mode",
+                    crate::permission::PermissionType::ExecuteCommand,
+                    "session_control create explicit-project /not-opened/authorized-root",
+                );
+            }
+            let executor = BuiltinToolExecutorBuilder::new()
+                .with_permission_checker(Arc::new(ConfigPermissionChecker::new(config)))
+                .build();
+            let call = make_tool_call("spawn_session", args.clone());
+            let (tx, mut rx) = mpsc::channel(8);
+            let ctx = ToolExecutionContext {
+                session_id: Some("root-policy-mode"),
+                event_tx: Some(&tx),
+                bypass_permissions: true,
+                auto_approve_permissions: auto,
+                plan_read_only: plan,
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let result = executor
+                .check_framework_root_spawn_permissions(&call, &args, &ctx)
+                .await;
+            if expect_deny {
+                assert!(result.is_err(), "{label}: {result:?}");
+            } else {
+                assert!(
+                    result.unwrap().is_none(),
+                    "{label} must preserve no-prompt behavior"
+                );
+            }
+            assert!(rx.try_recv().is_err(), "{label} must not ask");
+        }
+        // A rule restricted to followup does not become a create restriction.
+        let config = Arc::new(PermissionConfig::new());
+        config.set_mode(PermissionMode::BypassPermissions);
+        config.set_ask_rules([r#"session_control(*"action":"followup"*)"#.into()]);
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_permission_checker(Arc::new(ConfigPermissionChecker::new(config)))
+            .build();
+        let call = make_tool_call("spawn_session", args.clone());
+        assert!(executor
+            .check_framework_root_spawn_permissions(
+                &call,
+                &args,
+                &ToolExecutionContext {
+                    bypass_permissions: true,
+                    ..ToolExecutionContext::none(&call.id)
+                }
+            )
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn framework_root_spawn_preserves_configless_legacy_force_ask_and_denial() {
+        struct LegacyCreateChecker(Arc<AtomicUsize>);
+        #[async_trait]
+        impl PermissionChecker for LegacyCreateChecker {
+            async fn needs_confirmation(
+                &self,
+                _: crate::permission::PermissionType,
+                _: &str,
+            ) -> bool {
+                true
+            }
+            async fn request_confirmation(
+                &self,
+                context: crate::permission::PermissionContext,
+            ) -> Result<bool, PermissionError> {
+                assert_eq!(
+                    context.resource,
+                    "session_control create explicit-project /not-opened/authorized-root"
+                );
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(false)
+            }
+            fn requires_forced_confirmation(&self, name: &str, args: &serde_json::Value) -> bool {
+                name == "session_control"
+                    && args["action"] == "create"
+                    && args["request"]["project_id"] == "explicit-project"
+            }
+            fn grant_session_permission(&self, _: crate::permission::PermissionType, _: String) {
+                panic!("a denied call must not create a grant");
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = BuiltinToolExecutorBuilder::new()
+            .with_permission_checker(Arc::new(LegacyCreateChecker(calls.clone())))
+            .build();
+        let args = json!({"project_id":"explicit-project", "workspace_path":"/not-opened/authorized-root"});
+        let call = make_tool_call("default::spawnSession", args.clone());
+        let original = call.clone();
+        let ctx = ToolExecutionContext {
+            bypass_permissions: true,
+            ..ToolExecutionContext::none(&call.id)
+        };
+        let decision = executor
+            .check_framework_root_spawn_permissions(&call, &args, &ctx)
+            .await;
+        assert!(
+            decision.is_err(),
+            "legacy forced denial must not become Bypass allow: {decision:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(call, original);
+    }
+
+    async fn assert_legacy_exact_spawn_permission_owner(args: serde_json::Value) {
+        struct LegacyOwnerChecker(Arc<AtomicUsize>);
+        #[async_trait]
+        impl PermissionChecker for LegacyOwnerChecker {
+            async fn needs_confirmation(
+                &self,
+                _: crate::permission::PermissionType,
+                _: &str,
+            ) -> bool {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                true
+            }
+            async fn request_confirmation(
+                &self,
+                _: crate::permission::PermissionContext,
+            ) -> Result<bool, PermissionError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(PermissionError::CheckFailed(
+                    "unexpected framework Root permission".into(),
+                ))
+            }
+            fn grant_session_permission(&self, _: crate::permission::PermissionType, _: String) {
+                panic!("custom tool classification must not grant framework permissions");
+            }
+        }
+        let checks = Arc::new(AtomicUsize::new(0));
+        let mut failures = Vec::new();
+        for name in ["spawn_session", "spawnSession", "vendor::spawn_session"] {
+            let executor = BuiltinToolExecutorBuilder::new()
+                .with_tool(ExactRoutingTool {
+                    name,
+                    label: "legacy-custom-spawn",
+                    args_sensitive: false,
+                })
+                .unwrap()
+                .with_permission_checker(Arc::new(LegacyOwnerChecker(checks.clone())))
+                .build();
+            let call = make_tool_call(name, args.clone());
+            let ctx = ToolExecutionContext::none(&call.id);
+            for (entry, result) in [
+                ("raw", executor.check_permissions_for(&call, &ctx).await),
+                (
+                    "exact",
+                    executor
+                        .check_permissions_for_exact(&call, name, &ctx)
+                        .await,
+                ),
+                (
+                    "resolved",
+                    executor
+                        .check_permissions_for_resolved(&call, name, &args, &ctx)
+                        .await,
+                ),
+            ] {
+                match result {
+                    Ok(None) => {}
+                    other => failures.push(format!("{name}/{entry}: {other:?}")),
+                }
+            }
+            match executor
+                .execute_exact_with_context_outcome(&call, name, ctx)
+                .await
+            {
+                Ok(ToolOutcome::Completed(result)) => {
+                    assert!(result.success);
+                    let result: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+                    assert_eq!(result["label"], "legacy-custom-spawn");
+                    assert_eq!(result["args"], args);
+                }
+                other => failures.push(format!("{name}/execute: {other:?}")),
+            }
+        }
+        if checks.load(Ordering::SeqCst) != 0 {
+            failures.push(format!(
+                "framework permission checks: {}",
+                checks.load(Ordering::SeqCst)
+            ));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[tokio::test]
+    async fn legacy_exact_spawn_custom_arguments_do_not_gain_framework_root_permissions() {
+        assert_legacy_exact_spawn_permission_owner(json!({"payload":"legacy custom request"}))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn legacy_exact_spawn_framework_shaped_arguments_keep_the_custom_permission_owner() {
+        assert_legacy_exact_spawn_permission_owner(json!({
+            "project_id":"not-a-framework-request", "workspace_path":"/not-opened/custom-root",
+        }))
+        .await;
     }
 
     #[tokio::test]
@@ -5020,6 +5624,53 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn native_ceiling_admits_original_polled_shells_and_never_expands_frozen_grants() {
+        let executor = BuiltinToolExecutor::new()
+            .with_native_tool_ceiling(
+                BuiltinToolExecutor::NATIVE_TOOL_NAMES
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            )
+            .unwrap();
+        for name in ["Bash", "exec_command", "write_stdin"] {
+            assert!(executor.eligible_native_tool(name));
+            assert!(executor.owns_exact_tool(name));
+        }
+        for name in [
+            "default::exec_command",
+            "Exec_Command",
+            "BashInput",
+            "BashOutput",
+            "KillShell",
+        ] {
+            assert!(!executor.eligible_native_tool(name));
+        }
+        let narrowed = executor
+            .with_native_tool_ceiling(vec!["Bash".into()])
+            .unwrap();
+        assert!(narrowed.owns_exact_tool("Bash"));
+        assert!(!narrowed.owns_exact_tool("exec_command"));
+        assert!(!narrowed.owns_exact_tool("write_stdin"));
+        assert!(narrowed
+            .with_native_tool_ceiling(vec!["exec_command".into()])
+            .is_err());
+        for name in ["exec_command", "write_stdin"] {
+            let registry = ToolRegistry::new();
+            registry
+                .register(ExactRoutingTool {
+                    name,
+                    label: "spoofed native shell",
+                    args_sensitive: false,
+                })
+                .unwrap();
+            assert!(BuiltinToolExecutor::with_registry(registry)
+                .with_native_tool_ceiling(vec![name.into()])
+                .is_err());
+        }
+    }
+
     #[tokio::test]
     async fn task_only_native_ceiling_has_no_filesystem_or_shell_surface() {
         let executor = BuiltinToolExecutor::new()
@@ -5038,7 +5689,15 @@ mod tests {
             json!({"tasks":[{"content":"Own step","status":"pending"}]}),
         );
         assert!(executor.execute(&call).await.unwrap().success);
-        for name in ["Bash", "Read", "Write", "Edit", "SubAgent"] {
+        for name in [
+            "Bash",
+            "exec_command",
+            "write_stdin",
+            "Read",
+            "Write",
+            "Edit",
+            "SubAgent",
+        ] {
             assert!(executor
                 .execute(&make_tool_call(name, json!({})))
                 .await
@@ -5160,5 +5819,485 @@ mod tests {
                 .is_err());
         }
         assert!(!path.exists());
+    }
+    #[tokio::test]
+    async fn local_task_resources_owned_write_survives_awaiter_abort_and_preserves_scopes() {
+        struct Proxy;
+        #[async_trait]
+        impl crate::ApprovalProxy for Proxy {
+            async fn request_approval(&self, _: crate::ApprovalAsk) -> bool {
+                false
+            }
+        }
+        struct Probe {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            path: std::path::PathBuf,
+        }
+        #[async_trait]
+        impl Tool for Probe {
+            fn name(&self) -> &str {
+                "Write"
+            }
+            fn description(&self) -> &str {
+                "owned invocation test fixture"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type":"object"})
+            }
+            async fn invoke(
+                &self,
+                _: serde_json::Value,
+                ctx: bamboo_agent_core::ToolCtx,
+            ) -> Result<ToolOutcome, ToolError> {
+                assert!(crate::current_approval_proxy().is_some());
+                assert_eq!(
+                    crate::current_hook_permission_override(ctx.tool_call_id.as_ref()),
+                    Some(crate::HookPermissionOverride::Allow)
+                );
+                assert_eq!(
+                    bamboo_agent_core::tools::observed_tool_output_cap(&ctx),
+                    Some(77)
+                );
+                assert!(matches!(
+                    bamboo_agent_core::tools::context::root_actor_tool_writer(),
+                    Some(None)
+                ));
+                self.entered.notify_one();
+                self.release.notified().await;
+                tokio::fs::write(&self.path, "finished after awaiter cancellation")
+                    .await
+                    .unwrap();
+                Ok(ToolOutcome::Completed(ToolResult {
+                    success: true,
+                    result: "done".into(),
+                    display_preference: None,
+                    images: vec![],
+                }))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("write.txt");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let tool: Arc<dyn Tool> = Arc::new(Probe {
+            entered: entered.clone(),
+            release: release.clone(),
+            path: path.clone(),
+        });
+        let registry = ToolRegistry::new();
+        registry.register_shared(tool.clone()).unwrap();
+        let executor = BuiltinToolExecutor {
+            registry,
+            permission_checker: None,
+            framework_builtin_tools: BTreeMap::from([("Write".into(), tool)]),
+            native_tool_ceiling: None,
+            tool_event_publisher: BuiltinToolExecutor::default_tool_event_publisher(),
+        };
+        let resources =
+            crate::LocalTaskResources::new("local-probe", "write-run", chrono::Utc::now());
+        let owned = resources.clone();
+        let call = make_tool_call("Write", json!({"file_path":path,"content":"value"}));
+        let invocation = tokio::spawn(async move {
+            let ctx = ToolExecutionContext {
+                session_id: Some("local-probe"),
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let invoke = executor.execute_with_context_outcome(&call, ctx);
+            let invoke =
+                bamboo_agent_core::tools::context::with_root_actor_tool_writer(None, invoke);
+            let invoke = bamboo_agent_core::tools::scope_tool_output_cap(
+                "local-probe",
+                &call.id,
+                Some(77),
+                invoke,
+            );
+            let invoke = crate::with_approval_proxy(Some(Arc::new(Proxy)), invoke);
+            let invoke = crate::with_hook_permission_override(
+                Some(crate::HookPermissionOverride::Allow),
+                &call.id,
+                invoke,
+            );
+            owned.scope(owned.guard_tool_invocation(invoke)).await
+        });
+        entered.notified().await;
+        invocation.abort();
+        assert!(invocation.await.unwrap_err().is_cancelled());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            resources.close_and_drain()
+        )
+        .await
+        .is_err());
+        assert!(!path.exists());
+        release.notify_one();
+        resources.close_and_drain().await.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "finished after awaiter cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_task_resources_permission_denial_precedes_owned_invocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("must-not-write.txt");
+        let checker = Arc::new(crate::permission::ReadOnlyCommandChecker::new(Arc::new(
+            crate::permission::AllowAllPermissionChecker,
+        )));
+        let executor = BuiltinToolExecutor::new_with_permissions(checker);
+        let resources = crate::LocalTaskResources::new("denied", "denied-run", chrono::Utc::now());
+        let call = make_tool_call("Write", json!({"file_path":path,"content":"denied"}));
+        assert!(resources.scope(executor.execute(&call)).await.is_err());
+        resources.close_and_drain().await.unwrap();
+        assert!(!path.exists());
+    }
+    mod suspension_contract_tests {
+        use super::*;
+        use bamboo_agent_core::tools::{suspension_allowed, with_suspension_disabled};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[tokio::test]
+        async fn disabled_suspension_rejects_typed_ask_before_proxy_event_pending_or_write() {
+            for proxy_enabled in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("must-not-write.txt");
+                let config = Arc::new(crate::permission::PermissionConfig::new());
+                config.set_ask_rules([format!("Write({})", path.display())]);
+                config.register_session_workspace("scope-ask", directory.path().to_string_lossy());
+                let executor = BuiltinToolExecutor::new_with_permissions(Arc::new(
+                    crate::permission::ConfigPermissionChecker::new(config.clone()),
+                ));
+                let call = make_tool_call("Write", json!({"file_path":path,"content":"forbidden"}));
+                let requests = Arc::new(AtomicUsize::new(0));
+                let proxy: Option<Arc<dyn crate::approval::ApprovalProxy>> =
+                    proxy_enabled.then(|| {
+                        Arc::new(RecordingApprovalProxy {
+                            requests: requests.clone(),
+                            approve: false,
+                        }) as Arc<dyn crate::approval::ApprovalProxy>
+                    });
+                let (tx, mut rx) = mpsc::channel(8);
+                let ctx = ToolExecutionContext {
+                    session_id: Some("scope-ask"),
+                    event_tx: Some(&tx),
+                    ..ToolExecutionContext::none(&call.id)
+                };
+                let result = with_suspension_disabled(crate::with_approval_proxy(
+                    proxy,
+                    executor.execute_with_context_outcome(&call, ctx),
+                ))
+                .await;
+                assert!(
+                    matches!(result, Err(ToolError::Execution(ref reason)) if reason.contains("suspension_disabled")),
+                    "{result:?}"
+                );
+                assert_eq!(requests.load(Ordering::SeqCst), 0);
+                assert!(config.pending_request("scope-ask", &call.id).is_none());
+                assert!(rx.try_recv().is_err(), "must not publish an approval event");
+                assert!(!path.exists());
+                assert!(suspension_allowed());
+            }
+        }
+
+        struct InteractiveChecker(Arc<AtomicUsize>);
+        #[async_trait]
+        impl crate::permission::PermissionChecker for InteractiveChecker {
+            async fn needs_confirmation(
+                &self,
+                _: crate::permission::PermissionType,
+                _: &str,
+            ) -> bool {
+                true
+            }
+            async fn request_confirmation(
+                &self,
+                ctx: crate::permission::PermissionContext,
+            ) -> Result<bool, crate::permission::PermissionError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(crate::permission::PermissionError::confirmation_required(
+                    ctx,
+                ))
+            }
+            fn grant_session_permission(&self, _: crate::permission::PermissionType, _: String) {}
+        }
+
+        #[tokio::test]
+        async fn disabled_suspension_rejects_configless_checker_before_real_confirmation() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("must-not-write.txt");
+            let requests = Arc::new(AtomicUsize::new(0));
+            let executor = BuiltinToolExecutor::new_with_permissions(Arc::new(InteractiveChecker(
+                requests.clone(),
+            )));
+            let call = make_tool_call("Write", json!({"file_path":path,"content":"forbidden"}));
+            let (tx, mut rx) = mpsc::channel(8);
+            let ctx = ToolExecutionContext {
+                session_id: Some("configless"),
+                event_tx: Some(&tx),
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let result =
+                with_suspension_disabled(executor.execute_with_context_outcome(&call, ctx)).await;
+            assert!(
+                matches!(result, Err(ToolError::Execution(ref reason)) if reason.contains("suspension_disabled")),
+                "{result:?}"
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
+            assert!(rx.try_recv().is_err());
+            assert!(!path.exists());
+        }
+
+        #[tokio::test]
+        async fn disabled_suspension_keeps_existing_auto_bypass_and_plan_gates() {
+            for (auto, bypass, plan, allowed) in [
+                (true, false, false, true),
+                (false, true, false, true),
+                (true, false, true, false),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("posture.txt");
+                let config = Arc::new(crate::permission::PermissionConfig::new());
+                let executor = BuiltinToolExecutor::new_with_permissions(Arc::new(
+                    crate::permission::ConfigPermissionChecker::new(config),
+                ));
+                let call = make_tool_call(
+                    "Write",
+                    json!({"file_path":path,"content":"explicit posture"}),
+                );
+                let (tx, mut rx) = mpsc::channel(8);
+                let ctx = ToolExecutionContext {
+                    session_id: Some("posture"),
+                    event_tx: Some(&tx),
+                    auto_approve_permissions: auto,
+                    bypass_permissions: bypass,
+                    plan_read_only: plan,
+                    ..ToolExecutionContext::none(&call.id)
+                };
+                let result =
+                    with_suspension_disabled(executor.execute_with_context_outcome(&call, ctx))
+                        .await;
+                assert_eq!(
+                    result.is_ok(),
+                    allowed,
+                    "auto={auto},bypass={bypass},plan={plan}: {result:?}"
+                );
+                assert_eq!(path.exists(), allowed);
+                assert!(rx.try_recv().is_err());
+            }
+        }
+
+        #[tokio::test]
+        async fn ordinary_execution_still_publishes_and_retains_typed_approval() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("ordinary-ask.txt");
+            let config = Arc::new(crate::permission::PermissionConfig::new());
+            config.set_ask_rules([format!("Write({})", path.display())]);
+            let executor = BuiltinToolExecutor::new_with_permissions(Arc::new(
+                crate::permission::ConfigPermissionChecker::new(config.clone()),
+            ));
+            let call = make_tool_call(
+                "Write",
+                json!({"file_path":path,"content":"approval required"}),
+            );
+            let (tx, mut rx) = mpsc::channel(8);
+            let ctx = ToolExecutionContext {
+                session_id: Some("ordinary-ask"),
+                event_tx: Some(&tx),
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let outcome = executor
+                .execute_with_context_outcome(&call, ctx)
+                .await
+                .unwrap();
+            let result = outcome.into_tool_result();
+            assert_eq!(
+                result.display_preference.as_deref(),
+                Some("request_permissions")
+            );
+            assert!(config.pending_request("ordinary-ask", &call.id).is_some());
+            assert!(matches!(
+                rx.try_recv().unwrap(),
+                AgentEvent::ToolApprovalRequested { .. }
+            ));
+            assert!(!path.exists());
+        }
+    }
+
+    mod owned_suspension_rebind_tests {
+        use super::*;
+        use bamboo_agent_core::tools::with_suspension_disabled;
+        #[tokio::test]
+        async fn managed_owned_builtin_keeps_suspension_denial_before_background_bash_spawn() {
+            let directory = tempfile::tempdir().unwrap();
+            let session_id = "owned-rebind-background-probe";
+            let resources =
+                crate::LocalTaskResources::new(session_id, "probe-run", chrono::Utc::now());
+            let executor = BuiltinToolExecutor::new();
+            let call = make_tool_call(
+                "Bash",
+                json!({"command":"exit 0","run_in_background":true,"workdir":directory.path()}),
+            );
+            let (tx, mut rx) = mpsc::channel(32);
+            let ctx = ToolExecutionContext {
+                session_id: Some(session_id),
+                event_tx: Some(&tx),
+                can_async_resume: true,
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let result = with_suspension_disabled(
+                resources.scope(executor.execute_with_context_outcome(&call, ctx)),
+            )
+            .await;
+            // A RED may have spawned this fixture's exact short shell. Clean
+            // only its returned handle and drain this fixture before asserting.
+            if let Ok(ToolOutcome::Completed(output)) = &result {
+                if let Some(id) = serde_json::from_str::<serde_json::Value>(&output.result)
+                    .ok()
+                    .and_then(|v| v["bash_id"].as_str().map(str::to_owned))
+                {
+                    if let Some(shell) = crate::tools::bash_runtime::get_shell(&id) {
+                        let _ = shell.kill().await;
+                    }
+                }
+            }
+            let drained = resources.close_and_drain().await;
+            let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(
+                matches!(result,Err(ToolError::Execution(ref text)) if text.contains("suspension_disabled")),
+                "{result:?}"
+            );
+            drained.unwrap();
+            assert!(
+                events.is_empty(),
+                "no detached shell event should be published: {events:?}"
+            );
+            assert!(crate::tools::bash_runtime::running_shells_for_session(session_id).is_empty());
+        }
+    }
+
+    mod owned_late_running_helper_tests {
+        use super::*;
+        use bamboo_agent_core::tools::{
+            capture_suspension_restriction, with_suspension_disabled, AsyncWaitKind,
+            RunningCompletion, RunningHandle,
+        };
+        use std::{
+            future::Future,
+            pin::Pin,
+            sync::atomic::{AtomicUsize, Ordering},
+            task::{Context, Poll},
+            time::Duration,
+        };
+        struct NeverDrive {
+            polls: Arc<AtomicUsize>,
+            drops: Arc<AtomicUsize>,
+        }
+        impl Future for NeverDrive {
+            type Output = ToolResult;
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<ToolResult> {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                panic!("restricted completion must not be polled");
+            }
+        }
+        impl Drop for NeverDrive {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        // This uses the public resource registry and the production helper.
+        // It deliberately does not claim a custom tool is a framework builtin.
+        #[tokio::test]
+        async fn owned_completion_guard_survives_abort_of_registered_awaiter() {
+            for panic_kill in [false, true] {
+                let resources = crate::LocalTaskResources::new(
+                    "late-running-helper",
+                    "private-owned-probe",
+                    chrono::Utc::now(),
+                );
+                let owned_resources = resources.clone();
+                let kills = Arc::new(AtomicUsize::new(0));
+                let polls = Arc::new(AtomicUsize::new(0));
+                let drops = Arc::new(AtomicUsize::new(0));
+                let child_kills = kills.clone();
+                let child_polls = polls.clone();
+                let child_drops = drops.clone();
+                let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+                let parent = tokio::spawn(async move {
+                    with_suspension_disabled(async move {
+                        let token = capture_suspension_restriction().unwrap();
+                        let child_token = token.clone();
+                        let registered = owned_resources
+                            .spawn_owned(async move {
+                                child_token
+                                    .scope(async move {
+                                        let _ = started_tx.send(());
+                                        let _ = release_rx.await;
+                                        let outcome = ToolOutcome::Running(RunningHandle {
+                                            tool_call_id: "late-running".into(),
+                                            ack: ToolResult::text(
+                                                true,
+                                                "must not publish this ack",
+                                            ),
+                                            completion: RunningCompletion::Driven(Box::pin(
+                                                NeverDrive {
+                                                    polls: child_polls,
+                                                    drops: child_drops,
+                                                },
+                                            )),
+                                            wait_kind: AsyncWaitKind::AsyncTools,
+                                            kill: Box::new(move || {
+                                                child_kills.fetch_add(1, Ordering::SeqCst);
+                                                assert!(!panic_kill, "injected cleanup panic");
+                                            }),
+                                        });
+                                        // Exact helper the real owned branch calls before
+                                        // returning to its oneshot. The parent is gone.
+                                        let outcome =
+                                            enforce_registered_tool_suspension(Ok(outcome))
+                                                .unwrap();
+                                        let result =
+                                            enforce_registered_tool_suspension(Ok(outcome))
+                                                .unwrap()
+                                                .into_tool_result();
+                                        let _ = completed_tx.send(result);
+                                    })
+                                    .await;
+                            })
+                            .unwrap();
+                        let _ = observed_tx.send(token);
+                        registered.await
+                    })
+                    .await
+                });
+                let started = tokio::time::timeout(Duration::from_secs(5), started_rx).await;
+                let observed = tokio::time::timeout(Duration::from_secs(5), observed_rx).await;
+                parent.abort();
+                let parent_exit = parent.await;
+                let _ = release_tx.send(());
+                let completed = tokio::time::timeout(Duration::from_secs(5), completed_rx).await;
+                let drained =
+                    tokio::time::timeout(Duration::from_secs(5), resources.close_and_drain()).await;
+                // Join/drain this private domain before checking failure details.
+                assert!(started.unwrap().is_ok());
+                assert!(parent_exit.unwrap_err().is_cancelled());
+                let report = observed.unwrap().unwrap().observation();
+                let result = completed.unwrap().unwrap();
+                assert!(!result.success);
+                assert!(result.result.contains("stop unconfirmed"));
+                assert!(!result.result.contains("must not publish this ack"));
+                assert!(report.running_seen && report.forbidden_running_seen);
+                assert_eq!(kills.load(Ordering::SeqCst), 1);
+                assert_eq!(polls.load(Ordering::SeqCst), 0);
+                assert_eq!(drops.load(Ordering::SeqCst), 1);
+                let error = drained.unwrap().unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("cooperative kill has no stop receipt"));
+            }
+        }
     }
 }

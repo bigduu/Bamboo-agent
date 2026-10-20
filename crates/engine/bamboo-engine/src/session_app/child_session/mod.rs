@@ -11,22 +11,26 @@ use bamboo_domain::{AdmissionCommit, AdmissionGate};
 use std::collections::HashMap;
 
 mod actions;
+mod depth_policy;
 mod helpers;
 mod inspection;
 pub mod named_profile;
 pub mod owned_tree;
 pub(crate) mod result_projection;
+mod shared_workspace;
 
 #[cfg(test)]
 mod tests;
 
 pub use actions::{
     apply_child_session_update, assemble_session_tree, build_session_tree_action,
-    cancel_child_action, create_child_action, create_ticket_child_action, delete_child_action,
-    get_child_action, list_children_action, rollback_failed_wait_launch, run_child_action,
-    send_message_to_child_action, send_message_to_child_action_with_gate, update_child_action,
+    cancel_child_action, create_child_action, create_shared_child_action,
+    create_ticket_child_action, delete_child_action, get_child_action, list_children_action,
+    rollback_failed_wait_launch, run_child_action, send_message_to_child_action,
+    send_message_to_child_action_with_gate, update_child_action,
     update_child_action_with_background, ChildSessionUpdate, SessionTreeNode,
 };
+pub use depth_policy::validate_spawn_parent;
 pub use helpers::{
     append_subagent_delegation_contract, compute_status_guidance, format_child_assignment,
     format_child_assignment_with_background, map_child_entry, metadata_text,
@@ -35,6 +39,7 @@ pub use helpers::{
 };
 pub use inspection::{inspect_child_action, inspect_child_report_action};
 pub use result_projection::{unavailable_child_result, MAX_CHILD_RESULT_BYTES};
+pub use shared_workspace::resolve_shared_child_workspace;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -214,6 +219,12 @@ pub struct QueuedInjectedMessage {
 
 #[async_trait]
 pub trait ChildSessionPort: Send + Sync {
+    /// Read the current Host policy for a new child. Existing lineage and
+    /// activation are independent of a later configuration change.
+    async fn max_spawn_depth(&self) -> u32 {
+        bamboo_config::DEFAULT_MAX_SPAWN_DEPTH
+    }
+
     /// Check the child's final provider/model before persistence or activation.
     /// Hosts without configuration-managed model admission retain their own
     /// routing policy; server adapters enforce the configured runtime list.

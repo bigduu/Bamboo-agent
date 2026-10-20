@@ -226,7 +226,11 @@ async fn await_host(host: &mut Host, client: &reqwest::Client, base: &str, data:
 }
 async fn fixture(case: Case) {
     eprintln!("actual CLI case {case:?}");
-    let temp = tempfile::tempdir().unwrap();
+    let mut temp = tempfile::Builder::new()
+        .prefix(&format!("bamboo-1754-required-packet-{case:?}-"))
+        .tempdir()
+        .unwrap();
+    temp.disable_cleanup(true);
     let data = temp.path().canonicalize().unwrap();
     let mut packet = ChildContextPacket {
         version: 1,
@@ -339,10 +343,94 @@ async fn fixture(case: Case) {
         .send()
         .await
         .unwrap();
-    assert!(started.status().is_success());
+    if !started.status().is_success() {
+        let status = started.status();
+        let response_body = started
+            .text()
+            .await
+            .unwrap_or_else(|error| format!("<response body read failed: {error}>"));
+        let host_pid = host.0.id();
+        let host_exit = host.0.try_wait();
+        let host_log = std::fs::read_to_string(data.join("host.log"))
+            .unwrap_or_else(|error| format!("<host log read failed: {error}>"));
+        let root_calls = probe.root_calls.load(Ordering::SeqCst);
+        let request_models = probe
+            .requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|request| request["model"].clone())
+            .collect::<Vec<_>>();
+        let retained = temp.keep();
+        panic!(
+            "execute rejected: case={case:?}, status={status}, body={response_body}, \
+             host_pid={host_pid}, host_exit={host_exit:?}, root_calls={root_calls}, \
+             provider_request_models={request_models:?}; retained fixture {}\n{host_log}",
+            retained.display(),
+        );
+    }
     let completed = match tokio::time::timeout(Duration::from_secs(60), async {
         loop {
-            let parent = store.load_session("packet-root").await.unwrap().unwrap();
+            let parent = match store.load_session("packet-root").await {
+                Ok(Some(parent)) => parent,
+                result => {
+                    let host_pid = host.0.id();
+                    let host_exit = host.0.try_wait();
+                    let host_log = std::fs::read_to_string(data.join("host.log"))
+                        .unwrap_or_else(|error| format!("<host log read failed: {error}>"));
+                    let root_calls = probe.root_calls.load(Ordering::SeqCst);
+                    let request_models = probe
+                        .requests
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .iter()
+                        .map(|request| request["model"].clone())
+                        .collect::<Vec<_>>();
+                    let directories = [
+                        data.clone(),
+                        data.join("sessions"),
+                        data.join("sessions/packet-root"),
+                        data.join(".runtime-task-transactions"),
+                        data.join(".root-revocations"),
+                    ]
+                        .into_iter()
+                        .map(|path| {
+                            let metadata = std::fs::symlink_metadata(&path)
+                                .map(|metadata| (metadata.is_dir(), metadata.is_file()));
+                            let entries = std::fs::read_dir(&path).map(|entries| {
+                                entries
+                                    .map(|entry| entry.map(|entry| entry.file_name()))
+                                    .collect::<Vec<_>>()
+                            });
+                            format!("{path:?}: metadata={metadata:?}, entries={entries:?}")
+                        })
+                        .collect::<Vec<_>>();
+                    let cached_rel = store.resolve_rel_path("packet-root").await;
+                    let file_states = [
+                        "sessions.json",
+                        ".runtime-task-transactions.lock",
+                        "sessions/packet-root/session.json",
+                        "sessions/packet-root/runtime.json",
+                        "sessions/packet-root/root-tool-authority.json",
+                        ".root-revocations/packet-root.json",
+                    ]
+                    .into_iter()
+                    .map(|relative| {
+                        let path = data.join(relative);
+                        let metadata = std::fs::symlink_metadata(&path);
+                        let read = std::fs::read(&path).map(|bytes| bytes.len());
+                        format!("{path:?}: metadata={metadata:?}, read_bytes={read:?}")
+                    })
+                    .collect::<Vec<_>>();
+                    panic!(
+                        "session poll failed: case={case:?}, load={result:?}, data={}, \
+                         host_pid={host_pid}, host_exit={host_exit:?}, root_calls={root_calls}, \
+                         provider_request_models={request_models:?}, cached_rel={cached_rel:?}, \
+                         directories={directories:?}, file_states={file_states:?}; retained fixture\n{host_log}",
+                        data.display(),
+                    );
+                }
+            };
             if parent
                 .messages
                 .iter()
@@ -549,6 +637,7 @@ async fn fixture(case: Case) {
         }
     }
     provider_handle.stop(false).await;
+    temp.disable_cleanup(false);
 }
 
 #[test]

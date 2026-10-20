@@ -54,11 +54,12 @@ impl RootThinkingMode {
 /// Exact execution identities admitted for an orchestration-only Root.
 /// Unknown tools, external providers, and legacy aliases do not enter this
 /// list; callers first resolve a registered execution identity.
-pub const ROOT_ORCHESTRATION_TOOLS: [&str; 15] = [
+pub const ROOT_ORCHESTRATION_TOOLS: [&str; 16] = [
     "SubAgent",
     "Plan",
     "Task",
     "session_history_current",
+    "session_message",
     "Read",
     "Grep",
     "Glob",
@@ -74,6 +75,19 @@ pub const ROOT_ORCHESTRATION_TOOLS: [&str; 15] = [
 
 pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
     ROOT_ORCHESTRATION_TOOLS.contains(&execution_name)
+}
+
+/// Exact management tools with their own live Supervisor/target authority gate.
+/// The history executor restricts Supervisor reads to this scope too.
+pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 3] =
+    ["session_control", "session_history", "spawn_session"];
+
+pub fn orchestration_only_allows_execution_name_for_supervisor(
+    execution_name: &str,
+    executing_supervisor: bool,
+) -> bool {
+    orchestration_only_allows_execution_name(execution_name)
+        || (executing_supervisor && SUPERVISOR_ORCHESTRATION_TOOLS.contains(&execution_name))
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -143,10 +157,29 @@ impl Session {
         Ok(())
     }
 
+    /// Derived model posture, not a persisted selection or permission grant.
+    /// A trusted Supervisor orchestrates in both thinking modes. Children and
+    /// ordinary Roots retain their own independent mode and permissions.
+    pub fn model_orchestration_only_enabled(&self) -> bool {
+        self.root_orchestration_only_enabled() || self.supervisor_incarnation_id().is_some()
+    }
+
     /// Defense in depth at both catalog projection and final dispatch.
     pub fn allows_model_tool_execution(&self, execution_name: &str) -> bool {
-        !self.root_orchestration_only_enabled()
-            || orchestration_only_allows_execution_name(execution_name)
+        if execution_name == "spawn_session" {
+            return if self.independent_root_spawn_contract() {
+                self.supervisor_incarnation_id().is_some()
+            } else {
+                // An old exact custom registration is not the new framework
+                // capability; existing Standard ordinary execution is retained.
+                !self.model_orchestration_only_enabled()
+            };
+        }
+        !self.model_orchestration_only_enabled()
+            || orchestration_only_allows_execution_name_for_supervisor(
+                execution_name,
+                self.supervisor_incarnation_id().is_some(),
+            )
     }
 
     /// Refresh a running snapshot from the durable control plane before tool
@@ -165,7 +198,10 @@ impl Session {
                 session.root_session_id.as_str()
             }
         }
-        if self.id != latest.id
+        if !super::compatibility::same_session_tool_contract(
+            self.session_version,
+            latest.session_version,
+        ) || self.id != latest.id
             || self.kind != latest.kind
             || self.created_at != latest.created_at
             || self.authority_identity != latest.authority_identity
@@ -206,6 +242,121 @@ impl Session {
 mod tests {
     use super::*;
     use crate::session::{AgentRuntimeState, ModelContextState, PlanModeState, PlanModeStatus};
+
+    #[test]
+    fn supervisor_delegation_first_does_not_depend_on_ultra_or_leak_to_children() {
+        use crate::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        for ultra in [false, true, false] {
+            supervisor.set_root_orchestration_only(ultra).unwrap();
+            let restored: Session =
+                serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
+            for name in ROOT_ORCHESTRATION_TOOLS
+                .into_iter()
+                .chain(SUPERVISOR_ORCHESTRATION_TOOLS)
+            {
+                assert!(
+                    restored.allows_model_tool_execution(name),
+                    "{ultra}: {name}"
+                );
+            }
+            for name in [
+                "exec_command",
+                "write_stdin",
+                "Bash",
+                "Edit",
+                "Write",
+                "apply_patch",
+                "load_skill",
+                "workflow_run",
+                "mcp__vendor__read",
+                "default::Read",
+            ] {
+                assert!(
+                    !restored.allows_model_tool_execution(name),
+                    "Supervisor {ultra}: {name}"
+                );
+            }
+            let child = Session::new_child_of("worker", &restored, "model", "worker");
+            assert!(child.authority_identity.is_ordinary());
+            assert!(child.allows_model_tool_execution("Edit"));
+            assert!(child.allows_model_tool_execution("exec_command"));
+        }
+        let mut ordinary = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        ordinary.metadata.insert("role".into(), "supervisor".into());
+        assert!(ordinary.allows_model_tool_execution("Edit"));
+        ordinary.set_root_orchestration_only(true).unwrap();
+        assert!(!ordinary.allows_model_tool_execution("session_control"));
+        assert!(!ordinary.allows_model_tool_execution("session_history"));
+    }
+
+    #[test]
+    fn trusted_supervisor_session_management_survives_thinking_mode_selection() {
+        use crate::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        for ultra in [false, true] {
+            supervisor.set_root_orchestration_only(ultra).unwrap();
+            let restored: Session =
+                serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
+            for name in ["session_control", "session_history"] {
+                assert!(
+                    restored.allows_model_tool_execution(name),
+                    "trusted Supervisor lost {name} in {:?}",
+                    restored.root_thinking_mode()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ultra_management_exception_requires_canonical_supervisor_and_exact_tool() {
+        use crate::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        supervisor.set_root_orchestration_only(true).unwrap();
+        for mutation in [
+            |s: &mut Session| s.authority_identity = SessionAuthorityIdentity::Ordinary,
+            |s: &mut Session| s.id = "other".into(),
+            |s: &mut Session| s.root_session_id = "other".into(),
+            |s: &mut Session| s.spawn_depth = 1,
+            |s: &mut Session| {
+                s.authority_identity = SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: uuid::Uuid::nil(),
+                }
+            },
+        ] {
+            let mut invalid = supervisor.clone();
+            mutation(&mut invalid);
+            invalid.metadata.insert("role".into(), "supervisor".into());
+            for name in ["session_control", "session_history"] {
+                assert!(!invalid.allows_model_tool_execution(name));
+            }
+        }
+        for name in [
+            "default::session_control",
+            "vendor::session_control",
+            "exec_command",
+            "Write",
+        ] {
+            assert!(!supervisor.allows_model_tool_execution(name), "{name}");
+        }
+        let child = Session::new_child_of("child", &supervisor, "model", "child");
+        assert_eq!(child.supervisor_incarnation_id(), None);
+        let mut ordinary = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        ordinary.set_root_orchestration_only(true).unwrap();
+        ordinary.metadata.insert("role".into(), "supervisor".into());
+        for name in ["session_control", "session_history"] {
+            assert!(!ordinary.allows_model_tool_execution(name));
+        }
+    }
 
     #[test]
     fn thinking_mode_is_a_derived_root_policy_independent_of_effort() {
@@ -303,6 +454,8 @@ mod tests {
             assert!(root.allows_model_tool_execution(tool), "{tool}");
         }
         for tool in [
+            "exec_command",
+            "write_stdin",
             "Bash",
             "Edit",
             "Write",

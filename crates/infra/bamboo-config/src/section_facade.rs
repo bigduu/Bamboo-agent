@@ -27,7 +27,7 @@ use crate::{
     KeywordMaskingConfig, LifecycleHooksConfig, LiveSection, MemoryConfig, NotificationsConfig,
     PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig, RunBudgetConfig, SectionEnvelope,
     SectionSourceKind, SectionStatus, ServerConfig, SkillsConfig, StreamTimeoutConfig,
-    SubagentsConfig, ToolsConfig,
+    SubagentsConfig, ToolsConfig, WorktreeSettings,
 };
 
 pub(crate) const SECTION_SCHEMA_VERSION: u32 = 1;
@@ -36,6 +36,106 @@ pub const SECTION_LAYOUT_FILE: &str = "config-sections.json";
 const SECTION_LAYOUT_COMPLETION_VERSION: u32 = 1;
 pub const COPILOT_GITHUB_ACCESS_CREDENTIAL_REF: &str = "copilot.oauth.github_access_token";
 pub const COPILOT_CHAT_CONFIG_CREDENTIAL_REF: &str = "copilot.oauth.chat_config";
+
+#[cfg(test)]
+mod observed_credential_hydration_tests {
+    use super::*;
+
+    #[test]
+    fn observed_hydration_uses_retained_document_until_explicit_reload_and_keeps_lkg() {
+        let _key = crate::encryption::set_test_encryption_key([0x63; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let reference = crate::CredentialRef::parse("provider.openai.api_key").unwrap();
+        let store = crate::CredentialStore::open(dir.path());
+        store
+            .replace(
+                reference.clone(),
+                "observed-old",
+                crate::CredentialSource::User,
+                0,
+            )
+            .unwrap();
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let old_revision = facade.registry().credentials.snapshot().revision;
+        let mut runtime = Config::default();
+        runtime.providers_mut().openai = Some(crate::OpenAIConfig {
+            credential_ref: Some(reference.clone()),
+            ..Default::default()
+        });
+        store
+            .replace(
+                reference,
+                "external-new",
+                crate::CredentialSource::User,
+                old_revision,
+            )
+            .unwrap();
+        assert_eq!(
+            facade
+                .hydrate_runtime_section_from_observed_credentials(
+                    SectionId::Providers,
+                    &mut runtime
+                )
+                .unwrap(),
+            old_revision
+        );
+        assert_eq!(
+            runtime.providers().openai.as_ref().unwrap().api_key,
+            "observed-old"
+        );
+        facade
+            .registry()
+            .reload_if_changed(SectionId::Credentials)
+            .unwrap();
+        let new_revision = facade.registry().credentials.snapshot().revision;
+        assert!(new_revision > old_revision);
+        runtime
+            .providers_mut()
+            .openai
+            .as_mut()
+            .unwrap()
+            .api_key
+            .clear();
+        assert_eq!(
+            facade
+                .hydrate_runtime_section_from_observed_credentials(
+                    SectionId::Providers,
+                    &mut runtime
+                )
+                .unwrap(),
+            new_revision
+        );
+        assert_eq!(
+            runtime.providers().openai.as_ref().unwrap().api_key,
+            "external-new"
+        );
+        std::fs::write(dir.path().join("credentials.json"), b"{broken").unwrap();
+        facade
+            .registry()
+            .reload_if_changed(SectionId::Credentials)
+            .unwrap();
+        runtime
+            .providers_mut()
+            .openai
+            .as_mut()
+            .unwrap()
+            .api_key
+            .clear();
+        assert_eq!(
+            facade
+                .hydrate_runtime_section_from_observed_credentials(
+                    SectionId::Providers,
+                    &mut runtime
+                )
+                .unwrap(),
+            new_revision
+        );
+        assert_eq!(
+            runtime.providers().openai.as_ref().unwrap().api_key,
+            "external-new"
+        );
+    }
+}
 
 /// Stable logical identity for every section in the accepted #597 ADR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -187,7 +287,7 @@ impl SectionId {
 /// `proxy_auth` and `proxy_auth_encrypted` remain compatibility read fields,
 /// but their owner is still core; section serialization always drops them in
 /// favour of `proxy_auth_credential_ref`.
-pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 31] = [
+pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 32] = [
     ("http_proxy", SectionId::Core),
     ("https_proxy", SectionId::Core),
     ("proxy_auth", SectionId::Core),
@@ -208,6 +308,7 @@ pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 31] = [
     ("skills", SectionId::ToolsSkills),
     ("env_vars", SectionId::Env),
     ("default_work_area", SectionId::Core),
+    ("worktrees", SectionId::Core),
     ("access_control", SectionId::AccessControl),
     ("features", SectionId::Providers),
     ("run_budget", SectionId::Core),
@@ -235,6 +336,8 @@ pub struct CoreSection {
     pub server: ServerConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_work_area: Option<DefaultWorkAreaConfig>,
+    #[serde(default, skip_serializing_if = "WorktreeSettings::is_empty")]
+    pub worktrees: WorktreeSettings,
     #[serde(default)]
     pub run_budget: RunBudgetConfig,
     #[serde(default)]
@@ -490,6 +593,7 @@ impl SectionProjection {
             skills,
             env_vars,
             default_work_area,
+            worktrees,
             access_control,
             features,
             run_budget,
@@ -513,6 +617,7 @@ impl SectionProjection {
                 headless_auth,
                 server,
                 default_work_area,
+                worktrees,
                 run_budget,
                 stream_timeout,
                 context_management,
@@ -579,6 +684,7 @@ impl SectionProjection {
             headless_auth,
             server,
             default_work_area,
+            worktrees,
             run_budget,
             stream_timeout,
             context_management,
@@ -631,6 +737,7 @@ impl SectionProjection {
                 skills,
                 env_vars: env.0,
                 default_work_area,
+                worktrees,
                 access_control: access_control.0,
                 features,
                 run_budget,
@@ -730,6 +837,7 @@ pub(crate) fn apply_runtime_section(id: SectionId, source: &Config, target: &mut
             target.headless_auth = source.headless_auth;
             target.server = source.server.clone();
             target.default_work_area = source.default_work_area.clone();
+            target.worktrees = source.worktrees.clone();
             target.run_budget = source.run_budget;
             target.stream_timeout = source.stream_timeout;
             target.context_management = source.context_management.clone();
@@ -756,7 +864,10 @@ pub(crate) fn apply_runtime_section(id: SectionId, source: &Config, target: &mut
         SectionId::ClusterFabric => target.cluster_fabric = source.cluster_fabric.clone(),
         SectionId::Env => target.env_vars = source.env_vars.clone(),
         SectionId::AccessControl => target.access_control = source.access_control.clone(),
-        SectionId::Hooks => target.hooks = source.hooks.clone(),
+        SectionId::Hooks => {
+            target.hooks = source.hooks.clone();
+            target.lifecycle_hooks = source.lifecycle_hooks.clone();
+        }
         SectionId::ModelPolicy => {
             target.keyword_masking = source.keyword_masking.clone();
             target.anthropic_model_mapping = source.anthropic_model_mapping.clone();
@@ -2726,9 +2837,28 @@ fn validate_model_policy(value: &ModelPolicySection) -> Result<(), String> {
     validate_json_serializable(value)
 }
 
+/// Decode the shape consumed by `bamboo_compression::limits::ModelLimit`
+/// before publishing a model-limit snapshot. This private DTO keeps the config
+/// crate independent of compression while preserving unknown row fields.
+#[derive(Deserialize)]
+struct ModelLimitRowShape {
+    #[serde(rename = "model_pattern")]
+    _model_pattern: String,
+    #[serde(rename = "max_context_tokens")]
+    _max_context_tokens: u32,
+    #[serde(default, rename = "max_output_tokens")]
+    _max_output_tokens: Option<u32>,
+    #[serde(default, rename = "safety_margin")]
+    _safety_margin: Option<u32>,
+}
+
 fn validate_model_limits(value: &ModelLimitsSection) -> Result<(), String> {
-    if value.0.iter().any(|entry| !entry.is_object()) {
-        return Err("model limit entries must be objects".to_string());
+    for (index, row) in value.0.iter().enumerate() {
+        if !row.is_object() {
+            return Err(format!("model limit entry {index}: expected an object"));
+        }
+        serde_json::from_value::<ModelLimitRowShape>(row.clone())
+            .map_err(|error| format!("model limit entry {index}: {error}"))?;
     }
     validate_json_serializable(value)
 }
@@ -3548,6 +3678,7 @@ fn project_legacy_raw_sections(
             | "headless_auth"
             | "server"
             | "default_work_area"
+            | "worktrees"
             | "run_budget"
             | "stream_timeout"
             | "context_management" => {
@@ -4939,7 +5070,19 @@ impl SectionRegistry {
             access_control: open!(AccessControl, AccessControlSection, validate_access_control),
             hooks: open!(Hooks, HooksSection, validate_hooks),
             model_policy: open!(ModelPolicy, ModelPolicySection, validate_model_policy),
-            model_limits: open!(ModelLimits, ModelLimitsSection, validate_model_limits),
+            model_limits: {
+                let descriptor = SectionId::ModelLimits.descriptor();
+                Arc::new(LiveSection::open_with_raw_validator_allowing_unversioned(
+                    descriptor.name,
+                    AtomicJsonStore::<ModelLimitsSection>::new(
+                        data_dir.join(descriptor.file_name),
+                        SECTION_SCHEMA_VERSION,
+                    ),
+                    ModelLimitsSection::default(),
+                    validate_model_limits,
+                    validate_ordinary_section_raw,
+                )?)
+            },
             credentials: Arc::new(CredentialSection::open(data_dir, migration_lock_held)),
         })
     }
@@ -5610,8 +5753,54 @@ impl ConfigFacade {
         &self.registry
     }
 
+    /// Replace compatibility model limits against the latest durable section,
+    /// adopting that exact result into this facade before returning success.
+    pub fn replace_compatibility_model_limits(
+        &self,
+        candidate: ModelLimitsSection,
+    ) -> ConfigStoreResult<Option<ConfigSectionEvent>> {
+        crate::ensure_provider_mcp_migration_ready(&self.data_dir)?;
+        self.registry.model_limits.replace_from_durable(candidate)
+    }
+
     pub fn effective_config(&self) -> Config {
         self.registry.projection().into_config()
+    }
+
+    /// Hydrate one runtime domain from this process's retained credential
+    /// document. This is a read-only materialization: it never opens or reloads
+    /// the durable store, and returns the exact observed credential revision.
+    /// Callers must keep the resulting runtime inputs paired with that revision.
+    pub fn hydrate_runtime_section_from_observed_credentials(
+        &self,
+        section: SectionId,
+        runtime: &mut Config,
+    ) -> ConfigStoreResult<u64> {
+        let credentials = &self.registry.credentials;
+        let _operation = credentials
+            .operation_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let revision = credentials.snapshot().revision;
+        let document = credentials.live_credential_document(revision)?;
+        match section {
+            SectionId::Core => runtime.hydrate_proxy_auth_from_snapshot(&document)?,
+            SectionId::Providers => {
+                runtime.hydrate_provider_credentials_from_snapshot(&document)?
+            }
+            SectionId::Mcp => runtime.hydrate_mcp_credentials_from_snapshot(&document)?,
+            SectionId::Connect => runtime.hydrate_connect_credentials_from_snapshot(&document)?,
+            SectionId::Notifications => {
+                runtime.hydrate_notification_credentials_from_snapshot(&document)?
+            }
+            _ => {
+                return Err(crate::ConfigStoreError::Validation(
+                    "observed credential hydration is unsupported for this runtime domain"
+                        .to_string(),
+                ))
+            }
+        }
+        Ok(revision)
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -6095,16 +6284,17 @@ fn exact_section_credential_bindings(
 fn persist_facade_effective_config_inner(
     data_dir: impl AsRef<Path>,
     config: &Config,
+    source_facade: Option<&ConfigFacade>,
     process_facade: Option<&ConfigFacade>,
 ) -> ConfigStoreResult<(Vec<ConfigSectionEvent>, Option<FacadeConfigCommit>)> {
     let data_dir = data_dir.as_ref();
     let facade = ConfigFacade::open(data_dir)?;
     let durable = facade.registry.projection();
-    // A process-owned facade is the immutable source generation from which
-    // AppState built this compatibility candidate. Comparing against that
+    // The caller's facade is the immutable source generation from which it
+    // built this compatibility candidate. Comparing against that
     // source, rather than the freshly opened durable facade, distinguishes the
     // caller's one intended section change from unrelated external winners.
-    let source = process_facade
+    let source = source_facade
         .map(|facade| facade.registry.projection())
         .unwrap_or_else(|| durable.clone());
     let mut candidate = SectionProjection::from_config(config, source.model_limits.clone())?;
@@ -6184,7 +6374,7 @@ fn persist_facade_effective_config_inner(
             )));
         }
 
-        let source_registry = process_facade
+        let source_registry = source_facade
             .map(|facade| facade.registry.as_ref())
             .unwrap_or(facade.registry.as_ref());
         let (expected_revision, source_status, source_kind, _, source_value) =
@@ -6339,13 +6529,32 @@ pub fn persist_facade_effective_config(
     data_dir: impl AsRef<Path>,
     config: &Config,
 ) -> ConfigStoreResult<Vec<ConfigSectionEvent>> {
-    persist_facade_effective_config_inner(data_dir, config, None).map(|(events, _)| events)
+    persist_facade_effective_config_inner(data_dir, config, None, None).map(|(events, _)| events)
+}
+
+/// Persist one metadata section against the immutable facade from which the
+/// caller built `config`. Competing changes to that section conflict even if
+/// they reuse its revision; unrelated section changes remain untouched.
+///
+/// This does not adopt a runtime or grant the credential-backed section
+/// authority reserved for the dedicated APIs.
+pub fn persist_facade_effective_config_from_snapshot(
+    config: &Config,
+    source_facade: &ConfigFacade,
+) -> ConfigStoreResult<Vec<ConfigSectionEvent>> {
+    persist_facade_effective_config_inner(
+        source_facade.data_dir(),
+        config,
+        Some(source_facade),
+        None,
+    )
+    .map(|(events, _)| events)
 }
 
 /// Persist a compatibility [`Config`] through the active modular authorities
 /// and capture the exact changed-section runtime for `process_facade`.
 ///
-/// This is the bridge used by legacy root PATCH/CLI callers during the
+/// This is the bridge used by legacy root PATCH callers during the
 /// compatibility window: `config.json` is never recreated after activation,
 /// unchanged sections retain their own revisions, and the caller can install
 /// only the section it actually committed.
@@ -6354,8 +6563,12 @@ pub fn persist_facade_effective_config_with_adoption(
     config: &Config,
     process_facade: &ConfigFacade,
 ) -> ConfigStoreResult<FacadeConfigCommit> {
-    let (_, commit) =
-        persist_facade_effective_config_inner(data_dir, config, Some(process_facade))?;
+    let (_, commit) = persist_facade_effective_config_inner(
+        data_dir,
+        config,
+        Some(process_facade),
+        Some(process_facade),
+    )?;
     commit.ok_or_else(|| {
         crate::ConfigStoreError::Validation(
             "compatibility commit omitted process adoption result".to_string(),
@@ -6451,6 +6664,166 @@ mod tests {
 
     fn write_json(path: &Path, value: &Value) {
         std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn compatibility_hook_commit_installs_lifecycle_hooks_and_reset() {
+        let dir = TempDir::new().unwrap();
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let mut candidate = facade.effective_config();
+        candidate.lifecycle_hooks = serde_json::from_value(json!({
+            "enabled": true,
+            "PreToolUse": [{"matcher": "Bash", "hooks": [{
+                "type": "command", "command": "compat-lifecycle-generation"
+            }]}]
+        }))
+        .unwrap();
+        let commit =
+            persist_facade_effective_config_with_adoption(dir.path(), &candidate, &facade).unwrap();
+        assert!(matches!(commit.section_adoption.unwrap().unwrap(),
+            ConfigSectionEvent::Changed { section, .. } if section == "hooks"));
+        let mut installed = Config::default();
+        installed.server.port = 29_999;
+        commit
+            .runtime
+            .unwrap()
+            .unwrap()
+            .install_into(&mut installed);
+        assert_eq!(installed.lifecycle_hooks, candidate.lifecycle_hooks);
+        assert_eq!(installed.server.port, 29_999);
+        assert_eq!(
+            facade.effective_config().lifecycle_hooks,
+            candidate.lifecycle_hooks
+        );
+
+        candidate.lifecycle_hooks = Default::default();
+        let reset =
+            persist_facade_effective_config_with_adoption(dir.path(), &candidate, &facade).unwrap();
+        reset.runtime.unwrap().unwrap().install_into(&mut installed);
+        assert!(installed.lifecycle_hooks.is_empty());
+        assert_eq!(installed.server.port, 29_999);
+    }
+
+    #[test]
+    fn model_limit_validation_accepts_compression_shape_and_preserves_unknown_fields() {
+        let section = ModelLimitsSection(vec![json!({
+            "model_pattern": "model-family",
+            "max_context_tokens": 0,
+            "max_output_tokens": null,
+            "safety_margin": 0,
+            "future_option": {"enabled": true}
+        })]);
+        validate_model_limits(&section).unwrap();
+        assert_eq!(section.0[0]["future_option"]["enabled"], true);
+        validate_model_limits(&ModelLimitsSection(vec![json!({
+            "model_pattern": "model",
+            "max_context_tokens": u32::MAX
+        })]))
+        .unwrap();
+    }
+
+    #[test]
+    fn model_limit_validation_rejects_rows_the_runtime_cannot_decode() {
+        for row in [
+            json!(["model", 48_000, null, null]),
+            json!({}),
+            json!({"model_pattern": "model"}),
+            json!({"model_pattern": 42, "max_context_tokens": 48_000}),
+            json!({"model_pattern": "model", "max_context_tokens": -1}),
+            json!({"model_pattern": "model", "max_context_tokens": u64::MAX}),
+            json!({"model_pattern": "model", "max_context_tokens": "48000"}),
+            json!({"model_pattern": "model", "max_context_tokens": 48_000, "max_output_tokens": -1}),
+            json!({"model_pattern": "model", "max_context_tokens": 48_000, "safety_margin": "500"}),
+        ] {
+            assert!(
+                validate_model_limits(&ModelLimitsSection(vec![row.clone()])).is_err(),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_limit_raw_sidecar_reopens_after_modular_install_and_retains_lkg() {
+        let _key = crate::encryption::set_test_encryption_key([0x63; 32]);
+        let dir = TempDir::new().unwrap();
+        let installed = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        // Use an existing exact authority transaction to represent an
+        // established installation beyond the initial split manifest.
+        let mut config = installed.effective_config();
+        config.proxy_auth = Some(crate::ProxyAuth {
+            username: "test-user".into(),
+            password: "test-password".into(),
+        });
+        crate::persist_proxy_auth_credential_transaction_at_revision(
+            dir.path(),
+            &mut config,
+            installed.registry().core.snapshot().revision,
+        )
+        .unwrap();
+        drop(installed);
+        let path = dir.path().join("model_limits.json");
+        let first = json!([{
+            "model_pattern": "legacy-hosted-model",
+            "max_context_tokens": 48_000,
+            "max_output_tokens": 4_000,
+            "future_option": {"kept": true}
+        }]);
+        write_json(&path, &first);
+
+        // Existing modular installations can still be edited with the
+        // documented raw-array sidecar before the server restarts.
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let section = &facade.registry().model_limits;
+        assert_eq!(section.snapshot().status, SectionStatus::Healthy);
+        assert_eq!(section.snapshot().revision, 0);
+        assert_eq!(
+            serde_json::to_value(section.snapshot().data.as_ref()).unwrap(),
+            first
+        );
+        section
+            .commit(0, section.snapshot().data.as_ref().clone())
+            .unwrap();
+        assert_eq!(section.snapshot().revision, 1);
+        let upgraded: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(upgraded["revision"], 1);
+        assert_eq!(upgraded["data"], first);
+
+        let second = json!([{
+            "model_pattern": "legacy-hosted-model",
+            "max_context_tokens": 72_000,
+            "max_output_tokens": 6_000
+        }]);
+        write_json(&path, &second);
+        section.reload();
+        let good = section.snapshot();
+        assert_eq!(good.status, SectionStatus::Healthy);
+        assert_eq!(good.revision, 2);
+        let normalized: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(normalized["revision"], good.revision);
+        assert_eq!(normalized["data"], second);
+
+        for corrupt in ["{invalid", "[{}]"] {
+            std::fs::write(&path, corrupt).unwrap();
+            section.reload();
+            assert_ne!(section.snapshot().status, SectionStatus::Healthy);
+            assert_eq!(section.snapshot().revision, good.revision);
+            assert_eq!(section.snapshot().data.0, good.data.0);
+        }
+
+        write_json(&path, &first);
+        section.reload();
+        let repaired = section.snapshot();
+        assert_eq!(repaired.status, SectionStatus::Healthy);
+        assert_eq!(repaired.revision, good.revision + 1);
+        assert_eq!(serde_json::to_value(repaired.data.as_ref()).unwrap(), first);
+        assert!(matches!(
+            section.commit(good.revision, repaired.data.as_ref().clone()),
+            Err(crate::ConfigStoreError::Conflict { .. })
+        ));
+        section
+            .commit(repaired.revision, repaired.data.as_ref().clone())
+            .unwrap();
+        assert_eq!(section.snapshot().revision, repaired.revision + 1);
     }
 
     #[test]
@@ -7330,7 +7703,9 @@ mod tests {
 
         let projection = SectionProjection::from_config(
             &config,
-            ModelLimitsSection(vec![json!({"model_pattern": "gpt-*", "max_tokens": 42})]),
+            ModelLimitsSection(vec![
+                json!({"model_pattern": "gpt-*", "max_context_tokens": 42, "max_tokens": 42}),
+            ]),
         )
         .unwrap();
         assert_eq!(projection.core.extra["future_root_key"]["nested"], true);
@@ -7596,7 +7971,7 @@ mod tests {
         );
         write_json(
             &dir.path().join("model_limits.json"),
-            &json!([{"model_pattern": "future-*", "custom": {"kept": true}}]),
+            &json!([{"model_pattern": "future-*", "max_context_tokens": 48_000, "custom": {"kept": true}}]),
         );
         write_json(
             &dir.path().join("mcp.json"),
@@ -9273,6 +9648,7 @@ mod tests {
                 },
                 "model_limits": [{
                     "model_pattern": "future-*",
+                    "max_context_tokens": 48_000,
                     "future_limit": {"nested": "kept"}
                 }]
             }),
@@ -9696,6 +10072,52 @@ mod tests {
                 .server
                 .port,
             21_002
+        );
+    }
+
+    #[test]
+    fn pending_initial_split_rejects_legacy_writes_before_marker_publication() {
+        use crate::credential_migration::{
+            install_section_split_migration_with_fault, SectionSplitTestFault,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let mut candidate = Config::default();
+        candidate.save_to_dir(dir.path().to_path_buf()).unwrap();
+        let plan = plan_config_facade_layout(dir.path()).unwrap();
+        assert!(install_section_split_migration_with_fault(
+            dir.path(),
+            plan,
+            SectionSplitTestFault::Manifest,
+        )
+        .is_err());
+        // The journal is authoritative before any modular marker/quorum.
+        assert!(!crate::modular_authority_boundary_present(dir.path()).unwrap());
+        let paths = ["memory.json", "subagents.json", "providers.json"];
+        let before: Vec<_> = paths
+            .iter()
+            .map(|name| std::fs::read(dir.path().join(name)).unwrap())
+            .collect();
+        candidate.memory.0 = Some(MemoryConfig {
+            background_model: Some("must-not-replace-committed-split".into()),
+            ..MemoryConfig::default()
+        });
+        candidate.subagents.max_concurrent = Some(99);
+        assert!(candidate.save_memory_to_dir(dir.path()).is_err());
+        assert!(candidate.save_subagents_to_dir(dir.path()).is_err());
+        assert!(candidate.save_providers_to_dir(dir.path()).is_err());
+        for (name, bytes) in paths.iter().zip(before) {
+            assert_eq!(
+                std::fs::read(dir.path().join(name)).unwrap(),
+                bytes,
+                "{name}"
+            );
+        }
+        let recovered = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert!(recovered.effective_config().memory.is_none());
+        assert_ne!(
+            recovered.effective_config().subagents.max_concurrent,
+            Some(99)
         );
     }
 
@@ -11716,6 +12138,45 @@ mod tests {
         assert_eq!(reloaded.revision, 2);
         assert_eq!(reloaded.status, SectionStatus::Healthy);
         assert_eq!(reloaded.data.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_metadata_write_conflicts_with_same_revision_editor_change() {
+        let _key = crate::encryption::set_test_encryption_key([0x62; 32]);
+        let dir = TempDir::new().unwrap();
+        let source = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let mut candidate = source.effective_config();
+        candidate.tools.disabled.push("bash".to_string());
+        let path = dir.path().join("tools-skills.json");
+        let mut editor: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        editor["data"]["skills"]["disabled"] = serde_json::json!(["external-skill"]);
+        let winner = serde_json::to_vec_pretty(&editor).unwrap();
+        std::fs::write(&path, &winner).unwrap();
+
+        let error = persist_facade_effective_config_from_snapshot(&candidate, &source).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("changed without advancing revision"));
+        assert_eq!(std::fs::read(&path).unwrap(), winner);
+        assert_eq!(source.registry().tools_skills.snapshot().revision, 0);
+        assert!(source.effective_config().tools.disabled.is_empty());
+    }
+
+    #[test]
+    fn snapshot_metadata_write_does_not_grant_credential_section_authority() {
+        let _key = crate::encryption::set_test_encryption_key([0x63; 32]);
+        let dir = TempDir::new().unwrap();
+        let source = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let mut candidate = source.effective_config();
+        candidate.server.port = 22_262;
+        let path = dir.path().join("core.json");
+        let before = std::fs::read(&path).unwrap();
+
+        let error = persist_facade_effective_config_from_snapshot(&candidate, &source).unwrap_err();
+
+        assert!(error.to_string().contains("dedicated revisioned API"));
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
     #[test]
@@ -14421,6 +14882,7 @@ fn reconciliation_root_sections(root: &Value) -> ReconciliationRootSectionsResul
             | "headless_auth"
             | "server"
             | "default_work_area"
+            | "worktrees"
             | "run_budget"
             | "stream_timeout"
             | "context_management" => object(SectionId::Core, key, value, &mut object_sections),
@@ -15585,4 +16047,51 @@ fn reconcile_reappeared_legacy_root_locked(
         guard_advanced,
         partial: !record.complete,
     }))
+}
+
+#[cfg(test)]
+mod worktree_settings_tests {
+    use super::*;
+
+    #[test]
+    fn worktree_settings_persist_in_existing_core_authority_across_restart() {
+        let _key = crate::encryption::set_test_encryption_key([0x63; 32]);
+        let dir = tempfile::tempdir().unwrap();
+        let facade = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        let mut config = facade.effective_config();
+        config.worktrees.default_root = Some("/Volumes/External/worktrees".into());
+        config
+            .worktrees
+            .project_roots
+            .insert("project-a".into(), "/work/overrides".into());
+        // AppState's metadata updater uses the process facade so Core keeps
+        // its existing revision and credential authority checks.
+        persist_facade_effective_config_with_adoption(dir.path(), &config, &facade).unwrap();
+        drop(facade);
+        let restarted = ConfigFacade::open_or_migrate(dir.path()).unwrap();
+        assert_eq!(restarted.effective_config().worktrees, config.worktrees);
+        let core: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("core.json")).unwrap()).unwrap();
+        assert_eq!(
+            core["data"]["worktrees"]["default_root"],
+            "/Volumes/External/worktrees"
+        );
+    }
+
+    #[test]
+    fn worktree_preferences_survive_compatibility_and_core_projection() {
+        let mut config = Config::default();
+        config.worktrees.default_root = Some("/Volumes/External/worktrees".into());
+        config
+            .worktrees
+            .project_roots
+            .insert("project-a".into(), "/work/project-a".into());
+        let encoded = serde_json::to_value(&config).unwrap();
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.worktrees, config.worktrees);
+        let sections =
+            SectionProjection::from_config(&config, ModelLimitsSection::default()).unwrap();
+        assert_eq!(sections.core.worktrees, config.worktrees);
+        assert_eq!(sections.into_config().worktrees, config.worktrees);
+    }
 }

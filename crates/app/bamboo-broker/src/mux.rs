@@ -186,7 +186,7 @@ impl MultiplexedClient {
         self.reader.mark_intentional_shutdown();
         let close_result = {
             let mut sink = self.sink.lock().await;
-            send_close(&mut *sink).await
+            send_close(&mut sink).await
         };
         self.reader.shutdown().await;
 

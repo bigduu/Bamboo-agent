@@ -551,6 +551,7 @@ fn make_queued_run_record(
         status: ScheduleRunStatus::Queued,
         outcome_reason: None,
         session_id: None,
+        workflow_run_id: None,
         dispatch_lag_ms: None,
         execution_duration_ms: None,
         was_catch_up,
@@ -581,6 +582,7 @@ fn make_fallback_run_record(
         status,
         outcome_reason: None,
         session_id: None,
+        workflow_run_id: None,
         dispatch_lag_ms: None,
         execution_duration_ms: None,
         was_catch_up: false,
@@ -1189,6 +1191,83 @@ impl ScheduleStore {
         .await
     }
 
+    /// Admit a claimed Workflow occurrence once in this running process.
+    /// A storage failure leaves it undispatched; it is never retried by this queue.
+    pub(crate) async fn start_workflow_occurrence(
+        &self,
+        schedule_id: &str,
+        run_id: &str,
+    ) -> io::Result<bool> {
+        self.update_index(|index| {
+            let Some(record) = index.run_records.get_mut(run_id) else {
+                return Err(other_io_error("claimed schedule run is unavailable"));
+            };
+            if record.schedule_id != schedule_id || record.status != ScheduleRunStatus::Queued {
+                return Ok(false);
+            }
+            let now = Utc::now();
+            update_run_record_started(record, now, None);
+            if let Some(entry) = index.schedules.get_mut(schedule_id) {
+                entry.state.queued_run_count = entry.state.queued_run_count.saturating_sub(1);
+                entry.state.running_run_count = entry.state.running_run_count.saturating_add(1);
+                entry.state.last_started_at = Some(now);
+                entry.updated_at = now;
+            }
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Persist correlation before reporting that the scheduled Workflow was bound.
+    /// This deliberately does not change the write behavior of other schedule actions.
+    pub(crate) async fn bind_run_workflow(
+        &self,
+        schedule_id: &str,
+        run_id: &str,
+        workflow_run_id: &str,
+    ) -> io::Result<()> {
+        let _guard = self.write_lock.lock().await;
+        let mut index = self.index.write().await;
+        let mut updated = index.clone();
+        let record = updated
+            .run_records
+            .get_mut(run_id)
+            .filter(|record| {
+                record.schedule_id == schedule_id && record.status == ScheduleRunStatus::Running
+            })
+            .ok_or_else(|| other_io_error("running schedule record is unavailable"))?;
+        record.workflow_run_id = Some(workflow_run_id.to_string());
+        updated.updated_at = Utc::now();
+        atomic_write_json(
+            &self.index_path,
+            serde_json::to_vec_pretty(&updated)
+                .map_err(|error| other_io_error(error.to_string()))?,
+        )
+        .await?;
+        *index = updated;
+        Ok(())
+    }
+
+    pub(crate) async fn note_workflow_unknown(
+        &self,
+        schedule_id: &str,
+        run_id: &str,
+        reason: String,
+    ) -> io::Result<()> {
+        self.update_index(|index| {
+            let record = index
+                .run_records
+                .get_mut(run_id)
+                .filter(|record| {
+                    record.schedule_id == schedule_id && record.status == ScheduleRunStatus::Running
+                })
+                .ok_or_else(|| other_io_error("running schedule record is unavailable"))?;
+            record.outcome_reason = Some(reason);
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn bind_run_session(
         &self,
         schedule_id: &str,
@@ -1353,6 +1432,7 @@ mod tests {
             status,
             outcome_reason: None,
             session_id: None,
+            workflow_run_id: None,
             dispatch_lag_ms: None,
             execution_duration_ms: None,
             was_catch_up: false,
@@ -2329,5 +2409,83 @@ mod tests {
         let deleted = store.delete_schedule(&created.id).await.unwrap();
         assert!(deleted);
         assert!(store.get_run_record(&claimed.run_id).await.is_none());
+    }
+}
+
+#[cfg(test)]
+mod workflow_correlation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn workflow_occurrence_dispatches_once_and_failed_correlation_preserves_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        let schedule = store
+            .create_schedule(
+                "workflow".into(),
+                ScheduleTrigger::Once {
+                    at: Utc::now() + Duration::hours(1),
+                },
+                true,
+                ScheduleRunConfig::default(),
+            )
+            .await
+            .unwrap();
+        let claimed = store.create_run_now(&schedule.id).await.unwrap().unwrap();
+        assert!(store
+            .start_workflow_occurrence(&schedule.id, &claimed.run_id)
+            .await
+            .unwrap());
+        assert!(!store
+            .start_workflow_occurrence(&schedule.id, &claimed.run_id)
+            .await
+            .unwrap());
+        assert_eq!(
+            store
+                .get_schedule(&schedule.id)
+                .await
+                .unwrap()
+                .state
+                .running_run_count,
+            1
+        );
+        let before = store.get_run_record(&claimed.run_id).await.unwrap();
+        let index = tokio::fs::read(store.index_path()).await.unwrap();
+        tokio::fs::remove_file(store.index_path()).await.unwrap();
+        tokio::fs::create_dir(store.index_path()).await.unwrap();
+        assert!(store
+            .bind_run_workflow(&schedule.id, &claimed.run_id, "workflow-run")
+            .await
+            .is_err());
+        assert_eq!(store.get_run_record(&claimed.run_id).await.unwrap(), before);
+        tokio::fs::remove_dir(store.index_path()).await.unwrap();
+        tokio::fs::write(store.index_path(), index).await.unwrap();
+        store
+            .bind_run_workflow(&schedule.id, &claimed.run_id, "workflow-run")
+            .await
+            .unwrap();
+        let reopened = ScheduleStore::new(dir.path().to_path_buf()).await.unwrap();
+        assert_eq!(
+            reopened
+                .get_run_record(&claimed.run_id)
+                .await
+                .unwrap()
+                .workflow_run_id
+                .as_deref(),
+            Some("workflow-run")
+        );
+        store
+            .mark_run_terminal(
+                &schedule.id,
+                &claimed.run_id,
+                ScheduleRunStatus::Success,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!store
+            .start_workflow_occurrence(&schedule.id, &claimed.run_id)
+            .await
+            .unwrap());
     }
 }

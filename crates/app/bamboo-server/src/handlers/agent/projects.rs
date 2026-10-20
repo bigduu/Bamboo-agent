@@ -5,12 +5,17 @@
 //! responses are counts/revisions only and never include file contents,
 //! environment values, headers, or credentials.
 
+use crate::error::ResponseResult;
+
+use std::collections::{BTreeMap, HashSet};
+use std::io::{self, Write};
 use std::path::Path;
 
 use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse, Result};
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::{
-    LegacySessionProjectInput, ProjectId, ProjectManifest, ProjectStatus, WorkspaceBinding,
+    LegacySessionProjectInput, ProjectId, ProjectManifest, ProjectSidebar, ProjectStatus,
+    SessionKind, WorkspaceBinding,
 };
 use bamboo_projects::{
     canonicalize_workspace_path, plan_legacy_migration, resolve_git_common_dir, ProjectStoreError,
@@ -41,6 +46,15 @@ where
     Option::<String>::deserialize(deserializer).map(Some)
 }
 
+fn deserialize_sidebar_snapshot<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<ProjectSidebar>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    ProjectSidebar::deserialize(deserializer).map(Some)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PatchProjectRequest {
     #[serde(default)]
@@ -55,6 +69,127 @@ pub struct PatchProjectRequest {
     /// revision as name/description updates.
     #[serde(default)]
     pub project_path: Option<String>,
+    /// Complete Project-owned sidebar snapshot. Explicit null is invalid;
+    /// clearing the sidebar uses an empty snapshot, which remains durable.
+    #[serde(default, deserialize_with = "deserialize_sidebar_snapshot")]
+    pub sidebar: Option<ProjectSidebar>,
+    /// One-time browser migration. It cannot overwrite an existing snapshot.
+    #[serde(default, deserialize_with = "deserialize_sidebar_snapshot")]
+    pub import_sidebar: Option<ProjectSidebar>,
+}
+
+// Bound incoming organization snapshots without imposing new read-time rules
+// on already-persisted manifests or on the Project's total session history.
+const MAX_SIDEBAR_SECTIONS: usize = 256;
+const MAX_SIDEBAR_ASSIGNMENTS: usize = 10_000;
+const MAX_SIDEBAR_JSON_BYTES: usize = 1024 * 1024;
+
+struct SidebarByteBudget {
+    remaining: usize,
+}
+
+impl Write for SidebarByteBudget {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes.len())
+            .ok_or_else(|| io::Error::other("sidebar snapshot byte limit exceeded"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn sidebar_request_within_limits(sidebar: &ProjectSidebar) -> bool {
+    if sidebar.sections.len() > MAX_SIDEBAR_SECTIONS
+        || sidebar.session_sections.len() > MAX_SIDEBAR_ASSIGNMENTS
+    {
+        return false;
+    }
+    serde_json::to_writer(
+        SidebarByteBudget {
+            remaining: MAX_SIDEBAR_JSON_BYTES,
+        },
+        sidebar,
+    )
+    .is_ok()
+}
+
+fn clear_removed_sidebar_assignments(
+    previous: Option<&ProjectSidebar>,
+    assignments: &mut BTreeMap<String, Option<String>>,
+    available: &HashSet<&str>,
+) {
+    for (id, target) in assignments {
+        if target
+            .as_deref()
+            .is_some_and(|value| !available.contains(value))
+            && previous.is_some_and(|old| old.session_sections.get(id) == Some(&*target))
+        {
+            *target = None;
+        }
+    }
+}
+
+fn apply_sidebar_snapshot(
+    project: &mut ProjectManifest,
+    requested: Option<&ProjectSidebar>,
+    importing: bool,
+    valid_roots: &HashSet<String>,
+) -> bamboo_projects::ProjectStoreResult<()> {
+    if importing && project.sidebar.is_some() {
+        return Err(ProjectStoreError::Validation(
+            "Project sidebar has already been saved or imported".into(),
+        ));
+    }
+    let previous = project.sidebar.as_ref();
+    let Some(mut sidebar) = requested.cloned().or_else(|| previous.cloned()) else {
+        return Ok(());
+    };
+    for section in &mut sidebar.sections {
+        section.name = section.name.trim().to_string();
+    }
+    let mut available = sidebar
+        .sections
+        .iter()
+        .map(|section| section.id.as_str())
+        .collect::<HashSet<_>>();
+    if project.section.is_some() && !sidebar.hidden_legacy {
+        available.insert("legacy");
+    }
+    clear_removed_sidebar_assignments(previous, &mut sidebar.session_sections, &available);
+    if importing {
+        for target in sidebar.session_sections.values_mut() {
+            if target
+                .as_ref()
+                .is_some_and(|target| !available.contains(target.as_str()))
+            {
+                *target = None;
+            }
+        }
+        sidebar
+            .session_sections
+            .retain(|id, _| valid_roots.contains(id));
+    } else if requested.is_some() {
+        for (id, target) in &sidebar.session_sections {
+            let old = previous.and_then(|previous| previous.session_sections.get(id));
+            // Existing entries may outlive a deleted/reassigned root. Preserve
+            // unchanged mappings and always permit an existing entry to clear.
+            if old == Some(target) || (target.is_none() && old.is_some()) {
+                continue;
+            }
+            if !valid_roots.contains(id) {
+                return Err(ProjectStoreError::Validation(
+                    "sidebar assignment requires an existing root session in this Project".into(),
+                ));
+            }
+        }
+    }
+    bamboo_projects::validate_project_sidebar(&sidebar, project.section.as_deref())?;
+    project.sidebar = Some(sidebar);
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,12 +299,13 @@ fn enrich_legacy_dry_run_sessions(
     (sessions, diagnostics)
 }
 
-fn parse_if_match(req: &HttpRequest) -> std::result::Result<u64, HttpResponse> {
+fn parse_if_match(req: &HttpRequest) -> ResponseResult<u64> {
     let Some(raw) = req.headers().get(actix_web::http::header::IF_MATCH) else {
         return Err(crate::error::json_error(
             StatusCode::PRECONDITION_REQUIRED,
             "If-Match with the current Project revision is required",
-        ));
+        )
+        .into());
     };
     let value = raw
         .to_str()
@@ -183,12 +319,13 @@ fn parse_if_match(req: &HttpRequest) -> std::result::Result<u64, HttpResponse> {
             StatusCode::BAD_REQUEST,
             "If-Match must be a Project revision integer or quoted ETag",
         )
+        .into()
     })
 }
 
-fn parse_id(raw: &str) -> std::result::Result<ProjectId, HttpResponse> {
+fn parse_id(raw: &str) -> ResponseResult<ProjectId> {
     raw.parse::<ProjectId>()
-        .map_err(|_| crate::error::json_error(StatusCode::BAD_REQUEST, "invalid Project id"))
+        .map_err(|_| crate::error::json_error(StatusCode::BAD_REQUEST, "invalid Project id").into())
 }
 
 fn project_error(error: ProjectStoreError) -> HttpResponse {
@@ -223,6 +360,8 @@ fn project_error(error: ProjectStoreError) -> HttpResponse {
         ProjectStoreError::AlreadyExists(_)
         | ProjectStoreError::NotArchived(_)
         | ProjectStoreError::Validation(_)
+        | ProjectStoreError::UnsupportedManifestSchema { .. }
+        | ProjectStoreError::LegacyMigrationConflict { .. }
         | ProjectStoreError::InvalidPathComponent(_)
         | ProjectStoreError::ProjectPathUnbindConflict { .. } => {
             (StatusCode::CONFLICT, error.to_string())
@@ -328,7 +467,7 @@ pub async fn get_project(
 ) -> Result<HttpResponse> {
     let id = match parse_id(&path) {
         Ok(id) => id,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     match state.project_store.get(&id) {
         Ok(project) => Ok(with_etag(&project, StatusCode::OK)),
@@ -344,12 +483,101 @@ pub async fn patch_project(
 ) -> Result<HttpResponse> {
     let id = match parse_id(&path) {
         Ok(id) => id,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let expected = match parse_if_match(&http_request) {
         Ok(revision) => revision,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
+    for sidebar in request
+        .sidebar
+        .as_ref()
+        .into_iter()
+        .chain(request.import_sidebar.as_ref())
+    {
+        if !sidebar_request_within_limits(sidebar) {
+            return Ok(crate::error::json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Sidebar snapshots allow at most 256 sections, 10000 session mappings and 1 MiB of compact JSON",
+            ));
+        }
+    }
+    if request.sidebar.is_some() && request.import_sidebar.is_some() {
+        return Ok(project_error(ProjectStoreError::Validation(
+            "sidebar and import_sidebar are mutually exclusive".into(),
+        )));
+    }
+    let requested_sidebar = request.sidebar.as_ref().or(request.import_sidebar.as_ref());
+    let importing = request.import_sidebar.is_some();
+    if requested_sidebar.is_some()
+        && (request.name.is_some()
+            || request.description.is_some()
+            || request.section.is_some()
+            || request.project_path.is_some())
+    {
+        return Ok(project_error(ProjectStoreError::Validation(
+            "sidebar snapshots cannot be mixed with other Project metadata mutations".into(),
+        )));
+    }
+    let mut valid_roots = HashSet::new();
+    if let Some(sidebar) = requested_sidebar {
+        let current = match state.project_store.get(&id) {
+            Ok(current) => current,
+            Err(error) => return Ok(project_error(error)),
+        };
+        if current.revision != expected {
+            return Ok(project_error(ProjectStoreError::Conflict {
+                expected,
+                actual: current.revision,
+            }));
+        }
+        if importing && current.sidebar.is_some() {
+            return Ok(project_error(ProjectStoreError::Validation(
+                "Project sidebar has already been saved or imported".into(),
+            )));
+        }
+        for (session_id, target) in &sidebar.session_sections {
+            if session_id.is_empty()
+                || session_id.contains('/')
+                || session_id.contains('\\')
+                || session_id.contains("..")
+                || session_id.chars().any(char::is_control)
+            {
+                return Ok(project_error(ProjectStoreError::Validation(
+                    "invalid sidebar session id".into(),
+                )));
+            }
+            let old = current
+                .sidebar
+                .as_ref()
+                .and_then(|old| old.session_sections.get(session_id));
+            if !importing && (old == Some(target) || (target.is_none() && old.is_some())) {
+                continue;
+            }
+            // Read the durable control plane, never the paginated list or UI
+            // cache. Normal reads use the lightweight sidecar; the storage
+            // port retains its existing legacy main-history fallback.
+            match state.storage.load_runtime_control_plane(session_id).await {
+                Ok(Some(session))
+                    if session.id == *session_id
+                        && session.kind == SessionKind::Root
+                        && session.parent_session_id.is_none()
+                        && session.spawn_depth == 0
+                        && (session.root_session_id.is_empty()
+                            || session.root_session_id == session.id)
+                        && session.project_id_meta().as_deref() == Some(id.as_str()) =>
+                {
+                    valid_roots.insert(session_id.clone());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // An uncertain read must never turn a browser import into
+                    // a durable empty snapshot and discard its only source.
+                    return Ok(project_error(ProjectStoreError::Io(error)));
+                }
+            }
+        }
+    }
     let mutate = |project: &mut ProjectManifest| {
         if let Some(name) = request.name.as_ref() {
             project.name = name.clone();
@@ -360,6 +588,7 @@ pub async fn patch_project(
         if let Some(section) = request.section.as_ref() {
             project.section = section.as_ref().map(|value| value.trim().to_string());
         }
+        apply_sidebar_snapshot(project, requested_sidebar, importing, &valid_roots)?;
         Ok(())
     };
     let result = if let Some(project_path) = request.project_path.as_deref() {
@@ -401,11 +630,11 @@ pub async fn bind_workspace(
 ) -> Result<HttpResponse> {
     let id = match parse_id(&path) {
         Ok(id) => id,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let expected = match parse_if_match(&http_request) {
         Ok(revision) => revision,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let project = match state.project_store.bind_workspace(
         &id,
@@ -437,11 +666,11 @@ pub async fn unbind_workspace(
 ) -> Result<HttpResponse> {
     let id = match parse_id(&path) {
         Ok(id) => id,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let expected = match parse_if_match(&http_request) {
         Ok(revision) => revision,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let project = match state
         .project_store
@@ -466,7 +695,7 @@ pub async fn project_resources(
 ) -> Result<HttpResponse> {
     let id = match parse_id(&path) {
         Ok(id) => id,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     match state.project_store.resource_summary(&id) {
         Ok(summary) => Ok(HttpResponse::Ok().json(summary)),
@@ -481,11 +710,11 @@ pub async fn archive_project(
 ) -> Result<HttpResponse> {
     let id = match parse_id(&path) {
         Ok(id) => id,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let expected = match parse_if_match(&http_request) {
         Ok(revision) => revision,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let project = match state.project_store.archive(&id, expected) {
         Ok(project) => project,
@@ -508,11 +737,11 @@ pub async fn unarchive_project(
 ) -> Result<HttpResponse> {
     let id = match parse_id(&path) {
         Ok(id) => id,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let expected = match parse_if_match(&http_request) {
         Ok(revision) => revision,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let project = match state.project_store.unarchive(&id, expected) {
         Ok(project) => project,
@@ -545,6 +774,10 @@ pub async fn legacy_dry_run(
 pub fn is_active(project: &ProjectManifest) -> bool {
     project.status == ProjectStatus::Active
 }
+
+#[cfg(test)]
+#[path = "projects/sidebar_tests.rs"]
+mod sidebar_tests;
 
 #[cfg(test)]
 mod tests {

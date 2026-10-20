@@ -42,6 +42,20 @@ pub(crate) fn plugin_scope() -> impl HttpServiceFactory {
     web::scope("/plugins")
         .route("", web::get().to(agent::plugin::list_plugins))
         .route("/install", web::post().to(agent::plugin::install_plugin))
+        .route("/jiandu/setup", web::get().to(agent::plugin::jiandu_setup))
+        .route("/nova/app", web::get().to(agent::plugin::nova_app))
+        .route(
+            "/nova/app/install",
+            web::post().to(agent::plugin::install_nova_app),
+        )
+        .route(
+            "/nova/app/start",
+            web::post().to(agent::plugin::start_nova_app),
+        )
+        .route(
+            "/official/jiandu/install",
+            web::post().to(agent::plugin::install_official_jiandu),
+        )
         .route("/{id}/hooks", web::get().to(agent::plugin::plugin_hooks))
         .route(
             "/{id}/hooks/review",
@@ -90,9 +104,19 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             settings::enforce_access_password_middleware,
         ))
         .route("/bootstrap", web::get().to(agent::bootstrap::handler))
+        .route(
+            "/supervisor/default",
+            web::post().to(agent::supervisor::open_default),
+        )
+        .service(
+            web::resource("/supervisor/default/scope")
+                .route(web::get().to(agent::supervisor::inspect_project_scope))
+                .route(web::put().to(agent::supervisor::configure_project_scope)),
+        )
         .service(
             web::scope("/tickets")
                 .route("/scope", web::get().to(agent::tickets::scope))
+                .route("/initialize", web::post().to(agent::tickets::initialize))
                 .route("/overview", web::get().to(agent::tickets::overview))
                 .route("/search", web::post().to(agent::tickets::search))
                 .route("/inspect", web::post().to(agent::tickets::inspect))
@@ -223,6 +247,22 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/projects/migrations/legacy/dry-run",
             web::post().to(agent::projects::legacy_dry_run),
+        )
+        .route(
+            "/worktrees/preferences",
+            web::get().to(agent::worktrees::get_preferences),
+        )
+        .route(
+            "/worktrees/preferences",
+            web::put().to(agent::worktrees::set_preferences),
+        )
+        .route(
+            "/projects/{project_id}/worktrees",
+            web::get().to(agent::worktrees::list),
+        )
+        .route(
+            "/projects/{project_id}/worktrees",
+            web::post().to(agent::worktrees::create),
         )
         .route("/projects", web::get().to(agent::projects::list_projects))
         .route("/projects", web::post().to(agent::projects::create_project))
@@ -386,8 +426,12 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::events::handler),
         )
         .route(
+            "/sessions/{session_id}/runs/{run_id}/output",
+            web::get().to(agent::run_output::handler),
+        )
+        .route(
             "/sessions/{session_id}/stop",
-            web::post().to(agent::stop::handler),
+            web::post().to(agent::stop::handler_with_run),
         )
         .route(
             "/sessions/{session_id}/history",
@@ -433,7 +477,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         // Account-scoped change feed: one resumable SSE stream across all
         // sessions (multi-client sync, replaces session-index polling).
         .route("/stream", web::get().to(agent::stream::handler))
-        .route("/stop/{session_id}", web::post().to(agent::stop::handler))
+        .route(
+            "/stop/{session_id}",
+            web::post().to(agent::stop::handler_with_run),
+        )
         .route(
             "/child-approval/{child_session_id}",
             web::post().to(agent::child_approval::handler),

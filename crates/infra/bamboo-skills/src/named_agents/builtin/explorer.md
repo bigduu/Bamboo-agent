@@ -4,7 +4,7 @@ name: explorer
 description: Investigate a bounded question and return evidence without changing files.
 tools:
   allow: [Read, Glob]
-  deny: [Bash, Edit, Write]
+  deny: [Bash, exec_command, write_stdin, Edit, Write]
 ---
 Builtin role package v1: explorer.
 

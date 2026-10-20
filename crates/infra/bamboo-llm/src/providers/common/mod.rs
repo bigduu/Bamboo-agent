@@ -10,8 +10,47 @@ pub mod stream_tool_accumulator;
 pub mod tool_schema;
 
 use bamboo_domain::ReasoningEffort;
+use sha2::{Digest, Sha256};
 
 use crate::provider::{LLMError, Result};
+
+/// Bound caller/provider-controlled identifiers in operational logs while
+/// retaining stable correlation. Request bodies and returned errors stay intact.
+pub(crate) fn log_identity(value: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bamboo-provider-operational-log-v1\0");
+    digest.update(value.as_bytes());
+    hex::encode(&digest.finalize()[..8])
+}
+
+pub(crate) fn http_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else if error.is_status() {
+        "status"
+    } else {
+        "transport"
+    }
+}
+
+pub(crate) fn llm_error_kind(error: &LLMError) -> &'static str {
+    match error {
+        LLMError::Http(error) => http_error_kind(error),
+        LLMError::Json(_) => "json",
+        LLMError::Stream(_) => "stream",
+        LLMError::Api(_) => "api",
+        LLMError::Auth(_) => "auth",
+        LLMError::Protocol(_) => "protocol",
+    }
+}
 
 const MIN_NUMERIC_THINKING_TOKENS: u32 = 1_024;
 const MIN_VISIBLE_OUTPUT_TOKENS: u32 = 1_024;
@@ -248,3 +287,6 @@ mod bounded_thinking_budget_tests {
         assert!(validate_max_thinking_budget(Some(ReasoningEffort::Max), Some(2_049)).is_ok());
     }
 }
+
+#[cfg(test)]
+pub(crate) mod log_privacy_tests;

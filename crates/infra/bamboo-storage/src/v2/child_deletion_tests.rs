@@ -298,3 +298,465 @@ async fn child_deletion_preserves_existing_ignored_removal_error() {
     assert!(store.session_lifecycle_lock.try_read().is_ok());
     assert!(store.runtime_task_transaction_gate.try_read().is_ok());
 }
+
+const GRANDCHILD: &str = "delete-guard-grandchild";
+
+fn descendant_claim(id: &str) -> bamboo_domain::ActorActivationClaim {
+    let now = Utc::now();
+    bamboo_domain::ActorActivationClaim {
+        actor_id: id.into(),
+        run_id: format!("run-{id}"),
+        lease_owner: "deletion-test".into(),
+        lease_expires_at: now + chrono::Duration::minutes(5),
+        inbox_generation: 0,
+        placement_ref: None,
+        now,
+    }
+}
+
+async fn active_descendant_fixture(
+    home: &Path,
+) -> (
+    Arc<SessionStoreV2>,
+    Session,
+    Session,
+    bamboo_domain::ActorActivation,
+) {
+    use bamboo_domain::ActorDirectoryPort;
+    let (store, root, child) = fixture(home).await;
+    let mut grandchild = Session::new_child_of(GRANDCHILD, &child, "model", "grandchild");
+    grandchild.pinned = true;
+    store.save_session(&grandchild).await.unwrap();
+    let activation = store
+        .claim_activation(&descendant_claim(GRANDCHILD))
+        .await
+        .unwrap();
+    store
+        .start_activation(&activation.fence(), Utc::now())
+        .await
+        .unwrap();
+    (Arc::new(store), root, child, activation)
+}
+
+fn descendant_row(home: &Path, root: &str, id: &str) -> bamboo_domain::ActorDirectoryEntry {
+    serde_json::from_slice(
+        &std::fs::read(
+            home.join("sessions")
+                .join(root)
+                .join("children")
+                .join(id)
+                .join("actor-authority.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn descendant_cancellation_covers_deeper_rows_and_preserves_other_scopes() {
+    use bamboo_domain::{
+        ActorActivationStatus, ActorDirectoryError, ActorDirectoryPort, ActorLogicalState,
+    };
+    let home = tempfile::tempdir().unwrap();
+    let (store, root, child, old) = active_descendant_fixture(home.path()).await;
+    let grandchild = store.load_session(GRANDCHILD).await.unwrap().unwrap();
+    let deep = Session::new_child_of("delete-deep", &grandchild, "model", "deep");
+    let sibling = Session::new_child_of(SIBLING, &root, "model", "sibling");
+    let foreign_root = Session::new("delete-foreign-root", "model");
+    let foreign = Session::new_child_of("delete-foreign-child", &foreign_root, "model", "foreign");
+    for session in [&deep, &sibling, &foreign_root, &foreign] {
+        store.save_session(session).await.unwrap();
+    }
+    let deep_owner = store
+        .claim_activation(&descendant_claim(&deep.id))
+        .await
+        .unwrap();
+    let sibling_owner = store
+        .claim_activation(&descendant_claim(SIBLING))
+        .await
+        .unwrap();
+    let foreign_owner = store
+        .claim_activation(&descendant_claim(&foreign.id))
+        .await
+        .unwrap();
+    let before_sibling = descendant_row(home.path(), ROOT, SIBLING);
+    let before_foreign = descendant_row(home.path(), &foreign_root.id, &foreign.id);
+    let main_path = home
+        .path()
+        .join("sessions")
+        .join(ROOT)
+        .join("children")
+        .join(GRANDCHILD)
+        .join("session.json");
+    let main_before = std::fs::read(&main_path).unwrap();
+    assert!(store.delete_session_recursive(CHILD, false).await.unwrap());
+    assert_eq!(std::fs::read(main_path).unwrap(), main_before);
+    for (id, owner) in [(GRANDCHILD, &old), (deep.id.as_str(), &deep_owner)] {
+        let row = descendant_row(home.path(), ROOT, id);
+        assert_eq!(row.actor.state, ActorLogicalState::Cold);
+        let activation = row.activation.unwrap();
+        assert_eq!(activation.status, ActorActivationStatus::Cancelled);
+        assert_eq!(activation.lease_epoch, owner.lease_epoch + 1);
+    }
+    assert_eq!(descendant_row(home.path(), ROOT, SIBLING), before_sibling);
+    assert_eq!(
+        descendant_row(home.path(), &foreign_root.id, &foreign.id),
+        before_foreign
+    );
+    store.save_session(&child).await.unwrap();
+    let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+    for owner in [&old, &deep_owner] {
+        assert_eq!(
+            reopened
+                .validate_fence(&owner.fence(), Utc::now())
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::StaleFence
+        );
+    }
+    reopened
+        .validate_fence(&sibling_owner.fence(), Utc::now())
+        .await
+        .unwrap();
+    reopened
+        .validate_fence(&foreign_owner.fence(), Utc::now())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn child_deletion_preserves_legacy_and_interrupted_inert_actor_initialization() {
+    use bamboo_domain::{ActorDirectoryEntry, ActorDirectoryPort, ActorSession};
+    let home = tempfile::tempdir().unwrap();
+    let (store, root, child, _) = active_descendant_fixture(home.path()).await;
+    let grandchild = store.load_session(GRANDCHILD).await.unwrap().unwrap();
+    let inert = Session::new_child_of("delete-inert", &grandchild, "model", "inert");
+    let legacy = Session::new_child_of(SIBLING, &root, "model", "legacy");
+    store.save_session(&inert).await.unwrap();
+    store.save_session(&legacy).await.unwrap();
+    let mut actor = ActorSession::from_session(&inert).unwrap();
+    actor.ancestor_observations = store.validate_actor_lineage(&actor).await.unwrap();
+    let bytes = serde_json::to_vec_pretty(&ActorDirectoryEntry::new(actor)).unwrap();
+    let children = home.path().join("sessions").join(ROOT).join("children");
+    let row_path = children.join(&inert.id).join("actor-authority.json");
+    let marker_path = children
+        .join(&inert.id)
+        .join("actor-authority.initialized.json");
+    std::fs::write(&row_path, &bytes).unwrap();
+    assert!(store.delete_session_recursive(CHILD, false).await.unwrap());
+    assert_eq!(std::fs::read(&row_path).unwrap(), bytes);
+    assert!(!marker_path.exists());
+    assert!(!children.join(SIBLING).join("actor-authority.json").exists());
+    assert!(!children
+        .join(SIBLING)
+        .join("actor-authority.initialized.json")
+        .exists());
+    store.save_session(&child).await.unwrap();
+    let fresh = store
+        .claim_activation(&descendant_claim(&inert.id))
+        .await
+        .unwrap();
+    store
+        .validate_fence(&fresh.fence(), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(fresh.attempt, 1);
+    assert!(marker_path.is_file());
+}
+
+#[tokio::test]
+async fn descendant_preflight_failure_keeps_ancestor_and_all_live_rows() {
+    use bamboo_domain::ActorDirectoryPort;
+    for failure in ["missing-marker", "epoch-overflow", "revision-overflow"] {
+        let home = tempfile::tempdir().unwrap();
+        let (store, _, _, _) = active_descendant_fixture(home.path()).await;
+        let grandchild = store.load_session(GRANDCHILD).await.unwrap().unwrap();
+        let deep = Session::new_child_of("delete-preflight-deep", &grandchild, "model", "deep");
+        store.save_session(&deep).await.unwrap();
+        store
+            .claim_activation(&descendant_claim(&deep.id))
+            .await
+            .unwrap();
+        let directory = home
+            .path()
+            .join("sessions")
+            .join(ROOT)
+            .join("children")
+            .join(GRANDCHILD);
+        match failure {
+            "missing-marker" => {
+                std::fs::remove_file(directory.join("actor-authority.initialized.json")).unwrap();
+            }
+            _ => {
+                let mut row = descendant_row(home.path(), ROOT, GRANDCHILD);
+                if failure == "epoch-overflow" {
+                    row.activation.as_mut().unwrap().lease_epoch = u64::MAX;
+                } else {
+                    row.revision = u64::MAX;
+                }
+                std::fs::write(
+                    directory.join("actor-authority.json"),
+                    serde_json::to_vec_pretty(&row).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        let before = descendant_row(home.path(), ROOT, GRANDCHILD);
+        let before_deep = descendant_row(home.path(), ROOT, &deep.id);
+        let error = store
+            .delete_session_recursive(CHILD, false)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{failure}");
+        assert!(store.load_session(CHILD).await.unwrap().is_some());
+        assert_eq!(descendant_row(home.path(), ROOT, GRANDCHILD), before);
+        assert_eq!(descendant_row(home.path(), ROOT, &deep.id), before_deep);
+    }
+}
+
+#[tokio::test]
+async fn pinned_refusal_leaves_descendant_live_and_forced_delete_cancels_it() {
+    use bamboo_domain::{ActorDirectoryError, ActorDirectoryPort};
+    let home = tempfile::tempdir().unwrap();
+    let (store, _, mut child, old) = active_descendant_fixture(home.path()).await;
+    child.pinned = true;
+    store.save_session(&child).await.unwrap();
+    let before = descendant_row(home.path(), ROOT, GRANDCHILD);
+    assert!(store.delete_session_recursive(CHILD, false).await.is_err());
+    assert_eq!(descendant_row(home.path(), ROOT, GRANDCHILD), before);
+    store
+        .validate_fence(&old.fence(), Utc::now())
+        .await
+        .unwrap();
+    assert!(!store
+        .delete_session_recursive("missing-child", false)
+        .await
+        .unwrap());
+    assert_eq!(descendant_row(home.path(), ROOT, GRANDCHILD), before);
+    assert!(store.delete_session_recursive(CHILD, true).await.unwrap());
+    store.save_session(&child).await.unwrap();
+    assert_eq!(
+        store
+            .validate_fence(&old.fence(), Utc::now())
+            .await
+            .unwrap_err(),
+        ActorDirectoryError::StaleFence
+    );
+}
+
+#[tokio::test]
+async fn cleanup_cancels_surviving_pinned_descendant_before_ancestor_removal() {
+    use bamboo_domain::{ActorDirectoryError, ActorDirectoryPort};
+    let home = tempfile::tempdir().unwrap();
+    let (store, root, child, old) = active_descendant_fixture(home.path()).await;
+    let mut sibling = Session::new_child_of(SIBLING, &root, "model", "sibling");
+    sibling.pinned = true;
+    store.save_session(&sibling).await.unwrap();
+    let result = store.cleanup(CleanupMode::Children, true).await.unwrap();
+    assert_eq!(result.deleted_session_ids, [CHILD]);
+    assert!(
+        store
+            .load_session(GRANDCHILD)
+            .await
+            .unwrap()
+            .unwrap()
+            .pinned
+    );
+    assert!(store.load_session(SIBLING).await.unwrap().unwrap().pinned);
+    store.save_session(&child).await.unwrap();
+    assert_eq!(
+        store
+            .validate_fence(&old.fence(), Utc::now())
+            .await
+            .unwrap_err(),
+        ActorDirectoryError::StaleFence
+    );
+}
+
+struct ReleaseActorHook(Arc<super::actor_directory_lifetime_tests::ActorWriteHook>);
+impl Drop for ReleaseActorHook {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+fn cancelled_descendant_invalidation_retains_guards(shutdown: bool) {
+    use super::actor_directory_lifetime_tests::ActorWriteHook;
+    use bamboo_domain::{ActorDirectoryError, ActorDirectoryPort};
+    let home = tempfile::tempdir().unwrap();
+    let mut deleting_runtime = Some(runtime());
+    let (first, second, mut root, old) = deleting_runtime.as_ref().unwrap().block_on(async {
+        let (first, root, _, old) = active_descendant_fixture(home.path()).await;
+        let second = SessionStoreV2::new(home.path().into()).await.unwrap();
+        (first, second, root, old)
+    });
+    let hook = ActorWriteHook::install(
+        &first,
+        "actor-authority.json",
+        DurableWritePhase::BeforeReplace,
+        false,
+    );
+    let _release = ReleaseActorHook(hook.clone());
+    let job = {
+        let first = first.clone();
+        deleting_runtime
+            .as_ref()
+            .unwrap()
+            .spawn(async move { first.delete_session_recursive(CHILD, false).await })
+    };
+    hook.wait_entered();
+    assert_delete_locks_held(&first);
+    if shutdown {
+        deleting_runtime.take().unwrap().shutdown_background();
+    } else {
+        job.abort();
+    }
+    let successor_runtime = runtime();
+    assert!(successor_runtime.block_on(job).unwrap_err().is_cancelled());
+    assert_delete_locks_held(&first);
+    hook.release();
+    root.title = "independent writer after descendant cancellation".into();
+    successor_runtime.block_on(async {
+        second.save_session(&root).await.unwrap();
+        // Caller cancellation prevented the later physical removal from starting.
+        assert!(second.load_session(CHILD).await.unwrap().is_some());
+        assert_eq!(
+            second
+                .validate_fence(&old.fence(), Utc::now())
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::StaleFence
+        );
+        let fresh = second
+            .claim_activation(&descendant_claim(GRANDCHILD))
+            .await
+            .unwrap();
+        second
+            .start_activation(&fresh.fence(), Utc::now())
+            .await
+            .unwrap();
+        second
+            .validate_fence(&fresh.fence(), Utc::now())
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn caller_abort_keeps_started_descendant_invalidation_locked() {
+    cancelled_descendant_invalidation_retains_guards(false);
+}
+
+#[test]
+fn runtime_shutdown_keeps_started_descendant_invalidation_locked() {
+    cancelled_descendant_invalidation_retains_guards(true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn descendant_publication_error_keeps_ancestor_and_reports_actual_row_state() {
+    use super::actor_directory_lifetime_tests::ActorWriteHook;
+    use bamboo_domain::{ActorDirectoryError, ActorDirectoryPort};
+    for phase in [
+        DurableWritePhase::BeforeReplace,
+        DurableWritePhase::AfterReplace,
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let (store, _, _, old) = active_descendant_fixture(home.path()).await;
+        let before = descendant_row(home.path(), ROOT, GRANDCHILD);
+        let hook = ActorWriteHook::install(&store, "actor-authority.json", phase, true);
+        let _release = ReleaseActorHook(hook.clone());
+        let job = {
+            let store = store.clone();
+            tokio::spawn(async move { store.delete_session_recursive(CHILD, false).await })
+        };
+        hook.wait_entered();
+        assert_delete_locks_held(&store);
+        hook.release();
+        assert!(job.await.unwrap().is_err());
+        assert!(store.load_session(CHILD).await.unwrap().is_some());
+        if phase == DurableWritePhase::BeforeReplace {
+            assert_eq!(descendant_row(home.path(), ROOT, GRANDCHILD), before);
+            store
+                .validate_fence(&old.fence(), Utc::now())
+                .await
+                .unwrap();
+        } else {
+            assert_eq!(
+                store
+                    .validate_fence(&old.fence(), Utc::now())
+                    .await
+                    .unwrap_err(),
+                ActorDirectoryError::StaleFence
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn same_birth_ancestor_restore_does_not_revive_descendant_fence(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use bamboo_domain::{
+        ActorActivationClaim, ActorActivationStatus, ActorDirectoryEntry, ActorDirectoryError,
+        ActorDirectoryPort, ActorLogicalState,
+    };
+    let claim = |actor_id: &str, run_id: &str, lease_owner: &str, now| ActorActivationClaim {
+        run_id: run_id.into(),
+        lease_owner: lease_owner.into(),
+        now,
+        ..descendant_claim(actor_id)
+    };
+    let home = tempfile::tempdir()?;
+    let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+    let root = Session::new("restore-root", "model");
+    let child = Session::new_child_of("restore-child", &root, "model", "Child");
+    let grandchild = Session::new_child_of("restore-grandchild", &child, "model", "Grandchild");
+    store.save_session(&root).await?;
+    store.save_session(&child).await?;
+    store.save_session(&grandchild).await?;
+    let now = Utc::now();
+    let activation = store
+        .claim_activation(&claim(&grandchild.id, "old-run", "old-host", now))
+        .await?;
+    let fence = activation.fence();
+    store.start_activation(&fence, now).await?;
+    let descendant = home
+        .path()
+        .join("sessions/restore-root/children/restore-grandchild");
+    let original_row = std::fs::read(descendant.join("actor-authority.json"))?;
+    store.validate_fence(&fence, now).await?;
+    assert!(store.delete_session(&child.id).await?);
+    assert!(!home
+        .path()
+        .join("sessions/restore-root/children/restore-child")
+        .exists());
+    assert!(descendant.join("session.json").is_file());
+    // Only a normal Store save restores the old ancestor; no raw authority replay.
+    store.save_session(&child).await?;
+    let reopened = SessionStoreV2::new(home.path().to_path_buf()).await?;
+    let restored = reopened.load_session(&child.id).await?.unwrap();
+    assert_eq!(restored.created_at, child.created_at);
+    assert_eq!(restored.metadata_version, child.metadata_version);
+    let validation = reopened.validate_fence(&fence, now).await;
+    println!("same-birth/version restored; descendant row unchanged={}; old-fence validation={validation:?}",
+        std::fs::read(descendant.join("actor-authority.json"))? == original_row);
+    assert_eq!(validation.unwrap_err(), ActorDirectoryError::StaleFence);
+    let cancelled: ActorDirectoryEntry =
+        serde_json::from_slice(&std::fs::read(descendant.join("actor-authority.json"))?)?;
+    assert_eq!(cancelled.actor.state, ActorLogicalState::Cold);
+    assert_eq!(cancelled.actor.current_attempt, activation.attempt);
+    let durable_activation = cancelled.activation.unwrap();
+    assert_eq!(durable_activation.status, ActorActivationStatus::Cancelled);
+    assert_eq!(durable_activation.lease_epoch, activation.lease_epoch + 1);
+    let successor = reopened
+        .claim_activation(&claim(&grandchild.id, "new-run", "new-host", now))
+        .await?;
+    assert_eq!(successor.attempt, activation.attempt + 1);
+    assert_eq!(successor.lease_epoch, activation.lease_epoch + 2);
+    reopened.start_activation(&successor.fence(), now).await?;
+    reopened.validate_fence(&successor.fence(), now).await?;
+    assert_eq!(
+        reopened.validate_fence(&fence, now).await.unwrap_err(),
+        ActorDirectoryError::StaleFence
+    );
+    Ok(())
+}

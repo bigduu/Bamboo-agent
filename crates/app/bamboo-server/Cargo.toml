@@ -24,7 +24,7 @@ include = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
 
 [dependencies]
 tempfile = "3"
@@ -78,7 +78,7 @@ actix-server = "2"
 actix-service = "2"
 socket2 = "0.6"
 actix-cors = "0.7"
-actix-files = "0.6"
+actix-files = "0.7"
 # v2-P1 (#181): the `GET /v2/stream` unified WebSocket multiplex. `actix-ws`
 # gives a non-actor WS upgrade (`actix_ws::handle`) returning an owned
 # `Session` + `MessageStream` we drive from a spawned task. 0.3 targets the
@@ -100,7 +100,7 @@ tokio-stream = "0.1"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+serde_yaml = { package = "serde_norway", version = "=0.9.42" }
 # v2-P3 (#181): MessagePack codec for the `bamboo.v2.msgpack` subprotocol. We use
 # `to_vec_named` (structs-as-maps) so `ServerEnvelope`'s `#[serde(flatten)]` +
 # untagged body round-trip; the default array-encoding would break them.
@@ -150,7 +150,7 @@ base64 = "0.23"
 # (SSH deploy, `bamboo-broker`) so signature verification and SSH host-key
 # support share one resolved version.
 ed25519-dalek = { version = "=3.0.0" }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
 # Plugin source staging (`src/plugin_source.rs`): unpacking a local/remote
 # `.tar.gz`/`.tgz` plugin bundle or platform-artifact archive. `flate2` is
 # already pulled in transitively by `actix-http`'s gzip support, but a crate
@@ -163,7 +163,6 @@ tar = "0.4"
 # already depends on the same "0.10" line for its own WS message-rate
 # limiting, so this adds no new crate to the dependency tree.
 governor = "0.10"
-notify-rust = "4.18"
 notify = "8"
 # Feishu/Lark connect adapter (`src/connect/platforms/feishu/`): the
 # `pbbp2.Frame`/`Header` wire types are hand-derived `prost::Message` impls
@@ -182,7 +181,29 @@ ticket-runtime-fixtures = ["bamboo-tickets/test-utils"]
 # Kept out of defaults so production builds retain the ordinary global path.
 test-utils = ["bamboo-config/test-utils"]
 
+# macOS and Windows keep notify-rust's existing native notification APIs.
+# Disable its default Unix zbus 5 backend, whose standalone wire/name crates
+# are retired (RUSTSEC-2026-0370/0371/0372).
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+notify-rust = { version = "4.18", default-features = false }
+
+# Unix notifications use maintained pure-Rust D-Bus, without a new system
+# libdbus dependency or a bundled native library.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus = { version = "6", default-features = false, features = ["default-rt"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Existing locked objc2 versions; AppKit UI is confined to the own-executable helper.
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSGeometry"] }
+
+# Exercise the same XDG wire contract on macOS without creating a D-Bus
+# connection or changing its production notification implementation.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+zbus = { version = "6", default-features = false }
+
 [dev-dependencies]
+bamboo-server-tools = { path = "../bamboo-server-tools", features = ["test-utils"] }
 wiremock = "0.6"
 tokio-test = "0.4"
 mockall = "0.15"

@@ -44,6 +44,9 @@ use std::path::PathBuf;
 
 pub mod error;
 
+/// Explicit, content-free OpenTelemetry initialization and W3C propagation.
+pub use bamboo_infrastructure::telemetry;
+
 pub mod commands;
 
 #[doc(hidden)]
@@ -128,9 +131,10 @@ pub mod core {
 pub use bamboo_infrastructure as infrastructure;
 pub use bamboo_sdk::agent;
 pub use bamboo_sdk::{
-    Agent, AgentBuilder, AgentHook, AgentHookPoint, HookPayload, HookResult, HookRunner,
-    HookToolOutcome, LifecycleHookEvent, LifecycleHookTestOutput, LifecycleScriptRunner,
-    ScriptHook, ShellCommandHook, ShellHookEvent,
+    Agent, AgentBuilder, AgentHook, AgentHookPoint, CountedLoopConfig, HookPayload, HookResult,
+    HookRunner, HookToolOutcome, LifecycleHookEvent, LifecycleHookTestOutput,
+    LifecycleScriptRunner, LoopControlConfig, ScriptHook, SdkSkillInput, ShellCommandHook,
+    ShellHookEvent,
 };
 
 // Re-export the runtime config crate so consumers can reach config, paths,

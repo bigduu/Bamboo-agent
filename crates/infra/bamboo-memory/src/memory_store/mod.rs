@@ -109,6 +109,19 @@ pub struct MemoryStore {
     store: jiandu_memory::memory_store::MemoryStore,
 }
 
+/// Jiandu 0.3.3 stores message IDs without durable role/content proof. Bamboo
+/// therefore treats Session message coverage as unknown, including old records
+/// and records whose maintenance has changed the actor. Keep the source Session,
+/// memory identity and body; normalize only the returned view, never stored bytes.
+fn with_unknown_session_ranges(mut document: DurableMemoryDocument) -> DurableMemoryDocument {
+    for source in &mut document.frontmatter.sources {
+        if source.kind == "session" {
+            source.message_range.clear();
+        }
+    }
+    document
+}
+
 impl Default for MemoryStore {
     fn default() -> Self {
         Self::with_defaults()
@@ -116,6 +129,12 @@ impl Default for MemoryStore {
 }
 
 impl MemoryStore {
+    /// The active Jiandu canonical root, including an explicitly selected root.
+    /// External clients must share this root rather than guessing a default.
+    pub fn data_dir(&self) -> PathBuf {
+        self.store.resolver().data_dir()
+    }
+
     /// Construct a Jiandu store rooted at an explicit data directory.
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -262,7 +281,10 @@ impl MemoryStore {
         id: &str,
         preferred_project_key: Option<&str>,
     ) -> io::Result<Option<DurableMemoryDocument>> {
-        self.store.get_memory(id, preferred_project_key).await
+        self.store
+            .get_memory(id, preferred_project_key)
+            .await
+            .map(|document| document.map(with_unknown_session_ranges))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -293,6 +315,7 @@ impl MemoryStore {
                 granularity,
             )
             .await
+            .map(with_unknown_session_ranges)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -325,6 +348,7 @@ impl MemoryStore {
                 granularity,
             )
             .await
+            .map(with_unknown_session_ranges)
     }
 
     pub async fn archive_memory(
@@ -337,6 +361,7 @@ impl MemoryStore {
         self.store
             .archive_memory(id, preferred_project_key, mode, reason)
             .await
+            .map(|document| document.map(with_unknown_session_ranges))
     }
 
     pub async fn split_memory(
@@ -619,7 +644,15 @@ impl MemoryStore {
         scope: MemoryScope,
         project_key: Option<&str>,
     ) -> io::Result<Vec<DurableMemoryDocument>> {
-        self.store.list_memory_documents(scope, project_key).await
+        self.store
+            .list_memory_documents(scope, project_key)
+            .await
+            .map(|documents| {
+                documents
+                    .into_iter()
+                    .map(with_unknown_session_ranges)
+                    .collect()
+            })
     }
 
     pub async fn count_scope_memories(
@@ -824,6 +857,72 @@ mod tests {
             .await
             .expect("unrelated Project lookup")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_session_ranges_are_unknown_without_rewriting_memory() {
+        let directory = tempdir().expect("tempdir");
+        let store = MemoryStore::new(directory.path());
+        let project_id = bamboo_domain::ProjectId::parse("legacy_ranges").unwrap();
+        for scope in [MemoryScope::Global, MemoryScope::Project] {
+            let (store, project_key) = if scope == MemoryScope::Project {
+                (store.for_project(&project_id), Some(project_id.as_str()))
+            } else {
+                (store.clone(), None)
+            };
+            // Seed the previously persisted Jiandu format directly. Actor changes
+            // during maintenance cannot make ID-only Session coverage reliable.
+            let legacy = store
+                .store
+                .write_memory_with_retrieval_and_source_range(
+                    scope,
+                    project_key,
+                    DurableMemoryType::Reference,
+                    "Legacy source",
+                    "Preserve this user memory.",
+                    &[],
+                    &MemoryRetrievalInput::default(),
+                    Some("legacy-session"),
+                    "user",
+                    false,
+                    None,
+                    &["edited-or-deleted-message".to_string()],
+                )
+                .await
+                .unwrap();
+            assert_eq!(legacy.frontmatter.sources[0].message_range.len(), 1);
+            let bytes_before = tokio::fs::read(&legacy.path).await.unwrap();
+            let mut expected = legacy.clone();
+            expected.frontmatter.sources[0].message_range.clear();
+            assert_eq!(
+                store
+                    .get_memory(&legacy.frontmatter.id, project_key)
+                    .await
+                    .unwrap(),
+                Some(expected.clone()),
+            );
+            assert_eq!(
+                store
+                    .list_memory_documents(scope, project_key)
+                    .await
+                    .unwrap(),
+                vec![expected],
+            );
+            assert_eq!(tokio::fs::read(&legacy.path).await.unwrap(), bytes_before);
+            let archived = store
+                .archive_memory(
+                    &legacy.frontmatter.id,
+                    project_key,
+                    DurableMemoryStatus::Archived,
+                    Some("test archive"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(archived.frontmatter.sources[0].message_range.is_empty());
+            assert_eq!(archived.frontmatter.sources[0].id, "legacy-session");
+            assert_eq!(archived.body, legacy.body);
+        }
     }
 
     #[tokio::test]

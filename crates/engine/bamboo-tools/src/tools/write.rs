@@ -1,15 +1,17 @@
 use async_trait::async_trait;
 use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
-use serde_json::json;
 use std::path::Path;
 
 use super::read_tracker::{BaselineAdvance, ReadState};
-use super::{content_diagnostics, file_change, read_tracker};
+use super::{content_diagnostics, file_change, parameter_schema, read_tracker};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 struct WriteArgs {
+    /// The absolute path to the file to write
     file_path: String,
+    /// The content to write to the file
     content: String,
 }
 
@@ -38,21 +40,7 @@ impl Tool for WriteTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "The absolute path to the file to write"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "The content to write to the file"
-                }
-            },
-            "required": ["file_path", "content"],
-            "additionalProperties": false
-        })
+        parameter_schema::for_arguments::<WriteArgs>()
     }
 
     async fn invoke(
@@ -169,6 +157,17 @@ mod tests {
     use super::*;
     use crate::tools::ReadTool;
     use serde_json::json;
+
+    #[test]
+    fn schema_derivation_does_not_change_extra_argument_compatibility() {
+        let args: WriteArgs = serde_json::from_value(json!({
+            "file_path": "/tmp/example.txt",
+            "content": "example",
+            "legacy_extra": true
+        }))
+        .unwrap();
+        assert_eq!(args.content, "example");
+    }
 
     fn ctx(session_id: &str) -> ToolCtx {
         ToolCtx {

@@ -114,6 +114,7 @@ pub mod error;
 pub mod events;
 pub mod handlers;
 mod lifecycle_hooks;
+mod local_child_skills;
 pub mod logging;
 pub mod notify_sinks;
 mod permission_audit;
@@ -128,6 +129,7 @@ pub mod server;
 pub mod service_manager;
 pub mod services;
 pub mod session_app;
+mod skill_runtime;
 #[cfg(all(test, target_os = "macos"))]
 mod test_unwinding;
 pub mod tool_event_policy;
@@ -156,6 +158,7 @@ pub use routes::{
     configure_routes_with_rate_limiting, gemini_routes, openai_prefixed_routes,
 };
 pub use server::{
-    run, run_with_bind, run_with_bind_and_static, run_with_bind_and_static_tls, run_with_bind_tls,
+    native_scope_confirmation_helper_entry, run, run_with_bind, run_with_bind_and_static,
+    run_with_bind_and_static_tls, run_with_bind_tls, run_with_native_scope_confirmation,
     run_with_tls, WebService,
 };

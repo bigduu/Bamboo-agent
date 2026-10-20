@@ -59,6 +59,10 @@ impl Drop for SynchronousLaunchGuard {
 use crate::parent_request_reply::{
     ParentRequestMessageReceipt, ParentRequestReplyPort, ParentRequestReplyState,
 };
+#[cfg(feature = "test-utils")]
+#[path = "sub_agent_test_diagnostics.rs"]
+pub mod test_diagnostics;
+
 use crate::sub_agent_facade::{self as facade, Projection};
 use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_domain::session::runtime_state::ChildWaitPolicy;
@@ -153,9 +157,10 @@ enum SubAgentArgs {
     Wait {
         #[serde(default)]
         child_session_ids: Option<Vec<String>>,
-        /// Wait policy: `all` (default) resumes when every tracked child is
-        /// terminal; `any` resumes on the first; `first_error` resumes early on
-        /// any error/timeout/cancel.
+        /// Wait release policy: `all` (default) retains the wait until every
+        /// tracked child is terminal; `any` releases on the first;
+        /// `first_error` releases early on any error/timeout/cancel. Each child
+        /// outcome can wake the parent to reason while an unfinished wait stays armed.
         #[serde(default)]
         wait_for: Option<ChildWaitPolicy>,
     },
@@ -661,11 +666,9 @@ fn parse_model_spec(
     Ok(bamboo_domain::ProviderModelRef::new(provider, spec))
 }
 
-/// Default max nesting depth for sub-agent spawning (Phase 6: direct nested
-/// execution). An agent at `spawn_depth >= this` may not create more children,
-/// bounding worker→worker→… recursion. Root orchestrator = depth 0, so this
-/// allows 4 levels of sub-agents below the root.
-pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = 4;
+/// Compatibility export of the migration default. Creation reads the Host's
+/// current `subagents.max_spawn_depth` through the shared child-session policy.
+pub use bamboo_config::DEFAULT_MAX_SPAWN_DEPTH;
 
 /// The `SubAgent` tool description. Exposed standalone so a nested worker's
 /// SubAgent proxy can advertise the identical tool to its own LLM (no drift).
@@ -700,10 +703,34 @@ impl Tool for SubAgentTool {
         args: serde_json::Value,
         ctx: ToolCtx,
     ) -> Result<ToolOutcome, ToolError> {
+        #[cfg(feature = "test-utils")]
+        let diagnostic = test_diagnostics::capture(&ctx);
         let host_args = args.clone();
         let normalized = facade::normalize(args)?;
         let args = normalized.args;
         let projection = normalized.projection;
+        if !bamboo_agent_core::tools::suspension_allowed() {
+            // Normalize compact/legacy calls before selecting effects, and
+            // reject before a Host callback or owned launch task can escape
+            // the invoking task-local scope. Reads/cancel retain their gates.
+            let action = args
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(if projection.is_none() { "create" } else { "" });
+            // Even non-auto Create publishes a pending child; update
+            // and send can reset a child to pending. Deny all variants.
+            let may_wait = projection == Some(Projection::ParentQuestionAsk)
+                || matches!(
+                    action,
+                    "create" | "run" | "wait" | "update" | "send_message"
+                );
+            if may_wait {
+                return Err(ToolError::Execution(
+                    "suspension_disabled: SubAgent operation may create or wait for child work"
+                        .into(),
+                ));
+            }
+        }
         if projection == Some(Projection::Tree) {
             let parent_id = ctx.session_id().ok_or_else(|| {
                 ToolError::Execution("SubAgent requires a current session".into())
@@ -888,15 +915,21 @@ impl Tool for SubAgentTool {
                 ToolError::Execution(format!("SubAgent launch owner failed: {error}"))
             })?;
             cancel_on_drop.armed = false;
+            #[cfg(feature = "test-utils")]
+            test_diagnostics::record(&diagnostic, &result);
             return facade::finish(projection, result);
         }
         if action == Some("cancel") {
             let result = self.invoke_cancel(args, ctx).await;
+            #[cfg(feature = "test-utils")]
+            test_diagnostics::record(&diagnostic, &result);
             return facade::finish(projection, result);
         }
         let result = self
             .invoke_inner(args, ctx, None, projection.is_some())
             .await;
+        #[cfg(feature = "test-utils")]
+        test_diagnostics::record(&diagnostic, &result);
         facade::finish(projection, result)
     }
 }
@@ -1186,17 +1219,11 @@ impl SubAgentTool {
                     }
                 }
                 let mut packet_counts = None;
-                // Phase 6: enforce the max nesting-depth cap. `parent` is this
-                // agent's run session; its `spawn_depth` is the current nesting
-                // level (workers stamp it from the actor spec, so it accumulates
-                // across the actor boundary). Refuse to spawn beyond the cap so
-                // worker→worker→… recursion is bounded.
-                if parent.spawn_depth >= DEFAULT_MAX_SPAWN_DEPTH {
-                    return Err(ToolError::InvalidArguments(format!(
-                        "spawn depth limit ({}) reached: this agent is at depth {} and cannot create more sub-agents. Finish the work here, or delegate to a sibling.",
-                        DEFAULT_MAX_SPAWN_DEPTH, parent.spawn_depth
-                    )));
-                }
+                // Resident reuse bypasses the creator, so it shares the same
+                // Host policy and canonical parent validation here.
+                let parent = child_session::validate_spawn_parent(self.sessions.as_ref(), &parent)
+                    .await
+                    .map_err(tool_error_from_child_session)?;
                 let title = normalize_title(title, description)?;
                 let responsibility = normalize_required_text(responsibility, "responsibility")?;
                 let prompt = if compact {
@@ -1235,10 +1262,7 @@ impl SubAgentTool {
                         }
                     };
                 let (workspace, workspace_source) = if compact {
-                    // Chat stores its workspace on the typed metadata plane.
-                    // Use the same canonical resolver as Plan before creation.
-                    self.sessions
-                        .resolve_child_workspace(&parent, workspace.as_deref())
+                    child_session::resolve_shared_child_workspace(self.sessions.as_ref(), &parent)
                         .await
                         .map_err(tool_error_from_child_session)?
                 } else {
@@ -1587,9 +1611,7 @@ impl SubAgentTool {
                             runtime_metadata.insert(bamboo_domain::CHILD_PACKET_INPUT_KEY.into(),
                                 serde_json::to_string(packet).map_err(|_| ToolError::InvalidArguments(bamboo_domain::ChildContextPacketError::Invalid.to_string()))?);
                         }
-                        let result = Box::pin(child_session::create_child_action(
-                            self.sessions.as_ref(),
-                            CreateChildInput {
+                        let input = CreateChildInput {
                                 parent_session: parent.clone(),
                                 child_id: child_id.clone(),
                                 title: title.clone(),
@@ -1615,10 +1637,12 @@ impl SubAgentTool {
                                 // Phase 3: model-controllable context fork — carry
                                 // the last N parent messages into the child's brief.
                                 context_fork: fork_last_messages.filter(|n| *n > 0),
-                            },
-                        ))
-                        .await
-                        .map_err(tool_error_from_child_session)?;
+                            };
+                        let result = if compact {
+                            Box::pin(child_session::create_shared_child_action(self.sessions.as_ref(), input)).await
+                        } else {
+                            Box::pin(child_session::create_child_action(self.sessions.as_ref(), input)).await
+                        }.map_err(tool_error_from_child_session)?;
                         {
                             let child = self.sessions.load_child_for_parent(&parent.id, &result.child_session_id)
                                 .await.map_err(tool_error_from_child_session)?;
@@ -1684,7 +1708,7 @@ impl SubAgentTool {
                 let note = if should_wait {
                     "Child session queued (typically 30-120 seconds); the parent is suspended until it finishes. Use send_message (not create) to correct a child in place."
                 } else if should_auto_run {
-                    "Child session is running in the background (typically 30-120 seconds). Spawn any other children you need, then call action=wait once to suspend until they finish. Use send_message (not create) to correct a child in place."
+                    "Child session is running in the background (typically 30-120 seconds). Spawn any other children you need, then call action=wait once. Each completion wakes you to process its result while unfinished children remain tracked. Use send_message to correct a child in place."
                 } else {
                     "Child session created (not started). Use action=run to start it. Use send_message (not create) to correct a child in place."
                 };
@@ -1813,6 +1837,7 @@ impl SubAgentTool {
                     "already_terminal_child_ids": dropped_ids,
                     "wait_for": policy.as_str(),
                     "waiting_on": count,
+                    "note": "Each completed child wakes the parent to process its result. Unfinished children remain tracked until the wait release policy is satisfied.",
                 }))
             }
             SubAgentArgs::List => {

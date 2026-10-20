@@ -5,17 +5,75 @@ use bamboo_agent_core::{
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Deserialize;
 use serde_json::json;
+use std::future::Future;
 use std::path::Path;
+use std::sync::Arc;
 
+use futures::future::BoxFuture;
+
+use super::parameter_schema;
 use super::read_tracker::{self, MAX_TRACKED_FILE_SIZE};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ViewImageArgs {
+    /// Absolute local image path or exact image reference supplied by this conversation
     path: String,
 }
 
-/// Read a local raster image and return it through Bamboo's multimodal tool-result channel.
+/// Host-owned reader for references from the executing Session's original image parts.
+/// It is scoped to dispatch, never deserialized from model arguments or persisted.
+pub type ViewImageReferenceReader =
+    Arc<dyn Fn(String) -> BoxFuture<'static, Result<Vec<u8>, ToolError>> + Send + Sync>;
+
+pub const MAX_VIEW_IMAGE_BYTES: usize = MAX_TRACKED_FILE_SIZE as usize;
+
+struct ImageReferenceScope {
+    session_id: String,
+    reader: ViewImageReferenceReader,
+}
+
+tokio::task_local! {
+    static IMAGE_REFERENCES: ImageReferenceScope;
+}
+
+/// Keep reference access inside the same inline tool dispatch and cancellation scope.
+pub async fn with_image_reference_reader<F: Future>(
+    session_id: &str,
+    reader: ViewImageReferenceReader,
+    dispatch: F,
+) -> F::Output {
+    IMAGE_REFERENCES
+        .scope(
+            ImageReferenceScope {
+                session_id: session_id.to_string(),
+                reader,
+            },
+            dispatch,
+        )
+        .await
+}
+
+fn is_image_reference(path: &str) -> bool {
+    path.starts_with("bamboo-attachment://") || path.starts_with("bamboo-image://")
+}
+
+async fn read_image_reference(ctx: &ToolCtx, reference: &str) -> Result<Vec<u8>, ToolError> {
+    let reader = IMAGE_REFERENCES
+        .try_with(|scope| {
+            (ctx.session_id() == Some(scope.session_id.as_str())).then(|| scope.reader.clone())
+        })
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            ToolError::Execution(
+                "Image reference is unavailable outside its executing conversation. Use the exact reference from the current conversation or an authorized local image path.".into(),
+            )
+        })?;
+    reader(reference.to_string()).await
+}
+
+/// Read a local raster image or a host-bound conversation image reference.
 pub struct ViewImageTool;
 
 impl ViewImageTool {
@@ -51,7 +109,7 @@ impl Tool for ViewImageTool {
     }
 
     fn description(&self) -> &str {
-        "View a local PNG, JPEG, GIF, or WebP image. Returns the image as base64 multimodal content; when hooks.image_fallback is enabled in vision mode, Bamboo uses the resolved vision model to replace it with a detailed description before the next model turn."
+        "View a local PNG, JPEG, GIF, or WebP image, or the exact image reference supplied in this conversation. Vision-capable main models receive image content directly. For a main without Vision, an explicitly configured Vision model returns a labeled, untrusted description. Uploaded images remain preserved; only this requested tool call sends them to the configured Vision model. Missing or unsupported Vision configuration returns actionable feedback. Never claim to have inspected an image before receiving a successful result."
     }
 
     fn classify(&self, _args: &serde_json::Value) -> ToolClass {
@@ -59,17 +117,7 @@ impl Tool for ViewImageTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Absolute path to a local PNG, JPEG, GIF, or WebP image"
-                }
-            },
-            "required": ["path"],
-            "additionalProperties": false
-        })
+        parameter_schema::for_arguments::<ViewImageArgs>()
     }
 
     async fn invoke(
@@ -87,43 +135,59 @@ impl Tool for ViewImageTool {
             ));
         }
 
-        let path = Path::new(raw_path);
-        if !path.is_absolute() {
-            return Err(ToolError::InvalidArguments(
-                "path must be an absolute path".to_string(),
-            ));
-        }
+        let (reference_bytes, stable) = if is_image_reference(raw_path) {
+            // Never pass an unavailable/forged reference to the ordinary file branch.
+            (Some(read_image_reference(&ctx, raw_path).await?), None)
+        } else {
+            let path = Path::new(raw_path);
+            if !path.is_absolute() {
+                return Err(ToolError::InvalidArguments(
+                    "path must be an absolute local path or a current conversation image reference"
+                        .to_string(),
+                ));
+            }
 
-        let metadata = tokio::fs::metadata(path)
-            .await
-            .map_err(|error| ToolError::Execution(format!("Failed to inspect image: {error}")))?;
-        if !metadata.is_file() {
-            return Err(ToolError::InvalidArguments(format!(
-                "Image path must point to a regular file: {}",
-                path.display()
-            )));
-        }
-        if metadata.len() > MAX_TRACKED_FILE_SIZE {
+            let metadata = tokio::fs::metadata(path).await.map_err(|error| {
+                ToolError::Execution(format!("Failed to inspect image: {error}"))
+            })?;
+            if !metadata.is_file() {
+                return Err(ToolError::InvalidArguments(format!(
+                    "Image path must point to a regular file: {}",
+                    path.display()
+                )));
+            }
+            if metadata.len() > MAX_TRACKED_FILE_SIZE {
+                return Err(ToolError::Execution(format!(
+                    "Image is {} bytes, which exceeds the maximum ViewImage size of {} bytes ({} MB)",
+                    metadata.len(),
+                    MAX_TRACKED_FILE_SIZE,
+                    MAX_TRACKED_FILE_SIZE / 1024 / 1024
+                )));
+            }
+
+            let stable = read_tracker::stable_read(raw_path).await.map_err(|error| {
+                ToolError::Execution(format!("Failed to read stable image: {error}"))
+            })?;
+            (None, Some(stable))
+        };
+        let bytes = match (&reference_bytes, &stable) {
+            (Some(bytes), _) => bytes.as_slice(),
+            (_, Some(stable)) => stable.bytes(),
+            _ => unreachable!("image source selected above"),
+        };
+        if bytes.len() > MAX_VIEW_IMAGE_BYTES {
             return Err(ToolError::Execution(format!(
-                "Image is {} bytes, which exceeds the maximum ViewImage size of {} bytes ({} MB)",
-                metadata.len(),
-                MAX_TRACKED_FILE_SIZE,
-                MAX_TRACKED_FILE_SIZE / 1024 / 1024
+                "Image exceeds the maximum ViewImage size of {MAX_VIEW_IMAGE_BYTES} bytes"
             )));
         }
-
-        let stable = read_tracker::stable_read(raw_path).await.map_err(|error| {
-            ToolError::Execution(format!("Failed to read stable image: {error}"))
-        })?;
-        let bytes = stable.bytes();
         let mime_type = Self::supported_mime(bytes).ok_or_else(|| {
             ToolError::InvalidArguments(
                 "Unsupported image format; expected PNG, JPEG, GIF, or WebP content".to_string(),
             )
         })?;
 
-        if let Some(session_id) = ctx.session_id() {
-            read_tracker::mark_stable_read(session_id, raw_path, &stable).await;
+        if let (Some(session_id), Some(stable)) = (ctx.session_id(), stable.as_ref()) {
+            read_tracker::mark_stable_read(session_id, raw_path, stable).await;
         }
 
         Ok(ToolOutcome::Completed(ToolResult {

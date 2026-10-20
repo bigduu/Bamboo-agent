@@ -16,6 +16,83 @@ const MAX_IDS: usize = 4096;
 const MAX_RECEIPT_SCAN_ROOTS: usize = 4096;
 const MAX_RECEIPT_SCAN_CHILDREN: usize = 16384;
 const MAX_RECEIPT_LEDGER_BYTES: u64 = 32 * 1024 * 1024;
+const COMPLETION_SOURCE_KEY: &str = "runtime.child_completion_source_v1";
+
+/// The durable, bounded Host proof for a strict terminal receipt. This is not
+/// Worker-supplied evidence: only the Host-only prepare/commit APIs can publish
+/// it. The sequence is the Host's independently applied contiguous frontier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerTerminalCompleteness {
+    pub version: u32,
+    pub session_id: String,
+    pub created_at: DateTime<Utc>,
+    pub parent_session_id: String,
+    pub root_session_id: String,
+    pub project_id: Option<String>,
+    pub spawn_depth: u32,
+    pub activation_run_id: String,
+    pub execution_epoch: u64,
+    pub contiguous_applied_seq: u64,
+    pub message_count: usize,
+    pub messages_sha256: String,
+}
+
+/// Rust-only live Host evidence. Deliberately not deserializable from Worker
+/// JSON or Session metadata. The caller must derive the frontier from applied
+/// Events, never copy a Worker's claimed final sequence into this constructor.
+#[derive(Clone)]
+pub struct HostTerminalCompleteness {
+    proof: BrokerTerminalCompleteness,
+}
+
+impl HostTerminalCompleteness {
+    pub fn from_verified_host(
+        session: &Session,
+        activation_run_id: &str,
+        execution_epoch: u64,
+        contiguous_applied_seq: u64,
+    ) -> io::Result<Self> {
+        validate_session_id(&session.id)?;
+        bamboo_domain::ActorSession::from_session(session)
+            .map_err(|_| invalid("invalid Host terminal completeness lineage"))?;
+        if session.kind != SessionKind::Child
+            || session
+                .parent_session_id
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || session.root_session_id.is_empty()
+            || activation_run_id.is_empty()
+            || activation_run_id.len() > 128
+            || execution_epoch == 0
+        {
+            return Err(invalid("invalid Host terminal completeness identity"));
+        }
+        Ok(Self {
+            proof: BrokerTerminalCompleteness {
+                version: 1,
+                session_id: session.id.clone(),
+                created_at: session.created_at,
+                parent_session_id: session.parent_session_id.clone().expect("validated parent"),
+                root_session_id: session.root_session_id.clone(),
+                project_id: session.project_id_meta(),
+                spawn_depth: session.spawn_depth,
+                activation_run_id: activation_run_id.into(),
+                execution_epoch,
+                contiguous_applied_seq,
+                message_count: session.messages.len(),
+                messages_sha256: digest_messages(&session.messages)?,
+            },
+        })
+    }
+
+    pub fn execution_epoch(&self) -> u64 {
+        self.proof.execution_epoch
+    }
+
+    pub fn contiguous_applied_seq(&self) -> u64 {
+        self.proof.contiguous_applied_seq
+    }
+}
 
 /// Rust-only Host evidence; Session metadata and Worker JSON cannot construct
 /// this value. The embedding Host first verifies its authoritative question
@@ -95,6 +172,12 @@ pub struct BrokerTerminalReceipt {
     pub parent_question_request: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_yield_call_id: Option<String>,
+    /// Independent strict marker. Missing proof must never reinterpret a strict
+    /// receipt as legacy. None retains the explicit legacy receipt behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_execution_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_completeness: Option<BrokerTerminalCompleteness>,
     committed: bool,
 }
 
@@ -138,6 +221,108 @@ fn identity_matches(receipt: &BrokerTerminalReceipt, session: &Session) -> bool 
         && receipt.root_session_id == session.root_session_id
         && receipt.project_id == session.project_id_meta()
         && valid_parent_mailbox(&receipt.parent_mailbox)
+}
+
+// This is only the receipt-bound projection of the engine's completion source.
+// The engine still validates the complete source before publishing completion.
+#[derive(Deserialize)]
+struct PendingCompletionIdentity {
+    activation_run_id: String,
+    child_session_id: String,
+    child_created_at: DateTime<Utc>,
+    parent_session_id: String,
+    project_id: Option<String>,
+    status: String,
+    error_sha256: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingCompletionEnvelope {
+    pending_confirmation: PendingCompletionIdentity,
+}
+
+fn pending_completion_matches(receipt: &BrokerTerminalReceipt, session: &Session) -> bool {
+    let Some(raw) = session.metadata.get(COMPLETION_SOURCE_KEY) else {
+        return false;
+    };
+    if raw.len() > 8192 {
+        return false;
+    }
+    let Ok(envelope) = serde_json::from_str::<PendingCompletionEnvelope>(raw) else {
+        return false;
+    };
+    completion_identity_matches(receipt, &envelope.pending_confirmation)
+}
+
+fn completion_identity_matches(
+    receipt: &BrokerTerminalReceipt,
+    source: &PendingCompletionIdentity,
+) -> bool {
+    let expected_error = match receipt.terminal_error.as_ref() {
+        Some(error) => match serde_json::to_vec(error) {
+            Ok(bytes) => Some(format!("{:x}", Sha256::digest(bytes))),
+            Err(_) => return false,
+        },
+        None => None,
+    };
+    source.activation_run_id == receipt.activation_run_id
+        && source.child_session_id == receipt.session_id
+        && source.child_created_at == receipt.created_at
+        && source.parent_session_id == receipt.parent_session_id
+        && source.project_id == receipt.project_id
+        && source.status == receipt.terminal_status
+        && source.error_sha256 == expected_error
+}
+
+fn staged_terminal_matches(receipt: &BrokerTerminalReceipt, session: &Session) -> bool {
+    session.last_run_status().as_deref() == Some("running")
+        && session.last_run_error().is_none()
+        && pending_completion_matches(receipt, session)
+}
+
+fn completeness_matches_receipt(receipt: &BrokerTerminalReceipt) -> bool {
+    match (
+        receipt.required_execution_epoch,
+        receipt.terminal_completeness.as_ref(),
+    ) {
+        (None, None) => true,
+        (Some(epoch), Some(proof)) => {
+            proof.version == 1
+                && epoch != 0
+                && proof.execution_epoch == epoch
+                && proof.session_id == receipt.session_id
+                && proof.created_at == receipt.created_at
+                && proof.parent_session_id == receipt.parent_session_id
+                && proof.root_session_id == receipt.root_session_id
+                && proof.project_id == receipt.project_id
+                && proof.activation_run_id == receipt.activation_run_id
+                && proof.message_count <= receipt.message_count
+        }
+        _ => false,
+    }
+}
+
+fn completeness_prefix_matches(
+    receipt: &BrokerTerminalReceipt,
+    session: &Session,
+) -> io::Result<bool> {
+    if !completeness_matches_receipt(receipt) {
+        return Ok(false);
+    }
+    let Some(proof) = receipt.terminal_completeness.as_ref() else {
+        return Ok(true);
+    };
+    if proof.spawn_depth != session.spawn_depth {
+        return Ok(false);
+    }
+    // The SDK may append Host messages after Event drain. Both the earlier
+    // applied-event prefix and the final prepared receipt remain immutable.
+    let mut prefix_receipt = receipt.clone();
+    prefix_receipt.message_count = proof.message_count;
+    prefix_receipt.messages_sha256 = proof.messages_sha256.clone();
+    prefix_receipt.tool_yield_call_id = None;
+    prefix_matches(&prefix_receipt, session)
 }
 
 fn prefix_matches(receipt: &BrokerTerminalReceipt, session: &Session) -> io::Result<bool> {
@@ -215,9 +400,14 @@ async fn read_ledger(dir: &Path) -> io::Result<ReceiptLedger> {
                 .receipts
                 .iter()
                 .chain(ledger.acknowledged_anchor.iter())
-                .any(|receipt| !valid_parent_mailbox(&receipt.parent_mailbox))
+                .any(|receipt| {
+                    !valid_parent_mailbox(&receipt.parent_mailbox)
+                        || !completeness_matches_receipt(receipt)
+                })
             {
-                return Err(invalid("invalid Host broker receipt parent mailbox"));
+                return Err(invalid(
+                    "invalid Host broker receipt route or completeness proof",
+                ));
             }
             Ok(ledger)
         }
@@ -227,9 +417,19 @@ async fn read_ledger(dir: &Path) -> io::Result<ReceiptLedger> {
 }
 
 async fn write_ledger(dir: &Path, ledger: &ReceiptLedger) -> io::Result<()> {
+    #[cfg(test)]
+    if RECEIPT_WRITE_FAILURES.lock().unwrap().remove(dir) {
+        return Err(io::Error::other(
+            "injected Host broker receipt write failure",
+        ));
+    }
     let bytes = serde_json::to_vec(ledger).map_err(|_| invalid("invalid Host broker receipt"))?;
     durable_atomic_write(&dir.join(RECEIPTS_FILE), &bytes).await
 }
+
+#[cfg(test)]
+static RECEIPT_WRITE_FAILURES: std::sync::LazyLock<std::sync::Mutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
 async fn real_receipt_directory(path: &Path) -> io::Result<bool> {
     match fs::symlink_metadata(path).await {
@@ -461,8 +661,21 @@ impl SessionStoreV2 {
                 message_ids,
             },
             None,
+            None,
         )
         .await
+    }
+
+    /// Prepare a strict receipt using an independently derived, live Host
+    /// frontier. This does not authorize ACK until explicit strict commit.
+    pub async fn prepare_broker_terminal_receipt_with_completeness(
+        &self,
+        session: &Session,
+        route: BrokerTerminalRoute<'_>,
+        completeness: &HostTerminalCompleteness,
+    ) -> io::Result<()> {
+        self.prepare_terminal_receipt(session, route, None, Some(completeness))
+            .await
     }
 
     pub async fn prepare_broker_tool_yield_receipt(
@@ -471,7 +684,18 @@ impl SessionStoreV2 {
         route: BrokerTerminalRoute<'_>,
         proof: &HostToolYield,
     ) -> io::Result<()> {
-        self.prepare_terminal_receipt(session, route, Some(proof))
+        self.prepare_terminal_receipt(session, route, Some(proof), None)
+            .await
+    }
+
+    pub async fn prepare_broker_tool_yield_receipt_with_completeness(
+        &self,
+        session: &Session,
+        route: BrokerTerminalRoute<'_>,
+        proof: &HostToolYield,
+        completeness: &HostTerminalCompleteness,
+    ) -> io::Result<()> {
+        self.prepare_terminal_receipt(session, route, Some(proof), Some(completeness))
             .await
     }
 
@@ -480,6 +704,7 @@ impl SessionStoreV2 {
         session: &Session,
         route: BrokerTerminalRoute<'_>,
         proof: Option<&HostToolYield>,
+        completeness: Option<&HostTerminalCompleteness>,
     ) -> io::Result<()> {
         let BrokerTerminalRoute {
             activation_run_id,
@@ -563,7 +788,7 @@ impl SessionStoreV2 {
         let dir = self.broker_receipt_dir(&session.id).await?;
         let mut ledger = read_ledger(&dir).await?;
         if let Some(anchor) = ledger.acknowledged_anchor.as_ref() {
-            if !prefix_matches(anchor, session)? {
+            if !prefix_matches(anchor, session)? || !completeness_prefix_matches(anchor, session)? {
                 return Err(invalid("Child broker transcript anchor changed"));
             }
         }
@@ -591,8 +816,13 @@ impl SessionStoreV2 {
             parent_question_request: (session.last_run_status().as_deref() == Some("suspended"))
                 .then(|| session.metadata.get(PARENT_QUESTION_REQUEST_KEY).cloned())
                 .flatten(),
+            required_execution_epoch: completeness.map(HostTerminalCompleteness::execution_epoch),
+            terminal_completeness: completeness.map(|host| host.proof.clone()),
             committed: false,
         };
+        if !completeness_prefix_matches(&receipt, session)? {
+            return Err(invalid("Host terminal completeness proof changed"));
+        }
         if let Some(existing) = ledger.receipts.iter().find(|item| {
             item.created_at == receipt.created_at
                 && item.activation_run_id == receipt.activation_run_id
@@ -622,6 +852,28 @@ impl SessionStoreV2 {
         session: &Session,
         activation_run_id: &str,
     ) -> io::Result<BrokerTerminalReceipt> {
+        self.commit_terminal_receipt(session, activation_run_id, None)
+            .await
+    }
+
+    /// Commit only the exact proof retained by the live Host after Event drain.
+    /// A cold recovery may re-ACK a committed proof but cannot mint this commit.
+    pub async fn commit_broker_terminal_receipt_with_completeness(
+        &self,
+        session: &Session,
+        activation_run_id: &str,
+        completeness: &HostTerminalCompleteness,
+    ) -> io::Result<BrokerTerminalReceipt> {
+        self.commit_terminal_receipt(session, activation_run_id, Some(completeness))
+            .await
+    }
+
+    async fn commit_terminal_receipt(
+        &self,
+        session: &Session,
+        activation_run_id: &str,
+        completeness: Option<&HostTerminalCompleteness>,
+    ) -> io::Result<BrokerTerminalReceipt> {
         let _guard = self
             .acquire_session_write_lock(&session.id, SaveKind::Runtime)
             .await?;
@@ -638,9 +890,30 @@ impl SessionStoreV2 {
                 item.created_at == session.created_at && item.activation_run_id == activation_run_id
             })
             .ok_or_else(|| invalid("prepared broker receipt missing"))?;
-        if !prefix_matches(receipt, &durable)?
-            || durable.last_run_status().as_deref() != Some(receipt.terminal_status.as_str())
-            || durable.last_run_error() != receipt.terminal_error
+        if receipt.terminal_completeness.as_ref() != completeness.map(|host| &host.proof)
+            || receipt.required_execution_epoch
+                != completeness.map(HostTerminalCompleteness::execution_epoch)
+        {
+            return Err(invalid(
+                "live Host terminal completeness proof missing or changed",
+            ));
+        }
+        let terminal_checkpoint_matches = durable.last_run_status().as_deref()
+            == Some(receipt.terminal_status.as_str())
+            && durable.last_run_error() == receipt.terminal_error;
+        // Keep public status non-terminal throughout the transcript/proof gap.
+        // Only a live caller carrying the same exact pending envelope and the
+        // intended terminal status may confirm this staged canonical save.
+        let staged_checkpoint_matches = staged_terminal_matches(receipt, &durable)
+            && session.last_run_status().as_deref() == Some(receipt.terminal_status.as_str())
+            && session.last_run_error() == receipt.terminal_error
+            && pending_completion_matches(receipt, session)
+            && durable.metadata.get(COMPLETION_SOURCE_KEY)
+                == session.metadata.get(COMPLETION_SOURCE_KEY);
+        if !identity_matches(receipt, session)
+            || !prefix_matches(receipt, &durable)?
+            || !completeness_prefix_matches(receipt, &durable)?
+            || !(terminal_checkpoint_matches || staged_checkpoint_matches)
         {
             return Err(invalid(
                 "Child broker terminal was not canonically checkpointed",
@@ -654,12 +927,146 @@ impl SessionStoreV2 {
         if must_publish {
             write_ledger(&dir, &ledger).await?;
         }
+        // ACK eligibility includes durable ledger readback while the same
+        // cross-process lock still excludes ordinary Session writers.
+        if !read_ledger(&dir)
+            .await?
+            .receipts
+            .iter()
+            .any(|receipt| receipt == &confirmed)
+        {
+            return Err(invalid("committed Host broker receipt readback changed"));
+        }
+        Ok(confirmed)
+    }
+
+    /// Publish only the pending completion observed by this caller. A concurrent
+    /// successor must never receive an older Run's status/source, even if its
+    /// transcript still extends the committed receipt prefix.
+    pub async fn publish_broker_terminal_source(
+        &self,
+        receipt: &BrokerTerminalReceipt,
+        expected: &Session,
+        published_source: &str,
+    ) -> io::Result<Session> {
+        if !receipt.committed || published_source.len() > 4096 {
+            return Err(invalid(
+                "broker terminal source requires a committed bounded receipt",
+            ));
+        }
+        let published: serde_json::Value = serde_json::from_str(published_source)
+            .map_err(|_| invalid("invalid published broker terminal source"))?;
+        let published_identity: PendingCompletionIdentity = serde_json::from_str(published_source)
+            .map_err(|_| invalid("invalid published broker terminal source identity"))?;
+        if !completion_identity_matches(receipt, &published_identity) {
+            return Err(invalid(
+                "published broker terminal source does not match receipt",
+            ));
+        }
+        let mut published_expected = expected.clone();
+        published_expected
+            .metadata
+            .insert(COMPLETION_SOURCE_KEY.into(), published_source.into());
+        published_expected.set_last_run_status(&receipt.terminal_status);
+        if let Some(error) = receipt.terminal_error.as_ref() {
+            published_expected.set_last_run_error(error);
+        } else {
+            published_expected.clear_last_run_error();
+        }
+        if expected
+            .metadata
+            .get(COMPLETION_SOURCE_KEY)
+            .map(String::as_str)
+            != Some(published_source)
+        {
+            if !staged_terminal_matches(receipt, expected) {
+                return Err(invalid(
+                    "broker terminal source is not the expected pending Run",
+                ));
+            }
+            let pending: serde_json::Value = serde_json::from_str(
+                expected
+                    .metadata
+                    .get(COMPLETION_SOURCE_KEY)
+                    .expect("validated pending source"),
+            )
+            .map_err(|_| invalid("invalid pending broker terminal source"))?;
+            if pending.get("pending_confirmation") != Some(&published) {
+                return Err(invalid(
+                    "broker terminal published source differs from pending source",
+                ));
+            }
+        } else if expected.last_run_status().as_deref() != Some(receipt.terminal_status.as_str())
+            || expected.last_run_error() != receipt.terminal_error
+        {
+            return Err(invalid("published broker terminal source status changed"));
+        }
+
+        let started = Instant::now();
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let writer = self
+            .acquire_session_write_lock(&receipt.session_id, SaveKind::Full)
+            .await?;
+        let guards = DefaultWriterGuards::shared(lifecycle, task, writer);
+        let current = self
+            .load_session_unlocked(&receipt.session_id)
+            .await?
+            .ok_or_else(|| invalid("canonical Child missing at broker source publication"))?;
+        let dir = self.broker_receipt_dir(&receipt.session_id).await?;
+        let ledger = read_ledger(&dir).await?;
+        if !ledger
+            .receipts
+            .iter()
+            .chain(ledger.acknowledged_anchor.iter())
+            .any(|item| item == receipt && item.committed)
+            || !identity_matches(receipt, &current)
+            || !prefix_matches(receipt, &current)?
+            || !completeness_prefix_matches(receipt, &current)?
+        {
+            return Err(invalid(
+                "broker terminal publication lost its exact committed receipt",
+            ));
+        }
+        let canonical_value = serde_json::to_value(&current)
+            .map_err(|_| invalid("invalid canonical broker terminal snapshot"))?;
+        let published_value = serde_json::to_value(&published_expected)
+            .map_err(|_| invalid("invalid expected broker terminal snapshot"))?;
+        // A duplicate reconciler may observe exactly the first reconciler's
+        // publication. Any other intervening runtime/input/source change fails.
+        if canonical_value == published_value {
+            return Ok(current);
+        }
+        if canonical_value
+            != serde_json::to_value(expected)
+                .map_err(|_| invalid("invalid expected pending broker terminal snapshot"))?
+            || !staged_terminal_matches(receipt, &current)
+        {
+            return Err(invalid(
+                "broker terminal source snapshot changed before publication",
+            ));
+        }
+        self.save_session_after_lock(&published_expected, started, &guards, None)
+            .await?;
+        let confirmed = self
+            .load_session_unlocked(&receipt.session_id)
+            .await?
+            .ok_or_else(|| invalid("published broker terminal source disappeared"))?;
+        if serde_json::to_value(&confirmed)
+            .map_err(|_| invalid("invalid broker terminal publication readback"))?
+            != published_value
+        {
+            return Err(invalid(
+                "broker terminal source publication readback changed",
+            ));
+        }
         Ok(confirmed)
     }
 
     /// On reconnect, return only receipts whose Host transcript proof still
-    /// matches. A prepared receipt may be promoted after a crash between final
-    /// save and ACK. Any uncertain old Run blocks a successor from consuming
+    /// matches. Only a legacy prepared receipt may be promoted after a crash
+    /// between final save and ACK. Strict receipts require an earlier explicit
+    /// live commit. Any uncertain old Run blocks a successor from consuming
     /// its mailbox, rather than silently stranding that Run's Outcome.
     pub async fn recover_broker_terminal_receipts(
         &self,
@@ -675,16 +1082,25 @@ impl SessionStoreV2 {
         let dir = self.broker_receipt_dir(&session.id).await?;
         let mut ledger = read_ledger(&dir).await?;
         if let Some(anchor) = ledger.acknowledged_anchor.as_ref() {
-            if !prefix_matches(anchor, &durable)? {
+            if !prefix_matches(anchor, &durable)? || !completeness_prefix_matches(anchor, &durable)?
+            {
                 return Err(invalid("ACKed Child broker transcript anchor changed"));
             }
         }
         let mut changed = false;
         for receipt in &mut ledger.receipts {
-            if !identity_matches(receipt, session) || !prefix_matches(receipt, &durable)? {
+            if !identity_matches(receipt, session)
+                || !prefix_matches(receipt, &durable)?
+                || !completeness_prefix_matches(receipt, &durable)?
+            {
                 return Err(invalid("unverified old Child broker receipt"));
             }
             if !receipt.committed {
+                if receipt.required_execution_epoch.is_some() {
+                    return Err(invalid(
+                        "strict Child broker completeness was not live committed",
+                    ));
+                }
                 if durable.last_run_status().as_deref() != Some(receipt.terminal_status.as_str())
                     || durable.last_run_error() != receipt.terminal_error
                 {
@@ -753,9 +1169,21 @@ impl SessionStoreV2 {
             .iter()
             .chain(ledger.acknowledged_anchor.iter())
         {
+            // A failed strict proof publication must let the SDK persist its
+            // conservative error projection instead of leaving public success
+            // behind. This never grants ACK: the receipt remains uncommitted,
+            // and both exact transcript prefixes are still protected below.
+            let strict_failure_projection = receipt.required_execution_epoch.is_some()
+                && candidate.last_run_status().as_deref() == Some("error")
+                && candidate
+                    .last_run_error()
+                    .is_some_and(|error| !error.is_empty());
             if !identity_matches(receipt, durable)
                 || !prefix_matches(receipt, candidate)?
+                || !completeness_prefix_matches(receipt, candidate)?
                 || (!receipt.committed
+                    && !strict_failure_projection
+                    && !staged_terminal_matches(receipt, candidate)
                     && (candidate.last_run_status().as_deref()
                         != Some(receipt.terminal_status.as_str())
                         || candidate.last_run_error() != receipt.terminal_error))
@@ -888,6 +1316,651 @@ mod tests {
             .await?;
         store.save_session(&completed).await?;
         Ok(completed)
+    }
+
+    fn strict_completed(
+        child: &Session,
+        seq: u64,
+    ) -> io::Result<(Session, HostTerminalCompleteness)> {
+        let mut completed = child.clone();
+        completed.add_message(Message::assistant("strict finished", None));
+        completed.set_last_run_status("completed");
+        let proof = HostTerminalCompleteness::from_verified_host(&completed, "strict-run", 7, seq)?;
+        Ok((completed, proof))
+    }
+
+    async fn prepare_strict(
+        store: &SessionStoreV2,
+        completed: &Session,
+        proof: &HostTerminalCompleteness,
+    ) -> io::Result<()> {
+        store
+            .prepare_broker_terminal_receipt_with_completeness(
+                completed,
+                BrokerTerminalRoute {
+                    activation_run_id: "strict-run",
+                    broker_identity: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    parent_mailbox: TEST_PARENT_MAILBOX,
+                    broker_correlation_id: "strict-correlation",
+                    message_ids: &["strict-event".into(), "strict-outcome".into()],
+                },
+                proof,
+            )
+            .await
+    }
+
+    fn pending_terminal(completed: &Session) -> (Session, Session, String) {
+        let source = serde_json::json!({
+            "activation_run_id": "strict-run",
+            "child_session_id": completed.id,
+            "child_created_at": completed.created_at,
+            "parent_session_id": completed.parent_session_id,
+            "project_id": completed.project_id_meta(),
+            "status": completed.last_run_status(),
+            "error_sha256": completed.last_run_error().map(|error| {
+                format!("{:x}", Sha256::digest(serde_json::to_vec(&error).unwrap()))
+            }),
+        });
+        let published = serde_json::to_string(&source).unwrap();
+        let mut intended = completed.clone();
+        intended.metadata.insert(
+            COMPLETION_SOURCE_KEY.into(),
+            serde_json::to_string(&serde_json::json!({"pending_confirmation": source})).unwrap(),
+        );
+        let mut staged = intended.clone();
+        staged.set_last_run_status("running");
+        staged.clear_last_run_error();
+        (staged, intended, published)
+    }
+
+    #[tokio::test]
+    async fn staged_running_receipt_requires_live_commit_before_source_publication(
+    ) -> io::Result<()> {
+        for strict in [false, true] {
+            let (home, store, child) = fixture().await?;
+            let (completed, proof) = strict_completed(&child, 2)?;
+            if strict {
+                prepare_strict(&store, &completed, &proof).await?;
+            } else {
+                store
+                    .prepare_broker_terminal_receipt(
+                        &completed,
+                        "strict-run",
+                        "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        TEST_PARENT_MAILBOX,
+                        "strict-correlation",
+                        &["strict-outcome".into()],
+                    )
+                    .await?;
+            }
+            let (staged, intended, published) = pending_terminal(&completed);
+            store.save_session(&staged).await?;
+            let expected = store.load_session(&staged.id).await?.unwrap();
+            assert_eq!(expected.last_run_status().as_deref(), Some("running"));
+            drop(store);
+            let store = SessionStoreV2::new(home.path().into()).await?;
+            assert!(store
+                .recover_broker_terminal_receipts(&expected)
+                .await
+                .is_err());
+
+            let mut mismatched = intended.clone();
+            mismatched
+                .metadata
+                .get_mut(COMPLETION_SOURCE_KEY)
+                .unwrap()
+                .push(' ');
+            let wrong = if strict {
+                store
+                    .commit_broker_terminal_receipt_with_completeness(
+                        &mismatched,
+                        "strict-run",
+                        &proof,
+                    )
+                    .await
+            } else {
+                store
+                    .commit_broker_terminal_receipt(&mismatched, "strict-run")
+                    .await
+            };
+            assert!(wrong.is_err());
+            let committed = if strict {
+                store
+                    .commit_broker_terminal_receipt_with_completeness(
+                        &intended,
+                        "strict-run",
+                        &proof,
+                    )
+                    .await?
+            } else {
+                store
+                    .commit_broker_terminal_receipt(&intended, "strict-run")
+                    .await?
+            };
+            assert_eq!(
+                store
+                    .load_session(&staged.id)
+                    .await?
+                    .unwrap()
+                    .last_run_status()
+                    .as_deref(),
+                Some("running")
+            );
+            assert_eq!(
+                store.recover_broker_terminal_receipts(&expected).await?,
+                vec![committed.clone()]
+            );
+            let published_session = store
+                .publish_broker_terminal_source(&committed, &expected, &published)
+                .await?;
+            assert_eq!(
+                published_session.last_run_status().as_deref(),
+                Some("completed")
+            );
+            assert_eq!(
+                published_session.metadata.get(COMPLETION_SOURCE_KEY),
+                Some(&published)
+            );
+            // Lost publication/ACK responses may repeat the exact operation.
+            let duplicate = store
+                .publish_broker_terminal_source(&committed, &expected, &published)
+                .await?;
+            assert_eq!(
+                serde_json::to_value(&duplicate).unwrap(),
+                serde_json::to_value(&published_session).unwrap()
+            );
+            store
+                .clear_acknowledged_broker_terminal_receipt(
+                    &completed.id,
+                    completed.created_at,
+                    "strict-run",
+                    TEST_PARENT_MAILBOX,
+                )
+                .await?;
+            assert!(store
+                .publish_broker_terminal_source(&committed, &expected, &published)
+                .await
+                .is_ok());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn staged_running_receipt_rejects_wrong_pending_identity_run_status_or_shape(
+    ) -> io::Result<()> {
+        let (_home, store, child) = fixture().await?;
+        let (completed, proof) = strict_completed(&child, 2)?;
+        prepare_strict(&store, &completed, &proof).await?;
+        let (staged, _, _) = pending_terminal(&completed);
+        for field in [
+            "activation_run_id",
+            "child_session_id",
+            "child_created_at",
+            "parent_session_id",
+            "project_id",
+            "status",
+            "error_sha256",
+            "shape",
+        ] {
+            let mut wrong = staged.clone();
+            let mut raw: serde_json::Value =
+                serde_json::from_str(wrong.metadata.get(COMPLETION_SOURCE_KEY).unwrap()).unwrap();
+            if field == "shape" {
+                raw["unexpected"] = true.into();
+            } else if field == "child_created_at" {
+                raw["pending_confirmation"][field] = "2000-01-01T00:00:00Z".into();
+            } else {
+                raw["pending_confirmation"][field] = "wrong".into();
+            }
+            wrong.metadata.insert(
+                COMPLETION_SOURCE_KEY.into(),
+                serde_json::to_string(&raw).unwrap(),
+            );
+            assert!(store.save_session(&wrong).await.is_err(), "{field}");
+        }
+        let mut wrong = staged.clone();
+        wrong.set_last_run_error("running cannot carry the terminal error");
+        assert!(store.save_session(&wrong).await.is_err());
+        store.save_session(&staged).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_terminal_source_publication_cannot_overwrite_successor_snapshot(
+    ) -> io::Result<()> {
+        for replace_source in [false, true] {
+            let (_home, store, child) = fixture().await?;
+            let (completed, proof) = strict_completed(&child, 2)?;
+            prepare_strict(&store, &completed, &proof).await?;
+            let (staged, intended, published) = pending_terminal(&completed);
+            store.save_session(&staged).await?;
+            let committed = store
+                .commit_broker_terminal_receipt_with_completeness(&intended, "strict-run", &proof)
+                .await?;
+            let expected = store.load_session(&staged.id).await?.unwrap();
+            let mut successor = expected.clone();
+            successor.add_message(Message::user("successor input"));
+            if replace_source {
+                successor
+                    .metadata
+                    .insert(COMPLETION_SOURCE_KEY.into(), "successor source".into());
+                successor.set_last_run_status("error");
+                successor.set_last_run_error("successor error");
+            }
+            store.save_session(&successor).await?;
+            let before = store.load_session(&successor.id).await?.unwrap();
+            assert!(store
+                .publish_broker_terminal_source(&committed, &expected, &published)
+                .await
+                .is_err());
+            let after = store.load_session(&successor.id).await?.unwrap();
+            assert_eq!(
+                serde_json::to_value(before).unwrap(),
+                serde_json::to_value(after).unwrap()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_prepared_receipt_never_cold_promotes_even_after_exact_checkpoint(
+    ) -> io::Result<()> {
+        let (home, store, child) = fixture().await?;
+        let (completed, proof) = strict_completed(&child, 3)?;
+        prepare_strict(&store, &completed, &proof).await?;
+        // A matching proposed transcript is not evidence of a canonical save.
+        assert!(store
+            .commit_broker_terminal_receipt_with_completeness(&completed, "strict-run", &proof,)
+            .await
+            .is_err());
+        store.save_session(&completed).await?;
+        // Neither the legacy commit port nor a cold status/length match can
+        // replace the live Host's exact completeness commit.
+        assert!(store
+            .commit_broker_terminal_receipt(&completed, "strict-run")
+            .await
+            .is_err());
+        drop(store);
+        let reopened = SessionStoreV2::new(home.path().into()).await?;
+        assert!(reopened
+            .recover_broker_terminal_receipts(&completed)
+            .await
+            .is_err());
+        let dir = reopened.broker_receipt_dir(&completed.id).await?;
+        assert!(!read_ledger(&dir).await?.receipts[0].committed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_proof_prepare_and_commit_write_failures_fail_closed() -> io::Result<()> {
+        let (home, store, child) = fixture().await?;
+        let (completed, proof) = strict_completed(&child, 2)?;
+        let dir = store.broker_receipt_dir(&child.id).await?;
+        RECEIPT_WRITE_FAILURES.lock().unwrap().insert(dir.clone());
+        assert!(prepare_strict(&store, &completed, &proof).await.is_err());
+        assert!(read_ledger(&dir).await?.receipts.is_empty());
+        assert!(store
+            .commit_broker_terminal_receipt_with_completeness(&completed, "strict-run", &proof,)
+            .await
+            .is_err());
+
+        prepare_strict(&store, &completed, &proof).await?;
+        store.save_session(&completed).await?;
+        RECEIPT_WRITE_FAILURES.lock().unwrap().insert(dir.clone());
+        assert!(store
+            .commit_broker_terminal_receipt_with_completeness(&completed, "strict-run", &proof,)
+            .await
+            .is_err());
+        assert!(!read_ledger(&dir).await?.receipts[0].committed);
+        drop(store);
+        let reopened = SessionStoreV2::new(home.path().into()).await?;
+        assert!(reopened
+            .recover_broker_terminal_receipts(&completed)
+            .await
+            .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_uncommitted_receipt_allows_only_fail_closed_error_projection() -> io::Result<()>
+    {
+        let (home, store, child) = fixture().await?;
+        let (completed, proof) = strict_completed(&child, 2)?;
+        prepare_strict(&store, &completed, &proof).await?;
+        store.save_session(&completed).await?;
+        let dir = store.broker_receipt_dir(&completed.id).await?;
+        RECEIPT_WRITE_FAILURES.lock().unwrap().insert(dir.clone());
+        assert!(store
+            .commit_broker_terminal_receipt_with_completeness(&completed, "strict-run", &proof)
+            .await
+            .is_err());
+
+        let mut failed = completed.clone();
+        failed.set_last_run_status("error");
+        assert!(store.save_session(&failed).await.is_err());
+        failed.set_last_run_error("Host strict proof publication failed");
+        let mut rewritten = failed.clone();
+        rewritten.messages[0].content = "changed work".into();
+        assert!(store.save_session(&rewritten).await.is_err());
+        store.save_session(&failed).await?;
+        let canonical = store.load_session(&failed.id).await?.unwrap();
+        assert_eq!(
+            digest_messages(&canonical.messages)?,
+            digest_messages(&completed.messages)?
+        );
+        assert_eq!(canonical.last_run_status().as_deref(), Some("error"));
+        assert!(!read_ledger(&dir).await?.receipts[0].committed);
+        assert!(store
+            .commit_broker_terminal_receipt_with_completeness(&failed, "strict-run", &proof)
+            .await
+            .is_err());
+        drop(store);
+        let reopened = SessionStoreV2::new(home.path().into()).await?;
+        assert!(reopened
+            .recover_broker_terminal_receipts(&failed)
+            .await
+            .is_err());
+        assert_eq!(
+            reopened
+                .load_session(&failed.id)
+                .await?
+                .unwrap()
+                .last_run_status()
+                .as_deref(),
+            Some("error")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_committed_proof_cold_reopens_exactly_and_zero_frontier_is_valid(
+    ) -> io::Result<()> {
+        for seq in [0, 4] {
+            let (home, store, child) = fixture().await?;
+            let (completed, proof) = strict_completed(&child, seq)?;
+            prepare_strict(&store, &completed, &proof).await?;
+            store.save_session(&completed).await?;
+            let committed = store
+                .commit_broker_terminal_receipt_with_completeness(&completed, "strict-run", &proof)
+                .await?;
+            assert_eq!(committed.required_execution_epoch, Some(7));
+            assert_eq!(
+                committed
+                    .terminal_completeness
+                    .as_ref()
+                    .unwrap()
+                    .contiguous_applied_seq,
+                seq
+            );
+            assert_eq!(
+                store
+                    .commit_broker_terminal_receipt_with_completeness(
+                        &completed,
+                        "strict-run",
+                        &proof,
+                    )
+                    .await?,
+                committed
+            );
+            drop(store);
+            let reopened = SessionStoreV2::new(home.path().into()).await?;
+            assert_eq!(
+                reopened
+                    .recover_broker_terminal_receipts(&completed)
+                    .await?,
+                vec![committed.clone()]
+            );
+            // A lost ACK result can safely replay precisely the same MsgIds.
+            assert_eq!(
+                reopened
+                    .recover_broker_terminal_receipts(&completed)
+                    .await?,
+                vec![committed]
+            );
+            reopened
+                .clear_acknowledged_broker_terminal_receipt(
+                    &completed.id,
+                    completed.created_at,
+                    "strict-run",
+                    TEST_PARENT_MAILBOX,
+                )
+                .await?;
+            assert!(reopened
+                .recover_broker_terminal_receipts(&completed)
+                .await?
+                .is_empty());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_live_proof_rejects_wrong_identity_run_epoch_and_conflicting_frontier(
+    ) -> io::Result<()> {
+        let (_home, store, child) = fixture().await?;
+        let (completed, proof) = strict_completed(&child, 2)?;
+        assert!(
+            HostTerminalCompleteness::from_verified_host(&completed, "strict-run", 0, 0).is_err()
+        );
+        for field in [
+            "id", "birth", "parent", "root", "project", "depth", "run", "digest",
+        ] {
+            let mut wrong = proof.clone();
+            match field {
+                "id" => wrong.proof.session_id = "other-child".into(),
+                "birth" => wrong.proof.created_at += chrono::Duration::milliseconds(1),
+                "parent" => wrong.proof.parent_session_id = "other-parent".into(),
+                "root" => wrong.proof.root_session_id = "other-root".into(),
+                "project" => wrong.proof.project_id = Some("other-project".into()),
+                "depth" => wrong.proof.spawn_depth += 1,
+                "run" => wrong.proof.activation_run_id = "other-run".into(),
+                "digest" => wrong.proof.messages_sha256 = "other-digest".into(),
+                _ => unreachable!(),
+            }
+            assert!(
+                prepare_strict(&store, &completed, &wrong).await.is_err(),
+                "{field}"
+            );
+        }
+        prepare_strict(&store, &completed, &proof).await?;
+        // Exact duplicate prepare is idempotent; any new claim for this Run is not.
+        prepare_strict(&store, &completed, &proof).await?;
+        store.save_session(&completed).await?;
+        for field in ["epoch", "seq", "run", "birth"] {
+            let mut wrong = proof.clone();
+            match field {
+                "epoch" => wrong.proof.execution_epoch += 1,
+                "seq" => wrong.proof.contiguous_applied_seq += 1,
+                "run" => wrong.proof.activation_run_id = "other-run".into(),
+                "birth" => wrong.proof.created_at += chrono::Duration::milliseconds(1),
+                _ => unreachable!(),
+            }
+            assert!(
+                prepare_strict(&store, &completed, &wrong).await.is_err(),
+                "{field}"
+            );
+            assert!(
+                store
+                    .commit_broker_terminal_receipt_with_completeness(
+                        &completed,
+                        "strict-run",
+                        &wrong,
+                    )
+                    .await
+                    .is_err(),
+                "{field}"
+            );
+        }
+        let mut wrong_session = completed.clone();
+        wrong_session.root_session_id = "other-root".into();
+        assert!(store
+            .commit_broker_terminal_receipt_with_completeness(&wrong_session, "strict-run", &proof,)
+            .await
+            .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_cold_recovery_rejects_missing_proof_or_corrupt_identity_run_epoch(
+    ) -> io::Result<()> {
+        let (home, store, child) = fixture().await?;
+        let (completed, proof) = strict_completed(&child, 2)?;
+        prepare_strict(&store, &completed, &proof).await?;
+        store.save_session(&completed).await?;
+        store
+            .commit_broker_terminal_receipt_with_completeness(&completed, "strict-run", &proof)
+            .await?;
+        let dir = store.broker_receipt_dir(&completed.id).await?;
+        let original = fs::read(dir.join(RECEIPTS_FILE)).await?;
+        drop(store);
+        for field in [
+            "missing",
+            "marker",
+            "version",
+            "missing_version",
+            "epoch",
+            "run",
+            "birth",
+            "parent",
+            "digest",
+        ] {
+            let mut raw: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            let receipt = &mut raw["receipts"][0];
+            match field {
+                "missing" => {
+                    receipt
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("terminal_completeness");
+                }
+                "marker" => {
+                    receipt
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("required_execution_epoch");
+                }
+                "version" => receipt["terminal_completeness"]["version"] = 2.into(),
+                "missing_version" => {
+                    receipt["terminal_completeness"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("version");
+                }
+                "epoch" => receipt["terminal_completeness"]["execution_epoch"] = 8.into(),
+                "run" => receipt["terminal_completeness"]["activation_run_id"] = "other-run".into(),
+                "birth" => {
+                    receipt["terminal_completeness"]["created_at"] = "2000-01-01T00:00:00Z".into()
+                }
+                "parent" => {
+                    receipt["terminal_completeness"]["parent_session_id"] = "other-parent".into()
+                }
+                "digest" => {
+                    receipt["terminal_completeness"]["messages_sha256"] = "other-digest".into()
+                }
+                _ => unreachable!(),
+            }
+            fs::write(dir.join(RECEIPTS_FILE), serde_json::to_vec(&raw).unwrap()).await?;
+            let reopened = SessionStoreV2::new(home.path().into()).await?;
+            assert!(
+                reopened
+                    .recover_broker_terminal_receipts(&completed)
+                    .await
+                    .is_err(),
+                "{field}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_proof_allows_host_suffix_and_later_append_but_rejects_prefix_mutation(
+    ) -> io::Result<()> {
+        let (home, store, child) = fixture().await?;
+        let (mut completed, proof) = strict_completed(&child, 1)?;
+        completed.add_message(Message::assistant("Host final annotation", None));
+        prepare_strict(&store, &completed, &proof).await?;
+        store.save_session(&completed).await?;
+        let committed = store
+            .commit_broker_terminal_receipt_with_completeness(&completed, "strict-run", &proof)
+            .await?;
+        assert!(
+            committed.message_count
+                > committed
+                    .terminal_completeness
+                    .as_ref()
+                    .unwrap()
+                    .message_count
+        );
+        let mut successor = completed.clone();
+        successor.add_message(Message::user("next task"));
+        successor.set_last_run_status("running");
+        store.save_session(&successor).await?;
+        let mut mutated = successor.clone();
+        mutated.messages[0].content = "mutated assignment".into();
+        assert!(store.save_session(&mutated).await.is_err());
+        drop(store);
+        let reopened = SessionStoreV2::new(home.path().into()).await?;
+        assert_eq!(
+            reopened
+                .recover_broker_terminal_receipts(&successor)
+                .await?,
+            vec![committed]
+        );
+        // Even bypassing ordinary writer protections cannot make a changed
+        // same-length canonical prefix eligible for ACK after restart.
+        let main = reopened.session_json_path(&mutated.id).await?.unwrap();
+        fs::write(&main, compact_main::serialize_main(&mutated)?).await?;
+        drop(reopened);
+        let reopened = SessionStoreV2::new(home.path().into()).await?;
+        assert!(reopened
+            .recover_broker_terminal_receipts(&mutated)
+            .await
+            .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_committed_receipt_requires_canonical_checkpoint_to_remain_present(
+    ) -> io::Result<()> {
+        let (home, store, child) = fixture().await?;
+        let (completed, proof) = strict_completed(&child, 1)?;
+        prepare_strict(&store, &completed, &proof).await?;
+        store.save_session(&completed).await?;
+        store
+            .commit_broker_terminal_receipt_with_completeness(&completed, "strict-run", &proof)
+            .await?;
+        fs::remove_file(store.session_json_path(&completed.id).await?.unwrap()).await?;
+        drop(store);
+        let reopened = SessionStoreV2::new(home.path().into()).await?;
+        assert!(reopened
+            .recover_broker_terminal_receipts(&completed)
+            .await
+            .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_receipt_without_strict_fields_retains_checkpoint_promotion() -> io::Result<()> {
+        let (home, store, child) = fixture().await?;
+        let completed = completed_receipt(&store, &child).await?;
+        let mut failed = completed.clone();
+        failed.set_last_run_status("error");
+        failed.set_last_run_error("legacy terminal changed");
+        assert!(store.save_session(&failed).await.is_err());
+        let dir = store.broker_receipt_dir(&completed.id).await?;
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join(RECEIPTS_FILE)).await?).unwrap();
+        assert!(raw["receipts"][0].get("required_execution_epoch").is_none());
+        assert!(raw["receipts"][0].get("terminal_completeness").is_none());
+        drop(store);
+        let reopened = SessionStoreV2::new(home.path().into()).await?;
+        let recovered = reopened
+            .recover_broker_terminal_receipts(&completed)
+            .await?;
+        assert_eq!(recovered.len(), 1);
+        assert!(recovered[0].committed);
+        assert_eq!(recovered[0].required_execution_epoch, None);
+        assert_eq!(recovered[0].terminal_completeness, None);
+        Ok(())
     }
 
     #[tokio::test]

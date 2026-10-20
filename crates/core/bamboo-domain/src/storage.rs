@@ -18,6 +18,81 @@ pub struct RootActorRuntimeWrite {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Target-only transport disposal, issued by the actual registered owner.
+/// `binding` identifies bytes to retire; it is NOT a retained Supervisor grant.
+/// The callback must retain a closed exact owner and never notify or activate.
+/// This operation does not publish Session state, cursor, or control receipts.
+pub struct ScopedLoopTransportRetirement<'a> {
+    pub binding: &'a crate::ScopedLoopControlBinding,
+    pub inbox: std::sync::Arc<dyn crate::SessionInboxPort>,
+    pub owner: Option<&'a RootActorRuntimeWrite>,
+    pub retain: std::sync::Arc<
+        dyn Fn() -> std::io::Result<std::sync::Arc<dyn crate::SessionRunDeliveryGuard>>
+            + Send
+            + Sync,
+    >,
+}
+
+/// Exact native Child execution capability captured by its Host after Actor admission.
+/// This is not serialized and never recovered from Session metadata.
+#[derive(Debug, Clone)]
+pub struct ChildActorRuntimeWrite {
+    pub fence: crate::ActorActivationFence,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub root_session_id: String,
+    pub parent_session_id: String,
+    pub parent_created_at: chrono::DateTime<chrono::Utc>,
+    pub spawn_depth: u32,
+    pub project_id: Option<String>,
+}
+
+impl ChildActorRuntimeWrite {
+    /// Capture identity only. Every actual operation independently checks the
+    /// current canonical Actor fence, birth and complete ancestor chain.
+    pub fn from_session(
+        fence: crate::ActorActivationFence,
+        session: &Session,
+    ) -> std::io::Result<Self> {
+        if session.kind != crate::SessionKind::Child
+            || !session.authority_identity.is_ordinary()
+            || fence.actor_id != session.id
+        {
+            return Err(std::io::Error::other(
+                "native Child execution identity required",
+            ));
+        }
+        Ok(Self {
+            fence,
+            created_at: session.created_at,
+            root_session_id: session.root_session_id.clone(),
+            parent_session_id: session
+                .parent_session_id
+                .clone()
+                .ok_or_else(|| std::io::Error::other("Child parent missing"))?,
+            parent_created_at: session
+                .parent_created_at
+                .ok_or_else(|| std::io::Error::other("Child parent birth missing"))?,
+            spawn_depth: session.spawn_depth,
+            project_id: session.project_id_meta(),
+        })
+    }
+}
+
+/// Full/runtime publication through the dedicated native Child capability.
+/// Optional input is checkpointed and ACKed under the same physical guards.
+pub struct ChildActorRuntimeSave<'a> {
+    pub owner: &'a ChildActorRuntimeWrite,
+    pub session: &'a mut Session,
+    pub runtime_only: bool,
+    pub inherited: Option<&'a crate::InheritedChildWait>,
+    pub finalized_wait: Option<&'a crate::session::runtime_state::WaitingForChildrenState>,
+    pub input: Option<(
+        std::sync::Arc<dyn crate::SessionInboxPort>,
+        crate::SessionInboxOwnedClaim,
+    )>,
+    pub publish: RootActorRuntimePublisher,
+}
+
 /// Synchronous cache publication at the storage commit boundary. Implementors
 /// retain the same physical guards and revalidate the owner before invoking it.
 pub type RootActorRuntimePublisher = std::sync::Arc<dyn Fn(&Session) + Send + Sync>;
@@ -54,6 +129,46 @@ pub trait Storage: Send + Sync {
         Ok(())
     }
 
+    /// Native Child support is separate from the ordinary Root contract.
+    fn supports_child_actor_runtime_write(&self) -> bool {
+        false
+    }
+
+    fn bind_child_actor_inbox(
+        &self,
+        owner: &ChildActorRuntimeWrite,
+        inbox: std::sync::Arc<dyn crate::SessionInboxPort>,
+    ) -> std::io::Result<std::sync::Arc<dyn crate::SessionInboxPort>> {
+        let _ = (owner, inbox);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage does not support owned Child Inbox admission",
+        ))
+    }
+
+    async fn save_child_actor_runtime(
+        &self,
+        request: ChildActorRuntimeSave<'_>,
+    ) -> std::io::Result<()> {
+        let _ = request;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage does not support fenced Child runtime writes",
+        ))
+    }
+
+    async fn publish_child_actor_runtime_event(
+        &self,
+        owner: &ChildActorRuntimeWrite,
+        publish: RootActorRuntimeEventPublisher,
+    ) -> std::io::Result<()> {
+        let _ = (owner, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage does not support fenced Child runtime events",
+        ))
+    }
+
     /// Bind an Inbox to this exact Root execution before opting into owned
     /// claims. Unsupported/custom queues fail closed, without a legacy claim.
     fn bind_root_actor_inbox(
@@ -83,6 +198,51 @@ pub trait Storage: Send + Sync {
             std::io::ErrorKind::Unsupported,
             "storage backend does not support fenced Root input checkpoints",
         ))
+    }
+
+    /// Strict, uncached full observation under retained canonical Supervisor
+    /// authority and the exact live host grant. This read is not a write grant.
+    async fn load_scoped_loop_session(
+        &self,
+        binding: &crate::ScopedLoopControlBinding,
+        activation: std::sync::Arc<dyn crate::SessionActivationPort>,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (binding, activation);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support scoped Loop observations",
+        ))
+    }
+
+    /// Publish Loop state and typed consumption before ACK, retaining the same
+    /// canonical and exact owner guards. Err is not a rollback receipt: callers
+    /// must stop dispatch and must not save the proposed state generically.
+    async fn checkpoint_scoped_loop(
+        &self,
+        request: crate::ScopedLoopControlCheckpoint<'_>,
+    ) -> std::io::Result<()> {
+        let _ = request;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support scoped Loop checkpoints",
+        ))
+    }
+
+    /// Dispose exact closed-run Loop transports under the target's own real
+    /// writer and Inbox locks. No Supervisor capability is acquired or renewed.
+    async fn retire_scoped_loop_transport(
+        &self,
+        request: ScopedLoopTransportRetirement<'_>,
+    ) -> std::io::Result<()> {
+        let _ = request;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support target-owned Loop transport retirement",
+        ))
+    }
+
+    fn supports_scoped_loop_transport_retirement(&self) -> bool {
+        false
     }
 
     /// Probe before claiming an Actor; unsupported backends must not leave a
@@ -260,6 +420,7 @@ pub trait Storage: Send + Sync {
 
     /// Trusted host bootstrap for one stable default Supervisor Root. Only the
     /// initial model is caller supplied and is used on first creation only.
+    /// It may be empty before provider setup; bootstrap does not execute a run.
     /// Implementations must publish the complete identity atomically, protect it
     /// from ordinary writers, and return a receipt rather than a partial Session.
     async fn get_or_create_default_supervisor(
@@ -315,6 +476,39 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Immutable history snapshot read while canonical Supervisor and target
+    /// authority are locked. A public inspect_link followed by load_session is
+    /// not equivalent: its observation expires before the read starts.
+    async fn load_supervisor_managed_session(
+        &self,
+        supervisor: &SupervisorReference,
+        target_session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (supervisor, target_session_id);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support scoped Supervisor history",
+        ))
+    }
+
+    /// Trusted Host file publication while the current canonical Supervisor's
+    /// incarnation, Ultra mode and authority revision remain physically locked.
+    /// This is a transient critical section, never a durable permission grant.
+    /// A backend must retain the complete lock set after caller cancellation
+    /// until its synchronous job returns; unsupported backends never run it.
+    async fn with_supervisor_orchestration_authority(
+        &self,
+        supervisor: &SupervisorReference,
+        expected_revision: u64,
+        operation: Box<dyn FnOnce() -> std::io::Result<()> + Send>,
+    ) -> std::io::Result<()> {
+        let _ = (supervisor, expected_revision, operation);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support locked Supervisor publication",
+        ))
+    }
+
     /// Strict canonical Root control-plane read for authority decisions.
     /// `None` means absent; partial/corrupt/mismatched published authority is an
     /// error, never a fallback to stale session.json. Returned messages are empty;
@@ -334,6 +528,18 @@ pub trait Storage: Send + Sync {
 
     /// Loads a session by ID, returns None if not found.
     async fn load_session(&self, session_id: &str) -> std::io::Result<Option<Session>>;
+
+    /// Read a full durable Session for execution admission without repairing an
+    /// index or granting execution/write authority. Canonical backends retain
+    /// their strict identity and lifetime checks, including the complete main
+    /// history needed to detect pending input. Uncached legacy backends keep
+    /// their existing full loader; a control-only snapshot is not sufficient.
+    async fn load_execution_admission_snapshot(
+        &self,
+        session_id: &str,
+    ) -> std::io::Result<Option<Session>> {
+        self.load_session(session_id).await
+    }
 
     /// Deletes a session, returns true if anything was deleted.
     async fn delete_session(&self, session_id: &str) -> std::io::Result<bool>;

@@ -100,7 +100,7 @@ pub(super) fn parameters_schema() -> Value {
 }
 
 pub(super) fn description() -> &'static str {
-    "Delegate bounded work to a durable child ActorId. Use for parallel or context-heavy tasks; handle simple tasks directly. A child uses only the tools and permissions exposed to it by the runtime. With default chat intent, message is the full assignment: omit target to create, include target to correct or continue. role=explorer, implementer, reviewer, or a catalog name applies only on creation; omitted role is worker. intent=inspect shows the tree without target (Root full tree; Host-routed Child its owned subtree) or target overview, diagnostics, messages, result, or error. Paginate with a JSON message containing view/cursor/message_id; changed trees reject stale cursors. intent=control uses target and message=cancel or retry. Children use intent=ask_parent with a bounded question in message. Direct parents answer an exact pending ParentRequest using reply_to and message, omitting target and role; forced permission accepts only approve_once or deny. Host verifies kind, direct-parent lineage, Project, and deadline. Root audit: intent=inspect, message=forced_permission_audit. Runtime handles activation and waiting; never pass physical worker or mailbox ids."
+    "Delegate bounded work to a durable child ActorId. Ordinary executing Sessions use it for parallel or context-heavy tasks and handle simple tasks directly. A trusted Supervisor delegates execution, including simple implementation tasks; necessary dedicated read-only acquisition and orchestration remain with the Supervisor. If a suitable authorized worker is unavailable, report the recoverable blocker without self-execution or repeated unchanged delegation. A child uses only the tools and permissions exposed to it by the runtime. With default chat intent, message is the full assignment: omit target to create, include target to correct or continue. New compact children share this Session's selected workspace/worktree; an unavailable or policy-redirected parent workspace blocks creation. Independent Root creation and choosing another checkout require their separate authorized Host route. role=explorer, implementer, reviewer, or a catalog name applies only on creation; omitted role is worker. intent=inspect shows the tree without target (Root full tree; Host-routed Child its owned subtree) or target overview, diagnostics, messages, result, or error. Paginate with a JSON message containing view/cursor/message_id; changed trees reject stale cursors. intent=control uses target and message=cancel or retry. Children use intent=ask_parent with a bounded question in message. Direct parents answer an exact pending ParentRequest using reply_to and message, omitting target and role; forced permission accepts only approve_once or deny. Host verifies kind, direct-parent lineage, Project, and deadline. Root audit: intent=inspect, message=forced_permission_audit. Runtime handles activation and waiting; never pass physical worker or mailbox ids."
 }
 
 /// Must run before launch-owner classification. Only legacy calls retain the
@@ -982,6 +982,51 @@ pub(super) fn inspect_tree<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_permission_classification_matches_real_facade_routes() {
+        use bamboo_tools::permission::check_permissions;
+
+        for args in [
+            json!({"message":"Do the task"}),
+            json!({"intent":"chat", "role":"explorer", "message":"Do the task"}),
+            json!({"target":"child", "message":"Continue the task"}),
+            json!({"intent":"control", "target":"child", "message":" cancel "}),
+            json!({"intent":"control", "target":"child", "message":" retry "}),
+            json!({"intent":"inspect"}),
+            json!({"intent":"inspect", "target":"child", "message":"diagnostics"}),
+            json!({"intent":"inspect", "message":"forced_permission_audit"}),
+            json!({"intent":"ask_parent", "message":"Which option?"}),
+            json!({"reply_to":"request_123", "message":"Use option A"}),
+            json!({"reply_to":"request_123", "message":"approve_once"}),
+            json!({"reply_to":"request_123", "message":"deny"}),
+        ] {
+            for sentinel in [None, Some(json!("")), Some(Value::Null)] {
+                let mut args = args.clone();
+                if let Some(sentinel) = sentinel {
+                    for field in ["target", "role", "reply_to"] {
+                        if args.get(field).is_none() {
+                            args[field] = sentinel.clone();
+                        }
+                    }
+                }
+                let normalized = normalize(args.clone()).expect("valid compact call");
+                let expected = match normalized.projection {
+                    Some(
+                        Projection::ParentQuestionAsk
+                        | Projection::ParentRequestReply
+                        | Projection::ForcedPermissionAudit,
+                    ) => None,
+                    _ => check_permissions("SubAgent", &normalized.args).unwrap(),
+                };
+                assert_eq!(
+                    check_permissions("SubAgent", &args).unwrap(),
+                    expected,
+                    "pre-invoke classification must match the actual route: {args}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn provider_empty_optional_fields_do_not_become_parent_replies() {

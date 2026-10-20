@@ -304,6 +304,30 @@ Use this skill when users want to create skills.
 
     #[test]
     fn repeated_static_warning_for_same_key_and_error_downgrades_to_debug() {
+        const CHILD_ENV: &str = "BAMBOO_SKILLS_PARSER_WARN_DEDUP_ISOLATED_CHILD_1751";
+        if std::env::var(CHILD_ENV).as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "store::parser::tests::repeated_static_warning_for_same_key_and_error_downgrades_to_debug",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env_remove(CHILD_ENV)
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("run isolated static warning fixture");
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+                "isolated static warning fixture failed or selected no test ({}):\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let levels = Arc::new(Mutex::new(Vec::new()));
         let subscriber = LevelSubscriber(levels.clone());
         let content = r#"---

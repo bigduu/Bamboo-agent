@@ -10,16 +10,36 @@ use super::ChildSessionError;
 pub const NAMED_PROFILE_BINDING_KEY: &str = "child.named_profile.v1";
 /// Host creator signal derived from the existing explicit create.model input.
 pub const PROFILE_EXPLICIT_MODEL_KEY: &str = "child.named_profile.explicit_model.v1";
-const NATIVE_NAMES: [&str; 5] = ["Bash", "Edit", "Glob", "Read", "Write"];
+const NATIVE_NAMES: [&str; 7] = [
+    "Bash",
+    "exec_command",
+    "write_stdin",
+    "Edit",
+    "Glob",
+    "Read",
+    "Write",
+];
+
+/// Legacy Bash declarations cover starting and continuing model-polled shells.
+/// Apply only while resolving source declarations; frozen grants stay exact.
+fn declares_tool(declarations: &[String], tool: &str) -> bool {
+    declarations.iter().any(|name| {
+        name == tool || (name == "Bash" && matches!(tool, "exec_command" | "write_stdin"))
+    })
+}
 
 /// Only the host catalog producer constructs this value. No request decoder,
 /// serialization or Debug output exposes its private instruction body.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedChildProfile {
     identity: NamedAgentProfileIdentity,
     prompt: String,
     model: Option<ProviderModelRef>,
     tools: Vec<String>,
     read_only: bool,
+    parent_id: String,
+    parent_created_at: chrono::DateTime<chrono::Utc>,
+    parent_project: crate::project_context::SessionProjectIdentity,
 }
 
 impl std::fmt::Debug for ResolvedChildProfile {
@@ -36,6 +56,23 @@ fn rejected() -> ChildSessionError {
 
 fn hash(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
+}
+
+/// Host-only creation from the exact preflight snapshot. No model tool can supply it.
+pub async fn create_profile_child(
+    port: &dyn super::ChildSessionPort,
+    input: super::CreateChildInput,
+    profile: ResolvedChildProfile,
+) -> Result<super::CreateChildResult, super::ChildSessionError> {
+    super::actions::create_profile_child_action(port, input, profile).await
+}
+
+/// Existing committed Child seal; rejects changed input/output and pending delivery.
+/// A Host activation is distinct from the local SDK runtime's run identifier.
+pub fn committed_child_activation(child: &Session) -> Option<String> {
+    crate::execution::ChildCompletionSource::from_committed_session(child)
+        .map(|source| source.activation_run_id)
+        .filter(|id| !id.is_empty())
 }
 
 impl ResolvedChildProfile {
@@ -86,12 +123,8 @@ impl ResolvedChildProfile {
         let tools = NATIVE_NAMES
             .iter()
             .filter(|name| {
-                (definition.tool_allow().is_empty()
-                    || definition
-                        .tool_allow()
-                        .iter()
-                        .any(|allowed| allowed == **name))
-                    && !definition.tool_deny().iter().any(|denied| denied == **name)
+                (definition.tool_allow().is_empty() || declares_tool(definition.tool_allow(), name))
+                    && !declares_tool(definition.tool_deny(), name)
                     && (!read_only || matches!(**name, "Read" | "Glob"))
             })
             .map(|name| (*name).to_owned())
@@ -102,6 +135,10 @@ impl ResolvedChildProfile {
             model,
             tools,
             read_only,
+            parent_id: parent.id.clone(),
+            parent_created_at: parent.created_at,
+            parent_project:
+                crate::project_context::ProjectContextResolver::session_project_identity(parent),
         })
     }
 
@@ -109,7 +146,7 @@ impl ResolvedChildProfile {
         self.model.as_ref()
     }
 
-    pub(super) fn read_only(&self) -> bool {
+    pub fn read_only(&self) -> bool {
         self.read_only
     }
 
@@ -125,6 +162,13 @@ impl ResolvedChildProfile {
         child: &mut Session,
         parent: &Session,
     ) -> Result<(), ChildSessionError> {
+        if parent.id != self.parent_id
+            || parent.created_at != self.parent_created_at
+            || crate::project_context::ProjectContextResolver::session_project_identity(parent)
+                != self.parent_project
+        {
+            return Err(rejected());
+        }
         let base = child
             .metadata
             .get("base_system_prompt")
@@ -223,7 +267,7 @@ fn read_binding(session: &Session) -> Result<Option<Binding>, ChildSessionError>
         || binding.name.len() > 64
         || binding.revision.len() != 64
         || !binding.revision.bytes().all(|b| b.is_ascii_hexdigit())
-        || binding.tools.len() > 5
+        || binding.tools.len() > NATIVE_NAMES.len()
         || binding
             .tools
             .iter()
@@ -372,7 +416,10 @@ mod tests {
         for name in ["explorer", "reviewer", "independent-reviewer"] {
             std::fs::write(
                 home.join(format!("agents/{name}.md")),
-                definition(name, "tools:\n  allow: [Read, Glob, Write]"),
+                definition(
+                    name,
+                    "tools:\n  allow: [Read, Glob, Write, Bash, exec_command, write_stdin]",
+                ),
             )
             .unwrap();
             let child = bound(selected(&home, name, &parent), &parent);
@@ -395,6 +442,75 @@ mod tests {
     }
 
     #[test]
+    fn legacy_bash_declarations_cover_exec_sessions_without_overriding_denials() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(home.join("agents")).unwrap();
+        let parent = Session::new("profile-parent", "parent-model");
+        for (declarations, expected) in [
+            (
+                "tools:\n  allow: [Bash, exec_command, write_stdin, Edit, Glob, Read, Write]",
+                vec![
+                    "Bash",
+                    "exec_command",
+                    "write_stdin",
+                    "Edit",
+                    "Glob",
+                    "Read",
+                    "Write",
+                ],
+            ),
+            (
+                "tools:\n  allow: [Bash]",
+                vec!["Bash", "exec_command", "write_stdin"],
+            ),
+            (
+                "tools:\n  allow: [exec_command, write_stdin]",
+                vec!["exec_command", "write_stdin"],
+            ),
+            (
+                "tools:\n  allow: [exec_command, write_stdin, Read]\n  deny: [Bash]",
+                vec!["Read"],
+            ),
+            (
+                "tools:\n  allow: [Bash]\n  deny: [exec_command]",
+                vec!["Bash", "write_stdin"],
+            ),
+        ] {
+            std::fs::write(
+                home.join("agents/implementer.md"),
+                definition("implementer", declarations),
+            )
+            .unwrap();
+            let child = bound(selected(&home, "implementer", &parent), &parent);
+            assert_eq!(named_profile_tool_names(&child).unwrap().unwrap(), expected);
+            validate_named_profile(&child).unwrap();
+        }
+    }
+
+    #[test]
+    fn frozen_legacy_bash_binding_remains_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(home.join("agents")).unwrap();
+        std::fs::write(
+            home.join("agents/implementer.md"),
+            definition("implementer", "tools:\n  allow: [Bash]"),
+        )
+        .unwrap();
+        let parent = Session::new("profile-parent", "parent-model");
+        let mut child = bound(selected(&home, "implementer", &parent), &parent);
+        let mut binding = read_binding(&child).unwrap().unwrap();
+        binding.tools = vec!["Bash".into()];
+        child.metadata.insert(
+            NAMED_PROFILE_BINDING_KEY.into(),
+            serde_json::to_string(&binding).unwrap(),
+        );
+        assert_eq!(named_profile_tool_names(&child).unwrap().unwrap(), ["Bash"]);
+        validate_named_profile(&child).unwrap();
+    }
+
+    #[test]
     fn unsupported_composition_declarations_do_not_become_native_grants() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().canonicalize().unwrap();
@@ -414,6 +530,64 @@ mod tests {
             "openai"
         )
         .is_err());
+    }
+
+    #[test]
+    fn workflow_committed_activation_validates_native_host_idle_snapshot() {
+        let mut child = Session::new_child("child", "parent", "model", "reviewer");
+        child.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new(""));
+        child.add_message(Message::user("assignment"));
+        child.add_message(Message::assistant("report", None));
+        child.set_last_run_status("completed");
+        crate::execution::ChildCompletionSource::prepare(
+            &mut child,
+            "host-activation",
+            &Default::default(),
+        );
+        assert_eq!(
+            committed_child_activation(&child).as_deref(),
+            Some("host-activation")
+        );
+        for change in 0..3 {
+            let mut changed = child.clone();
+            match change {
+                0 => changed.messages[0].content = "new input".into(),
+                1 => changed.messages[1].content = "new output".into(),
+                _ => changed.created_at += chrono::Duration::nanoseconds(1),
+            }
+            assert!(committed_child_activation(&changed).is_none());
+        }
+        crate::execution::ChildCompletionSource::defer_for_durable_delivery(
+            &mut child,
+            "host-activation",
+        )
+        .unwrap();
+        assert!(committed_child_activation(&child).is_none());
+    }
+
+    #[test]
+    fn workflow_pinned_profile_rejects_replaced_parent_or_changed_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        std::fs::create_dir(home.join("agents")).unwrap();
+        std::fs::write(
+            home.join("agents/reviewer.md"),
+            definition("reviewer", "tools:\n  allow: [Read]"),
+        )
+        .unwrap();
+        let parent = Session::new("parent", "model");
+        for replaced in [Session::new("parent", "model"), {
+            let mut changed = parent.clone();
+            changed.set_project_id_meta("different-project");
+            changed
+        }] {
+            let profile = selected(&home, "reviewer", &parent);
+            let mut child = Session::new_child_of("child", &replaced, "model", "role");
+            child
+                .metadata
+                .insert("base_system_prompt".into(), "base".into());
+            assert!(profile.bind(&mut child, &replaced).is_err());
+        }
     }
 
     #[test]

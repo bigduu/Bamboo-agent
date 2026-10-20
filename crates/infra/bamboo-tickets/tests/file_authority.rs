@@ -198,3 +198,28 @@ fn canonical_nested_request_hash_is_order_independent() {
         canonical_bytes(&second).unwrap()
     );
 }
+
+#[test]
+fn explicit_empty_initializer_refuses_existing_or_unknown_bytes_without_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("scope");
+    let service = TicketService::initialize_empty(&root, binding()).unwrap();
+    assert_eq!(service.health(), Health::Writable);
+    assert!(service.published().unwrap().1.tickets.is_empty());
+    let head = fs::read(root.join("HEAD")).unwrap();
+    drop(service);
+    assert!(TicketService::initialize_empty(&root, binding()).is_err());
+    assert_eq!(fs::read(root.join("HEAD")).unwrap(), head);
+    for partial in [false, true] {
+        let root = dir.path().join(if partial { "partial" } else { "unknown" });
+        fs::create_dir(&root).unwrap();
+        if partial {
+            fs::create_dir(root.join("objects")).unwrap();
+        }
+        fs::write(root.join("old.txt"), b"preserve").unwrap();
+        assert!(TicketService::initialize_empty(&root, binding()).is_err());
+        assert_eq!(fs::read(root.join("old.txt")).unwrap(), b"preserve");
+        assert!(!root.join("HEAD").exists());
+        assert!(!root.join("writer.lock").exists());
+    }
+}

@@ -301,37 +301,86 @@ async fn root_owned_renew_fences_old_token_and_release_preserves_input_without_f
 async fn root_owned_final_full_write_rejects_real_root_or_input_expiry() {
     for file in [RUNTIME_SIDECAR_FILE, "session.json"] {
         for root_expiry in [false, true] {
-            let f = Arc::new(
-                Fixture::new(if root_expiry {
-                    LeaseDuration::seconds(2)
-                } else {
-                    LeaseDuration::seconds(30)
-                })
-                .await,
-            );
-            let claim = f
-                .claim(if root_expiry {
-                    LeaseDuration::seconds(5)
-                } else {
-                    LeaseDuration::milliseconds(250)
-                })
-                .await;
+            let (ready, prepared) = tokio::sync::oneshot::channel();
+            let writer = tokio::spawn(async move {
+                // Issue the short leases in the task that immediately uses them.
+                let f = Arc::new(
+                    Fixture::new(if root_expiry {
+                        LeaseDuration::seconds(2)
+                    } else {
+                        LeaseDuration::seconds(30)
+                    })
+                    .await,
+                );
+                let before_main = std::fs::read(f.directory().join("session.json")).unwrap();
+                let before_runtime =
+                    std::fs::read(f.directory().join(RUNTIME_SIDECAR_FILE)).unwrap();
+                let hook =
+                    DefaultWriteHook::install(&f.a, file, DurableWritePhase::BeforeReplace, false);
+                let release = Release(hook.clone());
+                let claim = f
+                    .claim(if root_expiry {
+                        LeaseDuration::seconds(5)
+                    } else {
+                        LeaseDuration::seconds(2)
+                    })
+                    .await;
+                assert!(
+                    ready
+                        .send((
+                            f.clone(),
+                            claim.clone(),
+                            before_main,
+                            before_runtime,
+                            hook,
+                            release
+                        ))
+                        .is_ok(),
+                    "expiry fixture receiver closed"
+                );
+                f.checkpoint(&claim).await
+            });
+            let (f, claim, before_main, before_runtime, hook, _release) = prepared.await.unwrap();
+            hook.wait();
+            let authority_path = f.directory().join("actor-authority.json");
+            let authority = std::fs::read(&authority_path).unwrap();
+            let entry: bamboo_domain::ActorDirectoryEntry =
+                serde_json::from_slice(&authority).unwrap();
+            let inbox = f.directory().join("inbox");
+            let claim_path = inbox.join("cur").join(&claim.claim.claim_id);
+            let token = std::fs::read(&claim_path).unwrap();
+            let before_expiry = Utc::now();
+            let activation = actor_directory::current_live(&entry, &f.owner.fence, before_expiry)
+                .expect("Root lease expired before the actual replacement barrier");
+            assert_eq!(activation.lease_expires_at, f.root_expires_at);
+            f.raw
+                .locked_owned_claim(&inbox, ROOT, &claim, before_expiry, false)
+                .expect("input lease expired before the actual replacement barrier");
+            assert!(Utc::now() < claim.lease.expires_at);
             let deadline = if root_expiry {
-                f.root_expires_at
+                activation.lease_expires_at
             } else {
                 claim.lease.expires_at
             };
-            let before_main = std::fs::read(f.directory().join("session.json")).unwrap();
-            let before_runtime = std::fs::read(f.directory().join(RUNTIME_SIDECAR_FILE)).unwrap();
-            let hook =
-                DefaultWriteHook::install(&f.a, file, DurableWritePhase::BeforeReplace, false);
-            let _release = Release(hook.clone());
-            let run = f.clone();
-            let current = claim.clone();
-            let writer = tokio::spawn(async move { run.checkpoint(&current).await });
-            hook.wait();
             held(&f);
             expire(deadline).await;
+            assert_eq!(std::fs::read(&authority_path).unwrap(), authority);
+            assert_eq!(std::fs::read(&claim_path).unwrap(), token);
+            // Only wall time changed: the identical token still validates at
+            // its recorded live time, and is rejected at the actual new time.
+            f.raw
+                .locked_owned_claim(&inbox, ROOT, &claim, before_expiry, false)
+                .unwrap();
+            assert!(f
+                .raw
+                .locked_owned_claim(&inbox, ROOT, &claim, Utc::now(), false)
+                .is_err());
+            if root_expiry {
+                assert!(actor_directory::current_live(&entry, &f.owner.fence, Utc::now()).is_err());
+            } else {
+                actor_directory::current_live(&entry, &f.owner.fence, Utc::now())
+                    .expect("Root remains live while only the input lease expires");
+            }
             hook.release();
             assert!(tokio::time::timeout(WAIT, writer)
                 .await
@@ -649,4 +698,83 @@ async fn checkpoint_successor_once(
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn root_receipt_claim_uses_current_writer_run_and_existing_checkpoint_ack() {
+    let f = Fixture::new(LeaseDuration::seconds(30)).await;
+    let selected = bamboo_domain::SessionInboxReceipt {
+        id: f.input.id.clone(),
+        generation: 1,
+    };
+    let now = Utc::now();
+    let request = SessionInboxLeaseRequest {
+        consumer: SessionInboxConsumerId::new(),
+        now,
+        duration: LeaseDuration::seconds(5),
+    };
+    for run in [None, Some("another-run")] {
+        assert!(f
+            .bound
+            .claim_owned_receipt(ROOT, &selected, run, &request)
+            .await
+            .is_err());
+    }
+    f.assert_unadmitted().await;
+    let claim = f
+        .bound
+        .claim_owned_receipt(ROOT, &selected, Some("run-a"), &request)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.claim.envelope, f.input);
+    assert!(claim.lease.expires_at <= f.root_expires_at);
+    f.checkpoint(&claim).await.unwrap();
+    assert!(f.raw.was_admitted(ROOT, &selected.id).await.unwrap());
+    assert_eq!(f.publications.lock().unwrap().len(), 1);
+    assert!(f
+        .bound
+        .claim_owned_receipt(ROOT, &selected, Some("run-a"), &request)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn root_receipt_claim_rejects_stale_actor_and_lease_beyond_actor_deadline() {
+    let f = Fixture::new(LeaseDuration::seconds(30)).await;
+    let selected = bamboo_domain::SessionInboxReceipt {
+        id: f.input.id.clone(),
+        generation: 1,
+    };
+    let now = Utc::now();
+    let overlong = SessionInboxLeaseRequest {
+        consumer: SessionInboxConsumerId::new(),
+        now,
+        duration: LeaseDuration::minutes(1),
+    };
+    assert!(f
+        .bound
+        .claim_owned_receipt(ROOT, &selected, Some("run-a"), &overlong)
+        .await
+        .is_err());
+    f.a.finish_activation(
+        &f.owner.fence,
+        Utc::now(),
+        bamboo_domain::ActorActivationFinish::Cancelled,
+    )
+    .await
+    .unwrap();
+    let request = SessionInboxLeaseRequest {
+        duration: LeaseDuration::seconds(5),
+        ..overlong
+    };
+    assert!(f
+        .bound
+        .claim_owned_receipt(ROOT, &selected, Some("run-a"), &request)
+        .await
+        .is_err());
+    f.assert_unadmitted().await;
+    let backlog = f.raw.inspect(ROOT).await.unwrap();
+    assert_eq!((backlog.pending, backlog.claimed), (1, 0));
 }

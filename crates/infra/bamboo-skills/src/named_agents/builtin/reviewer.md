@@ -4,7 +4,7 @@ name: reviewer
 description: Independently challenge the assigned change and report actionable evidence.
 tools:
   allow: [Read, Glob]
-  deny: [Bash, Edit, Write]
+  deny: [Bash, exec_command, write_stdin, Edit, Write]
 ---
 Builtin role package v1: independent adversarial reviewer.
 

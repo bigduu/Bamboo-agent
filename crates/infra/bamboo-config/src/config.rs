@@ -218,6 +218,21 @@ pub struct DefaultWorkAreaConfig {
     pub path: Option<String>,
 }
 
+/// User-selected locations for new user worktrees. Git remains the registry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_root: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub project_roots: BTreeMap<String, String>,
+}
+
+impl WorktreeSettings {
+    pub fn is_empty(&self) -> bool {
+        self.default_root.is_none() && self.project_roots.is_empty()
+    }
+}
+
 /// Access control configuration for password-based UI/API gating.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AccessControlConfig {
@@ -695,6 +710,9 @@ pub enum CodexApprovalPolicy {
     OnRequest,
 }
 
+/// Default number of child levels below a Root (whose depth is zero).
+pub const DEFAULT_MAX_SPAWN_DEPTH: u32 = 4;
+
 /// Sub-agent execution settings.
 ///
 /// Sub-agents always run as independent **actor** processes — an isolated OS
@@ -707,6 +725,10 @@ pub enum CodexApprovalPolicy {
 /// custom worker.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SubagentsConfig {
+    /// Maximum child depth below Root=0. Zero disables new child creation.
+    /// Unset preserves the historical four-level limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_spawn_depth: Option<u32>,
     /// Maximum actor activations running at once; further spawns wait their
     /// turn. Default: 200. Warm-idle process retention has a separate, smaller
     /// bound.
@@ -848,6 +870,12 @@ pub struct SubagentsConfig {
     /// worker, not a malicious one that lies about its own role).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_role_allowlist: Vec<McpRoleAllowlistEntry>,
+}
+
+impl SubagentsConfig {
+    pub fn effective_max_spawn_depth(&self) -> u32 {
+        self.max_spawn_depth.unwrap_or(DEFAULT_MAX_SPAWN_DEPTH)
+    }
 }
 
 /// One role's MCP proxy tool allowlist entry (issue #54). See
@@ -993,7 +1021,7 @@ impl RemoteBrokerPeer {
             && self
                 .parent_role
                 .as_deref()
-                .map_or(true, |s| identifier(s, false))
+                .is_none_or(|s| identifier(s, false))
             && self
                 .worker_role
                 .as_deref()
@@ -1268,14 +1296,23 @@ pub struct TrustedKey {
     pub public_key: String,
 }
 
+/// Raw Ed25519 public anchor committed by the Jiandu plugin publisher.
+pub const JIANDU_PLUGIN_PUBLIC_KEY: &str =
+    "bba9d0e5553401125f939bc3d844e891706d579a611fea9215545771d5306676";
+
 /// The official plugin-signing keys trusted by default, so an out-of-the-box
 /// `bamboo plugin install <official release url>` needs no `--allow-unsigned`
 /// for a bundle those repos' release CI signed. One entry per first-party
 /// plugin publisher; each repo commits its public half as
 /// `packaging/plugin/signing-key.pub` (nova) / `plugin/signing-key.pub`
-/// (magpie) for cross-checking.
+/// (magpie and jiandu) for cross-checking.
 fn default_trusted_keys() -> Vec<TrustedKey> {
     vec![
+        TrustedKey {
+            label: "jiandu (bigduu official)".to_string(),
+            algorithm: "ed25519".to_string(),
+            public_key: JIANDU_PLUGIN_PUBLIC_KEY.to_string(),
+        },
         TrustedKey {
             label: "nova (bigduu official)".to_string(),
             algorithm: "ed25519".to_string(),
@@ -1522,7 +1559,9 @@ pub fn is_host_trusted(url: &str, trusted_hosts: &[String]) -> bool {
 
 /// Host strategy used when the active model context approaches its input limit.
 ///
-/// `Summary` remains the compatibility default. `RetrievalWindow` is opt-in and
+/// `Summary` remains the compatibility default. `MessageSummary` summarizes only
+/// historical user/assistant prose and removes completed tool exchanges from the
+/// active model view. `RetrievalWindow` is opt-in and
 /// archives old exact messages only after the runtime has verified that the
 /// current-session history capability is callable and the boundary can be
 /// durably checkpointed.
@@ -1531,6 +1570,7 @@ pub fn is_host_trusted(url: &str, trusted_hosts: &[String]) -> bool {
 pub enum ContextManagementStrategy {
     #[default]
     Summary,
+    MessageSummary,
     RetrievalWindow,
 }
 
@@ -1790,6 +1830,9 @@ pub struct ConfigValues {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_work_area: Option<DefaultWorkAreaConfig>,
 
+    #[serde(default, skip_serializing_if = "WorktreeSettings::is_empty")]
+    pub worktrees: WorktreeSettings,
+
     /// Access control / password gate configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_control: Option<AccessControlConfig>,
@@ -1884,6 +1927,7 @@ impl Default for ConfigValues {
             skills: SkillsConfig::default(),
             env_vars: Vec::new(),
             default_work_area: None,
+            worktrees: WorktreeSettings::default(),
             access_control: None,
             features: FeatureFlags::default(),
             defaults: None,
@@ -1969,6 +2013,8 @@ struct WorkspaceConfigSection {
     env_vars: Vec<EnvVarEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     default_work_area: Option<DefaultWorkAreaConfig>,
+    #[serde(default, skip_serializing_if = "WorktreeSettings::is_empty")]
+    worktrees: WorktreeSettings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     access_control: Option<AccessControlConfig>,
 }
@@ -2091,6 +2137,7 @@ impl From<ConfigValues> for ConfigRoot {
             skills,
             env_vars,
             default_work_area,
+            worktrees,
             access_control,
             features,
             run_budget,
@@ -2131,6 +2178,7 @@ impl From<ConfigValues> for ConfigRoot {
             workspace: WorkspaceConfigSection {
                 env_vars,
                 default_work_area,
+                worktrees,
                 access_control,
             },
             execution: ExecutionConfigSection {
@@ -2191,6 +2239,7 @@ impl From<ConfigRoot> for ConfigValues {
         let WorkspaceConfigSection {
             env_vars,
             default_work_area,
+            worktrees,
             access_control,
         } = workspace;
         let ExecutionConfigSection {
@@ -2227,6 +2276,7 @@ impl From<ConfigRoot> for ConfigValues {
             skills,
             env_vars,
             default_work_area,
+            worktrees,
             access_control,
             features,
             run_budget,
@@ -2438,6 +2488,9 @@ pub struct FeatureFlags {
     /// Enable MiniLoop-based complexity evaluation and dynamic per-round model switching.
     #[serde(default)]
     pub dynamic_model_routing: bool,
+    /// Check a final answer once against this request's recorded tool evidence.
+    #[serde(default)]
+    pub final_evidence_check: bool,
 }
 
 /// Default model assignments for specific capabilities.
@@ -4761,6 +4814,7 @@ impl Config {
                 skills: SkillsConfig::default(),
                 env_vars: Vec::new(),
                 default_work_area: None,
+                worktrees: WorktreeSettings::default(),
                 access_control: None,
                 features: FeatureFlags::default(),
                 defaults: None,
@@ -4787,18 +4841,22 @@ impl Config {
     }
 
     /// Persist only the memory module, leaving every other config file untouched.
+    /// Legacy layouts only; modular layouts require a revisioned section update.
     pub fn save_memory_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
         self.memory.save_sync(data_dir)
     }
 
     /// Persist only the sub-agent module, leaving every other config file untouched.
+    /// Legacy layouts only; modular layouts require a revisioned section update.
     pub fn save_subagents_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
         self.subagents.save_sync(data_dir)
     }
 
     /// Persist only provider configuration. Provider plaintext keys are first
     /// refreshed into their encrypted at-rest representation.
+    /// Legacy layouts only; modular layouts require a revisioned section update.
     pub fn save_providers_to_dir(&self, data_dir: &std::path::Path) -> Result<()> {
+        crate::config_module::ensure_legacy_module_layout(data_dir)?;
         crate::validate_runtime_model_admission(self).map_err(anyhow::Error::msg)?;
         let mut config = self.clone();
         config.clear_legacy_provider_aliases_for_instance_mode();
@@ -5899,6 +5957,40 @@ mod tests {
     }
 
     #[test]
+    fn message_summary_context_management_round_trips_without_changing_defaults() {
+        let root: ConfigRoot = serde_json::from_value(serde_json::json!({
+            "context_management": {
+                "strategy": "message_summary"
+            }
+        }))
+        .unwrap();
+        let values = ConfigValues::from(root);
+        assert_eq!(
+            values.context_management.strategy,
+            ContextManagementStrategy::MessageSummary
+        );
+        assert_eq!(
+            values.context_management.retrieval_window,
+            RetrievalWindowContextConfig::default()
+        );
+
+        let persisted = serde_json::to_value(ConfigRoot::from(values)).unwrap();
+        assert_eq!(
+            persisted["context_management"]["strategy"],
+            "message_summary"
+        );
+        let reloaded: ConfigRoot = serde_json::from_value(persisted).unwrap();
+        assert_eq!(
+            ConfigValues::from(reloaded).context_management.strategy,
+            ContextManagementStrategy::MessageSummary
+        );
+        assert_eq!(
+            ContextManagementConfig::default().strategy,
+            ContextManagementStrategy::Summary
+        );
+    }
+
+    #[test]
     fn retrieval_window_context_management_rejects_unsafe_policy() {
         for invalid in [
             serde_json::json!({
@@ -6229,6 +6321,34 @@ mod tests {
         // nulls.
         let empty = serde_json::to_string(&RunBudgetConfig::default()).unwrap();
         assert_eq!(empty, "{}");
+    }
+
+    #[test]
+    fn subagents_spawn_depth_preserves_default_and_explicit_zero() {
+        let old: SubagentsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.effective_max_spawn_depth(), DEFAULT_MAX_SPAWN_DEPTH);
+        assert!(!serde_json::to_string(&old)
+            .unwrap()
+            .contains("max_spawn_depth"));
+        for depth in [0, 1, 8] {
+            let config: SubagentsConfig =
+                serde_json::from_value(serde_json::json!({"max_spawn_depth": depth})).unwrap();
+            assert_eq!(config.effective_max_spawn_depth(), depth);
+            assert_eq!(
+                serde_json::to_value(config).unwrap()["max_spawn_depth"],
+                depth
+            );
+        }
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("4"),
+        ] {
+            assert!(serde_json::from_value::<SubagentsConfig>(
+                serde_json::json!({"max_spawn_depth": invalid}),
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -10635,5 +10755,23 @@ mod tests {
             outcome.config.plugin_trust.enforcement,
             PluginTrustEnforcement::Strict
         );
+    }
+}
+
+#[cfg(test)]
+mod final_evidence_feature_tests {
+    use super::FeatureFlags;
+
+    #[test]
+    fn final_evidence_check_is_opt_in_and_survives_config_round_trip() {
+        let existing: FeatureFlags =
+            serde_json::from_str(r#"{"dynamic_model_routing":true}"#).unwrap();
+        assert!(!existing.final_evidence_check);
+        let enabled: FeatureFlags =
+            serde_json::from_str(r#"{"final_evidence_check":true}"#).unwrap();
+        let restored: FeatureFlags =
+            serde_json::from_value(serde_json::to_value(enabled).unwrap()).unwrap();
+        assert!(restored.final_evidence_check);
+        assert!(!FeatureFlags::default().final_evidence_check);
     }
 }

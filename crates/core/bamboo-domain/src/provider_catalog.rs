@@ -14,7 +14,7 @@ pub struct ProviderDescriptor {
 pub struct ModelCapabilities {
     #[serde(default)]
     pub supports_tools: bool,
-    #[serde(default)]
+    #[serde(default = "default_vision_support")]
     pub supports_vision: bool,
     #[serde(default)]
     pub supports_reasoning: bool,
@@ -26,11 +26,15 @@ pub struct ModelCapabilities {
     pub max_output_tokens: Option<u32>,
 }
 
+fn default_vision_support() -> bool {
+    true
+}
+
 impl Default for ModelCapabilities {
     fn default() -> Self {
         Self {
             supports_tools: true,
-            supports_vision: false,
+            supports_vision: true,
             supports_reasoning: false,
             supports_streaming: None,
             max_context_tokens: None,
@@ -92,7 +96,12 @@ mod tests {
     fn test_model_capabilities_default() {
         let c = ModelCapabilities::default();
         assert!(c.supports_tools);
-        assert!(!c.supports_vision);
+        assert!(c.supports_vision);
+        let legacy: ModelCapabilities = serde_json::from_str("{}").unwrap();
+        assert!(legacy.supports_vision);
+        let disabled: ModelCapabilities =
+            serde_json::from_str(r#"{"supports_vision":false}"#).unwrap();
+        assert!(!disabled.supports_vision);
         assert!(!c.supports_reasoning);
     }
 

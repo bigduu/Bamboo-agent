@@ -51,6 +51,7 @@ pub use session_app::child_completion_coordinator::ChildCompletionCoordinator;
 pub use session_messaging::{
     SessionMessagingMetrics, SessionMessagingMetricsSnapshot, SessionMessenger,
     SessionMessengerAdmission, SessionMessengerError, SessionMessengerReceipt,
+    SessionPeerDeliveryReceipt,
 };
 
 // Re-export commonly used types from agent (via dependency)
@@ -74,6 +75,7 @@ pub use runtime::config::{
     ChildApprovalRequest, DisabledFilterResolver, DisabledFilterSets, GuardianConfig,
     GuardianSpawner, ImageFallbackConfig, ImageFallbackMode,
 };
+pub use runtime::counted_loop::CountedLoopConfig;
 pub use runtime::execution::runner_state::{AgentRunner, AgentStatus};
 pub use runtime::execution::{
     VisibleAssistantMessage, VisibleMessageEvent, VisibleMessageEventKind, VisibleMessageSnapshot,
@@ -84,6 +86,7 @@ pub use runtime::hooks::{
     LifecycleHookTestOutput, LifecycleScriptRunner, ScriptHook, ShellCommandHook, ShellHookEvent,
     ShellHookTestOutput,
 };
+pub use runtime::loop_control::{LoopControlConfig, SupervisorLoopControlGrant};
 pub use runtime::managers::{
     LifecycleManager, LlmManager, MemoryManager, MiniLoopExecutor, PromptManager, ToolManager,
 };

@@ -131,6 +131,74 @@ pub struct SessionInboxRuntimeBinding {
 /// and respecting the `cancel_token`.
 #[async_trait::async_trait]
 pub trait ExternalChildRunner: Send + Sync {
+    /// App catalog/read services for the owned local backend only.
+    /// Process and remote adapters deliberately retain the default no-op.
+    fn set_local_child_skill_factory(
+        &self,
+        _factory: Option<Arc<dyn crate::external_agents::local_task::LocalChildSkillFactory>>,
+    ) {
+    }
+
+    /// Bind the Host's in-process execution resources. Process/remote adapters
+    /// deliberately ignore this capability and retain their existing mode.
+    fn set_local_task_runtime(
+        &self,
+        _runtime: Option<crate::external_agents::local_task::LocalTaskRuntime>,
+    ) {
+    }
+
+    /// Acquire this backend's exact durable writer before the canonical
+    /// running checkpoint. A default writer is never substituted after claim.
+    async fn prepare_child_execution(
+        &self,
+        _session: &Session,
+        _run_id: &str,
+        _cancel: CancellationToken,
+    ) -> Result<Option<Arc<dyn RuntimeSessionPersistence>>, String> {
+        Ok(None)
+    }
+
+    /// Roll back a prepared execution whose initial canonical checkpoint failed.
+    /// Local implementations must close the launch gate and prove resource drain.
+    async fn abandon_child_execution(
+        &self,
+        _session: &Session,
+        _run_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Record a setup panic without inventing a successful resource stop.
+    fn quarantine_child_execution(&self, _session: &Session, _run_id: &str) {}
+
+    /// Keep a local coordinator handle owned until it really exits. Returning
+    /// the handle leaves supervision to an outer composite or legacy caller.
+    fn track_child_task(
+        &self,
+        _session_id: &str,
+        _run_id: &str,
+        handle: tokio::task::JoinHandle<()>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        Some(handle)
+    }
+
+    /// End the exact backend writer after terminal persistence and the history
+    /// barrier, before publishing runner replacement eligibility.
+    async fn finish_child_execution(
+        &self,
+        _session: &Session,
+        _run_id: &str,
+        _history_committed: bool,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Stop admission, request cancellation, and await owned task/resource
+    /// completion. This is called by the Host's graceful shutdown path.
+    async fn shutdown(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Opt-in, host-owned scope authority. It is never copied into the Worker.
     fn set_ticket_service(&self, _service: Option<Arc<bamboo_tickets::TicketService>>) {}
     /// A narrow, pre-persistence compatibility check on the actual registered
@@ -164,14 +232,29 @@ pub trait ExternalChildRunner: Send + Sync {
         Ok(false)
     }
 
-    /// Called only after the Host's final Child Session save returns. The
-    /// exact Child birth and activation run identify a pending broker terminal
-    /// receipt; a failed save leaves the mailbox unacknowledged.
+    /// Commit and read back any Host-only proof required for this terminal
+    /// delivery after the final Child Session save. Failure (including timeout)
+    /// prevents a committed completion source and successful runner finalization.
+    /// When the source is pending, publish its terminal status and seal with an
+    /// exact-snapshot canonical write before returning; the SDK verifies readback.
+    /// Legacy/default runners need no separate proof and retain save-only behavior.
+    async fn commit_durable_child_delivery(
+        &self,
+        _session: &Session,
+        _activation_run_id: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// ACK transport delivery only after the final Child save and required
+    /// Host proof commit both succeed. The exact Child birth and activation run
+    /// identify the pending receipt; failed commitment leaves it unacknowledged.
+    /// ACK delivery failure does not invalidate an already-proven completion.
     async fn confirm_durable_child_delivery(
         &self,
         _session: &Session,
         _activation_run_id: &str,
-        _save_succeeded: bool,
+        _history_committed: bool,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -259,6 +342,10 @@ impl SpawnScheduler {
         role: &str,
     ) -> Result<(), String> {
         let mut candidate = Session::new("required-context-preflight", "");
+        // This is a route-only probe for the Child we have not created yet.
+        // Keep it out of execution/persistence, but select the same backend as
+        // that Child; a Root-shaped probe cannot match the native Child runner.
+        candidate.kind = bamboo_domain::SessionKind::Child;
         candidate.metadata = metadata.clone();
         candidate
             .metadata

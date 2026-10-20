@@ -722,10 +722,8 @@ async fn owned_root_expiry_at_actual_replace_rejects_before_cache_or_canonical_m
     for runtime_only in [false, true] {
         let home = tempfile::tempdir().unwrap();
         let (first, second, mut incoming) = stores(home.path()).await;
-        let owner = running_root_writer(&first, &incoming, 250).await;
         incoming.conversation_summary.as_mut().unwrap().content = "obsolete".into();
         incoming.add_message(Message::assistant("obsolete", None));
-        let before = snapshot(&home.path().join("sessions").join(ID));
         let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = published.clone();
         let hook = DefaultWriteHook::install(
@@ -735,9 +733,17 @@ async fn owned_root_expiry_at_actual_replace_rejects_before_cache_or_canonical_m
             false,
         );
         let _release = Release(hook.clone());
+        let (ready, prepared) = tokio::sync::oneshot::channel();
         let job = {
             let first = first.clone();
             tokio::spawn(async move {
+                // Task startup must not spend the short lease before writing.
+                let owner = running_root_writer(&first, &incoming, 2_000).await;
+                let before = snapshot(&first.bamboo_home_dir.join("sessions").join(ID));
+                assert!(
+                    ready.send((before, owner.clone())).is_ok(),
+                    "expiry fixture receiver closed"
+                );
                 first
                     .save_root_actor_runtime(
                         &owner,
@@ -750,8 +756,24 @@ async fn owned_root_expiry_at_actual_replace_rejects_before_cache_or_canonical_m
                     .await
             })
         };
+        let (before, owner) = prepared.await.unwrap();
         hook.wait();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let directory = home.path().join("sessions").join(ID);
+        let authority = std::fs::read(directory.join(RECORD)).unwrap();
+        assert_eq!(before[2].as_deref(), Some(authority.as_slice()));
+        let entry: ActorDirectoryEntry = serde_json::from_slice(&authority).unwrap();
+        let activation = actor_directory::current_live(&entry, &owner.fence, Utc::now())
+            .expect("Root lease expired before the actual replacement barrier");
+        let deadline = activation.lease_expires_at;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while Utc::now() <= deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the unchanged Root lease expires in actual wall time");
+        assert_eq!(std::fs::read(directory.join(RECORD)).unwrap(), authority);
+        assert!(actor_directory::current_live(&entry, &owner.fence, Utc::now()).is_err());
         physical_locks_held(&first);
         hook.release();
         root_writer_rejected(job.await.unwrap().unwrap_err());

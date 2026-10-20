@@ -333,7 +333,7 @@ pub fn select_worker_host<'a>(
             })
             .then_with(|| a.host_ref.cmp(&b.host_ref))
         });
-    selected.ok_or_else(|| match &request.intent {
+    selected.ok_or(match &request.intent {
         HostPlacementIntent::Local { .. } | HostPlacementIntent::PinnedHost { .. } => {
             HostRegistryError::PinnedUnavailable
         }

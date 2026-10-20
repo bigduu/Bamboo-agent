@@ -47,6 +47,24 @@ impl DirectExecutionLease {
     }
 }
 
+/// Opaque, single-use SDK submission receipt. The owned User is the genuine
+/// portable-hook result; subsequent F preparation may change only its prompt.
+pub struct SdkInputSubmission {
+    session_id: String,
+    execution_id: String,
+    user: bamboo_agent_core::Message,
+    hook_runner: Arc<crate::runtime::hooks::HookRunner>,
+}
+
+impl SdkInputSubmission {
+    pub fn execution_id(&self) -> &str {
+        &self.execution_id
+    }
+    pub fn user(&self) -> &bamboo_agent_core::Message {
+        &self.user
+    }
+}
+
 impl Agent {
     /// Wrap an existing [`AgentRuntime`] in an `Agent`.
     pub fn from_runtime(runtime: Arc<AgentRuntime>) -> Self {
@@ -66,6 +84,138 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Install the registered SDK adapter on this execution's runtime only.
+    #[doc(hidden)]
+    pub fn with_sdk_skill_execution_host(
+        &self,
+        host: Arc<dyn crate::runtime::config::SdkSkillExecutionHost>,
+    ) -> Self {
+        self.with_skill_execution_host(host)
+    }
+
+    /// Attach an execution-local registered host; this creates no caller authority.
+    #[doc(hidden)]
+    pub fn with_skill_execution_host(
+        &self,
+        host: Arc<dyn crate::runtime::config::SkillExecutionHost>,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.sdk_skill_execution_host = Some(host);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Run the genuine portable submission hook before F and append. No old
+    /// metadata receipt may skip this new submission's hook.
+    #[doc(hidden)]
+    pub async fn precheck_sdk_user_input(
+        &self,
+        session: &mut Session,
+        user: &bamboo_agent_core::Message,
+        app_data_dir: Option<std::path::PathBuf>,
+    ) -> crate::runtime::runner::Result<SdkInputSubmission> {
+        session
+            .check_execution_compatibility()
+            .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
+        if user.role != bamboo_agent_core::Role::User
+            || crate::runtime::config::UntrustedInputObservation::new(&user.id, None).is_none()
+            || session.messages.iter().any(|message| message.id == user.id)
+        {
+            return Err(bamboo_agent_core::AgentError::Tool(
+                "invalid new SDK User".into(),
+            ));
+        }
+        let hook_runner = {
+            let config = self.runtime.config.read().await;
+            Arc::new(
+                self.runtime
+                    .hook_runner
+                    .with_lifecycle_config(&config.lifecycle_hooks, app_data_dir),
+            )
+        };
+        session.metadata.remove("runtime.plugin_prompt_prechecked");
+        let prompt = hook_runner
+            .apply_portable_user_prompt(session, &user.content)
+            .await?;
+        let mut transformed = user.clone();
+        transformed.content = prompt.clone();
+        if let Some(parts) = transformed.content_parts.as_mut() {
+            if let Some(bamboo_domain::MessagePart::Text { text }) =
+                parts.iter_mut().find(|part| matches!(part, bamboo_domain::MessagePart::Text { text } if text == &user.content))
+            {
+                *text = prompt;
+            }
+        }
+        Ok(SdkInputSubmission {
+            session_id: session.id.clone(),
+            execution_id: crate::runtime::runner::round_prelude::new_execution_id(),
+            user: transformed,
+            hook_runner,
+        })
+    }
+
+    /// Actual SDK producer append. The private pending receipt becomes checked
+    /// only after startup hooks and a durable same-repository checkpoint.
+    #[doc(hidden)]
+    pub fn append_sdk_user_input(
+        &self,
+        session: &mut Session,
+        user: bamboo_agent_core::Message,
+        receipt: Option<SdkInputSubmission>,
+        request: Option<bamboo_domain::SessionSkillRequest>,
+    ) -> crate::runtime::runner::Result<crate::runtime::config::UntrustedExecutionInputs> {
+        session
+            .check_execution_compatibility()
+            .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
+        use crate::runtime::config::{
+            sdk_message_digest, sdk_message_header_digest, SdkPendingInput,
+            UntrustedExecutionInputs, UntrustedInputObservation,
+        };
+        let invalid = || bamboo_agent_core::AgentError::Tool("invalid SDK append receipt".into());
+        let header_digest = sdk_message_header_digest(&user);
+        let input_id = user.id.clone();
+        if let Some(receipt) = receipt.as_ref() {
+            if receipt.session_id != session.id
+                || receipt.user.role != bamboo_agent_core::Role::User
+                || user.role != bamboo_agent_core::Role::User
+                || sdk_message_header_digest(&receipt.user) != header_digest
+                || session
+                    .messages
+                    .iter()
+                    .any(|message| message.id == input_id)
+            {
+                return Err(invalid());
+            }
+        }
+        // Preserve the legacy String append even when optional observation data
+        // is malformed. Typed callers fail before append on an invalid receipt.
+        let final_digest = receipt.as_ref().map(|_| sdk_message_digest(&user));
+        if receipt.is_some() {
+            crate::runtime::hooks::HookRunner::mark_user_prompt_prechecked(session, &user.content);
+        }
+        session.add_message(user);
+        let observation =
+            UntrustedInputObservation::new(&input_id, request.as_ref()).ok_or_else(invalid)?;
+        let carrier = UntrustedExecutionInputs::new(vec![observation]).ok_or_else(invalid)?;
+        let (execution_id, hook_runner) = receipt
+            .map(|receipt| (receipt.execution_id, Some(receipt.hook_runner)))
+            .unwrap_or_else(|| {
+                (
+                    crate::runtime::runner::round_prelude::new_execution_id(),
+                    None,
+                )
+            });
+        Ok(carrier.bind_sdk_append(
+            execution_id,
+            SdkPendingInput {
+                session_id: session.id.clone(),
+                input_id,
+                header_digest,
+                final_digest,
+            },
+            hook_runner,
+        ))
+    }
+
     /// Return a new builder.
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
@@ -78,6 +228,17 @@ impl Agent {
         req: ExecuteRequest,
     ) -> crate::runtime::runner::Result<()> {
         self.runtime.execute(session, req).await
+    }
+
+    /// Explicit bounded caller-data handoff; no currentness or Skill authority.
+    /// Ordinary execute/direct/spawn entrypoints continue to supply None.
+    pub async fn execute_with_inputs(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+    ) -> crate::runtime::runner::Result<()> {
+        self.runtime.execute_with_inputs(session, req, inputs).await
     }
 
     /// Execute a caller-owned session under a complete logical-session
@@ -95,9 +256,46 @@ impl Agent {
         session: &mut Session,
         req: ExecuteRequest,
     ) -> crate::runtime::runner::Result<()> {
+        session
+            .check_execution_compatibility()
+            .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
         let lease = self.begin_direct_execution(&session.id).await?;
+        self.check_direct_execution_admission(session, &lease)
+            .await?;
         self.prepare_external_session_for_execution(session).await?;
         self.execute_direct_registered(session, req, lease).await
+    }
+
+    /// Check counted-state admission under an already acquired opaque lease.
+    /// SDK facades call this before Project preparation or approved-tool replay.
+    /// This can refuse/fence an interrupted generation; it never replays it.
+    pub fn check_direct_execution_admission<'a>(
+        &'a self,
+        session: &'a mut Session,
+        lease: &'a DirectExecutionLease,
+    ) -> impl std::future::Future<Output = crate::runtime::runner::Result<()>> + Send + 'a {
+        let matches_target = lease.target_session_id == session.id;
+        // Keep the lease borrowed for this future's lifetime without carrying
+        // its non-Sync FnOnce cleanup across await. Only real private proof
+        // enters the Send future; it is revalidated against the current owner.
+        let ownership = lease.registration.as_ref().map(|run| run.ownership());
+        async move {
+            if !matches_target {
+                return Err(bamboo_agent_core::AgentError::LLM(
+                    "direct execution lease target does not match session".into(),
+                ));
+            }
+            session
+                .check_execution_compatibility()
+                .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
+            super::counted_loop::admit_registered(
+                session,
+                ownership.as_ref(),
+                self.activation_router(),
+                self.persistence().as_ref(),
+            )
+            .await
+        }
     }
 
     /// Validate and publish Project/Workspace context for a caller-owned
@@ -174,6 +372,20 @@ impl Agent {
         req: ExecuteRequest,
         lease: DirectExecutionLease,
     ) -> crate::runtime::runner::Result<()> {
+        self.execute_direct_registered_with_inputs(session, req, lease, None)
+            .await
+    }
+
+    /// Existing direct lifecycle with a separately owned, untrusted input handoff.
+    pub async fn execute_direct_registered_with_inputs(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        lease: DirectExecutionLease,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+    ) -> crate::runtime::runner::Result<()> {
+        self.check_direct_execution_admission(session, &lease)
+            .await?;
         let inherited = self.persistence().inherited_child_wait().or_else(|| {
             (!self.runtime.inherited_child_wait_captured)
                 .then(|| bamboo_domain::InheritedChildWait::capture(session))
@@ -196,15 +408,16 @@ impl Agent {
             self.with_execution_persistence(self.persistence().clone())
         };
         agent
-            .execute_direct_registered_bound(session, req, lease)
+            .execute_direct_registered_bound(session, req, lease, inputs)
             .await
     }
 
     async fn execute_direct_registered_bound(
         &self,
         session: &mut Session,
-        req: ExecuteRequest,
+        mut req: ExecuteRequest,
         mut lease: DirectExecutionLease,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
         if lease.target_session_id != session.id {
             return Err(bamboo_agent_core::AgentError::LLM(format!(
@@ -213,14 +426,66 @@ impl Agent {
             )));
         }
         let Some(router) = lease.router.take() else {
-            return self.execute(session, req).await;
+            return self.execute_with_inputs(session, req, inputs).await;
         };
         let mut registration = lease.registration.take().ok_or_else(|| {
             bamboo_agent_core::AgentError::LLM(
                 "direct execution lease is missing its router registration".to_string(),
             )
         })?;
-        let result = self.execute(session, req).await;
+        if !router
+            .bind_run_lifetime(&registration.ownership(), session)
+            .await
+        {
+            return Err(bamboo_agent_core::AgentError::Tool(
+                "registered run Session lifetime differs".into(),
+            ));
+        }
+        if let Some(counted) = req.counted_loop.as_mut() {
+            counted.bind_owner(registration.ownership(), session);
+        }
+        if let Some(control) = req.loop_control.as_mut() {
+            control.bind_owner(registration.ownership(), session);
+            control.bind_transport_cleanup(
+                &mut registration,
+                self.storage().clone(),
+                self.session_inbox().cloned(),
+                self.persistence().root_actor_writer(),
+            );
+        }
+        let result = if req.loop_control.is_some() {
+            bamboo_agent_core::tools::observe_tool_suspension(false, async {
+                let token = bamboo_agent_core::tools::capture_suspension_restriction().ok_or_else(
+                    || {
+                        bamboo_agent_core::AgentError::Tool(
+                            "direct loop_control execution is missing its host observation scope"
+                                .into(),
+                        )
+                    },
+                )?;
+                // Bind before the runtime is first polled, so cancellation of
+                // this observer still leaves Drop the same sticky host proof.
+                registration.bind_tool_suspension_observation(token);
+                self.execute_with_inputs(session, req, inputs).await
+            })
+            .await
+            .0
+        } else {
+            self.execute_with_inputs(session, req, inputs).await
+        };
+        if registration.observed_forbidden_running() {
+            // No stop receipt exists for this detached outcome, including when
+            // direct Root execution has no LocalTaskResources domain.
+            // Retain the exact owner before migration or ordinary finish can
+            // release it or dispatch a successor. Preserve the runtime error.
+            registration.quarantine().await;
+            return match result {
+                Err(error) => Err(error),
+                Ok(()) => Err(bamboo_agent_core::AgentError::Tool(
+                    "suspension_disabled: detached Running outcome; stop unconfirmed".into(),
+                )),
+            };
+        }
 
         // Freeze what this provider execution actually consumed. Compatibility
         // migration and concurrent deliveries below must remain newer work.
@@ -452,6 +717,16 @@ impl AgentBuilder {
 
     pub fn config(mut self, v: Arc<tokio::sync::RwLock<bamboo_llm::Config>>) -> Self {
         self.inner = self.inner.config(v);
+        self
+    }
+
+    /// Resolve model limits from a host-owned last-known-good section on each
+    /// round instead of reopening the instance's configuration file.
+    pub fn model_limits_section(
+        mut self,
+        section: Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>,
+    ) -> Self {
+        self.inner = self.inner.model_limits_section(section);
         self
     }
 

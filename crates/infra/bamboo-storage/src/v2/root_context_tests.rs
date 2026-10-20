@@ -2065,7 +2065,153 @@ async fn full_root_reads_reject_child_kind_and_foreign_identity_even_after_index
 }
 
 #[tokio::test]
-async fn indexed_runtime_save_preserves_tool_proof_when_main_is_later_damaged() {
+async fn admission_reads_full_canonical_root_history_without_repairing_stale_index() {
+    let home = tempfile::tempdir().unwrap();
+    let stale = std::sync::Arc::new(
+        SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let writer = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let mut initial = root();
+    initial.add_message(Message::assistant("iteration complete", None));
+    initial.add_message(Message::user("pending counted-loop repeat"));
+    writer.save_session(&initial).await.unwrap();
+    let mut current = initial.clone();
+    current.metadata.insert(
+        "runtime.counted_loop".into(),
+        serde_json::json!({"generation":"current-durable-generation","revision":2}).to_string(),
+    );
+    writer.save_runtime_state(&current).await.unwrap();
+    assert_eq!(
+        stale.load_session(&initial.id).await.unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let before = files(&writer, &initial.id).await;
+    assert!(writer
+        .load_root_authority(&initial.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .messages
+        .is_empty());
+    let locked = crate::LockedSessionStore::new(stale.clone());
+    let loaded = bamboo_domain::RuntimeSessionPersistence::load_runtime_admission_snapshot(
+        &locked,
+        &initial.id,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(loaded.created_at, current.created_at);
+    assert_eq!(
+        serde_json::to_value(&loaded.messages).unwrap(),
+        serde_json::to_value(&current.messages).unwrap()
+    );
+    assert_eq!(
+        loaded.messages.last().unwrap().content,
+        "pending counted-loop repeat"
+    );
+    assert_eq!(
+        loaded.metadata["runtime.counted_loop"],
+        current.metadata["runtime.counted_loop"]
+    );
+    assert_eq!(files(&writer, &initial.id).await, before);
+    assert_eq!(
+        stale.load_session(&initial.id).await.unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(
+        bamboo_domain::RuntimeSessionPersistence::load_runtime_admission_snapshot(
+            &locked,
+            "never-published-root"
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(files(&writer, &initial.id).await, before);
+    writer.flush_search_index().await;
+    stale.flush_search_index().await;
+}
+
+#[tokio::test]
+async fn admission_reads_reject_partial_corrupt_or_mismatched_root_without_writes() {
+    for tamper in [
+        "missing-main",
+        "missing-runtime",
+        "invalid-main",
+        "invalid-runtime",
+        "child-kind",
+        "foreign-id",
+        "birth",
+        "missing-proof",
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let writer = std::sync::Arc::new(
+            SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let mut initial = root();
+        initial.set_root_orchestration_only(true).unwrap();
+        writer.save_session(&initial).await.unwrap();
+        let target = directory(&writer, &initial.id);
+        match tamper {
+            "missing-main" => fs::remove_file(target.join("session.json")).await.unwrap(),
+            "missing-runtime" => fs::remove_file(target.join(RUNTIME_SIDECAR_FILE))
+                .await
+                .unwrap(),
+            "invalid-main" => fs::write(target.join("session.json"), b"{invalid")
+                .await
+                .unwrap(),
+            "invalid-runtime" => fs::write(target.join(RUNTIME_SIDECAR_FILE), b"{invalid")
+                .await
+                .unwrap(),
+            "missing-proof" => {
+                fs::remove_file(target.join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE))
+                    .await
+                    .unwrap()
+            }
+            _ => {
+                let main = target.join("session.json");
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&main).await.unwrap()).unwrap();
+                match tamper {
+                    "child-kind" => value["kind"] = serde_json::json!("child"),
+                    "foreign-id" => value["id"] = serde_json::json!("other-root"),
+                    "birth" => {
+                        value["created_at"] =
+                            serde_json::to_value(initial.created_at + chrono::Duration::seconds(1))
+                                .unwrap()
+                    }
+                    _ => unreachable!(),
+                }
+                fs::write(main, serde_json::to_vec(&value).unwrap())
+                    .await
+                    .unwrap();
+            }
+        }
+        let before = files(&writer, &initial.id).await;
+        let locked = crate::LockedSessionStore::new(writer.clone());
+        assert!(
+            bamboo_domain::RuntimeSessionPersistence::load_runtime_admission_snapshot(
+                &locked,
+                &initial.id
+            )
+            .await
+            .is_err(),
+            "tamper={tamper}"
+        );
+        assert_eq!(files(&writer, &initial.id).await, before, "tamper={tamper}");
+        writer.flush_search_index().await;
+    }
+}
+
+#[tokio::test]
+async fn indexed_runtime_save_rejects_damaged_main_without_changing_tool_proof() {
     let initial = root();
     let fixture = Fixture::new(&initial, false).await;
     let main = directory(&fixture.first, &initial.id).join("session.json");
@@ -2077,11 +2223,21 @@ async fn indexed_runtime_save_preserves_tool_proof_when_main_is_later_damaged() 
     runtime
         .metadata
         .insert("last_run_status".into(), "completed".into());
-    fixture.second.save_runtime_state(&runtime).await.unwrap();
+    // Main owns the behavior stamp. A committed tool proof remains readable,
+    // but cannot authorize a checkpoint whose Main contract is unreadable.
+    let before = files(&fixture.first, &initial.id).await;
+    let error = fixture
+        .second
+        .save_runtime_state(&runtime)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(files(&fixture.first, &initial.id).await, before);
     assert_eq!(fs::read(&proof).await.unwrap(), proof_before);
     assert_eq!(fs::read(&main).await.unwrap(), b"{invalid");
     assert!(fixture.second.load_session(&initial.id).await.is_err());
     assert!(fixture.second.save_session(&runtime).await.is_err());
+    assert_eq!(files(&fixture.first, &initial.id).await, before);
     let control = fixture
         .second
         .load_runtime_control_plane(&initial.id)

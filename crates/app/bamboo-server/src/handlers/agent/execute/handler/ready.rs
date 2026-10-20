@@ -6,7 +6,8 @@
 //! reserve the runner, persist + cache, kick auto-title-gen, resolve the
 //! session-effective provider/area models, and spawn the agent loop.
 //!
-//! Behavior is identical to the prior inline branch — this is a pure extraction.
+//! Image validation uses the routed provider before spawning. Native Root
+//! admission may already hold the exact reservation that reaches this path.
 
 use actix_web::{web, HttpResponse};
 use std::collections::BTreeSet;
@@ -19,8 +20,7 @@ use super::response::{
 };
 use crate::app_state::AppState;
 use crate::handlers::agent::execute::runtime::{
-    reserve_runner, spawn_agent_execution, spawn_event_forwarder_with_root_actor,
-    RunnerReservation, SpawnAgentExecution,
+    reserve_runner, spawn_event_forwarder_with_root_actor, RunnerReservation, SpawnAgentExecution,
 };
 use bamboo_engine::model_areas::resolve_global_area_models;
 use bamboo_engine::model_config_helper::{
@@ -35,8 +35,13 @@ use bamboo_llm::Config;
 pub(super) struct ReadyExecution<'a> {
     pub session: bamboo_agent_core::Session,
     pub startup_guard: &'a mut crate::handlers::agent::events::ExecuteStartupGuard,
+    pub admission_reservation:
+        &'a mut Option<bamboo_engine::execution::SessionExecutionReservation>,
     /// Durable message id owned by the pending execute handoff, if any.
     pub startup_turn_id: Option<String>,
+    pub untrusted_inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
+    pub generate_title: bool,
+    pub native_main: bool,
     pub effective_model: String,
     pub effective_reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
     pub model_source: &'static str,
@@ -89,11 +94,12 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             Ok(routing_key) => routing_key,
             Err(error) => {
                 let detail = format!("provider routing failed: {error}");
-                super::fail_pending_startup(
+                super::fail_reserved_pending_startup(
                     state,
                     session_id,
                     ready.startup_turn_id.as_deref(),
                     &detail,
+                    ready.admission_reservation,
                     &mut *ready.startup_guard,
                 )
                 .await;
@@ -106,11 +112,12 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             Ok(provider) => Some(provider),
             Err(error) => {
                 let detail = format!("provider routing failed: {error}");
-                super::fail_pending_startup(
+                super::fail_reserved_pending_startup(
                     state,
                     session_id,
                     ready.startup_turn_id.as_deref(),
                     &detail,
+                    ready.admission_reservation,
                     &mut *ready.startup_guard,
                 )
                 .await;
@@ -121,6 +128,68 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         None
     };
 
+    // Consult the same provider/model that will execute this session. A legacy
+    // Error fallback must not reject explicitly supported native image input.
+    let vision_provider = match provider_override.as_ref() {
+        Some(provider) => provider.clone(),
+        None => state.provider.read().await.clone(),
+    };
+    let vision_override = vision_provider
+        .vision_support_override(&ready.effective_model)
+        .await;
+    if let Err(error) = bamboo_engine::session_app::execute::validate_image_fallback_for_session(
+        &session,
+        image_fallback.as_ref(),
+        &ready.effective_model,
+        vision_override,
+    ) {
+        super::fail_reserved_pending_startup(
+            state,
+            session_id,
+            ready.startup_turn_id.as_deref(),
+            &error,
+            ready.admission_reservation,
+            &mut *ready.startup_guard,
+        )
+        .await;
+        return bad_request_error_response(error);
+    }
+
+    // A non-Vision main receives references, never image payloads. Fail with
+    // actionable retained-image feedback when its explicit auxiliary target is
+    // unavailable. This inspects configuration only: no provider construction,
+    // credential initialization, target resolution or model request.
+    if vision_override == Some(false)
+        && session.messages.iter().any(|message| {
+            message.content_parts.as_ref().is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
+            })
+        })
+    {
+        let active_provider = session_effective_model_ref(&session)
+            .map(|model_ref| model_ref.provider)
+            .unwrap_or_else(|| config.provider_name.clone());
+        if let Err(error) =
+            bamboo_engine::model_config_helper::validate_image_reference_vision_config(
+                config_snapshot,
+                &active_provider,
+            )
+        {
+            super::fail_reserved_pending_startup(
+                state,
+                session_id,
+                ready.startup_turn_id.as_deref(),
+                &error,
+                ready.admission_reservation,
+                &mut *ready.startup_guard,
+            )
+            .await;
+            return bad_request_error_response(error);
+        }
+    }
+
     // #74: re-derive the "no interactive human approver" posture per
     // user-initiated execute, OVERWRITING the session's persisted flag (see
     // `apply_no_human_approver`). Done before the `merge_save_runtime` persist
@@ -129,27 +198,30 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
 
     // ---- Reserve runner ----
     let session_tx = state.get_session_event_sender(session_id).await;
-    let (mut execution_reservation, run_id) =
-        match reserve_runner(state.get_ref(), session_id, &session_tx).await {
-            RunnerReservation::Started(reservation) => {
-                let rid = reservation.run_id().to_string();
-                tracing::debug!(
-                    "[{}] Execute Ready -> runner reserved & STARTING (run_id={})",
-                    session_id,
-                    rid
-                );
-                (reservation, rid)
-            }
-            RunnerReservation::AlreadyRunning(rid) => {
-                tracing::debug!(
-                    "[{}] Execute Ready -> runner AlreadyRunning (run_id={}); not spawning",
-                    session_id,
-                    rid
-                );
-                let sync_info = build_sync_info_from_session(&session);
-                return already_running_response(session_id, sync_info, Some(rid));
-            }
-        };
+    let reservation = match ready.admission_reservation.take() {
+        Some(reservation) => RunnerReservation::Started(reservation),
+        None => reserve_runner(state.get_ref(), session_id, &session_tx).await,
+    };
+    let (mut execution_reservation, run_id) = match reservation {
+        RunnerReservation::Started(reservation) => {
+            let rid = reservation.run_id().to_string();
+            tracing::debug!(
+                "[{}] Execute Ready -> runner reserved & STARTING (run_id={})",
+                session_id,
+                rid
+            );
+            (reservation, rid)
+        }
+        RunnerReservation::AlreadyRunning(rid) => {
+            tracing::debug!(
+                "[{}] Execute Ready -> runner AlreadyRunning (run_id={}); not spawning",
+                session_id,
+                rid
+            );
+            let sync_info = build_sync_info_from_session(&session);
+            return already_running_response(session_id, sync_info, Some(rid));
+        }
+    };
 
     if let Err(error) = execution_reservation
         .bind_root_actor(&state.agent, &session)
@@ -161,6 +233,34 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             "error": crate::error::error_value(error.to_string())
         }));
     }
+    let native_binding = if ready.native_main && crate::skill_runtime::registered_main(&session) {
+        match crate::skill_runtime::bind_execution(
+            state.clone(),
+            &session,
+            &execution_reservation,
+            state.tools_for(crate::tools::ToolSurface::Root),
+        ) {
+            Ok(binding) => Some(binding),
+            Err(error) => {
+                execution_reservation.abandon().await;
+                super::fail_reserved_pending_startup(
+                    state,
+                    session_id,
+                    ready.startup_turn_id.as_deref(),
+                    &error.to_string(),
+                    ready.admission_reservation,
+                    ready.startup_guard,
+                )
+                .await;
+                return HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                    "status": "rejected", "session_id": session_id,
+                    "error": crate::error::error_value(error.to_string())
+                }));
+            }
+        }
+    } else {
+        None
+    };
     let execution_persistence = execution_reservation.execution_persistence();
 
     // The reservation owns this exact turn now. Moving the owned marker out of
@@ -199,6 +299,26 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         );
     }
 
+    // Finish cancellable output binding before any auxiliary title task.
+    // Title generation and forwarder/spawn then share one uninterrupted Ready
+    // handoff. Ordinary reservations remain a synchronous no-op here.
+    if let Err(error) = execution_reservation.retain_selected_run_output().await {
+        execution_reservation.abandon().await;
+        rollback_startup(
+            state,
+            session_id,
+            &run_id,
+            ready.startup_turn_id.as_deref(),
+            &error.to_string(),
+            ready.startup_guard,
+        )
+        .await;
+        return internal_server_error_response("Selected run output binding rejected");
+    }
+
+    if ready.generate_title && !session.title_generated {
+        crate::title_gen::spawn_title_generation(state.clone().into_inner(), session_id.to_owned());
+    }
     let disabled_tools: BTreeSet<String> = disabled_tools.into_iter().collect();
     let disabled_skill_ids: BTreeSet<String> = disabled_skill_ids.into_iter().collect();
     let resolved_provider_name = session_effective_model_ref(&session)
@@ -259,7 +379,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         resolved_provider_type,
         areas,
     );
-    spawn_agent_execution(SpawnAgentExecution {
+    SpawnAgentExecution {
         state: state.clone(),
         session_id: session_id.to_string(),
         session,
@@ -278,7 +398,8 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         gold_config,
         app_data_dir: Some(state.app_data_dir.clone()),
         run_budget: ready.run_budget,
-    });
+    }
+    .spawn_with_native_inputs(ready.untrusted_inputs, native_binding);
 
     started_response(session_id, sync_info, run_id)
 }

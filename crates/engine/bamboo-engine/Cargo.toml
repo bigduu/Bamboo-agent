@@ -27,8 +27,8 @@ bamboo-subagent = { path = "../../infra/bamboo-subagent" }
 bamboo-broker = { path = "../../app/bamboo-broker" }
 bamboo-tools = { path = "../../engine/bamboo-tools" }
 serde = { workspace = true }
-serde_json = "1"
-serde_yaml = "0.9"
+serde_json = { version = "1", features = ["raw_value"] }
+serde_yaml = { package = "serde_norway", version = "=0.9.42" }
 anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -55,7 +55,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 tokio-stream = "0.1"
 url = "2"
 toml = "1.1"
-dirs = "6"
+dirs = "7"
 libc = "0.2"
 rand = "0.10"
 sysinfo = "0.39"
@@ -65,6 +65,7 @@ bytes = "1"
 rust_ocr = "0.1.5"
 
 [dev-dependencies]
+bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure", features = ["test-utils"] }
 bamboo-plugin = { path = "../../infra/bamboo-plugin" }
 tempfile = "3"
 mockall = "0.15"

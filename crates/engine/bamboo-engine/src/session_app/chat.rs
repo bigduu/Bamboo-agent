@@ -9,7 +9,9 @@ use bamboo_skills::selection::normalize_selected_skill_ids;
 use bamboo_skills::{
     ActiveWorkflow, WorkflowActivationStatus, WorkflowSelection, ACTIVE_WORKFLOW_METADATA_KEY,
     ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY, WORKFLOW_ACTIVATION_EVENT_METADATA_KEY,
-    WORKFLOW_ORCHESTRATION_OPT_IN_METADATA_KEY, WORKFLOW_SELECTION_METADATA_KEY,
+    WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY, WORKFLOW_CONTEXT_CACHE_METADATA_KEY,
+    WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY, WORKFLOW_ORCHESTRATION_OPT_IN_METADATA_KEY,
+    WORKFLOW_SELECTION_METADATA_KEY,
 };
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -223,7 +225,7 @@ pub fn prepare_chat_turn_from_authoritative_session_with_workspace_policy(
     if let Some(enabled) = input.root_orchestration_only {
         session.set_root_orchestration_only(enabled)?;
     }
-    if session.root_orchestration_only_enabled() {
+    if session.model_orchestration_only_enabled() {
         session.validate_root_orchestration_compatibility()?;
         // A typed Workflow can remain pending or active without a valid
         // selected-skill mirror. Treat malformed authority as incompatible.
@@ -634,6 +636,51 @@ fn deactivate_active_workflow(session: &mut Session) {
 pub fn clear_skill_runtime_state(session: &mut Session) {
     session.metadata.remove(SKILL_RUNTIME_LOADED_KEY);
     session.metadata.remove(SKILL_RUNTIME_LAST_KEY);
+}
+
+/// Retire legacy executable state before publishing a different resource scope.
+/// Keep host Skill restrictions and ordinary history: removing selected_skill_ids
+/// would widen the Native execution ceiling. No new snapshot format is required.
+pub fn clear_workflow_authority_for_resource_scope_change(session: &mut Session) {
+    let identity = session
+        .metadata
+        .get(ACTIVE_WORKFLOW_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<ActiveWorkflow>(raw).ok())
+        .map(|active| (active.id, active.revision))
+        .or_else(|| {
+            session
+                .metadata
+                .get(WORKFLOW_SELECTION_METADATA_KEY)
+                .and_then(|raw| serde_json::from_str::<WorkflowSelection>(raw).ok())
+                .map(|selection| (selection.id, selection.revision))
+        });
+    session.metadata.retain(|key, _| {
+        !key.starts_with("skill_runtime_")
+            && !matches!(
+                key.as_str(),
+                ACTIVE_WORKFLOW_METADATA_KEY
+                    | ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY
+                    | WORKFLOW_SELECTION_METADATA_KEY
+                    | WORKFLOW_ACTIVATION_EVENT_METADATA_KEY
+                    | WORKFLOW_CONTEXT_CACHE_METADATA_KEY
+                    | WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY
+                    | WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY
+                    | "skill.context"
+            )
+    });
+    if let Some((workflow_id, revision)) = identity {
+        session.metadata.insert(
+            WORKFLOW_ACTIVATION_EVENT_METADATA_KEY.to_string(),
+            serde_json::json!({
+                "type": "workflow.deactivated",
+                "workflow_id": workflow_id,
+                "revision": revision,
+                "reason": "resource_scope_changed",
+                "deactivated_at": chrono::Utc::now(),
+            })
+            .to_string(),
+        );
+    }
 }
 
 fn persist_selected_skill_ids_metadata(
@@ -1128,6 +1175,89 @@ mod tests {
     }
 
     #[test]
+    fn resource_scope_cleanup_removes_recovery_bytes_without_widening_skill_ceiling() {
+        let mut session = Session::new("scope-cleanup", "model");
+        session.set_selected_skill_ids(vec!["review".into()]);
+        session.add_message(Message::user("Keep the prior request"));
+        session.add_message(Message::assistant("Keep the prior result", None));
+        let history = session.messages.clone();
+        session
+            .metadata
+            .insert("permission_mode".into(), "default".into());
+        session.metadata.insert("skill_mode".into(), "code".into());
+        session
+            .metadata
+            .insert("workflow.run_ids.v1".into(), r#"["run-1"]"#.into());
+        session.metadata.insert(
+            ACTIVE_WORKFLOW_METADATA_KEY.into(),
+            serde_json::to_string(&active_workflow("review", 7)).unwrap(),
+        );
+        for key in [
+            ACTIVE_WORKFLOW_SNAPSHOT_METADATA_KEY,
+            WORKFLOW_CONTEXT_CACHE_METADATA_KEY,
+            WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY,
+            "skill_runtime_pinned_snapshot_v1",
+            "skill_runtime_last_load_summary",
+            "skill.context",
+        ] {
+            session
+                .metadata
+                .insert(key.into(), "old private bytes".into());
+        }
+
+        clear_workflow_authority_for_resource_scope_change(&mut session);
+
+        let restored: Session = serde_json::from_str(&serde_json::to_string(&session).unwrap())
+            .expect("existing session format remains restart-compatible");
+        assert_eq!(restored.selected_skill_ids(), Some(vec!["review".into()]));
+        assert_eq!(
+            serde_json::to_value(&restored.messages).unwrap(),
+            serde_json::to_value(&history).unwrap()
+        );
+        assert_eq!(restored.metadata["permission_mode"], "default");
+        assert_eq!(restored.metadata["skill_mode"], "code");
+        assert_eq!(restored.metadata["workflow.run_ids.v1"], r#"["run-1"]"#);
+        assert!(!serde_json::to_string(&restored)
+            .unwrap()
+            .contains("old private bytes"));
+        let event: serde_json::Value =
+            serde_json::from_str(&restored.metadata[WORKFLOW_ACTIVATION_EVENT_METADATA_KEY])
+                .unwrap();
+        assert_eq!(event["type"], "workflow.deactivated");
+        assert_eq!(event["reason"], "resource_scope_changed");
+        assert_eq!(event["workflow_id"], "review");
+    }
+
+    #[test]
+    fn resource_scope_cleanup_removes_pending_or_malformed_legacy_authority() {
+        for selection in [
+            serde_json::to_string(&WorkflowSelection {
+                id: "review".into(),
+                source: bamboo_skills::WorkflowSource::Builtin,
+                revision: 7,
+                args: serde_json::json!({}),
+            })
+            .unwrap(),
+            "malformed".into(),
+        ] {
+            let mut session = Session::new("scope-pending", "model");
+            session
+                .metadata
+                .insert(WORKFLOW_SELECTION_METADATA_KEY.into(), selection);
+            session
+                .metadata
+                .insert("skill_runtime_pinned_snapshot_v1".into(), "old pin".into());
+            clear_workflow_authority_for_resource_scope_change(&mut session);
+            assert!(!session
+                .metadata
+                .contains_key(WORKFLOW_SELECTION_METADATA_KEY));
+            assert!(!session
+                .metadata
+                .contains_key("skill_runtime_pinned_snapshot_v1"));
+        }
+    }
+
+    #[test]
     fn pending_typed_workflow_survives_an_ordinary_chat_before_execute() {
         let mut session = Session::new("pending-selection", "model");
         let selection = WorkflowSelection {
@@ -1416,6 +1546,41 @@ mod tests {
                 bamboo_domain::RootToolAuthorityError::LegacyPlanActive
             ))
         ));
+    }
+
+    #[test]
+    fn supervisor_delegation_first_rejects_execution_workflow_selection_in_both_modes() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for ultra in [false, true] {
+            let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+            supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: uuid::Uuid::new_v4(),
+            };
+            supervisor.set_root_orchestration_only(ultra).unwrap();
+            let mut input = chat_turn_input(None);
+            input.session_id = supervisor.id.clone();
+            let prepared = prepare_chat_turn_from_authoritative_session(
+                Some(supervisor.clone()),
+                input,
+                "",
+                "base",
+            )
+            .unwrap();
+            assert_eq!(
+                prepared.root_thinking_mode(),
+                supervisor.root_thinking_mode()
+            );
+            assert!(prepared.model_orchestration_only_enabled());
+            let mut input = chat_turn_input(None);
+            input.session_id = supervisor.id.clone();
+            input.selected_skill_ids = Some(vec!["implementation-workflow".into()]);
+            assert!(matches!(
+                prepare_chat_turn_from_authoritative_session(Some(supervisor), input, "", "base"),
+                Err(ChatError::RootToolAuthority(
+                    bamboo_domain::RootToolAuthorityError::WorkflowSelected
+                ))
+            ));
+        }
     }
 
     #[test]

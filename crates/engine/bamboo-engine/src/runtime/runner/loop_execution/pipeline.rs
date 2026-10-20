@@ -87,7 +87,7 @@ fn take_test_post_llm_retry_failure(session: &mut Session) -> Option<AgentError>
     ))
 }
 
-fn effective_callable_set_for_round(
+pub(in crate::runtime::runner) fn effective_callable_set_for_round(
     session: &Session,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
     capability_loading_mode: CapabilityLoadingMode,
@@ -318,6 +318,7 @@ impl CompleteCapabilityDiscovery {
             .iter()
             .cloned()
             .filter_map(ClassifiedToolSchema::new)
+            .filter(|entry| session.allows_model_tool_execution(entry.execution_name()))
             .collect::<Vec<_>>();
         let searchable_tool_catalog = catalog.iter().filter(|entry| {
             entry.loading_class() == CapabilityLoadingClass::Deferred
@@ -326,7 +327,7 @@ impl CompleteCapabilityDiscovery {
         let tools = bamboo_tools::tool_search::ToolSearchIndex::from_resolved_catalog(
             searchable_tool_catalog,
         );
-        if browser_only || !include_commands {
+        if browser_only || !include_commands || session.model_orchestration_only_enabled() {
             // Tool search does not depend on Skill applicability or its store.
             return Ok(Self {
                 catalog,
@@ -640,11 +641,14 @@ async fn ensure_discovery_allowed(
     config: &AgentLoopConfig,
 ) -> Result<(), AgentError> {
     state_bridge::refresh_round_root_tool_authority(session, config.storage.as_ref()).await?;
-    if session.root_orchestration_only_enabled() {
+    if session.root_orchestration_only_enabled() && session.supervisor_incarnation_id().is_none() {
         return Err(AgentError::Tool(
             "capability discovery is outside this Root's tool authority".into(),
         ));
     }
+    // A trusted Supervisor may load its already-approved orchestration tools.
+    // CompleteCapabilityDiscovery re-filters exact names and never opens its
+    // Skill/Workflow store. Discovery does not grant execution authority.
     Ok(())
 }
 
@@ -844,7 +848,7 @@ async fn commit_openai_client_tool_search_round(
     session: &mut Session,
     config: &AgentLoopConfig,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
-) -> Result<(), AgentError> {
+) -> Result<Message, AgentError> {
     ensure_discovery_allowed(session, config).await?;
     let host_outputs = build_openai_client_tool_search_outputs(
         session,
@@ -865,7 +869,7 @@ async fn commit_openai_client_tool_search_round(
     );
     let anchor = message.id.clone();
     let mut provider_items = Some(stream_output.provider_transcript_items);
-    commit_assistant_message(session, message, &mut provider_items)?;
+    commit_assistant_message(session, message.clone(), &mut provider_items)?;
     for output in host_outputs {
         session
             .append_provider_transcript_group(&anchor, None, vec![output])
@@ -885,7 +889,7 @@ async fn commit_openai_client_tool_search_round(
                 ))
             })?;
     }
-    Ok(())
+    Ok(message)
 }
 
 // ---- Error classification (from rounds.rs) ----
@@ -1186,8 +1190,9 @@ async fn suspend_to_wait_for_children(
 ///
 /// Returns `Some` suspend outcome (with the durable wait persisted) when it
 /// engages, or `None` to let the run complete normally. No-ops when there is no
-/// storage, no active children, or an untagged wait is already registered.
-/// An inherited tool wait is freshly observed even when its children finished.
+/// storage or no active children and no inherited wait. Every inherited wait is
+/// freshly observed even when its children finished, including an untagged
+/// safety-net wait retained after an incremental child-completion wake.
 async fn maybe_suspend_for_orphaned_children(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -1204,13 +1209,7 @@ async fn maybe_suspend_for_orphaned_children(
         // wait before this Run can be reported terminal.
         return Ok(None);
     }
-    let inherited_tool_wait = runtime_state
-        .waiting_for_children
-        .as_ref()
-        .is_some_and(|wait| wait.registered_by_tool_call_id.is_some());
-    if runtime_state.waiting_for_children.is_some() && !inherited_tool_wait {
-        return Ok(None);
-    }
+    let inherited_wait = runtime_state.waiting_for_children.is_some();
     let Some(storage) = config.storage.as_ref() else {
         return Ok(None);
     };
@@ -1231,7 +1230,7 @@ async fn maybe_suspend_for_orphaned_children(
         .filter(|(_, status)| !status.as_deref().is_some_and(is_terminal_child_status))
         .map(|(id, _)| id)
         .collect();
-    if !inherited_tool_wait {
+    if !inherited_wait {
         let mut ordinary = Vec::with_capacity(active.len());
         for child_id in active {
             if !crate::ticket_runtime::is_independent_ticket_child(
@@ -1246,8 +1245,13 @@ async fn maybe_suspend_for_orphaned_children(
         }
         active = ordinary;
     }
-    if active.is_empty() && !inherited_tool_wait {
+    if active.is_empty() && !inherited_wait {
         return Ok(None);
+    }
+    if crate::runtime::loop_control::suspension::active(config) {
+        return Err(AgentError::Tool(
+            "managed loop cannot establish an asynchronous child wait".into(),
+        ));
     }
     active.sort();
     active.dedup();
@@ -1258,7 +1262,7 @@ async fn maybe_suspend_for_orphaned_children(
     let durable = storage.load_session(&session.id).await.map_err(|_| {
         AgentError::Tool("parent wait observation failed; refusing to replace its wait".into())
     })?;
-    if inherited_tool_wait && durable.is_none() {
+    if inherited_wait && durable.is_none() {
         return Err(AgentError::Tool(
             "parent wait observation failed; current session is missing".into(),
         ));
@@ -1288,7 +1292,7 @@ async fn maybe_suspend_for_orphaned_children(
         }
     }
 
-    if inherited_tool_wait {
+    if inherited_wait {
         // A completed Any/FirstError wait can leave another child active.
         // Its clear is final: do not grant that child a new six-hour wait.
         runtime_state.waiting_for_children = None;
@@ -1941,7 +1945,7 @@ fn spawn_task_evaluation_request(
     // drops the in-flight LLM request future at the first await point (`None`)
     // instead of running the evaluation — and its late `TaskListUpdated` event —
     // to completion (issue #347). `biased` checks cancellation first.
-    let join_handle = tokio::spawn(async move {
+    let join_handle = bamboo_tools::local_task_resources::spawn_cancellable(async move {
         tokio::select! {
             biased;
             _ = cancel_token.cancelled() => None,
@@ -2297,6 +2301,8 @@ async fn handle_no_tool_calls_with_native(
     iteration: u32,
     llm: Arc<dyn LLMProvider>,
     provider_transcript_items: Vec<ProviderTranscriptItem>,
+    evidence_llm: Arc<dyn LLMProvider>,
+    cancel_token: &CancellationToken,
 ) -> Result<TurnOutcome, AgentError> {
     // The Gold judge reads the recent transcript, so when the goal loop is active
     // the assistant's final turn must be in the session BEFORE the gate runs
@@ -2306,17 +2312,69 @@ async fn handle_no_tool_calls_with_native(
     // Stop path does NOT persist a message the resumed turn re-emits — preserving
     // the exact pre-#343 no-goal guardian behavior (the guardian ran before the
     // assistant message was appended).
-    let add_message_before_gold = config.goal_loop_active();
+    let add_message_before_gold =
+        config.goal_loop_active() || config.effective_counted_loop().is_some();
     let mut deferred_assistant_message = Some(assistant_with_visible_identity(
         Message::assistant_with_reasoning(content, None, reasoning)
             .with_reasoning_signature(reasoning_signature),
         visible_message,
     ));
+    let buffered_candidate = config.features_final_evidence_check.then(|| {
+        deferred_assistant_message
+            .as_ref()
+            .expect("candidate exists")
+            .clone()
+    });
     let mut native_items = Some(provider_transcript_items);
     if add_message_before_gold {
         if let Some(message) = deferred_assistant_message.take() {
             commit_assistant_message(session, message, &mut native_items)?;
         }
+    }
+
+    // Counted repetition is a peer terminal gate inside this same owner. Gold
+    // combinations are rejected at startup; no judge is added by this gate.
+    if config.effective_counted_loop().is_some() && cancel_token.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    let counted_decision = crate::runtime::counted_loop::terminal(session, config).await?;
+    if config.effective_counted_loop().is_some() && cancel_token.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    match counted_decision {
+        crate::runtime::counted_loop::TerminalDecision::Continue => {
+            if let Some(message) = buffered_candidate.as_ref() {
+                publish_buffered_message(event_tx, message).await;
+            }
+            record_no_tool_calls_round_completed(
+                metrics_collector,
+                round_id,
+                session_id,
+                session,
+                round_usage,
+            );
+            return Ok(TurnOutcome {
+                should_break: false,
+                sent_complete: false,
+            });
+        }
+        crate::runtime::counted_loop::TerminalDecision::Stop => {
+            if let Some(message) = buffered_candidate.as_ref() {
+                publish_buffered_message(event_tx, message).await;
+            }
+            record_no_tool_calls_round_completed(
+                metrics_collector,
+                round_id,
+                session_id,
+                session,
+                round_usage,
+            );
+            return Ok(TurnOutcome {
+                should_break: true,
+                sent_complete: false,
+            });
+        }
+        crate::runtime::counted_loop::TerminalDecision::Finalize => {}
     }
 
     // Terminal goal gate FIRST (issue #343): when an autonomous goal is active,
@@ -2340,6 +2398,9 @@ async fn handle_no_tool_calls_with_native(
     .await;
 
     if let GoldTerminalDecision::Continue { continuation_count } = decision {
+        if let Some(message) = buffered_candidate.as_ref() {
+            publish_buffered_message(event_tx, message).await;
+        }
         tracing::info!(
             "[{}] Goal terminal gate: continuing toward goal (continuation {})",
             session_id,
@@ -2385,6 +2446,9 @@ async fn handle_no_tool_calls_with_native(
     )
     .await
     {
+        if let Some(message) = buffered_candidate.as_ref() {
+            publish_buffered_message(event_tx, message).await;
+        }
         // Suspended on the guardian verdict. In the no-goal case the assistant
         // message was intentionally not appended yet (the resumed turn re-emits
         // it), so nothing to roll back here.
@@ -2420,6 +2484,9 @@ async fn handle_no_tool_calls_with_native(
                 if let Some(message) = deferred_assistant_message.take() {
                     commit_assistant_message(session, message, &mut native_items)?;
                 }
+                if let Some(message) = buffered_candidate.as_ref() {
+                    publish_buffered_message(event_tx, message).await;
+                }
                 let extra_context = outcome
                     .injected_contexts
                     .iter()
@@ -2432,13 +2499,17 @@ async fn handle_no_tool_calls_with_native(
                 } else {
                     format!("\n\nAdditional hook context:\n{extra_context}")
                 };
-                session.add_message(Message::user(format!(
+                let mut continuation = Message::user(format!(
                     "A Stop lifecycle hook requires another work round ({}/{}): {}{}\n\nContinue working and address this feedback before attempting to finish again.",
                     runtime_state.stop_hook_forced_continuations,
                     MAX_STOP_HOOK_CONTINUATIONS,
                     reason.trim(),
                     context_suffix,
-                )));
+                ));
+                continuation.metadata = Some(serde_json::json!({
+                    "runtime_kind": "stop_hook_continuation"
+                }));
+                session.add_message(continuation);
                 state_bridge::write_runtime_state(session, runtime_state);
                 record_no_tool_calls_round_completed(
                     metrics_collector,
@@ -2473,14 +2544,70 @@ async fn handle_no_tool_calls_with_native(
         }
     }
 
+    let mut complete_usage = MetricsTokenUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+    };
+    if let Some(mut answer) = buffered_candidate {
+        let check = super::final_answer::check(
+            session,
+            runtime_state,
+            &mut answer,
+            config,
+            evidence_llm,
+            eval_model,
+            cancel_token,
+            metrics_collector,
+            round_id,
+            round_usage,
+        )
+        .await;
+        let check = match check {
+            Ok(check) => check,
+            Err(error) => {
+                if add_message_before_gold {
+                    session.messages.retain(|message| message.id != answer.id);
+                    session.updated_at = Utc::now();
+                }
+                reset_final_answer_context(session);
+                return Err(error);
+            }
+        };
+        complete_usage.add_assign_durable(check.usage);
+        if check.revised {
+            if let Some(message) = deferred_assistant_message.as_mut() {
+                *message = answer.clone();
+            } else {
+                let stored = session
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id == answer.id)
+                    .ok_or_else(|| {
+                        AgentError::LLM("final candidate is no longer present".to_string())
+                    })?;
+                *stored = answer.clone();
+                session.updated_at = Utc::now();
+            }
+            // Provider envelopes and previous_response_id still describe the
+            // original answer. Rebuild both context lanes from canonical text.
+            native_items = None;
+            reset_final_answer_context(session);
+        }
+        publish_buffered_message(event_tx, &answer).await;
+    }
     if let Some(message) = deferred_assistant_message.take() {
         commit_assistant_message(session, message, &mut native_items)?;
     }
-    let _ = event_tx
-        .send(AgentEvent::Complete {
-            usage: to_event_token_usage(prompt_tokens, completion_tokens),
-        })
-        .await;
+    let usage = to_event_token_usage(
+        complete_usage.prompt_tokens,
+        complete_usage.completion_tokens,
+    );
+    // Counted publication belongs to the outer runner, after AfterRound,
+    // normal finalization and the terminal LoopState checkpoint all succeed.
+    if !super::defers_terminal_complete(config) {
+        let _ = event_tx.send(AgentEvent::Complete { usage }).await;
+    }
     record_no_tool_calls_round_completed(
         metrics_collector,
         round_id,
@@ -2490,8 +2617,28 @@ async fn handle_no_tool_calls_with_native(
     );
     Ok(TurnOutcome {
         should_break: true,
-        sent_complete: true,
+        sent_complete: !super::defers_terminal_complete(config),
     })
+}
+
+fn reset_final_answer_context(session: &mut Session) {
+    session.metadata.remove("responses.previous_response_id");
+    session.reset_model_context_epoch(
+        bamboo_domain::session::model_context::ModelContextResetReason::ExplicitHistoryRewrite,
+    );
+}
+
+async fn publish_buffered_message(event_tx: &mpsc::Sender<AgentEvent>, message: &Message) {
+    crate::runtime::stream::handler::publish_buffered_response(
+        event_tx,
+        &VisibleMessageIdentity {
+            message_id: message.id.clone(),
+            created_at: message.created_at,
+        },
+        &message.content,
+        message.reasoning.as_deref(),
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -2533,8 +2680,10 @@ async fn handle_no_tool_calls(
         task_context,
         eval_model,
         iteration,
-        llm,
+        llm.clone(),
         Vec::new(),
+        llm,
+        &CancellationToken::new(),
     )
     .await
 }
@@ -2702,19 +2851,21 @@ async fn handle_tool_calls_path(
                 "runtime.completion_reason".into(),
                 "ticket_question_yield".into(),
             );
-            let _ = frame
-                .event_tx
-                .send(AgentEvent::Complete {
-                    usage: to_event_token_usage(
-                        round_usage.prompt_tokens,
-                        round_usage.completion_tokens,
-                    ),
-                })
-                .await;
+            if !super::defers_terminal_complete(frame.config) {
+                let _ = frame
+                    .event_tx
+                    .send(AgentEvent::Complete {
+                        usage: to_event_token_usage(
+                            round_usage.prompt_tokens,
+                            round_usage.completion_tokens,
+                        ),
+                    })
+                    .await;
+            }
         }
         return Ok(TurnOutcome {
             should_break: true,
-            sent_complete: ticket_question_yield,
+            sent_complete: ticket_question_yield && !super::defers_terminal_complete(frame.config),
         });
     }
 
@@ -2814,7 +2965,17 @@ pub(super) async fn run_pipeline(
     state: &mut LoopRunState,
 ) -> super::super::Result<bool> {
     let result =
-        run_pipeline_inner(session, event_tx, llm, tools, cancel_token, config, state).await;
+        boxed_pipeline_inner(session, event_tx, llm, tools, cancel_token, config, state).await;
+    // Stop/budget checkpoint awaits can race Session cancellation. Until a
+    // Complete was actually published, cancellation retains its error path.
+    let result = if config.effective_counted_loop().is_some()
+        && cancel_token.is_cancelled()
+        && matches!(result, Ok(false))
+    {
+        Err(AgentError::Cancelled)
+    } else {
+        result
+    };
 
     // This outer lifecycle fence deliberately catches every return from the
     // implementation below, including `?` from prompt refresh and hook paths.
@@ -2830,7 +2991,28 @@ pub(super) async fn run_pipeline(
         "run_completed"
     };
     abort_in_flight_evaluations(state, event_tx, reason).await;
+    state.current_inputs = None;
     result
+}
+
+fn boxed_pipeline_inner<'a>(
+    session: &'a mut Session,
+    event_tx: &'a mpsc::Sender<AgentEvent>,
+    llm: Arc<dyn LLMProvider>,
+    tools: Arc<dyn ToolExecutor>,
+    cancel_token: &'a CancellationToken,
+    config: &'a AgentLoopConfig,
+    state: &'a mut LoopRunState,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = super::super::Result<bool>> + 'a>> {
+    Box::pin(run_pipeline_inner(
+        session,
+        event_tx,
+        llm,
+        tools,
+        cancel_token,
+        config,
+        state,
+    ))
 }
 
 async fn run_pipeline_inner(
@@ -2861,6 +3043,7 @@ async fn run_pipeline_inner(
     // summary round; the next hit stops unconditionally.
     let mut budget_summary_used = false;
     session.metadata.remove("runtime.completion_reason");
+    session.metadata.remove("runtime.final_evidence_check");
     // Same hygiene for the budget-trip detail key (issue #221): without this,
     // one tripped run would leave `budget_exceeded_kind` on the session
     // forever, misleading clients on every later run that stops for an
@@ -2873,6 +3056,27 @@ async fn run_pipeline_inner(
     );
 
     loop {
+        if config.effective_counted_loop().is_some() && cancel_token.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        // Startup has already admitted this run's input. A runtime-only wakeup
+        // cannot spend model calls while the Human progress question is pending,
+        // including auxiliary evaluations and prompt-memory work below.
+        if crate::session_app::no_progress::resume_after_user_message(
+            session,
+            &mut state.runtime_state,
+        ) {
+            tool_policy_guard.reset_observation_progress();
+        }
+        if crate::session_app::no_progress::retain_pending_pause(session, &mut state.runtime_state)
+        {
+            break;
+        }
+        crate::runtime::loop_control::scoped::drain(session, config, turn_counter).await?;
+        if !crate::runtime::counted_loop::before_round(session, config, &state.execution_id).await?
+        {
+            break;
+        }
         if let Some(message) = tool_policy_guard.delegation_failure_message() {
             // The preceding round has already persisted every tool response and
             // accounted for its usage. Stop before another model request rather
@@ -2935,6 +3139,12 @@ async fn run_pipeline_inner(
             turn_counter as usize,
         );
         state.runtime_state.round.last_round_id = Some(round_id.clone());
+        if config.effective_counted_loop().is_some() {
+            // A prelude may fail before normal round finalization mirrors this
+            // snapshot. Keep the Session on this owned round so the outer
+            // failure correction retains its exact run/round fence.
+            state_bridge::write_runtime_state(session, &state.runtime_state);
+        }
 
         if config
             .hook_runner
@@ -2974,8 +3184,8 @@ async fn run_pipeline_inner(
                 .unwrap_or_else(|| llm.clone()),
             background_model_name: state.auxiliary_models.background_model_name.clone(),
         };
-        let prompt_memory_exposure =
-            crate::runtime::runner::round_prelude::refresh_round_boundary_and_prompt_context(
+        let (prompt_memory_exposure, observation) =
+            crate::runtime::runner::round_prelude::refresh_round_boundary_with_observation(
                 session,
                 &mut state.runtime_state,
                 config,
@@ -2983,8 +3193,58 @@ async fn run_pipeline_inner(
                 cancel_token,
                 state.metrics_collector.as_ref(),
                 Some(&runtime_context),
+                &state.execution_id,
             )
             .await?;
+        // Use this boundary's newly admitted inputs, never replayed history or
+        // hook-authored User text, to reset the unchanged-observation streak.
+        let fresh_human_input = observation.new_inputs().is_some_and(|batch| {
+            batch.records().iter().any(|input| {
+                (input.source == bamboo_domain::SessionMessageSource::User
+                    && input.kind == bamboo_domain::SessionMessageKind::UserInput)
+                    || input.wrapper.as_deref() == Some("root_chat_turn_v1")
+            })
+        });
+        observation.update_current(
+            &mut state.current_inputs,
+            &state.session_id,
+            &state.execution_id,
+        );
+
+        let resumed_progress_question = crate::session_app::no_progress::resume_after_user_message(
+            session,
+            &mut state.runtime_state,
+        );
+        if fresh_human_input || resumed_progress_question {
+            tool_policy_guard.reset_observation_progress();
+        }
+        // Consume only after the complete real tool batch and newly admitted
+        // Human input. The same-model facts are mandatory for each bounded
+        // recovery request; they create neither a pending question nor a grant.
+        let feedback_active = crate::runtime::runner::tool_execution::progress_feedback_active(
+            session,
+            &state.runtime_state,
+            config,
+        );
+        let observation_progress_hint =
+            match tool_policy_guard.feedback_for_next_round(feedback_active) {
+                crate::runtime::runner::tool_execution::FeedbackDecision::Continue(hint) => hint,
+                crate::runtime::runner::tool_execution::FeedbackDecision::Exhausted {
+                    feedback,
+                    summary,
+                } => {
+                    crate::runtime::runner::tool_execution::finish_exhausted_progress(
+                        session,
+                        &state.runtime_state,
+                        event_tx,
+                        config,
+                        &feedback,
+                        &summary,
+                    )
+                    .await?;
+                    break;
+                }
+            };
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {
@@ -3021,9 +3281,6 @@ async fn run_pipeline_inner(
             &state.model_name,
         );
 
-        // --- Resolve tool schemas ---
-        let tool_schemas = resolve_tool_schemas_for_round(config, tools.as_ref(), session);
-
         // --- LLM call with retry ---
         let mut overflow_recovery_attempted = false;
         let mut turn_outcome: Option<TurnOutcome> = None;
@@ -3036,6 +3293,27 @@ async fn run_pipeline_inner(
         // `RoundActivity` for why it must sum, never overwrite); an attempt
         // that errors before streaming contributes 0.
         let mut round_activity = RoundActivity::default();
+
+        if let Some(host) = config.sdk_skill_execution_host.as_ref() {
+            host.observe_current_inputs(
+                &state.session_id,
+                &state.execution_id,
+                state.current_inputs.as_ref(),
+            )?;
+        }
+        let current_inputs = state.current_inputs.take();
+        let (round_result, current_inputs) =
+            crate::runtime::managers::lifecycle::scope_input_request_data(current_inputs, async {
+        if let Some(host) = config.sdk_skill_execution_host.as_ref() {
+            let context = host.render_skill_prompt(session, &state.execution_id).await?;
+            if context.is_empty() {
+                session.metadata.remove("skill.context");
+            } else {
+                session.metadata.insert("skill.context".into(), context);
+            }
+            super::super::session_setup::refresh_prompt_snapshot(session);
+        }
+        let tool_schemas = resolve_tool_schemas_for_round(config, tools.as_ref(), session);
 
         if config.goal_loop_active() {
             let goal = crate::runtime::goal_state::ensure_goal_state(
@@ -3082,6 +3360,7 @@ async fn run_pipeline_inner(
                 &state.session_id,
                 &state.model_name,
                 &tool_schemas,
+                observation_progress_hint.as_deref(),
                 Some(
                     crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
                         round_id: &round_id,
@@ -3119,7 +3398,7 @@ async fn run_pipeline_inner(
                             error,
                         );
                         let overflow_tool_schemas =
-                            crate::runtime::runner::round_lifecycle::request_tool_schemas_for_session(
+                            crate::runtime::runner::round_lifecycle::context_tool_schemas_for_session(
                                 session,
                                 &llm,
                                 &state.model_name,
@@ -3173,6 +3452,7 @@ async fn run_pipeline_inner(
                                 &state.session_id,
                                 &state.model_name,
                                 &tool_schemas_after_recovery,
+                                observation_progress_hint.as_deref(),
                                 Some(
                                     crate::runtime::runner::round_lifecycle::PromptMemoryExposureFrame {
                                         round_id: &round_id,
@@ -3339,7 +3619,10 @@ async fn run_pipeline_inner(
                     )
                     .await
                     {
-                        Ok(()) => {
+                        Ok(message) => {
+                            if config.features_final_evidence_check {
+                                publish_buffered_message(event_tx, &message).await;
+                            }
                             record_no_tool_calls_round_completed(
                                 state.metrics_collector.as_ref(),
                                 &round_id,
@@ -3359,10 +3642,54 @@ async fn run_pipeline_inner(
                 // Safety net: if the model is about to finish but left background
                 // children running without waiting on them, suspend instead of
                 // completing so their results are collected.
+                let inherited_untagged_wait = state
+                    .runtime_state
+                    .waiting_for_children
+                    .as_ref()
+                    .is_some_and(|wait| wait.registered_by_tool_call_id.is_none());
                 match maybe_suspend_for_orphaned_children(session, config, &mut state.runtime_state)
                     .await
                 {
                     Ok(Some(suspend)) => {
+                        if inherited_untagged_wait {
+                            // This safety-net wait can also survive a real user
+                            // input. Keep its answer as an intermediate message
+                            // while the remaining children still prevent Complete.
+                            let reasoning = (!stream_output.reasoning_content.trim().is_empty())
+                                .then_some(stream_output.reasoning_content);
+                            let reasoning_signature = reasoning
+                                .as_ref()
+                                .and_then(|_| stream_output.reasoning_signature.clone());
+                            let message = assistant_with_visible_identity(
+                                Message::assistant_with_reasoning(
+                                    stream_output.content,
+                                    None,
+                                    reasoning,
+                                )
+                                .with_reasoning_signature(reasoning_signature),
+                                stream_output.visible_message,
+                            );
+                            let buffered_message = config
+                                .features_final_evidence_check
+                                .then(|| message.clone());
+                            let mut native_items = Some(stream_output.provider_transcript_items);
+                            if let Err(error) =
+                                commit_assistant_message(session, message, &mut native_items)
+                            {
+                                terminal_error = Some(error);
+                                break;
+                            }
+                            if let Some(message) = buffered_message.as_ref() {
+                                publish_buffered_message(event_tx, message).await;
+                            }
+                            record_no_tool_calls_round_completed(
+                                state.metrics_collector.as_ref(),
+                                &round_id,
+                                &state.session_id,
+                                session,
+                                round_activity.token_usage(),
+                            );
+                        }
                         turn_outcome = Some(suspend);
                         break;
                     }
@@ -3377,6 +3704,14 @@ async fn run_pipeline_inner(
                 // session, suspend instead of completing so background output is not
                 // silently dropped. Independent of the children gate; runs only when
                 // children did not already suspend this pass.
+                if crate::runtime::loop_control::suspension::active(config)
+                    && !bamboo_tools::tools::bash_runtime::running_shells_for_session(&session.id).is_empty()
+                {
+                    terminal_error = Some(AgentError::Tool(
+                        "managed loop cannot establish an asynchronous shell wait".into(),
+                    ));
+                    break;
+                }
                 if let Some(suspend) =
                     maybe_suspend_for_outstanding_bash(session, config, &mut state.runtime_state)
                         .await
@@ -3420,6 +3755,12 @@ async fn run_pipeline_inner(
                     turn_counter + 1,
                     llm.clone(),
                     stream_output.provider_transcript_items,
+                    state
+                        .auxiliary_models
+                        .fast_model_provider
+                        .clone()
+                        .unwrap_or_else(|| llm.clone()),
+                    cancel_token,
                 )
                 .await
                 {
@@ -3485,6 +3826,7 @@ async fn run_pipeline_inner(
             }
 
             let frame = crate::runtime::runner::round_frame::RoundFrame {
+                vision_support: llm.supports_vision(&state.model_name).await,
                 session_id: &state.session_id,
                 round_id: &round_id,
                 turn: turn_counter as usize,
@@ -3578,6 +3920,11 @@ async fn run_pipeline_inner(
                 }
             }
         }
+
+        Ok::<(), AgentError>(())
+        }).await;
+        state.current_inputs = current_inputs;
+        round_result?;
 
         // Commit once for every exit from the attempt loop. In particular, a
         // terminal validation/post-LLM failure must retain the same accumulated
@@ -3874,6 +4221,15 @@ async fn run_pipeline_inner(
 
         turn_counter += 1;
 
+        // Counted loops have a hard total-round cap, including finalizer work.
+        // Do not grant an additional model summary beyond either host bound.
+        if (config.effective_counted_loop().is_some() || config.loop_control.is_some())
+            && check_run_budget_exceeded(&state.runtime_state.round, &config.run_budget).is_some()
+        {
+            crate::runtime::counted_loop::exhaust_budget(session, config).await?;
+            break;
+        }
+
         // --- Guard against the per-run resource budget (issue #221) ---
         //
         // Checked BEFORE max_rounds so a budget trip is reported with its own
@@ -3901,12 +4257,14 @@ async fn run_pipeline_inner(
                     "runtime.budget_exceeded_kind".to_string(),
                     exceeded.kind.to_string(),
                 );
-                session.add_message(Message::user(format!(
+                let mut summary = Message::user(format!(
                     "The run's resource budget ({}, limit={}, reached={}) was exceeded; the \
                      task was stopped before completion. Stop working now and summarize your \
                      progress so far and what remains.",
                     exceeded.kind, exceeded.limit, exceeded.actual
-                )));
+                ));
+                summary.metadata = Some(serde_json::json!({"runtime_kind": "run_budget_summary"}));
+                session.add_message(summary);
                 let _ = event_tx
                     .send(AgentEvent::BudgetExceeded {
                         session_id: state.session_id.clone(),
@@ -3954,6 +4312,12 @@ async fn run_pipeline_inner(
         // the instruction and emitting more tool calls). It can therefore never
         // recurse or extend the loop indefinitely.
         if let Some(max_rounds) = config.run_budget.max_rounds {
+            if (config.effective_counted_loop().is_some() || config.loop_control.is_some())
+                && turn_counter >= max_rounds
+            {
+                crate::runtime::counted_loop::exhaust_budget(session, config).await?;
+                break;
+            }
             if turn_counter >= max_rounds {
                 if !max_rounds_summary_used {
                     tracing::warn!(
@@ -3971,12 +4335,15 @@ async fn run_pipeline_inner(
                     // role alternation (Anthropic 400s on it), breaking the summary
                     // turn and the next resume. One user turn keeps alternation valid
                     // (a preceding Tool message is merged into it by the serializer).
-                    session.add_message(Message::user(format!(
+                    let mut summary = Message::user(format!(
                         "Reached the maximum of {0} rounds; the task was stopped before \
                          completion. Stop working now and summarize your progress so far \
                          and what remains.",
                         max_rounds
-                    )));
+                    ));
+                    summary.metadata =
+                        Some(serde_json::json!({"runtime_kind": "max_rounds_summary"}));
+                    session.add_message(summary);
                     max_rounds_summary_used = true;
                     continue;
                 }
@@ -4056,7 +4423,14 @@ fn heuristic_complexity(
 ) -> crate::runtime::complexity_classifier::TaskComplexity {
     use crate::runtime::complexity_classifier::TaskComplexity;
 
-    let simple_tools = ["Read", "Glob", "Grep", "Bash"];
+    let simple_tools = [
+        "Read",
+        "Glob",
+        "Grep",
+        "Bash",
+        "exec_command",
+        "write_stdin",
+    ];
     let complex_tools = ["Agent", "Plan", "SubAgent", "TodoWrite"];
 
     let names: Vec<&str> = tool_calls
@@ -4076,7 +4450,189 @@ fn heuristic_complexity(
 }
 
 #[cfg(test)]
+#[tokio::test]
+async fn supervisor_delegation_first_discovery_is_readonly_bounded_and_keeps_ordinary_ultra_denial()
+{
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    let schemas = [
+        "Read",
+        "SubAgent",
+        "exec_command",
+        "load_skill",
+        "workflow_run",
+        "vendor::Read",
+    ]
+    .into_iter()
+    .map(|name| bamboo_agent_core::tools::ToolSchema {
+        schema_type: "function".into(),
+        function: bamboo_agent_core::tools::FunctionSchema {
+            name: name.into(),
+            description: name.into(),
+            parameters: serde_json::json!({"type":"object"}),
+        },
+    })
+    .collect::<Vec<_>>();
+    let config = AgentLoopConfig::default();
+    for ultra in [false, true] {
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let before = serde_json::to_value(&supervisor).unwrap();
+        ensure_discovery_allowed(&mut supervisor, &config)
+            .await
+            .unwrap();
+        let discovery =
+            CompleteCapabilityDiscovery::new(&supervisor, &config, &schemas, false, true)
+                .await
+                .unwrap();
+        assert!(
+            discovery.commands.is_none(),
+            "Supervisor must not open Skill/Workflow discovery"
+        );
+        assert_eq!(
+            discovery
+                .catalog
+                .iter()
+                .map(|entry| entry.execution_name())
+                .collect::<Vec<_>>(),
+            ["Read", "SubAgent"]
+        );
+        let request = serde_json::from_value(
+            serde_json::json!({"query":"SubAgent","kinds":["tool"],"limit":1}),
+        )
+        .unwrap();
+        let found = discovery.discover_complete_schemas(&request).unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|schema| schema.function.name.as_str())
+                .collect::<Vec<_>>(),
+            ["SubAgent"]
+        );
+        assert_eq!(serde_json::to_value(&supervisor).unwrap(), before);
+    }
+    let mut ordinary = Session::new("ordinary-ultra", "model");
+    ordinary.metadata.insert("role".into(), "supervisor".into());
+    ordinary.set_root_orchestration_only(true).unwrap();
+    assert!(ensure_discovery_allowed(&mut ordinary, &config)
+        .await
+        .is_err());
+}
+
+#[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn ql_main_pipeline_observes_real_new_then_terminal_or_cancel_drops_owner() {
+        for cancelled in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(home.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let storage: Arc<dyn Storage> = store.clone();
+            let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> =
+                Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+            let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+                store,
+                SessionInboxLimits::default(),
+            ));
+            let mut session = Session::new_child("ql-main", "parent", "model", "Child");
+            session.add_message(Message::system("base system"));
+            storage.save_session(&session).await.unwrap();
+            let mut expected = Vec::new();
+            for text in [
+                "first current input",
+                "second current input without selection",
+            ] {
+                let envelope = SessionMessageEnvelope::user_input(&session.id, text);
+                expected.push(envelope.id.to_string());
+                let receipt = inbox.deliver(&envelope).await.unwrap();
+                inbox
+                    .mark_activation_eligible(
+                        &session.id,
+                        receipt.generation,
+                        SessionActivationPolicy::InterruptSpecificWait,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let config = AgentLoopConfig {
+                storage: Some(storage),
+                persistence: Some(persistence),
+                session_inbox: Some(inbox.clone()),
+                skip_initial_user_message: true,
+                model_name: Some("model".into()),
+                run_budget: bamboo_config::RunBudgetConfig {
+                    max_rounds: Some(2),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let provider = Arc::new(ContextProbeProvider::default());
+            let tools = Arc::new(bamboo_tools::BuiltinToolExecutorBuilder::new().build());
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut state = e2e_loop_state(&session.id);
+            let (tx, _rx) = tokio::sync::mpsc::channel(256);
+            // Inspect the actual inner consumer before the outer terminal fence.
+            assert!(super::run_pipeline_inner(
+                &mut session,
+                &tx,
+                provider.clone(),
+                tools.clone(),
+                &cancel,
+                &config,
+                &mut state
+            )
+            .await
+            .unwrap());
+            let batch = state
+                .current_inputs
+                .as_ref()
+                .expect("production shared prelude moved real New");
+            assert_eq!(
+                batch
+                    .records()
+                    .iter()
+                    .map(|r| r.input_id.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(batch.records().iter().all(|r| r.request.is_none()));
+            assert_eq!(batch.execution_id(), state.execution_id);
+            assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            if cancelled {
+                cancel.cancel();
+            }
+            let result = super::run_pipeline(
+                &mut session,
+                &tx,
+                provider.clone(),
+                tools,
+                &cancel,
+                &config,
+                &mut state,
+            )
+            .await;
+            assert!(
+                state.current_inputs.is_none(),
+                "outer terminal fence drops prior N for every return"
+            );
+            if cancelled {
+                assert!(matches!(result, Err(AgentError::Cancelled)));
+            } else {
+                assert!(result.unwrap());
+            }
+            assert_eq!(
+                provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+                if cancelled { 1 } else { 2 }
+            );
+            assert_eq!(inbox.inspect(&session.id).await.unwrap().claimed, 0);
+        }
+    }
+
     use super::super::startup::{InFlightTaskEvaluation, OverflowRecoveryState};
     use super::{
         apply_successful_explicit_activation, assistant_with_visible_identity,
@@ -4110,9 +4666,9 @@ mod tests {
         AgentStatusState, ChildWaitPolicy, WaitingForChildrenState,
     };
     use bamboo_domain::{
-        AgentHookPoint, AgentRuntimeState, HookPayload, HookResult, ProjectId,
-        ProjectResourceSummary, SessionActivationPolicy, SessionInboxLimits, SessionInboxPort,
-        SessionMessageEnvelope,
+        AgentHookPoint, AgentRuntimeState, CapabilityLoadingMode, HookPayload, HookResult,
+        ProjectId, ProjectResourceSummary, SessionActivationPolicy, SessionInboxLimits,
+        SessionInboxPort, SessionMessageEnvelope,
     };
     use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
     use bamboo_metrics::{
@@ -5052,6 +5608,379 @@ mod tests {
         }
     }
 
+    struct SupervisorLoadingProvider {
+        mode: CapabilityLoadingMode,
+        calls: AtomicUsize,
+        failure: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for SupervisorLoadingProvider {
+        async fn capability_loading_mode(
+            &self,
+            _: &str,
+            required: Option<&str>,
+        ) -> CapabilityLoadingMode {
+            assert!(
+                required.is_none(),
+                "delegation must not become a forced named-tool call"
+            );
+            self.mode
+        }
+
+        async fn provider_visible_tool_footprint(
+            &self,
+            ir: &bamboo_llm::PromptIR,
+            tools: &[bamboo_agent_core::tools::ToolSchema],
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<bamboo_llm::ProviderVisibleToolFootprint, LLMError> {
+            if self.mode == CapabilityLoadingMode::Progressive {
+                bamboo_llm::providers::openai::OpenAIProvider::new("test")
+                    .with_responses_only_models(vec!["gpt-5*".into()])
+                    .with_tool_search_execution(bamboo_llm::providers::common::openai_responses::ResponsesToolSearchExecution::Client)
+                    .provider_visible_tool_footprint(ir, tools, "gpt-5.6", None)
+                    .await
+            } else {
+                let projected =
+                    bamboo_llm::providers::common::openai_compat::tools_to_openai_compat_json(
+                        tools,
+                    );
+                Ok(bamboo_llm::ProviderVisibleToolFootprint {
+                    segments: vec![bamboo_llm::ProviderVisibleToolSegment {
+                        kind: bamboo_llm::ProviderVisibleToolSegmentKind::InitialFullDefinition,
+                        serialized: serde_json::to_string(&projected)?,
+                    }],
+                })
+            }
+        }
+
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            panic!("the controlled provider must receive the real PromptIR");
+        }
+
+        async fn chat_stream_ir(
+            &self,
+            ir: &bamboo_llm::PromptIR,
+            tools: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+            options: Option<&bamboo_llm::LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            assert!(options
+                .and_then(|options| options.required_tool.as_ref())
+                .is_none());
+            assert!(tools.iter().all(|schema| !matches!(
+                schema.function.name.as_str(),
+                "exec_command" | "load_skill" | "vendor::SubAgent"
+            )));
+            let messages = ir.flatten();
+            let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            let marker = "Current delegation route observation: ";
+            let latest = messages
+                .iter()
+                .rev()
+                .find_map(|message| {
+                    message
+                        .content
+                        .rfind(marker)
+                        .map(|index| &message.content[index + marker.len()..])
+                })
+                .expect("Supervisor request must report current delegation state");
+            let observation = serde_json::Deserializer::from_str(latest)
+                .into_iter::<serde_json::Value>()
+                .next()
+                .unwrap()
+                .unwrap();
+            if count == 0 {
+                assert_eq!(
+                    observation["status"], "discovery_required",
+                    "deferred definitions are not callable yet"
+                );
+            } else {
+                assert_eq!(
+                    observation["status"], "routes_exposed",
+                    "validated discovery must be reflected in the next request"
+                );
+                assert_eq!(observation["routes"], serde_json::json!(["SubAgent"]));
+            }
+            if self.mode == CapabilityLoadingMode::StickyFallback {
+                assert!(tools.iter().any(|schema| schema.function.name
+                    == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
+                assert!(!tools
+                    .iter()
+                    .any(|schema| schema.function.name == "SubAgent"));
+            } else {
+                let response_options = ir.responses_request_options(None);
+                let body = bamboo_llm::providers::common::openai_responses::build_responses_body_with_capability_loading(
+                    "gpt-5.6", &messages, tools, None, None, Some(&response_options), None, None,
+                    CapabilityLoadingMode::Progressive,
+                    bamboo_llm::providers::common::openai_responses::ResponsesToolSearchExecution::Client);
+                let initial = body["tools"].as_array().unwrap();
+                assert!(initial
+                    .iter()
+                    .any(|tool| tool["type"] == "tool_search" && tool["execution"] == "client"));
+                assert!(initial
+                    .iter()
+                    .all(|tool| tool["name"] != "SubAgent" && tool["name"] != "exec_command"));
+            }
+            let chunks = match count {
+                0 if self.mode == CapabilityLoadingMode::StickyFallback => vec![
+                    Ok(LLMChunk::ToolCalls(vec![activation_call(
+                        "supervisor-search",
+                        bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                        r#"{"query":"SubAgent","kinds":["tool"],"limit":1}"#,
+                    )])),
+                    Ok(LLMChunk::Done),
+                ],
+                0 => vec![
+                    Ok(LLMChunk::ProviderTranscriptItem(
+                        native_client_search_item_for("supervisor-search", "SubAgent"),
+                    )),
+                    Ok(LLMChunk::Done),
+                ],
+                1 => {
+                    if self.mode == CapabilityLoadingMode::StickyFallback {
+                        let result = messages
+                            .iter()
+                            .find(|message| {
+                                message.tool_call_id.as_deref() == Some("supervisor-search")
+                            })
+                            .unwrap();
+                        let definitions = sticky_result_definition_values(result).unwrap();
+                        assert_eq!(definitions.len(), 1);
+                        assert_eq!(definitions[0]["function"]["name"], "SubAgent");
+                    } else {
+                        let result = ir
+                            .provider_transcript_groups
+                            .iter()
+                            .flat_map(|group| group.items())
+                            .find(|item| item.payload()["type"] == "tool_search_output")
+                            .unwrap();
+                        assert_eq!(result.payload()["tools"].as_array().unwrap().len(), 1);
+                        assert_eq!(result.payload()["tools"][0]["name"], "SubAgent");
+                    }
+                    vec![
+                        Ok(LLMChunk::ToolCalls(vec![activation_call(
+                            "supervisor-delegate",
+                            "SubAgent",
+                            r#"{"message":"Implement only the assigned change and return verification evidence."}"#,
+                        )])),
+                        Ok(LLMChunk::Done),
+                    ]
+                }
+                2 => {
+                    let result = messages
+                        .iter()
+                        .find(|message| {
+                            message.tool_call_id.as_deref() == Some("supervisor-delegate")
+                        })
+                        .unwrap();
+                    assert_eq!(result.tool_success, Some(self.failure.is_none()));
+                    if let Some(reason) = self.failure {
+                        assert!(result.content.contains(reason));
+                    }
+                    let text = if self.failure.is_some() {
+                        "Delegation blocked; owner action is required before a retry."
+                    } else {
+                        "Delegation admitted; the worker result is still pending."
+                    };
+                    vec![Ok(LLMChunk::Token(text.into())), Ok(LLMChunk::Done)]
+                }
+                _ => panic!("unexpected Supervisor request {count}"),
+            };
+            Ok(Box::pin(stream::iter(chunks)))
+        }
+    }
+
+    struct SupervisorLoadingExecutor {
+        calls: AtomicUsize,
+        failure: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for SupervisorLoadingExecutor {
+        async fn execute(
+            &self,
+            call: &ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<bamboo_agent_core::tools::ToolResult>
+        {
+            assert_eq!(
+                call.function.name, "SubAgent",
+                "only delegated work may enter the executor"
+            );
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.failure {
+                Some(reason) => Err(bamboo_agent_core::tools::ToolError::Execution(
+                    reason.into(),
+                )),
+                None => Ok(bamboo_agent_core::tools::ToolResult::text(
+                    true,
+                    "child assignment admitted",
+                )),
+            }
+        }
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            [
+                "Read",
+                "SubAgent",
+                "exec_command",
+                "load_skill",
+                "vendor::SubAgent",
+            ]
+            .into_iter()
+            .map(|name| {
+                let mut schema = loading_test_schema_with_description(name, name);
+                if name == "SubAgent" {
+                    schema.function.parameters = serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "message": {"type": "string"},
+                            "intent": {"type": "string"},
+                            "role": {"type": "string"},
+                            "target": {"type": "string"},
+                            "reply_to": {"type": "string"}
+                        },
+                        "required": ["message"],
+                        "additionalProperties": false
+                    });
+                }
+                schema
+            })
+            .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_delegation_first_real_runner_loads_only_scoped_delegation_and_reports_worker_blockers(
+    ) {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for ultra in [false, true] {
+            for mode in [
+                CapabilityLoadingMode::StickyFallback,
+                CapabilityLoadingMode::Progressive,
+            ] {
+                for failure in [
+                    None,
+                    Some("worker_unavailable: configure an authorized worker"),
+                    Some("scope_denied: target is not attached"),
+                ] {
+                    let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "gpt-5.6");
+                    session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                        incarnation_id: uuid::Uuid::new_v4(),
+                    };
+                    session.set_root_orchestration_only(ultra).unwrap();
+                    session.add_message(Message::user(
+                        "Delegate the scoped implementation and report its admission or blocker.",
+                    ));
+                    let provider = Arc::new(SupervisorLoadingProvider {
+                        mode,
+                        calls: AtomicUsize::new(0),
+                        failure,
+                    });
+                    let executor = Arc::new(SupervisorLoadingExecutor {
+                        calls: AtomicUsize::new(0),
+                        failure,
+                    });
+                    let config = AgentLoopConfig {
+                        provider_name: Some("supervisor-loading-test".into()),
+                        provider_type: Some("openai".into()),
+                        model_name: Some("gpt-5.6".into()),
+                        ..delegation_loop_config()
+                    };
+                    let (tx, _rx) = tokio::sync::mpsc::channel(256);
+                    let mut state = e2e_loop_state(&session.id);
+                    state.model_name = "gpt-5.6".into();
+                    assert!(super::run_pipeline(
+                        &mut session,
+                        &tx,
+                        provider.clone(),
+                        executor.clone(),
+                        &tokio_util::sync::CancellationToken::new(),
+                        &config,
+                        &mut state
+                    )
+                    .await
+                    .unwrap());
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+                    assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+                    let mut restored: Session =
+                        serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+                    let current = super::resolve_tool_schemas_for_round(
+                        &config,
+                        executor.as_ref(),
+                        &mut restored,
+                    );
+                    let callable = effective_callable_set_for_round(&restored, &current, mode);
+                    assert!(callable.contains_execution_name("SubAgent"));
+                    assert!(!callable.contains_execution_name("exec_command"));
+                    assert!(!callable.contains_execution_name("load_skill"));
+                    let removed = effective_callable_set_for_round(&restored, &[], mode);
+                    assert!(
+                        !removed.contains_execution_name("SubAgent"),
+                        "a saved loading receipt cannot restore a removed tool"
+                    );
+                    let observation = crate::runtime::runner::session_setup::prompt_envelope::build_root_orchestration_context_block_for_tools(
+                        &restored, &[], mode,
+                    ).unwrap();
+                    assert!(observation.content.contains("delegation_tools_unavailable"));
+                    assert!(!observation.content.contains("routes_exposed"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_delegation_first_repeated_worker_failures_keep_existing_bounded_circuit() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for ultra in [false, true] {
+            let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+            session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: uuid::Uuid::new_v4(),
+            };
+            session.set_root_orchestration_only(ultra).unwrap();
+            session.add_message(Message::user("Delegate scoped work"));
+            let provider = Arc::new(DelegationLoopProvider {
+                calls: AtomicUsize::new(0),
+                finish_after: None,
+                calls_per_round: 1,
+            });
+            let executor = Arc::new(SupervisorLoadingExecutor {
+                calls: AtomicUsize::new(0),
+                failure: Some("worker_unavailable: owner must configure an authorized worker"),
+            });
+            let (tx, _rx) = tokio::sync::mpsc::channel(256);
+            let mut state = e2e_loop_state(&session.id);
+            let error = super::run_pipeline(
+                &mut session,
+                &tx,
+                provider.clone(),
+                executor.clone(),
+                &tokio_util::sync::CancellationToken::new(),
+                &delegation_loop_config(),
+                &mut state,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error,AgentError::Tool(ref reason) if reason.contains("3 consecutive failures"))
+            );
+            assert_eq!(executor.calls.load(Ordering::SeqCst), 3);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+            assert!(session
+                .messages
+                .iter()
+                .any(|message| message.tool_success == Some(false)
+                    && message.content.contains("worker_unavailable")));
+        }
+    }
+
     struct CodexSearchLoopProvider {
         calls: AtomicUsize,
     }
@@ -5561,7 +6490,7 @@ mod tests {
     fn anthropic_history_drives_progressive_round_membership_while_legacy_stays_full() {
         const BOUNDARY: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let tools = vec![
-            loading_test_schema("Bash"),
+            loading_test_schema("exec_command"),
             loading_test_schema("get_weather"),
             loading_test_schema("Glob"),
         ];
@@ -5579,7 +6508,7 @@ mod tests {
             &tools,
             bamboo_domain::CapabilityLoadingMode::Progressive,
         );
-        assert!(first_effective.contains_execution_name("Bash"));
+        assert!(first_effective.contains_execution_name("exec_command"));
         assert!(!first_effective.contains_execution_name("get_weather"));
 
         let assistant = Message::assistant("normalized", None);
@@ -5637,7 +6566,7 @@ mod tests {
             &tools,
             bamboo_domain::CapabilityLoadingMode::Progressive,
         );
-        assert!(loaded_effective.contains_execution_name("Bash"));
+        assert!(loaded_effective.contains_execution_name("exec_command"));
         assert!(loaded_effective.contains_execution_name("get_weather"));
         assert!(!loaded_effective.contains_execution_name("Glob"));
 
@@ -5647,7 +6576,7 @@ mod tests {
             &tools,
             bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
         );
-        assert!(legacy_effective.contains_execution_name("Bash"));
+        assert!(legacy_effective.contains_execution_name("exec_command"));
         assert!(legacy_effective.contains_execution_name("get_weather"));
         assert!(legacy_effective.contains_execution_name("Glob"));
     }
@@ -5656,7 +6585,7 @@ mod tests {
     fn openai_search_output_drives_progressive_membership_across_resume() {
         const BOUNDARY: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
         let tools = vec![
-            loading_test_schema("Bash"),
+            loading_test_schema("exec_command"),
             loading_test_schema("search_orders"),
             loading_test_schema("Glob"),
         ];
@@ -5673,7 +6602,7 @@ mod tests {
             &tools,
             bamboo_domain::CapabilityLoadingMode::Progressive,
         );
-        assert!(first.contains_execution_name("Bash"));
+        assert!(first.contains_execution_name("exec_command"));
         assert!(!first.contains_execution_name("search_orders"));
 
         let assistant = Message::assistant("", None);
@@ -5705,7 +6634,7 @@ mod tests {
             &tools,
             bamboo_domain::CapabilityLoadingMode::Progressive,
         );
-        assert!(loaded.contains_execution_name("Bash"));
+        assert!(loaded.contains_execution_name("exec_command"));
         assert!(loaded.contains_execution_name("search_orders"));
         assert!(!loaded.contains_execution_name("Glob"));
 
@@ -5724,7 +6653,7 @@ mod tests {
     fn hosted_search_output_enables_its_same_response_function_but_not_an_ordinary_call() {
         const BOUNDARY: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
         let tools = vec![
-            loading_test_schema("Bash"),
+            loading_test_schema("exec_command"),
             loading_test_schema("search_orders"),
             loading_test_schema("Glob"),
         ];
@@ -5793,7 +6722,7 @@ mod tests {
             &tools,
             bamboo_domain::CapabilityLoadingMode::Progressive,
         );
-        assert!(effective.contains_execution_name("Bash"));
+        assert!(effective.contains_execution_name("exec_command"));
         assert!(effective.contains_execution_name("search_orders"));
         assert!(
             !effective.contains_execution_name("Glob"),
@@ -7083,6 +8012,7 @@ mod tests {
         LoopRunState {
             session_id: session_id.to_string(),
             execution_id: "test-execution".to_string(),
+            current_inputs: None,
             model_name: "model".to_string(),
             metrics_collector: None,
             debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),
@@ -9945,6 +10875,7 @@ mod tests {
         let mut state = super::super::startup::LoopRunState {
             session_id: "session-task-eval".to_string(),
             execution_id: "task-eval-execution".to_string(),
+            current_inputs: None,
             model_name: "model".to_string(),
             metrics_collector: None,
             debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),
@@ -10467,30 +11398,282 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn safety_net_noop_when_already_waiting() {
-        // A model that DID call wait already has waiting_for_children set; the
-        // safety net must not touch it (and must not even query storage).
+    async fn safety_net_resuspends_existing_untagged_wait_before_terminal_gates() {
+        // An incremental child outcome can interrupt a safety-net wait. Restore
+        // its durable lease before the final-answer and guardian gates run.
         let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
             inner: Arc::new(TestStorage::default()),
             children: vec![("x".into(), Some("running".into()))],
         });
-        let config = config_with_storage(storage);
+        let config = config_with_storage(storage.clone());
         let mut session = Session::new("parent-waiting", "model");
         let mut runtime_state = AgentRuntimeState::new("parent-waiting");
-        runtime_state.waiting_for_children = Some(super::WaitingForChildrenState {
+        let wait = super::WaitingForChildrenState {
             child_session_ids: vec!["x".into()],
             wait_for: super::ChildWaitPolicy::All,
-            registered_at: chrono::Utc::now(),
+            registered_at: chrono::Utc::now() - chrono::Duration::minutes(5),
             timeout_at: None,
             registered_by_tool_call_id: None,
-        });
+        };
+        runtime_state.waiting_for_children = Some(wait.clone());
+        session.agent_runtime_state = Some(runtime_state.clone());
+        storage.save_session(&session).await.unwrap();
 
-        assert!(
+        let outcome =
             maybe_suspend_for_orphaned_children(&mut session, &config, &mut runtime_state)
                 .await
                 .unwrap()
-                .is_none()
+                .expect("remaining inherited child wait suspends the reasoning turn");
+        assert!(outcome.should_break && !outcome.sent_complete);
+        assert_eq!(runtime_state.waiting_for_children.as_ref(), Some(&wait));
+        assert_eq!(
+            session
+                .metadata
+                .get("runtime.suspend_reason")
+                .map(String::as_str),
+            Some("waiting_for_children")
         );
+    }
+
+    struct PartialChildWorkProvider {
+        calls: AtomicUsize,
+        outcome_seen: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for PartialChildWorkProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.outcome_seen.store(
+                    messages
+                        .iter()
+                        .any(|message| message.content == "fast child outcome"),
+                    Ordering::SeqCst,
+                );
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::ToolCalls(vec![
+                        activation_call(
+                            "partial-message",
+                            "SubAgent",
+                            r#"{"action":"send_message","child_session_id":"slow-child","message":"Use the fast child finding"}"#,
+                        ),
+                        activation_call(
+                            "partial-cancel",
+                            "SubAgent",
+                            r#"{"action":"cancel","child_session_id":"obsolete-child"}"#,
+                        ),
+                        activation_call(
+                            "partial-create",
+                            "SubAgent",
+                            r#"{"action":"create","prompt":"Verify the fast child finding","wait":false}"#,
+                        ),
+                    ])),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            for (id, action) in [
+                ("partial-message", "send_message"),
+                ("partial-cancel", "cancel"),
+                ("partial-create", "create"),
+            ] {
+                assert!(
+                    messages.iter().any(|message| {
+                        message.tool_call_id.as_deref() == Some(id)
+                            && message.content.contains(&format!("handled {action}"))
+                    }),
+                    "tool feedback for {action} reaches the next reasoning round"
+                );
+            }
+            let native = |author, payload| {
+                Ok(LLMChunk::ProviderTranscriptItem(
+                    bamboo_domain::ProviderTranscriptItem::try_from_payload(
+                        bamboo_domain::ProviderFamily::OpenAi,
+                        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                        bamboo_domain::ProviderTranscriptOrigin::Provider,
+                        author,
+                        payload,
+                    )
+                    .unwrap(),
+                ))
+            };
+            Ok(Box::pin(stream::iter(vec![
+                native(
+                    bamboo_domain::ProviderTranscriptAuthor::Model,
+                    serde_json::json!({
+                        "type":"tool_search_call","id":"partial-native-search","execution":"server",
+                        "call_id":"partial-search","status":"completed","arguments":{"paths":["children"]}
+                    }),
+                ),
+                native(
+                    bamboo_domain::ProviderTranscriptAuthor::ToolResult,
+                    serde_json::json!({
+                        "type":"tool_search_output","id":"partial-native-search-result","execution":"server",
+                        "call_id":"partial-search","status":"completed","tools":[]
+                    }),
+                ),
+                native(
+                    bamboo_domain::ProviderTranscriptAuthor::Model,
+                    serde_json::json!({
+                        "type":"message","id":"partial-native-reply","role":"assistant","status":"completed",
+                        "content":[{"type":"output_text","text":"continued after child","annotations":[]}]
+                    }),
+                ),
+                Ok(LLMChunk::ReasoningToken("remaining child work".into())),
+                Ok(LLMChunk::ReasoningSignature(
+                    "partial-reasoning-signature".into(),
+                )),
+                Ok(LLMChunk::Token("continued after child".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[derive(Default)]
+    struct PartialChildWorkExecutor(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for PartialChildWorkExecutor {
+        async fn execute(
+            &self,
+            call: &bamboo_agent_core::tools::ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<bamboo_agent_core::tools::ToolResult>
+        {
+            let arguments: serde_json::Value =
+                serde_json::from_str(&call.function.arguments).unwrap();
+            let action = arguments["action"].as_str().unwrap();
+            self.0.lock().unwrap().push(action.into());
+            Ok(bamboo_agent_core::tools::ToolResult::text(
+                true,
+                format!("handled {action}"),
+            ))
+        }
+
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            vec![loading_test_schema("SubAgent")]
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_child_outcome_can_drive_tool_work_before_resuspending_exact_inherited_wait() {
+        for (tagged, buffered) in [true, false].into_iter().flat_map(|tagged| {
+            [false, true]
+                .into_iter()
+                .map(move |buffered| (tagged, buffered))
+        }) {
+            let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
+                inner: Arc::new(TestStorage::default()),
+                children: vec![("slow-child".into(), Some("running".into()))],
+            });
+            let mut config = config_with_storage(storage.clone());
+            config.model_name = Some("model".into());
+            config.prompt_memory_flags = delegation_loop_config().prompt_memory_flags;
+            config.features_final_evidence_check = buffered;
+            let mut session = Session::new("partial-parent", "model");
+            let mut outcome = Message::user("fast child outcome");
+            outcome.metadata = Some(serde_json::json!({
+                "runtime_kind": "child_completion_resume"
+            }));
+            session.add_message(outcome);
+            let mut state = e2e_loop_state(&session.id);
+            let mut wait = WaitingForChildrenState::for_children(
+                vec!["fast-child".into(), "slow-child".into()],
+                ChildWaitPolicy::All,
+                Utc::now() - chrono::Duration::minutes(5),
+            );
+            wait.registered_by_tool_call_id = tagged.then(|| "original-wait-call".into());
+            state.runtime_state.waiting_for_children = Some(wait.clone());
+            session.agent_runtime_state = Some(state.runtime_state.clone());
+            storage.save_session(&session).await.unwrap();
+            let provider = Arc::new(PartialChildWorkProvider {
+                calls: AtomicUsize::new(0),
+                outcome_seen: AtomicBool::new(false),
+            });
+            let tools = Arc::new(PartialChildWorkExecutor::default());
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+
+            let sent_complete = super::run_pipeline(
+                &mut session,
+                &tx,
+                provider.clone(),
+                tools.clone(),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await
+            .expect("partial child reasoning turn runs without waiting for the slow child");
+
+            assert!(provider.outcome_seen.load(Ordering::SeqCst));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            let mut actions = tools.0.lock().unwrap().clone();
+            actions.sort();
+            assert_eq!(actions, vec!["cancel", "create", "send_message"]);
+            assert!(
+                !sent_complete,
+                "remaining child work bypasses terminal gates"
+            );
+            assert_eq!(state.runtime_state.status, AgentStatusState::Suspended);
+            assert_eq!(
+                state.runtime_state.waiting_for_children.as_ref(),
+                Some(&wait)
+            );
+            let replies: Vec<_> = session
+                .messages
+                .iter()
+                .filter(|message| message.content == "continued after child")
+                .collect();
+            assert_eq!(replies.len(), usize::from(!tagged));
+            let mut events = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                assert!(
+                    !matches!(event, AgentEvent::Complete { .. }),
+                    "an inherited wait must not publish Complete"
+                );
+                events.push(event);
+            }
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::Token { content } if content == "continued after child"))
+                    .count(),
+                usize::from(!buffered || !tagged),
+                "the untagged reply is published once in either streaming mode"
+            );
+            if let Some(reply) = replies.first() {
+                assert_eq!(reply.reasoning.as_deref(), Some("remaining child work"));
+                assert_eq!(
+                    reply.reasoning_signature.as_deref(),
+                    Some("partial-reasoning-signature")
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::VisibleMessageStart { message_id, created_at } if message_id == &reply.id && *created_at == reply.created_at))
+                        .count(),
+                    1,
+                    "persistence retains the published reply identity"
+                );
+                let boundary = session
+                    .provider_transcript
+                    .active_provider_boundary_sha256()
+                    .unwrap();
+                let groups = session.provider_transcript.replayable_groups(
+                    bamboo_domain::ProviderFamily::OpenAi,
+                    bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+                    boundary,
+                );
+                assert_eq!(groups.len(), 1);
+                assert_eq!(groups[0].anchor_message_id(), reply.id);
+                assert_eq!(groups[0].items().len(), 3);
+                assert_eq!(groups[0].items()[2].payload()["id"], "partial-native-reply");
+            }
+        }
     }
 
     struct InterruptedWaitStorage {
@@ -10524,11 +11707,15 @@ mod tests {
 
     #[tokio::test]
     async fn interrupted_wait_restores_exact_value_without_save_and_completion_wins() {
-        for policy in [
-            ChildWaitPolicy::All,
-            ChildWaitPolicy::Any,
-            ChildWaitPolicy::FirstError,
-        ] {
+        for (tagged, policy) in [true, false].into_iter().flat_map(|tagged| {
+            [
+                ChildWaitPolicy::All,
+                ChildWaitPolicy::Any,
+                ChildWaitPolicy::FirstError,
+            ]
+            .into_iter()
+            .map(move |policy| (tagged, policy))
+        }) {
             let inner = Arc::new(TestStorage::default());
             let mut parent = Session::new("interrupted-parent", "model");
             let registered_at = Utc::now() - chrono::Duration::minutes(5);
@@ -10543,7 +11730,7 @@ mod tests {
                         Some(registered_at + chrono::Duration::minutes(10))
                     }
                 },
-                registered_by_tool_call_id: Some("original-subagent-call".into()),
+                registered_by_tool_call_id: tagged.then(|| "original-subagent-call".into()),
             };
             let mut durable_runtime = AgentRuntimeState::new("original-parent-run");
             durable_runtime.status = AgentStatusState::Suspended;
@@ -10557,13 +11744,18 @@ mod tests {
             });
             let config = config_with_storage(storage.clone());
             let mut runtime = AgentRuntimeState::new("interrupt-reasoning-run");
+            runtime.waiting_for_children = Some(wait.clone());
             parent.agent_runtime_state = Some(runtime.clone());
             let outcome = maybe_suspend_for_orphaned_children(&mut parent, &config, &mut runtime)
                 .await
                 .unwrap()
                 .unwrap();
             assert!(outcome.should_break && !outcome.sent_complete);
-            assert_eq!(runtime.waiting_for_children.as_ref(), Some(&wait));
+            assert_eq!(
+                runtime.waiting_for_children.as_ref(),
+                Some(&wait),
+                "tagged={tagged}, policy={policy:?}"
+            );
             assert_eq!(
                 parent
                     .agent_runtime_state
@@ -10697,21 +11889,24 @@ mod tests {
             assert_eq!(runtime, original_runtime);
             assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
 
-            // An already registered live wait preserves the old no-read path.
-            runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
-                vec!["child-running".into()],
-                ChildWaitPolicy::All,
-                Utc::now(),
-            ));
-            let live_wait = runtime.waiting_for_children.clone();
-            assert!(
-                maybe_suspend_for_orphaned_children(&mut parent, &config, &mut runtime)
+            // Neither tagged nor untagged inherited waits can bypass a failed
+            // observation and continue into terminal completion gates.
+            for tagged in [true, false] {
+                let mut live_wait = WaitingForChildrenState::for_children(
+                    vec!["child-running".into()],
+                    ChildWaitPolicy::All,
+                    Utc::now(),
+                );
+                live_wait.registered_by_tool_call_id = tagged.then(|| "wait-call".into());
+                runtime.waiting_for_children = Some(live_wait.clone());
+                let error = maybe_suspend_for_orphaned_children(&mut parent, &config, &mut runtime)
                     .await
-                    .unwrap()
-                    .is_none()
-            );
-            assert_eq!(runtime.waiting_for_children, live_wait);
-            assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
+                    .err()
+                    .expect("inherited wait observation must fail closed");
+                assert!(matches!(error, AgentError::Tool(_)));
+                assert_eq!(runtime.waiting_for_children.as_ref(), Some(&live_wait));
+                assert_eq!(storage.saves.load(Ordering::SeqCst), 0);
+            }
         }
     }
 
@@ -11042,6 +12237,7 @@ mod tests {
         let config = AgentLoopConfig::default();
         let mut session = Session::new("s-cancel", "model");
         let frame = RoundFrame {
+            vision_support: true,
             session_id: "s-cancel",
             round_id: "r1",
             turn: 0,
@@ -11135,6 +12331,7 @@ mod tests {
         let config = AgentLoopConfig::default();
         let mut session = Session::new("s-normal", "model");
         let frame = RoundFrame {
+            vision_support: true,
             session_id: "s-normal",
             round_id: "r1",
             turn: 0,
@@ -11342,6 +12539,7 @@ mod tests {
         session.add_message(Message::user("keep going"));
 
         let frame = RoundFrame {
+            vision_support: true,
             session_id: "s-compress-fail",
             round_id: "r1",
             turn: 0,
@@ -12655,4 +13853,436 @@ mod tests {
         .expect("stop interrupts the persisted five-second backoff");
         assert!(matches!(result, Err(AgentError::Cancelled)));
     }
+    struct VisionLoopProvider {
+        support: Option<bool>,
+        path: String,
+        expect_description: bool,
+        alias: &'static str,
+        calls: AtomicUsize,
+        received_images: std::sync::Mutex<Vec<bool>>,
+    }
+    #[async_trait::async_trait]
+    impl LLMProvider for VisionLoopProvider {
+        async fn vision_support_override(&self, model: &str) -> Option<bool> {
+            assert_eq!(model, "actual-model");
+            self.support
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            assert_eq!(model, "actual-model");
+            if self.support == Some(false) {
+                assert!(
+                    messages.iter().all(|message| {
+                        message.content_parts.as_ref().is_none_or(|parts| {
+                            parts.iter().all(|part| {
+                                !matches!(part, bamboo_domain::MessagePart::ImageUrl { .. })
+                            })
+                        })
+                    }),
+                    "non-Vision main never receives pixels from upload or tool output"
+                );
+                if self.path.starts_with("bamboo-") {
+                    assert!(messages
+                        .iter()
+                        .any(|message| message.content.contains(&self.path)));
+                }
+            }
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::ToolCalls(vec![activation_call(
+                        "vision-call",
+                        self.alias,
+                        &serde_json::json!({"path":self.path}).to_string(),
+                    )])),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            let result = messages
+                .iter()
+                .find(|m| m.tool_call_id.as_deref() == Some("vision-call"))
+                .expect("paired tool feedback reaches next model request");
+            let images = result.content_parts.as_ref().is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|p| matches!(p, bamboo_domain::MessagePart::ImageUrl { .. }))
+            });
+            self.received_images.lock().unwrap().push(images);
+            if self.support == Some(false) {
+                assert!(!images);
+                if self.expect_description {
+                    assert!(result.content.contains("Vision model output"));
+                    assert!(result.content.contains("untrusted data"));
+                    assert!(result.content.contains("visual fixture"));
+                } else {
+                    assert!(result.content.contains("configured Vision model"));
+                    assert!(result.content.contains("No image was sent"));
+                }
+            } else {
+                assert!(
+                    images,
+                    "real ViewImage result is delivered in the following request"
+                );
+            }
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("done".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+    #[tokio::test]
+    async fn vision_real_viewimage_loop_delivers_direct_images_or_configuration_feedback() {
+        let image = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+        std::fs::write(image.path(), b"\x89PNG\r\n\x1a\nvision-test").unwrap();
+        for support in [Some(true), Some(false), None] {
+            let provider = Arc::new(VisionLoopProvider {
+                support,
+                path: if support == Some(false) {
+                    "/does-not-exist-vision-rejected-before-read.png".into()
+                } else {
+                    image.path().to_string_lossy().into_owned()
+                },
+                expect_description: false,
+                alias: "default::ViewImage",
+                calls: AtomicUsize::new(0),
+                received_images: Default::default(),
+            });
+            let mut session =
+                Session::new(format!("vision-loop-{support:?}"), "stale-session-model");
+            session.add_message(Message::user("View the image"));
+            let mut state = e2e_loop_state(&session.id);
+            state.model_name = "actual-model".into();
+            let config = AgentLoopConfig {
+                model_name: Some("actual-model".into()),
+                image_fallback: (support == Some(true)).then_some(crate::ImageFallbackConfig {
+                    mode: crate::ImageFallbackMode::Error,
+                    vision_model: None,
+                }),
+                vision_model_resolver: if support == Some(false) {
+                    None
+                } else {
+                    Some(Arc::new(|| {
+                        panic!("Vision-capable main must not invoke an auxiliary model")
+                    }))
+                },
+                ..delegation_loop_config()
+            };
+            let (tx, _rx) = tokio::sync::mpsc::channel(256);
+            let tools = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+            assert!(super::run_pipeline(
+                &mut session,
+                &tx,
+                provider.clone(),
+                tools,
+                &tokio_util::sync::CancellationToken::new(),
+                &config,
+                &mut state
+            )
+            .await
+            .unwrap());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                *provider.received_images.lock().unwrap(),
+                vec![support != Some(false)]
+            );
+        }
+    }
+
+    struct AuxiliaryVisionMock(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl LLMProvider for AuxiliaryVisionMock {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[bamboo_domain::ToolSchema],
+            max: Option<u32>,
+            model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            assert_eq!(model, "configured-vision");
+            assert_eq!(max, Some(1024));
+            assert!(tools.is_empty());
+            assert!(messages[0].content.contains("untrusted"));
+            assert!(messages[1]
+                .content_parts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. })));
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token("visual fixture".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_nonvision_upload_and_history_followup_use_only_requested_reference_fallback() {
+        use bamboo_agent_core::storage::Storage;
+        use base64::Engine;
+
+        for (inline, followup) in [(false, false), (false, true), (true, false), (true, true)] {
+            let home = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let mut session = Session::new("vision-reference-loop", "stale-session-model");
+            store.save_session(&session).await.unwrap();
+            let png = b"\x89PNG\r\n\x1a\nvision-test";
+            let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+            let (attachment_id, url) = if inline {
+                (None, format!("data:image/png;base64,{encoded}"))
+            } else {
+                let (id, url) = store
+                    .write_image_attachment(&session, &encoded, Some("image/png"))
+                    .await
+                    .unwrap();
+                (Some(id), url)
+            };
+            let image = Message::user_with_parts(
+                "inspect this image",
+                vec![bamboo_domain::MessagePart::ImageUrl {
+                    image_url: bamboo_domain::ImageUrlRef {
+                        url: url.clone(),
+                        detail: None,
+                    },
+                }],
+            );
+            let image_id = image.id.clone();
+            let original = serde_json::to_vec(&image).unwrap();
+            let reference = crate::runtime::runner::image_fallback::conversation_image_reference(
+                &session.id,
+                &image.id,
+                0,
+                &url,
+            );
+            session.add_message(image);
+            if followup {
+                session.add_message(Message::assistant("earlier turn", None));
+                session.add_message(Message::user("inspect the earlier retained image"));
+            }
+            store.save_session(&session).await.unwrap();
+            let session_file = store
+                .sessions_root_dir()
+                .join(&session.id)
+                .join("session.json");
+            let original_record_bytes = tokio::fs::read(&session_file).await.unwrap();
+            let disk_before = serde_json::to_vec(
+                &store
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .messages,
+            )
+            .unwrap();
+            let provider = Arc::new(VisionLoopProvider {
+                support: Some(false),
+                path: reference,
+                expect_description: true,
+                alias: "view_image",
+                calls: AtomicUsize::new(0),
+                received_images: Default::default(),
+            });
+            let vision_calls = Arc::new(AtomicUsize::new(0));
+            let vision: Arc<dyn LLMProvider> = Arc::new(AuxiliaryVisionMock(vision_calls.clone()));
+            let target_resolutions = Arc::new(AtomicUsize::new(0));
+            let resolutions = target_resolutions.clone();
+            let config = AgentLoopConfig {
+                model_name: Some("actual-model".into()),
+                attachment_reader: Some(store.clone()),
+                // An enabled legacy hook cannot eagerly describe uploads.
+                image_fallback: Some(crate::ImageFallbackConfig {
+                    mode: crate::ImageFallbackMode::Vision,
+                    vision_model: Some("configured-vision".into()),
+                }),
+                vision_model_resolver: Some(Arc::new(move || {
+                    resolutions.fetch_add(1, Ordering::SeqCst);
+                    let provider = vision.clone();
+                    Box::pin(async move {
+                        Ok(bamboo_llm::ResolvedModel::new(
+                            provider,
+                            "configured-vision",
+                        ))
+                    })
+                })),
+                ..delegation_loop_config()
+            };
+            crate::session_app::execute::validate_image_fallback_for_session(
+                &session,
+                config.image_fallback.as_ref(),
+                "actual-model",
+                Some(false),
+            )
+            .unwrap();
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(target_resolutions.load(Ordering::SeqCst), 0);
+            assert_eq!(vision_calls.load(Ordering::SeqCst), 0);
+
+            let mut state = e2e_loop_state(&session.id);
+            state.model_name = "actual-model".into();
+            let (tx, _rx) = tokio::sync::mpsc::channel(256);
+            assert!(super::run_pipeline(
+                &mut session,
+                &tx,
+                provider.clone(),
+                Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+                &tokio_util::sync::CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await
+            .unwrap());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(target_resolutions.load(Ordering::SeqCst), 1);
+            assert_eq!(vision_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*provider.received_images.lock().unwrap(), vec![false]);
+            assert_eq!(session.model, "stale-session-model");
+            assert_eq!(
+                serde_json::to_vec(
+                    session
+                        .messages
+                        .iter()
+                        .find(|message| message.id == image_id)
+                        .unwrap(),
+                )
+                .unwrap(),
+                original
+            );
+            assert_eq!(
+                serde_json::to_vec(
+                    &store
+                        .load_session(&session.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .messages,
+                )
+                .unwrap(),
+                disk_before
+            );
+            assert_eq!(
+                tokio::fs::read(&session_file).await.unwrap(),
+                original_record_bytes,
+                "the durable session record bytes are unchanged",
+            );
+            if let Some(id) = attachment_id {
+                assert_eq!(
+                    store
+                        .read_attachment(&session.id, &id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .0
+                        .as_slice(),
+                    &png[..],
+                );
+            }
+            let result = session
+                .messages
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some("vision-call"))
+                .unwrap();
+            assert!(result.content_parts.is_none());
+            assert!(result.content.contains("Vision model output"));
+            assert!(result.content.contains("untrusted data"));
+        }
+    }
+
+    struct WaitingVisionMock {
+        started: Arc<tokio::sync::Notify>,
+        dropped: Arc<AtomicBool>,
+    }
+    struct WaitingVisionDrop(Arc<AtomicBool>);
+    impl Drop for WaitingVisionDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    #[async_trait::async_trait]
+    impl LLMProvider for WaitingVisionMock {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_domain::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let guard = WaitingVisionDrop(self.dropped.clone());
+            self.started.notify_one();
+            futures::future::pending::<()>().await;
+            drop(guard);
+            unreachable!()
+        }
+    }
+    #[tokio::test]
+    async fn vision_pipeline_cancellation_drops_only_the_viewimage_fallback_request() {
+        let image = tempfile::Builder::new().suffix(".png").tempfile().unwrap();
+        std::fs::write(image.path(), b"\x89PNG\r\n\x1a\nvision-test").unwrap();
+        let main = Arc::new(VisionLoopProvider {
+            support: Some(false),
+            path: image.path().to_string_lossy().into_owned(),
+            expect_description: true,
+            alias: "viewImage",
+            calls: AtomicUsize::new(0),
+            received_images: Default::default(),
+        });
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let vision: Arc<dyn LLMProvider> = Arc::new(WaitingVisionMock {
+            started: started.clone(),
+            dropped: dropped.clone(),
+        });
+        let mut session = Session::new("cancel-viewimage-fallback", "actual-model");
+        session.add_message(Message::user("View the image"));
+        let mut state = e2e_loop_state(&session.id);
+        state.model_name = "actual-model".into();
+        let config = AgentLoopConfig {
+            model_name: Some("actual-model".into()),
+            vision_model_resolver: Some(Arc::new(move || {
+                let provider = vision.clone();
+                Box::pin(async move {
+                    Ok(bamboo_llm::ResolvedModel::new(
+                        provider,
+                        "configured-vision",
+                    ))
+                })
+            })),
+            ..delegation_loop_config()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let work = super::run_pipeline(
+            &mut session,
+            &tx,
+            main.clone(),
+            Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+            &cancel,
+            &config,
+            &mut state,
+        );
+        let (result, ()) = tokio::join!(work, async {
+            started.notified().await;
+            cancel.cancel();
+        });
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(main.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(session.model, "actual-model");
+    }
 }
+
+#[cfg(test)]
+#[path = "pipeline_final_evidence_tests.rs"]
+mod final_evidence_tests;
+
+#[cfg(all(test, unix))]
+#[path = "pipeline_exec_sessions_tests.rs"]
+mod exec_sessions_tests;

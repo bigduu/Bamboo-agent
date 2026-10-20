@@ -28,6 +28,44 @@ async fn bootstrap(store: &SessionStoreV2) -> SupervisorBootstrapReceipt {
         .unwrap()
 }
 
+#[tokio::test]
+async fn supervisor_identity_precedes_model_setup_and_reopens_without_rebinding() {
+    let (store, home) = fixture().await;
+    let first = store.get_or_create_default_supervisor("  ").await.unwrap();
+    assert!(first.created);
+    let initial = authority(&store).await;
+    assert!(initial.model.is_empty());
+    assert!(initial.messages.is_empty());
+    assert_eq!(incarnation(&initial), first.incarnation_id);
+    let birth = initial.created_at;
+    drop(store);
+
+    let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let second = reopened
+        .get_or_create_default_supervisor("configured-later")
+        .await
+        .unwrap();
+    assert!(!second.created);
+    assert_eq!(second.incarnation_id, first.incarnation_id);
+    let mut session = reopened
+        .load_session(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.created_at, birth);
+    assert!(session.model.is_empty());
+    // Normal Session configuration can bind the idle identity without a message.
+    session.model = "selected-model".into();
+    reopened.save_session(&session).await.unwrap();
+    let third = reopened
+        .get_or_create_default_supervisor("another-default")
+        .await
+        .unwrap();
+    assert!(!third.created);
+    assert_eq!(authority(&reopened).await.model, "selected-model");
+    assert_eq!(third.incarnation_id, first.incarnation_id);
+}
+
 async fn authority(store: &SessionStoreV2) -> Session {
     store
         .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)

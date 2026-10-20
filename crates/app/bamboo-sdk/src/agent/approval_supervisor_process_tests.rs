@@ -43,7 +43,7 @@ async fn run_stage(home: &Path, stage: u32) {
     let fixture = fixture_at(home).await;
     if stage == 1 {
         bamboo_tools::permission::storage::PermissionStorage::new(home)
-            .save(alias_config().as_ref())
+            .save(management_config().as_ref())
             .await
             .unwrap();
         setup_supervisor(&fixture).await;
@@ -80,10 +80,10 @@ async fn run_stage(home: &Path, stage: u32) {
             .decision_receipt(id, CALL, &request.request_generation)
             .is_none());
     }
-    let agent = protected_agent_with(&fixture, config, &["Bash"], true, None);
+    let agent = protected_agent_with(&fixture, config, &["session_control"], true, None);
     match stage {
         1 => {
-            *fixture.probe.next_call.lock().unwrap() = Some(alias_call());
+            *fixture.probe.next_call.lock().unwrap() = Some(management_call());
             let output = events(agent.run_stream(session, "attach the permitted Root")).await;
             assert!(output
                 .iter()

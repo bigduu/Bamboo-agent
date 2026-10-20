@@ -1,4 +1,5 @@
-//! Actual Host, native Worker and Git worktree; controlled provider, no live
+//! Actual Host and Git worktree; physical-PID cases explicitly use legacy Workers.
+//! Controlled provider, no live
 //! model quality or production #1488 writer-fence claim.
 #![cfg(unix)]
 #[path = "support/ticket_runtime.rs"]
@@ -13,7 +14,8 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
 {
     use bamboo_engine::ticket_worker_plan::tickets::{ScopeBinding, TicketService};
     use std::os::unix::fs::MetadataExt;
-    let mut f = Fixture::with_fault(Some(("worker-file/", "before_head_enospc"))).await;
+    let mut f =
+        Fixture::legacy_worker_with_fault(Some(("worker-file/", "before_head_enospc"))).await;
     let repo = f.temp.join("repo");
     let tree = f.temp.join("assignment");
     std::fs::create_dir(&repo).unwrap();
@@ -335,7 +337,7 @@ async fn expired_capacity_lease_cannot_admit_same_worktree_while_native_pid_is_a
     };
     use bamboo_storage::v2::FileHostRegistry;
     use std::collections::BTreeSet;
-    let f = Fixture::new().await;
+    let f = Fixture::legacy_worker().await;
     let repo = f.temp.join("repo");
     let tree = f.temp.join("assignment");
     std::fs::create_dir(&repo).unwrap();

@@ -652,3 +652,6 @@ async fn prepared_receipt_survives_ticket_publication_failure_and_no_run_is_auth
     assert!(root.task_list.is_none());
     assert!(root.messages.is_empty());
 }
+
+#[path = "local_task_stop_tests.rs"]
+mod local_task_stop_tests;

@@ -11,12 +11,15 @@ Task-oriented, kept current with the shipped codebase.
 | Doc | What it covers |
 |---|---|
 | [`guides/GETTING_STARTED.md`](guides/GETTING_STARTED.md) | Install, configure a provider, run your first turn three ways (CLI/HTTP/SDK). |
+| [`product-manual.md`](product-manual.md) | Binary-embedded, version-bound offline Skill for configuration, memory, hooks and safe troubleshooting. |
 | [`config-reference.md`](config-reference.md) | Every `config.json` key, the sibling config files (`connect.json`, `schedules.json`, `model_limits.json`), every `BAMBOO_*` env var, the secret-masking contract, encryption at rest, and corrupt-config recovery. |
 | [`lifecycle-hooks.md`](lifecycle-hooks.md) | Configure command or external multi-language script lifecycle handlers, event payloads, decisions, runtime selection, and practical examples. |
 | [`guides/CONNECT.md`](guides/CONNECT.md) | Drive Bamboo from Telegram or Feishu/Lark. |
 | [`guides/PLUGINS.md`](guides/PLUGINS.md) | Install/update/remove plugins, and the three-layer URL trust model. |
 | [`guides/DEPLOY.md`](guides/DEPLOY.md) | Run `bamboo serve` long-lived: bare binary, systemd, Docker, reverse proxy, backups. |
+| [`guides/OPENTELEMETRY.md`](guides/OPENTELEMETRY.md) | Opt-in, content-free runtime traces: local OTLP collector, privacy allowlist, bounded failure behavior and Rust context propagation. |
 | [`guides/API.md`](guides/API.md) | HTTP/SSE API reference. |
+| [`guides/SUPERVISOR_TASK_CLI.md`](guides/SUPERVISOR_TASK_CLI.md) | Thin local Supervisor/Root task client: real run IDs, JSON status, bounded events and fenced stop. |
 | [`guides/MIGRATION_GUIDE.md`](guides/MIGRATION_GUIDE.md) | Upgrading across breaking changes. |
 | [`architecture-crates.md`](architecture-crates.md) | The Cargo workspace's crate layers and dependency direction — useful when extending Bamboo itself, not just using it. |
 | [`claude-code-executor.md`](claude-code-executor.md) | Protocol reference for driving the `claude` CLI as a sub-agent executor (`subagents.executor = "claude_code"` in the [config reference](config-reference.md#sub-agents--external-cli-executors)). |

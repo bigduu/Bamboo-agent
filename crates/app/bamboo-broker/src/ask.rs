@@ -286,16 +286,51 @@ mod tests {
 
     #[tokio::test]
     async fn overlapping_asks_from_one_caller_route_reversed_replies_exactly() {
+        overlapping_asks_with_reversed_replies(false).await;
+    }
+
+    #[tokio::test]
+    async fn overlapping_asks_route_reversed_replies_after_unacked_redelivery() {
+        overlapping_asks_with_reversed_replies(true).await;
+    }
+
+    async fn overlapping_asks_with_reversed_replies(force_redelivery: bool) {
         let (endpoint, _dir) = start_test_broker().await;
         let mut worker = BrokerClient::connect(&endpoint, agent("worker"), "t")
             .await
             .unwrap();
         worker.subscribe().await.unwrap();
+        let (replayed_tx, replayed_rx) = tokio::sync::oneshot::channel();
         let responder = tokio::spawn(async move {
             let first = worker.next_message().await.unwrap();
-            let second = worker.next_message().await.unwrap();
             assert_eq!(first.kind, InboxKind::Ask);
-            assert_eq!(second.kind, InboxKind::Ask);
+            let mut replayed_tx = Some(replayed_tx);
+            if force_redelivery {
+                worker.subscribe().await.unwrap();
+                // The same-connection query follows Subscribe on the wire, so
+                // its response proves the unacked backlog preload completed.
+                assert!(worker.list_connected("").await.unwrap().is_empty());
+            }
+            let second = loop {
+                let next = worker.next_message().await.unwrap();
+                assert_eq!(next.kind, InboxKind::Ask);
+                if next.id == first.id {
+                    // Maildir is at-least-once; startup preload can overlap a
+                    // live push. A replay is not the second distinct request.
+                    assert_eq!(next, first, "a replay must preserve the whole Ask");
+                    if force_redelivery {
+                        if let Some(replayed) = replayed_tx.take() {
+                            replayed.send(()).unwrap();
+                        }
+                    }
+                    continue;
+                }
+                break next;
+            };
+            assert_ne!(first.id, second.id);
+            if force_redelivery {
+                assert!(replayed_tx.is_none(), "the regression must actually replay");
+            }
             for request in [second, first] {
                 let question: AskBody = serde_json::from_value(request.body.clone()).unwrap();
                 worker
@@ -316,15 +351,23 @@ mod tests {
                     AskMode::Query,
                     Duration::from_secs(3),
                 ),
-                ask_agent(
-                    &endpoint,
-                    agent("caller"),
-                    "t",
-                    "worker",
-                    "second",
-                    AskMode::Query,
-                    Duration::from_secs(3),
-                )
+                async {
+                    if force_redelivery {
+                        // Keep the first Ask pending while its replay is consumed;
+                        // the second genuine Ask then overlaps it on the same route.
+                        replayed_rx.await.unwrap();
+                    }
+                    ask_agent(
+                        &endpoint,
+                        agent("caller"),
+                        "t",
+                        "worker",
+                        "second",
+                        AskMode::Query,
+                        Duration::from_secs(3),
+                    )
+                    .await
+                }
             )
         })
         .await

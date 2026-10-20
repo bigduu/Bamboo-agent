@@ -17,6 +17,8 @@ use serde_json::{value::RawValue, Value};
 pub(super) const MEMBER: &str = "_bamboo_main_authority";
 pub(super) const SECTION_CAP: usize = 512 * 1024;
 pub(super) const PREFIX: &[u8] = b"{\"_bamboo_main_authority\":{\"version\":1,\"payload_bytes\":\"";
+pub(super) const PREFIX_V2: &[u8] =
+    b"{\"_bamboo_main_authority\":{\"version\":2,\"payload_bytes\":\"";
 const MIDDLE: &[u8] = b"\",\"payload\":";
 const CLOSE: &[u8] = b"},";
 pub(super) const HEADER_BYTES: usize = PREFIX.len() + 10 + MIDDLE.len();
@@ -33,6 +35,8 @@ pub(super) struct CompactMainAuthority {
     created_at: DateTime<Utc>,
     kind: SessionKind,
     parent_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_created_at: Option<DateTime<Utc>>,
     root_session_id: String,
     spawn_depth: u32,
     authority_identity: SessionAuthorityIdentity,
@@ -63,6 +67,7 @@ impl CompactMainAuthority {
             created_at: session.created_at,
             kind: session.kind,
             parent_session_id: session.parent_session_id.clone(),
+            parent_created_at: session.parent_created_at,
             root_session_id: session.root_session_id.clone(),
             spawn_depth: session.spawn_depth,
             authority_identity: session.authority_identity.clone(),
@@ -84,6 +89,7 @@ impl CompactMainAuthority {
         session.title = self.title_label;
         session.kind = self.kind;
         session.parent_session_id = self.parent_session_id;
+        session.parent_created_at = self.parent_created_at;
         session.root_session_id = self.root_session_id;
         session.spawn_depth = self.spawn_depth;
         session.authority_identity = self.authority_identity;
@@ -100,7 +106,8 @@ impl CompactMainAuthority {
     }
 
     fn validate(&self) -> io::Result<()> {
-        if self.title_label != public_title(&self.title_label)
+        if (self.kind == SessionKind::Root && self.parent_created_at.is_some())
+            || self.title_label != public_title(&self.title_label)
             || self.root_mode_operations.len() > ROOT_MODE_OPERATION_HISTORY_LIMIT
         {
             return Err(invalid());
@@ -151,7 +158,11 @@ pub(super) fn serialize_main(session: &Session) -> io::Result<Vec<u8>> {
     let suffix = flat.strip_prefix(b"{").ok_or_else(invalid)?;
     let capacity = section_len.checked_add(suffix.len()).ok_or_else(invalid)?;
     let mut output = Vec::with_capacity(capacity);
-    output.extend_from_slice(PREFIX);
+    output.extend_from_slice(if session.parent_created_at.is_some() {
+        PREFIX_V2
+    } else {
+        PREFIX
+    });
     output.extend_from_slice(format!("{:010}", payload.0.len()).as_bytes());
     output.extend_from_slice(MIDDLE);
     output.extend_from_slice(&payload.0);
@@ -163,7 +174,7 @@ pub(super) fn serialize_main(session: &Session) -> io::Result<Vec<u8>> {
 /// Checked framing shared by full-buffer compatibility and retained-FD readers.
 /// This observes only the fixed header; callers enforce their own section budget.
 pub(super) fn section_length(header: &[u8]) -> io::Result<usize> {
-    if !header.starts_with(PREFIX) {
+    if !header.starts_with(PREFIX) && !header.starts_with(PREFIX_V2) {
         return Err(invalid());
     }
     let digits_end = PREFIX.len().checked_add(10).ok_or_else(invalid)?;
@@ -201,6 +212,9 @@ pub(super) fn decode_v1_section(bytes: &[u8], cap: usize) -> io::Result<CompactM
     // Presence of nullable members, unknown nested fields, collapsed duplicate
     // sets and noncanonical numeric shapes cannot disappear through typed serde.
     if serde_json::to_value(&authority).map_err(|_| invalid())? != value.0 {
+        return Err(invalid());
+    }
+    if bytes.starts_with(PREFIX_V2) != authority.parent_created_at.is_some() {
         return Err(invalid());
     }
     authority.validate()?;
@@ -251,6 +265,7 @@ impl<'de> Deserialize<'de> for MainFields<'de> {
                             | "created_at"
                             | "kind"
                             | "parent_session_id"
+                            | "parent_created_at"
                             | "root_session_id"
                             | "spawn_depth"
                             | "authority_identity"
@@ -345,6 +360,7 @@ impl FlatAuthority {
             created_at: get(fields, "created_at")?,
             kind: default(fields, "kind")?,
             parent_session_id: default(fields, "parent_session_id")?,
+            parent_created_at: default(fields, "parent_created_at")?,
             root_session_id: default(fields, "root_session_id")?,
             spawn_depth: default(fields, "spawn_depth")?,
             authority_identity: get_or_unique_default(fields, "authority_identity")?,

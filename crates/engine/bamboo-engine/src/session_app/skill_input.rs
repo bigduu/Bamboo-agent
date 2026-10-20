@@ -4,7 +4,9 @@
 
 use bamboo_agent_core::{Message, Role};
 use bamboo_domain::MessagePart;
-use bamboo_skills::progressive::{truncate_skill_utf8_bytes, EXPLICIT_SKILL_PROMPT_BYTES};
+use bamboo_skills::progressive::{
+    truncate_skill_utf8_bytes, CurrentSkillInput, EXPLICIT_SKILL_PROMPT_BYTES,
+};
 use bamboo_skills::{SkillActivationSnapshot, WorkflowKind, WorkflowSelection, WorkflowStatus};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -63,33 +65,64 @@ pub fn prepare_skill_input(
     caller: Result<&SkillInputRestrictions<'_>, &str>,
     intent: Option<&SkillInputIntent<'_>>,
 ) -> Result<PreparedSkillInput, String> {
+    let Some(intent) = intent else {
+        return prepare_current_skill_input(user, caller, None);
+    };
+    if intent.chosen.len() > MAX_EXPLICIT_SKILLS {
+        return Err("Skill invocation is empty, excessive or denied by Root Ultra".into());
+    }
+    let chosen = intent
+        .chosen
+        .iter()
+        .map(|chosen| {
+            let entry = chosen
+                .snapshot
+                .skills
+                .get(&chosen.selection.id)
+                .ok_or("chosen Skill is missing from its correlated snapshot")?;
+            Ok(CurrentSkillInput {
+                selection: chosen.selection,
+                definition: &entry.definition,
+                catalog_entry: &entry.catalog_entry,
+                revision: entry.revision,
+                catalog_revision: chosen.snapshot.catalog_revision,
+                mode: chosen.snapshot.selected_skill_mode.as_deref(),
+                main_resource: chosen.main_resource,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    prepare_current_skill_input(user, caller, Some((intent.input_id, &chosen)))
+}
+
+/// The same pure validation/render kernel for borrowed current-publication data.
+/// A host must independently establish current Source and caller authority.
+pub fn prepare_current_skill_input(
+    user: &Message,
+    caller: Result<&SkillInputRestrictions<'_>, &str>,
+    intent: Option<(&str, &[CurrentSkillInput<'_>])>,
+) -> Result<PreparedSkillInput, String> {
     if user.role != Role::User {
         return Err("Skill input requires an ordinary User message".into());
     }
-    let Some(intent) = intent else {
+    let Some((input_id, chosen)) = intent else {
         return Ok(PreparedSkillInput {
             message: user.clone(),
             warnings: vec![],
         });
     };
     let caller = caller.map_err(|error| format!("Skill caller unavailable: {error}"))?;
-    if user.id.is_empty() || user.id != intent.input_id || user.id != caller.input_id {
+    if user.id.is_empty() || user.id != input_id || user.id != caller.input_id {
         return Err("Skill invocation does not belong to this User input".into());
     }
-    if intent.chosen.is_empty() || intent.chosen.len() > MAX_EXPLICIT_SKILLS || caller.root_ultra {
+    if chosen.is_empty() || chosen.len() > MAX_EXPLICIT_SKILLS || caller.root_ultra {
         return Err("Skill invocation is empty, excessive or denied by Root Ultra".into());
     }
     let mut ids = BTreeSet::new();
     let mut fragments = String::new();
     let mut warnings = Vec::new();
-    for chosen in intent.chosen {
+    for chosen in chosen {
         let selection = chosen.selection;
-        let entry = chosen
-            .snapshot
-            .skills
-            .get(&selection.id)
-            .ok_or("chosen Skill is missing from its correlated snapshot")?;
-        let catalog = &entry.catalog_entry;
+        let catalog = chosen.catalog_entry;
         if selection.id.is_empty()
             || selection.id.len() > 256
             || !ids.insert(&selection.id)
@@ -97,12 +130,12 @@ pub fn prepare_skill_input(
                 .ceiling
                 .is_some_and(|ids| !ids.contains(&selection.id))
             || caller.disabled.contains(&selection.id)
-            || chosen.snapshot.catalog_revision == 0
-            || chosen.snapshot.selected_skill_mode.as_deref() != caller.mode
-            || entry.definition.id != selection.id
+            || chosen.catalog_revision == 0
+            || chosen.mode != caller.mode
+            || chosen.definition.id != selection.id
             || catalog.id != selection.id
-            || entry.revision == 0
-            || entry.revision != selection.revision
+            || chosen.revision == 0
+            || chosen.revision != selection.revision
             || catalog.revision != selection.revision
             || catalog.source != selection.source
             || catalog.kind != WorkflowKind::Instruction
@@ -120,10 +153,10 @@ pub fn prepare_skill_input(
         serde_json::to_writer(&mut args, &selection.args).map_err(|error| error.to_string())?;
         bamboo_domain::validate_schema(&catalog.argument_schema, &selection.args)?;
         let args = String::from_utf8(args.0).map_err(|error| error.to_string())?;
-        let (name, name_cut) = truncate_skill_utf8_bytes(&entry.definition.name, 256);
+        let (name, name_cut) = truncate_skill_utf8_bytes(&chosen.definition.name, 256);
         let (path, path_cut) = truncate_skill_utf8_bytes(chosen.main_resource, 1_024);
         let (body, body_cut) =
-            truncate_skill_utf8_bytes(&entry.definition.prompt, EXPLICIT_SKILL_PROMPT_BYTES);
+            truncate_skill_utf8_bytes(&chosen.definition.prompt, EXPLICIT_SKILL_PROMPT_BYTES);
         if name.is_empty() || path.is_empty() {
             return Err("chosen Skill requires a name and main-resource locator".into());
         }
@@ -232,6 +265,105 @@ pub(crate) mod tests {
             root_ultra: false,
             mode: Some("code"),
         }
+    }
+
+    #[test]
+    fn skill_input_rejects_oversized_intent_before_snapshot_lookup() {
+        let user = Message::user("original");
+        let original = serde_json::to_value(&user).unwrap();
+        let disabled = BTreeSet::new();
+        let caller = restrictions(&user, &disabled);
+        let mut snapshot = snapshot();
+        snapshot.skills.clear();
+        let selection = selection();
+        for (count, expected) in [
+            (
+                MAX_EXPLICIT_SKILLS,
+                "chosen Skill is missing from its correlated snapshot",
+            ),
+            (
+                MAX_EXPLICIT_SKILLS + 1,
+                "Skill invocation is empty, excessive or denied by Root Ultra",
+            ),
+        ] {
+            let chosen = (0..count)
+                .map(|_| ChosenSkillInput {
+                    selection: &selection,
+                    snapshot: &snapshot,
+                    main_resource: "review/SKILL.md",
+                })
+                .collect::<Vec<_>>();
+            let intent = SkillInputIntent {
+                input_id: &user.id,
+                chosen: &chosen,
+            };
+            assert_eq!(
+                prepare_skill_input(&user, Ok(&caller), Some(&intent)).unwrap_err(),
+                expected,
+                "count {count}"
+            );
+            assert_eq!(serde_json::to_value(&user).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn current_skill_input_reuses_exact_snapshot_kernel_without_auxiliary_data() {
+        let user = Message::user("client ### Explicit Skill text");
+        let mut snapshot = snapshot();
+        snapshot.skills.get_mut("review").unwrap().definition.prompt = "é".repeat(4_001);
+        let selection = selection();
+        let disabled = BTreeSet::new();
+        let caller = restrictions(&user, &disabled);
+        let old_chosen = [ChosenSkillInput {
+            selection: &selection,
+            snapshot: &snapshot,
+            main_resource: "review/SKILL.md",
+        }];
+        let old = prepare_skill_input(
+            &user,
+            Ok(&caller),
+            Some(&SkillInputIntent {
+                input_id: &user.id,
+                chosen: &old_chosen,
+            }),
+        )
+        .unwrap();
+        let entry = snapshot.skills.get("review").unwrap();
+        let chosen = [CurrentSkillInput {
+            selection: &selection,
+            definition: &entry.definition,
+            catalog_entry: &entry.catalog_entry,
+            revision: entry.revision,
+            catalog_revision: snapshot.catalog_revision,
+            mode: snapshot.selected_skill_mode.as_deref(),
+            main_resource: "review/SKILL.md",
+        }];
+        let prepared =
+            prepare_current_skill_input(&user, Ok(&caller), Some((&user.id, &chosen))).unwrap();
+        assert_eq!(
+            serde_json::to_value(&prepared.message).unwrap(),
+            serde_json::to_value(old.message).unwrap()
+        );
+        assert_eq!(prepared.warnings, old.warnings);
+        assert_eq!(prepared.warnings.len(), 1);
+        assert!(prepared.message.content.contains(&"é".repeat(4_000)));
+        assert!(!prepared.message.content.contains(&"é".repeat(4_001)));
+        assert!(!prepared
+            .message
+            .content
+            .contains("RESOURCE_MUST_NOT_APPEAR"));
+        assert!(
+            prepare_current_skill_input(&user, Err("unknown"), Some((&user.id, &chosen))).is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(
+                prepare_current_skill_input(&user, Err("unknown"), None)
+                    .unwrap()
+                    .message
+            )
+            .unwrap(),
+            serde_json::to_value(&user).unwrap()
+        );
     }
 
     #[test]

@@ -54,12 +54,8 @@ use crate::runtime::execution::{ExternalChildRunner, SessionInboxRuntimeBinding,
 /// supported operating point rather than an opt-in escape hatch.
 pub const DEFAULT_MAX_CONCURRENT_ACTORS: usize = 200;
 
-/// Max nesting depth for direct nested execution (Phase 6). A worker whose
-/// session `spawn_depth` is below this gets its own spawn stack + the real
-/// SubAgent tool; at/over it, neither (and the tool itself refuses). Mirrors
-/// `bamboo_server_tools::DEFAULT_MAX_SPAWN_DEPTH` (kept in sync; engine can't
-/// depend on server-tools). Root orchestrator = 0 ⇒ 4 levels of sub-agents.
-pub const MAX_SPAWN_DEPTH: u32 = 4;
+/// Compatibility name for the default. Runtime creation uses Host config.
+pub use bamboo_config::DEFAULT_MAX_SPAWN_DEPTH as MAX_SPAWN_DEPTH;
 
 /// Default cap on idle pooled (warm, reusable) workers kept per fingerprint.
 const DEFAULT_MAX_IDLE_PER_KEY: usize = 4;
@@ -1205,6 +1201,9 @@ impl BrokerTerminalReceiptReconciler {
             .map(String::as_str)
             .unwrap_or("worker");
         for receipt in receipts {
+            publish_recovered_completion_source(&self.store, &receipt)
+                .await
+                .map_err(|_| "committed Child completion source remains pending")?;
             if current
                 .metadata
                 .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
@@ -1282,6 +1281,61 @@ impl BrokerTerminalReceiptReconciler {
         }
         Ok(())
     }
+}
+
+/// Finish only the interrupted publication of an already committed Host
+/// receipt. The pending source stays in the existing protected source record;
+/// no provider, event admission or transcript reconstruction is involved.
+async fn publish_recovered_completion_source(
+    store: &Arc<bamboo_storage::SessionStoreV2>,
+    receipt: &bamboo_storage::v2::BrokerTerminalReceipt,
+) -> Result<(), String> {
+    let expected = store
+        .load_session(&receipt.session_id)
+        .await
+        .map_err(|error| format!("Child completion recovery reload failed: {error}"))?
+        .ok_or("Child completion recovery snapshot missing")?;
+    if expected.id != receipt.session_id
+        || expected.created_at != receipt.created_at
+        || expected.parent_session_id.as_deref() != Some(receipt.parent_session_id.as_str())
+        || expected.root_session_id != receipt.root_session_id
+        || expected.project_id_meta() != receipt.project_id
+    {
+        return Err("Child completion recovery identity changed".into());
+    }
+    let mut candidate = expected.clone();
+    if candidate.last_run_status().as_deref() == Some("running") {
+        candidate.set_last_run_status(receipt.terminal_status.clone());
+        if let Some(error) = &receipt.terminal_error {
+            candidate.set_last_run_error(error.clone());
+        } else {
+            candidate.clear_last_run_error();
+        }
+    }
+    if crate::execution::ChildCompletionSource::publish_after_durable_delivery(
+        &mut candidate,
+        &receipt.activation_run_id,
+    )? {
+        let source = crate::execution::ChildCompletionSource::from_committed_session(&candidate)
+            .ok_or("Child completion recovery source invalid")?;
+        let published = candidate
+            .metadata
+            .get("runtime.child_completion_source_v1")
+            .ok_or("Child completion recovery source missing")?;
+        // CAS reloads under the physical Session lock and mutates only the
+        // source/status fields. Another reconciler or successor cannot be
+        // overwritten by this earlier snapshot.
+        let saved = store
+            .publish_broker_terminal_source(receipt, &expected, published)
+            .await
+            .map_err(|error| format!("Child completion recovery publication failed: {error}"))?;
+        if crate::execution::ChildCompletionSource::from_committed_session(&saved).as_ref()
+            != Some(&source)
+        {
+            return Err("Child completion recovery source changed".into());
+        }
+    }
+    Ok(())
 }
 
 fn receipt_remote_route(
@@ -1397,9 +1451,11 @@ pub struct ActorChildRunner {
     credentials: Vec<ScopedCredential>,
     /// Parent's default provider (used when the child has no explicit one).
     default_provider: String,
+    /// Startup fallback for embeddings without a live Host configuration.
+    max_spawn_depth: u32,
     /// Live server configuration used to resolve provider credentials at child
-    /// activation time. This is deliberately limited to provider provisioning:
-    /// executor/placement policy remains the immutable runner configuration.
+    /// activation time, including the depth cap for new worker provisioning.
+    /// Executor/placement policy remains the immutable runner configuration.
     live_provider_config: Option<Arc<tokio::sync::RwLock<bamboo_llm::Config>>>,
     /// The mailbox bus to run local children over (the unified transport). Local
     /// sub-agents require it; `None` only when no broker could be embedded.
@@ -1481,6 +1537,16 @@ struct PendingDurableChildLink {
     /// Captured from this Host frame pump after canonical nested-wait checks.
     /// The map key binds it to the exact Child birth and activation Run.
     host_nested_wait_handoff: bool,
+    // Never reconstructed from Worker JSON or ordinary Session metadata.
+    strict_history: Option<StrictTerminalHistory>,
+    strict_history_required: bool,
+    strict_history_committed: bool,
+}
+
+#[derive(Clone)]
+struct StrictTerminalHistory {
+    proof: bamboo_storage::v2::HostTerminalCompleteness,
+    watermark: bamboo_subagent::ActorEventWatermark,
 }
 
 fn effective_broker_terminal_status(
@@ -1688,6 +1754,7 @@ impl ActorChildRunner {
             executor,
             credentials,
             default_provider,
+            max_spawn_depth: MAX_SPAWN_DEPTH,
             live_provider_config: None,
             native_tool_ceiling: None,
             bus: None,
@@ -1745,6 +1812,11 @@ impl ActorChildRunner {
         config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
     ) -> Self {
         self.live_provider_config = Some(config);
+        self
+    }
+
+    pub fn with_max_spawn_depth(mut self, max_spawn_depth: u32) -> Self {
+        self.max_spawn_depth = max_spawn_depth;
         self
     }
 
@@ -2050,6 +2122,7 @@ impl ActorChildRunner {
         job: &SpawnJob,
         credentials: &[ScopedCredential],
         default_provider: &str,
+        max_spawn_depth: u32,
     ) -> ProvisionSpec {
         let mut spec = ProvisionSpec::new(
             ChildIdentity {
@@ -2156,14 +2229,10 @@ impl ActorChildRunner {
                 }
             }
         }
-        // Phase 6 (direct nested execution): a worker BELOW the depth cap may
-        // orchestrate its OWN children — on startup it builds its own spawn
-        // stack and runs the real SubAgent tool (no host proxy). The cap (the
-        // SubAgent tool refuses to spawn at/over `max_spawn_depth`) bounds the
-        // recursion. Driven purely by the child's depth, so it auto-propagates
-        // down the tree without any extra config threading.
-        spec.capabilities.nested_spawn = session.spawn_depth < MAX_SPAWN_DEPTH;
-        spec.capabilities.max_spawn_depth = Some(MAX_SPAWN_DEPTH);
+        // Tool exposure is baked at provision time. Every actual nested create
+        // is also checked against the canonical Host's current depth policy.
+        spec.capabilities.nested_spawn = session.spawn_depth < max_spawn_depth;
+        spec.capabilities.max_spawn_depth = Some(max_spawn_depth);
         // #69: activate child-approval review. Sub-agents enforce permissions so
         // their DANGEROUS actions (the worker uses a HIGH threshold) reach the
         // parent for review — escalated to the human, or model-reviewed off-loop
@@ -2316,6 +2385,7 @@ impl ActorChildRunner {
             job,
             &self.credentials,
             &self.default_provider,
+            self.max_spawn_depth,
         )
     }
 
@@ -2331,7 +2401,13 @@ impl ActorChildRunner {
         let config = config.read().await;
         let credentials = super::runtime::extract_provider_credentials(&config);
         let default_provider = config.effective_default_provider().to_string();
-        self.build_spec_with_provider_config(session, job, &credentials, &default_provider)
+        self.build_spec_with_provider_config(
+            session,
+            job,
+            &credentials,
+            &default_provider,
+            config.subagents().effective_max_spawn_depth(),
+        )
     }
 
     /// The `metadata["placement"]` JSON to stamp on a child from its resolved
@@ -2599,17 +2675,21 @@ impl ExternalChildRunner for ActorChildRunner {
             session.created_at,
             activation_run_id.to_owned(),
         );
-        let (delivery, host_nested_wait_handoff) = {
+        let (delivery, host_nested_wait_handoff, strict_history) = {
             let pending = self.pending_durable_links.lock().await;
             let Some(pending) = pending.get(&key) else {
                 return Ok(false);
             };
+            if pending.strict_history_required && pending.strict_history.is_none() {
+                return Err("Host strict terminal completeness proof missing".into());
+            }
             (
                 pending
                     .link
                     .durable_delivery_receipt()
                     .ok_or_else(|| "broker terminal has no exact durable receipt".to_string())?,
                 pending.host_nested_wait_handoff,
+                pending.strict_history.clone(),
             )
         };
         let expected_status =
@@ -2657,41 +2737,146 @@ impl ExternalChildRunner for ActorChildRunner {
         } else {
             None
         };
+        let route = bamboo_storage::v2::BrokerTerminalRoute {
+            activation_run_id,
+            broker_identity: &delivery.broker_identity,
+            parent_mailbox: &delivery.parent_mailbox,
+            broker_correlation_id: &delivery.correlation_id,
+            message_ids: &delivery.message_ids,
+        };
         if let Some(call_id) = yielded_call {
             let proof = bamboo_storage::v2::HostToolYield::from_verified_host(
                 session,
                 activation_run_id,
                 &call_id,
             )
-            .map_err(|e| e.to_string())?;
-            store
-                .prepare_broker_tool_yield_receipt(
-                    session,
-                    bamboo_storage::v2::BrokerTerminalRoute {
-                        activation_run_id,
-                        broker_identity: &delivery.broker_identity,
-                        parent_mailbox: &delivery.parent_mailbox,
-                        broker_correlation_id: &delivery.correlation_id,
-                        message_ids: &delivery.message_ids,
-                    },
-                    &proof,
-                )
-                .await
-                .map_err(|e| e.to_string())?;
+            .map_err(|error| error.to_string())?;
+            if let Some(history) = strict_history.as_ref() {
+                store
+                    .prepare_broker_tool_yield_receipt_with_completeness(
+                        session,
+                        route,
+                        &proof,
+                        &history.proof,
+                    )
+                    .await
+            } else {
+                store
+                    .prepare_broker_tool_yield_receipt(session, route, &proof)
+                    .await
+            }
+            .map_err(|error| format!("Host broker receipt prepare failed: {error}"))?;
         } else {
-            store
-                .prepare_broker_terminal_receipt(
-                    session,
-                    activation_run_id,
-                    &delivery.broker_identity,
-                    &delivery.parent_mailbox,
-                    &delivery.correlation_id,
-                    &delivery.message_ids,
-                )
-                .await
-                .map_err(|error| format!("Host broker receipt prepare failed: {error}"))?;
+            if let Some(history) = strict_history.as_ref() {
+                store
+                    .prepare_broker_terminal_receipt_with_completeness(
+                        session,
+                        route,
+                        &history.proof,
+                    )
+                    .await
+            } else {
+                store
+                    .prepare_broker_terminal_receipt(
+                        session,
+                        activation_run_id,
+                        &delivery.broker_identity,
+                        &delivery.parent_mailbox,
+                        &delivery.correlation_id,
+                        &delivery.message_ids,
+                    )
+                    .await
+            }
+            .map_err(|error| format!("Host broker receipt prepare failed: {error}"))?;
         }
         Ok(true)
+    }
+
+    async fn commit_durable_child_delivery(
+        &self,
+        session: &Session,
+        activation_run_id: &str,
+    ) -> Result<(), String> {
+        let key = (
+            session.id.clone(),
+            session.created_at,
+            activation_run_id.to_owned(),
+        );
+        let mut pending_links = self.pending_durable_links.lock().await;
+        let Some(pending) = pending_links.get_mut(&key) else {
+            return Ok(());
+        };
+        let delivery = pending
+            .link
+            .durable_delivery_receipt()
+            .ok_or_else(|| "broker terminal lost its exact durable receipt".to_string())?;
+        let expected_status = effective_broker_terminal_status(
+            delivery.terminal_status,
+            pending.host_nested_wait_handoff,
+        )?;
+        if session.last_run_status().as_deref() != Some(expected_status) {
+            return Err("Host final status differs from accepted broker terminal".into());
+        }
+        if pending.strict_history_required && pending.strict_history.is_none() {
+            return Err("Host strict terminal completeness proof missing".into());
+        }
+        let store = self
+            .actor_directory_store
+            .lock()
+            .recover_poison()
+            .clone()
+            .ok_or_else(|| "Host broker receipt store unavailable".to_string())?;
+        let committed = if let Some(history) = pending.strict_history.as_ref() {
+            store
+                .commit_broker_terminal_receipt_with_completeness(
+                    session,
+                    activation_run_id,
+                    &history.proof,
+                )
+                .await
+        } else {
+            store
+                .commit_broker_terminal_receipt(session, activation_run_id)
+                .await
+        }
+        .map_err(|error| format!("Host broker receipt checkpoint unconfirmed: {error}"))?;
+        if committed.broker_identity != delivery.broker_identity
+            || committed.parent_mailbox != delivery.parent_mailbox
+            || committed.broker_correlation_id != delivery.correlation_id
+            || committed.message_ids != delivery.message_ids
+            || committed.terminal_status != expected_status
+        {
+            return Err("Host broker receipt changed before completion".into());
+        }
+        if let Some(history) = pending.strict_history.as_ref() {
+            let proof = committed
+                .terminal_completeness
+                .as_ref()
+                .ok_or_else(|| "Host strict terminal completeness readback missing".to_string())?;
+            let creation = bamboo_subagent::proto::ChildCreationIdentity {
+                created_at: session.created_at,
+                spawn_depth: session.spawn_depth,
+            };
+            validate_strict_history_terminal(
+                Some(&history.watermark),
+                session,
+                session
+                    .parent_session_id
+                    .as_deref()
+                    .ok_or("Child parent missing")?,
+                Some(activation_run_id),
+                proof.execution_epoch,
+                Some(&creation),
+                proof.contiguous_applied_seq,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        // The same exact-snapshot CAS serves live and cold publication. An
+        // append-safe generic save could expose Completed after merging new
+        // input that invalidates the source; CAS rejects before that write.
+        publish_recovered_completion_source(&store, &committed).await?;
+        pending.strict_history_committed = true;
+        Ok(())
     }
 
     async fn confirm_durable_child_delivery(
@@ -2755,10 +2940,27 @@ impl ExternalChildRunner for ActorChildRunner {
             .recover_poison()
             .clone()
             .ok_or_else(|| "Host broker receipt store unavailable".to_string())?;
-        let committed = store
-            .commit_broker_terminal_receipt(session, activation_run_id)
-            .await
-            .map_err(|error| format!("Host broker receipt checkpoint unconfirmed: {error}"))?;
+        let committed = if pending.strict_history_required {
+            if !pending.strict_history_committed {
+                return Err("Host strict completeness was not committed before ACK".into());
+            }
+            let history = pending
+                .strict_history
+                .as_ref()
+                .ok_or_else(|| "Host strict terminal completeness proof missing".to_string())?;
+            store
+                .commit_broker_terminal_receipt_with_completeness(
+                    session,
+                    activation_run_id,
+                    &history.proof,
+                )
+                .await
+        } else {
+            store
+                .commit_broker_terminal_receipt(session, activation_run_id)
+                .await
+        }
+        .map_err(|error| format!("Host broker receipt checkpoint unconfirmed: {error}"))?;
         if committed.broker_identity != delivery.broker_identity
             || committed.parent_mailbox != delivery.parent_mailbox
             || committed.broker_correlation_id != delivery.correlation_id
@@ -2990,7 +3192,7 @@ impl ExternalChildRunner for ActorChildRunner {
                     .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY))
             && matches!(spec.placement, Placement::Local)
             && matches!(spec.executor, ExecutorSpec::BambooRuntime))
-        .then(|| spec.capabilities.native_tool_ceiling.as_ref())
+        .then_some(spec.capabilities.native_tool_ceiling.as_ref())
         .flatten()
         .filter(|ceiling| {
             bamboo_subagent::proto::LocalToolMessages::supports_tools(
@@ -3342,6 +3544,9 @@ impl ExternalChildRunner for ActorChildRunner {
                             format!("Host broker receipt recovery blocked: {error}")
                         })?;
                     for receipt in receipts {
+                        // This path already owns a successor Run and its public
+                        // running marker. Old committed receipts authorize ACK
+                        // only; never publish the predecessor over that owner.
                         if client.broker_parent_mailbox() != Some(receipt.parent_mailbox.as_str()) {
                             return Err(
                                 "old Child broker parent mailbox changed before ACK".to_string()
@@ -3465,9 +3670,7 @@ impl ExternalChildRunner for ActorChildRunner {
                     remote_canonical_lineage(session_inbox_runtime.as_ref().unwrap(), session)
                         .await;
                 if current.as_ref().ok() != lineage.as_ref()
-                    || bound_activation_run_id
-                        .as_deref()
-                        .map_or(true, str::is_empty)
+                    || bound_activation_run_id.as_deref().is_none_or(str::is_empty)
                     || cancel_token.is_cancelled()
                 {
                     if let (Some(binding), Some(run_id)) = (
@@ -3550,9 +3753,9 @@ impl ExternalChildRunner for ActorChildRunner {
                 .await;
                 match started {
                     Ok((activation, prepared)) => {
-                        if let Some((prefix, delivery)) = prepared {
+                        if let Some((prefix, deliveries)) = prepared {
                             messages = prefix;
-                            initial_session_messages = vec![delivery];
+                            initial_session_messages = deliveries;
                         }
                         plain_activation = Some(activation);
                     }
@@ -3768,7 +3971,7 @@ impl ExternalChildRunner for ActorChildRunner {
             let dispatch = async {
                 if let Some(activation) = plain_activation
                     .as_ref()
-                    .filter(|activation| activation.initial_input.is_some())
+                    .filter(|activation| !activation.initial_inputs.is_empty())
                 {
                     activation.refresh_continuation_posture(
                         session,
@@ -3823,6 +4026,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 self.approval_registry.clone(),
             );
 
+            let mut strict_history = None;
             let result = drive(ActorDriveContext {
                 client: &mut *client,
                 parent_session_id: &job.parent_session_id,
@@ -3864,6 +4068,7 @@ impl ExternalChildRunner for ActorChildRunner {
                 },
                 local_history_tools: local_history_tools.as_deref(),
                 local_history_read_only: spec.capabilities.read_only_enforced(),
+                strict_history_output: Some(&mut strict_history),
                 plain_input: plain_activation.as_ref(),
                 canonical_activation: active_lease.as_ref().map(|lease| &lease.fence),
                 canonical_placement_ref: active_lease.as_ref().map(|lease| &lease.placement_ref),
@@ -4006,6 +4211,9 @@ impl ExternalChildRunner for ActorChildRunner {
                         PendingDurableChildLink {
                             link: client,
                             host_nested_wait_handoff,
+                            strict_history,
+                            strict_history_required: local_history_tools.is_some(),
+                            strict_history_committed: false,
                         },
                     );
                 } else {
@@ -4251,11 +4459,13 @@ struct PlainActorActivation {
     initial_release_required: bool,
     input_inbox: bamboo_storage::FileSessionInbox,
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
-    initial_input: Option<SessionInboxOwnedClaim>,
+    initial_inputs: Vec<SessionInboxOwnedClaim>,
+    initial_input_count: usize,
     recovering_pre_ack: bool,
     completion_router: std::sync::Mutex<Option<ActorEventRouter>>,
 }
 type PlainInitialDelivery = (Vec<serde_json::Value>, SessionMessageDelivery);
+type PlainInitialBatch = (Vec<serde_json::Value>, Vec<SessionMessageDelivery>);
 #[track_caller]
 fn plain_actor_unsupported() -> AgentError {
     let source = std::panic::Location::caller();
@@ -4266,7 +4476,7 @@ fn plain_actor_unsupported() -> AgentError {
         source_column = source.column(),
         "plain Actor continuation unsupported"
     );
-    AgentError::LLM("This Actor Child supports a fresh plain activation, a completed plain Child with one new input, two bounded corrections while Running, a Failed retry with one new input, an expired initial Local owner with one new input, or verified expired pre-ACK input recovery through run(reset_to_last_user=false). Other continuation is unsupported; durable history is preserved.".into())
+    AgentError::LLM("This Actor Child supports a fresh plain activation, a completed plain Child with a bounded batch of new inputs, two bounded corrections while Running, a Failed retry with one new input, an expired initial Local owner with one new input, or verified expired pre-ACK input recovery through run(reset_to_last_user=false). Other continuation is unsupported; durable history is preserved.".into())
 }
 fn plain_initial_history(session: &Session) -> bool {
     !session.messages.iter().any(|message| {
@@ -4446,15 +4656,27 @@ impl PlainActorActivation {
                         && backlog.generation > old.inbox_generation
                 })
                 && new_input;
+            // Only completed plain local history gains a bounded initial batch.
+            // Retry, expired owner and pre-ACK recovery retain their single-input
+            // contracts. QueueOnly alone still cannot authorize a cold start.
+            let new_batch = backlog.pending > 1
+                && backlog.pending <= bamboo_domain::SessionInboxLimits::default().max_claim_batch
+                && backlog.claimed == 0
+                && backlog
+                    .oldest_generation
+                    .is_some_and(|oldest| oldest < backlog.generation)
+                && backlog.activation_pending();
             let continuation = allow_failed_retry
                 && release_worker.is_some()
                 && entry.actor.state == ActorLogicalState::Cold
                 && entry.actor.current_attempt > 0
                 && entry.activation.as_ref().is_some_and(|old| {
                     old.status == bamboo_domain::ActorActivationStatus::Succeeded
-                        && backlog.generation > old.inbox_generation
+                        && backlog
+                            .oldest_generation
+                            .is_some_and(|oldest| oldest > old.inbox_generation)
                 })
-                && new_input
+                && (new_input || new_batch)
                 && plain_completed_history(session);
             let input_inbox = bamboo_storage::FileSessionInbox::new(
                 store.clone(),
@@ -4562,7 +4784,12 @@ impl PlainActorActivation {
                 initial_release_required: release_worker.is_some(),
                 input_inbox,
                 permission_config,
-                initial_input: recovered,
+                initial_inputs: recovered.into_iter().collect(),
+                initial_input_count: if continuation {
+                    backlog.pending
+                } else {
+                    usize::from(claimed.inbox_generation > 0)
+                },
                 recovering_pre_ack: recovery.is_some(),
                 completion_router: std::sync::Mutex::new(None),
             };
@@ -4587,9 +4814,8 @@ impl PlainActorActivation {
         release_worker: Option<&'a str>,
     ) -> std::pin::Pin<
         Box<
-            impl std::future::Future<
-                    Output = Result<(Self, Option<PlainInitialDelivery>), AgentError>,
-                > + Send
+            impl std::future::Future<Output = Result<(Self, Option<PlainInitialBatch>), AgentError>>
+                + Send
                 + 'a,
         >,
     > {
@@ -4617,26 +4843,46 @@ impl PlainActorActivation {
                 let expected = if activation.recovering_pre_ack {
                     (0, 1)
                 } else {
-                    (1, 0)
+                    (activation.initial_input_count, 0)
                 };
                 if (backlog.pending, backlog.claimed) != expected
                     || backlog.generation != activation.inbox_generation
                 {
                     return Err(plain_actor_unsupported());
                 }
-                let claim = match activation.initial_input.clone() {
-                    Some(claim) => claim,
-                    None => activation
-                        .claim_input(binding, session, run_id)
+                let claims = if activation.initial_inputs.is_empty() {
+                    // claim_owned is idempotent for this consumer. Repeating
+                    // limit=1 would return the same first claim, not the next.
+                    // Select once under the existing bounded queue transaction.
+                    activation
+                        .claim_inputs(binding, session, run_id, activation.initial_input_count)
                         .await?
-                        .ok_or_else(|| plain_actor_unsupported())?,
+                } else {
+                    activation.initial_inputs.clone()
                 };
-                if claim.claim.generation != activation.inbox_generation {
+                if claims.len() != activation.initial_input_count
+                    || claims.last().map(|claim| claim.claim.generation)
+                        != Some(activation.inbox_generation)
+                    || claims
+                        .windows(2)
+                        .any(|pair| pair[0].claim.generation >= pair[1].claim.generation)
+                {
                     return Err(plain_actor_unsupported());
                 }
-                let delivery = activation.checkpoint_input(session, run_id, &claim).await?;
-                activation.initial_input = Some(claim);
-                Ok(delivery)
+                // Validate/claim the entire bounded selection before publishing
+                // any input. Each checkpoint still uses its own physical lease,
+                // complete current prefix and actual Actor fence. A partial or
+                // uncertain checkpoint never dispatches a Run or ACKs a sibling.
+                let mut prefix = None;
+                let mut deliveries = Vec::with_capacity(claims.len());
+                for claim in &claims {
+                    let (messages, delivery) =
+                        activation.checkpoint_input(session, run_id, claim).await?;
+                    prefix.get_or_insert(messages);
+                    deliveries.push(delivery);
+                }
+                activation.initial_inputs = claims;
+                Ok((prefix.ok_or_else(|| plain_actor_unsupported())?, deliveries))
             }
             .await;
             match prepared {
@@ -4660,7 +4906,25 @@ impl PlainActorActivation {
                 + 'a,
         >,
     > {
+        Box::pin(async move { Ok(self.claim_inputs(binding, session, run_id, 1).await?.pop()) })
+    }
+    fn claim_inputs<'a>(
+        &'a self,
+        binding: &'a SessionInboxRuntimeBinding,
+        session: &'a Session,
+        run_id: &'a str,
+        limit: usize,
+    ) -> std::pin::Pin<
+        Box<
+            impl std::future::Future<Output = Result<Vec<SessionInboxOwnedClaim>, AgentError>>
+                + Send
+                + 'a,
+        >,
+    > {
         Box::pin(async move {
+            if limit == 0 || limit > bamboo_domain::SessionInboxLimits::default().max_claim_batch {
+                return Err(plain_actor_unsupported());
+            }
             if !self
                 .input_inbox
                 .inspect(&session.id)
@@ -4668,7 +4932,7 @@ impl PlainActorActivation {
                 .map_err(|_| plain_actor_unsupported())?
                 .activation_pending()
             {
-                return Ok(None);
+                return Ok(Vec::new());
             }
             if run_id != self.fence.run_id || !binding.router.owns_run(&session.id, run_id).await {
                 return Err(plain_actor_unsupported());
@@ -4682,19 +4946,17 @@ impl PlainActorActivation {
                 now,
                 duration: self.input_deadline - now,
             };
-            let claim = self
+            let claims = self
                 .input_inbox
-                .claim_owned(&session.id, 1, Some(run_id), &lease)
+                .claim_owned(&session.id, limit, Some(run_id), &lease)
                 .await
                 .map_err(|error| {
                     tracing::warn!(%error, "Actor correction claim unconfirmed");
                     AgentError::LLM(
                         "Actor correction claim unconfirmed; durable input is preserved".into(),
                     )
-                })?
-                .into_iter()
-                .next();
-            if let Some(claim) = &claim {
+                })?;
+            for claim in &claims {
                 if !matches!(&claim.claim.envelope.body, bamboo_domain::SessionMessageBody::Content(content)
                     if content.parts.is_empty() && !content.text.trim().is_empty() && content.text.len() <= 8192)
                 {
@@ -4717,7 +4979,7 @@ impl PlainActorActivation {
                     return Err(plain_actor_unsupported());
                 }
             }
-            Ok(claim)
+            Ok(claims)
         })
     }
     fn checkpoint_input<'a>(
@@ -5181,6 +5443,23 @@ fn local_tool_history_unsupported() -> AgentError {
     AgentError::LLM("local_tool_history_unsupported".into())
 }
 
+#[derive(Clone, Copy)]
+enum LocalToolTerminal<'a> {
+    Completed(Option<&'a str>),
+    // Only the selected Cancelled terminal may finish a validated Read/Glob
+    // prefix. This is Host control flow, never a Worker DATA authority flag.
+    Cancelled,
+}
+
+impl LocalToolTerminal<'_> {
+    fn permits_checkpoint(self, cancel: &CancellationToken) -> bool {
+        match self {
+            Self::Completed(_) => !cancel.is_cancelled(),
+            Self::Cancelled => cancel.is_cancelled(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct LocalToolCollector {
     messages: Option<Vec<bamboo_agent_core::Message>>,
@@ -5351,7 +5630,33 @@ impl LocalToolCollector {
         read_only: bool,
         terminal: Option<&str>,
     ) -> Result<Vec<bamboo_agent_core::Message>, AgentError> {
+        self.suffix_for_terminal(
+            host,
+            tools,
+            read_only,
+            LocalToolTerminal::Completed(terminal),
+        )
+    }
+
+    fn suffix_for_terminal(
+        self,
+        host: &Session,
+        tools: &[String],
+        read_only: bool,
+        terminal: LocalToolTerminal<'_>,
+    ) -> Result<Vec<bamboo_agent_core::Message>, AgentError> {
         use bamboo_subagent::proto::LocalToolMessages;
+        let cancelled = matches!(terminal, LocalToolTerminal::Cancelled);
+        if cancelled
+            && (!read_only
+                || tools.is_empty()
+                || tools
+                    .iter()
+                    .any(|name| !matches!(name.as_str(), "Read" | "Glob"))
+                || self.ticket_yield.is_some())
+        {
+            return Err(local_tool_history_unsupported());
+        }
         let data = self.messages.ok_or_else(local_tool_history_unsupported)?;
         let candidate: Vec<_> = data.iter().skip_while(|m| m.role == Role::System).collect();
         let prefix: Vec<_> = host
@@ -5360,7 +5665,8 @@ impl LocalToolCollector {
             .filter(|m| m.role != Role::System)
             .collect();
         if !host.provider_transcript.groups().is_empty()
-            || candidate.len() <= prefix.len()
+            || candidate.len() < prefix.len()
+            || (!cancelled && candidate.len() == prefix.len())
             || serde_json::to_value(&candidate[..prefix.len()])
                 .map_err(|_| local_tool_history_unsupported())?
                 != serde_json::to_value(&prefix).map_err(|_| local_tool_history_unsupported())?
@@ -5418,6 +5724,8 @@ impl LocalToolCollector {
                                     call.function.name.as_str(),
                                     "Read" | "Glob" | "Write" | "Task"
                                 )
+                                || (cancelled
+                                    && !matches!(call.function.name.as_str(), "Read" | "Glob"))
                                 || self.starts.get(&call.id).is_some_and(|(name, actual)| {
                                     name != &call.function.name || actual != &arguments
                                 })
@@ -5484,29 +5792,61 @@ impl LocalToolCollector {
                 _ => return Err(local_tool_history_unsupported()),
             }
         }
-        let last = suffix.last().ok_or_else(local_tool_history_unsupported)?;
-        let question_terminal = self.ticket_yield.as_ref().is_some_and(|(id, question)| {
-            last.role == Role::Tool
+        let last = suffix.last();
+        let completed_text = match terminal {
+            LocalToolTerminal::Completed(text) => text,
+            LocalToolTerminal::Cancelled => None,
+        };
+        let question_terminal =
+            self.ticket_yield.as_ref().is_some_and(|(id, question)| {
+                last.is_some_and(|last| last.role == Role::Tool
                 && last.tool_call_id.as_ref() == Some(id)
                 && last.tool_success == Some(true)
                 && self.starts.get(id).is_some_and(|(name, _)| name == "Task")
-                && terminal.is_none_or(str::is_empty)
+                && completed_text.is_none_or(str::is_empty)
                 && serde_json::from_str::<serde_json::Value>(&last.content).ok()
-                    == Some(serde_json::json!({"status":"waiting_for_answer", "request":question}))
+                    == Some(serde_json::json!({"status":"waiting_for_answer", "request":question})))
+            });
+        let report_terminal = last.is_some_and(|last| {
+            last.role == Role::Assistant
+                && last.tool_calls.is_none()
+                && last.phase != Some(bamboo_domain::MessagePhase::Commentary)
+                && completed_text == Some(last.content.as_str())
         });
-        let report_terminal = last.role == Role::Assistant
-            && last.tool_calls.is_none()
-            && last.phase != Some(bamboo_domain::MessagePhase::Commentary)
-            && terminal == Some(last.content.as_str());
         if !pending.is_empty()
             || used.len() != self.outcomes.len()
             || self.starts.keys().any(|id| !used.contains(id))
-            || !(report_terminal || question_terminal)
+            || !(cancelled || report_terminal || question_terminal)
         {
             return Err(local_tool_history_unsupported());
         }
         Ok(suffix)
     }
+}
+
+async fn validate_local_tool_checkpoint(
+    session: &Session,
+    binding: &SessionInboxRuntimeBinding,
+    run_id: &str,
+    terminal: LocalToolTerminal<'_>,
+    cancel: &CancellationToken,
+) -> Result<(), AgentError> {
+    if !terminal.permits_checkpoint(cancel) || !binding.router.owns_run(&session.id, run_id).await {
+        return Err(local_tool_history_unsupported());
+    }
+    if matches!(terminal, LocalToolTerminal::Cancelled) {
+        let backlog = binding
+            .inbox
+            .inspect(&session.id)
+            .await
+            .map_err(|_| local_tool_history_unsupported())?;
+        if backlog.pending != 0 || backlog.claimed != 0 || backlog.activation_pending() {
+            // An unclaimed correction can race its delivery notification.
+            // Inspect only: neither admission nor ACK belongs to cancellation.
+            return Err(local_tool_history_unsupported());
+        }
+    }
+    Ok(())
 }
 
 async fn commit_local_tool_history(
@@ -5515,12 +5855,10 @@ async fn commit_local_tool_history(
     binding: &SessionInboxRuntimeBinding,
     run_id: &str,
     selection: (&[String], bool),
-    terminal: Option<&str>,
+    terminal: LocalToolTerminal<'_>,
     cancel: &CancellationToken,
 ) -> Result<(), AgentError> {
-    if cancel.is_cancelled() || !binding.router.owns_run(&session.id, run_id).await {
-        return Err(local_tool_history_unsupported());
-    }
+    validate_local_tool_checkpoint(session, binding, run_id, terminal, cancel).await?;
     let latest = binding
         .storage
         .load_session(&session.id)
@@ -5541,15 +5879,25 @@ async fn commit_local_tool_history(
     {
         return Err(local_tool_history_unsupported());
     }
-    let suffix = collector.suffix(&latest, selection.0, selection.1, terminal)?;
+    let suffix = match terminal {
+        LocalToolTerminal::Completed(text) => {
+            collector.suffix(&latest, selection.0, selection.1, text)?
+        }
+        LocalToolTerminal::Cancelled => {
+            collector.suffix_for_terminal(&latest, selection.0, selection.1, terminal)?
+        }
+    };
     let before = session.clone();
     let mut staged = session.clone();
     staged.messages = latest.messages.clone();
     staged.messages.extend(suffix.iter().cloned());
     staged.updated_at = chrono::Utc::now();
-    if cancel.is_cancelled() || !binding.router.owns_run(&session.id, run_id).await {
-        return Err(local_tool_history_unsupported());
-    }
+    let cancelled_messages = if matches!(terminal, LocalToolTerminal::Cancelled) {
+        Some(serde_json::to_value(&staged.messages).map_err(|_| local_tool_history_unsupported())?)
+    } else {
+        None
+    };
+    validate_local_tool_checkpoint(session, binding, run_id, terminal, cancel).await?;
     binding
         .persistence
         .checkpoint_runtime_session(&mut staged)
@@ -5568,11 +5916,21 @@ async fn commit_local_tool_history(
     {
         return Err(local_tool_history_unsupported());
     }
-    let start = saved
-        .messages
-        .iter()
-        .position(|message| message.id == suffix[0].id)
-        .ok_or_else(local_tool_history_unsupported)?;
+    let start = match suffix.first() {
+        Some(first) => saved
+            .messages
+            .iter()
+            .position(|message| message.id == first.id)
+            .ok_or_else(local_tool_history_unsupported)?,
+        None => latest.messages.len(),
+    };
+    if cancelled_messages.as_ref().is_some_and(|expected| {
+        serde_json::to_value(&saved.messages).ok().as_ref() != Some(expected)
+    }) {
+        // A new canonical input during cancellation has not been applied by
+        // this Worker. Preserve it, but do not certify it with the old terminal.
+        return Err(local_tool_history_unsupported());
+    }
     if saved.messages.len() < latest.messages.len()
         || serde_json::to_value(&saved.messages[..latest.messages.len()])
             .map_err(|_| local_tool_history_unsupported())?
@@ -5602,9 +5960,7 @@ async fn commit_local_tool_history(
             return Err(local_tool_history_unsupported());
         }
     }
-    if cancel.is_cancelled() || !binding.router.owns_run(&session.id, run_id).await {
-        return Err(local_tool_history_unsupported());
-    }
+    validate_local_tool_checkpoint(session, binding, run_id, terminal, cancel).await?;
     staged.messages = saved.messages;
     *session = staged;
     Ok(())
@@ -6295,6 +6651,7 @@ struct ActorDriveContext<'a> {
     readonly_output: Option<&'a mut Vec<bamboo_agent_core::Message>>,
     local_history_tools: Option<&'a [String]>,
     local_history_read_only: bool,
+    strict_history_output: Option<&'a mut Option<StrictTerminalHistory>>,
     plain_input: Option<&'a PlainActorActivation>,
     canonical_activation: Option<&'a ActorActivationFence>,
     canonical_placement_ref: Option<&'a bamboo_domain::ActorPlacementRef>,
@@ -7555,6 +7912,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
         mut readonly_output,
         local_history_tools,
         local_history_read_only,
+        mut strict_history_output,
         plain_input,
         canonical_activation,
         canonical_placement_ref,
@@ -7578,15 +7936,17 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     let mut got_first_frame = false;
     let mut first_frame_watch = first_frame_timeout.map(|d| Box::pin(tokio::time::sleep(d)));
     let mut inflight_claims = initial_inflight_claims;
-    let mut owned_input = plain_input.and_then(|activation| activation.initial_input.clone());
-    // Retry/recovery already consumes its one input; only a fresh activation
-    // can continue twice. Neither budget restarts the Actor lease or watchdog.
-    let continuation_limit = if owned_input.is_some() { 1 } else { 2 };
-    let mut continuations = usize::from(owned_input.is_some());
-    let mut released_input: Option<(
+    let mut owned_inputs = plain_input
+        .map(|activation| VecDeque::from(activation.initial_inputs.clone()))
+        .unwrap_or_default();
+    // A retry/recovery or completed initial batch consumes its cold allowance;
+    // only a fresh activation can continue twice. No lease/watchdog restarts.
+    let continuation_limit = if owned_inputs.is_empty() { 2 } else { 1 };
+    let mut continuations = usize::from(!owned_inputs.is_empty());
+    let mut released_inputs: Vec<(
         SessionInboxOwnedClaim,
         bamboo_subagent::proto::InitialInputRelease,
-    )> = None;
+    )> = Vec::new();
     let mut current_epoch = execution_epoch;
     let approval_epoch = Arc::new(AtomicU64::new(execution_epoch));
     let approval_cancel = cancel_token.child_token();
@@ -7612,8 +7972,19 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     let canonical_store = plain_input
         .map(|activation| activation.store.as_ref())
         .or(actor_directory_store);
-    let remote_claim_fence =
-        canonical_activation.and_then(|fence| actor_directory_store.map(|store| (store, fence)));
+    let remote_claim_fence = actor_directory_store.zip(canonical_activation);
+    let workflow_usage_requested = logical_session
+        .metadata
+        .get(bamboo_subagent::proto::WORKFLOW_USAGE_REQUESTED_KEY)
+        .is_some_and(|v| v == "true");
+    if workflow_usage_requested {
+        logical_session
+            .metadata
+            .remove(bamboo_subagent::proto::WORKFLOW_USAGE_OBSERVATION_KEY);
+        logical_session
+            .metadata
+            .remove(bamboo_subagent::proto::WORKFLOW_TERMINAL_OBSERVATION_KEY);
+    }
     let mut remote_cancel_deadline: Option<tokio::time::Instant> = None;
     let mut display = ActorEventDisplay::default();
     let mut readonly = readonly_output
@@ -7623,7 +7994,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
     loop {
         tokio::select! {
             _ = cancel_token.cancelled(), if remote_cancel_deadline.is_none() => {
-                if remote_claim_fence.is_some() {
+                if remote_claim_fence.is_some() || workflow_usage_requested {
                     // A remote Worker may finish after its subscriber cancels.
                     // Keep the same correlated frame pump alive briefly so an
                     // exact Cancelled Outcome can terminalize the Actor fence.
@@ -7704,15 +8075,25 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             let activation = plain_input.ok_or_else(|| plain_actor_unsupported())?;
                             let binding = session_inbox_runtime.ok_or_else(|| plain_actor_unsupported())?;
                             let (run, _) = plain_run.ok_or_else(|| plain_actor_unsupported())?;
-                            let claim = owned_input.as_ref().or_else(|| released_input.as_ref().map(|(claim, _)| claim))
-                                .ok_or_else(|| plain_actor_unsupported())?;
-                            let release = activation.release_initial_input(binding, logical_session, run, current_epoch, claim,
-                                &request, &mut expected_permission_posture, released_input.as_ref().map(|(_, release)| release)).await?;
+                            // Exact retransmission may refer to an earlier
+                            // release while the next input is still waiting.
+                            // Every new request must match the ordered front.
+                            let previous = released_inputs.iter()
+                                .find(|(_, release)| release.request == request);
+                            let (claim, previous) = match previous {
+                                Some((claim, release)) => (claim.clone(), Some(release.clone())),
+                                None => (owned_inputs.front().cloned()
+                                    .ok_or_else(|| plain_actor_unsupported())?, None),
+                            };
+                            let release = activation.release_initial_input(binding, logical_session, run, current_epoch, &claim,
+                                &request, &mut expected_permission_posture, previous.as_ref()).await?;
                             if cancel_token.is_cancelled() { return Err(AgentError::Cancelled); }
                             client.send(ParentFrame::InitialInputRelease { release: release.clone() }).await
                                 .map_err(|_| AgentError::LLM("Actor initial release unconfirmed; durable input is preserved".into()))?;
-                            released_input = Some((claim.clone(), release));
-                            owned_input = None;
+                            if previous.is_none() {
+                                let _ = owned_inputs.pop_front();
+                                released_inputs.push((claim, release));
+                            }
                             continue;
                         }
                         if expected_creation.is_some() {
@@ -7813,7 +8194,18 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                         for (offset, event) in batch.events.into_iter().enumerate().skip(skip) {
                             let seq = batch.first_seq + offset as u64;
                             let mut publish = true;
-                            if let Some(collector) = local_history.as_mut() {
+                            if event["type"] == bamboo_subagent::proto::WorkflowAgentUsage::TYPE {
+                                if workflow_usage_requested {
+                                    if permission_handshake.is_awaiting() { return Err(plain_actor_unsupported()); }
+                                    let usage: bamboo_subagent::proto::WorkflowAgentUsage = serde_json::from_value(event.clone()).map_err(|_| plain_actor_unsupported())?;
+                                    let activation = activation_run_id.ok_or_else(plain_actor_unsupported)?;
+                                    if !usage.matches(logical_session, activation) { return Err(plain_actor_unsupported()); }
+                                    if logical_session.metadata.contains_key(bamboo_subagent::proto::WORKFLOW_USAGE_OBSERVATION_KEY) { return Err(plain_actor_unsupported()); }
+                                    logical_session.metadata.insert(bamboo_subagent::proto::WORKFLOW_USAGE_OBSERVATION_KEY.into(), serde_json::to_string(&usage).map_err(|_| plain_actor_unsupported())?);
+                                }
+                                publish = false;
+                            }
+                            if publish { if let Some(collector) = local_history.as_mut() {
                                 if permission_handshake.is_awaiting() && event["type"] != "permission_posture_activated" {
                                     return Err(local_tool_history_unsupported());
                                 }
@@ -7824,7 +8216,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             } else if event["type"] == bamboo_subagent::proto::LocalToolMessages::TYPE {
                                 // Completion DATA is private and grants nothing on an unselected route.
                                 publish = false;
-                            }
+                            }}
                             if publish { publish = if let Some(collector) = readonly.as_mut() {
                                 if permission_handshake.is_awaiting()
                                     && event["type"] != "permission_posture_activated" {
@@ -7851,7 +8243,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                     ActorEventRoute::Publish(envelope) => {
                                         let public_event = actor_event_observer
                                             .filter(|_| envelope.class != ActorEventClass::Ephemeral)
-                                            .map(|_| PublicActorEvent::from(&envelope));
+                                            .map(|_| PublicActorEvent::from(envelope.as_ref()));
                                         tracing::trace!(
                                             actor_id = %envelope.actor_id,
                                             event_id = %envelope.event_id,
@@ -8231,9 +8623,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             if activation.initial_release_required { return Err(plain_actor_unsupported()); }
                             let binding = session_inbox_runtime.ok_or_else(|| plain_actor_unsupported())?;
                             let run_id = activation_run_id.ok_or_else(|| plain_actor_unsupported())?;
-                            let claim = owned_input.as_ref().ok_or_else(|| plain_actor_unsupported())?;
+                            let claim = owned_inputs.front().ok_or_else(|| plain_actor_unsupported())?;
                             activation.confirm_input(binding, logical_session, run_id, claim, &confirmation).await?;
-                            owned_input = None;
+                            let _ = owned_inputs.pop_front();
                             continue;
                         }
                         let Some(binding) = session_inbox_runtime else {
@@ -8320,12 +8712,49 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                             )?;
                         }
                         if remote_cancel_deadline.is_some() && status == TerminalStatus::Cancelled {
+                            if let Some(tools) = local_history_tools {
+                                // The watermark proves transport completeness, not
+                                // persistence. Certify only an entirely validated
+                                // local Read/Glob prefix with no pending handoff.
+                                if permission_handshake.is_awaiting()
+                                    || !owned_inputs.is_empty()
+                                    || !inflight_claims.is_empty()
+                                    || parent_question_checkpoint_id.is_some()
+                                    || nested_wait_registered_this_run
+                                    || strict_history_output.is_none()
+                                {
+                                    return Err(local_tool_history_unsupported());
+                                }
+                                commit_local_tool_history(
+                                    local_history.take().ok_or_else(local_tool_history_unsupported)?,
+                                    logical_session,
+                                    session_inbox_runtime.ok_or_else(local_tool_history_unsupported)?,
+                                    activation_run_id.ok_or_else(local_tool_history_unsupported)?,
+                                    (tools, local_history_read_only),
+                                    LocalToolTerminal::Cancelled,
+                                    cancel_token,
+                                ).await?;
+                                let proof = bamboo_storage::v2::HostTerminalCompleteness::from_verified_host(
+                                    logical_session,
+                                    activation_run_id.ok_or_else(local_tool_history_unsupported)?,
+                                    current_epoch,
+                                    next_actor_event_seq - 1,
+                                ).map_err(|_| local_tool_history_unsupported())?;
+                                *strict_history_output.as_deref_mut()
+                                    .ok_or_else(local_tool_history_unsupported)? = Some(StrictTerminalHistory {
+                                        proof,
+                                        watermark: final_event_watermark.ok_or_else(local_tool_history_unsupported)?,
+                                    });
+                            }
                             // A selected Worker terminal proves that its Run
                             // ended even if permission posture or an Inbox
                             // correction was still pending. Claims remain
                             // unacked for retry; only the placement fence can
                             // now be released after SDK saves Cancelled.
                             client.accept_durable_terminal(status);
+                            if workflow_usage_requested {
+                                logical_session.metadata.insert(bamboo_subagent::proto::WORKFLOW_TERMINAL_OBSERVATION_KEY.into(), activation_run_id.ok_or_else(plain_actor_unsupported)?.into());
+                            }
                             return Err(AgentError::Cancelled);
                         }
                         if parent_question_checkpoint_id.is_some()
@@ -8345,6 +8774,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                     // the Host records the failure. Other early terminals
                                     // remain unproven and keep their placement fence.
                                     client.accept_durable_terminal(status);
+                            if workflow_usage_requested {
+                                logical_session.metadata.insert(bamboo_subagent::proto::WORKFLOW_TERMINAL_OBSERVATION_KEY.into(), activation_run_id.ok_or_else(plain_actor_unsupported)?.into());
+                            }
                                     return Err(AgentError::LLM(code.to_owned()));
                                 }
                             }
@@ -8353,7 +8785,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                     .to_string(),
                             ));
                         }
-                        if owned_input.is_some() {
+                        if !owned_inputs.is_empty() {
                             return Err(AgentError::LLM("Actor terminated before confirming its durable correction; Inbox claim is retained".into()));
                         }
                         if let Some(claim) = inflight_claims.front() {
@@ -8369,7 +8801,7 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                     session_inbox_runtime.ok_or_else(local_tool_history_unsupported)?,
                                     activation_run_id.ok_or_else(local_tool_history_unsupported)?,
                                     (local_history_tools.ok_or_else(local_tool_history_unsupported)?, local_history_read_only),
-                                    result.as_deref(), cancel_token,
+                                    LocalToolTerminal::Completed(result.as_deref()), cancel_token,
                                 ).await?;
                             }
                         }
@@ -8393,8 +8825,8 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                         client, binding, logical_session, run_id, plain_run, &mut expected_permission_posture,
                                         result.clone().filter(|text| !text.is_empty()).ok_or_else(|| plain_actor_unsupported())?, event_tx,
                                     ).await? {
-                                        owned_input = Some(claim);
-                                        released_input = None;
+                                        owned_inputs = VecDeque::from([claim]);
+                                        released_inputs.clear();
                                         continuations += 1;
                                         current_epoch = epoch;
                                         approval_epoch.store(epoch, Ordering::Release);
@@ -8499,6 +8931,27 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                                 Ok(None)
                             }
                         };
+                        if local_history_tools.is_some() {
+                            // Failed strict Runs discard their collected suffix. A
+                            // consumed watermark cannot certify those unapplied
+                            // effects; retain every broker frame for recovery.
+                            if status != TerminalStatus::Completed {
+                                return terminal_result;
+                            }
+                            let proof = bamboo_storage::v2::HostTerminalCompleteness::from_verified_host(
+                                logical_session,
+                                activation_run_id.ok_or_else(local_tool_history_unsupported)?,
+                                current_epoch,
+                                next_actor_event_seq - 1,
+                            ).map_err(|_| local_tool_history_unsupported())?;
+                            let history = StrictTerminalHistory {
+                                proof,
+                                watermark: final_event_watermark.ok_or_else(local_tool_history_unsupported)?,
+                            };
+                            if let Some(output) = strict_history_output.as_deref_mut() {
+                                *output = Some(history);
+                            }
+                        }
                         // This marker is set only after every Host terminal
                         // validation above succeeded. A surfaced broker Outcome
                         // that failed permission, Inbox, or question checks must
@@ -8506,6 +8959,9 @@ async fn drive(context: ActorDriveContext<'_>) -> crate::runtime::runner::Result
                         // an error status. Genuine Worker Error/Cancelled frames
                         // are accepted terminals even though drive returns Err.
                         client.accept_durable_terminal(status);
+                            if workflow_usage_requested {
+                                logical_session.metadata.insert(bamboo_subagent::proto::WORKFLOW_TERMINAL_OBSERVATION_KEY.into(), activation_run_id.ok_or_else(plain_actor_unsupported)?.into());
+                            }
                         if status == TerminalStatus::Completed {
                             if let Some(activation) = plain_input {
                                 // Only the final epoch reaches here: continued Runs
@@ -8593,7 +9049,7 @@ async fn remote_canonical_lineage(
         .map_err(|_| remote_broker_unavailable())?;
     let mut chain = Vec::new();
     loop {
-        if chain.len() > MAX_SPAWN_DEPTH as usize {
+        if chain.len() > session.spawn_depth as usize {
             return Err(remote_broker_unavailable());
         }
         let saved = binding
@@ -8718,8 +9174,17 @@ mod tests {
 
     include!("expired_plain_owner_tests.rs");
 
+    include!("owned_cold_input_tests.rs");
+
     #[test]
     fn plain_rejection_logs_branch_and_run_without_changing_error() {
+        // Keep shared callsites consulting the current subscriber during scoped capture.
+        let capture_interest_guard = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing_subscriber::filter::LevelFilter::OFF)
+                .with_writer(std::io::sink)
+                .finish(),
+        );
         let output = tempfile::NamedTempFile::new().unwrap();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -8728,6 +9193,10 @@ mod tests {
             .finish();
         let branch_line = std::cell::Cell::new(0);
         let error = tracing::subscriber::with_default(subscriber, || {
+            // Exercise the shared warning callsite without this thread's scoped subscriber.
+            std::thread::spawn(|| drop(plain_actor_unsupported()))
+                .join()
+                .expect("unscoped rejection warning thread panicked");
             let span = tracing::warn_span!(
                 "actor_child_run",
                 child_session_id = %"diagnostic-child",
@@ -8763,13 +9232,14 @@ mod tests {
             "{log}"
         );
         assert!(!error.to_string().contains("diagnostic-run"));
+        drop(capture_interest_guard);
     }
 
     #[tokio::test]
-    async fn completed_plain_continuation_requires_one_input_and_current_identity() {
+    async fn completed_plain_continuation_requires_bounded_inputs_and_current_identity() {
         for case in [
             "valid",
-            "two-inputs",
+            "over-batch-limit",
             "tool-history",
             "stale-lineage",
             "no-release",
@@ -8817,7 +9287,11 @@ mod tests {
                 store.clone(),
                 Default::default(),
             ));
-            for slot in 0..if case == "two-inputs" { 2 } else { 1 } {
+            for slot in 0..if case == "over-batch-limit" {
+                bamboo_domain::SessionInboxLimits::default().max_claim_batch + 1
+            } else {
+                1
+            } {
                 let envelope = bamboo_domain::SessionMessageEnvelope::user_input(
                     &child.id,
                     format!("new task {slot}"),
@@ -9186,6 +9660,7 @@ mod tests {
 
     struct DurableAckProbe {
         calls: Arc<AtomicUsize>,
+        fail: bool,
         terminal_status: TerminalStatus,
         parent_mailbox: String,
     }
@@ -9216,7 +9691,13 @@ mod tests {
 
         async fn acknowledge_durable_frames(&mut self) -> bamboo_subagent::TransportResult<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            if self.fail {
+                Err(bamboo_subagent::TransportError::Protocol(
+                    "injected ACK delivery failure".into(),
+                ))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -9241,10 +9722,14 @@ mod tests {
             PendingDurableChildLink {
                 link: Box::new(DurableAckProbe {
                     calls: calls.clone(),
+                    fail: false,
                     terminal_status,
                     parent_mailbox: format!("p-{}", session.id),
                 }),
                 host_nested_wait_handoff,
+                strict_history: None,
+                strict_history_required: false,
+                strict_history_committed: false,
             },
         );
     }
@@ -9346,18 +9831,58 @@ mod tests {
             assert_eq!(mailbox.drain().await.unwrap().len(), 1);
             child.add_message(bamboo_agent_core::Message::assistant("done", None));
             child.set_last_run_status("completed");
-            store
-                .prepare_broker_terminal_receipt(
-                    &child,
-                    "run-1",
-                    receipt_broker,
-                    receipt_mailbox,
-                    "correlation-1",
-                    &[message_id.as_str().to_owned()],
+            if id == "receipt-good" {
+                let prior_ids = child.messages[..child.messages.len() - 1]
+                    .iter()
+                    .map(|message| message.id.clone())
+                    .collect();
+                crate::execution::ChildCompletionSource::prepare(&mut child, "run-1", &prior_ids);
+                assert!(
+                    crate::execution::ChildCompletionSource::defer_for_durable_delivery(
+                        &mut child, "run-1"
+                    )
+                    .unwrap()
+                );
+                let proof = bamboo_storage::v2::HostTerminalCompleteness::from_verified_host(
+                    &child, "run-1", 7, 1,
                 )
-                .await
                 .unwrap();
-            store.save_session(&child).await.unwrap();
+                store
+                    .prepare_broker_terminal_receipt_with_completeness(
+                        &child,
+                        bamboo_storage::v2::BrokerTerminalRoute {
+                            activation_run_id: "run-1",
+                            broker_identity: receipt_broker,
+                            parent_mailbox: receipt_mailbox,
+                            broker_correlation_id: "correlation-1",
+                            message_ids: &[message_id.as_str().to_owned()],
+                        },
+                        &proof,
+                    )
+                    .await
+                    .unwrap();
+                let mut staged = child.clone();
+                staged.set_last_run_status("running");
+                staged.clear_last_run_error();
+                store.save_session(&staged).await.unwrap();
+                store
+                    .commit_broker_terminal_receipt_with_completeness(&child, "run-1", &proof)
+                    .await
+                    .unwrap();
+            } else {
+                store
+                    .prepare_broker_terminal_receipt(
+                        &child,
+                        "run-1",
+                        receipt_broker,
+                        receipt_mailbox,
+                        "correlation-1",
+                        &[message_id.as_str().to_owned()],
+                    )
+                    .await
+                    .unwrap();
+                store.save_session(&child).await.unwrap();
+            }
         }
 
         let mut config = bamboo_config::Config::default();
@@ -9377,11 +9902,40 @@ mod tests {
                 broker_peer: None,
                 placement_requirements: None,
             });
-        let repair = BrokerTerminalReceiptReconciler::new(store.clone(), &config);
+        // Recover on an independently reopened Store, with no Actor executor or
+        // provider available. Only the committed Host proof can authorize ACK.
+        let cold_store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let before = cold_store
+            .load_session("receipt-good")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(crate::execution::ChildCompletionSource::has_source_record(
+            &before
+        ));
+        assert_eq!(before.last_run_status().as_deref(), Some("running"));
+        assert!(crate::execution::ChildCompletionSource::from_committed_session(&before).is_none());
+        let repair = BrokerTerminalReceiptReconciler::new(cold_store.clone(), &config);
         let report = repair.reconcile_once().await;
         assert_eq!(report.candidates, 5);
         assert_eq!(report.repaired, 2);
         assert_eq!(report.blocked, 3);
+        let after = cold_store
+            .load_session("receipt-good")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(crate::execution::ChildCompletionSource::from_committed_session(&after).is_some());
+        assert_eq!(
+            serde_json::to_value(before.messages).unwrap(),
+            serde_json::to_value(after.messages).unwrap()
+        );
+        let retry = repair.reconcile_once().await;
+        assert_eq!(retry.repaired, 0, "committed strict recovery is idempotent");
 
         let good = bamboo_subagent::Mailbox::at(broker_dir.path().join("mailboxes/p-receipt-good"));
         let wrong = bamboo_subagent::Mailbox::at(
@@ -9535,6 +10089,143 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn strict_completeness_gate_precedes_ack_and_ack_failure_preserves_cold_proof() {
+        for commit in [false, true] {
+            let runner = ActorChildRunner::new(
+                "test".into(),
+                PathBuf::new(),
+                vec![],
+                PathBuf::new(),
+                ExecutorSpec::BambooRuntime,
+                vec![],
+                "test".into(),
+                1,
+            );
+            let home = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(home.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let root = Session::new("strict-ack-parent", "model");
+            store.save_session(&root).await.unwrap();
+            let mut child = Session::new_child_of("strict-ack-child", &root, "model", "work");
+            child.add_message(bamboo_agent_core::Message::user("work"));
+            store.save_session(&child).await.unwrap();
+            child.add_message(bamboo_agent_core::Message::assistant("finished", None));
+            child.set_last_run_status("completed");
+            let proof = bamboo_storage::v2::HostTerminalCompleteness::from_verified_host(
+                &child, "run-1", 7, 2,
+            )
+            .unwrap();
+            let creation = bamboo_subagent::proto::ChildCreationIdentity {
+                created_at: child.created_at,
+                spawn_depth: child.spawn_depth,
+            };
+            let history = StrictTerminalHistory {
+                proof: proof.clone(),
+                watermark: bamboo_subagent::ActorEventWatermark {
+                    version: 1,
+                    logical_session: Some(actor_event_logical_identity(
+                        &child,
+                        &root.id,
+                        Some(&creation),
+                    )),
+                    activation_id: Some("run-1".into()),
+                    execution_epoch: 7,
+                    final_seq: 2,
+                },
+            };
+            let parent_mailbox = "p-strict-ack-child";
+            store
+                .prepare_broker_terminal_receipt_with_completeness(
+                    &child,
+                    bamboo_storage::v2::BrokerTerminalRoute {
+                        activation_run_id: "run-1",
+                        broker_identity: "00000000-0000-4000-8000-000000000001",
+                        parent_mailbox,
+                        broker_correlation_id: "broker-run-1",
+                        message_ids: &["broker-outcome-1".into()],
+                    },
+                    &proof,
+                )
+                .await
+                .unwrap();
+            store.save_session(&child).await.unwrap();
+            runner.set_actor_directory_store(Some(store.clone()));
+            let calls = Arc::new(AtomicUsize::new(0));
+            runner.pending_durable_links.lock().await.insert(
+                (child.id.clone(), child.created_at, "run-1".into()),
+                PendingDurableChildLink {
+                    link: Box::new(DurableAckProbe {
+                        calls: calls.clone(),
+                        fail: true,
+                        terminal_status: TerminalStatus::Completed,
+                        parent_mailbox: parent_mailbox.into(),
+                    }),
+                    host_nested_wait_handoff: false,
+                    strict_history: Some(history),
+                    strict_history_required: true,
+                    strict_history_committed: false,
+                },
+            );
+            if commit {
+                runner
+                    .commit_durable_child_delivery(&child, "run-1")
+                    .await
+                    .unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 0, "proof commit cannot ACK");
+            }
+            assert!(runner
+                .confirm_durable_child_delivery(&child, "run-1", true)
+                .await
+                .is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(commit));
+            let cold = bamboo_storage::SessionStoreV2::new(home.path().into())
+                .await
+                .unwrap();
+            let recovered = cold.recover_broker_terminal_receipts(&child).await;
+            if commit {
+                let receipts = recovered.unwrap();
+                assert_eq!(receipts.len(), 1);
+                assert_eq!(
+                    receipts[0]
+                        .terminal_completeness
+                        .as_ref()
+                        .unwrap()
+                        .contiguous_applied_seq,
+                    2
+                );
+                assert_eq!(
+                    cold.load_session(&child.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .last_run_status()
+                        .as_deref(),
+                    Some("completed")
+                );
+            } else {
+                assert!(
+                    recovered.is_err(),
+                    "matching canonical history is not proof commitment"
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(
+                    cold.load_session(&child.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .messages
+                )
+                .unwrap(),
+                serde_json::to_value(&child.messages).unwrap(),
+            );
+        }
     }
 
     #[tokio::test]
@@ -9812,6 +10503,7 @@ mod tests {
                 readonly_output: None,
                 local_history_tools: None,
                 local_history_read_only: false,
+                strict_history_output: None,
                 plain_input: Some(&activation),
                 canonical_activation: None,
                 canonical_placement_ref: None,
@@ -10383,7 +11075,7 @@ mod tests {
                 &binding,
                 "current-run",
                 (&["Read".into(), "Write".into()], false),
-                Some("complete exact report"),
+                LocalToolTerminal::Completed(Some("complete exact report")),
                 &cancel,
             )
             .await;
@@ -10599,6 +11291,7 @@ mod tests {
                 readonly_output: None,
                 local_history_tools: Some(&tools),
                 local_history_read_only: true,
+                strict_history_output: None,
                 plain_input: None,
                 canonical_activation: None,
                 canonical_placement_ref: None,
@@ -10656,6 +11349,417 @@ mod tests {
         }
     }
 
+    struct CancelConcurrentInputCheckpoint {
+        real: SessionInboxRuntimeBinding,
+        envelope: bamboo_domain::SessionMessageEnvelope,
+    }
+    #[async_trait]
+    impl RuntimeSessionPersistence for CancelConcurrentInputCheckpoint {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            self.real.persistence.save_runtime_session(session).await
+        }
+        async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            let receipt = self
+                .real
+                .inbox
+                .deliver(&self.envelope)
+                .await
+                .map_err(|_| std::io::Error::other("concurrent delivery failed"))?;
+            self.real
+                .inbox
+                .mark_activation_eligible(
+                    &session.id,
+                    receipt.generation,
+                    bamboo_domain::SessionActivationPolicy::RespectSpecificWait,
+                )
+                .await
+                .map_err(|_| std::io::Error::other("concurrent activation failed"))?;
+            let claim = self
+                .real
+                .inbox
+                .claim(&session.id, 1)
+                .await
+                .map_err(|_| std::io::Error::other("concurrent claim failed"))?
+                .remove(0);
+            let mut latest = self.real.storage.load_session(&session.id).await?.unwrap();
+            checkpoint_and_ack_canonical_claim(&self.real, &mut latest, &claim, None)
+                .await
+                .map_err(|_| std::io::Error::other("concurrent admission failed"))?;
+            self.real
+                .persistence
+                .checkpoint_runtime_session(session)
+                .await
+        }
+        async fn load_runtime_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            self.real.storage.load_session(id).await
+        }
+    }
+
+    struct CancelHistoryProbe {
+        inner: HistoryTerminalProbe,
+        cancel_requested: bool,
+    }
+
+    #[async_trait]
+    impl bamboo_subagent::ChildLink for CancelHistoryProbe {
+        async fn send(&mut self, frame: ParentFrame) -> bamboo_subagent::TransportResult<()> {
+            self.cancel_requested |= matches!(frame, ParentFrame::Cancel);
+            Ok(())
+        }
+        async fn next_frame(&mut self) -> bamboo_subagent::TransportResult<Option<ChildFrame>> {
+            if !self.cancel_requested {
+                std::future::pending().await
+            } else {
+                self.inner.next_frame().await
+            }
+        }
+        fn accept_durable_terminal(&mut self, status: TerminalStatus) {
+            self.inner.accept_durable_terminal(status);
+        }
+        fn durable_delivery_receipt(&self) -> Option<bamboo_subagent::DurableChildDeliveryReceipt> {
+            self.inner.durable_delivery_receipt()
+        }
+        async fn acknowledge_durable_frames(&mut self) -> bamboo_subagent::TransportResult<()> {
+            self.inner.acknowledge_durable_frames().await
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_cancelled_read_history_requires_checkpointed_complete_prefix() {
+        use bamboo_subagent::ChildLink;
+        for case in [
+            "success",
+            "empty",
+            "missing",
+            "unclosed",
+            "unobserved",
+            "prefix",
+            "metadata",
+            "write",
+            "not_read_only",
+            "watermark",
+            "epoch",
+            "birth",
+            "permission",
+            "inbox",
+            "pending",
+            "pending_eligible",
+            "claimed",
+            "inspect_error",
+            "checkpoint_error",
+            "lost_owner",
+            "concurrent_input",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let root = Session::new("cancel-history-root", "model");
+            store.save_session(&root).await.unwrap();
+            let mut child = Session::new_child("cancel-history-child", &root.id, "model", "child");
+            child
+                .messages
+                .push(bamboo_agent_core::Message::user("exact assignment"));
+            child.metadata.insert(
+                bamboo_subagent::proto::WORKFLOW_USAGE_REQUESTED_KEY.into(),
+                "true".into(),
+            );
+            store.save_session(&child).await.unwrap();
+            let before = serde_json::to_value(&child.messages).unwrap();
+            let inbox: Arc<dyn SessionInboxPort> = Arc::new(bamboo_storage::FileSessionInbox::new(
+                store.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            ));
+            let locked = Arc::new(bamboo_storage::LockedSessionStore::new(store.clone()));
+            let mut binding = actor_binding(store.clone(), inbox.clone(), locked.clone());
+            let mut owner = Some(
+                binding
+                    .router
+                    .register_run(&child.id, "current")
+                    .await
+                    .unwrap(),
+            );
+            let creation = bamboo_subagent::proto::ChildCreationIdentity {
+                created_at: child.created_at,
+                spawn_depth: child.spawn_depth,
+            };
+            let identity = actor_event_logical_identity(&child, &root.id, Some(&creation));
+            let tool = if case == "write" { "Write" } else { "Read" };
+            let arguments = serde_json::json!({"file_path":"assigned.txt"});
+            let call = bamboo_agent_core::ToolCall {
+                id: "cancel-read".into(),
+                tool_type: "function".into(),
+                function: bamboo_agent_core::FunctionCall {
+                    name: tool.into(),
+                    arguments: arguments.to_string(),
+                },
+            };
+            let mut rows = child.messages.clone();
+            let mut events = Vec::new();
+            if case != "empty" {
+                rows.push(bamboo_agent_core::Message::assistant("", Some(vec![call])));
+                events.push(
+                    serde_json::to_value(AgentEvent::ToolStart {
+                        tool_call_id: "cancel-read".into(),
+                        tool_name: tool.into(),
+                        arguments,
+                    })
+                    .unwrap(),
+                );
+                if case != "unclosed" {
+                    let mut result = bamboo_agent_core::Message::tool_result_with_status(
+                        "cancel-read",
+                        "exact Read result",
+                        true,
+                    );
+                    if case == "metadata" {
+                        result.metadata = Some(serde_json::json!({"permission":true}));
+                    }
+                    rows.push(result);
+                    events.push(
+                        serde_json::to_value(AgentEvent::ToolComplete {
+                            tool_call_id: "cancel-read".into(),
+                            result: bamboo_agent_core::tools::ToolResult::text(
+                                true,
+                                "exact Read result",
+                            ),
+                        })
+                        .unwrap(),
+                    );
+                }
+            }
+            if case == "unobserved" {
+                events.clear();
+            }
+            if case == "prefix" {
+                rows[0].content.push('!');
+            }
+            events.push(
+                serde_json::to_value(bamboo_subagent::proto::LocalToolMessages::Complete {
+                    version: 1,
+                    messages: rows
+                        .iter()
+                        .map(|row| serde_json::to_value(row).unwrap())
+                        .collect(),
+                })
+                .unwrap(),
+            );
+            if case == "missing" {
+                events.clear();
+            }
+            let final_seq = events.len() as u64;
+            let mut watermark = bamboo_subagent::ActorEventWatermark {
+                version: 1,
+                logical_session: Some(identity.clone()),
+                activation_id: Some("current".into()),
+                execution_epoch: 7,
+                final_seq,
+            };
+            match case {
+                "watermark" => watermark.final_seq += 1,
+                "epoch" => watermark.execution_epoch -= 1,
+                "birth" => {
+                    watermark
+                        .logical_session
+                        .as_mut()
+                        .unwrap()
+                        .creation
+                        .as_mut()
+                        .unwrap()
+                        .created_at += chrono::Duration::nanoseconds(1)
+                }
+                _ => {}
+            }
+            let mut frames = VecDeque::new();
+            if !events.is_empty() {
+                frames.push_back(ChildFrame::EventBatch {
+                    batch: ActorEventBatch {
+                        logical_session: Some(identity),
+                        activation_id: Some("current".into()),
+                        execution_epoch: 7,
+                        source_node_id: None,
+                        source_actor_id: Some("selected".into()),
+                        first_seq: 1,
+                        last_seq: final_seq,
+                        qos: bamboo_subagent::ActorEventQos::Durable,
+                        events,
+                    },
+                });
+            }
+            frames.push_back(ChildFrame::Terminal {
+                status: TerminalStatus::Cancelled,
+                result: None,
+                error: None,
+                transcript: vec![],
+                final_event_watermark: Some(watermark),
+            });
+            let mut claims = VecDeque::new();
+            let pending_input =
+                bamboo_domain::SessionMessageEnvelope::user_input(&child.id, "new canonical input");
+            if matches!(case, "inbox" | "pending" | "pending_eligible" | "claimed") {
+                let receipt = inbox.deliver(&pending_input).await.unwrap();
+                if case != "pending" {
+                    inbox
+                        .mark_activation_eligible(
+                            &child.id,
+                            receipt.generation,
+                            bamboo_domain::SessionActivationPolicy::RespectSpecificWait,
+                        )
+                        .await
+                        .unwrap();
+                }
+                if matches!(case, "inbox" | "claimed") {
+                    let claim = inbox.claim(&child.id, 1).await.unwrap().remove(0);
+                    if case == "inbox" {
+                        claims.push_back(claim);
+                    }
+                }
+            }
+            if case == "concurrent_input" {
+                binding.persistence = Arc::new(CancelConcurrentInputCheckpoint {
+                    real: actor_binding(store.clone(), inbox.clone(), locked.clone()),
+                    envelope: pending_input.clone(),
+                });
+            }
+            if case == "inspect_error" {
+                let rel = store.resolve_rel_path(&child.id).await.unwrap();
+                let dir = store.bamboo_home_dir().join(rel).join("inbox");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::create_dir(dir.join(".session-inbox.lock")).unwrap();
+                assert!(inbox.inspect(&child.id).await.is_err());
+            }
+            let backlog_before =
+                if matches!(case, "inbox" | "pending" | "pending_eligible" | "claimed") {
+                    Some(inbox.inspect(&child.id).await.unwrap())
+                } else {
+                    None
+                };
+            if case == "checkpoint_error" {
+                binding.persistence = Arc::new(ActorFaultingPersistence {
+                    inner: locked.clone(),
+                    fail_checkpoint_once: AtomicBool::new(true),
+                });
+            }
+            if case == "lost_owner" {
+                owner.take().unwrap().abandon().await;
+            }
+            let mut link = CancelHistoryProbe {
+                inner: HistoryTerminalProbe {
+                    frames,
+                    accepted: None,
+                    acks: 0,
+                },
+                cancel_requested: false,
+            };
+            let (tx, mut rx) = mpsc::channel(32);
+            let (_live, mut live_rx) = mpsc::unbounded_channel();
+            let (_delivery, mut delivery_rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let tools = vec!["Read".into(), "Glob".into()];
+            let mut strict_history = None;
+            let outcome = drive(ActorDriveContext {
+                client: &mut link,
+                parent_session_id: &root.id,
+                child_session_id: &child.id.clone(),
+                child_attempt: 0,
+                approval_registry: None,
+                approval_decider: None,
+                approval_reviewer: None,
+                escalation_bridge: None,
+                event_tx: &tx,
+                cancel_token: &cancel,
+                live_rx: &mut live_rx,
+                delivery_rx: &mut delivery_rx,
+                logical_session: &mut child,
+                expected_permission_posture: (case == "permission")
+                    .then(|| expected_default_permission_posture(7)),
+                expected_creation: Some(&creation),
+                session_inbox_runtime: Some(&binding),
+                actor_directory_store: None,
+                canonical_subagent_tool: None,
+                ticket_service: None,
+                activation_run_id: Some("current"),
+                execution_epoch: 7,
+                expected_source_actor_id: "selected",
+                initial_inflight_claims: claims,
+                plain_actor: false,
+                remote_environment_lease: false,
+                readonly_output: None,
+                local_history_tools: Some(&tools),
+                local_history_read_only: case != "not_read_only",
+                strict_history_output: Some(&mut strict_history),
+                plain_input: None,
+                canonical_activation: None,
+                canonical_placement_ref: None,
+                actor_event_observer: None,
+                plain_run: None,
+                first_frame_timeout: None,
+            })
+            .await;
+            let proven = matches!(case, "success" | "empty");
+            assert_eq!(strict_history.is_some(), proven, "{case}");
+            assert_eq!(link.durable_delivery_receipt().is_some(), proven, "{case}");
+            assert_eq!(
+                link.inner.acks, 0,
+                "{case}: pump cannot ACK before SDK save/proof"
+            );
+            let cold = bamboo_storage::SessionStoreV2::new(temp.path().into())
+                .await
+                .unwrap()
+                .load_session(&child.id)
+                .await
+                .unwrap()
+                .unwrap();
+            if proven {
+                assert!(matches!(outcome, Err(AgentError::Cancelled)), "{case}");
+                assert_eq!(link.inner.accepted, Some(TerminalStatus::Cancelled));
+                let history = strict_history.unwrap();
+                assert_eq!(history.proof.execution_epoch(), 7);
+                assert_eq!(history.proof.contiguous_applied_seq(), final_seq);
+                assert_eq!(
+                    serde_json::to_value(&cold.messages).unwrap(),
+                    serde_json::to_value(&rows).unwrap()
+                );
+            } else {
+                assert!(outcome.is_err(), "{case}");
+                if case == "concurrent_input" {
+                    assert!(
+                        cold.messages
+                            .iter()
+                            .any(|message| message.id == pending_input.id.as_str()),
+                        "new input must survive refusal"
+                    );
+                } else {
+                    assert_eq!(
+                        serde_json::to_value(&cold.messages).unwrap(),
+                        before,
+                        "{case}: no unvalidated history write"
+                    );
+                }
+            }
+            if let Some(backlog) = backlog_before {
+                assert!(!inbox
+                    .was_admitted(&child.id, &pending_input.id)
+                    .await
+                    .unwrap());
+                assert_eq!(
+                    inbox.inspect(&child.id).await.unwrap(),
+                    backlog,
+                    "{case}: proof refusal must neither claim nor ACK the input"
+                );
+            }
+            while let Ok(event) = rx.try_recv() {
+                assert!(
+                    !matches!(event, AgentEvent::SessionHistoryCommitted { .. }),
+                    "private DATA is not a canonical public barrier"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn strict_terminal_watermark_gates_history_commit_and_durable_acceptance() {
         use bamboo_subagent::ChildLink;
@@ -10677,6 +11781,8 @@ mod tests {
             "zero_valid",
             "error_tail",
             "cancelled_tail",
+            "cancelled_valid",
+            "cancelled_zero_valid",
             "error_valid",
             "error_zero_valid",
             "ordinary_lossy",
@@ -10800,7 +11906,7 @@ mod tests {
                         },
                     ]
                 }
-                "zero_missing" | "zero_valid" | "error_zero_valid" => {
+                "zero_missing" | "zero_valid" | "error_zero_valid" | "cancelled_zero_valid" => {
                     frames.clear();
                     marker.final_seq = 0;
                 }
@@ -10813,7 +11919,9 @@ mod tests {
             }
             let status = match case {
                 "error_tail" | "error_valid" | "error_zero_valid" => TerminalStatus::Error,
-                "cancelled_tail" => TerminalStatus::Cancelled,
+                "cancelled_tail" | "cancelled_valid" | "cancelled_zero_valid" => {
+                    TerminalStatus::Cancelled
+                }
                 _ => TerminalStatus::Completed,
             };
             frames.push(ChildFrame::Terminal {
@@ -10837,6 +11945,7 @@ mod tests {
             let (_delivery, mut delivery_rx) = mpsc::unbounded_channel();
             let cancel = CancellationToken::new();
             let tools = vec!["Read".into()];
+            let mut strict_history = None;
             let outcome = drive(ActorDriveContext {
                 client: &mut link,
                 parent_session_id: &root.id,
@@ -10866,6 +11975,7 @@ mod tests {
                 readonly_output: None,
                 local_history_tools: (case != "ordinary_lossy").then_some(&tools),
                 local_history_read_only: true,
+                strict_history_output: Some(&mut strict_history),
                 plain_input: None,
                 canonical_activation: None,
                 canonical_placement_ref: None,
@@ -10874,11 +11984,21 @@ mod tests {
                 first_frame_timeout: Some(Duration::from_secs(1)),
             })
             .await;
+            assert_eq!(strict_history.is_some(), case == "success", "{case}");
+            if let Some(history) = strict_history {
+                assert_eq!(history.proof.execution_epoch(), 7);
+                assert_eq!(history.proof.contiguous_applied_seq(), 1);
+                assert_eq!(history.watermark.final_seq, 1);
+            }
             let cold = store.load_session(&child.id).await.unwrap().unwrap();
             if matches!(case, "success" | "ordinary_lossy") {
                 assert_eq!(outcome.unwrap().as_deref(), Some("complete"), "{case}");
             } else {
-                let error = outcome.unwrap_err().to_string();
+                let error = outcome.unwrap_err();
+                if matches!(case, "cancelled_valid" | "cancelled_zero_valid") {
+                    assert!(matches!(&error, AgentError::Cancelled), "{case}: {error}");
+                }
+                let error = error.to_string();
                 if !matches!(
                     case,
                     "duplicate"
@@ -10889,6 +12009,8 @@ mod tests {
                         | "zero_valid"
                         | "error_valid"
                         | "error_zero_valid"
+                        | "cancelled_valid"
+                        | "cancelled_zero_valid"
                 ) {
                     assert!(
                         error.contains("actor_history_tail_incomplete"),
@@ -10913,10 +12035,7 @@ mod tests {
                     "{case}: no mutable history commit"
                 );
             }
-            let accepted = matches!(
-                case,
-                "success" | "ordinary_lossy" | "error_valid" | "error_zero_valid"
-            );
+            let accepted = matches!(case, "success" | "ordinary_lossy");
             assert_eq!(link.accepted.is_some(), accepted, "{case}");
             assert_eq!(
                 link.durable_delivery_receipt().is_some(),
@@ -11292,6 +12411,23 @@ mod tests {
         assert!(remote_canonical_lineage(&binding, &changed).await.is_err());
         store.delete_session(&parent.id).await.unwrap();
         assert!(remote_canonical_lineage(&binding, &child).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn spawn_depth_remote_lineage_accepts_existing_tree_above_default() {
+        let (_temp, store, locked, inbox, root, _claim) =
+            actor_inbox_fixture("deep-remote-root").await;
+        let mut parent = root;
+        for depth in 1..=6 {
+            let child =
+                Session::new_child_of(format!("remote-depth-{depth}"), &parent, "model", "child");
+            store.save_session(&child).await.unwrap();
+            parent = child;
+        }
+        let binding = actor_binding(store, inbox, locked);
+        let chain = remote_canonical_lineage(&binding, &parent).await.unwrap();
+        assert_eq!(chain.len(), 7);
+        assert_eq!(chain.last().unwrap().spawn_depth, 0);
     }
 
     #[tokio::test]
@@ -11885,7 +13021,9 @@ mod tests {
                 continue;
             }
             let (retry, prepared) = result.unwrap();
-            let (prefix, delivery) = prepared.unwrap();
+            let (prefix, mut deliveries) = prepared.unwrap();
+            assert_eq!(deliveries.len(), 1);
+            let delivery = deliveries.pop().unwrap();
             assert_eq!(
                 prefix,
                 serde_json::to_value(&before.messages)
@@ -11908,7 +13046,7 @@ mod tests {
                 bamboo_domain::ActorActivationStatus::Running
             );
             assert!(running.activation.unwrap().lease_epoch > first.fence.lease_epoch);
-            let claim = retry.initial_input.as_ref().unwrap();
+            let claim = retry.initial_inputs.first().unwrap();
             assert!(child
                 .session_inbox_admission()
                 .unwrap()
@@ -12013,8 +13151,20 @@ mod tests {
                 store.clone(),
                 bamboo_domain::SessionInboxLimits::default(),
             );
+            // Complete unfenced persistence before starting the setup lease window.
+            let envelope =
+                bamboo_domain::SessionMessageEnvelope::user_input(&child.id, "RECOVER_SAME_INPUT");
+            let receipt = inbox.deliver(&envelope).await.unwrap();
+            inbox
+                .mark_activation_eligible(
+                    &child.id,
+                    receipt.generation,
+                    bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                )
+                .await
+                .unwrap();
             let now = chrono::Utc::now();
-            let cutoff = now + chrono::Duration::seconds(1);
+            let cutoff = now + chrono::Duration::seconds(10);
             let consumer = SessionInboxConsumerId::new();
             let old = store
                 .claim_activation(&ActorActivationClaim {
@@ -12022,7 +13172,7 @@ mod tests {
                     run_id: "old-run".into(),
                     lease_owner: consumer.as_str().into(),
                     lease_expires_at: if case == "actor-live" {
-                        now + chrono::Duration::minutes(1)
+                        now + chrono::Duration::minutes(5)
                     } else {
                         cutoff
                     },
@@ -12040,18 +13190,11 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            store.start_activation(&old.fence(), now).await.unwrap();
-            let envelope =
-                bamboo_domain::SessionMessageEnvelope::user_input(&child.id, "RECOVER_SAME_INPUT");
-            let receipt = inbox.deliver(&envelope).await.unwrap();
-            inbox
-                .mark_activation_eligible(
-                    &child.id,
-                    receipt.generation,
-                    bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
-                )
+            store
+                .start_activation(&old.fence(), chrono::Utc::now())
                 .await
                 .unwrap();
+            let claim_now = chrono::Utc::now();
             let claim = inbox
                 .claim_owned(
                     &child.id,
@@ -12059,11 +13202,11 @@ mod tests {
                     Some("old-run"),
                     &SessionInboxLeaseRequest {
                         consumer,
-                        now,
+                        now: claim_now,
                         duration: if case == "claim-live" {
-                            chrono::Duration::minutes(1)
+                            chrono::Duration::minutes(5)
                         } else {
-                            cutoff - now
+                            cutoff - claim_now
                         },
                     },
                 )
@@ -12083,6 +13226,29 @@ mod tests {
                 .await
                 .unwrap()
                 .session;
+            // The real checkpoint must succeed under the original live authority.
+            store
+                .validate_fence(&old.fence(), chrono::Utc::now())
+                .await
+                .unwrap_or_else(|error| panic!("{case}: setup fence: {error:?}"));
+            let setup_leases = inbox
+                .inspect_owned_leases(&child.id, 2, chrono::Utc::now())
+                .await
+                .unwrap();
+            assert_eq!(setup_leases.len(), 1, "{case}: original setup claim");
+            assert_eq!(setup_leases[0].epoch, claim.lease.epoch, "{case}");
+            assert_eq!(setup_leases[0].expires_at, claim.lease.expires_at, "{case}");
+            assert!(!setup_leases[0].expired, "{case}: setup claim must be live");
+            let setup_at = chrono::Utc::now();
+            assert!(
+                setup_at < old.lease_expires_at,
+                "{case}: setup Actor expired"
+            );
+            assert!(
+                setup_at < claim.lease.expires_at,
+                "{case}: setup claim expired"
+            );
+            eprintln!("pre-ACK {case}: setup live at {setup_at}, cutoff {cutoff}");
             if case == "ack" {
                 inbox
                     .ack_owned(&child.id, &claim, chrono::Utc::now())
@@ -12122,8 +13288,40 @@ mod tests {
                 "birth" => child.created_at += chrono::Duration::nanoseconds(1),
                 _ => {}
             }
+            // One shared short deadline per case; never wait for the live controls.
+            // No reclaim, renewal or authority-file edit occurs between these stages.
             let delay = (cutoff - chrono::Utc::now()).to_std().unwrap_or_default();
             tokio::time::sleep(delay + Duration::from_millis(10)).await;
+            let recovery_at = chrono::Utc::now();
+            assert!(recovery_at >= cutoff, "{case}: real expiry is required");
+            let before_recovery = store.inspect_actor(&child.id).await.unwrap();
+            let original = before_recovery.activation.unwrap();
+            assert_eq!(original.fence(), old.fence(), "{case}: same authority");
+            assert_eq!(original.lease_expires_at, old.lease_expires_at, "{case}");
+            assert_eq!(
+                store
+                    .validate_fence(&old.fence(), recovery_at)
+                    .await
+                    .is_ok(),
+                case == "actor-live",
+                "{case}: Actor expiry control"
+            );
+            let recovery_leases = inbox
+                .inspect_owned_leases(&child.id, 2, recovery_at)
+                .await
+                .unwrap();
+            if case == "ack" {
+                assert!(recovery_leases.is_empty(), "{case}: terminal ACK");
+            } else {
+                assert_eq!(recovery_leases.len(), 1, "{case}: original recovery claim");
+                assert_eq!(recovery_leases[0].epoch, claim.lease.epoch, "{case}");
+                assert_eq!(
+                    recovery_leases[0].expires_at, claim.lease.expires_at,
+                    "{case}"
+                );
+                assert_eq!(recovery_leases[0].expired, case != "claim-live", "{case}");
+            }
+            eprintln!("pre-ACK {case}: recovery expiry control at {recovery_at}");
             let second = Arc::new(
                 bamboo_storage::SessionStoreV2::new(temp.path().into())
                     .await
@@ -12167,8 +13365,10 @@ mod tests {
             }
             let (replacement, delivery) = prepared.unwrap();
             assert!(replacement.recovering_pre_ack);
-            let (messages, delivery) = delivery.unwrap();
-            let new_claim = replacement.initial_input.as_ref().unwrap();
+            let (messages, mut deliveries) = delivery.unwrap();
+            assert_eq!(deliveries.len(), 1);
+            let delivery = deliveries.pop().unwrap();
+            let new_claim = replacement.initial_inputs.first().unwrap();
             assert_eq!(new_claim.claim.envelope, claim.claim.envelope);
             assert_eq!(new_claim.claim.generation, claim.claim.generation);
             assert_eq!(
@@ -13652,6 +14852,7 @@ mod tests {
             readonly_output: None,
             local_history_tools: None,
             local_history_read_only: false,
+            strict_history_output: None,
             plain_input: None,
             canonical_activation: None,
             canonical_placement_ref: None,
@@ -13765,6 +14966,7 @@ mod tests {
                 readonly_output: None,
                 local_history_tools: None,
                 local_history_read_only: false,
+                strict_history_output: None,
                 plain_input: None,
                 canonical_activation: None,
                 canonical_placement_ref: None,
@@ -13875,6 +15077,7 @@ mod tests {
                 readonly_output: None,
                 local_history_tools: None,
                 local_history_read_only: false,
+                strict_history_output: None,
                 plain_input: None,
                 canonical_activation: Some(&fence),
                 canonical_placement_ref: None,
@@ -15079,6 +16282,7 @@ mod tests {
             readonly_output: None,
             local_history_tools: None,
             local_history_read_only: false,
+            strict_history_output: None,
             plain_input: None,
             canonical_activation: None,
             canonical_placement_ref: None,
@@ -16101,6 +17305,7 @@ mod tests {
                 readonly_output: None,
                 local_history_tools: None,
                 local_history_read_only: false,
+                strict_history_output: None,
                 plain_input: None,
                 canonical_activation: None,
                 canonical_placement_ref: None,
@@ -16179,6 +17384,7 @@ mod tests {
                 readonly_output: None,
                 local_history_tools: None,
                 local_history_read_only: false,
+                strict_history_output: None,
                 plain_input: None,
                 canonical_activation: None,
                 canonical_placement_ref: None,
@@ -16255,6 +17461,7 @@ mod tests {
             readonly_output: None,
             local_history_tools: None,
             local_history_read_only: false,
+            strict_history_output: None,
             plain_input: None,
             canonical_activation: None,
             canonical_placement_ref: None,
@@ -16308,6 +17515,7 @@ mod tests {
             readonly_output: None,
             local_history_tools: None,
             local_history_read_only: false,
+            strict_history_output: None,
             plain_input: None,
             canonical_activation: None,
             canonical_placement_ref: None,
@@ -16376,8 +17584,54 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
+    #[tokio::test]
+    async fn spawn_depth_provisioning_uses_live_policy_for_local_and_remote_workers() {
+        let live = Arc::new(tokio::sync::RwLock::new(bamboo_llm::Config::default()));
+        live.write().await.subagents_mut().max_spawn_depth = Some(1);
+        let mut remote = HashMap::new();
+        remote.insert(
+            "remote-role".into(),
+            ResolvedRemotePlacement {
+                endpoint: "wss://worker.example:8443".into(),
+                token: None,
+                ca_cert_file: None,
+                host_label: None,
+                broker_peer: None,
+                requirements: None,
+            },
+        );
+        let runner = bogus_runner(remote).with_live_provider_config(live.clone());
+        let root = Session::new("provision-root", "model");
+        for role in ["local-role", "remote-role"] {
+            let mut child =
+                Session::new_child_of(format!("provision-{role}"), &root, "model", "child");
+            child.metadata.insert("subagent_type".into(), role.into());
+            let first = runner.build_live_spec(&child, &job_for(&child.id)).await;
+            assert_eq!(first.capabilities.max_spawn_depth, Some(1));
+            assert!(!first.capabilities.nested_spawn);
+            assert_eq!(
+                matches!(first.placement, Placement::Remote { .. }),
+                role == "remote-role"
+            );
+            live.write().await.subagents_mut().max_spawn_depth = Some(7);
+            let second = runner.build_live_spec(&child, &job_for(&child.id)).await;
+            assert_eq!(second.capabilities.max_spawn_depth, Some(7));
+            assert!(second.capabilities.nested_spawn);
+            assert_ne!(
+                ActorChildRunner::fingerprint(&first),
+                ActorChildRunner::fingerprint(&second)
+            );
+            assert_eq!(second.identity.depth, 1);
+            live.write().await.subagents_mut().max_spawn_depth = Some(1);
+        }
+        let fallback = bogus_runner(HashMap::new()).with_max_spawn_depth(0);
+        let spec = fallback.build_spec(&root, &job_for(&root.id));
+        assert_eq!(spec.capabilities.max_spawn_depth, Some(0));
+        assert!(!spec.capabilities.nested_spawn);
+    }
+
     struct RecordingChildSessionPort {
+        parent: Session,
         saved: std::sync::Mutex<Option<Session>>,
     }
 
@@ -16395,9 +17649,10 @@ mod tests {
     impl crate::session_app::child_session::ChildSessionPort for RecordingChildSessionPort {
         async fn load_root_session(
             &self,
-            _root_id: &str,
+            root_id: &str,
         ) -> Result<Session, crate::session_app::child_session::ChildSessionError> {
-            unreachable!("create_child_action does not load the root")
+            assert_eq!(root_id, self.parent.id);
+            Ok(self.parent.clone())
         }
 
         async fn load_child_for_parent(
@@ -17013,7 +18268,10 @@ mod tests {
                 .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
                 .set_permission_mode(mode);
             let workspace = tempfile::tempdir().expect("workspace fixture");
-            let port = RecordingChildSessionPort::default();
+            let port = RecordingChildSessionPort {
+                parent: parent.clone(),
+                saved: Default::default(),
+            };
             let child_id = format!("child-{label}-{}", uuid::Uuid::new_v4());
             crate::session_app::child_session::create_child_action(
                 &port,
@@ -17081,7 +18339,10 @@ mod tests {
         ] {
             let mut parent = Session::new(format!("parent-{role}"), "test-model");
             parent.set_project_id_meta(project_id.to_string());
-            let port = RecordingChildSessionPort::default();
+            let port = RecordingChildSessionPort {
+                parent: parent.clone(),
+                saved: Default::default(),
+            };
             let child_id = format!("child-{role}-{}", uuid::Uuid::new_v4());
             crate::session_app::child_session::create_child_action(
                 &port,

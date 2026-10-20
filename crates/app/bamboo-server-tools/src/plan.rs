@@ -10,7 +10,7 @@ use bamboo_engine::session_app::child_session::{
     self, ChildSessionError, ChildSessionPort, CreateChildInput, SubagentResolutionPort,
 };
 
-use crate::sub_agent::{waiting_for_children_tool_result, DEFAULT_MAX_SPAWN_DEPTH};
+use crate::sub_agent::waiting_for_children_tool_result;
 
 const PLANNER_ROLE: &str = "planner";
 const MAX_CONTEXT_FORK_MESSAGES: usize = 12;
@@ -212,6 +212,11 @@ impl Tool for PlanTool {
         let parsed: PlanArgs = serde_json::from_value(args)
             .map_err(|error| ToolError::InvalidArguments(format!("Invalid Plan args: {error}")))?;
         let task = normalize_task(parsed.task)?;
+        if !bamboo_agent_core::tools::suspension_allowed() {
+            return Err(ToolError::Execution(
+                "suspension_disabled: Plan requires a child wait".into(),
+            ));
+        }
         let title = plan_title(parsed.title, &task);
         if parsed
             .fork_last_messages
@@ -227,12 +232,6 @@ impl Tool for PlanTool {
             .load_root_session(parent_session_id)
             .await
             .map_err(child_error)?;
-        if parent.spawn_depth >= DEFAULT_MAX_SPAWN_DEPTH {
-            return Err(ToolError::InvalidArguments(format!(
-                "spawn depth limit ({DEFAULT_MAX_SPAWN_DEPTH}) reached: this agent is at depth {} and cannot create a planner child",
-                parent.spawn_depth
-            )));
-        }
         if parent.model.trim().is_empty() {
             return Err(ToolError::Execution(
                 "parent session model is empty".to_string(),
@@ -502,10 +501,12 @@ mod tests {
         async fn register_parent_wait_for_children(
             &self,
             _parent_session_id: &str,
-            _child_session_ids: &[String],
+            child_session_ids: &[String],
             _policy: ChildWaitPolicy,
         ) -> Result<usize, ChildSessionError> {
-            unreachable!("Plan registers one child")
+            self.record("register_wait_many");
+            self.wait_armed.store(true, Ordering::SeqCst);
+            Ok(child_session_ids.len())
         }
 
         async fn active_child_ids(&self, _parent_session_id: &str) -> Vec<String> {
@@ -670,5 +671,153 @@ mod tests {
                 "delete_child"
             ]
         );
+    }
+    mod suspension_contract_tests {
+        use super::*;
+        use crate::{OverlayToolExecutor, SubAgentTool};
+        use bamboo_agent_core::tools::{
+            with_suspension_disabled, FunctionCall, ToolCall, ToolExecutor,
+        };
+
+        fn call(name: &str, args: serde_json::Value) -> ToolCall {
+            ToolCall {
+                id: "suspension-child-call".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: name.into(),
+                    arguments: args.to_string(),
+                },
+            }
+        }
+
+        #[tokio::test]
+        async fn disabled_suspension_blocks_plan_before_any_child_port_or_wait() {
+            for name in ["Plan", "default::Plan"] {
+                let dir = tempfile::tempdir().unwrap();
+                let port = Arc::new(RecordingPlanPort::new(&dir.path().to_string_lossy(), false));
+                let tools = OverlayToolExecutor::new(
+                    Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+                    Arc::new(PlanTool::new(port.clone(), Arc::new(ActorPlannerResolver))),
+                );
+                let call = call(
+                    name,
+                    json!({"task":"Prepare a bounded plan.","workspace":dir.path()}),
+                );
+                let ctx = ToolExecutionContext {
+                    session_id: Some("plan-parent"),
+                    ..ToolExecutionContext::none(&call.id)
+                };
+                let result =
+                    with_suspension_disabled(tools.execute_with_context_outcome(&call, ctx)).await;
+                assert!(
+                    matches!(result,Err(ToolError::Execution(ref reason)) if reason.contains("suspension_disabled")),
+                    "{name}: {result:?}"
+                );
+                assert!(port.calls().is_empty());
+                assert!(port.child.lock().unwrap().is_none());
+                assert!(!port.wait_armed.load(Ordering::SeqCst));
+            }
+        }
+
+        #[tokio::test]
+        async fn disabled_suspension_blocks_normalized_subagent_launch_and_wait_before_ports() {
+            let cases = [
+                json!({"message":"Perform the complete bounded task."}),
+                json!({"action":"create","title":"bounded","prompt":"Do the task.","auto_run":false}),
+                json!({"action":"run","child_session_id":"child"}),
+                json!({"action":"wait","child_session_ids":["child"]}),
+                json!({"message":"Continue the task.","target":"child"}),
+                json!({"action":"update","child_session_id":"child","prompt":"Update the task.","auto_run":true}),
+                json!({"action":"update","child_session_id":"child","prompt":"Update the task.","auto_run":false}),
+                json!({"action":"send_message","child_session_id":"child","message":"Continue the task.","auto_run":false}),
+            ];
+            for name in ["SubAgent", "default::SubAgent", "sub_session_manager"] {
+                for args in &cases {
+                    let dir = tempfile::tempdir().unwrap();
+                    let port =
+                        Arc::new(RecordingPlanPort::new(&dir.path().to_string_lossy(), false));
+                    let tools = OverlayToolExecutor::new(
+                        Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+                        Arc::new(SubAgentTool::new(
+                            port.clone(),
+                            Arc::new(ActorPlannerResolver),
+                        )),
+                    );
+                    let call = call(name, args.clone());
+                    let ctx = ToolExecutionContext {
+                        session_id: Some("plan-parent"),
+                        ..ToolExecutionContext::none(&call.id)
+                    };
+                    let result =
+                        with_suspension_disabled(tools.execute_with_context_outcome(&call, ctx))
+                            .await;
+                    assert!(
+                        matches!(result,Err(ToolError::Execution(ref reason)) if reason.contains("suspension_disabled")),
+                        "{name} {args}: {result:?}"
+                    );
+                    assert!(
+                        port.calls().is_empty(),
+                        "rejection must precede child lookup/create/wait/enqueue: {:?}",
+                        port.calls()
+                    );
+                    assert!(port.child.lock().unwrap().is_none());
+                    assert!(!port.wait_armed.load(Ordering::SeqCst));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn disabled_suspension_keeps_subagent_read_and_cancel_authority_paths() {
+            for args in [
+                json!({"action":"list"}),
+                json!({"action":"get","child_session_id":"missing"}),
+                json!({"action":"cancel","child_session_id":"missing"}),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let port = Arc::new(RecordingPlanPort::new(&dir.path().to_string_lossy(), false));
+                let tool = SubAgentTool::new(port.clone(), Arc::new(ActorPlannerResolver));
+                let result = with_suspension_disabled(tool.invoke(args, plan_test_ctx())).await;
+                if let Err(error) = &result {
+                    assert!(
+                        !error.to_string().contains("suspension_disabled"),
+                        "{error}"
+                    );
+                }
+                assert!(
+                    !port.calls().is_empty(),
+                    "unchanged authority/lookup must still run"
+                );
+                assert!(port.child.lock().unwrap().is_none());
+                assert!(!port.wait_armed.load(Ordering::SeqCst));
+            }
+        }
+
+        #[tokio::test]
+        async fn ordinary_plan_keeps_original_create_wait_enqueue_order() {
+            let dir = tempfile::tempdir().unwrap();
+            let port = Arc::new(RecordingPlanPort::new(&dir.path().to_string_lossy(), false));
+            PlanTool::new(port.clone(),Arc::new(ActorPlannerResolver)).invoke(
+                json!({"task":"Inspect the implementation and return a plan.","workspace":dir.path()}),
+                plan_test_ctx(),
+            ).await.unwrap();
+            let calls = port.calls();
+            assert!(
+                calls.iter().position(|call| *call == "save_child").unwrap()
+                    < calls
+                        .iter()
+                        .position(|call| *call == "register_wait")
+                        .unwrap()
+            );
+            assert!(
+                calls
+                    .iter()
+                    .position(|call| *call == "register_wait")
+                    .unwrap()
+                    < calls
+                        .iter()
+                        .position(|call| *call == "enqueue_child")
+                        .unwrap()
+            );
+        }
     }
 }

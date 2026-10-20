@@ -138,6 +138,7 @@ pub async fn send(
             bamboo_domain::SessionMessageBody::Content(bamboo_domain::SessionMessageContent {
                 text: body.text.clone(),
                 parts,
+                skill_request: None,
             });
     }
     envelope.id = id;
@@ -191,6 +192,38 @@ pub async fn send(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[actix_web::test]
+    async fn skill_request_actual_guidance_constructor_keeps_untrusted_request_absent() {
+        use bamboo_domain::{Session, SessionMessageBody};
+        let root = tempfile::tempdir().unwrap();
+        let state = web::Data::new(crate::AppState::new(root.path().into()).await.unwrap());
+        let session = Session::new("skill-request-guidance", "test-model");
+        state.storage.save_session(&session).await.unwrap();
+        let request: GuidanceRequest = serde_json::from_value(serde_json::json!({
+            "id":"guidance-request-id", "text":"ordinary guidance", "mode":"after_round",
+            "skill_request":{"selections":[{"id":"review","source":"builtin","revision":7}]}
+        }))
+        .unwrap();
+        let response = send(
+            state.clone(),
+            web::Path::from(session.id.clone()),
+            web::Json(request),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let claims = state.session_inbox.claim(&session.id, 10).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert!(claims[0].envelope.is_guidance());
+        let SessionMessageBody::Content(content) = &claims[0].envelope.body else {
+            panic!("actual User guidance")
+        };
+        assert_eq!(content.skill_request, None);
+        assert_eq!(
+            claims[0].envelope.to_provider_message().unwrap().content,
+            "ordinary guidance"
+        );
+    }
 
     #[actix_web::test]
     async fn unpersisted_activation_watermark_returns_retryable_error_with_stable_id() {

@@ -362,6 +362,94 @@ pub(crate) struct CompressionResult {
     pub was_compressed: bool,
 }
 
+/// Terminal handles and final status are protocol fields. A global output cap
+/// may shrink captured text, but must never make the next poll impossible.
+pub(super) fn truncate_exec_session_output(
+    raw_result: &str,
+    max_tokens: u32,
+    counter: &bamboo_compression::TiktokenTokenCounter,
+) -> Option<String> {
+    use bamboo_compression::TokenCounter;
+
+    let mut payload = serde_json::from_str::<serde_json::Value>(raw_result).ok()?;
+    let object = payload.as_object_mut()?;
+    if !matches!(
+        object.get("status").and_then(serde_json::Value::as_str),
+        Some("running" | "completed" | "killed" | "error")
+    ) {
+        return None;
+    }
+    let output = object.get("output")?.as_str()?.to_owned();
+    let prior_omitted = object
+        .get("output_omitted_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    object.insert("output".into(), serde_json::json!(""));
+    object.insert(
+        "output_omitted_bytes".into(),
+        serde_json::json!(prior_omitted.saturating_add(output.len() as u64)),
+    );
+    let mut kept = serde_json::to_string(object).expect("terminal result is serializable");
+    if counter.count_text(&kept) > max_tokens {
+        // Hook context is optional; it cannot acquire the required terminal
+        // metadata exception merely by living inside the JSON envelope.
+        if let Some(feedback) = object.remove("hook_feedback") {
+            let omitted = feedback
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .fold(0_u64, |bytes, text| bytes.saturating_add(text.len() as u64));
+            let prior = object
+                .get("hook_feedback_omitted_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            object.insert(
+                "hook_feedback_omitted_bytes".into(),
+                serde_json::json!(prior.saturating_add(omitted)),
+            );
+            kept = serde_json::to_string(object).expect("terminal result is serializable");
+        }
+    }
+    if counter.count_text(&kept) > max_tokens && object.remove("polling").is_some() {
+        // Progress/advisory data is optional. It cannot inherit the exception
+        // that protects a continuation handle or a real terminal status.
+        kept = serde_json::to_string(object).expect("terminal result is serializable");
+    }
+    if counter.count_text(&kept) > max_tokens {
+        // Even a tiny budget must retain fixed metadata, including an error or
+        // session handle. The output itself is still reduced to zero bytes.
+        return Some(kept);
+    }
+    let mut render = |end: usize| {
+        object.insert("output".into(), serde_json::json!(&output[..end]));
+        object.insert(
+            "output_omitted_bytes".into(),
+            serde_json::json!(prior_omitted.saturating_add((output.len() - end) as u64)),
+        );
+        serde_json::to_string(object).expect("terminal result is serializable")
+    };
+    let mut low = 0;
+    let mut high = output.len();
+    while low <= high {
+        let midpoint = low + (high - low) / 2;
+        let mut end = midpoint;
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        let candidate = render(end);
+        if counter.count_text(&candidate) <= max_tokens {
+            kept = candidate;
+            low = midpoint + 1;
+        } else if midpoint == 0 {
+            break;
+        } else {
+            high = midpoint - 1;
+        }
+    }
+    Some(kept)
+}
+
 /// Compress a `ToolExecutionOutcome` in-place.
 ///
 /// Returns the same outcome with the `ToolResult.result` potentially replaced
@@ -376,6 +464,12 @@ pub(super) async fn maybe_compress(
     context_pressure: Option<ContextPressure>,
     task_hint: Option<&TaskCompressionHint>,
 ) -> ToolExecutionOutcome {
+    let execution_name = outcome
+        .portable_tool
+        .as_ref()
+        .map(|tool| tool.execution_name())
+        .unwrap_or(tool_name);
+    let exec_session = matches!(execution_name, "exec_command" | "write_stdin");
     let result = match outcome.result {
         Ok(ref mut result) => result,
         Err(_) => return outcome, // error path — never compress
@@ -399,10 +493,9 @@ pub(super) async fn maybe_compress(
         };
 
         if compressed.was_compressed {
-            // Tee-save full output when compression occurred.
+            // Recovery files screen output and never receive command arguments.
             let tee_note =
-                tee::tee_save_if_needed(session_id, args_json, &original, &compressed.compressed)
-                    .await;
+                tee::tee_save_if_needed(session_id, &original, &compressed.compressed).await;
 
             // Replace result with compressed version (+ optional tee note).
             result.result = match tee_note {
@@ -418,6 +511,14 @@ pub(super) async fn maybe_compress(
         let counter = bamboo_compression::TiktokenTokenCounter::default();
         let tokens = counter.count_text(&result.result);
         if tokens > max_tool_output_tokens {
+            if exec_session {
+                if let Some(truncated) =
+                    truncate_exec_session_output(&result.result, max_tool_output_tokens, &counter)
+                {
+                    result.result = truncated;
+                    return outcome;
+                }
+            }
             let browser_download = tool_name
                 .trim()
                 .rsplit("::")
@@ -660,6 +761,199 @@ mod tests {
     use super::*;
     use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolResult};
 
+    // Declare the identity retained after executor selection, without changing
+    // the pre-promotion model catalog or testing admission in this fixture.
+    fn selected_tool_identity(
+        execution_name: &str,
+    ) -> Option<super::super::per_call::PortableToolExecution> {
+        Some(
+            super::super::per_call::PortableToolExecution::selected_identity_fixture(
+                execution_name,
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn exec_session_caps_preserve_protocol_fields_and_count_omitted_utf8_bytes() {
+        use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
+        let counter = TiktokenTokenCounter::default();
+        let text = "界🦀\n\"\\variable output ".repeat(500);
+        for (name, execution_name) in [
+            ("exec_command", "exec_command"),
+            ("write_stdin", "write_stdin"),
+            ("default::exec_command", "exec_command"),
+            ("default::write_stdin", "write_stdin"),
+        ] {
+            for status in ["running", "completed", "killed", "error"] {
+                let mut payload = serde_json::json!({
+                    "status":status,
+                    "output":text,
+                    "output_omitted_bytes":7,
+                });
+                if status == "running" {
+                    payload["session_id"] = "retained-exec-handle".into();
+                } else if status == "completed" {
+                    payload["exit_code"] = 7.into();
+                } else if status == "error" {
+                    payload["error"] =
+                        "Output capture failed; final status remains available".into();
+                }
+                let raw = payload.to_string();
+                let mut expected_control = payload.clone();
+                expected_control.as_object_mut().unwrap().remove("output");
+                expected_control
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("output_omitted_bytes");
+                for cap in [0, 1, 32, 96, 512] {
+                    let outcome = ToolExecutionOutcome {
+                        output_cap: None,
+                        permission_replay_origin: None,
+                        result: Ok(ToolResult::text(true, raw.clone())),
+                        needs_human: None,
+                        portable_tool: selected_tool_identity(execution_name),
+                        post_tool_hook_eligible: true,
+                        managed_running_violation: false,
+                        tool_duration: std::time::Duration::ZERO,
+                    };
+                    let result = maybe_compress(name, "{}", "exec-cap", outcome, cap, None, None)
+                        .await
+                        .result
+                        .unwrap();
+                    assert!(result.success);
+                    let mut received: serde_json::Value =
+                        serde_json::from_str(&result.result).unwrap();
+                    let kept = received["output"].as_str().unwrap();
+                    assert!(text.starts_with(kept));
+                    assert_eq!(
+                        received["output_omitted_bytes"].as_u64().unwrap(),
+                        7 + (text.len() - kept.len()) as u64
+                    );
+                    if cap == 0 {
+                        assert_eq!(result.result, raw);
+                    } else if counter.count_text(&result.result) > cap {
+                        assert!(kept.is_empty(), "only fixed metadata may exceed the cap");
+                    } else if cap == 512 {
+                        assert!(!kept.is_empty(), "available output budget should be used");
+                    }
+                    received.as_object_mut().unwrap().remove("output");
+                    received
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("output_omitted_bytes");
+                    assert_eq!(received, expected_control);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exec_session_cap_exception_does_not_apply_to_foreign_names_or_other_json() {
+        let terminal = serde_json::json!({"status":"running", "session_id":"foreign", "output":"variable output ".repeat(500)}).to_string();
+        let approval = serde_json::json!({"status":"awaiting_permission_approval", "output":"variable output ".repeat(500)}).to_string();
+        for (name, raw) in [
+            ("vendor::exec_command", &terminal),
+            ("vendor::write_stdin", &terminal),
+            ("exec_command", &approval),
+        ] {
+            let outcome = ToolExecutionOutcome {
+                output_cap: None,
+                permission_replay_origin: None,
+                result: Ok(ToolResult::text(true, raw.clone())),
+                needs_human: None,
+                portable_tool: selected_tool_identity(name),
+                post_tool_hook_eligible: true,
+                managed_running_violation: false,
+                tool_duration: std::time::Duration::ZERO,
+            };
+            let result = maybe_compress(name, "{}", "other-cap", outcome, 1, None, None)
+                .await
+                .result
+                .unwrap();
+            assert!(result.result.contains("tool output truncated"));
+        }
+    }
+
+    #[test]
+    fn exec_session_caps_drop_optional_polling_before_required_metadata_exception() {
+        use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
+
+        let counter = TiktokenTokenCounter::default();
+        let output = "captured output 界🦀 ".repeat(500);
+        let polling = serde_json::json!({
+            "elapsed_ms":90_000, "output_idle_ms":90_000,
+            "consecutive_empty_readouts":3, "exit_observed":false,
+            "advisory":"No new output across repeated polls. Check a command-owned progress signal before polling again; silence does not prove completion.",
+        });
+        let payload = serde_json::json!({
+            "status":"running", "session_id":"retained-handle", "output":output,
+            "polling":polling,
+        });
+        for cap in [1, 32, 128, 512] {
+            let compressed =
+                truncate_exec_session_output(&payload.to_string(), cap, &counter).unwrap();
+            let received: serde_json::Value = serde_json::from_str(&compressed).unwrap();
+            assert_eq!(received["status"], "running");
+            assert_eq!(received["session_id"], "retained-handle");
+            let kept = received["output"].as_str().unwrap();
+            assert!(output.starts_with(kept));
+            assert_eq!(received["output_omitted_bytes"], output.len() - kept.len());
+            if counter.count_text(&compressed) > cap {
+                assert!(kept.is_empty());
+                assert!(received.get("polling").is_none());
+            }
+            if cap == 1 {
+                assert!(received.get("polling").is_none());
+            } else if cap == 512 {
+                assert_eq!(received["polling"], polling);
+                assert!(counter.count_text(&compressed) <= cap);
+            }
+        }
+    }
+
+    #[test]
+    fn exec_session_caps_drop_optional_feedback_before_required_metadata_exception() {
+        use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
+
+        let counter = TiktokenTokenCounter::default();
+        for feedback in ["review detail".to_owned(), "review 界🦀 ".repeat(1_000)] {
+            for cap in [1, 256] {
+                let output = "captured output ".repeat(1_000);
+                let payload = serde_json::json!({
+                    "status":"running", "session_id":"retained-handle", "output":output,
+                    "hook_feedback":[feedback], "hook_feedback_omitted_bytes":13,
+                });
+                let compressed =
+                    truncate_exec_session_output(&payload.to_string(), cap, &counter).unwrap();
+                let received: serde_json::Value = serde_json::from_str(&compressed).unwrap();
+                assert_eq!(received["status"], "running");
+                assert_eq!(received["session_id"], "retained-handle");
+                let retained = received["hook_feedback"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|text| text.as_str().unwrap().len())
+                    .sum::<usize>();
+                assert_eq!(
+                    received["hook_feedback_omitted_bytes"].as_u64().unwrap() as usize + retained,
+                    13 + feedback.len()
+                );
+                let kept = received["output"].as_str().unwrap();
+                assert_eq!(received["output_omitted_bytes"], output.len() - kept.len());
+                if cap == 1 {
+                    assert!(kept.is_empty());
+                    assert!(received.get("hook_feedback").is_none());
+                } else {
+                    assert!(counter.count_text(&compressed) <= cap);
+                    assert_eq!(
+                        received.get("hook_feedback").is_some(),
+                        feedback.len() < 100
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn browser_download_over_tool_budget_returns_valid_no_bytes_failure() {
         let raw = serde_json::json!({
@@ -674,11 +968,13 @@ mod tests {
         .to_string();
         let args = r##"{"action":"download","selector":"#link","expected_epoch":17}"##;
         let outcome = || ToolExecutionOutcome {
+            output_cap: None,
             permission_replay_origin: None,
             result: Ok(ToolResult::text(true, raw.clone())),
             needs_human: None,
             portable_tool: None,
             post_tool_hook_eligible: true,
+            managed_running_violation: false,
             tool_duration: std::time::Duration::ZERO,
         };
         for tool_name in ["browser", "default::browser"] {
@@ -750,11 +1046,13 @@ mod tests {
             guard.check_before_execution(&call, 0).unwrap();
             let raw = serde_json::json!({ "data_base64": "QUJD".repeat(4096) }).to_string();
             let outcome = ToolExecutionOutcome {
+                output_cap: None,
                 permission_replay_origin: None,
                 result: Ok(ToolResult::text(true, raw)),
                 needs_human: None,
                 portable_tool: None,
                 post_tool_hook_eligible: true,
+                managed_running_violation: false,
                 tool_duration: std::time::Duration::ZERO,
             };
             let compressed = maybe_compress(
@@ -1283,5 +1581,176 @@ mod tests {
         assert!(!hint.is_empty());
         assert!(hint.matches("re-running the module checks"));
         assert!(!hint.matches("xyz qrs unrelated"));
+    }
+
+    #[test]
+    fn skill_output_utf8_byte_ceiling_bounds_actual_bundled_and_default_counters() {
+        use bamboo_compression::{HeuristicTokenCounter, TiktokenTokenCounter, TokenCounter};
+        let bundled = TiktokenTokenCounter::default();
+        let heuristic = HeuristicTokenCounter::default();
+        let ascii = (0..=127).map(char::from).collect::<String>();
+        let unicode = [
+            "界🦀é",
+            "\r\n\0\"\\",
+            "<|endoftext|><|endofprompt|>",
+            "\u{10ffff}\u{10000}\u{7ff}",
+        ];
+        let mut cases = vec![String::new(), ascii.clone(), "a".into(), "🦀".into()];
+        cases.extend(unicode.iter().map(|s| s.to_string()));
+        for byte in 0..=127 {
+            cases.push(char::from(byte).to_string());
+        }
+        let maximal = "界🦀\0\r\n\"\\<|endoftext|>".repeat(30_000);
+        let mut end = (512 * 1024).min(maximal.len());
+        while !maximal.is_char_boundary(end) {
+            end -= 1;
+        }
+        cases.push(maximal[..end].to_string());
+        for text in cases {
+            assert!(text.len() <= 512 * 1024);
+            for count in [bundled.count_text(&text), heuristic.count_text(&text)] {
+                assert!(
+                    count as usize <= text.len(),
+                    "actual count {count} > {} bytes",
+                    text.len()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_output_byte_sized_json_survives_generic_compression_and_zero_cap() {
+        use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
+        let raw = serde_json::json!({"contents":"界🦀\0\r\n\"\\<|endoftext|>".repeat(12),"next_cursor":null}).to_string();
+        let counter = TiktokenTokenCounter::default();
+        assert!(counter.count_text(&raw) as usize <= raw.len());
+        for cap in [raw.len() as u32, 0] {
+            let outcome = ToolExecutionOutcome {
+                output_cap: None,
+                permission_replay_origin: None,
+                portable_tool: None,
+                result: Ok(ToolResult::text(true, raw.clone())),
+                needs_human: None,
+                post_tool_hook_eligible: true,
+                managed_running_violation: false,
+                tool_duration: std::time::Duration::ZERO,
+            };
+            let result =
+                maybe_compress("skills_read", "{}", "output-test", outcome, cap, None, None)
+                    .await
+                    .result
+                    .unwrap();
+            assert!(result.success);
+            assert_eq!(result.result, raw);
+            serde_json::from_str::<serde_json::Value>(&result.result).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_output_name_and_failed_ok_result_never_bypass_generic_hard_cap() {
+        use bamboo_compression::{TiktokenTokenCounter, TokenCounter};
+        let raw = serde_json::json!({"contents":"🦀\"\\ variable content ".repeat(2_000),"next_cursor":"later"}).to_string();
+        assert!(TiktokenTokenCounter::default().count_text(&raw) > 128);
+        for name in [
+            "skills_read",
+            "default::skills_read",
+            "untrusted::skills_read",
+            "unrelated",
+        ] {
+            for success in [true, false] {
+                let outcome = ToolExecutionOutcome {
+                    output_cap: None,
+                    permission_replay_origin: None,
+                    portable_tool: None,
+                    result: Ok(ToolResult::text(success, raw.clone())),
+                    needs_human: None,
+                    post_tool_hook_eligible: true,
+                    managed_running_violation: false,
+                    tool_duration: std::time::Duration::ZERO,
+                };
+                let result = maybe_compress(name, "{}", "output-test", outcome, 128, None, None)
+                    .await
+                    .result
+                    .unwrap();
+                assert_eq!(result.success, success);
+                assert_ne!(result.result, raw);
+                assert!(result.result.contains("tool output truncated"));
+            }
+        }
+        let error = "genuine execution error ".repeat(200);
+        let outcome = ToolExecutionOutcome {
+            output_cap: None,
+            permission_replay_origin: None,
+            portable_tool: None,
+            result: Err(error.clone()),
+            needs_human: None,
+            post_tool_hook_eligible: true,
+            managed_running_violation: false,
+            tool_duration: std::time::Duration::ZERO,
+        };
+        let result = maybe_compress("skills_read", "{}", "output-test", outcome, 1, None, None)
+            .await
+            .result
+            .unwrap_err();
+        assert_eq!(result, error);
+    }
+
+    #[tokio::test]
+    async fn scoped_cap_metadata_never_bypasses_generic_compressor_argument_or_error_path() {
+        let raw = "🦀 variable escaped \" \\ ".repeat(1000);
+        for observation in [None, Some(None), Some(Some(0)), Some(Some(64))] {
+            for name in ["skills_read", "ordinary_custom_tool"] {
+                let make_outcome = |result| ToolExecutionOutcome {
+                    output_cap: observation,
+                    permission_replay_origin: None,
+                    portable_tool: None,
+                    result,
+                    needs_human: None,
+                    post_tool_hook_eligible: true,
+                    managed_running_violation: false,
+                    tool_duration: std::time::Duration::ZERO,
+                };
+                let compressed = maybe_compress(
+                    name,
+                    "{}",
+                    "scoped-compressor",
+                    make_outcome(Ok(ToolResult::text(true, raw.clone()))),
+                    64,
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(compressed.output_cap, observation);
+                let result = compressed.result.unwrap();
+                assert!(result.success);
+                assert!(result.result.contains("tool output truncated"));
+                assert_ne!(result.result, raw);
+                let unbounded = maybe_compress(
+                    name,
+                    "{}",
+                    "scoped-compressor",
+                    make_outcome(Ok(ToolResult::text(true, raw.clone()))),
+                    0,
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(unbounded.output_cap, observation);
+                assert_eq!(unbounded.result.unwrap().result, raw);
+                let error = "genuine Reader failure".repeat(100);
+                let failed = maybe_compress(
+                    name,
+                    "{}",
+                    "scoped-compressor",
+                    make_outcome(Err(error.clone())),
+                    1,
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(failed.output_cap, observation);
+                assert_eq!(failed.result.unwrap_err(), error);
+            }
+        }
     }
 }

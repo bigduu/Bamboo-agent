@@ -290,6 +290,9 @@ pub fn validate_permission_replay_authority(
     target: &PermissionReplayTarget,
     execution_name: &str,
 ) -> Result<Option<ExecutingSupervisorObservation>, AgentError> {
+    session
+        .check_execution_compatibility()
+        .map_err(|error| AgentError::Tool(error.to_string()))?;
     let observation = ExecutingSupervisorObservation::restore_permission_replay_record(
         session,
         target.result_message_index,
@@ -673,8 +676,11 @@ pub async fn refresh_approval_replay_posture(
     configured_mode: PermissionMode,
     execution_name: Option<&str>,
 ) -> Result<ApprovalReplayDecision, AgentError> {
+    session
+        .check_execution_compatibility()
+        .map_err(|error| AgentError::Tool(error.to_string()))?;
     let latest = storage
-        .load_runtime_control_plane(&session.id)
+        .load_execution_admission_snapshot(&session.id)
         .await
         .map_err(|error| {
             AgentError::Tool(format!(
@@ -687,6 +693,9 @@ pub async fn refresh_approval_replay_posture(
                     .to_string(),
             )
         })?;
+    latest
+        .check_execution_compatibility()
+        .map_err(|error| AgentError::Tool(error.to_string()))?;
     let latest_runtime = latest.agent_runtime_state.as_ref().ok_or_else(|| {
         AgentError::Tool(
             "authoritative approval replay posture refresh failed closed: typed mode missing"
@@ -785,7 +794,14 @@ mod tests {
         }
 
         async fn load_session(&self, _session_id: &str) -> std::io::Result<Option<Session>> {
-            unreachable!("approval replay must use load_runtime_control_plane")
+            unreachable!("approval replay must use an explicit canonical/control-plane read")
+        }
+
+        async fn load_execution_admission_snapshot(
+            &self,
+            session_id: &str,
+        ) -> std::io::Result<Option<Session>> {
+            self.load_runtime_control_plane(session_id).await
         }
 
         async fn load_runtime_control_plane(
@@ -1002,6 +1018,53 @@ mod tests {
             assert_eq!(flags.bypass_permissions, expected_bypass);
             assert_eq!(flags.auto_approve_permissions, expected_auto);
             assert!(!flags.plan_read_only);
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_delegation_first_blocks_implementation_approval_replay_in_both_modes() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for ultra in [false, true] {
+            let mut owned =
+                session_with_mode(DEFAULT_SUPERVISOR_SESSION_ID, SessionPermissionMode::Auto);
+            owned.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: uuid::Uuid::new_v4(),
+            };
+            owned.set_root_orchestration_only(ultra).unwrap();
+            let storage = ReplayStorage {
+                session: RwLock::new(Some(owned.clone())),
+                fail_load: false,
+            };
+            for name in ["Write", "Edit", "exec_command", "load_skill"] {
+                assert_eq!(
+                    refresh_approval_replay_posture(
+                        &storage,
+                        &mut owned,
+                        PermissionMode::Default,
+                        Some(name)
+                    )
+                    .await
+                    .unwrap(),
+                    ApprovalReplayDecision::BlockedByRootToolAuthority,
+                    "{ultra}: {name}"
+                );
+            }
+            for name in ["Read", "SubAgent", "session_control"] {
+                assert!(
+                    matches!(
+                        refresh_approval_replay_posture(
+                            &storage,
+                            &mut owned,
+                            PermissionMode::Default,
+                            Some(name)
+                        )
+                        .await
+                        .unwrap(),
+                        ApprovalReplayDecision::Execute(_)
+                    ),
+                    "{ultra}: {name}"
+                );
+            }
         }
     }
 

@@ -49,6 +49,8 @@ pub struct AgentRuntime {
     pub persistence: Arc<dyn RuntimeSessionPersistence>,
     /// Capturing no inherited wait is also immutable for this execution.
     pub(crate) inherited_child_wait_captured: bool,
+    pub(crate) sdk_skill_execution_host:
+        Option<Arc<dyn crate::runtime::config::SdkSkillExecutionHost>>,
     pub session_inbox: Option<Arc<dyn SessionInboxPort>>,
     pub activation_router: Option<Arc<SessionActivationRouter>>,
     pub session_messenger: Option<Arc<SessionMessenger>>,
@@ -57,6 +59,8 @@ pub struct AgentRuntime {
     pub project_context_resolver: Option<Arc<crate::project_context::ProjectContextResolver>>,
     pub metrics_collector: MetricsCollector,
     pub config: Arc<RwLock<Config>>,
+    pub(crate) model_limits_section:
+        Option<Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>>,
     /// Live process-wide permission policy when the embedding exposes one.
     pub permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     /// SDK/static fallback used when there is no live policy handle.
@@ -103,6 +107,8 @@ pub struct AgentRuntimeBuilder {
     project_context_resolver: Option<Arc<crate::project_context::ProjectContextResolver>>,
     metrics_collector: Option<MetricsCollector>,
     config: Option<Arc<RwLock<Config>>>,
+    model_limits_section:
+        Option<Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>>,
     permission_config: Option<Arc<bamboo_tools::permission::PermissionConfig>>,
     permission_mode: PermissionMode,
     provider: Option<Arc<dyn LLMProvider>>,
@@ -124,6 +130,7 @@ impl AgentRuntimeBuilder {
             project_context_resolver: None,
             metrics_collector: None,
             config: None,
+            model_limits_section: None,
             permission_config: None,
             permission_mode: PermissionMode::Default,
             provider: None,
@@ -186,6 +193,17 @@ impl AgentRuntimeBuilder {
         self
     }
 
+    /// Use a host's validated model-limit snapshots for every agent round.
+    /// The host owns reloads and section health; budget resolution performs no
+    /// file I/O when this handle is installed.
+    pub fn model_limits_section(
+        mut self,
+        section: Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>,
+    ) -> Self {
+        self.model_limits_section = Some(section);
+        self
+    }
+
     pub fn permission_config(mut self, v: Arc<bamboo_tools::permission::PermissionConfig>) -> Self {
         self.permission_config = Some(v);
         self
@@ -223,6 +241,7 @@ impl AgentRuntimeBuilder {
         }
         Ok(AgentRuntime {
             inherited_child_wait_captured: false,
+            sdk_skill_execution_host: None,
             storage: self.storage.ok_or_else(|| format_missing("storage"))?,
             persistence: self
                 .persistence
@@ -241,6 +260,7 @@ impl AgentRuntimeBuilder {
                 .metrics_collector
                 .ok_or_else(|| format_missing("metrics_collector"))?,
             config: self.config.ok_or_else(|| format_missing("config"))?,
+            model_limits_section: self.model_limits_section,
             permission_config: self.permission_config,
             permission_mode: self.permission_mode,
             provider: self.provider.ok_or_else(|| format_missing("provider"))?,
@@ -343,6 +363,11 @@ pub struct ExecuteRequest {
     /// the config default (which may itself be unlimited). See
     /// [`bamboo_config::RunBudgetConfig::merged_with_override`].
     pub run_budget: Option<bamboo_config::RunBudgetConfig>,
+    /// Opt-in live counted repetition under the caller's existing execution owner.
+    /// Requires the shared activation router and an already registered run.
+    pub counted_loop: Option<super::counted_loop::CountedLoopConfig>,
+    /// Explicit finite authority for the model to start one loop in this activation.
+    pub loop_control: Option<super::loop_control::LoopControlConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +420,8 @@ pub struct ExecuteRequestBuilder {
     bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
     app_data_dir: Option<std::path::PathBuf>,
     run_budget: Option<bamboo_config::RunBudgetConfig>,
+    counted_loop: Option<super::counted_loop::CountedLoopConfig>,
+    loop_control: Option<super::loop_control::LoopControlConfig>,
 }
 
 impl ExecuteRequestBuilder {
@@ -436,6 +463,8 @@ impl ExecuteRequestBuilder {
             bash_completion_sink: None,
             app_data_dir: None,
             run_budget: None,
+            counted_loop: None,
+            loop_control: None,
         }
     }
 
@@ -637,6 +666,20 @@ impl ExecuteRequestBuilder {
         self
     }
 
+    /// Repeat the submitted prompt with explicit iteration and total-round bounds.
+    /// This is live-only; lifecycle/model management is a separate application seam.
+    pub fn counted_loop(mut self, config: super::counted_loop::CountedLoopConfig) -> Self {
+        self.counted_loop = Some(config);
+        self
+    }
+
+    /// Authorize live self start/status/update/stop within explicit host ceilings.
+    /// This starts no loop and grants no Session ownership.
+    pub fn loop_control(mut self, config: super::loop_control::LoopControlConfig) -> Self {
+        self.loop_control = Some(config);
+        self
+    }
+
     /// Materialize the underlying [`ExecuteRequest`].
     ///
     /// `gold_config` is an internal feature flag with only a crate-visible
@@ -679,6 +722,8 @@ impl ExecuteRequestBuilder {
             bash_completion_sink: self.bash_completion_sink,
             app_data_dir: self.app_data_dir,
             run_budget: self.run_budget,
+            counted_loop: self.counted_loop,
+            loop_control: self.loop_control,
         }
     }
 }
@@ -725,6 +770,47 @@ impl AgentRuntime {
         session: &mut Session,
         req: ExecuteRequest,
     ) -> crate::runtime::runner::Result<()> {
+        self.execute_with_inputs(session, req, None).await
+    }
+
+    pub(crate) async fn execute_with_inputs(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+    ) -> crate::runtime::runner::Result<()> {
+        session
+            .check_execution_compatibility()
+            .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
+        // Refusals are not executions: never reach SessionEnd or the generic
+        // final checkpoint, and never mutate another counted owner's clone.
+        super::counted_loop::reject_ambiguous_reentry(session, self.persistence.as_ref()).await?;
+        if let Some(control) = req.loop_control.as_ref() {
+            control
+                .validate_admission(session, self.activation_router.as_ref())
+                .await?;
+        }
+        struct SdkFinish {
+            host: Option<Arc<dyn crate::runtime::config::SdkSkillExecutionHost>>,
+            session_id: String,
+            execution_id: String,
+        }
+        impl Drop for SdkFinish {
+            fn drop(&mut self) {
+                if let Some(host) = self.host.as_ref() {
+                    host.finish(&self.session_id, &self.execution_id);
+                }
+            }
+        }
+        let _sdk_finish = SdkFinish {
+            host: self.sdk_skill_execution_host.clone(),
+            session_id: session.id.clone(),
+            execution_id: inputs
+                .as_ref()
+                .and_then(|inputs| inputs.sdk_execution_id())
+                .unwrap_or("")
+                .to_owned(),
+        };
         let existing = self.persistence.inherited_child_wait();
         if let Some(inherited) = existing.as_ref() {
             inherited
@@ -739,15 +825,16 @@ impl AgentRuntime {
                     .map_err(|error| bamboo_agent_core::AgentError::LLM(error.to_string()))?;
             }
             runtime.inherited_child_wait_captured = true;
-            return runtime.execute_bound(session, req).await;
+            return runtime.execute_bound(session, req, inputs).await;
         }
-        self.execute_bound(session, req).await
+        self.execute_bound(session, req, inputs).await
     }
 
     async fn execute_bound(
         &self,
         session: &mut Session,
         req: ExecuteRequest,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
         if self.persistence.root_actor_execution_required(session) {
             return Err(bamboo_agent_core::AgentError::Tool(
@@ -764,6 +851,16 @@ impl AgentRuntime {
             Some(router) => router.current_run_id(&session.id).await,
             None => None,
         };
+        if let Some(counted) = req.counted_loop.as_ref() {
+            if !counted
+                .owns_session(self.activation_router.as_ref(), session)
+                .await
+            {
+                return Err(bamboo_agent_core::AgentError::Budget(
+                    "counted loop requires the caller's exact Session activation owner".into(),
+                ));
+            }
+        }
         let system_prompt = extract_system_prompt(session);
         let config = self.config.read().await;
         let ExecuteRequest {
@@ -789,6 +886,8 @@ impl AgentRuntime {
             bash_completion_sink,
             app_data_dir,
             run_budget,
+            counted_loop,
+            loop_control,
         } = req;
         let tools = tools.unwrap_or_else(|| self.default_tools.clone());
         let llm = provider_override.unwrap_or_else(|| self.provider.clone());
@@ -818,11 +917,28 @@ impl AgentRuntime {
             provider_type,
             ..
         } = model_roster;
-        let hook_runner = Arc::new(
-            self.hook_runner
-                .with_lifecycle_config(&config.lifecycle_hooks, app_data_dir.clone()),
-        );
+        let active_provider =
+            provider_name.unwrap_or_else(|| config.effective_default_provider().to_string());
+        let hook_runner = inputs
+            .as_ref()
+            .and_then(|inputs| inputs.sdk_hook_runner())
+            .unwrap_or_else(|| {
+                Arc::new(
+                    self.hook_runner
+                        .with_lifecycle_config(&config.lifecycle_hooks, app_data_dir.clone()),
+                )
+            });
 
+        let mut effective_run_budget = config.run_budget.merged_with_override(run_budget.as_ref());
+        if let Some(control) = loop_control.as_ref() {
+            effective_run_budget.max_rounds = Some(
+                effective_run_budget
+                    .max_rounds
+                    .map_or(control.max_total_rounds, |cap| {
+                        cap.min(control.max_total_rounds)
+                    }),
+            );
+        }
         let loop_config = AgentLoopConfig {
             ticket_worker_plan: ticket_worker_plan.clone(),
             guidance_active_run_id,
@@ -830,9 +946,12 @@ impl AgentRuntime {
             // Snapshot the legacy model_limits from the live in-memory config so
             // resolve_token_budget never falls back to a disk-reading Config::new(). #38.
             legacy_model_limits: config.extra.get("model_limits").cloned(),
+            model_limits_section: self.model_limits_section.clone(),
             disabled_skill_ids: disabled_skill_ids.unwrap_or_else(|| config.disabled_skill_ids()),
             selected_skill_ids,
             selected_skill_mode,
+            initial_untrusted_inputs: inputs,
+            sdk_skill_execution_host: self.sdk_skill_execution_host.clone(),
             skill_manager: Some(self.skill_manager.clone()),
             project_context_resolver: self.project_context_resolver.clone(),
             skip_initial_user_message: true,
@@ -880,9 +999,7 @@ impl AgentRuntime {
                 .or_else(|| config.get_task_summary_model()),
             background_model_provider,
             summarization_model_provider,
-            provider_name: Some(
-                provider_name.unwrap_or_else(|| config.effective_default_provider().to_string()),
-            ),
+            provider_name: Some(active_provider.clone()),
             provider_type,
             reasoning_effort,
             auxiliary_model_resolver,
@@ -895,6 +1012,13 @@ impl AgentRuntime {
                 merged
             },
             image_fallback,
+            vision_model_resolver: Some(
+                crate::runtime::runner::image_fallback::configured_vision_resolver(
+                    self.config.clone(),
+                    app_data_dir.clone(),
+                    active_provider,
+                ),
+            ),
             app_data_dir,
             memory_store: self.memory_store.clone(),
             prompt_memory_flags: config
@@ -903,6 +1027,7 @@ impl AgentRuntime {
                 .map(PromptMemoryFlags::from)
                 .unwrap_or_default(),
             features_dynamic_model_routing: config.features.dynamic_model_routing,
+            features_final_evidence_check: config.features.final_evidence_check,
             permission_mode: Some(if active_plan_gate {
                 PermissionMode::Plan
             } else {
@@ -923,12 +1048,19 @@ impl AgentRuntime {
             // can loosen the operator's ceiling. Merging here (rather than in
             // the HTTP layer) means every caller — HTTP, schedules, connect,
             // the in-proc SDK — gets the same clamped fallback for free.
-            run_budget: config.run_budget.merged_with_override(run_budget.as_ref()),
+            run_budget: effective_run_budget,
+            counted_loop,
+            loop_control,
             stream_timeout: config.stream_timeout,
             ..Default::default()
         };
 
         drop(config);
+        #[cfg(test)]
+        crate::runtime::tests::observe_untrusted_inputs(
+            &session.id,
+            loop_config.initial_untrusted_inputs(),
+        );
 
         if let Some(plan) = &ticket_worker_plan {
             session
@@ -942,7 +1074,8 @@ impl AgentRuntime {
         let trace_message_start = session.messages.len();
         let session_end_runner = loop_config.hook_runner.clone();
         let session_end_event_tx = event_tx.clone();
-        let result = Box::pin(run_agent_loop_with_config(
+        let sdk_mode = loop_config.sdk_skill_execution_host.is_some();
+        let loop_future = Box::pin(run_agent_loop_with_config(
             session,
             initial_message,
             event_tx,
@@ -950,8 +1083,15 @@ impl AgentRuntime {
             tools,
             cancel_token,
             loop_config,
-        ))
-        .await;
+        ));
+        let result = if sdk_mode {
+            crate::runtime::runner::session_setup::legacy_instruction::scope_sdk_runtime(
+                loop_future,
+            )
+            .await
+        } else {
+            loop_future.await
+        };
 
         crate::runtime::hooks::run_session_end_hooks(
             &session_end_runner,

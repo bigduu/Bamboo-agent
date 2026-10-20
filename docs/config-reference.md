@@ -75,9 +75,9 @@ default. The full field list of `Config`:
 | `env_vars` | `Vec<EnvVarEntry>` | User-managed env vars injected into `Bash`-tool child processes. `secret: true` entries persist only stable `credential_ref`/`configured` metadata; their values live in the isolated credential store and are returned masked by the API. |
 | `default_work_area` | `Option<DefaultWorkAreaConfig>` | `{ path: Option<String> }` — default workspace when a session has none set. |
 | `access_control` | `Option<AccessControlConfig>` | Password gate for the HTTP API/UI (`password_enabled`, hashed+salted). |
-| `features` | `FeatureFlags` | `{ provider_model_ref: bool, dynamic_model_routing: bool }` — incremental rollout toggles, both off by default. |
+| `features` | `FeatureFlags` | Incremental rollout toggles, off by default. `final_evidence_check` enables the single final-answer check described below. |
 | `stream_timeout` | `StreamTimeoutConfig` | Independent transport, first-semantic, and midstream-semantic watchdog deadlines. See below. |
-| `context_management` | `ContextManagementConfig` | Selects legacy summary compression or the opt-in exact-history retrieval window. See below. |
+| `context_management` | `ContextManagementConfig` | Selects conversation summary, prose-only message summary, or the opt-in exact-history retrieval window. See below. |
 | `memory` | `Option<MemoryConfig>` | Memory/auto-dream/gardener settings. See below. |
 | `subagents` | `SubagentsConfig` | Sub-agent execution + the `claude_code` executor. See below. |
 | `cluster_fabric` | `ClusterFabricConfig` | Operator-managed remote nodes for deploying `broker-agent` workers over SSH; empty by default. SSH secrets encrypted at rest. |
@@ -286,7 +286,9 @@ not recommended.
 
 `context_management` defaults to `{"strategy":"summary"}`. Missing
 configuration therefore keeps the existing model-generated conversation
-summary behavior. The alternative `retrieval_window` strategy keeps exact raw
+summary behavior. The `message_summary` strategy summarizes historical user and
+assistant prose while discarding completed tool exchanges from the next model
+context. The `retrieval_window` strategy keeps exact raw
 messages in the Session store, removes eligible older complete turns only from
 the active provider window, and directs the model to
 `session_history_current` when it needs earlier evidence.
@@ -308,12 +310,42 @@ the active provider window, and directs the model to
 
 | Field | Default | What it does |
 |---|---|---|
-| `strategy` | `summary` | `summary` preserves the current summarizer path; `retrieval_window` enables exact-history archival at the ordinary pre-turn pressure boundary. |
+| `strategy` | `summary` | `summary` preserves the current summarizer path; `message_summary` summarizes historical user/assistant prose and removes completed tool exchanges from the active model view; `retrieval_window` enables exact-history archival at the ordinary pre-turn pressure boundary. |
 | `retrieval_window.min_recent_user_turns` | `3` | Minimum newest complete user-anchored turns that remain active. Must be greater than zero. |
 | `retrieval_window.trigger_usage_ratio` | `0.80` | Provider-prepared input ratio that starts automatic archival. |
 | `retrieval_window.target_usage_ratio` | `0.60` | Post-archive target ratio. Validation requires `0.01 <= target < trigger <= 1` because the planner uses whole percentages. |
 | `retrieval_window.history_tool_required` | `true` | Must remain `true` in this release. Bamboo fails before archival unless the effective callable catalog contains `session_history_current`. |
 | `retrieval_window.fallback_strategy` | `none` | `none` fails closed when retrieval archival is unavailable. `summary` explicitly opts into the legacy summarizer fallback. |
+
+To select message summaries:
+
+```json
+{
+  "context_management": {
+    "strategy": "message_summary"
+  }
+}
+```
+
+`message_summary` uses only the `content` text of historical user and assistant
+messages as summary source. It excludes tool-call names, arguments, IDs, tool
+outputs, reasoning, and image/OCR fields. An assistant message that also made
+tool calls can still contribute its prose; its tool fields do not enter the
+summary. The latest user request remains verbatim in the next model context.
+All completed tool exchanges are removed from that active view, including
+recent or skill-related exchanges. Original messages remain in durable Session
+history; compression does not delete them.
+
+Automatic pressure checks and `compact_context` use the selected message-summary
+mode. Its `compact_context.instructions` argument is ignored so tool parameters
+cannot re-enter the summary through custom instructions. Incomplete tool chains
+defer compression until their results are complete.
+When switching a Session with an existing mixed-message summary, Bamboo rebuilds
+from the durable user/assistant prose rather than merging the old summary's tool
+details. The default stays `summary`; selecting `message_summary` requires an
+explicit configuration change through the Bamboo configuration API, file, or a
+compatible Lotus context-management settings page. Older Lotus builds with a
+two-option switch do not expose this third strategy.
 
 Retrieval-window commits require runtime persistence and are checkpointed before
 the archived state is published or a provider request is sent. The checkpoint
@@ -325,9 +357,10 @@ for a Session that already has a conversation summary is rejected immediately;
 start a new Session or explicitly retain summary fallback. This first runtime
 slice supports automatic pre-turn archival, explicit model-requested archival
 through the argument-free `archive_context` tool, and critical overflow
-recovery through the same summary-free boundary. `compact_context` remains a
-summary-specific control: under `retrieval_window`, it fails closed unless
-`fallback_strategy: "summary"` explicitly opts into the legacy summarizer.
+recovery through the same summary-free boundary. `compact_context` uses the
+selected `summary` or `message_summary` mode: under `retrieval_window`, it fails
+closed unless `fallback_strategy: "summary"` explicitly opts into the legacy
+summarizer.
 Manual requests that are already at or below the target are durably consumed as
 no-ops so they do not loop after restart. Failed archive checkpoints remain
 retryable and never publish partially archived state.
@@ -653,9 +686,13 @@ context-window contract before runtime budgeting.
 
 The modular configuration store persists this section in a revisioned
 `{schema_version, revision, data}` envelope. Runtime loading accepts both that
-envelope and the legacy raw array, and root sessions re-read the sidecar at
-the start of every agent round; an explicit session/child or engine-level
-`TokenBudget` remains an intentional higher-priority override. Manage the
+envelope and the legacy raw array. Hosted agent runs use their server's live
+validated section snapshot at the start of every agent round. Invalid or
+temporarily deleted files retain the last-known-good limits and report section
+health errors; a valid repair is adopted by the existing configuration watcher.
+Standalone SDK and headless runtimes without a host section handle continue to
+read their instance-local sidecar each round. An explicit session/child or
+engine-level `TokenBudget` remains an intentional higher-priority override. Manage the
 section through Bamboo's settings API instead of hand-editing it while the
 server is running.
 
@@ -830,3 +867,64 @@ does not crash or silently reset to defaults — it runs a recovery flow
 Net effect: a corrupted `config.json` never causes silent data loss — you
 always get either your own values back (salvage/backup) or an explicit,
 confirmable prompt before anything is overwritten.
+
+### Final-answer evidence check
+
+Set `features.final_evidence_check` to `true` to check a final answer once against
+the current request's canonical Tool call/result records. The default is `false`.
+The check runs after Gold, Guardian and BeforeFinalize allow completion. It uses
+the configured fast provider/model, falling back to the current chat model, and
+shares the existing auxiliary concurrency limit, stream deadlines, cancellation
+and remaining run token budget. Its reported tokens count toward run usage and
+a separate `final_evidence_check` metrics round. No additional work tools run.
+
+When enabled, the engine buffers each response; tool-round text is published
+after that response completes, and final text is published after the check. A
+revision replaces the candidate in both visible output and canonical history,
+and clears the provider-native continuation so the next request uses that same
+answer. Disabled runs retain their existing streaming behavior.
+
+`runtime.final_evidence_check` records `supported`, `revised`,
+`skipped_no_evidence`, `skipped_budget`, `cancelled` or `failed`. Missing tool
+evidence skips the auxiliary call. An invalid verdict, provider failure, budget
+rejection or cancellation does not produce a verified completion. The check is
+a model judgment over bounded records; it does not certify omitted evidence or
+prove that an external operation completed.
+
+
+## Per-model Vision capability
+
+Provider instances may declare `model_capabilities` in their native configuration
+(exposed as `config.model_capabilities` by provider-instance CRUD). Keys are exact,
+non-empty model IDs scoped to that instance; they do not admit a runtime model.
+
+```json
+{
+  "provider_type": "openai",
+  "runtime_models": ["image-model", "text-model"],
+  "model_capabilities": {
+    "image-model": { "supports_vision": true },
+    "text-model": { "supports_vision": false }
+  }
+}
+```
+
+Vision is supported by default for new models, old configurations and missing or
+null `supports_vision` fields. Only an explicit `false` disables this model in
+this provider instance. No provider-wide toggle, model-name inference or migration
+overwrites user choices. The settings UI exposes Supports Vision / No Vision for
+each admitted model and saves new selections as supported unless opted out.
+Null restores the default supported policy through the model-level merge.
+
+`ViewImage` uses the actual provider handle and model of the current round,
+including role wrappers and reloaded providers. Explicit No Vision produces a
+paired tool error before reading or sending an image, including legacy aliases.
+Supported models receive image parts in the next model request. An explicit
+Supports Vision override bypasses legacy image fallback rewriting. A separately
+configured legacy `hooks.image_fallback` remains an opt-in image transform for
+models without an override; it does not declare the model unsupported.
+Switching to No Vision while image history remains produces an explicit
+model-request error and preserves that history; switch back to a Vision model to
+continue. Images are not silently dropped or claimed to have been seen.
+
+The canonical IR request entry and native Anthropic/Gemini serializers (including Bodhi proxy paths) reject tool-image batches exceeding 32 MiB of cumulative encoded image URL bytes before request cloning/serialization. The error is explicit, image history is preserved, and no upstream request is sent; use smaller images or batches. The per-file ViewImage size limit is unchanged.

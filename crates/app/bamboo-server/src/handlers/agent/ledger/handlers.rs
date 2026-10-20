@@ -1,3 +1,4 @@
+use crate::error::ResponseResult;
 use std::collections::HashSet;
 use std::fmt::Display;
 
@@ -110,7 +111,7 @@ fn normalize_opt(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn parse_datetime(raw: &str, field: &str) -> std::result::Result<DateTime<Utc>, HttpResponse> {
+fn parse_datetime(raw: &str, field: &str) -> ResponseResult<DateTime<Utc>> {
     let trimmed = raw.trim();
     if let Ok(parsed) = DateTime::parse_from_rfc3339(trimmed) {
         return Ok(parsed.with_timezone(&Utc));
@@ -123,30 +124,33 @@ fn parse_datetime(raw: &str, field: &str) -> std::result::Result<DateTime<Utc>, 
     }
     Err(bad_request(format!(
         "{field} must be RFC3339 (e.g. 2026-07-20T09:00:00Z) or YYYY-MM-DD, got: {raw}"
-    )))
+    ))
+    .into())
 }
 
-fn parse_priority(raw: &str) -> std::result::Result<TaskPriority, HttpResponse> {
+fn parse_priority(raw: &str) -> ResponseResult<TaskPriority> {
     serde_json::from_value(json!(raw.trim().to_ascii_lowercase())).map_err(|_| {
         bad_request(format!(
             "priority must be one of low|medium|high|critical, got: {raw}"
         ))
+        .into()
     })
 }
 
-fn parse_kind(raw: &str) -> std::result::Result<RecordKind, HttpResponse> {
-    RecordKind::parse(raw).ok_or_else(|| bad_request("kind cannot be empty"))
+fn parse_kind(raw: &str) -> ResponseResult<RecordKind> {
+    RecordKind::parse(raw).ok_or_else(|| bad_request("kind cannot be empty").into())
 }
 
-fn parse_status(raw: &str) -> std::result::Result<RecordStatus, HttpResponse> {
+fn parse_status(raw: &str) -> ResponseResult<RecordStatus> {
     RecordStatus::parse(raw).ok_or_else(|| {
         bad_request(format!(
             "status must be one of open|in_progress|blocked|done|cancelled|expired, got: {raw}"
         ))
+        .into()
     })
 }
 
-fn parse_status_csv(raw: &str) -> std::result::Result<Option<HashSet<RecordStatus>>, HttpResponse> {
+fn parse_status_csv(raw: &str) -> ResponseResult<Option<HashSet<RecordStatus>>> {
     let mut statuses = HashSet::new();
     for token in raw.split(',') {
         let token = token.trim();
@@ -158,7 +162,7 @@ fn parse_status_csv(raw: &str) -> std::result::Result<Option<HashSet<RecordStatu
     Ok((!statuses.is_empty()).then_some(statuses))
 }
 
-fn parse_kind_csv(raw: &str) -> std::result::Result<Option<HashSet<RecordKind>>, HttpResponse> {
+fn parse_kind_csv(raw: &str) -> ResponseResult<Option<HashSet<RecordKind>>> {
     let mut kinds = HashSet::new();
     for token in raw.split(',') {
         let token = token.trim();
@@ -176,7 +180,7 @@ fn parse_kind_csv(raw: &str) -> std::result::Result<Option<HashSet<RecordKind>>,
 fn resolve_scopes(
     scope: Option<&str>,
     project_key: Option<String>,
-) -> std::result::Result<Vec<(LedgerScope, Option<String>)>, HttpResponse> {
+) -> ResponseResult<Vec<(LedgerScope, Option<String>)>> {
     match scope.map(str::trim).filter(|value| !value.is_empty()) {
         Some("global") => Ok(vec![(LedgerScope::Global, None)]),
         Some("project") => match project_key {
@@ -192,7 +196,8 @@ fn resolve_scopes(
         }
         Some(other) => Err(bad_request(format!(
             "scope must be global, project, or all, got: {other}"
-        ))),
+        ))
+        .into()),
     }
 }
 
@@ -244,15 +249,15 @@ pub(super) async fn list_records_core(
     let project_key = normalize_opt(query.project_key.as_deref());
     let scopes = match resolve_scopes(query.scope.as_deref(), project_key) {
         Ok(scopes) => scopes,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let statuses = match query.status.as_deref().map(parse_status_csv).transpose() {
         Ok(statuses) => statuses.flatten(),
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let kinds = match query.kind.as_deref().map(parse_kind_csv).transpose() {
         Ok(kinds) => kinds.flatten(),
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let filter = RecordFilter {
         statuses,
@@ -321,7 +326,7 @@ pub(super) async fn upsert_record_core(
             let kind = match req.kind.as_deref() {
                 Some(raw) => match parse_kind(raw) {
                     Ok(kind) => kind,
-                    Err(response) => return Ok(response),
+                    Err(response) => return Ok(*response),
                 },
                 None => RecordKind::Todo,
             };
@@ -352,14 +357,14 @@ pub(super) async fn upsert_record_core(
         if let Some(raw) = req.kind.as_deref() {
             match parse_kind(raw) {
                 Ok(kind) => record.kind = kind,
-                Err(response) => return Ok(response),
+                Err(response) => return Ok(*response),
             }
         }
     }
     if let Some(raw) = req.priority.as_deref() {
         match parse_priority(raw) {
             Ok(priority) => record.priority = priority,
-            Err(response) => return Ok(response),
+            Err(response) => return Ok(*response),
         }
     }
     if let Some(parent_id) = &req.parent_id {
@@ -375,7 +380,7 @@ pub(super) async fn upsert_record_core(
         req.ends_at.as_deref(),
         req.remind_at.as_deref(),
     ) {
-        return Ok(response);
+        return Ok(*response);
     }
 
     let result = if existing.is_some() {
@@ -417,7 +422,7 @@ pub(super) async fn patch_record_core(
     let status = match req.status.as_deref() {
         Some(raw) => match parse_status(raw) {
             Ok(status) => Some(status),
-            Err(response) => return Ok(response),
+            Err(response) => return Ok(*response),
         },
         None => None,
     };
@@ -431,14 +436,14 @@ pub(super) async fn patch_record_core(
     if let Some(raw) = req.kind.as_deref() {
         match parse_kind(raw) {
             Ok(kind) => record.kind = kind,
-            Err(response) => return Ok(response),
+            Err(response) => return Ok(*response),
         }
         changed = true;
     }
     if let Some(raw) = req.priority.as_deref() {
         match parse_priority(raw) {
             Ok(priority) => record.priority = priority,
-            Err(response) => return Ok(response),
+            Err(response) => return Ok(*response),
         }
         changed = true;
     }
@@ -461,7 +466,7 @@ pub(super) async fn patch_record_core(
         req.ends_at.as_deref(),
         req.remind_at.as_deref(),
     ) {
-        return Ok(response);
+        return Ok(*response);
     }
     changed = changed || had_time_fields;
 
@@ -552,7 +557,7 @@ fn apply_time_fields(
     starts_at: Option<&str>,
     ends_at: Option<&str>,
     remind_at: Option<&[String]>,
-) -> std::result::Result<(), HttpResponse> {
+) -> ResponseResult<()> {
     if let Some(raw) = due_at {
         record.time.due_at = Some(parse_datetime(raw, "due_at")?);
     }

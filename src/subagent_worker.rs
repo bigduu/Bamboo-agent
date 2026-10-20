@@ -421,6 +421,13 @@ pub struct BambooRuntimeExecutor {
     /// Worker-local durable inbox. The orchestrator's copy remains canonical;
     /// this one drives the real local safe-turn admission/checkpoint boundary.
     session_inbox: Arc<dyn SessionInboxPort>,
+    /// Observe the real nested scheduler's publication boundary in wiring tests.
+    #[cfg(test)]
+    worker_event_senders: Arc<
+        tokio::sync::RwLock<
+            std::collections::HashMap<String, tokio::sync::broadcast::Sender<AgentEvent>>,
+        >,
+    >,
     model: Option<String>,
     workspace: Option<String>,
     disabled_tools: Option<BTreeSet<String>>,
@@ -773,23 +780,14 @@ impl BambooRuntimeExecutor {
                 store.clone(),
                 persistence.clone(),
             );
-            let load_skill = Arc::new(bamboo_server::tools::LoadSkillTool::new(
-                skill_manager.clone(),
-                config.clone(),
-                session_repo.clone(),
-            ));
-            let read_skill = Arc::new(bamboo_server::tools::ReadSkillResourceTool::new(
+            bamboo_server::tools::assemble_legacy_skill_tools(
+                default_tools,
                 skill_manager.clone(),
                 config.clone(),
                 session_repo,
-            ));
-            let with_load = Arc::new(bamboo_server::tools::OverlayToolExecutor::new(
-                default_tools,
-                load_skill,
-            ));
-            Arc::new(bamboo_server::tools::OverlayToolExecutor::new(
-                with_load, read_skill,
-            ))
+                None,
+                None,
+            )
         };
 
         // Capture clones for the worker's OWN spawn stack (Phase 6: direct nested
@@ -853,11 +851,9 @@ impl BambooRuntimeExecutor {
                     .unwrap_or_default(),
             });
 
-        // A worker BELOW the depth cap orchestrates its OWN children directly: it
-        // builds its own external-child runner + scheduler + adapter and runs the
-        // REAL SubAgent tool against them (no host proxy). `nested_spawn` is set
-        // by the host's build_spec purely from depth (< MAX_SPAWN_DEPTH), so it
-        // auto-propagates down the tree and bottoms out at the cap.
+        // A worker below the provisioned cap prepares its SubAgent template.
+        // The per-run overlay binds it to the canonical HostBridge, so actual
+        // nested creation uses the Host's current policy and durable lineage.
         type RunTools = Arc<dyn bamboo_agent_core::tools::ToolExecutor>;
         type ChildRunner = Arc<dyn bamboo_engine::runtime::execution::ExternalChildRunner>;
         let (run_tools, run_sub_agent, child_runner): (
@@ -876,12 +872,12 @@ impl BambooRuntimeExecutor {
             }
             let external_runner = {
                 let cfg = config_for_stack.read().await;
-                bamboo_engine::external_agents::runtime::build_external_child_runner_with_registry_and_reviewer(
-                        &cfg,
-                        None,
-                        Some(reviewer.clone()),
-                        permission_config.clone(),
-                    )
+                bamboo_engine::external_agents::runtime::build_legacy_worker_child_runner(
+                    &cfg,
+                    None,
+                    Some(reviewer.clone()),
+                    permission_config.clone(),
+                )
             };
             external_runner.set_session_inbox_runtime(Some(
                 bamboo_engine::execution::spawn::SessionInboxRuntimeBinding {
@@ -967,6 +963,8 @@ impl BambooRuntimeExecutor {
         Ok(Self {
             agent,
             session_inbox,
+            #[cfg(test)]
+            worker_event_senders,
             model: spec.model.as_ref().map(|m| m.model.clone()),
             workspace: spec.workspace.clone(),
             disabled_tools: spec
@@ -1385,6 +1383,10 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 );
                 format!("{}-run-{}", self.child_id, uuid::Uuid::new_v4())
             });
+        let workflow_usage_requested = run.messages.iter().any(|message| {
+            message["role"] == "system"
+                && message["metadata"][bamboo_subagent::proto::WORKFLOW_USAGE_REQUESTED_KEY] == true
+        });
         let expected_activation_run_id = run.activation_run_id.clone();
         match self.agent.storage().load_session(&logical_session_id).await {
             Ok(Some(current)) => {
@@ -1418,6 +1420,14 @@ impl ChildExecutor for BambooRuntimeExecutor {
             }
         }
         let initial_deliveries = run.initial_session_messages.clone();
+        if self.initial_input_release_required
+            && initial_deliveries.len()
+                > bamboo_domain::SessionInboxLimits::default().max_claim_batch
+        {
+            return ChildOutcome::error(
+                "initial release exceeds the existing Inbox claim batch bound",
+            );
+        }
         if !initial_deliveries.is_empty()
             && expected_activation_run_id
                 .as_deref()
@@ -1871,14 +1881,15 @@ impl ChildExecutor for BambooRuntimeExecutor {
                 }
             }
         }
-        let initial_release_deadline =
-            if self.initial_input_release_required && !initial_deliveries.is_empty() {
-                if initial_deliveries.len() != 1 {
-                    return ChildOutcome::error("initial release requires one exact typed input");
-                }
+        let mut initial_release_deadline: Option<chrono::DateTime<chrono::Utc>> = None;
+        if self.initial_input_release_required {
+            // Keep the existing exact-input v1 control and nonce for each item.
+            // No SDK/provider entry until every ordered Host ACK is released;
+            // later replies cannot extend the earliest physical lease deadline.
+            for delivery in &initial_deliveries {
                 let request = match bamboo_subagent::proto::InitialInputReleaseRequest::from_run(
                     &run,
-                    &initial_deliveries[0],
+                    delivery,
                     uuid::Uuid::new_v4().to_string(),
                 ) {
                     Ok(request) => request,
@@ -1888,12 +1899,15 @@ impl ChildExecutor for BambooRuntimeExecutor {
                     return ChildOutcome::error(error);
                 }
                 match steer.wait_initial_release(&request, &cancel, &events).await {
-                    Ok(deadline) => Some(deadline),
+                    Ok(deadline) => {
+                        initial_release_deadline = Some(
+                            initial_release_deadline.map_or(deadline, |old| old.min(deadline)),
+                        );
+                    }
                     Err(error) => return ChildOutcome::error(error),
                 }
-            } else {
-                None
-            };
+            }
+        }
 
         // In-band steering: typed ParentFrame::SessionMessage values enter the
         // worker-local durable SessionInbox. The real engine safe-turn bridge
@@ -2295,6 +2309,24 @@ impl ChildExecutor for BambooRuntimeExecutor {
         steer_done.cancel();
         let _ = steer_task.await;
         let _ = forward.await; // flush remaining events before the terminal frame
+        if workflow_usage_requested {
+            if let (Some(activation), Some(runtime)) = (
+                expected_activation_run_id.as_ref(),
+                session.agent_runtime_state.as_ref(),
+            ) {
+                let usage = bamboo_subagent::proto::WorkflowAgentUsage {
+                    kind: bamboo_subagent::proto::WorkflowAgentUsage::TYPE.into(),
+                    activation_run_id: activation.clone(),
+                    child_session_id: session.id.clone(),
+                    child_created_at: session.created_at,
+                    prompt_tokens: runtime.round.total_prompt_tokens,
+                    completion_tokens: runtime.round.total_completion_tokens,
+                };
+                tail_events
+                    .emit(serde_json::to_value(usage).expect("non-content Workflow usage"))
+                    .await;
+            }
+        }
 
         if let Some(checkpoint) = question_checkpoint
             .lock()
@@ -2358,7 +2390,31 @@ impl ChildExecutor for BambooRuntimeExecutor {
                     .unwrap_or_default();
                 ChildOutcome::completed(text)
             }
-            Err(AgentError::Cancelled) => ChildOutcome::cancelled(),
+            Err(AgentError::Cancelled) => {
+                // Execution has stopped. Supply the existing bounded DATA only
+                // on a selected strict Read/Glob route; the Host independently
+                // validates and checkpoints it before proving this cancellation.
+                if self.local_tool_history
+                    && self.read_only_child
+                    && self.native_tool_ceiling.as_ref().is_some_and(|ceiling| {
+                        !ceiling.tools.is_empty()
+                            && ceiling
+                                .tools
+                                .iter()
+                                .all(|name| matches!(name.as_str(), "Read" | "Glob"))
+                    })
+                {
+                    if let Ok(observation) = local_tool_completion(&session) {
+                        tail_events
+                            .emit(
+                                serde_json::to_value(observation)
+                                    .expect("validated local cancellation DATA"),
+                            )
+                            .await;
+                    }
+                }
+                ChildOutcome::cancelled()
+            }
             Err(e) => ChildOutcome::error(e.to_string()),
         }
     }
@@ -2454,8 +2510,10 @@ fn build_isolated_config(
         "provider": factory_name,
         "providers": { factory_name: slot },
     });
-    serde_json::from_value::<Config>(value)
-        .map_err(|e| format!("assemble isolated config for '{factory_name}': {e}"))
+    let mut config = serde_json::from_value::<Config>(value)
+        .map_err(|e| format!("assemble isolated config for '{factory_name}': {e}"))?;
+    config.subagents_mut().max_spawn_depth = spec.capabilities.max_spawn_depth;
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -2468,6 +2526,8 @@ mod tests {
     use bamboo_subagent::proto::{LogicalSessionIdentity, RunSecrets, SessionMessageDelivery};
     use bamboo_subagent::provision::{ChildIdentity, ModelRefSpec, ScopedCredential};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    include!("subagent_worker_cold_input_tests.rs");
 
     #[test]
     fn local_completion_preserves_message_data_and_refuses_provider_state() {
@@ -2647,6 +2707,7 @@ mod tests {
         BambooRuntimeExecutor {
             agent,
             session_inbox: inbox.clone(),
+            worker_event_senders: Arc::default(),
             model: Some("test-model".to_string()),
             workspace: None,
             disabled_tools: None,
@@ -3799,6 +3860,16 @@ mod tests {
                 1 => chunks.push(Ok(LLMChunk::Token(LOCAL_HISTORY_REPORT.into()))),
                 _ => panic!("local history fixture unexpectedly requested round {round}"),
             }
+            // Explicit provider counts also exercise canonical provider-first accounting.
+            chunks.push(Ok(LLMChunk::ProviderUsage {
+                input_tokens: Some(if round == 0 { 11 } else { 13 }),
+                output_tokens: Some(if round == 0 { 7 } else { 5 }),
+                total_tokens: Some(18),
+                reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+                cache_write_input_tokens: None,
+            }));
             chunks.push(Ok(LLMChunk::Done));
             Ok(Box::pin(futures::stream::iter(chunks)))
         }
@@ -3955,6 +4026,49 @@ mod tests {
         executor.native_tool_ceiling = Some(ceiling);
         executor.local_tool_history = true;
         (temp, executor, store, provider, run)
+    }
+
+    #[tokio::test]
+    async fn workflow_agent_worker_observes_all_provider_requests_once() {
+        use bamboo_subagent::proto::{WorkflowAgentUsage, WORKFLOW_USAGE_REQUESTED_KEY};
+        let (_temp, executor, _store, provider, mut run) =
+            strict_local_history_read_fixture(false).await;
+        run.messages[0]["metadata"] = serde_json::json!({ (WORKFLOW_USAGE_REQUESTED_KEY): true });
+        let (events, mut rx, _control) = EventSink::channel_with_control();
+        let outcome = ChildExecutor::run(
+            &executor,
+            run.clone(),
+            events,
+            SteerInbox::disconnected(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(outcome.status, bamboo_subagent::TerminalStatus::Completed);
+        assert_eq!(provider.calls.lock().unwrap().len(), 2);
+        let mut observations = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if event["type"] == WorkflowAgentUsage::TYPE {
+                observations.push(serde_json::from_value::<WorkflowAgentUsage>(event).unwrap());
+            }
+        }
+        assert_eq!(observations.len(), 1);
+        let usage = &observations[0];
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens()
+            ),
+            (24, 12, 36)
+        );
+        assert_eq!(
+            Some(usage.activation_run_id.as_str()),
+            run.activation_run_id.as_deref()
+        );
+        assert_eq!(
+            usage.child_session_id,
+            run.logical_session.unwrap().session_id
+        );
     }
 
     async fn assert_strict_local_history_read(with_reasoning: bool, over_broker: bool) {
@@ -4993,6 +5107,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_assembly_real_worker_synced_scope_and_strict_native_parity() {
+        for strict in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            // A localhost hold fixture satisfies provider construction without any model invocation.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut spec = spec_with(
+                "openai",
+                "unused-fixture-key",
+                Some(("openai", "test-model")),
+            );
+            spec.storage_dir = Some(home.path().join("worker").to_string_lossy().into_owned());
+            spec.fabric_dir = home.path().join("fabric").to_string_lossy().into_owned();
+            spec.workspace = Some(home.path().to_string_lossy().into_owned());
+            spec.secrets.provider_credentials[0].base_url = Some(format!("http://{address}/v1"));
+            let skills = home.path().join("synced-skills");
+            let skill = skills.join("assembly-worker");
+            std::fs::create_dir_all(skill.join("references")).unwrap();
+            std::fs::write(skill.join("SKILL.md"), "---\nname: assembly-worker\ndescription: Assembly worker\nmetadata:\n  dynamic_context:\n    - id: proof\n      tool: Read\n      input: {path: provider.txt}\n---\nWORKER_INSTRUCTIONS\n").unwrap();
+            std::fs::write(skill.join("references/proof.txt"), "SYNCED_RESOURCE\n").unwrap();
+            std::fs::write(
+                home.path().join("provider.txt"),
+                "MUST_NOT_DISPATCH_PROVIDER\n",
+            )
+            .unwrap();
+            if strict {
+                spec.identity.child_id = "assembly-strict".into();
+                spec.identity.parent_id = Some("assembly-root".into());
+                spec.identity.depth = 1;
+                spec.capabilities.required_child_context = true;
+                spec.capabilities.child_creation_identity = true;
+                spec.capabilities.enforce_permissions = true;
+                spec.capabilities.native_tool_ceiling_required = true;
+                spec.capabilities.native_tool_ceiling =
+                    Some(bamboo_subagent::proto::NativeToolCeiling {
+                        version: 1,
+                        child_session_id: spec.identity.child_id.clone(),
+                        parent_session_id: "assembly-root".into(),
+                        root_session_id: "assembly-root".into(),
+                        created_at: Utc::now(),
+                        spawn_depth: 1,
+                        project_id: None,
+                        tools: vec!["Read".into()],
+                    });
+            } else {
+                spec.capabilities.skills_dir = Some(skills.to_string_lossy().into_owned());
+            }
+            spec.validate().unwrap();
+            let runtime = BambooRuntimeExecutor::build(&spec).await.unwrap();
+            let tools = runtime.agent.default_tools();
+            let names: Vec<_> = tools
+                .list_tools()
+                .into_iter()
+                .map(|schema| schema.function.name)
+                .collect();
+            assert!(!names
+                .iter()
+                .any(|name| name == "skills_read" || name == "skills_list"));
+            let mut session = Session::new("assembly-worker-session", "test-model");
+            session.set_workspace_path_meta(home.path().to_string_lossy().into_owned());
+            session.metadata.insert(
+                bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.into(),
+                "[\"assembly-worker\"]".into(),
+            );
+            runtime
+                .agent
+                .storage()
+                .save_session(&session)
+                .await
+                .unwrap();
+            let call = ToolCall {
+                id: "assembly-worker-load".into(),
+                tool_type: "function".into(),
+                function: bamboo_agent_core::tools::FunctionCall {
+                    name: "load_skill".into(),
+                    arguments: serde_json::json!({"skill_id": "assembly-worker"}).to_string(),
+                },
+            };
+            let mut ctx = bamboo_agent_core::ToolExecutionContext::none(&call.id);
+            ctx.session_id = Some(&session.id);
+            if strict {
+                assert_eq!(names, ["Read"]);
+                assert!(tools.execute_with_context(&call, ctx).await.is_err());
+                let saved = runtime
+                    .agent
+                    .storage()
+                    .load_session(&session.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!saved
+                    .metadata
+                    .contains_key(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY));
+                continue;
+            }
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|name| name.as_str() == "load_skill")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                names
+                    .iter()
+                    .filter(|name| name.as_str() == "read_skill_resource")
+                    .count(),
+                1
+            );
+            let result = tools.execute_with_context(&call, ctx).await.unwrap();
+            assert!(result.success);
+            let receipt: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+            assert_eq!(receipt["activation_status"], "active");
+            let saved = runtime
+                .agent
+                .storage()
+                .load_session(&session.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let active: bamboo_skills::ActiveWorkflow =
+                serde_json::from_str(&saved.metadata[bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY])
+                    .unwrap();
+            assert_eq!(
+                active.dynamic_context[0].status,
+                bamboo_skills::WorkflowActivationStatus::Degraded
+            );
+            assert_eq!(
+                active.dynamic_context[0].provenance,
+                "typed_authority_unavailable"
+            );
+            assert!(active.dynamic_context[0].content.is_empty());
+            let read = ToolCall {
+                id: "assembly-worker-read".into(), tool_type: "function".into(),
+                function: bamboo_agent_core::tools::FunctionCall {
+                    name: "read_skill_resource".into(), arguments: serde_json::json!({"skill_id": "assembly-worker", "resource_path": "references/proof.txt"}).to_string(),
+                },
+            };
+            let mut ctx = bamboo_agent_core::ToolExecutionContext::none(&read.id);
+            ctx.session_id = Some(&session.id);
+            let result = tools.execute_with_context(&read, ctx).await.unwrap();
+            assert!(result.success && result.result.contains("SYNCED_RESOURCE"));
+            assert!(tools.execute(&read).await.is_err());
+            assert!(
+                listener.into_std().unwrap().accept().is_err(),
+                "no model request occurred"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn worker_session_note_uses_the_injected_jiandu_store() {
         let temp = tempfile::tempdir().unwrap();
         let selected_store = MemoryStore::new(temp.path().join("selected-jiandu"));
@@ -5090,17 +5355,26 @@ mod tests {
         assert_eq!(slot.api_key, "sk-oa");
     }
 
+    #[test]
+    fn spawn_depth_worker_config_preserves_provisioned_cap_and_legacy_default() {
+        let mut spec = spec_with("openai", "sk-test", Some(("openai", "gpt-test")));
+        for cap in [None, Some(0), Some(7)] {
+            spec.capabilities.max_spawn_depth = cap;
+            let config =
+                build_isolated_config("openai", spec.secrets.provider_credentials.first(), &spec)
+                    .unwrap();
+            assert_eq!(
+                config.subagents().effective_max_spawn_depth(),
+                cap.unwrap_or(bamboo_config::DEFAULT_MAX_SPAWN_DEPTH)
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn nested_worker_idle_session_message_uses_real_resume_reservation() {
+    async fn nested_worker_unroutable_child_reserves_once_and_preserves_unacknowledged_inbox() {
         let temp = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let provider_addr = listener.local_addr().unwrap();
-        let provider_hold = tokio::spawn(async move {
-            if let Ok((socket, _)) = listener.accept().await {
-                let _socket = socket;
-                std::future::pending::<()>().await;
-            }
-        });
         let mut spec = spec_with("openai", "sk-test", Some(("openai", "gpt-test")));
         spec.storage_dir = Some(temp.path().join("worker").to_string_lossy().into_owned());
         spec.fabric_dir = temp.path().join("fabric").to_string_lossy().into_owned();
@@ -5121,12 +5395,30 @@ mod tests {
         child.kind = SessionKind::Child;
         child.parent_session_id = Some("worker-parent".to_string());
         child.root_session_id = "worker-parent".to_string();
+        // This deliberately lacks the legacy Actor route. It exercises real
+        // reservation followed by fail-closed backend admission, not successful
+        // legacy Worker execution or an in-process fallback.
+        assert!(
+            !runtime
+                .child_runner
+                .as_ref()
+                .expect("nested worker child runner")
+                .should_handle(&child)
+                .await
+        );
         runtime
             .agent
             .storage()
             .save_session(&child)
             .await
             .expect("seed idle nested child");
+        let mut child_events = runtime
+            .worker_event_senders
+            .write()
+            .await
+            .entry(child.id.clone())
+            .or_insert_with(|| tokio::sync::broadcast::channel(32).0)
+            .subscribe();
 
         let envelope = SessionMessageEnvelope {
             id: SessionMessageId::parse("nested-idle-message").unwrap(),
@@ -5167,16 +5459,123 @@ mod tests {
             receipt.activation,
             bamboo_domain::SessionActivationDisposition::ActivationReserved
         );
+        let router = runtime.agent.activation_router().expect("worker router");
+        let run_id = router
+            .current_run_id(&child.id)
+            .await
+            .expect("real reservation owns the child");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match child_events.recv().await.expect("child event stream") {
+                    AgentEvent::Error { message } => {
+                        assert_eq!(
+                            message,
+                            format!(
+                                "Child {} activation blocked; execution outcome is unconfirmed: \
+                                 No child execution backend matched the canonical Session",
+                                child.id
+                            )
+                        );
+                        break;
+                    }
+                    AgentEvent::Complete { .. } => {
+                        panic!("unroutable child must not publish successful completion")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("actual backend rejection must be published");
+        let rejected = runtime
+            .session_inbox
+            .inspect(&child.id)
+            .await
+            .expect("backlog after backend rejection");
+        assert_eq!(
+            (
+                rejected.pending,
+                rejected.claimed,
+                rejected.generation,
+                rejected.oldest_generation,
+            ),
+            (
+                backlog.pending,
+                backlog.claimed,
+                backlog.generation,
+                backlog.oldest_generation,
+            ),
+            "backend refusal must not claim or ACK input"
+        );
+        assert_eq!(
+            [
+                backlog.activation_generation,
+                backlog.coordinator_generation,
+                backlog.interrupt_generation,
+            ],
+            [0; 3],
+            "admission alone does not authorize activation"
+        );
+        assert_eq!(
+            [
+                rejected.activation_generation,
+                rejected.coordinator_generation,
+                rejected.interrupt_generation,
+            ],
+            [admission.delivery.generation; 3],
+            "activation authorizes this generation before backend admission"
+        );
         let coalesced = messenger
             .activate(&admission)
             .await
             .expect("duplicate wake must target the existing owner");
         assert_eq!(
             coalesced.activation,
-            bamboo_domain::SessionActivationDisposition::ActiveNotified,
-            "the same durable generation must not reserve or launch a second runner"
+            bamboo_domain::SessionActivationDisposition::ActivationCoalesced,
+            "the rejected owner must not reserve or launch a second runner"
         );
-        provider_hold.abort();
+        assert_eq!(router.current_run_id(&child.id).await, Some(run_id));
+        let retained = runtime
+            .session_inbox
+            .inspect(&child.id)
+            .await
+            .expect("unacknowledged worker backlog");
+        assert_eq!(
+            (
+                retained.pending,
+                retained.claimed,
+                retained.generation,
+                retained.oldest_generation,
+            ),
+            (
+                rejected.pending,
+                rejected.claimed,
+                rejected.generation,
+                rejected.oldest_generation,
+            ),
+            "duplicate activation must not alter the retained input"
+        );
+        assert_eq!(
+            [
+                retained.activation_generation,
+                retained.coordinator_generation,
+                retained.interrupt_generation,
+            ],
+            [
+                rejected.activation_generation,
+                rejected.coordinator_generation,
+                rejected.interrupt_generation,
+            ],
+            "duplicate activation must not advance scheduling generations"
+        );
+        assert_eq!(retained.pending, 1);
+        assert_eq!(retained.claimed, 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "backend refusal must not contact the model provider"
+        );
     }
 
     #[tokio::test]

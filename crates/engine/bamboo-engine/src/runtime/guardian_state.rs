@@ -323,6 +323,8 @@ pub fn read_only_child_disabled_tools() -> BTreeSet<String> {
         "request_permissions",
         "conclusion_with_options",
         // Ambient/arbitrary execution surfaces, and web.
+        "exec_command",
+        "write_stdin",
         "Bash",
         "BashInput",
         "BashOutput",
@@ -587,6 +589,8 @@ mod tests {
             "memory",
             "ledger",
             "workflow_run",
+            "exec_command",
+            "write_stdin",
             "Bash",
             "BashOutput",
             "KillShell",

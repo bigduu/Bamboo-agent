@@ -109,8 +109,13 @@ pub async fn ready(client: &reqwest::Client, base: &str, host: &mut Host, data: 
     .expect("actual Host startup");
 }
 
+pub type ControlledResponse = fn(&Value, &Probe) -> Option<(Value, &'static str)>;
+
 #[derive(Default)]
 pub struct Probe {
+    /// Optional deterministic scenario. It sees real provider requests only.
+    pub controlled_response: std::sync::Mutex<Option<ControlledResponse>>,
+    pub scenario: std::sync::Mutex<Value>,
     pub coding_path: std::sync::Mutex<Option<(String, String)>>,
     pub hold_code: std::sync::atomic::AtomicBool,
     pub ui_fixture: std::sync::atomic::AtomicBool,
@@ -119,10 +124,55 @@ pub struct Probe {
     pub held: AtomicUsize,
     pub input_checks: AtomicUsize,
     pub questions: AtomicUsize,
+    pub question_retries: AtomicUsize,
     pub answer_checks: AtomicUsize,
     pub release: tokio::sync::Notify,
 }
+
+/// Native Task returns the service error directly; the legacy HostBridge wraps
+/// it once. These are the two exact wire forms of this fixture's known CAS race,
+/// not a general production error classifier or retry policy.
+pub fn is_question_revision_conflict(content: &str) -> bool {
+    matches!(
+        content,
+        "revision_conflict" | "authority_unavailable: revision_conflict"
+    )
+}
+
+/// A new model attempt must not reuse a completed tool-call identity. Only the
+/// known concurrent Ticket revision conflict permits this fixture to retry.
+pub fn question_call(messages: &Value, letter: &str, probe: &Probe) -> Value {
+    let prefix = format!("ticket-native-question-{letter}-");
+    let previous: Vec<_> = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    for (attempt, result) in previous.iter().enumerate() {
+        assert_eq!(result["tool_call_id"], format!("{prefix}{attempt}"));
+        let content = result["content"].as_str().unwrap();
+        assert!(
+            is_question_revision_conflict(content),
+            "question may retry only an observed Ticket revision conflict: {result}"
+        );
+    }
+    if !previous.is_empty() {
+        probe.question_retries.fetch_add(1, Ordering::SeqCst);
+    }
+    probe.questions.fetch_add(1, Ordering::SeqCst);
+    let args = json!({"tasks":[{"id":"own-step","content":format!("Own private plan {letter}"),"status":"blocked"}],"question":{"prompt":format!("问题 {letter}：请给出专属答案")}});
+    json!({"index":0,"id":format!("{prefix}{}", previous.len()),"type":"function","function":{"name":"Task","arguments":args.to_string()}})
+}
+
 async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpResponse {
+    let controlled = *probe.controlled_response.lock().unwrap();
+    if let Some((delta, finish)) = controlled.and_then(|respond| respond(&body, &probe)) {
+        let event = json!({"id":"ticket-controlled-scenario","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":finish}]});
+        return HttpResponse::Ok()
+            .content_type("text/event-stream")
+            .body(format!("data: {event}\n\ndata: [DONE]\n\n"));
+    }
     let task_only = body["tools"]
         .as_array()
         .is_some_and(|tools| tools.len() == 1 && tools[0]["function"]["name"] == "Task");
@@ -262,9 +312,8 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 body["tools"][0]["function"]["parameters"]["properties"]["question"].is_object()
             );
             if !content.contains(&format!("答案 {letter}")) {
-                probe.questions.fetch_add(1, Ordering::SeqCst);
-                let args = json!({"tasks":[{"id":"own-step","content":format!("Own private plan {letter}"),"status":"blocked"}],"question":{"prompt":format!("问题 {letter}：请给出专属答案")}});
-                let delta = json!({"tool_calls":[{"index":0,"id":"ticket-native-question","type":"function","function":{"name":"Task","arguments":args.to_string()}}]});
+                let delta =
+                    json!({"tool_calls":[question_call(&body["messages"], letter, &probe)]});
                 let event = json!({"id":"ticket-question","object":"chat.completion.chunk","choices":[{"index":0,"delta":delta,"finish_reason":"tool_calls"}]});
                 return HttpResponse::Ok()
                     .content_type("text/event-stream")
@@ -486,6 +535,17 @@ impl Fixture {
         Self::with_fault(None).await
     }
     pub async fn with_fault(fault: Option<(&str, &str)>) -> Self {
+        Self::with_backend(fault, false).await
+    }
+    /// Physical Worker-PID fixtures explicitly select the retained process
+    /// backend. Ordinary Ticket fixtures continue to exercise native tasks.
+    pub async fn legacy_worker() -> Self {
+        Self::legacy_worker_with_fault(None).await
+    }
+    pub async fn legacy_worker_with_fault(fault: Option<(&str, &str)>) -> Self {
+        Self::with_backend(fault, true).await
+    }
+    async fn with_backend(fault: Option<(&str, &str)>, legacy_worker: bool) -> Self {
         let temp = tempfile::Builder::new()
             .prefix("bamboo-1481-ticket-lifecycle-")
             .tempdir_in("/tmp")
@@ -518,13 +578,16 @@ impl Fixture {
         let running = server.run();
         let provider_handle = running.handle();
         actix_web::rt::spawn(running);
-        let synthetic_config =
-            serde_json::to_vec(&json!({"provider":"openai","setup":{"completed":true},
+        let mut synthetic_config = json!({"provider":"openai","setup":{"completed":true},
         "features":{"provider_model_ref":true,"ticket_mutation":true,"ticket_dispatch":true},
         "providers":{"openai":{"api_key":"fixture","base_url":url,"model":"ticket-model"}},
         "defaults":{"chat":{"provider":"openai","model":"ticket-model"}},
-        "subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":5}}))
-            .unwrap();
+        "subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":5}});
+        if legacy_worker {
+            synthetic_config["subagents"]["worker_bin"] = json!(env!("CARGO_BIN_EXE_bamboo"));
+            synthetic_config["subagents"]["worker_args"] = json!(["subagent-worker"]);
+        }
+        let synthetic_config = serde_json::to_vec(&synthetic_config).unwrap();
         std::fs::write(data.join("config.json"), &synthetic_config).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();

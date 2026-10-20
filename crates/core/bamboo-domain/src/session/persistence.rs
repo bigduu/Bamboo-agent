@@ -210,6 +210,23 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         None
     }
 
+    /// Execution-private input restriction. A selector carries no authority;
+    /// only a persister already bound to a real Root writer may install it.
+    /// Unsupported hosts fail closed. This introduces no durable state.
+    fn bind_root_inbox_receipt(
+        &self,
+        _receipt: crate::SessionInboxReceipt,
+    ) -> io::Result<Arc<dyn RuntimeSessionPersistence>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Root receipt binding unsupported",
+        ))
+    }
+
+    fn root_inbox_receipt(&self) -> Option<&crate::SessionInboxReceipt> {
+        None
+    }
+
     /// Whether this Host requires an explicit execution capability for the
     /// proposed Root. A route without a bound event/persistence handoff must
     /// reject before claiming or making a provider call.
@@ -431,6 +448,48 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         self.save_runtime_session(session).await
     }
 
+    /// Only the existing owner may claim structured Loop inputs. Unsupported
+    /// adapters do not fall back to ordinary provider-message admission.
+    async fn claim_scoped_loop_controls(
+        &self,
+        _session: &Session,
+        _inbox: Arc<dyn crate::SessionInboxPort>,
+        _active_run_id: &str,
+        _limit: usize,
+    ) -> io::Result<Vec<crate::ScopedLoopControlClaim>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "scoped Loop claims unsupported",
+        ))
+    }
+
+    /// State, immutable control outcome and typed consumption proof share the
+    /// actual target checkpoint; ACK is last. Err never means rollback.
+    async fn checkpoint_scoped_loop_control(
+        &self,
+        _session: &mut Session,
+        _bindings: &[crate::ScopedLoopControlBinding],
+        _activation: Arc<dyn crate::SessionActivationPort>,
+        _input: Option<(
+            Arc<dyn crate::SessionInboxPort>,
+            crate::ScopedLoopControlClaim,
+        )>,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "scoped Loop checkpoint unsupported",
+        ))
+    }
+
+    /// Canonical read after a failed/uncertain checkpoint. A cached Session or
+    /// the proposed caller snapshot is not confirmation of what was written.
+    async fn load_loop_control_checkpoint(&self, _session_id: &str) -> io::Result<Option<Session>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "strict Loop checkpoint reload unsupported",
+        ))
+    }
+
     async fn admit_root_inbox(
         &self,
         _session: &mut Session,
@@ -440,7 +499,7 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         Ok(None)
     }
 
-    /// Atomically commit a staged retrieval-window transcript rewrite.
+    /// Atomically commit a staged archive transcript rewrite.
     ///
     /// `expected_base` is the exact pre-archive Session used for planning.
     /// Implementations must compare it with the latest durable transcript while
@@ -448,7 +507,9 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     /// rewrite is present, they must perform no save, rebase `staged` onto that
     /// durable snapshot, and return [`RetrievalWindowCheckpointOutcome::Rebased`].
     /// Otherwise they must preserve the staged message archive flags and commit
-    /// them with the compression event and model-context reset.
+    /// them with the compression event and model-context reset. The built-in
+    /// implementation also accepts a MessageSummary archive through this same
+    /// boundary, preserving raw history while replacing its derived summary.
     ///
     /// There is no safe fallback through the ordinary append-only checkpoint,
     /// because that path deliberately restores durable message clones and would
@@ -526,6 +587,18 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     /// hook to merge narrowly-scoped tool side effects before its next save.
     async fn load_runtime_session(&self, _session_id: &str) -> io::Result<Option<Session>> {
         Ok(None)
+    }
+
+    /// Read a canonical snapshot for execution admission without publishing or
+    /// trusting a cached clone. Preserve the same bound-reader checks as the
+    /// runtime loader. A persister with a cache must override this operation to
+    /// read its durable source (or return Unsupported); the default serves
+    /// uncached/legacy loaders. This read never grants execution/write authority.
+    async fn load_runtime_admission_snapshot(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Session>> {
+        self.load_runtime_session(session_id).await
     }
 
     /// Clear the bounded compatibility queue iff it still equals the entries
@@ -616,6 +689,17 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
 
     fn root_actor_writer(&self) -> Option<crate::RootActorRuntimeWrite> {
         (**self).root_actor_writer()
+    }
+
+    fn bind_root_inbox_receipt(
+        &self,
+        receipt: crate::SessionInboxReceipt,
+    ) -> io::Result<Arc<dyn RuntimeSessionPersistence>> {
+        (**self).bind_root_inbox_receipt(receipt)
+    }
+
+    fn root_inbox_receipt(&self) -> Option<&crate::SessionInboxReceipt> {
+        (**self).root_inbox_receipt()
     }
 
     fn root_actor_execution_required(&self, session: &Session) -> bool {
@@ -725,6 +809,37 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
         (**self).checkpoint_runtime_session(session).await
     }
 
+    async fn claim_scoped_loop_controls(
+        &self,
+        session: &Session,
+        inbox: Arc<dyn crate::SessionInboxPort>,
+        active_run_id: &str,
+        limit: usize,
+    ) -> io::Result<Vec<crate::ScopedLoopControlClaim>> {
+        (**self)
+            .claim_scoped_loop_controls(session, inbox, active_run_id, limit)
+            .await
+    }
+
+    async fn checkpoint_scoped_loop_control(
+        &self,
+        session: &mut Session,
+        bindings: &[crate::ScopedLoopControlBinding],
+        activation: Arc<dyn crate::SessionActivationPort>,
+        input: Option<(
+            Arc<dyn crate::SessionInboxPort>,
+            crate::ScopedLoopControlClaim,
+        )>,
+    ) -> io::Result<()> {
+        (**self)
+            .checkpoint_scoped_loop_control(session, bindings, activation, input)
+            .await
+    }
+
+    async fn load_loop_control_checkpoint(&self, session_id: &str) -> io::Result<Option<Session>> {
+        (**self).load_loop_control_checkpoint(session_id).await
+    }
+
     async fn admit_root_inbox(
         &self,
         session: &mut Session,
@@ -778,6 +893,13 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
 
     async fn load_runtime_session(&self, session_id: &str) -> io::Result<Option<Session>> {
         (**self).load_runtime_session(session_id).await
+    }
+
+    async fn load_runtime_admission_snapshot(
+        &self,
+        session_id: &str,
+    ) -> io::Result<Option<Session>> {
+        (**self).load_runtime_admission_snapshot(session_id).await
     }
 
     async fn clear_legacy_pending_messages(

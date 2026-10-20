@@ -14,7 +14,8 @@ use super::{assemble_session_tree, ChildSessionEntry, SessionTreeNode, MAX_CHILD
 
 pub const MAX_TREE_CURSOR_BYTES: usize = 128;
 const PAGE_NODES: usize = 32;
-const MAX_DEPTH: u32 = 4;
+// A display window, independent of the policy for creating new children.
+const DISPLAY_DEPTH: u32 = 4;
 const INDEX_NODE_CAP: usize = 5000;
 pub const INDEX_SNAPSHOT_CAP: usize = 50_000;
 
@@ -120,7 +121,7 @@ async fn lineage(
     caller_id: &str,
 ) -> Result<Vec<Session>, OwnedTreeError> {
     let caller = port.load(caller_id).await?;
-    if caller.id != caller_id || caller.spawn_depth > MAX_DEPTH {
+    if caller.id != caller_id {
         return Err(OwnedTreeError::InvalidLineage);
     }
     let caller_actor = actor(&caller)?;
@@ -135,7 +136,7 @@ async fn lineage(
             .parent_session_id
             .as_deref()
             .ok_or(OwnedTreeError::InvalidLineage)?;
-        if !seen.insert(parent_id.to_owned()) || lineage.len() > MAX_DEPTH as usize {
+        if !seen.insert(parent_id.to_owned()) || lineage.len() > INDEX_NODE_CAP {
             return Err(OwnedTreeError::InvalidLineage);
         }
         let parent = port.load(parent_id).await?;
@@ -205,7 +206,7 @@ async fn verified_tree(
     });
     let mut queue = VecDeque::from([(caller.clone(), 0_u32)]);
     while let Some((parent, depth)) = queue.pop_front() {
-        if depth >= MAX_DEPTH - caller.spawn_depth {
+        if depth >= DISPLAY_DEPTH {
             continue;
         }
         let mut ids = if let Some(indexed) = &indexed {
@@ -246,12 +247,7 @@ async fn verified_tree(
         }
         adjacency.insert(parent.id, children);
     }
-    let tree = assemble_session_tree(
-        &caller.id,
-        &caller.title,
-        &adjacency,
-        MAX_DEPTH - caller.spawn_depth,
-    );
+    let tree = assemble_session_tree(&caller.id, &caller.title, &adjacency, DISPLAY_DEPTH);
     Ok((tree, hex::encode(proof.finalize())))
 }
 
@@ -285,7 +281,7 @@ fn page(
     raw_cursor: Option<&str>,
     scope_digest: &str,
 ) -> Result<Value, OwnedTreeError> {
-    let max_depth = MAX_DEPTH - caller.spawn_depth;
+    let max_depth = DISPLAY_DEPTH;
     let mut pending = vec![(tree, None)];
     let mut nodes = Vec::new();
     let mut depth_limited = false;

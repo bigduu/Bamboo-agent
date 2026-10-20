@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
 
 use async_trait::async_trait;
 use bamboo_domain::{
@@ -201,18 +201,53 @@ pub trait SessionActivationSpawner: Send + Sync {
 
 #[derive(Debug, Clone)]
 struct ActiveOwner {
+    instance: Arc<()>,
     run_id: String,
+    /// Set only by a real registration at its Session-bound execution entry.
+    session_created_at: Option<DateTime<Utc>>,
     finalizing: bool,
     registrations: usize,
+    /// Scheduling boundary for this owner, not durable queue/authority state.
+    /// Keep wait/Guardian outcomes together until this exact Run leaves.
+    child_completions_need_successor: bool,
     /// Present only while an external actor driver is alive. The payload is a
     /// wake generation; that driver remains the single consumer of the
     /// canonical FileSessionInbox and forwards the claimed typed envelope.
     delivery_sink: Option<mpsc::UnboundedSender<u64>>,
+    scoped_loop: Option<SupervisorLoopGrant>,
+}
+
+#[derive(Debug, Clone)]
+struct SupervisorLoopGrant {
+    binding: bamboo_domain::ScopedLoopControlBinding,
+    execution_cancel: tokio_util::sync::CancellationToken,
+    host_stop: tokio_util::sync::CancellationToken,
+}
+impl SupervisorLoopGrant {
+    fn stopped(&self) -> bool {
+        self.execution_cancel.is_cancelled() || self.host_stop.is_cancelled()
+    }
+}
+
+struct SupervisorLoopDeliveryGuard {
+    inner: ExpectedRunDeliveryGuard,
+    grant: SupervisorLoopGrant,
+}
+impl bamboo_domain::SessionRunDeliveryGuard for SupervisorLoopDeliveryGuard {
+    fn matches(&self, target: &str, birth: DateTime<Utc>, run: &str) -> bool {
+        !self.grant.stopped()
+            && bamboo_domain::SessionRunDeliveryGuard::matches(&self.inner, target, birth, run)
+    }
+    fn notify_committed_delivery(&self, generation: u64) -> bool {
+        self.inner.notify_if(generation, || !self.grant.stopped())
+    }
 }
 
 #[derive(Debug)]
 struct TargetActivationState {
     latest_generation: u64,
+    /// Delivery notification only. Never participates in successor scheduling.
+    latest_delivery_generation: u64,
     /// Highest generation for which this process already launched an execution.
     /// Adopting an independently running owner does not consume this retry. If a
     /// launched execution leaves the same poison claim pending,
@@ -247,6 +282,7 @@ impl Default for TargetActivationState {
         let (notify, _receiver) = watch::channel(0);
         Self {
             latest_generation: 0,
+            latest_delivery_generation: 0,
             last_dispatched_generation: 0,
             last_dispatched_coordinator_generation: 0,
             owner_completion_epoch: 0,
@@ -407,16 +443,96 @@ impl Drop for ActivationReservationLease {
     }
 }
 
+struct ExpectedRunDeliveryGuard {
+    target_session_id: String,
+    session_created_at: DateTime<Utc>,
+    run_id: String,
+    states: Arc<Mutex<HashMap<String, TargetActivationState>>>,
+    _publication: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl bamboo_domain::SessionRunDeliveryGuard for ExpectedRunDeliveryGuard {
+    fn matches(
+        &self,
+        target_session_id: &str,
+        target_created_at: DateTime<Utc>,
+        expected_run_id: &str,
+    ) -> bool {
+        self.target_session_id == target_session_id
+            && self.session_created_at == target_created_at
+            && self.run_id == expected_run_id
+    }
+
+    fn notify_committed_delivery(&self, inbox_generation: u64) -> bool {
+        self.notify_if(inbox_generation, || true)
+    }
+}
+
+impl ExpectedRunDeliveryGuard {
+    fn notify_if(&self, inbox_generation: u64, allowed: impl FnOnce() -> bool) -> bool {
+        // The blocking publication job already holds this target's fence.
+        // Take the global map only for its short notification update.
+        let mut states = self.states.blocking_lock();
+        let Some(state) = states.get_mut(&self.target_session_id) else {
+            return false;
+        };
+        let Some(owner) = state.owner.as_mut().filter(|owner| {
+            owner.run_id == self.run_id
+                && owner.session_created_at == Some(self.session_created_at)
+                && !owner.finalizing
+                && owner.registrations > 0
+                && allowed()
+        }) else {
+            return false;
+        };
+        // Same QueueOnly notification contract as v2: never reserve a successor.
+        state.latest_delivery_generation = state.latest_delivery_generation.max(inbox_generation);
+        state.notify.send_replace(inbox_generation);
+        if owner
+            .delivery_sink
+            .as_ref()
+            .is_some_and(|sink| sink.send(inbox_generation).is_err())
+        {
+            owner.delivery_sink = None;
+        }
+        true
+    }
+}
+
 /// One router per owning runtime/AppState. All keys are logical Session ids.
 #[derive(Clone, Default)]
 pub struct SessionActivationRouter {
+    runtime_instance: Arc<()>,
     states: Arc<Mutex<HashMap<String, TargetActivationState>>>,
+    /// Live operations for one logical target share a fence. Weak entries are
+    /// pruned on access; idle/deleted targets retain no separate lock state.
+    publication_fences: TargetPublicationFences,
     spawner: Arc<RwLock<Option<Arc<dyn SessionActivationSpawner>>>>,
     inbox: Arc<StdRwLock<Option<Arc<dyn SessionInboxPort>>>>,
+    #[cfg(test)]
+    terminal_inspection_pause: Arc<Mutex<Option<TerminalInspectionPause>>>,
 }
+
+type TargetPublicationFences = Arc<StdMutex<HashMap<String, Weak<Mutex<()>>>>>;
+
+#[cfg(test)]
+type TerminalInspectionPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 
 type AbortCleanup =
     Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + 'static>;
+
+type ScopedTransportCleanup =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> + Send + Sync>;
+
+struct ClosedLoopTransportGuard(ExpectedRunDeliveryGuard);
+impl bamboo_domain::SessionRunDeliveryGuard for ClosedLoopTransportGuard {
+    fn matches(&self, target: &str, birth: DateTime<Utc>, run: &str) -> bool {
+        bamboo_domain::SessionRunDeliveryGuard::matches(&self.0, target, birth, run)
+    }
+    fn notify_committed_delivery(&self, _generation: u64) -> bool {
+        false
+    }
+}
 
 /// Exact-run ownership lease returned by
 /// [`SessionActivationRouter::register_run`].
@@ -426,15 +542,167 @@ type AbortCleanup =
 /// durable activation watermark, and gives the router one chance to launch a
 /// successor. A stale lease can never clear a newer owner.
 pub struct SessionRunRegistration {
+    instance: Arc<()>,
     router: Arc<SessionActivationRouter>,
     target_session_id: String,
     run_id: String,
     notifications: Option<watch::Receiver<u64>>,
     abort_cleanup: Option<AbortCleanup>,
+    scoped_transport_cleanup: Option<ScopedTransportCleanup>,
+    quarantine_on_drop: bool,
+    // The host binds the actual opaque scope before polling direct execution.
+    // It is not a Session/model field and cannot grant or weaken authority.
+    tool_suspension_observation: Option<bamboo_agent_core::tools::SuspensionRestriction>,
+    selected_input_wakes: Option<watch::Receiver<u64>>,
     armed: bool,
 }
 
+/// Private proof derived from a real registration, never reconstructed from
+/// metadata or the presence of another caller's active run.
+#[derive(Clone)]
+pub(crate) struct SessionRunOwnership {
+    instance: Arc<()>,
+    router: Arc<SessionActivationRouter>,
+    target_session_id: String,
+    run_id: String,
+}
+
+impl SessionRunOwnership {
+    /// Target authority only. Close under the producer's original publication
+    /// fence, without recreating a missing owner or consulting a revoked grant.
+    pub(crate) async fn close_scoped_transport(
+        &self,
+        binding: &bamboo_domain::ScopedLoopControlBinding,
+    ) -> std::io::Result<()> {
+        if binding.target_session_id != self.target_session_id
+            || binding.owner_run_id != self.run_id
+        {
+            return Err(std::io::Error::other(
+                "target transport proof identity differs",
+            ));
+        }
+        let _publication = self.router.lock_publication(&self.target_session_id).await;
+        let mut states = self.router.states.lock().await;
+        let owner = states
+            .get_mut(&self.target_session_id)
+            .and_then(|state| state.owner.as_mut())
+            .filter(|owner| {
+                Arc::ptr_eq(&owner.instance, &self.instance)
+                    && owner.run_id == self.run_id
+                    && owner.session_created_at == Some(binding.target_created_at)
+                    && owner.registrations > 0
+            })
+            .ok_or_else(|| {
+                std::io::Error::other("target transport owner is no longer registered")
+            })?;
+        if owner
+            .scoped_loop
+            .as_ref()
+            .is_some_and(|grant| grant.binding.execution_id != binding.execution_id)
+        {
+            return Err(std::io::Error::other("target transport execution differs"));
+        }
+        owner.finalizing = true;
+        Ok(())
+    }
+
+    pub(crate) fn retain_closed_scoped_transport(
+        &self,
+        binding: &bamboo_domain::ScopedLoopControlBinding,
+    ) -> std::io::Result<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>> {
+        if binding.target_session_id != self.target_session_id
+            || binding.owner_run_id != self.run_id
+        {
+            return Err(std::io::Error::other("closed transport identity differs"));
+        }
+        let publication = self
+            .router
+            .publication_fence(&self.target_session_id)
+            .blocking_lock_owned();
+        let states = self.router.states.blocking_lock();
+        if !states
+            .get(&self.target_session_id)
+            .and_then(|state| state.owner.as_ref())
+            .is_some_and(|owner| {
+                Arc::ptr_eq(&owner.instance, &self.instance)
+                    && owner.run_id == self.run_id
+                    && owner.session_created_at == Some(binding.target_created_at)
+                    && owner.finalizing
+                    && owner.registrations > 0
+            })
+        {
+            return Err(std::io::Error::other("closed transport owner changed"));
+        }
+        drop(states);
+        Ok(Arc::new(ClosedLoopTransportGuard(
+            ExpectedRunDeliveryGuard {
+                target_session_id: self.target_session_id.clone(),
+                session_created_at: binding.target_created_at,
+                run_id: self.run_id.clone(),
+                states: self.router.states.clone(),
+                _publication: publication,
+            },
+        )))
+    }
+
+    pub(crate) fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub(crate) fn router(&self) -> &Arc<SessionActivationRouter> {
+        &self.router
+    }
+
+    pub(crate) fn matches_router(&self, router: &Arc<SessionActivationRouter>) -> bool {
+        Arc::ptr_eq(&self.router, router)
+    }
+
+    pub(crate) async fn is_current(&self, session_id: &str) -> bool {
+        self.target_session_id == session_id && self.router.owns_run(session_id, &self.run_id).await
+    }
+}
+
 impl SessionRunRegistration {
+    pub(crate) fn set_scoped_transport_cleanup<F, Fut>(&mut self, cleanup: F)
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::io::Result<()>> + Send + 'static,
+    {
+        self.scoped_transport_cleanup = Some(Arc::new(move || Box::pin(cleanup())));
+    }
+
+    pub(crate) fn bind_tool_suspension_observation(
+        &mut self,
+        token: bamboo_agent_core::tools::SuspensionRestriction,
+    ) {
+        self.tool_suspension_observation = Some(token);
+    }
+
+    pub(crate) fn observed_forbidden_running(&self) -> bool {
+        self.tool_suspension_observation
+            .as_ref()
+            .is_some_and(|token| token.observation().forbidden_running_seen)
+    }
+
+    pub(crate) fn ownership(&self) -> SessionRunOwnership {
+        SessionRunOwnership {
+            instance: self.instance.clone(),
+            router: self.router.clone(),
+            target_session_id: self.target_session_id.clone(),
+            run_id: self.run_id.clone(),
+        }
+    }
+
+    /// Observe independent producer wakeups without consuming the runtime's
+    /// normal receiver. A selected input must not promote unrelated durable
+    /// backlog merely by releasing its own registration. This is an existing
+    /// watch subscription, not a second routing state or durable grant.
+    pub(crate) fn restrict_to_selected_input(&mut self) {
+        if self.selected_input_wakes.is_none() {
+            self.selected_input_wakes = self.notifications.clone();
+        }
+    }
+
     pub fn notifications_mut(&mut self) -> &mut watch::Receiver<u64> {
         self.notifications
             .as_mut()
@@ -457,6 +725,36 @@ impl SessionRunRegistration {
             .await;
     }
 
+    /// Physical execution now outlives this lease's future. Unexpected unwind
+    /// must retain ownership until backend reconciliation, never launch a
+    /// successor through the ordinary abandoned-startup cleanup.
+    pub(crate) fn quarantine_on_drop(&mut self) {
+        self.quarantine_on_drop = true;
+    }
+
+    /// Keep this exact logical owner finalizing when its physical stop or
+    /// terminal delivery is unconfirmed. Dropping this lease must not run the
+    /// usual abandoned-owner recovery and launch a successor.
+    ///
+    /// Recovery must explicitly reconcile the retained owner before finishing
+    /// finalization. Disarm before the await so cancelling quarantine itself
+    /// cannot accidentally release the owner.
+    pub async fn quarantine(mut self) {
+        self.armed = false;
+        self.abort_cleanup = None;
+        self.router
+            .begin_finalization(&self.target_session_id, &self.run_id)
+            .await;
+        if let Some(cleanup) = self.scoped_transport_cleanup.take() {
+            let task = tokio::spawn(async move { cleanup().await });
+            match task.await {
+                Ok(Ok(())) => {}
+                result => tracing::warn!(?result, "quarantined Loop transport cleanup incomplete"),
+            }
+        }
+        self.notifications.take();
+    }
+
     /// Synchronously abandon this exact ownership lease.
     ///
     /// Most cancellation paths can rely on [`Drop`], which schedules the same
@@ -467,18 +765,33 @@ impl SessionRunRegistration {
     /// cleanup closure or this router owner.
     pub async fn abandon(mut self) {
         self.armed = false;
+        if self.selected_input_wakes.is_some() {
+            drop(self.notifications.take());
+        }
+        let scoped_transport_cleanup = self.scoped_transport_cleanup.clone();
         let abort_cleanup = self.abort_cleanup.take();
         let router = self.router.clone();
         let target_session_id = self.target_session_id.clone();
         let run_id = self.run_id.clone();
         let cleanup_target_session_id = target_session_id.clone();
         let cleanup_run_id = run_id.clone();
+        let selected_input_wakes = self.selected_input_wakes.take();
         let cleanup = tokio::spawn(async move {
+            if let Some(cleanup) = scoped_transport_cleanup {
+                if let Err(error) = cleanup().await {
+                    tracing::warn!(%error, "closed Loop transport cleanup failed; retaining abandoned owner");
+                    return;
+                }
+            }
             if let Some(cleanup) = abort_cleanup {
                 cleanup().await;
             }
             router
-                .cleanup_abandoned_registration(&cleanup_target_session_id, &cleanup_run_id)
+                .cleanup_abandoned_registration(
+                    &cleanup_target_session_id,
+                    &cleanup_run_id,
+                    selected_input_wakes,
+                )
                 .await;
         });
         if let Err(error) = cleanup.await {
@@ -497,13 +810,29 @@ impl SessionRunRegistration {
         mut self,
         admitted_generation: u64,
     ) -> Result<Option<SessionActivationDisposition>, SessionActivationError> {
+        if let Some(cleanup) = &self.scoped_transport_cleanup {
+            cleanup()
+                .await
+                .map_err(|error| SessionActivationError::Internal(error.to_string()))?;
+        }
         // The router compacts caught-up routing state only after the last
         // safe-point receiver is gone.
         drop(self.notifications.take());
-        let result = self
-            .router
-            .finish_finalization(&self.target_session_id, &self.run_id, admitted_generation)
-            .await;
+        let released = match self.selected_input_wakes.as_ref() {
+            Some(wakes) => {
+                self.router
+                    .release_selected_if_unnotified(&self.target_session_id, &self.run_id, wakes)
+                    .await
+            }
+            None => false,
+        };
+        let result = if released {
+            Ok(None)
+        } else {
+            self.router
+                .finish_finalization(&self.target_session_id, &self.run_id, admitted_generation)
+                .await
+        };
         if result.is_ok() {
             self.armed = false;
             self.abort_cleanup = None;
@@ -520,14 +849,34 @@ impl Drop for SessionRunRegistration {
         let router = self.router.clone();
         let target_session_id = self.target_session_id.clone();
         let run_id = self.run_id.clone();
+        let scoped_transport_cleanup = self.scoped_transport_cleanup.clone();
         let abort_cleanup = self.abort_cleanup.take();
+        let quarantine = self.quarantine_on_drop || self.observed_forbidden_running();
+        if self.selected_input_wakes.is_some() {
+            drop(self.notifications.take());
+        }
+        let selected_input_wakes = self.selected_input_wakes.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
+                if let Some(cleanup) = scoped_transport_cleanup {
+                    if let Err(error) = cleanup().await {
+                        tracing::warn!(%error, "closed Loop transport cleanup failed; retaining dropped owner");
+                        return;
+                    }
+                }
+                if quarantine {
+                    router.begin_finalization(&target_session_id, &run_id).await;
+                    return;
+                }
                 if let Some(cleanup) = abort_cleanup {
                     cleanup().await;
                 }
                 router
-                    .cleanup_abandoned_registration(&target_session_id, &run_id)
+                    .cleanup_abandoned_registration(
+                        &target_session_id,
+                        &run_id,
+                        selected_input_wakes,
+                    )
                     .await;
             });
         }
@@ -535,6 +884,26 @@ impl Drop for SessionRunRegistration {
 }
 
 impl SessionActivationRouter {
+    fn publication_fence(&self, target: &str) -> Arc<Mutex<()>> {
+        let mut fences = self
+            .publication_fences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fences.retain(|_, fence| fence.strong_count() > 0);
+        if let Some(fence) = fences.get(target).and_then(Weak::upgrade) {
+            return fence;
+        }
+        let fence = Arc::new(Mutex::new(()));
+        fences.insert(target.into(), Arc::downgrade(&fence));
+        fence
+    }
+
+    async fn lock_publication(&self, target: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        // Always acquire this target before the map. Never await a target
+        // publication while holding the runtime-wide states mutex.
+        self.publication_fence(target).lock_owned().await
+    }
+
     async fn coordinator_generation(&self, target: &str) -> Result<u64, SessionActivationError> {
         let inbox = self
             .inbox
@@ -600,6 +969,23 @@ impl SessionActivationRouter {
             .and_then(|state| state.owner.as_ref().map(|owner| owner.run_id.clone()))
     }
 
+    /// Select a completion's successor fence under the current owner lock.
+    /// Once a wait or Guardian transition belongs to this owner, later sibling
+    /// callbacks keep that boundary even after the durable wait was cleared.
+    /// A background-only reasoning owner can instead consume its next safe point.
+    pub(crate) async fn child_completion_successor_run(
+        &self,
+        target_session_id: &str,
+        wait_or_guardian_transition: bool,
+        previous_fenced_run: Option<&str>,
+    ) -> Option<String> {
+        let mut states = self.states.lock().await;
+        let owner = states.get_mut(target_session_id)?.owner.as_mut()?;
+        owner.child_completions_need_successor |=
+            wait_or_guardian_transition || previous_fenced_run == Some(owner.run_id.as_str());
+        (owner.finalizing || owner.child_completions_need_successor).then(|| owner.run_id.clone())
+    }
+
     /// Bind the durable inbox used by abandoned-run reconciliation.
     pub fn set_inbox(&self, inbox: Arc<dyn SessionInboxPort>) {
         *self
@@ -642,6 +1028,68 @@ impl SessionActivationRouter {
             (left, right) => left.or(right),
         };
         Ok(result)
+    }
+
+    /// A precise grant can open a delivery below an already dispatched high
+    /// watermark. Use the existing bounded recovery handshake for that hole;
+    /// ordinary same-generation leftovers keep their existing retry cadence.
+    async fn reconcile_older_message(
+        &self,
+        target: &str,
+    ) -> Result<Option<SessionActivationDisposition>, SessionActivationError> {
+        let high = self
+            .states
+            .lock()
+            .await
+            .get(target)
+            .map_or(0, |state| state.last_dispatched_generation);
+        self.reconcile_message_below(target, high).await
+    }
+
+    async fn reconcile_message_below(
+        &self,
+        target: &str,
+        high: u64,
+    ) -> Result<Option<SessionActivationDisposition>, SessionActivationError> {
+        if high == 0 {
+            return Ok(None);
+        }
+        let inbox = self
+            .inbox
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(inbox) = inbox else {
+            return Ok(None);
+        };
+        let now = Utc::now();
+        let candidate = inbox
+            .inspect_wake_readiness(target, now)
+            .await
+            .map_err(inbox_activation_error)?
+            .ready;
+        match candidate.filter(|candidate| {
+            candidate.generation < high
+                // Only an explicit coordinator upgrade opens this older hole.
+                // A prefix may already cover the delivery at Respect policy.
+                && candidate.coordinator_message_policy
+                    == Some(bamboo_domain::SessionActivationPolicy::InterruptSpecificWait)
+        }) {
+            Some(candidate) => self
+                .request_recovery_activation(target, candidate, now)
+                .await
+                .map(|result| result.disposition),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_after_terminal_inspection(&self) {
+        let pause = self.terminal_inspection_pause.lock().await.take();
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            release.notified().await;
+        }
     }
 
     async fn request_recovery_activation(
@@ -730,15 +1178,20 @@ impl SessionActivationRouter {
         target_session_id: &str,
         run_id: &str,
     ) {
+        let _publication = self.lock_publication(target_session_id).await;
         let mut states = self.states.lock().await;
         states
             .entry(target_session_id.to_string())
             .or_default()
             .owner = Some(ActiveOwner {
+            instance: Arc::new(()),
             run_id: run_id.to_string(),
+            session_created_at: None,
             finalizing: false,
             registrations: 0,
+            child_completions_need_successor: false,
             delivery_sink: None,
+            scoped_loop: None,
         });
     }
 
@@ -750,8 +1203,168 @@ impl SessionActivationRouter {
         target_session_id: &str,
         run_id: &str,
     ) -> Result<SessionRunRegistration, SessionRunRegistrationError> {
+        self.register_run_with_birth(target_session_id, run_id, None)
+            .await
+    }
+
+    /// Register from the actual execution's Session, enabling birth-fenced
+    /// steer. This is a trusted host entrypoint, not model-supplied authority.
+    pub async fn register_session_run(
+        self: &Arc<Self>,
+        session: &bamboo_domain::Session,
+        run_id: &str,
+    ) -> Result<SessionRunRegistration, SessionRunRegistrationError> {
+        self.register_run_with_birth(&session.id, run_id, Some(session.created_at))
+            .await
+    }
+
+    pub(crate) async fn bind_run_lifetime(
+        self: &Arc<Self>,
+        ownership: &SessionRunOwnership,
+        session: &bamboo_domain::Session,
+    ) -> bool {
+        if !ownership.matches_router(self) || ownership.target_session_id != session.id {
+            return false;
+        }
+        let _publication = self.lock_publication(&session.id).await;
+        let mut states = self.states.lock().await;
+        let Some(owner) = states
+            .get_mut(&session.id)
+            .and_then(|state| state.owner.as_mut())
+        else {
+            return false;
+        };
+        if owner.run_id != ownership.run_id
+            || owner.finalizing
+            || owner.registrations == 0
+            || owner
+                .session_created_at
+                .is_some_and(|birth| birth != session.created_at)
+        {
+            return false;
+        }
+        owner.session_created_at = Some(session.created_at);
+        true
+    }
+
+    /// Install only through the actual registered owner proof. Serialized
+    /// observations never enter this slot. A different grant requires host
+    /// revocation first; an equal retry is harmless.
+    pub(crate) async fn bind_supervisor_loop_control(
+        self: &Arc<Self>,
+        ownership: &SessionRunOwnership,
+        binding: bamboo_domain::ScopedLoopControlBinding,
+        execution_cancel: tokio_util::sync::CancellationToken,
+        host_stop: tokio_util::sync::CancellationToken,
+    ) -> Result<(), bamboo_domain::SessionInboxError> {
+        let inbox = self
+            .inbox
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                bamboo_domain::SessionInboxError::InvalidClaim("scoped Loop Inbox missing".into())
+            })?;
+        binding
+            .validate()
+            .map_err(bamboo_domain::SessionInboxError::InvalidClaim)?;
+        if execution_cancel.is_cancelled() || host_stop.is_cancelled() {
+            return Err(bamboo_domain::SessionInboxError::InvalidClaim(
+                "Loop owner is stopped".into(),
+            ));
+        }
+        if !ownership.matches_router(self)
+            || ownership.target_session_id != binding.target_session_id
+            || ownership.run_id != binding.owner_run_id
+        {
+            return Err(bamboo_domain::SessionInboxError::InvalidClaim(
+                "Loop owner proof mismatch".into(),
+            ));
+        }
+        let _publication = self.lock_publication(&binding.target_session_id).await;
+        let mut states = self.states.lock().await;
+        let owner = states
+            .get_mut(&binding.target_session_id)
+            .and_then(|state| state.owner.as_mut())
+            .filter(|owner| {
+                Arc::ptr_eq(&owner.instance, &ownership.instance)
+                    && owner.run_id == ownership.run_id
+                    && !owner.finalizing
+                    && owner.registrations > 0
+                    && owner.session_created_at == Some(binding.target_created_at)
+            })
+            .ok_or_else(|| {
+                bamboo_domain::SessionInboxError::InvalidClaim(
+                    "Loop owner is no longer current".into(),
+                )
+            })?;
+        // Tokens can be cancelled while waiting for the publication fence.
+        if execution_cancel.is_cancelled() || host_stop.is_cancelled() {
+            return Err(bamboo_domain::SessionInboxError::InvalidClaim(
+                "Loop owner stopped during grant binding".into(),
+            ));
+        }
+        if let Some(old) = &owner.scoped_loop {
+            if old.binding != binding || old.stopped() {
+                return Err(bamboo_domain::SessionInboxError::InvalidClaim(
+                    "different or stopped Loop grant already bound".into(),
+                ));
+            }
+            // Idempotency must not replace the original stop/cancel tokens.
+            return Ok(());
+        }
+        let runtime: Arc<dyn SessionActivationPort> = self.clone();
+        if !inbox
+            .bind_scoped_transport_runtime(Arc::downgrade(&runtime), self.runtime_instance.clone())
+        {
+            return Err(bamboo_domain::SessionInboxError::InvalidClaim(
+                "scoped Inbox belongs to another live runtime or is unsupported".into(),
+            ));
+        }
+        owner.scoped_loop = Some(SupervisorLoopGrant {
+            binding,
+            execution_cancel,
+            host_stop,
+        });
+        Ok(())
+    }
+
+    /// Host revocation shares the target publication fence with physical
+    /// writes. It does not stop another run or retain a grant after owner exit.
+    pub async fn revoke_supervisor_loop_control(
+        &self,
+        target: &str,
+        grant_id: &uuid::Uuid,
+    ) -> bool {
+        let _publication = self.lock_publication(target).await;
+        let mut states = self.states.lock().await;
+        let Some(owner) = states
+            .get_mut(target)
+            .and_then(|state| state.owner.as_mut())
+        else {
+            return false;
+        };
+        if owner
+            .scoped_loop
+            .as_ref()
+            .is_some_and(|grant| grant.binding.grant_id == *grant_id)
+        {
+            owner.scoped_loop = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn register_run_with_birth(
+        self: &Arc<Self>,
+        target_session_id: &str,
+        run_id: &str,
+        birth: Option<DateTime<Utc>>,
+    ) -> Result<SessionRunRegistration, SessionRunRegistrationError> {
         loop {
             let (notifications, reservation_wait) = {
+                let _publication = self.lock_publication(target_session_id).await;
                 let mut states = self.states.lock().await;
                 let state = states.entry(target_session_id.to_string()).or_default();
                 match state.owner.as_mut() {
@@ -763,8 +1376,32 @@ impl SessionActivationRouter {
                         // `dispatch_reserved` publishes the exact owner before
                         // making the task runnable. The task converts that
                         // placeholder into the one live registration here.
+                        if owner
+                            .session_created_at
+                            .is_some_and(|existing| birth.is_some_and(|birth| existing != birth))
+                        {
+                            return Err(SessionRunRegistrationError::OwnerCollision {
+                                target_session_id: target_session_id.into(),
+                                existing_run_id: owner.run_id.clone(),
+                                attempted_run_id: run_id.into(),
+                            });
+                        }
+                        if birth.is_some() {
+                            owner.session_created_at = birth;
+                        }
                         owner.registrations = 1;
-                        (Some(state.notify.subscribe()), None)
+                        (
+                            Some((
+                                state.notify.subscribe(),
+                                state
+                                    .owner
+                                    .as_ref()
+                                    .expect("registered owner")
+                                    .instance
+                                    .clone(),
+                            )),
+                            None,
+                        )
                     }
                     Some(owner) => {
                         return Err(SessionRunRegistrationError::OwnerCollision {
@@ -783,12 +1420,27 @@ impl SessionActivationRouter {
                     }
                     None => {
                         state.owner = Some(ActiveOwner {
+                            instance: Arc::new(()),
                             run_id: run_id.to_string(),
+                            session_created_at: birth,
                             finalizing: false,
                             registrations: 1,
+                            child_completions_need_successor: false,
                             delivery_sink: None,
+                            scoped_loop: None,
                         });
-                        (Some(state.notify.subscribe()), None)
+                        (
+                            Some((
+                                state.notify.subscribe(),
+                                state
+                                    .owner
+                                    .as_ref()
+                                    .expect("registered owner")
+                                    .instance
+                                    .clone(),
+                            )),
+                            None,
+                        )
                     }
                 }
             };
@@ -797,12 +1449,19 @@ impl SessionActivationRouter {
                 let _ = reservation_wait.changed().await;
                 continue;
             }
+            let (notifications, instance) =
+                notifications.expect("registered owner has a receiver and instance");
             return Ok(SessionRunRegistration {
+                instance,
                 router: self.clone(),
                 target_session_id: target_session_id.to_string(),
                 run_id: run_id.to_string(),
-                notifications,
+                notifications: Some(notifications),
                 abort_cleanup: None,
+                scoped_transport_cleanup: None,
+                quarantine_on_drop: false,
+                tool_suspension_observation: None,
+                selected_input_wakes: None,
                 armed: true,
             });
         }
@@ -826,7 +1485,10 @@ impl SessionActivationRouter {
         }
         owner.delivery_sink = Some(sink.clone());
         let run_id = owner.run_id.clone();
-        if state.latest_generation > 0 && sink.send(state.latest_generation).is_err() {
+        let delivery_generation = state
+            .latest_generation
+            .max(state.latest_delivery_generation);
+        if delivery_generation > 0 && sink.send(delivery_generation).is_err() {
             owner.delivery_sink = None;
             return None;
         }
@@ -862,6 +1524,7 @@ impl SessionActivationRouter {
     /// `latest_generation` and handed to one successor by
     /// [`finish_finalization`](Self::finish_finalization).
     pub async fn begin_finalization(&self, target_session_id: &str, run_id: &str) {
+        let _publication = self.lock_publication(target_session_id).await;
         let mut states = self.states.lock().await;
         let state = states.entry(target_session_id.to_string()).or_default();
         match state.owner.as_mut() {
@@ -869,21 +1532,72 @@ impl SessionActivationRouter {
             Some(_) => {}
             None => {
                 state.owner = Some(ActiveOwner {
+                    instance: Arc::new(()),
                     run_id: run_id.to_string(),
+                    session_created_at: None,
                     finalizing: true,
                     registrations: 0,
+                    child_completions_need_successor: false,
                     delivery_sink: None,
+                    scoped_loop: None,
                 });
             }
         }
+    }
+
+    /// Close selection and notification atomically under the original router
+    /// owner lock. A producer arriving afterwards sees no owner and reserves
+    /// its own activation; a coalesced earlier notification retains the normal
+    /// finalization/recovery path, including Child/Bash coordinator wakeups.
+    async fn release_selected_if_unnotified(
+        &self,
+        target_session_id: &str,
+        run_id: &str,
+        wakes: &watch::Receiver<u64>,
+    ) -> bool {
+        let _publication = self.lock_publication(target_session_id).await;
+        let mut states = self.states.lock().await;
+        let Some(state) = states.get_mut(target_session_id) else {
+            return true;
+        };
+        if !state
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.run_id == run_id)
+        {
+            return true;
+        }
+        if wakes.has_changed().unwrap_or(false) {
+            return false;
+        }
+        state.owner = None;
+        state.owner_completion_epoch = state.owner_completion_epoch.wrapping_add(1);
+        if state.latest_generation == 0
+            && !state.activation_reserved
+            && state.notify.receiver_count() <= 1
+            && state.activation_epoch.receiver_count() == 0
+        {
+            states.remove(target_session_id);
+        }
+        true
     }
 
     async fn cleanup_abandoned_registration(
         self: &Arc<Self>,
         target_session_id: &str,
         run_id: &str,
+        selected_input_wakes: Option<watch::Receiver<u64>>,
     ) {
+        if let Some(wakes) = selected_input_wakes {
+            if self
+                .release_selected_if_unnotified(target_session_id, run_id, &wakes)
+                .await
+            {
+                return;
+            }
+        }
         {
+            let _publication = self.lock_publication(target_session_id).await;
             let mut states = self.states.lock().await;
             let Some(state) = states.get_mut(target_session_id) else {
                 return;
@@ -927,7 +1641,10 @@ impl SessionActivationRouter {
             None => (0, 0),
         };
 
-        let reservation_to_dispatch = {
+        #[cfg(test)]
+        self.pause_after_terminal_inspection().await;
+        let (reservation_to_dispatch, previous_high) = {
+            let _publication = self.lock_publication(target_session_id).await;
             let mut states = self.states.lock().await;
             let Some(state) = states.get_mut(target_session_id) else {
                 return;
@@ -938,6 +1655,7 @@ impl SessionActivationRouter {
                 return;
             }
             state.latest_generation = state.latest_generation.max(durable_generation);
+            let previous_high = state.last_dispatched_generation;
             state.owner = None;
             state.owner_completion_epoch = state.owner_completion_epoch.wrapping_add(1);
             if (state.latest_generation > state.last_dispatched_generation
@@ -946,7 +1664,7 @@ impl SessionActivationRouter {
             {
                 let generation = state.latest_generation;
                 let token = reserve_activation_token(state);
-                Some((generation, token))
+                (Some((generation, token)), previous_high)
             } else {
                 if state.latest_generation == 0
                     && !state.activation_reserved
@@ -955,7 +1673,7 @@ impl SessionActivationRouter {
                 {
                     states.remove(target_session_id);
                 }
-                None
+                (None, previous_high)
             }
         };
 
@@ -970,6 +1688,17 @@ impl SessionActivationRouter {
                     %error,
                     "failed to reserve successor for abandoned SessionInbox owner"
                 );
+            }
+        } else {
+            // A precise grant can race the pre-lock inspection while the
+            // producer still observes this owner as finalizing. Re-read after
+            // releasing the owner even when that earlier snapshot was empty.
+            if let Err(error) = self
+                .reconcile_message_below(target_session_id, previous_high)
+                .await
+            {
+                tracing::warn!(%target_session_id, %error,
+                    "failed to reconcile older eligible message after abandoned owner");
             }
         }
     }
@@ -999,9 +1728,13 @@ impl SessionActivationRouter {
             ),
             None => None,
         };
-        let reservation_to_dispatch = {
+        #[cfg(test)]
+        self.pause_after_terminal_inspection().await;
+        let (reservation_to_dispatch, previous_high) = {
+            let _publication = self.lock_publication(target_session_id).await;
             let mut states = self.states.lock().await;
             let state = states.entry(target_session_id.to_string()).or_default();
+            let previous_high = state.last_dispatched_generation;
             if state
                 .owner
                 .as_ref()
@@ -1030,7 +1763,7 @@ impl SessionActivationRouter {
             {
                 let generation = state.latest_generation;
                 let token = reserve_activation_token(state);
-                Some((generation, token))
+                (Some((generation, token)), previous_high)
             } else {
                 // Both execution paths drop their safe-point receiver before
                 // calling finish_finalization. Once the durable cursor has
@@ -1045,7 +1778,7 @@ impl SessionActivationRouter {
                 {
                     states.remove(target_session_id);
                 }
-                None
+                (None, previous_high)
             }
         };
 
@@ -1054,7 +1787,12 @@ impl SessionActivationRouter {
                 .dispatch_reserved(target_session_id, generation, token)
                 .await
                 .map(Some),
-            None => Ok(None),
+            // Keep the prior high even if the empty pre-lock snapshot allowed
+            // state eviction. A late older grant still needs its one successor.
+            None => {
+                self.reconcile_message_below(target_session_id, previous_high)
+                    .await
+            }
         }
     }
 
@@ -1182,6 +1920,7 @@ impl SessionActivationRouter {
             Ok(SessionActivationReserveOutcome::Reserved(launch)) => {
                 let run_id = launch.run_id.clone();
                 {
+                    let _publication = self.lock_publication(target_session_id).await;
                     let mut states = self.states.lock().await;
                     let state = states.entry(target_session_id.to_string()).or_default();
                     if !release_activation_token(state, reservation_token) {
@@ -1202,10 +1941,14 @@ impl SessionActivationRouter {
                         };
                     }
                     state.owner = Some(ActiveOwner {
+                        instance: Arc::new(()),
                         run_id,
+                        session_created_at: None,
                         finalizing: false,
                         registrations: 0,
+                        child_completions_need_successor: false,
                         delivery_sink: None,
+                        scoped_loop: None,
                     });
                     state.last_dispatched_generation =
                         state.last_dispatched_generation.max(generation);
@@ -1223,6 +1966,7 @@ impl SessionActivationRouter {
                 Ok(SessionActivationDisposition::ActivationReserved)
             }
             Ok(SessionActivationReserveOutcome::AlreadyRunning { run_id }) => {
+                let _publication = self.lock_publication(target_session_id).await;
                 let mut states = self.states.lock().await;
                 let state = states.entry(target_session_id.to_string()).or_default();
                 if !release_activation_token(state, reservation_token) {
@@ -1230,10 +1974,14 @@ impl SessionActivationRouter {
                     return Ok(SessionActivationDisposition::ActiveNotified);
                 }
                 state.owner = Some(ActiveOwner {
+                    instance: Arc::new(()),
                     run_id,
+                    session_created_at: None,
                     finalizing: false,
                     registrations: 0,
+                    child_completions_need_successor: false,
                     delivery_sink: None,
+                    scoped_loop: None,
                 });
                 state.notify.send_replace(generation);
                 if let Some((candidate, now)) = recovery {
@@ -1255,6 +2003,7 @@ impl SessionActivationRouter {
                 Ok(SessionActivationDisposition::ActivationCoalesced)
             }
             Ok(SessionActivationReserveOutcome::NotFound) => {
+                let _publication = self.lock_publication(target_session_id).await;
                 let mut states = self.states.lock().await;
                 if states
                     .get(target_session_id)
@@ -1281,6 +2030,219 @@ impl SessionActivationRouter {
 
 #[async_trait]
 impl SessionActivationPort for SessionActivationRouter {
+    fn scoped_transport_runtime_instance(&self) -> Option<Arc<()>> {
+        Some(self.runtime_instance.clone())
+    }
+
+    fn retain_closed_scoped_transport_blocking(
+        &self,
+        binding: &bamboo_domain::ScopedLoopControlBinding,
+    ) -> Result<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>, bamboo_domain::SessionRunConflict>
+    {
+        let publication = self
+            .publication_fence(&binding.target_session_id)
+            .blocking_lock_owned();
+        let states = self.states.blocking_lock();
+        let matches = states
+            .get(&binding.target_session_id)
+            .and_then(|state| state.owner.as_ref())
+            .is_some_and(|owner| {
+                owner.finalizing
+                    && owner.registrations > 0
+                    && owner.run_id == binding.owner_run_id
+                    && owner.session_created_at == Some(binding.target_created_at)
+                    && owner
+                        .scoped_loop
+                        .as_ref()
+                        .is_none_or(|grant| grant.binding.execution_id == binding.execution_id)
+            });
+        if !matches {
+            return Err(bamboo_domain::SessionRunConflict::unsupported(
+                &binding.owner_run_id,
+            ));
+        }
+        drop(states);
+        Ok(Arc::new(ClosedLoopTransportGuard(
+            ExpectedRunDeliveryGuard {
+                target_session_id: binding.target_session_id.clone(),
+                session_created_at: binding.target_created_at,
+                run_id: binding.owner_run_id.clone(),
+                states: self.states.clone(),
+                _publication: publication,
+            },
+        )))
+    }
+
+    fn retain_expected_run_blocking(
+        &self,
+        target_session_id: &str,
+        target_created_at: DateTime<Utc>,
+        expected_run_id: &str,
+    ) -> Result<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>, bamboo_domain::SessionRunConflict>
+    {
+        use bamboo_domain::{SessionRunConflict, SessionRunConflictReason};
+        // Only this target is retained through disk publication. Every owner
+        // installation/release/finalization takes the same target fence first.
+        let publication = self
+            .publication_fence(target_session_id)
+            .blocking_lock_owned();
+        let states = self.states.blocking_lock();
+        let owner = states
+            .get(target_session_id)
+            .and_then(|state| state.owner.as_ref());
+        let reason = match owner {
+            None => Some(SessionRunConflictReason::NoActiveRun),
+            Some(owner)
+                if owner
+                    .session_created_at
+                    .is_some_and(|birth| birth != target_created_at) =>
+            {
+                Some(SessionRunConflictReason::SessionBirthChanged)
+            }
+            Some(owner) if owner.finalizing => Some(SessionRunConflictReason::Finalizing),
+            Some(owner) if owner.registrations == 0 => {
+                Some(SessionRunConflictReason::NotRegistered)
+            }
+            Some(owner) if owner.session_created_at.is_none() => {
+                Some(SessionRunConflictReason::UnboundLifetime)
+            }
+            Some(owner) if owner.run_id != expected_run_id => {
+                Some(SessionRunConflictReason::RunChanged)
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = reason {
+            return Err(SessionRunConflict {
+                reason,
+                expected_run_id: expected_run_id.into(),
+                observed_run_id: owner
+                    .filter(|owner| owner.session_created_at == Some(target_created_at))
+                    .map(|owner| owner.run_id.clone()),
+            });
+        }
+        Ok(Arc::new(ExpectedRunDeliveryGuard {
+            target_session_id: target_session_id.into(),
+            session_created_at: target_created_at,
+            run_id: expected_run_id.into(),
+            states: self.states.clone(),
+            _publication: publication,
+        }))
+    }
+
+    async fn observe_supervisor_loop(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target: &str,
+        expected_link_revision: Option<u64>,
+        action: bamboo_domain::LoopControlAction,
+    ) -> Result<bamboo_domain::ScopedLoopControlBinding, bamboo_domain::SessionInboxError> {
+        let _publication = self.lock_publication(target).await;
+        let states = self.states.lock().await;
+        let owner = states
+            .get(target)
+            .and_then(|state| state.owner.as_ref())
+            .filter(|owner| !owner.finalizing && owner.registrations > 0)
+            .ok_or_else(|| {
+                bamboo_domain::SessionInboxError::InvalidClaim("no live Loop owner".into())
+            })?;
+        let grant = owner
+            .scoped_loop
+            .as_ref()
+            .filter(|grant| !grant.stopped())
+            .ok_or_else(|| {
+                bamboo_domain::SessionInboxError::InvalidClaim(
+                    "host did not grant Supervisor Loop control".into(),
+                )
+            })?;
+        let binding = &grant.binding;
+        binding
+            .validate()
+            .map_err(bamboo_domain::SessionInboxError::InvalidClaim)?;
+        if binding.supervisor != *supervisor
+            || binding.target_session_id != target
+            || owner.run_id != binding.owner_run_id
+            || owner.session_created_at != Some(binding.target_created_at)
+            || !binding.allowed_actions.contains(&action)
+            || expected_link_revision.is_some_and(|revision| revision != binding.link_revision)
+            || (expected_link_revision.is_none()
+                && action != bamboo_domain::LoopControlAction::Status)
+        {
+            return Err(bamboo_domain::SessionInboxError::InvalidClaim(
+                "live Loop grant observation mismatch".into(),
+            ));
+        }
+        Ok(binding.clone())
+    }
+
+    fn retain_supervisor_loop_blocking(
+        &self,
+        binding: &bamboo_domain::ScopedLoopControlBinding,
+    ) -> Result<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>, bamboo_domain::SessionRunConflict>
+    {
+        use bamboo_domain::{SessionRunConflict, SessionRunConflictReason};
+        let publication = self
+            .publication_fence(&binding.target_session_id)
+            .blocking_lock_owned();
+        let states = self.states.blocking_lock();
+        let owner = states
+            .get(&binding.target_session_id)
+            .and_then(|state| state.owner.as_ref());
+        if binding.validate().is_err()
+            || owner.is_none_or(|owner| {
+                owner.finalizing
+                    || owner.registrations == 0
+                    || owner.run_id != binding.owner_run_id
+                    || owner.session_created_at != Some(binding.target_created_at)
+                    || owner
+                        .scoped_loop
+                        .as_ref()
+                        .is_none_or(|grant| grant.stopped() || grant.binding != *binding)
+            })
+        {
+            return Err(SessionRunConflict {
+                reason: SessionRunConflictReason::RunChanged,
+                expected_run_id: binding.owner_run_id.clone(),
+                observed_run_id: owner
+                    .filter(|owner| owner.session_created_at == Some(binding.target_created_at))
+                    .map(|owner| owner.run_id.clone()),
+            });
+        }
+        let grant = owner
+            .and_then(|owner| owner.scoped_loop.as_ref())
+            .expect("validated Loop grant")
+            .clone();
+        Ok(Arc::new(SupervisorLoopDeliveryGuard {
+            inner: ExpectedRunDeliveryGuard {
+                target_session_id: binding.target_session_id.clone(),
+                session_created_at: binding.target_created_at,
+                run_id: binding.owner_run_id.clone(),
+                states: self.states.clone(),
+                _publication: publication,
+            },
+            grant,
+        }))
+    }
+
+    async fn notify_active_delivery(&self, target_session_id: &str, inbox_generation: u64) -> bool {
+        let mut states = self.states.lock().await;
+        let Some(state) = states.get_mut(target_session_id) else {
+            return false;
+        };
+        let Some(owner) = state.owner.as_mut().filter(|owner| !owner.finalizing) else {
+            return false;
+        };
+        state.latest_delivery_generation = state.latest_delivery_generation.max(inbox_generation);
+        state.notify.send_replace(inbox_generation);
+        if owner
+            .delivery_sink
+            .as_ref()
+            .is_some_and(|sink| sink.send(inbox_generation).is_err())
+        {
+            owner.delivery_sink = None;
+        }
+        true
+    }
+
     async fn request_activation(
         &self,
         target_session_id: &str,
@@ -1322,7 +2284,13 @@ impl SessionActivationPort for SessionActivationRouter {
                 if inbox_generation <= state.last_dispatched_generation
                     && released_prefix <= state.last_dispatched_coordinator_generation
                 {
-                    return Ok(SessionActivationDisposition::ActivationCoalesced);
+                    drop(states);
+                    return self
+                        .reconcile_older_message(target_session_id)
+                        .await
+                        .map(|result| {
+                            result.unwrap_or(SessionActivationDisposition::ActivationCoalesced)
+                        });
                 }
                 if state.activation_reserved {
                     (Some(state.activation_epoch.subscribe()), None)
@@ -1510,7 +2478,41 @@ mod tests {
             Session, SessionActivationPolicy, SessionInboxLimits, SessionMessageEnvelope, Storage,
         };
         use bamboo_storage::{FileSessionInbox, SessionStoreV2};
-        for release_during_finalization in [false, true] {
+        async fn release(
+            inbox: &FileSessionInbox,
+            receipt: &bamboo_domain::SessionInboxReceipt,
+            precise: bool,
+        ) {
+            if precise {
+                inbox
+                    .mark_message_activation_eligible(
+                        "parent",
+                        receipt,
+                        SessionActivationPolicy::InterruptSpecificWait,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    inbox
+                        .coordinator_activation_generation("parent")
+                        .await
+                        .unwrap(),
+                    0
+                );
+            } else {
+                inbox
+                    .mark_activation_eligible(
+                        "parent",
+                        receipt.generation,
+                        SessionActivationPolicy::RespectSpecificWait,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        for (release_during_finalization, precise) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let temp = tempfile::TempDir::new().unwrap();
             let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
             store
@@ -1559,14 +2561,7 @@ mod tests {
             let mut registration = router.register_run("parent", "run-1").await.unwrap();
             registration.begin_finalization().await;
             if release_during_finalization {
-                restarted
-                    .mark_activation_eligible(
-                        "parent",
-                        first.generation,
-                        SessionActivationPolicy::RespectSpecificWait,
-                    )
-                    .await
-                    .unwrap();
+                release(&restarted, &first, precise).await;
                 assert_eq!(
                     router
                         .request_activation("parent", first.generation)
@@ -1580,14 +2575,7 @@ mod tests {
                 );
             } else {
                 assert_eq!(registration.finish(second.generation).await.unwrap(), None);
-                restarted
-                    .mark_activation_eligible(
-                        "parent",
-                        first.generation,
-                        SessionActivationPolicy::RespectSpecificWait,
-                    )
-                    .await
-                    .unwrap();
+                release(&restarted, &first, precise).await;
                 assert_eq!(
                     router
                         .request_activation("parent", first.generation)
@@ -1614,6 +2602,235 @@ mod tests {
             );
             assert_eq!(spawner.reservations.load(Ordering::SeqCst), 2);
             restarted.ack("parent", &claims[0]).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn precise_older_interrupt_below_released_prefix_reaches_one_successor() {
+        use bamboo_domain::{
+            Session, SessionActivationPolicy, SessionInboxLimits, SessionMessageEnvelope, Storage,
+        };
+        use bamboo_storage::{FileSessionInbox, SessionStoreV2};
+        for with_older_sibling in [false, true] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+            store
+                .save_session(&Session::new("parent", "model"))
+                .await
+                .unwrap();
+            let inbox = Arc::new(FileSessionInbox::new(store, SessionInboxLimits::default()));
+            let sibling = if with_older_sibling {
+                Some(
+                    inbox
+                        .deliver(&SessionMessageEnvelope::user_input(
+                            "parent",
+                            "older Respect sibling",
+                        ))
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let older = inbox
+                .deliver(&SessionMessageEnvelope::user_input("parent", "older child"))
+                .await
+                .unwrap();
+            let newer = inbox
+                .deliver(&SessionMessageEnvelope::user_input("parent", "newer Bash"))
+                .await
+                .unwrap();
+            inbox
+                .mark_activation_eligible(
+                    "parent",
+                    newer.generation,
+                    SessionActivationPolicy::RespectSpecificWait,
+                )
+                .await
+                .unwrap();
+            let router = SessionActivationRouter::new();
+            router.set_inbox(inbox.clone());
+            let spawner = spawner();
+            router.set_spawner(spawner.clone()).await;
+            router
+                .request_activation("parent", newer.generation)
+                .await
+                .unwrap();
+            let claims = inbox.claim("parent", 128).await.unwrap();
+            assert_eq!(claims.len(), 2 + usize::from(with_older_sibling));
+            let older_claim = claims
+                .iter()
+                .find(|claim| claim.envelope.id == older.id)
+                .unwrap();
+            assert_eq!(older_claim.generation, older.generation);
+            assert_eq!(
+                older_claim.activation_policy,
+                SessionActivationPolicy::RespectSpecificWait
+            );
+            let newer_claim = claims
+                .iter()
+                .find(|claim| claim.envelope.id == newer.id)
+                .unwrap();
+            inbox.ack("parent", newer_claim).await.unwrap();
+            let mut owner = router.register_run("parent", "run-1").await.unwrap();
+            owner.begin_finalization().await;
+            assert_eq!(owner.finish(newer.generation).await.unwrap(), None);
+            assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+
+            inbox
+                .mark_message_activation_eligible(
+                    "parent",
+                    &older,
+                    SessionActivationPolicy::InterruptSpecificWait,
+                )
+                .await
+                .unwrap();
+            let candidate = inbox
+                .inspect_wake_readiness("parent", Utc::now())
+                .await
+                .unwrap()
+                .ready
+                .unwrap();
+            assert_eq!(candidate.coordinator_generation, newer.generation);
+            assert_eq!(
+                candidate.id, older.id,
+                "a Respect sibling cannot obscure the precise wake"
+            );
+            assert_eq!(
+                candidate.coordinator_message_policy,
+                Some(SessionActivationPolicy::InterruptSpecificWait)
+            );
+            assert_eq!(
+                router
+                    .request_activation("parent", older.generation)
+                    .await
+                    .unwrap(),
+                SessionActivationDisposition::ActivationReserved
+            );
+            assert_eq!(spawner.reservations.load(Ordering::SeqCst), 2);
+            // Leaving the same exact item pending must retain bounded recovery.
+            let mut successor = router.register_run("parent", "run-2").await.unwrap();
+            successor.begin_finalization().await;
+            assert_eq!(successor.finish(newer.generation).await.unwrap(), None);
+            assert_eq!(
+                router
+                    .request_activation("parent", older.generation)
+                    .await
+                    .unwrap(),
+                SessionActivationDisposition::ActivationCoalesced
+            );
+            assert_eq!(spawner.reservations.load(Ordering::SeqCst), 2);
+            inbox.ack("parent", older_claim).await.unwrap();
+            if let Some(sibling) = sibling {
+                let claim = claims
+                    .iter()
+                    .find(|claim| claim.envelope.id == sibling.id)
+                    .unwrap();
+                inbox.ack("parent", claim).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn precise_older_grant_after_terminal_inspection_reaches_one_successor() {
+        use bamboo_domain::{
+            Session, SessionActivationPolicy, SessionInboxLimits, SessionMessageEnvelope, Storage,
+        };
+        use bamboo_storage::{FileSessionInbox, SessionStoreV2};
+        for abandon in [false, true] {
+            let temp = tempfile::TempDir::new().unwrap();
+            let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+            store
+                .save_session(&Session::new("parent", "model"))
+                .await
+                .unwrap();
+            let inbox = Arc::new(FileSessionInbox::new(store, SessionInboxLimits::default()));
+            let older = inbox
+                .deliver(&SessionMessageEnvelope::user_input(
+                    "parent",
+                    "staged child",
+                ))
+                .await
+                .unwrap();
+            let newer = inbox
+                .deliver_with_activation_intent(
+                    &SessionMessageEnvelope::user_input("parent", "newer user input"),
+                    SessionActivationPolicy::InterruptSpecificWait,
+                    None,
+                )
+                .await
+                .unwrap();
+            let router = SessionActivationRouter::new();
+            router.set_inbox(inbox.clone());
+            let spawner = spawner();
+            router.set_spawner(spawner.clone()).await;
+            router
+                .request_activation("parent", newer.generation)
+                .await
+                .unwrap();
+            let claims = inbox.claim("parent", 128).await.unwrap();
+            assert_eq!(claims.len(), 1);
+            inbox.ack("parent", &claims[0]).await.unwrap();
+
+            let mut owner = router.register_run("parent", "run-1").await.unwrap();
+            owner.begin_finalization().await;
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            *router.terminal_inspection_pause.lock().await =
+                Some((entered.clone(), release.clone()));
+            let finalizing = tokio::spawn(async move {
+                if abandon {
+                    owner.abandon().await;
+                    None
+                } else {
+                    owner.finish(newer.generation).await.unwrap()
+                }
+            });
+            entered.notified().await;
+            assert!(!inbox.inspect("parent").await.unwrap().activation_pending());
+            inbox
+                .mark_message_activation_eligible(
+                    "parent",
+                    &older,
+                    SessionActivationPolicy::InterruptSpecificWait,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                router
+                    .request_activation("parent", older.generation)
+                    .await
+                    .unwrap(),
+                SessionActivationDisposition::ActivationCoalesced
+            );
+            release.notify_one();
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), finalizing)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                outcome,
+                (!abandon).then_some(SessionActivationDisposition::ActivationReserved)
+            );
+            assert_eq!(spawner.reservations.load(Ordering::SeqCst), 2);
+            assert!(router.owns_run("parent", "run-2").await);
+
+            // Leave the newly processed item pending to prove the raced grant
+            // does not repeatedly restart a poisoned successor.
+            let claims = inbox.claim("parent", 128).await.unwrap();
+            assert_eq!(claims.len(), 1);
+            let mut successor = router.register_run("parent", "run-2").await.unwrap();
+            successor.begin_finalization().await;
+            assert_eq!(successor.finish(2).await.unwrap(), None);
+            assert_eq!(
+                router
+                    .request_activation("parent", older.generation)
+                    .await
+                    .unwrap(),
+                SessionActivationDisposition::ActivationCoalesced
+            );
+            assert_eq!(spawner.reservations.load(Ordering::SeqCst), 2);
+            inbox.ack("parent", &claims[0]).await.unwrap();
         }
     }
 
@@ -1665,6 +2882,17 @@ mod tests {
 
     #[async_trait]
     impl SessionInboxPort for BlockingInspectInbox {
+        async fn inspect_wake_readiness(
+            &self,
+            _target_session_id: &str,
+            _now: DateTime<Utc>,
+        ) -> Result<bamboo_domain::SessionInboxWakeReadiness, bamboo_domain::SessionInboxError>
+        {
+            // This double models only coordinator-prefix work, never a
+            // separately promoted per-message delivery below that prefix.
+            Ok(bamboo_domain::SessionInboxWakeReadiness::default())
+        }
+
         async fn coordinator_activation_generation(
             &self,
             _target_session_id: &str,
@@ -2738,4 +3966,910 @@ mod tests {
         assert_eq!(spawner.reservations.load(Ordering::SeqCst), 2);
         assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
     }
+    #[tokio::test]
+    async fn quarantined_registration_never_releases_owner_or_launches_successor() {
+        let router = SessionActivationRouter::new();
+        let spawner = spawner();
+        router.set_spawner(spawner.clone()).await;
+        let mut registration = router
+            .register_run("session", "quarantined-run")
+            .await
+            .unwrap();
+        let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_flag = cleaned.clone();
+        registration.set_abort_cleanup(move || async move {
+            cleanup_flag.store(true, Ordering::SeqCst);
+        });
+        registration.quarantine().await;
+        assert_eq!(
+            router.request_activation("session", 19).await.unwrap(),
+            SessionActivationDisposition::ActivationCoalesced
+        );
+        assert!(router.register_run("session", "successor").await.is_err());
+        assert!(router
+            .register_run("session", "quarantined-run")
+            .await
+            .is_err());
+        tokio::task::yield_now().await;
+        assert!(!cleaned.load(Ordering::SeqCst));
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
+        let states = router.states.lock().await;
+        let owner = states["session"].owner.as_ref().unwrap();
+        assert_eq!(owner.run_id, "quarantined-run");
+        assert!(owner.finalizing);
+    }
+
+    #[tokio::test]
+    async fn physical_execution_registration_drop_is_quarantined() {
+        let router = SessionActivationRouter::new();
+        let spawner = spawner();
+        router.set_spawner(spawner.clone()).await;
+        let mut registration = router
+            .register_run("session", "physical-run")
+            .await
+            .unwrap();
+        let cleaned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_flag = cleaned.clone();
+        registration.set_abort_cleanup(move || async move {
+            cleanup_flag.store(true, Ordering::SeqCst);
+        });
+        registration.quarantine_on_drop();
+        drop(registration);
+        // Drop retains the owner synchronously, then an owned cleanup task
+        // marks it finalizing. A racing delivery can still notify that retained
+        // owner before the task is polled; it must never spawn a successor.
+        assert!(matches!(
+            router.request_activation("session", 7).await.unwrap(),
+            SessionActivationDisposition::ActiveNotified
+                | SessionActivationDisposition::ActivationCoalesced
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if router.states.lock().await["session"]
+                    .owner
+                    .as_ref()
+                    .unwrap()
+                    .finalizing
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            router.request_activation("session", 8).await.unwrap(),
+            SessionActivationDisposition::ActivationCoalesced
+        );
+        assert!(!cleaned.load(Ordering::SeqCst));
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
+        assert!(router.register_run("session", "successor").await.is_err());
+        let states = router.states.lock().await;
+        assert!(states["session"].owner.as_ref().unwrap().finalizing);
+    }
+
+    #[tokio::test]
+    async fn cancelling_quarantine_wait_does_not_arm_abandoned_cleanup() {
+        let router = SessionActivationRouter::new();
+        let registration = router
+            .register_run("session", "quarantined-run")
+            .await
+            .unwrap();
+        let states_guard = router.states.lock().await;
+        let mut quarantine = Box::pin(registration.quarantine());
+        assert!(futures::poll!(quarantine.as_mut()).is_pending());
+        drop(quarantine);
+        drop(states_guard);
+        tokio::task::yield_now().await;
+        assert!(router.register_run("session", "successor").await.is_err());
+        assert_eq!(
+            router.current_run_id("session").await.as_deref(),
+            Some("quarantined-run")
+        );
+    }
+    async fn selected_fixture() -> (
+        tempfile::TempDir,
+        Arc<SessionActivationRouter>,
+        Arc<RecordingSpawner>,
+        Arc<bamboo_storage::FileSessionInbox>,
+    ) {
+        use bamboo_domain::{
+            Session, SessionActivationPolicy, SessionInboxLimits, SessionMessageEnvelope, Storage,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(temp.path().into())
+                .await
+                .unwrap(),
+        );
+        store
+            .save_session(&Session::new("selected", "model"))
+            .await
+            .unwrap();
+        let inbox = Arc::new(bamboo_storage::FileSessionInbox::new(
+            store,
+            SessionInboxLimits::default(),
+        ));
+        inbox
+            .deliver_with_activation_intent(
+                &SessionMessageEnvelope::user_input("selected", "other eligible input"),
+                SessionActivationPolicy::RespectSpecificWait,
+                None,
+            )
+            .await
+            .unwrap();
+        let router = SessionActivationRouter::new();
+        router.set_inbox(inbox.clone());
+        let spawner = spawner();
+        router.set_spawner(spawner.clone()).await;
+        (temp, router, spawner, inbox)
+    }
+
+    #[tokio::test]
+    async fn receipt_run_selected_release_never_inherits_unrequested_durable_backlog() {
+        for mode in ["finish", "abandon", "drop"] {
+            let (_temp, router, spawner, inbox) = selected_fixture().await;
+            let mut selected = router
+                .register_run("selected", "manual-selected")
+                .await
+                .unwrap();
+            selected.restrict_to_selected_input();
+            match mode {
+                "finish" => {
+                    selected.begin_finalization().await;
+                    assert_eq!(selected.finish(0).await.unwrap(), None);
+                }
+                "abandon" => selected.abandon().await,
+                _ => drop(selected),
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while router.current_run_id("selected").await.is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(spawner.reservations.load(Ordering::SeqCst), 0, "{mode}");
+            assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
+            assert_eq!(inbox.inspect("selected").await.unwrap().pending, 1);
+            // A subsequent real producer request still owns normal scheduling.
+            assert_eq!(
+                router.request_activation("selected", 1).await.unwrap(),
+                SessionActivationDisposition::ActivationReserved
+            );
+            assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn receipt_run_selected_release_preserves_explicit_coalesced_coordinator_wake() {
+        for mode in ["finish", "abandon", "drop"] {
+            for notify_before_scope in [false, true] {
+                let (_temp, router, spawner, _inbox) = selected_fixture().await;
+                let mut selected = router
+                    .register_run("selected", "manual-selected")
+                    .await
+                    .unwrap();
+                if !notify_before_scope {
+                    selected.restrict_to_selected_input();
+                }
+                assert_eq!(
+                    router.request_activation("selected", 1).await.unwrap(),
+                    SessionActivationDisposition::ActiveNotified
+                );
+                if notify_before_scope {
+                    selected.restrict_to_selected_input();
+                }
+                match mode {
+                    "finish" => {
+                        selected.begin_finalization().await;
+                        assert_eq!(
+                            selected.finish(0).await.unwrap(),
+                            Some(SessionActivationDisposition::ActivationReserved)
+                        );
+                    }
+                    "abandon" => selected.abandon().await,
+                    _ => drop(selected),
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while spawner.reservations.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    spawner.reservations.load(Ordering::SeqCst),
+                    1,
+                    "{mode}/{notify_before_scope}"
+                );
+                assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
+                assert!(router.owns_run("selected", "run-1").await);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn receipt_run_cancelled_selected_finish_retains_restricted_drop_cleanup() {
+        let (_temp, router, spawner, inbox) = selected_fixture().await;
+        let mut selected = router
+            .register_run("selected", "manual-selected")
+            .await
+            .unwrap();
+        selected.restrict_to_selected_input();
+        let lock = router.states.lock().await;
+        let mut finish = Box::pin(selected.finish(0));
+        assert!(futures::poll!(finish.as_mut()).is_pending());
+        drop(finish);
+        drop(lock);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while router.current_run_id("selected").await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(spawner.reservations.load(Ordering::SeqCst), 0);
+        assert_eq!(inbox.inspect("selected").await.unwrap().pending, 1);
+    }
+    struct PeerIntentFixture {
+        _temp: tempfile::TempDir,
+        store: Arc<bamboo_storage::SessionStoreV2>,
+        inbox: Arc<bamboo_storage::FileSessionInbox>,
+        router: Arc<SessionActivationRouter>,
+        spawner: Arc<RecordingSpawner>,
+        messenger: crate::SessionMessenger,
+    }
+
+    impl PeerIntentFixture {
+        async fn new() -> Self {
+            use bamboo_domain::{Session, SessionInboxLimits, Storage};
+            let temp = tempfile::tempdir().unwrap();
+            let store = Arc::new(
+                bamboo_storage::SessionStoreV2::new(temp.path().into())
+                    .await
+                    .unwrap(),
+            );
+            let target = Session::new("target", "model");
+            let source = Session::new_child_of("sender", &target, "model", "task");
+            store.save_session(&target).await.unwrap();
+            store.save_session(&source).await.unwrap();
+            let inbox = Arc::new(bamboo_storage::FileSessionInbox::new(
+                store.clone(),
+                SessionInboxLimits::default(),
+            ));
+            let router = SessionActivationRouter::new();
+            router.set_inbox(inbox.clone());
+            let spawner = spawner();
+            router.set_spawner(spawner.clone()).await;
+            let messenger =
+                crate::SessionMessenger::new(store.clone(), inbox.clone(), router.clone());
+            Self {
+                _temp: temp,
+                store,
+                inbox,
+                router,
+                spawner,
+                messenger,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_only_delivery_never_schedules_idle_finalizing_or_restarted_target() {
+        use bamboo_domain::SessionMessageDeliveryIntent::QueueOnly;
+        for timing in [
+            "idle",
+            "active",
+            "finalizing",
+            "after_terminal_inspection",
+            "selected_finish",
+            "selected_abandon",
+        ] {
+            let fixture = PeerIntentFixture::new().await;
+            let mut registration = if timing == "idle" {
+                None
+            } else {
+                Some(
+                    fixture
+                        .router
+                        .register_run("target", "manual-run")
+                        .await
+                        .unwrap(),
+                )
+            };
+            if timing == "selected_finish" || timing == "selected_abandon" {
+                registration.as_mut().unwrap().restrict_to_selected_input();
+            }
+            if timing == "finalizing" || timing == "after_terminal_inspection" {
+                registration.as_mut().unwrap().begin_finalization().await;
+            }
+            let mut race = None;
+            let release = Arc::new(Notify::new());
+            if timing == "after_terminal_inspection" {
+                let entered = Arc::new(Notify::new());
+                *fixture.router.terminal_inspection_pause.lock().await =
+                    Some((entered.clone(), release.clone()));
+                let registration = registration.take().unwrap();
+                race = Some(tokio::spawn(async move { registration.finish(0).await }));
+                tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+                    .await
+                    .unwrap();
+            }
+            let receipt = fixture
+                .messenger
+                .send_peer_with_intent("sender", "target", "queue", "queued", QueueOnly)
+                .await
+                .unwrap();
+            assert_eq!(receipt.activation, None, "{timing}");
+            assert_eq!(
+                receipt.active_delivery_notified,
+                matches!(timing, "active" | "selected_finish" | "selected_abandon")
+            );
+            if let Some(mut registration) = registration {
+                if timing == "selected_abandon" {
+                    registration.abandon().await;
+                } else {
+                    registration.begin_finalization().await;
+                    assert_eq!(registration.finish(0).await.unwrap(), None);
+                }
+            }
+            if let Some(race) = race {
+                release.notify_one();
+                assert_eq!(race.await.unwrap().unwrap(), None);
+            }
+            assert_eq!(
+                fixture.spawner.reservations.load(Ordering::SeqCst),
+                0,
+                "{timing}"
+            );
+            assert_eq!(fixture.spawner.launches.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.inbox.inspect("target").await.unwrap().pending, 1);
+            // Startup recovery uses the durable Inbox, not the live router hint.
+            let restarted = SessionActivationRouter::new();
+            restarted.set_inbox(fixture.inbox.clone());
+            restarted.set_spawner(fixture.spawner.clone()).await;
+            assert_eq!(
+                restarted
+                    .reconcile_wake("target", Utc::now())
+                    .await
+                    .unwrap()
+                    .disposition,
+                None
+            );
+            assert_eq!(fixture.spawner.reservations.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_only_notifies_late_bound_active_driver_and_checkpoints_at_safe_point() {
+        use bamboo_domain::{SessionMessageDeliveryIntent::QueueOnly, Storage};
+        let fixture = PeerIntentFixture::new().await;
+        let mut registration = fixture
+            .router
+            .register_run("target", "manual-run")
+            .await
+            .unwrap();
+        let receipt = fixture
+            .messenger
+            .send_peer_with_intent("sender", "target", "queue", "queued", QueueOnly)
+            .await
+            .unwrap();
+        assert!(receipt.active_delivery_notified);
+        assert!(registration.notifications_mut().has_changed().unwrap());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        assert_eq!(
+            fixture
+                .router
+                .attach_delivery_sink("target", tx)
+                .await
+                .as_deref(),
+            Some("manual-run")
+        );
+        assert_eq!(rx.try_recv().unwrap(), receipt.delivery.generation);
+        let claims = fixture
+            .inbox
+            .claim_for_turn("target", 8, Some("manual-run"))
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        let mut saved = fixture.store.load_session("target").await.unwrap().unwrap();
+        saved.add_message(claims[0].envelope.to_provider_message().unwrap());
+        fixture.store.save_session(&saved).await.unwrap();
+        fixture.inbox.ack("target", &claims[0]).await.unwrap();
+        registration.begin_finalization().await;
+        assert_eq!(
+            registration
+                .finish(receipt.delivery.generation)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(fixture.spawner.reservations.load(Ordering::SeqCst), 0);
+        let saved = fixture.store.load_session("target").await.unwrap().unwrap();
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .filter(|message| message.id == receipt.delivery.id.as_str())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_trigger_turn_can_start_a_turn_after_queue_only_delivery() {
+        use bamboo_domain::SessionMessageDeliveryIntent::{QueueOnly, TriggerTurn};
+        let fixture = PeerIntentFixture::new().await;
+        fixture
+            .messenger
+            .send_peer_with_intent("sender", "target", "queue", "queued", QueueOnly)
+            .await
+            .unwrap();
+        assert_eq!(fixture.spawner.reservations.load(Ordering::SeqCst), 0);
+        let followup = fixture
+            .messenger
+            .send_peer_with_intent("sender", "target", "followup", "followup", TriggerTurn)
+            .await
+            .unwrap();
+        assert_eq!(
+            followup.activation,
+            Some(SessionActivationDisposition::ActivationReserved)
+        );
+        assert_eq!(fixture.spawner.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.spawner.launches.load(Ordering::SeqCst), 1);
+        let claims = fixture
+            .inbox
+            .claim_for_turn("target", 8, Some("run-1"))
+            .await
+            .unwrap();
+        assert_eq!(claims.len(), 2);
+        assert!(claims.iter().all(|claim| claim.activation_policy
+            == bamboo_domain::SessionActivationPolicy::RespectSpecificWait));
+    }
+
+    #[tokio::test]
+    async fn acknowledged_explicit_peer_retry_cannot_activate_or_notify_a_new_owner() {
+        use bamboo_domain::{SessionMessageDeliveryIntent, Storage};
+        for intent in [
+            SessionMessageDeliveryIntent::TriggerTurn,
+            SessionMessageDeliveryIntent::QueueOnly,
+        ] {
+            for active_owner in [false, true] {
+                let fixture = PeerIntentFixture::new().await;
+                let first = fixture
+                    .messenger
+                    .send_peer_with_intent("sender", "target", "ack-operation", "input", intent)
+                    .await
+                    .unwrap();
+                let claim = fixture
+                    .inbox
+                    .claim_for_turn("target", 1, Some("first-run"))
+                    .await
+                    .unwrap()
+                    .remove(0);
+                let mut saved = fixture.store.load_session("target").await.unwrap().unwrap();
+                saved.add_message(claim.envelope.to_provider_message().unwrap());
+                saved
+                    .session_inbox_admission_mut()
+                    .record(claim.envelope.id.clone(), claim.generation);
+                fixture.store.save_session(&saved).await.unwrap();
+                fixture.inbox.ack("target", &claim).await.unwrap();
+
+                // This spawner has no independent Inbox filter. The messenger
+                // must not ask a fresh router to launch an acknowledged input.
+                let restarted = SessionActivationRouter::new();
+                restarted.set_inbox(fixture.inbox.clone());
+                let fresh_spawner = spawner();
+                restarted.set_spawner(fresh_spawner.clone()).await;
+                let mut registration = if active_owner {
+                    Some(restarted.register_run("target", "new-owner").await.unwrap())
+                } else {
+                    None
+                };
+                let messenger = crate::SessionMessenger::new(
+                    fixture.store.clone(),
+                    fixture.inbox.clone(),
+                    restarted,
+                );
+                let retry = messenger
+                    .send_peer_with_intent("sender", "target", "ack-operation", "input", intent)
+                    .await
+                    .unwrap();
+                assert_eq!(retry.delivery, first.delivery);
+                assert_eq!(retry.activation, None, "{intent:?} active={active_owner}");
+                assert!(!retry.active_delivery_notified);
+                assert_eq!(fresh_spawner.reservations.load(Ordering::SeqCst), 0);
+                assert_eq!(fresh_spawner.launches.load(Ordering::SeqCst), 0);
+                if let Some(mut registration) = registration.take() {
+                    assert!(!registration.notifications_mut().has_changed().unwrap());
+                    registration.begin_finalization().await;
+                    assert_eq!(registration.finish(claim.generation).await.unwrap(), None);
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn expected_run_guard_conflicts_and_blocks_finalization_until_publication_finishes() {
+        use bamboo_domain::{SessionRunConflictReason, SessionRunDeliveryGuard};
+        async fn retain(
+            router: Arc<SessionActivationRouter>,
+            birth: DateTime<Utc>,
+            expected: &'static str,
+        ) -> Result<Arc<dyn SessionRunDeliveryGuard>, bamboo_domain::SessionRunConflict> {
+            tokio::task::spawn_blocking(move || {
+                router.retain_expected_run_blocking("target", birth, expected)
+            })
+            .await
+            .unwrap()
+        }
+        let router = SessionActivationRouter::new();
+        let target = bamboo_domain::Session::new("target", "model");
+        let birth = target.created_at;
+        assert_eq!(
+            retain(router.clone(), birth, "run-a")
+                .await
+                .err()
+                .unwrap()
+                .reason,
+            SessionRunConflictReason::NoActiveRun
+        );
+        let mut registration = router.register_session_run(&target, "run-a").await.unwrap();
+        assert_eq!(
+            retain(router.clone(), birth, "replacement")
+                .await
+                .err()
+                .unwrap()
+                .reason,
+            SessionRunConflictReason::RunChanged
+        );
+        let stale_birth = retain(
+            router.clone(),
+            birth + chrono::Duration::seconds(1),
+            "run-a",
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            stale_birth.reason,
+            SessionRunConflictReason::SessionBirthChanged
+        );
+        assert_eq!(stale_birth.observed_run_id, None);
+        let guard = retain(router.clone(), birth, "run-a").await.unwrap();
+        assert!(guard.matches("target", birth, "run-a"));
+        assert!(!guard.matches("other-target", birth, "run-a"));
+        let notify = guard.clone();
+        assert!(
+            tokio::task::spawn_blocking(move || notify.notify_committed_delivery(7))
+                .await
+                .unwrap()
+        );
+        let mut finalizing = Box::pin(router.begin_finalization("target", "run-a"));
+        assert!(futures::poll!(finalizing.as_mut()).is_pending());
+        drop(guard);
+        finalizing.await;
+        assert_eq!(
+            retain(router.clone(), birth, "run-a")
+                .await
+                .err()
+                .unwrap()
+                .reason,
+            SessionRunConflictReason::Finalizing
+        );
+        assert_eq!(*registration.notifications_mut().borrow(), 7);
+        assert_eq!(registration.finish(0).await.unwrap(), None);
+        assert_eq!(router.current_run_id("target").await, None);
+    }
+
+    #[tokio::test]
+    async fn expected_run_publication_fence_does_not_block_other_sessions() {
+        let router = SessionActivationRouter::new();
+        let target = bamboo_domain::Session::new("target", "model");
+        let registration = router.register_session_run(&target, "run-a").await.unwrap();
+        let query = router.clone();
+        let guard = tokio::task::spawn_blocking(move || {
+            query.retain_expected_run_blocking(&target.id, target.created_at, "run-a")
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        // Keep the actual publication guard alive as if the final filesystem
+        // job is parked. Every unrelated owner transition must still complete.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let other = bamboo_domain::Session::new("independent", "model");
+            let mut other_run = router
+                .register_session_run(&other, "independent-run")
+                .await
+                .unwrap();
+            assert!(router.notify_active_delivery(&other.id, 11).await);
+            assert_eq!(*other_run.notifications_mut().borrow(), 11);
+            other_run.begin_finalization().await;
+            assert_eq!(other_run.finish(0).await.unwrap(), None);
+            assert_eq!(router.current_run_id(&other.id).await, None);
+        })
+        .await
+        .expect("a parked publication must not hold the global router lock");
+        drop(guard);
+        assert_eq!(registration.finish(0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn expected_run_requires_real_lifetime_binding_and_cannot_rebind() {
+        use bamboo_domain::SessionRunConflictReason;
+        let router = SessionActivationRouter::new();
+        let target = bamboo_domain::Session::new("target", "model");
+        let mut registration = router.register_run(&target.id, "run-a").await.unwrap();
+        let query = router.clone();
+        let birth = target.created_at;
+        let conflict = tokio::task::spawn_blocking(move || {
+            query.retain_expected_run_blocking("target", birth, "run-a")
+        })
+        .await
+        .unwrap()
+        .err()
+        .unwrap();
+        assert_eq!(conflict.reason, SessionRunConflictReason::UnboundLifetime);
+        assert_eq!(conflict.observed_run_id, None);
+        let other_router = SessionActivationRouter::new();
+        assert!(
+            !other_router
+                .bind_run_lifetime(&registration.ownership(), &target)
+                .await
+        );
+        assert!(
+            router
+                .bind_run_lifetime(&registration.ownership(), &target)
+                .await
+        );
+        let mut replacement = target.clone();
+        replacement.created_at += chrono::Duration::seconds(1);
+        assert!(
+            !router
+                .bind_run_lifetime(&registration.ownership(), &replacement)
+                .await
+        );
+        let query = router.clone();
+        let guard = tokio::task::spawn_blocking(move || {
+            query.retain_expected_run_blocking("target", birth, "run-a")
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(guard.matches("target", birth, "run-a"));
+        drop(guard);
+        registration.begin_finalization().await;
+        assert!(
+            !router
+                .bind_run_lifetime(&registration.ownership(), &target)
+                .await
+        );
+        assert_eq!(registration.finish(0).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn expected_run_guard_rejects_unregistered_reservations_without_notification() {
+        let router = SessionActivationRouter::new();
+        router
+            .install_owner_placeholder_for_test("target", "run-a")
+            .await;
+        let query = router.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            query.retain_expected_run_blocking("target", Utc::now(), "run-a")
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            result.err().unwrap().reason,
+            bamboo_domain::SessionRunConflictReason::NotRegistered
+        );
+        assert_eq!(
+            router.current_run_id("target").await.as_deref(),
+            Some("run-a")
+        );
+        assert_eq!(
+            router.states.lock().await["target"].latest_delivery_generation,
+            0
+        );
+    }
+
+    mod tool_suspension_registration_tests {
+        use super::*;
+        use bamboo_agent_core::tools::{
+            capture_suspension_restriction, observe_tool_suspension, with_suspension_disabled,
+            AsyncWaitKind, RunningCompletion, RunningHandle, ToolOutcome, ToolResult,
+            ToolSuspensionObservation,
+        };
+
+        async fn bind_running_probe(
+            registration: &mut SessionRunRegistration,
+            deny: bool,
+            kills: Arc<AtomicUsize>,
+        ) -> ToolSuspensionObservation {
+            let (_, report) = observe_tool_suspension(false, async {
+                registration
+                    .bind_tool_suspension_observation(capture_suspension_restriction().unwrap());
+                let collapse = async move {
+                    ToolOutcome::Running(RunningHandle {
+                        tool_call_id: "registration-running-probe".into(),
+                        ack: ToolResult::text(true, "ordinary running ack"),
+                        completion: RunningCompletion::Detached,
+                        wait_kind: AsyncWaitKind::AsyncTools,
+                        kill: Box::new(move || {
+                            kills.fetch_add(1, Ordering::SeqCst);
+                        }),
+                    })
+                    .into_tool_result()
+                };
+                let result = if deny {
+                    with_suspension_disabled(collapse).await
+                } else {
+                    collapse.await
+                };
+                assert_eq!(result.success, !deny);
+            })
+            .await;
+            report
+        }
+
+        #[tokio::test]
+        async fn forbidden_observation_retains_exact_owner_after_drop_or_observer_cancel() {
+            for cancel_observer in [false, true] {
+                let router = SessionActivationRouter::new();
+                let spawner = spawner();
+                router.set_spawner(spawner.clone()).await;
+                let mut registration = router
+                    .register_run("session", "observed-running-owner")
+                    .await
+                    .unwrap();
+                let cleaned = Arc::new(AtomicUsize::new(0));
+                let clean_count = cleaned.clone();
+                registration.set_abort_cleanup(move || async move {
+                    clean_count.fetch_add(1, Ordering::SeqCst);
+                });
+                assert_eq!(
+                    router.request_activation("session", 7).await.unwrap(),
+                    SessionActivationDisposition::ActiveNotified
+                );
+                let kills = Arc::new(AtomicUsize::new(0));
+                let report = if cancel_observer {
+                    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                    let child_kills = kills.clone();
+                    let task = tokio::spawn(async move {
+                        observe_tool_suspension(false, async move {
+                            let report =
+                                bind_running_probe(&mut registration, true, child_kills).await;
+                            assert!(registration.observed_forbidden_running());
+                            let _ = ready_tx.send(report);
+                            std::future::pending::<()>().await;
+                            // Keep the registration owned across the pending
+                            // await; cancellation drops it with its real token.
+                            drop(registration);
+                        })
+                        .await;
+                    });
+                    let ready =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx).await;
+                    task.abort();
+                    let task_exit = task.await;
+                    assert!(task_exit.unwrap_err().is_cancelled());
+                    ready.unwrap().unwrap()
+                } else {
+                    let report = bind_running_probe(&mut registration, true, kills.clone()).await;
+                    assert!(registration.observed_forbidden_running());
+                    // The observer is already gone: only the opaque token
+                    // retained on this exact lease preserves the proof.
+                    drop(registration);
+                    report
+                };
+                assert!(report.running_seen && report.forbidden_running_seen);
+                assert_eq!(kills.load(Ordering::SeqCst), 1);
+
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        let finalized = router
+                            .states
+                            .lock()
+                            .await
+                            .get("session")
+                            .and_then(|state| state.owner.as_ref())
+                            .is_some_and(|owner| {
+                                owner.run_id == "observed-running-owner" && owner.finalizing
+                            });
+                        if finalized {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the exact retained owner must enter finalization");
+                assert_eq!(
+                    router.request_activation("session", 8).await.unwrap(),
+                    SessionActivationDisposition::ActivationCoalesced
+                );
+                for attempted in ["successor", "observed-running-owner"] {
+                    let collision = router
+                        .register_run("session", attempted)
+                        .await
+                        .err()
+                        .expect("a quarantined owner cannot be replaced or adopted");
+                    assert_eq!(collision.existing_run_id(), "observed-running-owner");
+                }
+                assert_eq!(cleaned.load(Ordering::SeqCst), 0);
+                assert_eq!(spawner.reservations.load(Ordering::SeqCst), 0);
+                assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
+                let states = router.states.lock().await;
+                let owner = states["session"].owner.as_ref().unwrap();
+                assert_eq!(owner.run_id, "observed-running-owner");
+                assert!(owner.finalizing);
+                assert_eq!(owner.registrations, 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn allowed_observation_preserves_ordinary_drop_and_finish_successors() {
+            for finish_normally in [false, true] {
+                let router = SessionActivationRouter::new();
+                let spawner = spawner();
+                router.set_spawner(spawner.clone()).await;
+                let mut registration = router
+                    .register_run("session", "ordinary-observed-owner")
+                    .await
+                    .unwrap();
+                let cleaned = Arc::new(AtomicUsize::new(0));
+                let clean_count = cleaned.clone();
+                registration.set_abort_cleanup(move || async move {
+                    clean_count.fetch_add(1, Ordering::SeqCst);
+                });
+                let kills = Arc::new(AtomicUsize::new(0));
+                let report = bind_running_probe(&mut registration, false, kills.clone()).await;
+                assert!(report.running_seen);
+                assert!(!report.forbidden_running_seen);
+                assert!(!registration.observed_forbidden_running());
+                assert_eq!(kills.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    router.request_activation("session", 7).await.unwrap(),
+                    SessionActivationDisposition::ActiveNotified
+                );
+                if finish_normally {
+                    registration.begin_finalization().await;
+                    assert_eq!(
+                        registration.finish(0).await.unwrap(),
+                        Some(SessionActivationDisposition::ActivationReserved)
+                    );
+                } else {
+                    drop(registration);
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    while spawner.launches.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("ordinary handoff must still launch its one successor");
+                assert_eq!(spawner.reservations.load(Ordering::SeqCst), 1);
+                assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    cleaned.load(Ordering::SeqCst),
+                    usize::from(!finish_normally)
+                );
+                assert!(router.owns_run("session", "run-1").await);
+                let mut successor = router.register_run("session", "run-1").await.unwrap();
+                successor.begin_finalization().await;
+                assert_eq!(successor.finish(7).await.unwrap(), None);
+                assert!(router.current_run_id("session").await.is_none());
+                assert_eq!(spawner.launches.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
 }
+
+#[cfg(test)]
+#[path = "session_activation_child_completion_tests.rs"]
+mod child_completion_fence_tests;
+
+#[cfg(test)]
+#[path = "session_activation/scoped_loop_tests.rs"]
+mod scoped_loop_tests;

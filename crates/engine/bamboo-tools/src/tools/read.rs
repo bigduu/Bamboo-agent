@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use bamboo_agent_core::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
-use serde_json::json;
 use std::path::Path;
 
+use super::parameter_schema;
 use super::read_tracker::{self, MAX_TRACKED_FILE_SIZE};
 
 const BLOCKED_DEVICE_PATHS: &[&str] = &[
@@ -21,12 +21,24 @@ const BLOCKED_DEVICE_PATHS: &[&str] = &[
     "/dev/fd/2",
 ];
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 struct ReadArgs {
+    /// The absolute path to the file or directory to read
     file_path: String,
+    /// The line offset to start reading from. Omit when you want the full file or directory listing.
     #[serde(default)]
+    #[schemars(
+        schema_with = "parameter_schema::number",
+        skip_serializing_if = "Option::is_none"
+    )]
     offset: Option<usize>,
+    /// The maximum number of lines or directory entries to read. Omit for the full result when safe.
     #[serde(default)]
+    #[schemars(
+        schema_with = "parameter_schema::number",
+        skip_serializing_if = "Option::is_none"
+    )]
     limit: Option<usize>,
 }
 
@@ -151,25 +163,7 @@ impl Tool for ReadTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "The absolute path to the file or directory to read"
-                },
-                "offset": {
-                    "type": "number",
-                    "description": "The line offset to start reading from. Omit when you want the full file or directory listing."
-                },
-                "limit": {
-                    "type": "number",
-                    "description": "The maximum number of lines or directory entries to read. Omit for the full result when safe."
-                }
-            },
-            "required": ["file_path"],
-            "additionalProperties": false
-        })
+        parameter_schema::for_arguments::<ReadArgs>()
     }
 
     async fn invoke(
@@ -287,6 +281,38 @@ mod tests {
     use super::*;
     use crate::tools::WriteTool;
     use serde_json::json;
+
+    #[test]
+    fn read_args_preserve_optional_defaults_and_unknown_fields() {
+        for args in [
+            json!({"file_path": "/tmp/read.txt"}),
+            json!({
+                "file_path": "/tmp/read.txt",
+                "offset": null,
+                "limit": null,
+                "unknown": true
+            }),
+        ] {
+            let parsed: ReadArgs = serde_json::from_value(args).unwrap();
+            assert_eq!(parsed.file_path, "/tmp/read.txt");
+            assert_eq!(parsed.offset, None);
+            assert_eq!(parsed.limit, None);
+        }
+    }
+
+    #[test]
+    fn read_args_preserve_invalid_argument_rejection() {
+        for field in ["offset", "limit"] {
+            for invalid in [json!(-1), json!(1.5), json!("1"), json!(true)] {
+                let mut args = json!({"file_path": "/tmp/read.txt"});
+                args[field] = invalid;
+                assert!(serde_json::from_value::<ReadArgs>(args).is_err());
+            }
+        }
+        for args in [json!({}), json!({"file_path": null})] {
+            assert!(serde_json::from_value::<ReadArgs>(args).is_err());
+        }
+    }
 
     #[tokio::test]
     async fn binary_read_still_marks_file_as_read_for_session_write_gate() {

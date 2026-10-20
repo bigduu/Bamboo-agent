@@ -1,4 +1,4 @@
-//! Pure loaded-only conversion plan. Not called by runner setup or persistence.
+//! Pure loaded-only conversion plan, applied by defaults SDK runner setup.
 
 use bamboo_agent_core::{Message, Role};
 use bamboo_skills::runtime_metadata::*;
