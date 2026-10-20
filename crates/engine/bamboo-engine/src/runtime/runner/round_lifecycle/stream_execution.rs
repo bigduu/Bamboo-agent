@@ -120,7 +120,7 @@ fn interruption_kind(error: &AgentError) -> &'static str {
         AgentError::StreamTimeout(_) => "stream_timeout",
         AgentError::LLMOverflow(_) => "llm_overflow",
         AgentError::EmptyAssistantResponse { .. } => "empty_assistant_response",
-        AgentError::LLM(_) => "llm_error",
+        AgentError::LLM(_) | AgentError::LLMNonRetryable(_) => "llm_error",
         _ => "execution_error",
     }
 }
@@ -1523,7 +1523,7 @@ pub(super) async fn execute_llm_stream(
     planned.render.log(session_id);
     persist_request_render_metadata(session, &planned.render);
 
-    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
+    let mut timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
         config.stream_timeout,
         provider_name,
         Some(model),
@@ -1558,22 +1558,29 @@ pub(super) async fn execute_llm_stream(
     // not an LLM request. The same span remains alive through stream consumption.
     let observation =
         bamboo_infrastructure::telemetry::Observation::llm(provider_type, model, session_id);
+    let http_retry_observer = Arc::new(bamboo_llm::retry::InitialHttpRetryObserver::default());
     let stream = observation
-        .scope(crate::runtime::stream::handler::await_stream_bootstrap(
-            llm.chat_stream_ir(
-                &prepared_envelope.ir,
-                tool_schemas,
-                Some(max_output_tokens),
-                model,
-                Some(&planned.request_options),
+        .scope(
+            crate::runtime::stream::handler::await_stream_bootstrap_observed(
+                llm.chat_stream_ir(
+                    &prepared_envelope.ir,
+                    tool_schemas,
+                    Some(max_output_tokens),
+                    model,
+                    Some(&planned.request_options),
+                ),
+                cancel_token,
+                session_id,
+                &timeout_context,
+                http_retry_observer.clone(),
             ),
-            cancel_token,
-            session_id,
-            &timeout_context,
-        ))
+        )
         .await
         .and_then(|result| {
             result.map_err(|error| {
+                if let bamboo_llm::provider::LLMError::RequestFailed(message) = error {
+                    return AgentError::LLMNonRetryable(message);
+                }
                 let message = format_provider_error(error);
                 if is_llm_overflow_error(&message) {
                     AgentError::LLMOverflow(message)
@@ -1589,6 +1596,10 @@ pub(super) async fn execute_llm_stream(
             return Err(error);
         }
     };
+    let provider_manages_retry_budget = http_retry_observer.request_budget_managed();
+    if provider_manages_retry_budget {
+        timeout_context.disable_turn_retry();
+    }
 
     // A successful stream bootstrap is the first point at which the final
     // provider-visible PromptIR is known to have been accepted. Capture the
@@ -1688,7 +1699,19 @@ pub(super) async fn execute_llm_stream(
         .await;
     let mut stream_output = match stream_output_result {
         Ok(output) => output,
-        Err(failure) => {
+        Err(mut failure) => {
+            // A generic SSE/body error is no safer to replay than a watchdog
+            // expiry once text, reasoning or a tool-call delta was observed.
+            if matches!(failure.error, AgentError::LLM(_))
+                && (provider_manages_retry_budget
+                    || !failure.partial_output.content.is_empty()
+                    || !failure.partial_output.reasoning_content.is_empty()
+                    || !failure.partial_output.partial_tool_calls.is_empty())
+            {
+                if let AgentError::LLM(message) = &failure.error {
+                    failure.error = AgentError::LLMNonRetryable(message.clone());
+                }
+            }
             if let Some(usage) = failure.partial_output.provider_usage {
                 observation.usage(usage.input_tokens, usage.output_tokens);
             }

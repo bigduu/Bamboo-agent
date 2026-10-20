@@ -21,11 +21,14 @@
 //! immediately and unchanged.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::providers::common::http_error_kind;
 use reqwest::{RequestBuilder, Response, StatusCode};
+use tokio::time::Instant;
+
+use crate::provider::LLMError;
 
 /// Secret-free evidence from the most recent retryable HTTP response while
 /// establishing one provider stream. A fresh observer is scoped to each
@@ -37,15 +40,29 @@ pub struct InitialHttpRetry {
 }
 
 #[derive(Debug, Default)]
-pub struct InitialHttpRetryObserver(Mutex<Option<InitialHttpRetry>>);
+pub struct InitialHttpRetryObserver {
+    last: Mutex<Option<InitialHttpRetry>>,
+    budget_managed: AtomicBool,
+}
 
 impl InitialHttpRetryObserver {
+    /// Whether the provider owns a bounded request policy for this bootstrap.
+    pub fn request_budget_managed(&self) -> bool {
+        self.budget_managed.load(Ordering::Relaxed)
+    }
+
     pub fn last(&self) -> Option<InitialHttpRetry> {
-        *self.0.lock().expect("initial HTTP retry observer poisoned")
+        *self
+            .last
+            .lock()
+            .expect("initial HTTP retry observer poisoned")
     }
 
     fn record(&self, status: StatusCode, delay: Duration) {
-        *self.0.lock().expect("initial HTTP retry observer poisoned") = Some(InitialHttpRetry {
+        *self
+            .last
+            .lock()
+            .expect("initial HTTP retry observer poisoned") = Some(InitialHttpRetry {
             status: status.as_u16(),
             delay,
         });
@@ -232,62 +249,314 @@ pub async fn send_with_retry<F>(
 where
     F: Fn() -> RequestBuilder,
 {
-    let max_attempts = config.max_attempts.max(1);
-    let mut attempt: u32 = 0;
-
-    loop {
-        let result = build().send().await;
-        let is_last = attempt + 1 >= max_attempts;
-
-        match result {
+    retry_initial_request(config, provider, || async {
+        match build().send().await {
             Ok(response) => {
                 let status = response.status();
-                if is_last || !is_retryable_status(status) {
-                    return Ok(response);
+                let retry_after = parse_retry_after(&response).map(|d| d.min(RETRY_AFTER_CEILING));
+                RetryAttempt {
+                    retry: is_retryable_status(status),
+                    status: Some(status),
+                    retry_after,
+                    deadline: None,
+                    result: Ok(response),
                 }
-
-                // Prefer server-provided Retry-After (429s), else computed
-                // backoff. Retry-After is honored beyond `max_delay` (server is
-                // authoritative) but bounded by `RETRY_AFTER_CEILING`.
-                let delay = parse_retry_after(&response)
-                    .map(|d| d.min(RETRY_AFTER_CEILING))
-                    .unwrap_or_else(|| backoff_delay(config, attempt));
-
-                let _ =
-                    INITIAL_HTTP_RETRY_OBSERVER.try_with(|observer| observer.record(status, delay));
-
-                tracing::warn!(
-                    "[{provider}] transient HTTP {} on attempt {}/{}; retrying in {}ms",
-                    status.as_u16(),
-                    attempt + 1,
-                    max_attempts,
-                    delay.as_millis()
-                );
-
-                // Drop the response (and its connection) before retrying.
-                drop(response);
-                tokio::time::sleep(delay).await;
             }
-            Err(err) => {
-                if is_last || !is_retryable_reqwest_error(&err) {
-                    return Err(err);
-                }
-
-                let delay = backoff_delay(config, attempt);
-                tracing::warn!(
-                    "[{provider}] transient transport error on attempt {}/{} (error_kind={}); retrying in {}ms",
-                    attempt + 1,
-                    max_attempts,
-                    http_error_kind(&err),
-                    delay.as_millis()
-                );
-                tokio::time::sleep(delay).await;
-            }
+            Err(error) => RetryAttempt {
+                retry: is_retryable_reqwest_error(&error),
+                status: None,
+                retry_after: None,
+                deadline: None,
+                result: Err(error),
+            },
         }
+    })
+    .await
+}
 
-        attempt += 1;
+struct RetryAttempt<T> {
+    result: T,
+    retry: bool,
+    status: Option<StatusCode>,
+    retry_after: Option<Duration>,
+    deadline: Option<Instant>,
+}
+
+impl<T> RetryAttempt<T> {
+    fn final_result(result: T) -> Self {
+        Self {
+            result,
+            retry: false,
+            status: None,
+            retry_after: None,
+            deadline: None,
+        }
     }
 }
+
+// One inline retry driver: legacy callers keep their unread Response contract;
+// the Anthropic policy below supplies only its classification and shared budget.
+async fn retry_initial_request<T, F, Fut>(config: &RetryConfig, provider: &str, attempt: F) -> T
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = RetryAttempt<T>>,
+{
+    let max_attempts = config.max_attempts.max(1);
+    let mut index = 0;
+    loop {
+        let outcome = attempt().await;
+        if !outcome.retry || index + 1 >= max_attempts {
+            return outcome.result;
+        }
+        let delay = outcome
+            .retry_after
+            .unwrap_or_else(|| backoff_delay(config, index));
+        if outcome.deadline.is_some_and(|deadline| {
+            Instant::now()
+                .checked_add(delay)
+                .is_none_or(|next| next >= deadline)
+        }) {
+            // Never shorten a server hint to squeeze another request into a budget.
+            return outcome.result;
+        }
+        if let Some(status) = outcome.status {
+            let _ = INITIAL_HTTP_RETRY_OBSERVER.try_with(|observer| observer.record(status, delay));
+        }
+        if let Some(status) = outcome.status {
+            tracing::warn!(
+                "[{provider}] transient HTTP {} on attempt {}/{}; retrying in {}ms",
+                status.as_u16(),
+                index + 1,
+                max_attempts,
+                delay.as_millis()
+            );
+        } else {
+            tracing::warn!(
+                "[{provider}] transient transport error on attempt {}/{}; retrying in {}ms",
+                index + 1,
+                max_attempts,
+                delay.as_millis()
+            );
+        }
+        drop(outcome);
+        tokio::time::sleep(delay).await;
+        index += 1;
+    }
+}
+
+const CONNECTOR_BODY_LIMIT: usize = 16 * 1024;
+const ANTHROPIC_MAX_ATTEMPTS: u32 = 4;
+const ANTHROPIC_REQUEST_BUDGET: Duration = Duration::from_secs(60);
+
+/// One Anthropic call, including reasoning/tool-choice compatibility fallbacks.
+/// Atomic counting keeps borrowed policy futures Send without spawning work.
+pub(crate) struct InitialRequestBudget {
+    attempts: AtomicU32,
+    max_attempts: u32,
+    deadline: Instant,
+}
+
+impl InitialRequestBudget {
+    pub(crate) fn new(config: &RetryConfig) -> Self {
+        Self {
+            attempts: AtomicU32::new(0),
+            max_attempts: config.max_attempts.clamp(1, ANTHROPIC_MAX_ATTEMPTS),
+            deadline: Instant::now() + ANTHROPIC_REQUEST_BUDGET,
+        }
+    }
+
+    fn terminal(&self, status: Option<StatusCode>, reason: &str) -> LLMError {
+        let status = status
+            .map(|s| format!("HTTP {}", s.as_u16()))
+            .unwrap_or_else(|| "no HTTP response".to_string());
+        LLMError::RequestFailed(format!(
+            "Anthropic upstream request failed ({status}): {reason}. Automatic retry limit reached after {} request(s). Try again later or contact the upstream gateway administrator.",
+            self.attempts.load(Ordering::Relaxed)
+        ))
+    }
+}
+
+/// Non-transient error bodies are bounded for auth classification and existing
+/// compatibility fallbacks. Successful SSE bodies are never read by this policy.
+#[derive(Debug)]
+pub(crate) struct InitialResponse {
+    response: Response,
+    error_body: Option<String>,
+}
+
+impl InitialResponse {
+    pub(crate) fn status(&self) -> StatusCode {
+        self.response.status()
+    }
+
+    pub(crate) async fn text(self) -> reqwest::Result<String> {
+        match self.error_body {
+            Some(body) => Ok(body),
+            None => self.response.text().await,
+        }
+    }
+
+    pub(crate) fn into_response(self) -> Response {
+        self.response
+    }
+}
+
+/// Fail closed: this is the reported connector recovery diagnostic, not a
+/// general auth-error or database-error allowlist. All 403s stay terminal.
+pub(crate) fn is_connector_recovery(status: StatusCode, body: &str) -> bool {
+    if status != StatusCode::UNAUTHORIZED || body.len() > CONNECTOR_BODY_LIMIT {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let error = value.get("error").unwrap_or(&value);
+    // A conflicting gateway/credential code outranks a recovery-looking message.
+    // Unknown codes fail closed until an observed contract establishes them.
+    if [&value, error]
+        .iter()
+        .any(|value| value.get("code").is_some_and(|code| !code.is_null()))
+    {
+        return false;
+    }
+    if !matches!(
+        error.get("type").and_then(|v| v.as_str()),
+        Some("auth_error" | "authentication_error")
+    ) {
+        return false;
+    }
+    let Some(message) = error.get("message").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let normalized = message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let diagnostic = normalized
+        .strip_prefix("authentication error, ")
+        .unwrap_or(&normalized);
+    diagnostic == "error in connector: error querying the database: fatal: the database system is not yet accepting connections detail: consistent recovery state has not been yet reached."
+}
+
+async fn read_connector_body(response: &mut Response) -> reqwest::Result<String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > CONNECTOR_BODY_LIMIT {
+            return Ok("[upstream error response exceeded the diagnostic size limit]".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+fn parse_retry_after_with_date(response: &Response) -> Option<Duration> {
+    parse_retry_after(response).or_else(|| {
+        let value = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?;
+        let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+        Some(
+            (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                .to_std()
+                .unwrap_or_default(),
+        )
+    })
+}
+
+pub(crate) async fn send_anthropic_with_retry<F>(
+    config: &RetryConfig,
+    budget: &InitialRequestBudget,
+    build: F,
+) -> Result<InitialResponse, LLMError>
+where
+    F: Fn() -> RequestBuilder,
+{
+    let _ = INITIAL_HTTP_RETRY_OBSERVER
+        .try_with(|observer| observer.budget_managed.store(true, Ordering::Relaxed));
+    retry_initial_request(config, "Anthropic", || async {
+        if Instant::now() >= budget.deadline
+            || budget
+                .attempts
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |attempts| {
+                    (attempts < budget.max_attempts).then_some(attempts + 1)
+                })
+                .is_err()
+        {
+            return RetryAttempt::final_result(Err(
+                budget.terminal(None, "request budget exhausted")
+            ));
+        }
+        let sent = tokio::time::timeout_at(budget.deadline, build().send()).await;
+        let mut response = match sent {
+            Err(_) => {
+                return RetryAttempt::final_result(Err(
+                    budget.terminal(None, "request deadline exceeded")
+                ))
+            }
+            Ok(Err(error)) => {
+                let retry = is_retryable_reqwest_error(&error);
+                let result = if retry {
+                    budget.terminal(None, "temporary transport failure")
+                } else {
+                    LLMError::Http(error)
+                };
+                return RetryAttempt {
+                    result: Err(result),
+                    retry: retry && budget.attempts.load(Ordering::Relaxed) < budget.max_attempts,
+                    status: None,
+                    retry_after: None,
+                    deadline: Some(budget.deadline),
+                };
+            }
+            Ok(Ok(response)) => response,
+        };
+        let status = response.status();
+        let retry_after = parse_retry_after_with_date(&response);
+        let error_body = if !status.is_success() && !is_retryable_status(status) {
+            match tokio::time::timeout_at(budget.deadline, read_connector_body(&mut response)).await
+            {
+                Ok(Ok(body)) => Some(body),
+                _ => {
+                    return RetryAttempt::final_result(Err(budget
+                        .terminal(Some(status), "upstream error body could not be classified")))
+                }
+            }
+        } else {
+            None
+        };
+        let connector_recovery = error_body
+            .as_deref()
+            .is_some_and(|body| is_connector_recovery(status, body));
+        if connector_recovery || is_retryable_status(status) {
+            return RetryAttempt {
+                result: Err(budget.terminal(
+                    Some(status),
+                    if connector_recovery {
+                        "connector database is temporarily recovering"
+                    } else {
+                        "temporary upstream failure"
+                    },
+                )),
+                retry: budget.attempts.load(Ordering::Relaxed) < budget.max_attempts,
+                status: Some(status),
+                retry_after,
+                deadline: Some(budget.deadline),
+            };
+        }
+        RetryAttempt::final_result(Ok(InitialResponse {
+            response,
+            error_body,
+        }))
+    })
+    .await
+}
+
+#[cfg(test)]
+#[path = "retry/connector_tests.rs"]
+mod connector_tests;
 
 #[cfg(test)]
 mod tests {
