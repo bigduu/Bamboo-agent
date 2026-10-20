@@ -2451,8 +2451,7 @@ impl BrowserManager {
             .filter(|(_, session)| session.idle_for(ttl))
             .map(|(session_id, _)| session_id.clone())
             .collect();
-        let mut reaped = 0;
-        for session_id in candidates {
+        let retirements = candidates.into_iter().map(|session_id| async move {
             // Open and close are serialized for this chat. Commands and frame
             // polls touch their session while holding the map lock, so the
             // recheck/removal cannot race a newly active request.
@@ -2480,10 +2479,16 @@ impl BrowserManager {
                 if let Err(error) = Self::stop_session(session).await {
                     tracing::warn!(%error, "browser idle retirement did not confirm persistence");
                 }
-                reaped += 1;
+                true
+            } else {
+                false
             }
-        }
-        reaped
+        });
+        futures::future::join_all(retirements)
+            .await
+            .into_iter()
+            .filter(|reaped| *reaped)
+            .count()
     }
 
     pub async fn frame(

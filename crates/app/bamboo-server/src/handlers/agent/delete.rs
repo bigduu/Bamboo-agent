@@ -199,7 +199,17 @@ async fn delete_owned(state: web::Data<AppState>, session_id: String) -> DeleteO
                 tracing::warn!(session_id = %id, %error, "deleted session activation cleanup incomplete");
             }
         }
-        if let Err(error) = state.browser.retire_deleted_session(id).await {
+    }
+    // Start every confirmed deletion before waiting on any host's grace period.
+    // Results stay paired with their original IDs even when another one fails.
+    let retirements = ids_to_cancel
+        .iter()
+        .map(|id| state.browser.retire_deleted_session(id));
+    for (id, retirement) in ids_to_cancel
+        .iter()
+        .zip(futures::future::join_all(retirements).await)
+    {
+        if let Err(error) = retirement {
             tracing::warn!(session_id = %id, %error, "deleted session browser cleanup incomplete; retry deletion");
             browser_cleanup_pending.push(id.clone());
         }
