@@ -57,11 +57,12 @@ async fn reject_corrupt_main(store: &SessionStoreV2, snapshot: &Session) {
         // The lifetime-conflict oracle in `reject` remains unchanged.
         if !runtime {
             assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error:?}");
-            assert!(error
+            let cause = error
                 .get_ref()
-                .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
+                .and_then(|cause| cause.downcast_ref::<SessionAuthorityConflict>())
+                .expect("full-save corruption must retain its typed Root conflict");
             assert_eq!(
-                error.to_string(),
+                cause.0,
                 "Root context changed or unavailable: invalid compact Main authority"
             );
         } else {
