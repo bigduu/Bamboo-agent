@@ -247,6 +247,8 @@ function messages(value) {
     && !value.truncated && !value.has_more && !value.next_cursor, 'bounded_canonical_messages_required'); return value.messages;
 }
 function validateComposition(c, root, child, rootMessages, supervisorMessages, flow) {
+  requireFact(root.last_run_status === 'completed' && child.last_run_status === 'completed'
+    && root.is_running === false && child.is_running === false, 'composition_terminal_state_required');
   requireFact(root.id !== SUPERVISOR && root.id !== c.ordinary_session_id && root.kind === 'root' && root.parent_session_id === null && root.root_session_id === root.id
     && root.spawn_depth === 0 && root.project_id === c.project_id && root.workspace_path === c.workspace_path
     && root.thinking_mode === 'standard' && root.permission_mode === 'default' && !root.bypass_permissions, 'independent_root_contract_failed');
