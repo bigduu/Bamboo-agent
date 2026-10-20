@@ -192,6 +192,85 @@ fn contract(title: &str) -> Contract {
 }
 
 #[test]
+fn review_answer_budget_includes_the_next_project_context_without_adopting_it() {
+    let f = Fixture::new();
+    let work = f.create("answer-context-budget", true);
+    let mut context = f.context(&work);
+    context.sources = BTreeMap::from([("large-source".into(), "v".repeat(12000))]);
+    assert!(canonical_bytes(&context).unwrap().len() < 16 * 1024);
+    f.exec(
+        "answer-budget-context",
+        vec![Operation::SetProjectContext {
+            work_id: work.clone(),
+            context: context.clone(),
+        }],
+    );
+    let request = f.exec(
+        "answer-budget-question",
+        vec![Operation::Ask {
+            work_id: work.clone(),
+            temp_id: "question".into(),
+            prompt: "Provide the bounded input".into(),
+            action: None,
+        }],
+    ).ids["question"].clone();
+    let before = f.service.published().unwrap();
+    let oversized = f.command(
+        "answer-budget-oversized",
+        vec![Operation::Answer {
+            request_id: request.clone(),
+            prompt_revision: 1,
+            answer: "a".repeat(56000),
+        }],
+    );
+    let result = f.service.execute(&f.authority, &oversized);
+    assert!(
+        matches!(result, Err(Error::ContextBudgetExceeded)),
+        "Answer must include the known Project context in its complete next packet: {result:?}"
+    );
+    assert_eq!(
+        canonical_bytes(&f.service.published().unwrap()).unwrap(),
+        canonical_bytes(&before).unwrap()
+    );
+    assert_eq!(before.1.requests[&request].status, RequestStatus::Open);
+    assert!(before.1.project.assignment_contexts.is_empty());
+    let bounded = f.command(
+        "answer-budget-bounded",
+        vec![Operation::Answer {
+            request_id: request,
+            prompt_revision: 1,
+            answer: "short".into(),
+        }],
+    );
+    let receipt = f.service.execute(&f.authority, &bounded).unwrap();
+    let answered = f.service.published().unwrap();
+    assert_eq!(f.service.execute(&f.authority, &bounded).unwrap(), receipt);
+    assert_eq!(f.service.published().unwrap().0, answered.0);
+    assert!(answered.1.assignments.is_empty());
+    assert!(answered.1.project.assignment_contexts.is_empty());
+    let start = f.exec(
+        "answer-budget-start",
+        vec![
+            Operation::Ready { work_id: work.clone() },
+            Operation::Start {
+                work_id: work,
+                temp_id: "assignment".into(),
+                workspace: Some(f.execution()),
+            },
+        ],
+    );
+    let packet = f.service.child_context_packet(
+        &f.authority, &start.ids["assignment"], WORK_CONTEXT_BYTES_LIMIT,
+    ).unwrap();
+    assert_eq!(packet.project_context, Some(context));
+    assert_eq!(packet.answers.len(), 1);
+    assert_eq!(packet.answers[0].answer, "short");
+    assert!(canonical_bytes(&packet).unwrap().len() <= WORK_CONTEXT_BYTES_LIMIT);
+    assert!(!f.service.published().unwrap().1.project.assignment_contexts
+        .contains_key("00000000-0000-0000-0000-000000000000"));
+}
+
+#[test]
 fn explicit_membership_cas_replay_and_legacy_compatibility() {
     let f = Fixture::new();
     let legacy = f.create("legacy", false);
