@@ -606,6 +606,7 @@ mod tests {
         let (shutdown, _) = watch::channel(!alive);
         Arc::new(BrowserSession {
             child: Mutex::new(child),
+            profile_lease: Mutex::new(None),
             temp_dir: Mutex::new(None),
             process_group,
             stdin: AsyncMutex::new(stdin),
@@ -1351,12 +1352,15 @@ mod tests {
     async fn browser_host_environment_drops_parent_secrets() {
         let mut command = Command::new("/usr/bin/env");
         command.env("OPENAI_API_KEY", "sentinel-do-not-inherit");
+        command.env("BAMBOO_BROWSER_PROFILE_DIR", "sentinel-foreign-profile");
         restrict_host_environment(&mut command);
         let output = command.output().await.unwrap();
         assert!(output.status.success());
         let environment = String::from_utf8(output.stdout).unwrap();
         assert!(!environment.contains("OPENAI_API_KEY"));
         assert!(!environment.contains("sentinel-do-not-inherit"));
+        assert!(!environment.contains("BAMBOO_BROWSER_PROFILE_DIR"));
+        assert!(!environment.contains("sentinel-foreign-profile"));
     }
 
     #[cfg(unix)]
@@ -1411,6 +1415,196 @@ mod tests {
             browser.open("deleted-chat").await,
             Err(BrowserError::NotOpen)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn closing_a_chat_releases_its_profile_after_reaping_with_old_references_alive() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("browser-profiles");
+        let browser = BrowserManager::with_profile_root(root.clone());
+        let session = stub_session(Duration::ZERO, true);
+        *session.profile_lease.lock().unwrap() = Some(profile::acquire(&root, "chat-a").unwrap());
+        browser
+            .sessions
+            .lock()
+            .await
+            .insert("chat-a".into(), session.clone());
+        assert!(profile::acquire(&root, "chat-a").is_err());
+        let other = profile::acquire(&root, "chat-b").unwrap();
+
+        browser.close("chat-a").await.unwrap();
+
+        assert!(session.reaped.load(Ordering::Acquire));
+        assert!(session.profile_lease.lock().unwrap().is_none());
+        assert!(session.child.lock().unwrap().try_wait().unwrap().is_some());
+        assert!(profile::acquire(&root, "chat-a").is_ok());
+        assert!(profile::acquire(&root, "chat-b").is_err());
+        drop(other);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_reclamation_releases_the_profile_without_deleting_durable_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("browser-profiles");
+        let browser = BrowserManager::with_profile_root(root.clone());
+        let lease = profile::acquire(&root, "idle-chat").unwrap();
+        let path = lease.path.clone();
+        let sentinel = path.join("synthetic-site-data");
+        std::fs::write(&sentinel, b"synthetic durable state").unwrap();
+        let session = stub_session(BROWSER_IDLE_TTL + Duration::from_secs(1), true);
+        *session.profile_lease.lock().unwrap() = Some(lease);
+        browser
+            .sessions
+            .lock()
+            .await
+            .insert("idle-chat".into(), session.clone());
+
+        assert_eq!(browser.sweep_idle(BROWSER_IDLE_TTL).await, 1);
+
+        assert!(session.reaped.load(Ordering::Acquire));
+        assert!(session.profile_lease.lock().unwrap().is_none());
+        let reopened = profile::acquire(&root, "idle-chat").unwrap();
+        assert_eq!(reopened.path, path);
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"synthetic durable state");
+        assert!(!browser.retired.lock().unwrap().contains("idle-chat"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires the Playwright Chromium runtime"]
+    async fn persistent_manager_recreates_owned_hosts_without_resetting_or_sharing_site_state() {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let fixture = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0; 4096];
+                    if stream.read(&mut request).await.is_ok() {
+                        let body = "<!doctype html><title>Isolated manager profile fixture</title>";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                });
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("browser-profiles");
+        let browser = BrowserManager::with_profile_root(root.clone());
+        let opened = browser.open("chat-a").await.unwrap();
+        let old_host = browser.sessions.lock().await["chat-a"].clone();
+        assert_eq!(
+            browser.open("chat-a").await.unwrap()["page_epoch"],
+            opened["page_epoch"]
+        );
+        assert!(profile::acquire(&root, "chat-a").is_err());
+        let page = browser
+            .command(
+                "chat-a",
+                "navigate",
+                json!({"expected_epoch":opened["page_epoch"],"url":url}),
+            )
+            .await
+            .unwrap();
+        let seed = r#"(async () => {
+            document.cookie = 'fixture-session=synthetic; SameSite=Strict; Path=/';
+            document.cookie = 'fixture-persistent=synthetic; Max-Age=3600; SameSite=Strict; Path=/';
+            localStorage.setItem('manager-fixture', 'synthetic');
+            const db = await new Promise((resolve, reject) => {
+                const request = indexedDB.open('manager-fixture', 1);
+                request.onupgradeneeded = () => request.result.createObjectStore('values');
+                request.onsuccess = () => resolve(request.result); request.onerror = reject;
+            });
+            await new Promise((resolve, reject) => {
+                const transaction = db.transaction('values', 'readwrite');
+                transaction.objectStore('values').put('synthetic', 'marker');
+                transaction.oncomplete = resolve; transaction.onerror = reject;
+            });
+            db.close(); return true;
+        })()"#;
+        assert_eq!(
+            browser
+                .eval(
+                    "chat-a",
+                    json!({"code":seed,"expected_epoch":page["page_epoch"],"expected_url":url})
+                )
+                .await
+                .unwrap()["value"],
+            true
+        );
+        let probe = r#"(async () => {
+            const db = await new Promise((resolve, reject) => {
+                const request = indexedDB.open('manager-fixture', 1);
+                request.onupgradeneeded = () => request.result.createObjectStore('values');
+                request.onsuccess = () => resolve(request.result); request.onerror = reject;
+            });
+            const indexed = await new Promise((resolve, reject) => {
+                const request = db.transaction('values').objectStore('values').get('marker');
+                request.onsuccess = () => resolve(request.result === 'synthetic'); request.onerror = reject;
+            });
+            db.close(); return {
+                sessionCookie: document.cookie.includes('fixture-session=synthetic'),
+                persistentCookie: document.cookie.includes('fixture-persistent=synthetic'),
+                localStorage: localStorage.getItem('manager-fixture') === 'synthetic', indexedDB: indexed
+            };
+        })()"#;
+        let other = browser.open("chat-b").await.unwrap();
+        let page = browser
+            .command(
+                "chat-b",
+                "navigate",
+                json!({"expected_epoch":other["page_epoch"],"url":url}),
+            )
+            .await
+            .unwrap();
+        let other_state = browser
+            .eval(
+                "chat-b",
+                json!({"code":probe,"expected_epoch":page["page_epoch"],"expected_url":url}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            other_state["value"],
+            json!({"sessionCookie":false,"persistentCookie":false,"localStorage":false,"indexedDB":false})
+        );
+        browser.close("chat-b").await.unwrap();
+        browser.close("chat-a").await.unwrap();
+        assert!(old_host.reaped.load(Ordering::Acquire));
+        assert!(old_host.profile_lease.lock().unwrap().is_none());
+
+        let restarted = BrowserManager::with_profile_root(root);
+        let opened = restarted.open("chat-a").await.unwrap();
+        let page = restarted
+            .command(
+                "chat-a",
+                "navigate",
+                json!({"expected_epoch":opened["page_epoch"],"url":url}),
+            )
+            .await
+            .unwrap();
+        let restored = restarted
+            .eval(
+                "chat-a",
+                json!({"code":probe,"expected_epoch":page["page_epoch"],"expected_url":url}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            restored["value"],
+            json!({"sessionCookie":true,"persistentCookie":true,"localStorage":true,"indexedDB":true})
+        );
+        restarted.close("chat-a").await.unwrap();
+        fixture.abort();
     }
 
     #[cfg(unix)]
