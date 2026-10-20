@@ -717,7 +717,7 @@ async fn drain_group(pid: u32) -> io::Result<()> {
 // errors and every other cleanup phase must still fail closed.
 #[cfg(any(target_os = "linux", all(test, unix)))]
 fn proc_stat_task_vanished(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::NotFound
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 #[cfg(unix)]
