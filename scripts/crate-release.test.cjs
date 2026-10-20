@@ -852,14 +852,24 @@ test('interrupted initial frontend upload can recover before any crate, while pa
   assert.deepEqual(calls, ['atomic-body', 'upload'])
 })
 
-test('complete publication uses the canonical main CI source without release-PR log parsing', () => {
+test('complete publication keeps canonical main CI authority and authenticates empty-association evidence', () => {
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
   const automatic = workflow.split('  automatic:\n')[1]
   const preflight = automatic.split('      - uses: actions/checkout')[0]
   assert.match(preflight, /assert event_name == "workflow_run"/)
   assert.match(preflight, /run = event\["workflow_run"\]/)
   assert.match(preflight, /source = run\["head_sha"\]/)
-  assert.doesNotMatch(preflight, /actions\/jobs\/|matches\[0\]|--method=GET|accepted_ci_run/)
+  assert.doesNotMatch(preflight, /matches\[0\]|--method=GET|accepted_ci_run/)
+  assert.match(preflight, /assert pre\.get\("pull_requests"\) == \[\]/)
+  assert.match(preflight, /hashlib\.sha256\(raw\)\.hexdigest\(\) == PRODUCER_V1/)
+  assert.match(preflight, /suite\["app"\]\["databaseId"\] == 15368/)
+  assert.match(preflight, /actions\/runs\/\{pre\['id'\]\}\/attempts\/\{attempt\}\/jobs/)
+  assert.match(preflight, /--allow-escape-sequences/)
+  assert.match(preflight, /assert len\(records\) == 1/)
+  assert.match(preflight, /tested\["parents"\]\] == \[base, head\]/)
+  assert.match(preflight, /tested\["tree"\]\["sha"\] == commit\["tree"\]\["sha"\]/)
+  const producer = fs.readFileSync('scripts/tests/fixtures/main-authority-ci-v1.yml')
+  assert.ok(preflight.includes(`PRODUCER_V1 = "${sha256(producer)}"`))
 })
 
 test('trusted manual publication and automatic receipts share a queue while dry runs stay credential-free', () => {
