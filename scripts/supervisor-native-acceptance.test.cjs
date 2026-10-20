@@ -143,14 +143,14 @@ async function mockHost(t, mode, options = {}) {
     const childMessages = [user(args.message)], read = await provider(childMessages, true);
     const file = JSON.parse(read.tool_calls[0].function.arguments).file_path;
     const childReply = await provider([...childMessages, tool(await fs.readFile(file, 'utf8'))]);
-    Object.assign(child, { is_running: false, last_run_status: 'completed' });
+    Object.assign(child, { is_running: false, last_run_status: options.childStatus || 'completed' });
     histories.set(child.id, [user(args.message), childReply]);
     const inspect = await provider([...msgs, tool({ target: 'logical-child' })]);
     assert.deepEqual(JSON.parse(inspect.tool_calls[0].function.arguments), { intent: 'inspect', message: 'tree' });
     const notice = `Runtime notification: child session \`${child.id}\` finished with status \`completed\`. Remaining child sessions: 0.\n\nChild final response:\n${childReply.content}`;
     const finish = await provider([...msgs, user(notice), tool({ nodes: [child.id] })]);
     histories.set(work.id, [{ id: inputReceipt, role: 'user', content: flow.assignment, metadata: { session_message: { id: inputReceipt, kind: 'peer_message' } } }, finish]);
-    Object.assign(work, { is_running: false, last_run_status: 'completed' });
+    Object.assign(work, { is_running: false, last_run_status: options.rootStatus || 'completed' });
   }
   async function driveSupervisor() {
     const msgs = [user(flow.markers.supervisor)], one = await provider(msgs);
@@ -227,9 +227,9 @@ test('FRAMEWORK HTTP: an unrelated 403 cannot masquerade as the known Standard b
 
 test('composition validation rejects Child-as-Root, workspace/permission drift, duplicated input and missing notification', () => {
   const mode = c('ultra'), flow = d.scenario(mode, randomUUID());
-  const work = { ...root('work'), project_id: mode.project_id, workspace_path: mode.workspace_path };
+  const work = { ...root('work'), project_id: mode.project_id, workspace_path: mode.workspace_path, last_run_status: 'completed' };
   const child = { ...root('child'), kind: 'child', root_session_id: work.id, parent_session_id: work.id, spawn_depth: 1,
-    project_id: mode.project_id, workspace_path: mode.workspace_path };
+    project_id: mode.project_id, workspace_path: mode.workspace_path, last_run_status: 'completed' };
   const creation = { target_session_id: work.id, receipt_id: 'input', generation: 1 };
   Object.assign(flow, { creations: [creation, { ...creation, replayed: true }], noticeChild: child.id, noticeCount: 1, readObserved: true, historyObserved: true });
   const input = { role: 'user', content: flow.assignment, metadata: { session_message: { id: 'input', kind: 'peer_message' } } };
@@ -241,6 +241,29 @@ test('composition validation rejects Child-as-Root, workspace/permission drift, 
   fails(() => d.validateComposition(mode, work, child, [input, ...history], summary, flow), 'first_instruction_not_exactly_once');
   fails(() => d.validateComposition(mode, work, child, history, summary, { ...flow, noticeCount: 2 }), 'exact_child_completion_notice_required');
   fails(() => d.validateComposition(mode, work, child, history, summary, { ...flow, historyObserved: false }), 'actual_read_and_history_results_required');
+});
+test('canonical final status overrides persisted reports and an earlier completed notification', () => {
+  const mode = c('ultra'), flow = d.scenario(mode, randomUUID());
+  const work = { ...root('work'), project_id: mode.project_id, workspace_path: mode.workspace_path, last_run_status: 'completed' };
+  const child = { ...root('child'), kind: 'child', root_session_id: work.id, parent_session_id: work.id, spawn_depth: 1,
+    project_id: mode.project_id, workspace_path: mode.workspace_path, last_run_status: 'completed' };
+  const creation = { target_session_id: work.id, receipt_id: 'input', generation: 1 };
+  Object.assign(flow, { creations: [creation, { ...creation, replayed: true }], noticeChild: child.id, noticeCount: 1, readObserved: true, historyObserved: true });
+  const history = [{ role: 'user', content: flow.assignment, metadata: { session_message: { id: 'input', kind: 'peer_message' } } },
+    { role: 'assistant', content: flow.workerReport }];
+  const summary = [{ role: 'assistant', content: flow.supervisorReport }];
+  d.validateComposition(mode, work, child, history, summary, flow);
+  for (const patch of [{ last_run_status: 'failed' }, { last_run_status: 'error' }, { last_run_status: 'cancelled' },
+    { last_run_status: null }, { last_run_status: undefined }, { is_running: true }, { is_running: undefined }]) {
+    fails(() => d.validateComposition(mode, { ...work, ...patch }, child, history, summary, flow), 'composition_terminal_state_required');
+    fails(() => d.validateComposition(mode, work, { ...child, ...patch }, history, summary, flow), 'composition_terminal_state_required');
+  }
+});
+for (const target of ['root', 'child']) test('FRAMEWORK HTTP: persisted reports cannot hide a failed ' + target + ' finalization', { timeout: 5000 }, async t => {
+  const f = await mockHost(t, 'ultra', { [target + 'Status']: 'failed' });
+  await assert.rejects(d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] }), e => e.code === 'composition_terminal_state_required');
+  assert.deepEqual(f.errors, []);
+  assert.equal(f.sessions.get(target === 'root' ? 'fixture-work' : 'fixture-child').last_run_status, 'failed');
 });
 test('parent provider notification must be actual runtime-shaped, exactly one, and contain the returned Child report', async () => {
   const mode = c('ultra');
