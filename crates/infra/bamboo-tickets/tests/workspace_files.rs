@@ -211,20 +211,29 @@ fn actual_file_write_receipt_replay_changed_payload_and_full_manifest_backup() {
 
 #[test]
 fn schema_four_file_evidence_survives_stopped_offline_transfer_without_downgrade() {
-    file_evidence_transfer_preserves_schema(false, false);
+    file_evidence_transfer_preserves_schema(false, false, false);
 }
 
 #[test]
 fn schema_five_project_and_file_evidence_survive_stopped_transfer_without_downgrade() {
-    file_evidence_transfer_preserves_schema(true, false);
+    file_evidence_transfer_preserves_schema(true, false, false);
 }
 
 #[test]
 fn schema_six_sprint_project_and_file_evidence_survive_stopped_transfer() {
-    file_evidence_transfer_preserves_schema(true, true);
+    file_evidence_transfer_preserves_schema(true, true, false);
 }
 
-fn file_evidence_transfer_preserves_schema(with_project: bool, with_sprint: bool) {
+#[test]
+fn schema_seven_planning_sprint_project_and_file_evidence_survive_stopped_transfer() {
+    file_evidence_transfer_preserves_schema(true, true, true);
+}
+
+fn file_evidence_transfer_preserves_schema(
+    with_project: bool,
+    with_sprint: bool,
+    with_planning: bool,
+) {
     let f = fixture();
     if with_project {
         let snapshot = f.service.published().unwrap().1;
@@ -301,6 +310,28 @@ fn file_evidence_transfer_preserves_schema(with_project: bool, with_sprint: bool
         .unwrap()
         .artifact
         .unwrap();
+    if with_planning {
+        let s = f.service.published().unwrap().1;
+        let work_id = s.assignments[&f.assignment].work_id.clone();
+        let user = Authority::from_verified_host(
+            s.binding.clone(),
+            Principal::User {
+                user_id: "owner".into(),
+            },
+        );
+        execute(
+            &f.service,
+            &user,
+            "owner-plan",
+            vec![Operation::SetPlanningMetadata {
+                ticket_id: work_id.clone(),
+                expected_record_revision: s.tickets[&work_id].record_revision,
+                priority: bamboo_domain::TaskPriority::High,
+                expected_completion_at: Some("2026-12-01T18:00:00+08:00".into()),
+            }],
+        )
+        .unwrap();
+    }
     let s = f.service.published().unwrap().1;
     let runtime = Authority::from_verified_host(s.binding.clone(), Principal::Runtime);
     execute(
@@ -354,7 +385,9 @@ fn file_evidence_transfer_preserves_schema(with_project: bool, with_sprint: bool
     let migrated = destination.published().unwrap().1;
     assert_eq!(
         migrated.schema,
-        if with_sprint {
+        if with_planning {
+            7
+        } else if with_sprint {
             6
         } else if with_project {
             5
@@ -369,6 +402,18 @@ fn file_evidence_transfer_preserves_schema(with_project: bool, with_sprint: bool
         assert_eq!(sprint.members.len(), 1);
     }
     assert_eq!(migrated.project.links.len(), usize::from(with_project));
+    if with_planning {
+        let work_id = &migrated.assignments[&f.assignment].work_id;
+        assert_eq!(
+            migrated.tickets[work_id].priority,
+            bamboo_domain::TaskPriority::High
+        );
+        assert_eq!(
+            migrated.tickets[work_id].expected_completion_at.as_deref(),
+            Some("2026-12-01T18:00:00+08:00")
+        );
+        assert_eq!(migrated.receipts["owner-plan"].principal, "user:owner");
+    }
     assert_eq!(
         destination
             .read_artifact(&user, &artifact, FILE_BYTES_LIMIT)

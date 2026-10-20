@@ -94,8 +94,8 @@ fn main() -> Result<()> {
         Principal::Worker {
             assignment_id: assignment.clone(),
             generation: 1,
-            run_id: receipt.run_id,
-            session_id: receipt.session_id,
+            run_id: receipt.run_id.clone(),
+            session_id: receipt.session_id.clone(),
         },
     );
     let output = std::thread::spawn(|| (2 + 3).to_string())
@@ -121,6 +121,16 @@ fn main() -> Result<()> {
         WorkState::Submitted
     );
     assert_eq!(output, "5");
+    // The deterministic worker has joined; record its exact stop before acceptance.
+    execute(
+        &runtime,
+        "runtime-stopped",
+        vec![Operation::RuntimeStopped {
+            assignment_id: assignment.clone(),
+            receipt: receipt.clone(),
+            completed: true,
+        }],
+    )?;
     execute(
         &user,
         "accept",

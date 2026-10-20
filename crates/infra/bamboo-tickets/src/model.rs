@@ -50,6 +50,12 @@ pub struct Ticket {
     pub contract_revision: u64,
     pub generation: u64,
     pub contract: Contract,
+    /// User planning metadata; medium is the legacy default, not a runtime grant.
+    #[serde(default, skip_serializing_if = "crate::planning::is_default_priority")]
+    pub priority: bamboo_domain::TaskPriority,
+    /// User-desired deadline with an explicit RFC 3339 offset, never a model ETA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_completion_at: Option<String>,
     pub state: WorkState,
     pub blocked: Option<BlockReason>,
     /// Explicit user pause survives stop confirmation until an explicit resume.
@@ -430,6 +436,15 @@ pub enum Operation {
         parent: Option<String>,
         contract: Contract,
         depends_on: BTreeSet<String>,
+    },
+    /// Explicit owner replacement of planning metadata. A null deadline clears it;
+    /// omission is rejected so stale clients cannot accidentally clear a value.
+    SetPlanningMetadata {
+        ticket_id: String,
+        expected_record_revision: u64,
+        priority: bamboo_domain::TaskPriority,
+        #[serde(deserialize_with = "crate::planning::required_nullable_deadline")]
+        expected_completion_at: Option<String>,
     },
     Ready {
         work_id: String,
