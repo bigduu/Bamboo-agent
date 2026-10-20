@@ -161,6 +161,7 @@ pub(super) fn directory(root: &Path, session_id: &str) -> Result<PathBuf, Browse
     let root = root_directory(root, true)?.ok_or_else(unavailable)?;
     let profile = root.join(key(session_id));
     private_directory(&profile)?;
+    sync_directory(&root)?;
     std::fs::canonicalize(profile).map_err(|_| unavailable())
 }
 
