@@ -205,15 +205,18 @@ fn review_answer_budget_includes_the_next_project_context_without_adopting_it() 
             context: context.clone(),
         }],
     );
-    let request = f.exec(
-        "answer-budget-question",
-        vec![Operation::Ask {
-            work_id: work.clone(),
-            temp_id: "question".into(),
-            prompt: "Provide the bounded input".into(),
-            action: None,
-        }],
-    ).ids["question"].clone();
+    let request = f
+        .exec(
+            "answer-budget-question",
+            vec![Operation::Ask {
+                work_id: work.clone(),
+                temp_id: "question".into(),
+                prompt: "Provide the bounded input".into(),
+                action: None,
+            }],
+        )
+        .ids["question"]
+        .clone();
     let before = f.service.published().unwrap();
     let oversized = f.command(
         "answer-budget-oversized",
@@ -251,7 +254,9 @@ fn review_answer_budget_includes_the_next_project_context_without_adopting_it() 
     let start = f.exec(
         "answer-budget-start",
         vec![
-            Operation::Ready { work_id: work.clone() },
+            Operation::Ready {
+                work_id: work.clone(),
+            },
             Operation::Start {
                 work_id: work,
                 temp_id: "assignment".into(),
@@ -259,14 +264,25 @@ fn review_answer_budget_includes_the_next_project_context_without_adopting_it() 
             },
         ],
     );
-    let packet = f.service.child_context_packet(
-        &f.authority, &start.ids["assignment"], WORK_CONTEXT_BYTES_LIMIT,
-    ).unwrap();
+    let packet = f
+        .service
+        .child_context_packet(
+            &f.authority,
+            &start.ids["assignment"],
+            WORK_CONTEXT_BYTES_LIMIT,
+        )
+        .unwrap();
     assert_eq!(packet.project_context, Some(context));
     assert_eq!(packet.answers.len(), 1);
     assert_eq!(packet.answers[0].answer, "short");
     assert!(canonical_bytes(&packet).unwrap().len() <= WORK_CONTEXT_BYTES_LIMIT);
-    assert!(!f.service.published().unwrap().1.project.assignment_contexts
+    assert!(!f
+        .service
+        .published()
+        .unwrap()
+        .1
+        .project
+        .assignment_contexts
         .contains_key("00000000-0000-0000-0000-000000000000"));
 }
 
