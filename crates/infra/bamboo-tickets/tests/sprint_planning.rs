@@ -1447,3 +1447,54 @@ fn review_sprint_only_changes_are_commit_consistent_and_visible_once() {
     assert_eq!(later.data[0].entity, "sprint");
     assert_eq!(later.data[0].id, "later");
 }
+
+#[test]
+fn changes_cursors_from_before_sprint_projection_require_resync() {
+    let f = Fixture::new();
+    let since = f.service.published().unwrap().1.seq;
+    f.sprint("before-ticket-pages");
+    let first_work = f.work("first-old-page", Some(project()));
+    let second_work = f.work("second-old-page", Some(project()));
+    let before_read = f.service.published().unwrap();
+    let all = f.service.work_changes(&owner(), since, 100, None).unwrap();
+    assert_eq!(all.data.len(), 3);
+    assert_eq!(all.data[0].entity, "sprint");
+    let old_rows: Vec<_> = all
+        .data
+        .iter()
+        .filter(|row| row.entity != "sprint")
+        .collect();
+    assert_eq!(old_rows.len(), 2);
+    assert_eq!(old_rows[0].id, first_work);
+    assert_eq!(old_rows[1].id, second_work);
+    let old_query_hash =
+        content_hash(&canonical_bytes(&serde_json::json!({"changes_since": since})).unwrap());
+    // An old producer returned the first Ticket and offset=1, omitting Sprint rows.
+    // Accepting that offset now repeats the first Ticket and misses the earlier Sprint.
+    for offset in [0, 1] {
+        let legacy = ReadCursor {
+            commit: all.snapshot.commit.clone(),
+            query_hash: old_query_hash.clone(),
+            offset,
+        };
+        assert!(
+            matches!(
+                f.service.work_changes(&owner(), since, 1, Some(&legacy)),
+                Err(Error::ResyncRequired)
+            ),
+            "legacy changes cursor must require resync after the Sprint projection upgrade"
+        );
+    }
+    assert_eq!(f.service.published().unwrap().0, before_read.0);
+    let first = f.service.work_changes(&owner(), since, 1, None).unwrap();
+    let cursor = first.next_cursor.unwrap();
+    assert_ne!(cursor.query_hash, old_query_hash);
+    let next = f
+        .service
+        .work_changes(&owner(), since, 100, Some(&cursor))
+        .unwrap();
+    assert_eq!(next.snapshot.commit, all.snapshot.commit);
+    let mut pages = first.data;
+    pages.extend(next.data);
+    assert_eq!(pages, all.data);
+}
