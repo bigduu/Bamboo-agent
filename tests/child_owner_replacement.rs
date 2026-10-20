@@ -282,12 +282,17 @@ fn pause_boundary_locks(data: &Path, child_id: &str) -> Vec<(PathBuf, bool)> {
             false,
         ),
     ];
-    locks.push((
-        data.join("sessions")
-            .join(child_id)
-            .join("inbox/.session-inbox.lock"),
-        false,
-    ));
+    let child_inbox = data
+        .join("sessions")
+        .join(ROOT)
+        .join("children")
+        .join(child_id)
+        .join("inbox/.session-inbox.lock");
+    assert!(
+        child_inbox.is_file(),
+        "canonical Child Inbox claim exists before pausing its owner"
+    );
+    locks.push((child_inbox, false));
     for name in [".session-write-locks", ".actor-tree-locks"] {
         let entries = match std::fs::read_dir(data.join(name)) {
             Ok(entries) => entries,
