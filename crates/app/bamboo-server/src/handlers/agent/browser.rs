@@ -52,10 +52,11 @@ fn valid_tab_id(tab_id: &str) -> bool {
 
 pub async fn open(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     let session_id = path.into_inner();
+    let epoch = state.browser.open_epoch();
     if !known_session(&state, &session_id).await {
         return missing_session();
     }
-    match state.browser.open(&session_id).await {
+    match state.browser.open_in_epoch(&session_id, epoch).await {
         Ok(value) => HttpResponse::Ok().json(value),
         Err(error) => error_response(error),
     }

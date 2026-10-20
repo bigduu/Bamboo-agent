@@ -88,8 +88,47 @@ pub struct BrowserManager {
 #[derive(Default)]
 struct BrowserLifecycle {
     stopping: AtomicBool,
+    reset_epoch: AtomicU64,
     opens: tokio::sync::RwLock<()>,
     owners: Mutex<Vec<Arc<BrowserCleanup>>>,
+}
+
+/// Held through canonical reset and cache clear. Epoch changes before
+/// unlock, so local pre-reset/during-reset waiters cannot create a host.
+pub(crate) struct BrowserResetGuard<'a> {
+    // Release the process-shared gate before allowing local opens again.
+    _profile_gate: Option<std::fs::File>,
+    _opens: tokio::sync::RwLockWriteGuard<'a, ()>,
+    lifecycle: &'a BrowserLifecycle,
+    profile_root: Option<Arc<PathBuf>>,
+    retired: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for BrowserResetGuard<'_> {
+    fn drop(&mut self) {
+        self.lifecycle.reset_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl BrowserResetGuard<'_> {
+    /// Only a complete canonical wipe authorizes purging orphaned keys.
+    pub(crate) async fn purge_profiles(&self) -> Result<(), BrowserError> {
+        let Some(root) = self.profile_root.clone() else {
+            return Ok(());
+        };
+        let retired = self.retired.clone();
+        let pending: Vec<_> = retired.lock().unwrap().iter().cloned().collect();
+        tokio::task::spawn_blocking(move || {
+            for id in pending {
+                profile::remove_notifying(&root, &id, || {
+                    retired.lock().unwrap().remove(&id);
+                })?;
+            }
+            profile::purge_all(&root)
+        })
+        .await
+        .map_err(|_| BrowserError::Unavailable("browser reset interrupted".into()))?
+    }
 }
 
 struct BrowserCleanup {
@@ -1949,6 +1988,62 @@ impl BrowserManager {
         }
     }
 
+    /// Drain owners and fence admission through a canonical reset. This does
+    /// not permanently shut down the manager or destroy still-live history.
+    pub(crate) async fn reset_profiles(&self) -> Result<BrowserResetGuard<'_>, BrowserError> {
+        let mut guard = BrowserResetGuard {
+            _profile_gate: None,
+            _opens: self.lifecycle.opens.write().await,
+            lifecycle: &self.lifecycle,
+            profile_root: self.profile_root.clone(),
+            retired: self.retired.clone(),
+        };
+        if self.lifecycle.stopping.load(Ordering::Acquire) {
+            return Err(BrowserError::Unavailable(
+                "browser manager shut down".into(),
+            ));
+        }
+        let mut sessions: Vec<_> = std::mem::take(&mut *self.sessions.lock().await)
+            .into_values()
+            .collect();
+        let owners = self.lifecycle.owners.lock().unwrap().clone();
+        for owner in &owners {
+            if let Some(session) = owner.session.lock().unwrap().upgrade() {
+                if !sessions.iter().any(|known| Arc::ptr_eq(known, &session)) {
+                    sessions.push(session);
+                }
+            }
+        }
+        for session in &sessions {
+            if let Err(error) = session.begin_retirement("browser history resetting") {
+                tracing::warn!(%error, "browser reset could not mark its profile");
+                session.mark_dead("browser history resetting");
+                session.signal_stop();
+            }
+        }
+        for session in sessions {
+            if let Err(error) = Self::stop_session(session).await {
+                // Terminal purge may finish an unconfirmed close after both
+                // stable locks prove that the actual host has been reaped.
+                tracing::warn!(%error, "browser reset did not confirm persistence");
+            }
+        }
+        for owner in owners {
+            owner.wait().await;
+        }
+        if let Some(root) = &self.profile_root {
+            let root = root.clone();
+            // Own hosts released their shared gate. Foreign active owners
+            // make reset fail before storage is deleted. Hold X through wipe.
+            guard._profile_gate = Some(
+                tokio::task::spawn_blocking(move || profile::begin_reset(&root))
+                    .await
+                    .map_err(|_| BrowserError::Unavailable("browser reset interrupted".into()))??,
+            );
+        }
+        Ok(guard)
+    }
+
     /// Finish process-owned browser work before an executable can return.
     /// Open is fenced first; its read guard includes spawn/readiness, so no
     /// in-flight startup can escape the following owner snapshot.
@@ -2049,8 +2144,25 @@ impl BrowserManager {
         gate
     }
 
+    /// Snapshot before any asynchronous Session preflight. This is only a
+    /// reset-race fence, never a credential or a Session access grant.
+    pub(crate) fn open_epoch(&self) -> u64 {
+        self.lifecycle.reset_epoch.load(Ordering::Acquire)
+    }
+
     pub async fn open(&self, session_id: &str) -> Result<Value, BrowserError> {
+        self.open_in_epoch(session_id, self.open_epoch()).await
+    }
+
+    pub(crate) async fn open_in_epoch(
+        &self,
+        session_id: &str,
+        epoch: u64,
+    ) -> Result<Value, BrowserError> {
         let _opens = self.lifecycle.opens.read().await;
+        if epoch != self.open_epoch() {
+            return Err(BrowserError::NotOpen);
+        }
         if self.lifecycle.stopping.load(Ordering::Acquire) {
             return Err(BrowserError::Unavailable(
                 "browser manager shut down".into(),

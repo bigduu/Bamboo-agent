@@ -32,9 +32,13 @@ use bamboo_storage::{LockedSessionStore, SessionIndexEntry, SessionStoreV2};
 ///
 /// Holds all shared state needed by `SubAgentTool`.
 /// Implements the full `ChildSessionPort` trait with real methods (no stubs).
+#[derive(Clone)]
 pub struct ChildSessionAdapter {
     pub(crate) session_store: Arc<SessionStoreV2>,
     pub(crate) storage: Arc<dyn Storage>,
+    /// Server adapters share AppState's exact manager. A standalone worker
+    /// has no owned browser and retains the existing storage-only path.
+    pub(crate) browser: Option<Arc<crate::browser::BrowserManager>>,
     pub(crate) persistence: Arc<LockedSessionStore>,
     pub(crate) session_messenger: Option<Arc<bamboo_engine::SessionMessenger>>,
     pub(crate) scheduler: Arc<SpawnScheduler>,
@@ -382,6 +386,127 @@ impl ChildSessionAdapter {
         Ok(())
     }
 
+    async fn delete_child_session_owned(
+        &self,
+        parent_session_id: &str,
+        child_id: &str,
+    ) -> Result<DeleteChildResult, ChildSessionError> {
+        let _persistence_guard = if self.browser.is_some() {
+            Some(self.persistence.acquire_lock(child_id).await)
+        } else {
+            None
+        };
+        if let Some(browser) = &self.browser {
+            let canonical = self
+                .session_store
+                .session_has_canonical_cleanup_evidence(child_id)
+                .await
+                .map_err(|error| {
+                    ChildSessionError::Execution(format!(
+                        "child cleanup state unavailable: {error}"
+                    ))
+                })?;
+            if !canonical
+                && !browser
+                    .has_cleanup_evidence(child_id)
+                    .await
+                    .map_err(|error| {
+                        ChildSessionError::Execution(format!(
+                            "child browser state unavailable: {error}"
+                        ))
+                    })?
+            {
+                return Ok(DeleteChildResult {
+                    deleted: false,
+                    cancelled_running_child: false,
+                });
+            }
+        }
+        let cancelled_running_child = {
+            let mut runners = self.agent_runners.write().await;
+            if let Some(runner) =
+                bamboo_engine::runtime::execution::runner_lifecycle::remove_runner_entry(
+                    &mut runners,
+                    child_id,
+                )
+                .await
+            {
+                runner.cancel_token.cancel();
+                true
+            } else {
+                false
+            }
+        };
+
+        let stored = self.storage.delete_session(child_id).await;
+        let storage_failure = stored.as_ref().err().map(ToString::to_string);
+        let deleted = stored.unwrap_or(false);
+        let mut browser_failure = None;
+        if let Some(browser) = &self.browser {
+            let absent = self
+                .session_store
+                .session_is_canonically_absent(child_id)
+                .await
+                .map_err(|error| {
+                    ChildSessionError::Execution(format!(
+                        "child canonical cleanup state uncertain: {error}"
+                    ))
+                })?;
+            if !absent {
+                // Legacy/index-only deletion and partial failure cannot evict
+                // a surviving canonical Child or erase its site state.
+                if let Some(error) = storage_failure {
+                    return Err(ChildSessionError::Execution(format!(
+                        "failed to delete child session: {error}"
+                    )));
+                }
+                return Ok(DeleteChildResult {
+                    deleted: false,
+                    cancelled_running_child,
+                });
+            }
+            if let Err(error) = browser.retire_deleted_session(child_id).await {
+                browser_failure = Some(error.to_string());
+            }
+        } else if let Some(error) = &storage_failure {
+            return Err(ChildSessionError::Execution(format!(
+                "failed to delete child session: {error}"
+            )));
+        }
+        self.sessions_cache.remove(child_id);
+        {
+            let mut senders = self.session_event_senders.write().await;
+            senders.remove(child_id);
+        }
+        if cancelled_running_child {
+            self.scheduler
+                .publish_parent_replayable_event(
+                    parent_session_id,
+                    AgentEvent::SubAgentCompleted {
+                        parent_session_id: parent_session_id.to_string(),
+                        child_session_id: child_id.to_string(),
+                        status: "cancelled".to_string(),
+                        error: Some("Child session deleted while running".to_string()),
+                    },
+                )
+                .await;
+        }
+
+        if let Some(error) = storage_failure {
+            return Err(ChildSessionError::Execution(format!(
+                "failed to delete child session {child_id}: {error}; browser cleanup: {}",
+                browser_failure.as_deref().unwrap_or("complete")
+            )));
+        }
+        if let Some(error) = browser_failure {
+            return Err(ChildSessionError::Execution(format!("child {child_id} storage deleted; browser cleanup incomplete: {error}; retry cleanup by this Session ID")));
+        }
+        Ok(DeleteChildResult {
+            deleted,
+            cancelled_running_child,
+        })
+    }
+
     /// Construct an adapter. Public so a self-orchestrating WORKER (Phase 6:
     /// direct nested execution) can build its OWN child-session machinery
     /// against its own store/scheduler — the struct fields are `pub(crate)`, so
@@ -402,6 +527,7 @@ impl ChildSessionAdapter {
         Self {
             session_store,
             storage,
+            browser: None,
             persistence,
             session_messenger,
             scheduler,
@@ -1884,53 +2010,19 @@ impl ChildSessionPort for ChildSessionAdapter {
         parent_session_id: &str,
         child_id: &str,
     ) -> Result<DeleteChildResult, ChildSessionError> {
-        let cancelled_running_child = {
-            let mut runners = self.agent_runners.write().await;
-            if let Some(runner) =
-                bamboo_engine::runtime::execution::runner_lifecycle::remove_runner_entry(
-                    &mut runners,
-                    child_id,
-                )
-                .await
-            {
-                runner.cancel_token.cancel();
-                true
-            } else {
-                false
-            }
-        };
-
-        let deleted = self
-            .storage
-            .delete_session(child_id)
-            .await
-            .map_err(|error| {
-                ChildSessionError::Execution(format!("failed to delete child session: {error}"))
-            })?;
-
-        self.sessions_cache.remove(child_id);
-        {
-            let mut senders = self.session_event_senders.write().await;
-            senders.remove(child_id);
-        }
-        if cancelled_running_child {
-            self.scheduler
-                .publish_parent_replayable_event(
-                    parent_session_id,
-                    AgentEvent::SubAgentCompleted {
-                        parent_session_id: parent_session_id.to_string(),
-                        child_session_id: child_id.to_string(),
-                        status: "cancelled".to_string(),
-                        error: Some("Child session deleted while running".to_string()),
-                    },
-                )
+        if self.browser.is_none() {
+            return self
+                .delete_child_session_owned(parent_session_id, child_id)
                 .await;
         }
-
-        Ok(DeleteChildResult {
-            deleted,
-            cancelled_running_child,
-        })
+        // Once a server deletion starts, cancelling the tool/rollback waiter
+        // must not detach storage deletion from owned browser cleanup.
+        let adapter = self.clone();
+        let parent = parent_session_id.to_string();
+        let child = child_id.to_string();
+        tokio::spawn(async move { adapter.delete_child_session_owned(&parent, &child).await })
+            .await
+            .map_err(|_| ChildSessionError::Execution("child cleanup interrupted".into()))?
     }
 
     async fn get_child_runner_info(&self, child_id: &str) -> Option<ChildRunnerInfo> {

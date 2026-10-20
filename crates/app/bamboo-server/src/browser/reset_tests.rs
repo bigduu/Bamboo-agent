@@ -162,6 +162,12 @@ time.sleep(0.2)
     );
     let observed: Value =
         serde_json::from_slice(&std::fs::read(data.join("observed.json")).unwrap()).unwrap();
+    if mode == "gate" {
+        assert_eq!(observed["foreign_new_key_blocked"], true);
+        assert_eq!(observed["no_profile_created_while_reset"], true);
+        assert_eq!(observed["foreign_new_key_usable_after_release"], true);
+        return;
+    }
     assert_eq!(observed["reaped_before_success"], true);
     assert_eq!(observed["old_arc_fenced"], true);
     assert_eq!(observed["profile_purged"], true);
@@ -185,6 +191,33 @@ fn dev_reset_active_host_fixture() {
             let state =
                 web::Data::new(crate::app_state::AppState::new(data.clone()).await.unwrap());
             let entry = std::env::var("BAMBOO_BROWSER_RESET_ENTRY").unwrap();
+            if entry == "gate" {
+                let root = data.join("browser-profiles");
+                let foreign = BrowserManager::with_profile_root(root.clone());
+                let reset = state.browser.reset_profiles().await.unwrap();
+                // A distinct manager has its own in-memory open gate/epoch.
+                // Only the shared stable file gate can block this new key.
+                let blocked = foreign.open("foreign-new-key").await.is_err();
+                let unallocated = !profile::has_evidence(&root, "foreign-new-key").unwrap()
+                    && std::fs::read_to_string(data.join("owned-host-pids"))
+                        .unwrap_or_default()
+                        .is_empty();
+                drop(reset);
+                let usable = foreign.open("foreign-new-key").await.is_ok();
+                foreign.shutdown().await;
+                state.shutdown().await;
+                std::fs::write(
+                    data.join("observed.json"),
+                    serde_json::to_vec(&json!({
+                        "foreign_new_key_blocked":blocked,
+                        "no_profile_created_while_reset":unallocated,
+                        "foreign_new_key_usable_after_release":usable
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+                return;
+            }
             let parent = Session::new("adapter-parent", "synthetic-model");
             let active = if entry == "subagent" {
                 state.session_store.save_session(&parent).await.unwrap();
@@ -205,7 +238,7 @@ fn dev_reset_active_host_fixture() {
             let path = profile::directory(&data.join("browser-profiles"), "reset-active").unwrap();
             std::fs::write(path.join("Cookies"), b"synthetic login").unwrap();
             let (succeeded, queued_fenced) = if entry == "subagent" {
-                let deleted = super::terminal_entry_tests::delete_via_root_tool(
+                let deleted = super::terminal_entry_tests::delete_via_subagent_tool(
                     &state, &parent.id, &active.id,
                 )
                 .await;
@@ -252,4 +285,146 @@ fn dev_reset_active_host_fixture() {
             )
             .unwrap();
         });
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_gate_blocks_a_new_key_in_an_independent_manager() {
+    check_owned_host_entry("gate");
+}
+
+#[tokio::test]
+async fn partial_reset_evicts_revoked_children_even_when_index_publication_fails() {
+    let data = tempfile::tempdir().unwrap();
+    let state = web::Data::new(
+        crate::app_state::AppState::new(data.path().into())
+            .await
+            .unwrap(),
+    );
+    let parent = Session::new("partial-reset-parent", "synthetic-model");
+    let child = Session::new_child_of("partial-reset-child", &parent, "synthetic-model", "fixture");
+    state.session_store.save_session(&parent).await.unwrap();
+    state.session_store.save_session(&child).await.unwrap();
+    state.session_store.flush_search_index().await;
+    state.sessions.insert(
+        child.id.clone(),
+        Arc::new(bamboo_engine::SessionSnapshot::new(child.clone())),
+    );
+    let token = tokio_util::sync::CancellationToken::new();
+    state
+        .cancel_tokens
+        .write()
+        .await
+        .insert(child.id.clone(), token.clone());
+    let (sender, _) = tokio::sync::broadcast::channel(8);
+    state
+        .session_event_senders
+        .write()
+        .await
+        .insert(child.id.clone(), sender);
+    let root = data.path().join("browser-profiles");
+    let path = seed_profile(&root, &child.id);
+    // Actual filesystem error at the final index-publication boundary, after
+    // the real canonical Root revocation/tree deletion. Only this temp store.
+    let lock_path = data.path().join(".sessions-index.lock");
+    std::fs::remove_file(&lock_path).unwrap();
+    std::fs::create_dir(&lock_path).unwrap();
+    let failed = crate::handlers::agent::dev::reset(state.clone())
+        .await
+        .is_err();
+    std::fs::remove_dir(&lock_path).unwrap();
+    let absent = state
+        .session_store
+        .session_is_canonically_absent(&child.id)
+        .await
+        .unwrap();
+    let evicted = !state.sessions.contains_key(&child.id)
+        && !state.cancel_tokens.read().await.contains_key(&child.id)
+        && !state
+            .session_event_senders
+            .read()
+            .await
+            .contains_key(&child.id)
+        && token.is_cancelled();
+    let fenced = matches!(
+        profile::acquire(&root, &child.id),
+        Err(BrowserError::NotOpen)
+    );
+    state.shutdown().await;
+    assert!(
+        failed && absent,
+        "fixture must fail after real canonical deletion"
+    );
+    assert!(!path.exists() && fenced);
+    assert!(
+        evicted,
+        "a failed reset retained a logically deleted Child in runtime state"
+    );
+}
+
+#[tokio::test]
+async fn partial_reset_preserves_a_still_canonical_root_and_its_runtime_state() {
+    let data = tempfile::tempdir().unwrap();
+    let state = web::Data::new(
+        crate::app_state::AppState::new(data.path().into())
+            .await
+            .unwrap(),
+    );
+    let session = Session::new("partial-reset-survivor", "synthetic-model");
+    state.session_store.save_session(&session).await.unwrap();
+    state.sessions.insert(
+        session.id.clone(),
+        Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
+    );
+    let root = data.path().join("browser-profiles");
+    let profile = seed_profile(&root, &session.id);
+    let children = data
+        .path()
+        .join("sessions")
+        .join(&session.id)
+        .join("children");
+    assert!(!children.exists());
+    std::fs::write(&children, b"synthetic census obstruction").unwrap();
+    let failed = crate::handlers::agent::dev::reset(state.clone())
+        .await
+        .is_err();
+    let canonical = !state
+        .session_store
+        .session_is_canonically_absent(&session.id)
+        .await
+        .unwrap();
+    let retained =
+        profile.join("Default/Cookies").is_file() && state.sessions.contains_key(&session.id);
+    std::fs::remove_file(children).unwrap();
+    state.shutdown().await;
+    assert!(
+        failed && canonical && retained,
+        "partial failure purged still-canonical data"
+    );
+}
+
+#[tokio::test]
+async fn dev_reset_retries_when_the_canonical_sessions_directory_is_missing() {
+    let data = tempfile::tempdir().unwrap();
+    let state = web::Data::new(
+        crate::app_state::AppState::new(data.path().into())
+            .await
+            .unwrap(),
+    );
+    let session = Session::new("interrupted-reset", "synthetic-model");
+    state.session_store.save_session(&session).await.unwrap();
+    let root = data.path().join("browser-profiles");
+    let path = seed_profile(&root, &session.id);
+    // Establish real canonical revocation, then simulate the missing-directory
+    // state of an interrupted reset. This is not a power-cut/fsync claim.
+    state.session_store.dev_reset().await.unwrap();
+    std::fs::remove_dir(data.path().join("sessions")).unwrap();
+    let retried = crate::handlers::agent::dev::reset(state.clone()).await;
+    let fenced = matches!(
+        profile::acquire(&root, &session.id),
+        Err(BrowserError::NotOpen)
+    );
+    state.shutdown().await;
+    assert!(retried.is_ok() && data.path().join("sessions").is_dir());
+    assert!(!path.exists() && fenced);
 }

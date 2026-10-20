@@ -379,6 +379,7 @@ pub(super) fn build_root_tools(
     fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,
     project_store: Arc<bamboo_projects::ProjectStore>,
     workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
+    browser: Arc<crate::browser::BrowserManager>,
     parent_request_replies: Arc<dyn bamboo_server_tools::ParentRequestReplyPort>,
 ) -> (
     Arc<dyn ToolExecutor>,
@@ -386,6 +387,7 @@ pub(super) fn build_root_tools(
 ) {
     // Shared adapter for the unified child session tool.
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
+        browser: Some(browser),
         session_store: session_store.clone(),
         storage: storage.clone(),
         persistence: persistence.clone(),

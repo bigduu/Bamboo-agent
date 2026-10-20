@@ -1141,6 +1141,9 @@ impl AppState {
             messenger: session_messenger.clone(),
             account: account_sink.clone(),
         });
+        let browser = Arc::new(crate::browser::BrowserManager::with_profile_root(
+            data_dir.join("browser-profiles"),
+        ));
         let (tools, canonical_subagent_tool) = build_root_tools(
             tools_with_task.clone(),
             builtin_permission_executor,
@@ -1162,6 +1165,7 @@ impl AppState {
             fabric_deployer.clone(),
             project_store.clone(),
             workspace_resolver.clone(),
+            browser.clone(),
             parent_approval_reviewer,
         );
         external_runner.set_canonical_subagent_tool(Some(canonical_subagent_tool));
@@ -1171,9 +1175,6 @@ impl AppState {
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(
             crate::tools::OverlayToolExecutor::new(tools, workflow_run_tool),
         );
-        let browser = Arc::new(crate::browser::BrowserManager::with_profile_root(
-            data_dir.join("browser-profiles"),
-        ));
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
             Arc::new(crate::tools::OverlayToolExecutor::new(
                 tools,
@@ -1310,6 +1311,7 @@ impl AppState {
         // and a fresh wait-slot map suffices. `Arc<ChildSessionAdapter>` doubles
         // as `Arc<dyn GuardianSpawner>`.
         let child_adapter = Arc::new(crate::tools::ChildSessionAdapter {
+            browser: Some(browser.clone()),
             session_store: session_store.clone(),
             storage: storage.clone(),
             persistence: persistence.clone(),

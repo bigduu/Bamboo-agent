@@ -8,6 +8,7 @@ use super::BrowserError;
 
 const CLOSE_PENDING: &str = ".bamboo-profile-close-pending";
 const LEASES: &str = ".bamboo-profile-leases";
+const RESET_GATE: &str = ".bamboo-profile-reset.lock";
 const RETIRED: &[u8] = b"BAMBOO_BROWSER_RETIRED_V1\n";
 
 pub(super) struct Lease {
@@ -16,6 +17,8 @@ pub(super) struct Lease {
     // Never unlink this lock with the profile: queued openers may already hold
     // a descriptor to its inode. Open and deletion use the same stable lock.
     _lifecycle_lock: std::fs::File,
+    // Shared through actual host reaping; reset holds the same inode exclusively.
+    _reset_gate: std::fs::File,
 }
 
 impl Lease {
@@ -150,7 +153,7 @@ pub(super) fn directory(root: &Path, session_id: &str) -> Result<PathBuf, Browse
     std::fs::canonicalize(profile).map_err(|_| unavailable())
 }
 
-fn lock_file(lock_path: &Path) -> Result<std::fs::File, BrowserError> {
+fn open_lock_file(lock_path: &Path) -> Result<std::fs::File, BrowserError> {
     if let Ok(metadata) = std::fs::symlink_metadata(lock_path) {
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(unavailable());
@@ -164,14 +167,41 @@ fn lock_file(lock_path: &Path) -> Result<std::fs::File, BrowserError> {
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let lock = options.open(lock_path).map_err(|_| unavailable())?;
+    Ok(lock)
+}
+
+fn lock_file(lock_path: &Path) -> Result<std::fs::File, BrowserError> {
+    let lock = open_lock_file(lock_path)?;
     fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| unavailable())?;
     Ok(lock)
 }
 
+fn admission_gate(root: &Path, exclusive: bool) -> Result<std::fs::File, BrowserError> {
+    let gate = open_lock_file(&root.join(RESET_GATE))?;
+    if exclusive {
+        fs2::FileExt::try_lock_exclusive(&gate).map_err(|_| unavailable())?;
+    } else {
+        fs2::FileExt::try_lock_shared(&gate).map_err(|_| unavailable())?;
+    }
+    gate.sync_all().map_err(|_| unavailable())?;
+    sync_directory(root)?;
+    sync_directory(root.parent().ok_or_else(unavailable)?)?;
+    Ok(gate)
+}
+
+pub(super) fn begin_reset(root: &Path) -> Result<std::fs::File, BrowserError> {
+    let root = root_directory(root, true)?.ok_or_else(unavailable)?;
+    admission_gate(&root, true)
+}
+
 fn lifecycle_lock(root: &Path, session_id: &str) -> Result<std::fs::File, BrowserError> {
+    lifecycle_lock_key(root, &key(session_id))
+}
+
+fn lifecycle_lock_key(root: &Path, profile_key: &str) -> Result<std::fs::File, BrowserError> {
     let locks = root.join(LEASES);
     private_directory(&locks)?;
-    lock_file(&locks.join(format!("{}.lock", key(session_id))))
+    lock_file(&locks.join(format!("{profile_key}.lock")))
 }
 
 /// Metadata-only cleanup evidence. A missing ID must not mint a stable lock.
@@ -219,6 +249,7 @@ fn is_retired(lock: &std::fs::File) -> Result<bool, BrowserError> {
 
 pub(super) fn acquire(root: &Path, session_id: &str) -> Result<Lease, BrowserError> {
     let root = root_directory(root, true)?.ok_or_else(unavailable)?;
+    let reset_gate = admission_gate(&root, false)?;
     let lifecycle_lock = lifecycle_lock(&root, session_id)?;
     if is_retired(&lifecycle_lock)? {
         return Err(BrowserError::NotOpen);
@@ -233,6 +264,7 @@ pub(super) fn acquire(root: &Path, session_id: &str) -> Result<Lease, BrowserErr
         path,
         _lock: lock,
         _lifecycle_lock: lifecycle_lock,
+        _reset_gate: reset_gate,
     })
 }
 
@@ -248,10 +280,28 @@ pub(super) fn remove_notifying(
     session_id: &str,
     retirement_persisted: impl FnOnce(),
 ) -> Result<(), BrowserError> {
+    remove_key_notifying(root, &key(session_id), retirement_persisted)
+}
+
+fn valid_key(profile_key: &str) -> bool {
+    profile_key.len() == 64
+        && profile_key
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn remove_key_notifying(
+    root: &Path,
+    profile_key: &str,
+    retirement_persisted: impl FnOnce(),
+) -> Result<(), BrowserError> {
     use std::io::{Seek, SeekFrom, Write};
+    if !valid_key(profile_key) {
+        return Err(unavailable());
+    }
     let root = root_directory(root, true)?.ok_or_else(unavailable)?;
-    let path = root.join(key(session_id));
-    let lifecycle_lock = lifecycle_lock(&root, session_id)?;
+    let path = root.join(profile_key);
+    let lifecycle_lock = lifecycle_lock_key(&root, profile_key)?;
     // Hold the original inode before observing absence or writing the marker.
     // Existing/opening owners and preopened descriptors must still contend.
     let present = match std::fs::symlink_metadata(&path) {
@@ -278,6 +328,52 @@ pub(super) fn remove_notifying(
     sync_directory(&root)?;
     sync_directory(root.parent().ok_or_else(unavailable)?)?;
     retirement_persisted();
+    Ok(())
+}
+
+/// Greenfield reset covers actual profile/lease keys, including closed and
+/// orphaned state. Never treat a filename as a Session ID and hash it twice.
+/// Preserve every stable lease inode for old/preopened descriptors.
+pub(super) fn purge_all(root: &Path) -> Result<(), BrowserError> {
+    let Some(root) = root_directory(root, false)? else {
+        return Ok(());
+    };
+    let mut keys = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&root).map_err(|_| unavailable())? {
+        let entry = entry.map_err(|_| unavailable())?;
+        if entry.file_name() == RESET_GATE {
+            let kind = entry.file_type().map_err(|_| unavailable())?;
+            if !kind.is_file() || kind.is_symlink() {
+                return Err(unavailable());
+            }
+        } else if entry.file_name() == LEASES {
+            validate_private_directory(&entry.path())?;
+            for lease in std::fs::read_dir(entry.path()).map_err(|_| unavailable())? {
+                let lease = lease.map_err(|_| unavailable())?;
+                let name = lease.file_name();
+                let profile_key = name
+                    .to_str()
+                    .and_then(|s| s.strip_suffix(".lock"))
+                    .ok_or_else(unavailable)?;
+                let kind = lease.file_type().map_err(|_| unavailable())?;
+                if !valid_key(profile_key) || !kind.is_file() || kind.is_symlink() {
+                    return Err(unavailable());
+                }
+                keys.insert(profile_key.to_string());
+            }
+        } else {
+            let name = entry.file_name();
+            let profile_key = name.to_str().ok_or_else(unavailable)?;
+            if !valid_key(profile_key) {
+                return Err(unavailable());
+            }
+            validate_private_directory(&entry.path())?;
+            keys.insert(profile_key.to_string());
+        }
+    }
+    for profile_key in keys {
+        remove_key_notifying(&root, &profile_key, || {})?;
+    }
     Ok(())
 }
 

@@ -799,6 +799,7 @@ async fn build_test_harness_with_hook(
     activation.set_delegate(activation_router.clone());
 
     let adapter = Arc::new(ChildSessionAdapter {
+        browser: None,
         session_store,
         storage: storage.clone(),
         persistence,
@@ -6996,6 +6997,7 @@ async fn child_inspection_pages_long_utf8_result_after_storage_restart() {
     let reopened_store = Arc::new(SessionStoreV2::new(bamboo_home).await.unwrap());
     let reopened_storage: Arc<dyn Storage> = reopened_store.clone();
     let reopened_adapter = Arc::new(ChildSessionAdapter {
+        browser: None,
         session_store: reopened_store,
         storage: reopened_storage.clone(),
         persistence: Arc::new(bamboo_storage::LockedSessionStore::new(reopened_storage)),

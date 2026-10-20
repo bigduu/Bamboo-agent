@@ -2,24 +2,19 @@
 
 use super::*;
 use crate::app_state::AppState;
-use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutionContext};
+use bamboo_agent_core::tools::{Tool, ToolExecutionContext, ToolOutcome};
 use bamboo_agent_core::{Session, Storage};
 use bamboo_engine::session_app::child_session::ChildSessionPort;
 
-pub(super) async fn delete_via_root_tool(state: &AppState, parent: &str, child: &str) -> Value {
-    let call = ToolCall {
-        id: "synthetic-browser-child-delete".into(),
-        tool_type: "function".into(),
-        function: FunctionCall {
-            name: "SubAgent".into(),
-            arguments: json!({"action":"delete","child_session_id":child}).to_string(),
-        },
-    };
-    let result = state
-        .tool_factory
-        .get(crate::tools::ToolSurface::Root)
-        .execute_with_context(
-            &call,
+pub(super) async fn delete_via_subagent_tool(state: &AppState, parent: &str, child: &str) -> Value {
+    // Exercise the real SubAgent semantic component, as existing adapter tests
+    // do. The outer Root permission wrapper is a separate product boundary;
+    // this fixture never grants/bypasses it or calls a provider.
+    let port = Arc::new(adapter(state));
+    let tool = crate::tools::SubAgentTool::new(port.clone(), port);
+    let result = tool
+        .invoke(
+            json!({"action":"delete","child_session_id":child}),
             ToolExecutionContext {
                 executing_supervisor: None,
                 session_id: Some(parent),
@@ -33,10 +28,15 @@ pub(super) async fn delete_via_root_tool(state: &AppState, parent: &str, child: 
                 can_async_resume: false,
                 bash_completion_sink: None,
                 pre_parsed_args: None,
-            },
+            }
+            .to_tool_ctx(),
         )
         .await
         .unwrap();
+    let ToolOutcome::Completed(result) = result else {
+        panic!("expected completed deletion")
+    };
+    assert!(result.success, "{}", result.result);
     serde_json::from_str(&result.result).unwrap()
 }
 
@@ -49,6 +49,7 @@ fn seed(root: &std::path::Path, id: &str) -> PathBuf {
 
 fn adapter(state: &AppState) -> crate::tools::ChildSessionAdapter {
     crate::tools::ChildSessionAdapter {
+        browser: Some(state.browser.clone()),
         session_store: state.session_store.clone(),
         storage: state.storage.clone(),
         persistence: state.persistence.clone(),
@@ -77,7 +78,7 @@ async fn subagent_delete_purges_child_profile_and_preserves_parent_state() {
     let root = home.path().join("browser-profiles");
     let parent_profile = seed(&root, &parent.id);
     let child_profile = seed(&root, &child.id);
-    let result = delete_via_root_tool(&state, &parent.id, &child.id).await;
+    let result = delete_via_subagent_tool(&state, &parent.id, &child.id).await;
     let purged = !child_profile.exists();
     let fenced = matches!(
         profile::acquire(&root, &child.id),

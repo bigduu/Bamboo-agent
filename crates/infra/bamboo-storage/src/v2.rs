@@ -5664,58 +5664,92 @@ impl SessionStoreV2 {
     /// Root revocations remain canonical so surviving processes cannot restore
     /// their deleted snapshots after this reset.
     pub async fn dev_reset(&self) -> io::Result<()> {
-        let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
-        let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked(&_runtime_task)
-            .await?;
-        self.recover_all_session_copy_transactions_locked().await?;
-
-        let deleted_search_sources = self
-            .index
-            .read()
+        self.dev_reset_with_progress()
             .await
-            .sessions
-            .values()
-            .map(|entry| {
-                (
-                    entry.id.clone(),
-                    self.abs_path_from_rel(&entry.rel_path)
-                        .join(SEARCH_INDEX_REVISION_FILE),
-                )
-            })
-            .collect::<Vec<_>>();
+            .map(|_| ())
+            .map_err(|failure| failure.error)
+    }
 
-        // Revoke canonical Roots before removing the tree, including Roots
-        // omitted by this process's stale index. Preserve the revocations
-        // outside sessions/: stale writers may survive this development reset.
-        let mut roots = fs::read_dir(&self.sessions_dir).await?;
-        while let Some(root) = roots.next_entry().await? {
-            if root.file_type().await?.is_dir() {
-                if let Some(id) = root.file_name().to_str() {
-                    self.revoke_root_lifetime(id).await?;
+    /// Return exact canonical cleanup candidates, preserving partial failure.
+    /// The legacy ioResult API keeps the same revocation/write boundary.
+    pub async fn dev_reset_with_progress(&self) -> Result<CleanupResult, CleanupFailure> {
+        let mut candidates = Vec::new();
+        let result: io::Result<()> = async {
+            let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
+            let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
+            self.recover_all_runtime_task_transactions_locked(&_runtime_task)
+                .await?;
+            self.recover_all_session_copy_transactions_locked().await?;
+
+            let deleted_search_sources = self
+                .index
+                .read()
+                .await
+                .sessions
+                .values()
+                .map(|entry| {
+                    (
+                        entry.id.clone(),
+                        self.abs_path_from_rel(&entry.rel_path)
+                            .join(SEARCH_INDEX_REVISION_FILE),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            // Revoke canonical Roots before removing the tree, including Roots
+            // omitted by this process's stale index. Preserve the revocations
+            // outside sessions/: stale writers may survive this development reset.
+            match fs::read_dir(&self.sessions_dir).await {
+                Ok(mut roots) => {
+                    while let Some(root) = roots.next_entry().await? {
+                        if root.file_type().await?.is_dir() {
+                            if let Some(id) = root.file_name().to_str() {
+                                // Census actual canonical IDs under the same exclusive
+                                // lifecycle/Task guards, including unindexed Children.
+                                candidates.push(id.to_owned());
+                                candidates.extend(self.canonical_root_child_ids(id).await?);
+                                self.revoke_root_lifetime(id).await?;
+                            }
+                        }
+                    }
                 }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
-        }
-        match fs::remove_dir_all(&self.sessions_dir).await {
-            Ok(()) => sync_parent_directory_entry(&self.sessions_dir).await?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        fs::create_dir_all(&self.sessions_dir).await?;
-        sync_parent_directory_entry(&self.sessions_dir).await?;
+            match fs::remove_dir_all(&self.sessions_dir).await {
+                Ok(()) => sync_parent_directory_entry(&self.sessions_dir).await?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            fs::create_dir_all(&self.sessions_dir).await?;
+            sync_parent_directory_entry(&self.sessions_dir).await?;
 
-        // Reset through the same cross-process rebase/publish boundary as every
-        // other index mutation; dev reset must not race a stale direct writer.
-        self.update_index(|index| {
-            *index = SessionsIndex::empty();
+            // Reset through the same cross-process rebase/publish boundary as every
+            // other index mutation; dev reset must not race a stale direct writer.
+            self.update_index(|index| {
+                *index = SessionsIndex::empty();
+                Ok(())
+            })
+            .await?;
+            for (session_id, revision_path) in deleted_search_sources {
+                self.search_index_queue
+                    .enqueue_delete(&session_id, revision_path);
+            }
             Ok(())
-        })
-        .await?;
-        for (session_id, revision_path) in deleted_search_sources {
-            self.search_index_queue
-                .enqueue_delete(&session_id, revision_path);
         }
-        Ok(())
+        .await;
+        candidates.sort();
+        candidates.dedup();
+        match result {
+            Ok(()) => Ok(CleanupResult {
+                deleted_count: candidates.len(),
+                deleted_session_ids: candidates,
+            }),
+            Err(error) => Err(CleanupFailure {
+                error,
+                candidate_session_ids: candidates,
+            }),
+        }
     }
 
     /// Delete a session. If the session is a root, deletes its entire directory (and all child sessions).
