@@ -435,6 +435,12 @@ async function runSuite(config, request = jsonRequest) {
     return { status: cases.every(c => c.status === 'PASS') ? 'PASS' : 'PARTIAL', cases };
   } finally { controller.abort(); clearTimeout(timer); }
 }
+function bindHostRequest(config, request = jsonRequest, verify = verifyProcess) {
+  return async (base, route, body, signal) => {
+    if (body !== undefined) await verify({ ...config, cases: config.cases.filter(c => origin(c.api_base) === origin(base)) });
+    return request(base, route, body, signal);
+  };
+}
 function parseArgs(argv) {
   if (argv.length === 0 || argv[0] === '--help') return { command: 'help' };
   const [command, ...rest] = argv; requireFact(['preflight', 'run'].includes(command), 'unknown_command');
@@ -455,10 +461,7 @@ async function main(argv = process.argv.slice(2)) {
     }
     await verifyProcess(verified.config);
     nativeStarted = true;
-    const boundRequest = async (base, route, body, signal) => {
-      if (body !== undefined) await verifyProcess({ ...verified.config, cases: verified.config.cases.filter(c => origin(c.api_base) === origin(base)) });
-      return jsonRequest(base, route, body, signal);
-    };
+    const boundRequest = bindHostRequest(verified.config);
     const result = await runSuite(verified.config, boundRequest);
     console.log(JSON.stringify({ schema_version: 1, evidence_kind: 'actual_native_host', source_sha: SOURCE,
       receipt_sha256: verified.receipt_sha256, binary_sha256: verified.config.binary.sha256, ...result }));
@@ -471,5 +474,5 @@ async function main(argv = process.argv.slice(2)) {
   }
 }
 module.exports = { SOURCE, TREE, Failure, validateReceipt, readBounded, hashArtifact, origin, scenario, roleOf,
-  creationReceipt, nextReply, startProvider, validateComposition, messages, runSuite, parseArgs, verifyReceipt, jsonRequest, verifyProcess };
+  creationReceipt, nextReply, startProvider, validateComposition, messages, runSuite, parseArgs, verifyReceipt, jsonRequest, verifyProcess, bindHostRequest };
 if (require.main === module) main();

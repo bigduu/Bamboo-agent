@@ -375,3 +375,61 @@ test('LINUX SOURCE MODEL ONLY: verify socket inode, address family and network n
   await probe.verifyProcess({ ...config, cases: [{ ...config.cases[0], api_base: 'http://[::1]:39001' }] });
   assert.ok(state.calls.every(command => command === 'ps'));
 });
+async function ownedEvidenceProcess(t) {
+  const child = spawn(process.execPath, ['-e', `
+    const server = require('node:http').createServer((req, res) => { res.setHeader('Content-Type', 'application/json'); res.end('{"owner":"original"}'); });
+    server.listen(0, '127.0.0.1', () => process.stdout.write(String(server.address().port) + '\\n'));
+    process.stdin.on('end', () => server.close()); process.stdin.resume();
+  `], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const exited = once(child, 'exit');
+  t.after(async () => { child.stdin.end(); const [code] = await exited; assert.equal(code, 0); });
+  const [bytes] = await Promise.race([once(child.stdout, 'data'), exited.then(() => { throw new Error('own listener fixture did not start'); })]);
+  const port = Number(bytes.toString().trim()); assert.ok(port >= 1024);
+  const started = spawnSync('ps', ['-p', String(child.pid), '-o', 'lstart='], { encoding: 'utf8' }); assert.equal(started.status, 0);
+  const base = 'http://127.0.0.1:' + port;
+  const config = { binary: { path: process.execPath }, cases: [{ host_pid: child.pid, host_started_at: started.stdout.trim(), api_base: base }] };
+  return { child, exited, port, base, config };
+}
+test('OS COMPONENT ONLY: GET evidence rejects a replacement after the original owned process exits', { timeout: 5000 }, async t => {
+  if (!['darwin', 'linux'].includes(process.platform)) {
+    await assert.rejects(d.verifyProcess({ cases: [] }), e => e.code === 'native_process_binding_unsupported'); return;
+  }
+  const { child, exited, port, base, config } = await ownedEvidenceProcess(t);
+  const bound = d.bindHostRequest(config);
+  assert.equal((await bound(base, '/api/v1/probe', {}, AbortSignal.timeout(2000))).body.owner, 'original');
+  child.stdin.end(); const [code] = await exited; assert.equal(code, 0);
+  let replacementRequests = 0;
+  const replacement = http.createServer((req, res) => { replacementRequests++; res.setHeader('Content-Type', 'application/json'); res.end('{"owner":"replacement"}'); });
+  await new Promise((resolve, reject) => { replacement.once('error', reject); replacement.listen(port, '127.0.0.1', resolve); });
+  t.after(() => new Promise(resolve => replacement.close(resolve)));
+  await assert.rejects(bound(base, '/api/v1/evidence', undefined, AbortSignal.timeout(2000)));
+  assert.equal(replacementRequests, 0);
+});
+test('OS COMPONENT ONLY: port transfer after precheck must not receive an HTTP write', { timeout: 5000 }, async t => {
+  if (!['darwin', 'linux'].includes(process.platform)) {
+    await assert.rejects(d.verifyProcess({ cases: [] }), e => e.code === 'native_process_binding_unsupported'); return;
+  }
+  const { child, exited, port, base, config } = await ownedEvidenceProcess(t);
+  let checks = 0, replacementRequests = 0, replacement;
+  t.after(async () => { if (replacement) await new Promise(resolve => replacement.close(resolve)); });
+  const verify = async value => {
+    checks++; await d.verifyProcess(value);
+    if (checks === 1) {
+      child.stdin.end(); const [code] = await exited; assert.equal(code, 0);
+      replacement = http.createServer((req, res) => { replacementRequests++; res.setHeader('Content-Type', 'application/json'); res.end('{"owner":"replacement"}'); });
+      await new Promise((resolve, reject) => { replacement.once('error', reject); replacement.listen(port, '127.0.0.1', resolve); });
+    }
+  };
+  const bound = d.bindHostRequest(config, d.jsonRequest, verify);
+  await assert.rejects(bound(base, '/api/v1/write', {}, AbortSignal.timeout(2000)));
+  assert.equal(checks, 2); assert.equal(replacementRequests, 0);
+});
+test('HTTP BOUNDARY COMPONENT ONLY: a response is withheld if owner verification changes during transport', async () => {
+  let checks = 0, requests = 0;
+  const base = 'http://127.0.0.1:39001', config = { cases: [{ api_base: base }] };
+  const transport = async () => { requests++; return { status: 200, body: { result: 'not-yet-trusted' } }; };
+  const verify = async () => { checks++; if (requests) throw new d.Failure('host_process_changed'); };
+  const bound = d.bindHostRequest(config, transport, verify);
+  await assert.rejects(bound(base, '/api/v1/evidence', undefined, AbortSignal.timeout(2000)), e => e.code === 'host_process_changed');
+  assert.equal(checks, 2); assert.equal(requests, 1);
+});
