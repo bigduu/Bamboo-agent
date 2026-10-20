@@ -18,16 +18,25 @@ async fn retiring_a_closed_chat_purges_only_its_persisted_profile() {
 
     browser.retire("deleted").await.unwrap();
     assert!(!path.exists(), "deleted chat retained its site data");
-    assert_eq!(std::fs::read(other_cookie).unwrap(), b"other synthetic state");
+    assert_eq!(
+        std::fs::read(other_cookie).unwrap(),
+        b"other synthetic state"
+    );
     browser.retire("deleted").await.unwrap();
-    assert!(matches!(browser.open("deleted").await, Err(BrowserError::NotOpen)));
+    assert!(matches!(
+        browser.open("deleted").await,
+        Err(BrowserError::NotOpen)
+    ));
 }
 
 #[tokio::test]
 async fn retiring_a_missing_chat_does_not_create_profile_directories() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("profiles");
-    BrowserManager::with_profile_root(root.clone()).retire("absent").await.unwrap();
+    BrowserManager::with_profile_root(root.clone())
+        .retire("absent")
+        .await
+        .unwrap();
     assert!(!root.exists());
 }
 
@@ -41,7 +50,10 @@ async fn retiring_a_chat_refuses_to_remove_another_live_owners_profile() {
     let browser = BrowserManager::with_profile_root(root);
 
     assert!(browser.retire("deleted").await.is_err());
-    assert_eq!(std::fs::read(path.join("Cookies")).unwrap(), b"synthetic state");
+    assert_eq!(
+        std::fs::read(path.join("Cookies")).unwrap(),
+        b"synthetic state"
+    );
     drop(owner);
     browser.retire("deleted").await.unwrap();
     assert!(!path.exists());
@@ -53,17 +65,28 @@ async fn retiring_an_unconfirmed_closed_profile_purges_its_checkpoint() {
     let root = temporary.path().join("profiles");
     let owner = profile::acquire(&root, "deleted").unwrap();
     let path = owner.path.clone();
-    std::fs::write(path.join(".bamboo-session-cookies-v1.json"), b"synthetic state").unwrap();
+    std::fs::write(
+        path.join(".bamboo-session-cookies-v1.json"),
+        b"synthetic state",
+    )
+    .unwrap();
     owner.begin_close().unwrap();
     drop(owner);
     assert!(profile::acquire(&root, "deleted").is_err());
 
-    BrowserManager::with_profile_root(root).retire("deleted").await.unwrap();
+    BrowserManager::with_profile_root(root)
+        .retire("deleted")
+        .await
+        .unwrap();
     assert!(!path.exists());
 }
 
 #[cfg(unix)]
-fn closing_host(root: &std::path::Path, marker: &std::path::Path, status: i32) -> (Arc<BrowserSession>, PathBuf) {
+fn closing_host(
+    root: &std::path::Path,
+    marker: &std::path::Path,
+    status: i32,
+) -> (Arc<BrowserSession>, PathBuf) {
     let lease = profile::acquire(root, "deleted").unwrap();
     let path = lease.path.clone();
     let mut command = Command::new("/bin/sh");
@@ -83,12 +106,23 @@ async fn retiring_a_live_chat_reaps_its_host_before_purging_with_old_arcs_alive(
     let marker = temporary.path().join("profile-existed-at-eof");
     let (session, path) = closing_host(&root, &marker, 0);
     let browser = BrowserManager::with_profile_root(root);
-    browser.sessions.lock().await.insert("deleted".into(), session.clone());
+    browser
+        .sessions
+        .lock()
+        .await
+        .insert("deleted".into(), session.clone());
 
     browser.retire("deleted").await.unwrap();
     assert!(marker.exists());
     assert!(session.reaped.load(Ordering::Acquire));
-    assert!(session.child.lock().unwrap().try_wait().unwrap().unwrap().success());
+    assert!(session
+        .child
+        .lock()
+        .unwrap()
+        .try_wait()
+        .unwrap()
+        .unwrap()
+        .success());
     assert!(session.profile_lease.lock().unwrap().is_none());
     assert!(!path.exists());
 }
@@ -101,12 +135,23 @@ async fn retiring_a_nonzero_host_exit_still_purges_after_reaping() {
     let marker = temporary.path().join("profile-existed-at-eof");
     let (session, path) = closing_host(&root, &marker, 23);
     let browser = BrowserManager::with_profile_root(root);
-    browser.sessions.lock().await.insert("deleted".into(), session.clone());
+    browser
+        .sessions
+        .lock()
+        .await
+        .insert("deleted".into(), session.clone());
 
     browser.retire("deleted").await.unwrap();
     assert!(marker.exists());
     assert!(session.reaped.load(Ordering::Acquire));
-    assert!(!session.child.lock().unwrap().try_wait().unwrap().unwrap().success());
+    assert!(!session
+        .child
+        .lock()
+        .unwrap()
+        .try_wait()
+        .unwrap()
+        .unwrap()
+        .success());
     assert!(!path.exists());
 }
 
@@ -118,16 +163,28 @@ async fn cancelled_retirement_waiter_does_not_abandon_profile_deletion() {
     let marker = temporary.path().join("profile-existed-at-eof");
     let (session, path) = closing_host(&root, &marker, 0);
     let browser = BrowserManager::with_profile_root(root);
-    browser.sessions.lock().await.insert("deleted".into(), session.clone());
+    browser
+        .sessions
+        .lock()
+        .await
+        .insert("deleted".into(), session.clone());
     let waiter = tokio::spawn(async move { browser.retire("deleted").await });
     tokio::time::timeout(Duration::from_secs(3), async {
-        while !marker.exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
-    }).await.unwrap();
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
     tokio::time::timeout(Duration::from_secs(3), async {
-        while path.exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
-    }).await.expect("request cancellation abandoned the deleted chat's profile");
+        while path.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("request cancellation abandoned the deleted chat's profile");
     assert!(session.reaped.load(Ordering::Acquire));
 }
 
@@ -147,14 +204,20 @@ async fn retirement_rejects_profile_symlinks_and_does_not_follow_internal_links(
     std::os::unix::fs::symlink(&outside, &path).unwrap();
     let browser = BrowserManager::with_profile_root(root.clone());
     assert!(browser.retire("deleted").await.is_err());
-    assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside synthetic state");
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"outside synthetic state"
+    );
     std::fs::remove_file(&path).unwrap();
     let owner = profile::acquire(&root, "deleted").unwrap();
     std::os::unix::fs::symlink(&outside, owner.path.join("linked-site-data")).unwrap();
     drop(owner);
     browser.retire("deleted").await.unwrap();
     assert!(!path.exists());
-    assert_eq!(std::fs::read(&sentinel).unwrap(), b"outside synthetic state");
+    assert_eq!(
+        std::fs::read(&sentinel).unwrap(),
+        b"outside synthetic state"
+    );
 }
 
 #[tokio::test]
@@ -165,8 +228,14 @@ async fn retirement_cannot_pass_an_opener_that_has_not_created_its_directory() {
     let path = owner.path.clone();
     drop(owner);
     std::fs::remove_dir_all(&path).unwrap();
-    let lock = std::fs::OpenOptions::new().read(true).write(true)
-        .open(root.join(".bamboo-profile-leases").join(format!("{}.lock", path.file_name().unwrap().to_str().unwrap()))).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join(".bamboo-profile-leases").join(format!(
+            "{}.lock",
+            path.file_name().unwrap().to_str().unwrap()
+        )))
+        .unwrap();
     fs2::FileExt::try_lock_exclusive(&lock).unwrap();
     let browser = BrowserManager::with_profile_root(root);
     assert!(browser.retire("deleted").await.is_err());
@@ -184,11 +253,21 @@ async fn retirement_keeps_the_stable_lock_inode_and_preopened_descriptors_exclus
     let root = temporary.path().join("profiles");
     let owner = profile::acquire(&root, "deleted").unwrap();
     let path = owner.path.clone();
-    let stable = root.join(".bamboo-profile-leases").join(format!("{}.lock", path.file_name().unwrap().to_str().unwrap()));
-    let competing = std::fs::OpenOptions::new().read(true).write(true).open(&stable).unwrap();
+    let stable = root.join(".bamboo-profile-leases").join(format!(
+        "{}.lock",
+        path.file_name().unwrap().to_str().unwrap()
+    ));
+    let competing = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&stable)
+        .unwrap();
     let before = competing.metadata().unwrap();
     drop(owner);
-    BrowserManager::with_profile_root(root.clone()).retire("deleted").await.unwrap();
+    BrowserManager::with_profile_root(root.clone())
+        .retire("deleted")
+        .await
+        .unwrap();
     assert!(!path.exists());
     let after = std::fs::metadata(&stable).unwrap();
     assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));

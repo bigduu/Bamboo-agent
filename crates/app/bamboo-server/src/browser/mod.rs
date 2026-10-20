@@ -3,9 +3,9 @@
 
 #[cfg(test)]
 mod persistence_tests;
+mod profile;
 #[cfg(test)]
 mod retirement_tests;
-mod profile;
 
 #[cfg(test)]
 pub(crate) fn test_profile_directory(root: &std::path::Path, session_id: &str) -> PathBuf {
@@ -2088,7 +2088,9 @@ impl BrowserManager {
             let session_id = session_id.to_string();
             tokio::task::spawn_blocking(move || profile::remove(&root, &session_id))
                 .await
-                .map_err(|_| BrowserError::Unavailable("browser profile cleanup interrupted".into()))?
+                .map_err(|_| {
+                    BrowserError::Unavailable("browser profile cleanup interrupted".into())
+                })?
         } else {
             closed
         }

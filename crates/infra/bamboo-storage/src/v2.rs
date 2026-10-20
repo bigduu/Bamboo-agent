@@ -5613,7 +5613,10 @@ impl SessionStoreV2 {
                 .delete_session_recursive_locked(root_id, true, &guards)
                 .await
             {
-                return Err(CleanupFailure { error, candidate_session_ids: deleted_session_ids });
+                return Err(CleanupFailure {
+                    error,
+                    candidate_session_ids: deleted_session_ids,
+                });
             }
         }
         for child_id in delete_child_ids.iter() {
@@ -5621,7 +5624,10 @@ impl SessionStoreV2 {
                 .delete_session_recursive_locked(child_id, true, &guards)
                 .await
             {
-                return Err(CleanupFailure { error, candidate_session_ids: deleted_session_ids });
+                return Err(CleanupFailure {
+                    error,
+                    candidate_session_ids: deleted_session_ids,
+                });
             }
         }
         Ok(CleanupResult {
@@ -5725,15 +5731,30 @@ impl SessionStoreV2 {
             .await?;
         self.recover_all_session_copy_transactions_locked().await?;
         validate_session_id(session_id)?;
-        let mut candidate_session_ids: Vec<String> = self.index.read().await.sessions.values()
+        let mut candidate_session_ids: Vec<String> = self
+            .index
+            .read()
+            .await
+            .sessions
+            .values()
             .filter(|entry| entry.id == session_id || entry.root_session_id == session_id)
-            .map(|entry| entry.id.clone()).collect();
+            .map(|entry| entry.id.clone())
+            .collect();
         candidate_session_ids.push(session_id.to_string());
         candidate_session_ids.sort();
         candidate_session_ids.dedup();
-        match self.delete_session_recursive_locked(session_id, force, &guards).await {
-            Ok(deleted) => Ok(SessionDeletionResult { deleted, candidate_session_ids }),
-            Err(error) => Err(CleanupFailure { error, candidate_session_ids }),
+        match self
+            .delete_session_recursive_locked(session_id, force, &guards)
+            .await
+        {
+            Ok(deleted) => Ok(SessionDeletionResult {
+                deleted,
+                candidate_session_ids,
+            }),
+            Err(error) => Err(CleanupFailure {
+                error,
+                candidate_session_ids,
+            }),
         }
     }
 
@@ -5900,7 +5921,10 @@ pub struct SessionDeletionResult {
 
 impl From<io::Error> for CleanupFailure {
     fn from(error: io::Error) -> Self {
-        Self { error, candidate_session_ids: Vec::new() }
+        Self {
+            error,
+            candidate_session_ids: Vec::new(),
+        }
     }
 }
 

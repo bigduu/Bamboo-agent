@@ -162,13 +162,19 @@ pub(super) fn acquire(root: &Path, session_id: &str) -> Result<Lease, BrowserErr
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         _ => return Err(unavailable()),
     }
-    Ok(Lease { path, _lock: lock, _lifecycle_lock: lifecycle_lock })
+    Ok(Lease {
+        path,
+        _lock: lock,
+        _lifecycle_lock: lifecycle_lock,
+    })
 }
 
 /// Purge only the derived chat directory, with no live owner. A pending-close
 /// marker prevents replay, not deletion. Never create a missing profile here.
 pub(super) fn remove(root: &Path, session_id: &str) -> Result<(), BrowserError> {
-    let Some(root) = root_directory(root, false)? else { return Ok(()); };
+    let Some(root) = root_directory(root, false)? else {
+        return Ok(());
+    };
     let path = root.join(key(session_id));
     let _lifecycle_lock = lifecycle_lock(&root, session_id)?;
     // Lock before even the absence check: an opener can own the lease before

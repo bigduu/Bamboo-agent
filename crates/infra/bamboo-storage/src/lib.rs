@@ -22,8 +22,8 @@ pub use v2::{
     ActorClaimContextSeed, ActorInputCheckpoint, ActorInputCheckpointError,
     ActorInputCheckpointResult, ActorInputCheckpointStatus, ActorModelContextCheckpoint,
     ActorModelContextError, ActorModelContextOutcome, ActorTranscriptAppend,
-    ActorTranscriptAppendError, ActorTranscriptGroupAppend, CleanupFailure, CleanupMode, CleanupResult,
-    DurationMetricsSnapshot, SavePersistenceMetricsSnapshot, SessionCopyProjectionGuard,
-    SessionDeletionResult, SessionIndexEntry, SessionPersistenceMetricsSnapshot, SessionPlacement, SessionStoreV2,
-    SessionsIndex,
+    ActorTranscriptAppendError, ActorTranscriptGroupAppend, CleanupFailure, CleanupMode,
+    CleanupResult, DurationMetricsSnapshot, SavePersistenceMetricsSnapshot,
+    SessionCopyProjectionGuard, SessionDeletionResult, SessionIndexEntry,
+    SessionPersistenceMetricsSnapshot, SessionPlacement, SessionStoreV2, SessionsIndex,
 };

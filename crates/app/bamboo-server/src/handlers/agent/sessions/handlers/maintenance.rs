@@ -243,7 +243,10 @@ async fn cleanup_owned(
     mode: CleanupMode,
     keep_pinned: bool,
 ) -> CleanupOutcome {
-    let result = state.session_store.cleanup_with_progress(mode, keep_pinned).await;
+    let result = state
+        .session_store
+        .cleanup_with_progress(mode, keep_pinned)
+        .await;
     finish_cleanup(state, result).await
 }
 
@@ -267,7 +270,13 @@ async fn finish_cleanup(
                 }
             }
             deleted_session_ids.sort();
-            (CleanupResult { deleted_count: deleted_session_ids.len(), deleted_session_ids }, Some(failure.error.to_string()))
+            (
+                CleanupResult {
+                    deleted_count: deleted_session_ids.len(),
+                    deleted_session_ids,
+                },
+                Some(failure.error.to_string()),
+            )
         }
     };
 
@@ -323,7 +332,12 @@ async fn finish_cleanup(
         }
     }
 
-    CleanupOutcome { deleted: result, browser_cleanup_pending, storage_error, unconfirmed_session_ids }
+    CleanupOutcome {
+        deleted: result,
+        browser_cleanup_pending,
+        storage_error,
+        unconfirmed_session_ids,
+    }
 }
 
 #[cfg(test)]
@@ -362,15 +376,27 @@ mod tests {
         assert!(state.storage.delete_session(&deleted.id).await.unwrap());
         let outcome = finish_cleanup(
             state.clone(),
-            Err(CleanupFailure { error: std::io::Error::other("synthetic later cleanup failure"), candidate_session_ids: vec![deleted.id.clone(), kept.id.clone()] }),
-        ).await;
-        assert_eq!(outcome.deleted.deleted_session_ids, vec![deleted.id.clone()]);
+            Err(CleanupFailure {
+                error: std::io::Error::other("synthetic later cleanup failure"),
+                candidate_session_ids: vec![deleted.id.clone(), kept.id.clone()],
+            }),
+        )
+        .await;
+        assert_eq!(
+            outcome.deleted.deleted_session_ids,
+            vec![deleted.id.clone()]
+        );
         assert!(outcome.storage_error.is_some());
         assert!(outcome.browser_cleanup_pending.is_empty());
         assert!(outcome.unconfirmed_session_ids.is_empty());
         assert!(!deleted_profile.exists());
         assert!(kept_profile.join("Cookies").exists());
-        assert!(state.storage.load_session(&kept.id).await.unwrap().is_some());
+        assert!(state
+            .storage
+            .load_session(&kept.id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[cfg(unix)]
@@ -388,23 +414,46 @@ mod tests {
             state.session_store.save_session(session).await.unwrap();
             std::fs::write(profile.join("Cookies"), b"synthetic state").unwrap();
         }
-        let lock = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)
-            .open(blocked_profile.join(".bamboo-profile.lock")).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(blocked_profile.join(".bamboo-profile.lock"))
+            .unwrap();
         fs2::FileExt::try_lock_exclusive(&lock).unwrap();
 
-        let response = cleanup_sessions(state.clone(), web::Json(CleanupRequest { mode: "all".into(), keep_pinned: false })).await.unwrap();
+        let response = cleanup_sessions(
+            state.clone(),
+            web::Json(CleanupRequest {
+                mode: "all".into(),
+                keep_pinned: false,
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = actix_web::body::to_bytes(response.into_body()).await.unwrap();
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["browser_cleanup_pending_session_ids"], serde_json::json!([blocked.id.clone()]));
+        assert_eq!(
+            body["browser_cleanup_pending_session_ids"],
+            serde_json::json!([blocked.id.clone()])
+        );
         for id in [&blocked.id, &other.id] {
-            assert!(body["deleted_session_ids"].as_array().unwrap().contains(&serde_json::json!(id)));
+            assert!(body["deleted_session_ids"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(id)));
             assert!(state.storage.load_session(id).await.unwrap().is_none());
         }
         assert!(blocked_profile.join("Cookies").exists());
         assert!(!other_profile.exists());
         drop(lock);
-        let retried = crate::handlers::agent::delete::handler(state, web::Path::from(blocked.id)).await.unwrap();
+        let retried = crate::handlers::agent::delete::handler(state, web::Path::from(blocked.id))
+            .await
+            .unwrap();
         assert_eq!(retried.status(), StatusCode::NOT_FOUND);
         assert!(!blocked_profile.exists());
     }

@@ -13,9 +13,18 @@ async fn root_deletion_reports_late_children_without_relying_on_a_root_index_row
     store.save_session(&child).await.unwrap();
     // Exact interleaving: caller preflight precedes this admitted Child. The
     // Root remains canonical even if its rebuildable index row is missing.
-    store.update_index(|index| { index.sessions.remove(&root.id); Ok(()) }).await.unwrap();
+    store
+        .update_index(|index| {
+            index.sessions.remove(&root.id);
+            Ok(())
+        })
+        .await
+        .unwrap();
     assert!(store.get_index_entry(&root.id).await.is_none());
-    let result = store.delete_session_recursive_with_progress(&root.id, true).await.unwrap();
+    let result = store
+        .delete_session_recursive_with_progress(&root.id, true)
+        .await
+        .unwrap();
     assert!(result.deleted);
     let mut expected = vec![root.id.clone(), child.id.clone()];
     expected.sort();

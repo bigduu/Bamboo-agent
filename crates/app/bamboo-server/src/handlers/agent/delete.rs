@@ -81,18 +81,19 @@ async fn delete_owned(state: web::Data<AppState>, session_id: String) -> DeleteO
     let _persistence_guard = state.persistence.acquire_lock(&session_id).await;
 
     // Best-effort pre-cancellation of the session (and its children if this is a root session).
-    let mut ids_to_cancel: Vec<String> = match state.session_store.get_index_entry(&session_id).await {
-        Some(entry) if matches!(entry.kind, bamboo_agent_core::SessionKind::Root) => state
-            .session_store
-            .list_index_entries()
-            .await
-            .into_iter()
-            .filter(|e| e.root_session_id == session_id)
-            .map(|e| e.id)
-            .collect(),
-        Some(_) => vec![session_id.clone()],
-        None => vec![session_id.clone()],
-    };
+    let mut ids_to_cancel: Vec<String> =
+        match state.session_store.get_index_entry(&session_id).await {
+            Some(entry) if matches!(entry.kind, bamboo_agent_core::SessionKind::Root) => state
+                .session_store
+                .list_index_entries()
+                .await
+                .into_iter()
+                .filter(|e| e.root_session_id == session_id)
+                .map(|e| e.id)
+                .collect(),
+            Some(_) => vec![session_id.clone()],
+            None => vec![session_id.clone()],
+        };
 
     // Deletion is terminal, unlike a resumable stop/suspension. Release every
     // root/child activation before removing session state so immutable snapshot
@@ -128,9 +129,13 @@ async fn delete_owned(state: web::Data<AppState>, session_id: String) -> DeleteO
         cancelled
     };
 
-    let pre_cancelled_ids: std::collections::HashSet<String> = ids_to_cancel.iter().cloned().collect();
-    let (deleted_from_storage, storage_failed, mut actual_candidates) = match state.session_store
-        .delete_session_recursive_with_progress(&session_id, true).await {
+    let pre_cancelled_ids: std::collections::HashSet<String> =
+        ids_to_cancel.iter().cloned().collect();
+    let (deleted_from_storage, storage_failed, mut actual_candidates) = match state
+        .session_store
+        .delete_session_recursive_with_progress(&session_id, true)
+        .await
+    {
         Ok(result) => (result.deleted, false, result.candidate_session_ids),
         Err(failure) => {
             tracing::error!(
@@ -160,7 +165,11 @@ async fn delete_owned(state: web::Data<AppState>, session_id: String) -> DeleteO
     for id in &ids_to_cancel {
         // Late children were not in the pre-cancellation snapshot.
         if !pre_cancelled_ids.contains(id) {
-            if let Err(error) = state.skill_manager.release_activation_for_workspace(id, None).await {
+            if let Err(error) = state
+                .skill_manager
+                .release_activation_for_workspace(id, None)
+                .await
+            {
                 tracing::warn!(session_id = %id, %error, "deleted session activation cleanup incomplete");
             }
         }
@@ -182,7 +191,13 @@ async fn delete_owned(state: web::Data<AppState>, session_id: String) -> DeleteO
         let mut runners = state.agent_runners.write().await;
         let mut cancelled = cancelled_runner;
         for id in &ids_to_cancel {
-            if let Some(runner) = bamboo_engine::runtime::execution::runner_lifecycle::remove_runner_entry(&mut runners, id).await {
+            if let Some(runner) =
+                bamboo_engine::runtime::execution::runner_lifecycle::remove_runner_entry(
+                    &mut runners,
+                    id,
+                )
+                .await
+            {
                 runner.cancel_token.cancel();
                 cancelled = true;
             }
@@ -233,7 +248,8 @@ async fn delete_owned(state: web::Data<AppState>, session_id: String) -> DeleteO
         DeleteOutcome::StorageFailed(browser_cleanup_pending)
     } else if !browser_cleanup_pending.is_empty() {
         DeleteOutcome::BrowserCleanupIncomplete(browser_cleanup_pending)
-    } else if deleted_from_storage || removed_from_memory || cancelled_in_flight || cancelled_runner {
+    } else if deleted_from_storage || removed_from_memory || cancelled_in_flight || cancelled_runner
+    {
         DeleteOutcome::Deleted
     } else {
         DeleteOutcome::Missing
@@ -284,7 +300,8 @@ mod tests {
         let state = web::Data::new(state);
         let profiles = [&root.id, &child.id].map(|id| {
             let profile = crate::browser::test_profile_directory(
-                &directory.path().join("browser-profiles"), id,
+                &directory.path().join("browser-profiles"),
+                id,
             );
             std::fs::write(profile.join("Cookies"), b"synthetic state").unwrap();
             profile
@@ -308,25 +325,43 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn logically_deleted_root_still_purges_browser_data_when_physical_storage_removal_fails() {
+    async fn logically_deleted_root_still_purges_browser_data_when_physical_storage_removal_fails()
+    {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let state = web::Data::new(AppState::new(directory.path().to_path_buf()).await.unwrap());
         let session = Session::new("delete-browser-partial-storage", "model");
         state.session_store.save_session(&session).await.unwrap();
-        let profile = crate::browser::test_profile_directory(&directory.path().join("browser-profiles"), &session.id);
+        let profile = crate::browser::test_profile_directory(
+            &directory.path().join("browser-profiles"),
+            &session.id,
+        );
         std::fs::write(profile.join("Cookies"), b"synthetic state").unwrap();
         let storage_directory = directory.path().join("sessions").join(&session.id);
-        std::fs::set_permissions(&storage_directory, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let response = handler(state.clone(), web::Path::from(session.id.clone())).await.unwrap();
+        std::fs::set_permissions(&storage_directory, std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+        let response = handler(state.clone(), web::Path::from(session.id.clone()))
+            .await
+            .unwrap();
         if storage_directory.exists() {
-            std::fs::set_permissions(&storage_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&storage_directory, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
         }
-        assert_eq!(response.status(), actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
-        let body = actix_web::body::to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["storage_deletion_failed"], true);
-        assert!(state.storage.load_session(&session.id).await.unwrap().is_none());
+        assert!(state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .is_none());
         assert!(!profile.exists());
     }
 
@@ -338,16 +373,34 @@ mod tests {
         let state = web::Data::new(AppState::new(directory.path().to_path_buf()).await.unwrap());
         let session = Session::new("delete-browser-retry", "model");
         state.session_store.save_session(&session).await.unwrap();
-        let profile = crate::browser::test_profile_directory(&directory.path().join("browser-profiles"), &session.id);
+        let profile = crate::browser::test_profile_directory(
+            &directory.path().join("browser-profiles"),
+            &session.id,
+        );
         std::fs::write(profile.join("Cookies"), b"synthetic state").unwrap();
         std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o500)).unwrap();
-        let response = handler(state.clone(), web::Path::from(session.id.clone())).await.unwrap();
+        let response = handler(state.clone(), web::Path::from(session.id.clone()))
+            .await
+            .unwrap();
         std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert_eq!(response.status(), actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
-        let body = actix_web::body::to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["browser_cleanup_pending_session_ids"], serde_json::json!([session.id.clone()]));
-        assert!(state.storage.load_session(&session.id).await.unwrap().is_none());
+        assert_eq!(
+            body["browser_cleanup_pending_session_ids"],
+            serde_json::json!([session.id.clone()])
+        );
+        assert!(state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .is_none());
         assert!(profile.join("Cookies").exists());
 
         let retried = handler(state, web::Path::from(session.id)).await.unwrap();
@@ -362,16 +415,38 @@ mod tests {
         let state = web::Data::new(AppState::new(directory.path().to_path_buf()).await.unwrap());
         let session = Session::new("delete-browser-cancelled-waiter", "model");
         state.session_store.save_session(&session).await.unwrap();
-        let profile = crate::browser::test_profile_directory(&directory.path().join("browser-profiles"), &session.id);
+        let profile = crate::browser::test_profile_directory(
+            &directory.path().join("browser-profiles"),
+            &session.id,
+        );
         std::fs::write(profile.join("Cookies"), b"synthetic state").unwrap();
         let guard = state.persistence.acquire_lock(&session.id).await;
-        assert!(tokio::time::timeout(Duration::from_millis(50), handler(state.clone(), web::Path::from(session.id.clone()))).await.is_err());
-        assert!(state.storage.load_session(&session.id).await.unwrap().is_some());
+        assert!(tokio::time::timeout(
+            Duration::from_millis(50),
+            handler(state.clone(), web::Path::from(session.id.clone()))
+        )
+        .await
+        .is_err());
+        assert!(state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .is_some());
         drop(guard);
         tokio::time::timeout(Duration::from_secs(5), async {
-            while state.storage.load_session(&session.id).await.unwrap().is_some() || profile.exists() {
+            while state
+                .storage
+                .load_session(&session.id)
+                .await
+                .unwrap()
+                .is_some()
+                || profile.exists()
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.expect("the owned deletion was abandoned when its HTTP waiter disconnected");
+        })
+        .await
+        .expect("the owned deletion was abandoned when its HTTP waiter disconnected");
     }
 }
