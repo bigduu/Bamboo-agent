@@ -72,7 +72,7 @@ impl AppState {
         }
     }
 
-    /// Shut down Child runtimes and MCP servers gracefully.
+    /// Shut down Child runtimes, MCP servers and owned browsers gracefully.
     ///
     /// Sends shutdown signals to all running MCP server processes
     /// and waits for them to terminate cleanly.
@@ -89,6 +89,7 @@ impl AppState {
             tracing::warn!(%error, "Child runtime shutdown did not complete cleanly");
         }
         self.mcp_manager.shutdown_all().await;
+        self.browser.shutdown().await;
         tracing::info!("MCP servers shut down complete");
     }
 

@@ -71,10 +71,41 @@ pub struct BrowserManager {
     session_gates: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
     retired: Arc<Mutex<HashSet<String>>>,
     cleanup_started: Arc<AtomicBool>,
+    lifecycle: Arc<BrowserLifecycle>,
+}
+
+/// Tracks this manager's hosts even after removal from its live-session map.
+/// A cleanup record survives the final session Arc and its detached reaper.
+#[derive(Default)]
+struct BrowserLifecycle {
+    stopping: AtomicBool,
+    opens: tokio::sync::RwLock<()>,
+    owners: Mutex<Vec<Arc<BrowserCleanup>>>,
+}
+
+struct BrowserCleanup {
+    session: Mutex<Weak<BrowserSession>>,
+    done: watch::Sender<bool>,
+}
+
+impl BrowserCleanup {
+    fn finish(&self) {
+        self.done.send_replace(true);
+    }
+
+    async fn wait(&self) {
+        let mut done = self.done.subscribe();
+        while !*done.borrow_and_update() {
+            if done.changed().await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 struct BrowserSession {
     child: Arc<Mutex<Child>>,
+    cleanup: Arc<BrowserCleanup>,
     profile_lease: Mutex<Option<profile::Lease>>,
     /// Owns the host's TMPDIR, including Chromium's download scratch files.
     temp_dir: Mutex<Option<tempfile::TempDir>>,
@@ -99,6 +130,7 @@ struct BrowserSession {
 impl Drop for BrowserSession {
     fn drop(&mut self) {
         if self.reaped.load(Ordering::Acquire) && self.profile_lease.get_mut().unwrap().is_none() {
+            self.cleanup.finish();
             return;
         }
         let lease = self.profile_lease.get_mut().unwrap().take();
@@ -113,6 +145,7 @@ impl Drop for BrowserSession {
         let can_detach = lease.is_none() || marked;
         let resources = BrowserReaper {
             child: self.child.clone(),
+            cleanup: Some(self.cleanup.clone()),
             lease,
             temp_dir: self.temp_dir.get_mut().unwrap().take(),
             stdin: self.stdin.get_mut().take(),
@@ -149,6 +182,7 @@ impl Drop for BrowserSession {
 /// signalling a process is not evidence that it has stopped using its profile.
 struct BrowserReaper {
     child: Arc<Mutex<Child>>,
+    cleanup: Option<Arc<BrowserCleanup>>,
     lease: Option<profile::Lease>,
     temp_dir: Option<tempfile::TempDir>,
     stdin: Option<ChildStdin>,
@@ -215,7 +249,13 @@ impl BrowserReaper {
                 }
             }
         }
-        // self.lease remains alive through actual wait + owned scratch cleanup.
+        // Completion is published only after actual wait, scratch cleanup and
+        // release of both profile locks. A process shutdown awaits this record.
+        let cleanup = self.cleanup.take();
+        drop(self);
+        if let Some(cleanup) = cleanup {
+            cleanup.finish();
+        }
     }
 }
 
@@ -315,7 +355,10 @@ fn restrict_host_environment(command: &mut Command) {
 }
 
 impl BrowserSession {
-    async fn spawn(profile_lease: Option<profile::Lease>) -> Result<Arc<Self>, BrowserError> {
+    async fn spawn(
+        profile_lease: Option<profile::Lease>,
+        lifecycle: &BrowserLifecycle,
+    ) -> Result<Arc<Self>, BrowserError> {
         let script = host_script();
         if !script.is_file() {
             return Err(BrowserError::Unavailable(format!(
@@ -352,7 +395,7 @@ impl BrowserSession {
         let child = command
             .spawn()
             .map_err(|error| BrowserError::Unavailable(error.to_string()))?;
-        let session = Self::from_child(child, Some(temp_dir))?;
+        let session = Self::from_child_tracked(child, Some(temp_dir), lifecycle)?;
         *session.profile_lease.lock().unwrap() = profile_lease;
         let mut abort_guard = BrowserCallAbortGuard::new(session.clone(), None);
         // The first state request doubles as a readiness probe. A missing
@@ -366,9 +409,18 @@ impl BrowserSession {
         Ok(session)
     }
 
+    #[cfg(test)]
     fn from_child(
+        child: Child,
+        temp_dir: Option<tempfile::TempDir>,
+    ) -> Result<Arc<Self>, BrowserError> {
+        Self::from_child_tracked(child, temp_dir, &BrowserLifecycle::default())
+    }
+
+    fn from_child_tracked(
         mut child: Child,
         temp_dir: Option<tempfile::TempDir>,
+        lifecycle: &BrowserLifecycle,
     ) -> Result<Arc<Self>, BrowserError> {
         #[cfg(unix)]
         let process_group = child.id().and_then(|id| i32::try_from(id).ok());
@@ -382,7 +434,12 @@ impl BrowserSession {
             .ok_or_else(|| BrowserError::Unavailable("browser host stdout not available".into()))?;
         let (frames, _) = watch::channel(None);
         let (shutdown, _) = watch::channel(false);
+        let cleanup = Arc::new(BrowserCleanup {
+            session: Mutex::new(Weak::new()),
+            done: watch::channel(false).0,
+        });
         let session = Arc::new(Self {
+            cleanup: cleanup.clone(),
             child: Arc::new(Mutex::new(child)),
             profile_lease: Mutex::new(None),
             temp_dir: Mutex::new(temp_dir),
@@ -403,6 +460,12 @@ impl BrowserSession {
             alive: AtomicBool::new(true),
             last_used: Mutex::new(Instant::now()),
         });
+        *cleanup.session.lock().unwrap() = Arc::downgrade(&session);
+        {
+            let mut owners = lifecycle.owners.lock().unwrap();
+            owners.retain(|owner| !*owner.done.borrow());
+            owners.push(cleanup);
+        }
         let weak = Arc::downgrade(&session);
         tokio::spawn(async move { Self::read_messages(weak, stdout).await });
         Ok(session)
@@ -591,6 +654,10 @@ impl BrowserSession {
             return;
         }
         lease.take();
+        drop(lease);
+        if self.reaped.load(Ordering::Acquire) {
+            self.cleanup.finish();
+        }
     }
 
     async fn terminate(&self, reason: &'static str) {
@@ -1869,6 +1936,44 @@ impl BrowserManager {
         }
     }
 
+    /// Finish process-owned browser work before an executable can return.
+    /// Open is fenced first; its read guard includes spawn/readiness, so no
+    /// in-flight startup can escape the following owner snapshot.
+    pub async fn shutdown(&self) {
+        self.lifecycle.stopping.store(true, Ordering::Release);
+        let _opens = self.lifecycle.opens.write().await;
+        let mut sessions: Vec<_> = std::mem::take(&mut *self.sessions.lock().await)
+            .into_values()
+            .collect();
+        let owners = self.lifecycle.owners.lock().unwrap().clone();
+        for owner in &owners {
+            let session = owner.session.lock().unwrap().upgrade();
+            if let Some(session) = session {
+                if !sessions.iter().any(|known| Arc::ptr_eq(known, &session)) {
+                    sessions.push(session);
+                }
+            }
+        }
+        // Fence all old Arcs before waiting for any one Chromium checkpoint.
+        for session in &sessions {
+            if let Err(error) = session.begin_retirement("browser manager shutting down") {
+                tracing::warn!(%error, "browser shutdown could not mark its profile");
+                session.mark_dead("browser manager shutting down");
+                session.signal_stop();
+            }
+        }
+        for session in sessions {
+            if let Err(error) = Self::stop_session(session).await {
+                tracing::warn!(%error, "browser shutdown did not confirm persistence");
+            }
+        }
+        // Records also cover hosts whose final Arc already started a detached
+        // Drop reaper. Waiting on durable completion avoids a Weak/Drop race.
+        for owner in owners {
+            owner.wait().await;
+        }
+    }
+
     /// Start one sweep only after a browser page exists. AppState instances that
     /// never open Chromium do not leave timers behind.
     fn start_idle_cleanup(&self) -> bool {
@@ -1879,24 +1984,37 @@ impl BrowserManager {
         let weak_gates = Arc::downgrade(&self.session_gates);
         let weak_retired = Arc::downgrade(&self.retired);
         let weak_started = Arc::downgrade(&self.cleanup_started);
+        let weak_lifecycle = Arc::downgrade(&self.lifecycle);
         let profile_root = self.profile_root.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(BROWSER_IDLE_SWEEP_INTERVAL).await;
-                let (Some(sessions), Some(session_gates), Some(retired), Some(cleanup_started)) = (
+                let (
+                    Some(sessions),
+                    Some(session_gates),
+                    Some(retired),
+                    Some(cleanup_started),
+                    Some(lifecycle),
+                ) = (
                     weak_sessions.upgrade(),
                     weak_gates.upgrade(),
                     weak_retired.upgrade(),
                     weak_started.upgrade(),
-                ) else {
+                    weak_lifecycle.upgrade(),
+                )
+                else {
                     break;
                 };
+                if lifecycle.stopping.load(Ordering::Acquire) {
+                    break;
+                }
                 let browser = BrowserManager {
                     profile_root: profile_root.clone(),
                     sessions,
                     session_gates,
                     retired,
                     cleanup_started,
+                    lifecycle,
                 };
                 let reaped = browser.sweep_idle(BROWSER_IDLE_TTL).await;
                 if reaped > 0 {
@@ -1919,6 +2037,12 @@ impl BrowserManager {
     }
 
     pub async fn open(&self, session_id: &str) -> Result<Value, BrowserError> {
+        let _opens = self.lifecycle.opens.read().await;
+        if self.lifecycle.stopping.load(Ordering::Acquire) {
+            return Err(BrowserError::Unavailable(
+                "browser manager shut down".into(),
+            ));
+        }
         // Serialize only this chat's open/close lifecycle. Starting Chromium
         // or probing a slow host must not block unrelated chat sessions.
         let gate = self.session_gate(session_id);
@@ -1959,7 +2083,7 @@ impl BrowserManager {
             .as_ref()
             .map(|root| profile::acquire(root, session_id))
             .transpose()?;
-        let session = BrowserSession::spawn(profile_lease).await?;
+        let session = BrowserSession::spawn(profile_lease, &self.lifecycle).await?;
         let mut abort_guard = BrowserCallAbortGuard::new(
             session.clone(),
             Some((self.clone(), session_id.to_string())),
