@@ -271,8 +271,10 @@ fn blocked_file_locks(locks: &[(PathBuf, bool)]) -> std::io::Result<Vec<PathBuf>
 
 fn pause_boundary_locks(data: &Path, child_id: &str) -> Vec<(PathBuf, bool)> {
     let mut locks = vec![
-        (data.join(".session-lifecycle.lock"), true),
-        (data.join(".runtime-task-transactions.lock"), true),
+        // root_settled constructs a Store whose recovery takes both gates
+        // exclusively, so a paused shared writer is unsafe here too.
+        (data.join(".session-lifecycle.lock"), false),
+        (data.join(".runtime-task-transactions.lock"), false),
         (data.join(".sessions-index.lock"), false),
         (data.join("events/.account-journal.lock"), false),
         (
@@ -1127,33 +1129,53 @@ async fn replacement_fixture(delayed_release: bool) {
 }
 
 #[actix_web::test]
-async fn child_owner_pause_rejects_a_real_journal_claim() {
+async fn child_owner_pause_rejects_real_physical_claims() {
     let temp = tempfile::tempdir().unwrap();
-    let lock_path = temp.path().join(".account-journal.lock");
-    let mut held = Some(std::fs::File::create(&lock_path).unwrap());
-    held.as_ref().unwrap().lock().unwrap();
-    let mut host = Host {
-        child: Command::new("sleep").arg("30").spawn().unwrap(),
-        base: String::new(),
-        log: temp.path().join("unused-host.log"),
-        stopped: false,
-    };
-    let rejected = host
-        .stop_clear_of_file_locks(&[(lock_path.clone(), false)], |blocked| {
-            assert_eq!(blocked, [lock_path.clone()]);
-            drop(held.take());
-        })
-        .await
-        .unwrap();
-    assert!(
-        rejected > 0 && held.is_none(),
-        "the pause must reject a conflicting physical writer before accepting STOP"
-    );
-    let replacement = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .unwrap();
-    replacement.try_lock().unwrap();
-    assert!(host.stopped);
+    // Only negative filesystem claims, never a fabricated Actor or receipt.
+    let child_inbox = temp
+        .path()
+        .join("sessions")
+        .join(ROOT)
+        .join("children/boundary-child/inbox/.session-inbox.lock");
+    std::fs::create_dir_all(child_inbox.parent().unwrap()).unwrap();
+    std::fs::File::create(child_inbox).unwrap();
+    for (relative, shared_claim) in [
+        (".session-lifecycle.lock", true),
+        (".runtime-task-transactions.lock", true),
+        ("events/.account-journal.lock", false),
+    ] {
+        let lock_path = temp.path().join(relative);
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let mut held = Some(std::fs::File::create(&lock_path).unwrap());
+        if shared_claim {
+            held.as_ref().unwrap().lock_shared().unwrap();
+        } else {
+            held.as_ref().unwrap().lock().unwrap();
+        }
+        let mut host = Host {
+            child: Command::new("sleep").arg("30").spawn().unwrap(),
+            base: String::new(),
+            log: temp.path().join("unused-host.log"),
+            stopped: false,
+        };
+        let locks = pause_boundary_locks(temp.path(), "boundary-child");
+        let rejected = host
+            .stop_clear_of_file_locks(&locks, |blocked| {
+                assert_eq!(blocked, [lock_path.clone()]);
+                drop(held.take());
+            })
+            .await
+            .unwrap();
+        assert!(
+            rejected > 0 && held.is_none(),
+            "the pause must reject a conflicting physical claim before accepting STOP: {relative}"
+        );
+        let replacement = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        replacement.try_lock().unwrap();
+        assert!(host.stopped);
+    }
 }
