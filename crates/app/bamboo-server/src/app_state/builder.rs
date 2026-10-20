@@ -1058,7 +1058,9 @@ impl AppState {
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(
             crate::tools::OverlayToolExecutor::new(tools, workflow_run_tool),
         );
-        let browser = Arc::new(crate::browser::BrowserManager::default());
+        let browser = Arc::new(crate::browser::BrowserManager::with_profile_root(
+            data_dir.join("browser-profiles"),
+        ));
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
             Arc::new(crate::tools::OverlayToolExecutor::new(
                 tools,

@@ -4,7 +4,7 @@
   "private": true,
   "description": "Bamboo-owned browser host for the shared Lotus workbench",
   "scripts": {
-    "test:runtime": "node --test host.test.cjs"
+    "test:runtime": "node --test --test-concurrency=1 host.test.cjs profile.test.cjs"
   },
   "dependencies": {
     "playwright-core": "1.62.1"

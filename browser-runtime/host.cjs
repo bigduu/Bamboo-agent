@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// One host process owns one isolated Chromium context and a bounded tab set. Bamboo is the
+// One host process owns one isolated Chromium profile and a bounded tab set. Bamboo is the
 // only client: newline-delimited JSON over stdio never exposes a CDP port.
 const { chromium } = require('playwright-core');
 const { createHash, randomBytes } = require('node:crypto');
@@ -90,6 +90,101 @@ let transientPageCreation;
 const transientPages = new WeakSet();
 const orphanDownloads = new Set();
 let downloadSweep = Promise.resolve();
+let profileDirectory;
+let profileKey;
+let profileCookieState;
+let profileCheckpoint = Promise.resolve();
+let profileFailure;
+let profileTimer;
+let profileInterval;
+
+function profileError() {
+  const error = new Error('browser profile persistence unavailable');
+  error.code = 'browser_profile_unavailable';
+  return error;
+}
+
+async function readProfile() {
+  const directory = process.env.BAMBOO_BROWSER_PROFILE_DIR;
+  if (!directory) return;
+  try {
+    if (!path.isAbsolute(directory) || !/^[a-f0-9]{64}$/.test(path.basename(directory))) throw profileError();
+    const metadata = await fs.lstat(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() ||
+        await fs.realpath(directory) !== path.normalize(directory)) throw profileError();
+    if (process.platform !== 'win32' &&
+        ((metadata.mode & 0o077) !== 0 || metadata.uid !== process.getuid())) throw profileError();
+    profileDirectory = directory;
+    profileKey = path.basename(directory);
+    const file = path.join(directory, '.bamboo-session-cookies-v1.json');
+    let bytes;
+    try {
+      const stat = await fs.lstat(file);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 32 * 1024 * 1024 ||
+          (process.platform !== 'win32' && ((stat.mode & 0o077) !== 0 || stat.uid !== process.getuid()))) throw profileError();
+      bytes = await fs.readFile(file, 'utf8');
+    } catch (error) {
+      if (error.code === 'ENOENT') return [];
+      throw error;
+    }
+    const state = JSON.parse(bytes);
+    if (!state || Object.keys(state).join(',') !== 'schemaVersion,profileKey,cookies' ||
+        state.schemaVersion !== 1 || state.profileKey !== profileKey || !Array.isArray(state.cookies)) throw profileError();
+    for (const cookie of state.cookies) {
+      if (!cookie || cookie.expires !== -1 ||
+          !['name', 'value', 'domain', 'path'].every(key => typeof cookie[key] === 'string') ||
+          typeof cookie.httpOnly !== 'boolean' || typeof cookie.secure !== 'boolean' ||
+          !['Strict', 'Lax', 'None'].includes(cookie.sameSite)) throw profileError();
+    }
+    profileCookieState = bytes;
+    return state.cookies;
+  } catch {
+    throw profileError();
+  }
+}
+
+// Chromium owns cookies/localStorage/IndexedDB in the private profile. Its
+// headless shell drops session-only cookies on restart, even for a persistent
+// context. Keep only those cookies with the same logical chat profile: recycling
+// the host must not end that chat's login. No cookies from other profiles enter.
+function checkpointProfile() {
+  clearTimeout(profileTimer);
+  profileTimer = undefined;
+  if (!profileDirectory || !context || browserClosed) return Promise.resolve();
+  if (profileFailure) return Promise.reject(profileFailure);
+  profileCheckpoint = profileCheckpoint.then(async () => {
+    const cookies = (await context.cookies()).filter(cookie => cookie.expires === -1)
+      .sort((a, b) => JSON.stringify([a.domain, a.path, a.name, a.partitionKey || ''])
+        .localeCompare(JSON.stringify([b.domain, b.path, b.name, b.partitionKey || ''])));
+    const bytes = JSON.stringify({ schemaVersion: 1, profileKey, cookies }) + '\n';
+    if (Buffer.byteLength(bytes) > 32 * 1024 * 1024) throw profileError();
+    if (bytes === profileCookieState) return;
+    const target = path.join(profileDirectory, '.bamboo-session-cookies-v1.json');
+    const temporary = `${target}.${randomBytes(12).toString('hex')}.tmp`;
+    try {
+      const file = await fs.open(temporary, 'wx', 0o600);
+      try { await file.writeFile(bytes); await file.sync(); } finally { await file.close(); }
+      await fs.rename(temporary, target);
+      profileCookieState = bytes;
+    } finally {
+      await fs.rm(temporary, { force: true }).catch(() => {});
+    }
+  }).catch(() => {
+    profileFailure = profileError();
+    retireAfterReply = true;
+    throw profileFailure;
+  });
+  return profileCheckpoint;
+}
+
+function scheduleProfileCheckpoint() {
+  if (!profileDirectory || shuttingDown || browserClosed || profileTimer || profileFailure) return;
+  profileTimer = setTimeout(() => {
+    profileTimer = undefined;
+    void checkpointProfile().catch(() => {});
+  }, 100);
+  profileTimer.unref();
+}
 
 function emit(message) {
   if (!closing) process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -1456,7 +1551,7 @@ function cleanDownloadFilename(value) {
 
 function cancelDownloadGuid(guid) {
   return downloadCdp?.send('Browser.cancelDownload', {
-    guid, browserContextId: downloadContextId,
+    guid, ...(downloadContextId ? { browserContextId: downloadContextId } : {}),
   }).catch(() => {});
 }
 
@@ -3055,6 +3150,10 @@ async function closeHost() {
   desiredCapture = undefined;
   activeCapture = undefined;
   activeDownloadAttempt?.download?.cancel().catch(() => {});
+  clearTimeout(profileTimer);
+  clearInterval(profileInterval);
+  let checkpointError;
+  try { await checkpointProfile(); } catch (error) { checkpointError = error; }
   await context?.close().catch(() => {});
   await browser?.close().catch(() => {});
   browserClosed = true;
@@ -3067,6 +3166,7 @@ async function closeHost() {
     await fs.rm(downloadDir, { recursive: true, force: true }).catch(() => {});
     downloadDir = undefined;
   }
+  if (checkpointError) throw checkpointError;
 }
 
 async function main() {
@@ -3074,17 +3174,36 @@ async function main() {
   // selects different environment variables on Windows.
   const downloadRoot = process.env.BAMBOO_BROWSER_DOWNLOAD_ROOT || os.tmpdir();
   downloadDir = await fs.mkdtemp(path.join(downloadRoot, 'bamboo-browser-download-'));
-  browser = await chromium.launch({
+  const sessionCookies = await readProfile();
+  const launchOptions = {
     headless: true,
     downloadsPath: downloadDir,
     ...(process.env.BAMBOO_BROWSER_EXECUTABLE ? { executablePath: process.env.BAMBOO_BROWSER_EXECUTABLE } : {}),
-  });
-  context = await browser.newContext({
+  };
+  const contextOptions = {
     viewport: { width: 1000, height: 720 },
     deviceScaleFactor: 1,
     acceptDownloads: true,
     serviceWorkers: 'block',
-  });
+  };
+  if (profileDirectory) {
+    context = await chromium.launchPersistentContext(profileDirectory, { ...launchOptions, ...contextOptions });
+    browser = context.browser();
+    if (!browser) throw profileError();
+    if (sessionCookies.length) await context.addCookies(sessionCookies);
+    // Keep the existing zero-tab startup contract. Profile data survives; tab
+    // documents, sessionStorage and page memory are deliberately not restored.
+    for (const page of context.pages()) await page.close();
+    await checkpointProfile();
+    context.on('response', scheduleProfileCheckpoint);
+    profileInterval = setInterval(scheduleProfileCheckpoint, 5000);
+    profileInterval.unref();
+  } else {
+    // Direct standalone/test hosts can still explicitly omit a profile.
+    // Production Rust always supplies a stable, private chat profile.
+    browser = await chromium.launch(launchOptions);
+    context = await browser.newContext(contextOptions);
+  }
   await context.addInitScript(installEvalHelper, EVAL_HELPER_KEY);
   await context.addInitScript(installScriptBlobCapture, {
     key: SCRIPT_BLOB_KEY, secret: SCRIPT_BLOB_SECRET,
@@ -3125,12 +3244,19 @@ async function main() {
   });
   downloadCdp = await browser.newBrowserCDPSession();
   const { browserContextIds } = await downloadCdp.send('Target.getBrowserContexts');
-  downloadContextId = browserContextIds.length === 1 ? browserContextIds[0] : null;
-  if (!downloadContextId) throw new Error('browser context identity unavailable');
+  if (profileDirectory) {
+    if (browserContextIds.length !== 0 || browser.contexts().length !== 1 || browser.contexts()[0] !== context) {
+      throw new Error('browser context identity unavailable');
+    }
+    downloadContextId = undefined; // This host owns only Chromium's default context.
+  } else {
+    downloadContextId = browserContextIds.length === 1 ? browserContextIds[0] : null;
+    if (!downloadContextId) throw new Error('browser context identity unavailable');
+  }
   downloadCdp.on('Browser.downloadWillBegin', onDownloadWillBegin);
   downloadCdp.on('Browser.downloadProgress', onDownloadProgress);
   await downloadCdp.send('Browser.setDownloadBehavior', {
-    behavior: 'allowAndName', browserContextId: downloadContextId,
+    behavior: 'allowAndName', ...(downloadContextId ? { browserContextId: downloadContextId } : {}),
     downloadPath: downloadDir, eventsEnabled: true,
   });
   await captureTask;
@@ -3140,7 +3266,11 @@ async function main() {
     let request;
     try {
       request = JSON.parse(line);
+      if (profileFailure) throw profileFailure;
       const result = await dispatch(request.action, request.args);
+      // A successful reply is also a persistence boundary. Background response
+      // checkpoints cover cookie refreshes between user/tool commands.
+      await checkpointProfile();
       emit({ id: request.id, ok: true, result });
       if (request.action === 'close') break;
     } catch (error) {

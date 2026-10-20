@@ -1,6 +1,8 @@
 //! Process-owned browser sessions shared by HTTP workbench requests and agent tools.
 //! Each chat session has one isolated Playwright context in a child Node process.
 
+mod profile;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -50,6 +52,7 @@ pub struct BrowserFrame {
 
 #[derive(Clone, Default)]
 pub struct BrowserManager {
+    profile_root: Option<Arc<PathBuf>>,
     sessions: Arc<AsyncMutex<HashMap<String, Arc<BrowserSession>>>>,
     session_gates: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
     retired: Arc<Mutex<HashSet<String>>>,
@@ -58,6 +61,7 @@ pub struct BrowserManager {
 
 struct BrowserSession {
     child: Mutex<Child>,
+    profile_lease: Mutex<Option<profile::Lease>>,
     /// Owns the host's TMPDIR, including Chromium's download scratch files.
     temp_dir: Mutex<Option<tempfile::TempDir>>,
     #[cfg(unix)]
@@ -178,7 +182,7 @@ fn restrict_host_environment(command: &mut Command) {
 }
 
 impl BrowserSession {
-    async fn spawn() -> Result<Arc<Self>, BrowserError> {
+    async fn spawn(profile_lease: Option<profile::Lease>) -> Result<Arc<Self>, BrowserError> {
         let script = host_script();
         if !script.is_file() {
             return Err(BrowserError::Unavailable(format!(
@@ -189,6 +193,9 @@ impl BrowserSession {
         let node = std::env::var_os("BAMBOO_BROWSER_NODE").unwrap_or_else(|| "node".into());
         let mut command = Command::new(node);
         restrict_host_environment(&mut command);
+        if let Some(lease) = &profile_lease {
+            command.env("BAMBOO_BROWSER_PROFILE_DIR", &lease.path);
+        }
         let temp_dir = tempfile::Builder::new()
             .prefix("bamboo-browser-session-")
             .tempdir()
@@ -213,6 +220,7 @@ impl BrowserSession {
             .spawn()
             .map_err(|error| BrowserError::Unavailable(error.to_string()))?;
         let session = Self::from_child(child, Some(temp_dir))?;
+        *session.profile_lease.lock().unwrap() = profile_lease;
         let mut abort_guard = BrowserCallAbortGuard::new(session.clone(), None);
         // The first state request doubles as a readiness probe. A missing
         // Playwright package or Chromium binary fails here, not on first click.
@@ -243,6 +251,7 @@ impl BrowserSession {
         let (shutdown, _) = watch::channel(false);
         let session = Arc::new(Self {
             child: Mutex::new(child),
+            profile_lease: Mutex::new(None),
             temp_dir: Mutex::new(temp_dir),
             #[cfg(unix)]
             process_group,
@@ -421,6 +430,7 @@ impl BrowserSession {
         let _guard = self.termination.lock().await;
         if self.reaped.load(Ordering::Acquire) {
             self.cleanup_temp_dir().await;
+            self.profile_lease.lock().unwrap().take();
             return;
         }
         self.signal_stop();
@@ -444,6 +454,9 @@ impl BrowserSession {
             tracing::warn!("browser host did not exit after process termination");
         }
         self.cleanup_temp_dir().await;
+        if self.reaped.load(Ordering::Acquire) {
+            self.profile_lease.lock().unwrap().take();
+        }
     }
 
     async fn cleanup_temp_dir(&self) {
@@ -1438,6 +1451,15 @@ mod tests {
 }
 
 impl BrowserManager {
+    /// Production supplies a data-directory-owned root. Default managers used
+    /// by isolated protocol tests retain their explicitly ephemeral behavior.
+    pub fn with_profile_root(root: PathBuf) -> Self {
+        Self {
+            profile_root: Some(Arc::new(root)),
+            ..Self::default()
+        }
+    }
+
     /// Start one sweep only after a browser page exists. AppState instances that
     /// never open Chromium do not leave timers behind.
     fn start_idle_cleanup(&self) -> bool {
@@ -1448,6 +1470,7 @@ impl BrowserManager {
         let weak_gates = Arc::downgrade(&self.session_gates);
         let weak_retired = Arc::downgrade(&self.retired);
         let weak_started = Arc::downgrade(&self.cleanup_started);
+        let profile_root = self.profile_root.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(BROWSER_IDLE_SWEEP_INTERVAL).await;
@@ -1460,6 +1483,7 @@ impl BrowserManager {
                     break;
                 };
                 let browser = BrowserManager {
+                    profile_root: profile_root.clone(),
                     sessions,
                     session_gates,
                     retired,
@@ -1521,7 +1545,12 @@ impl BrowserManager {
             session.terminate("browser host unavailable").await;
             self.remove_if_same(session_id, &session).await;
         }
-        let session = BrowserSession::spawn().await?;
+        let profile_lease = self
+            .profile_root
+            .as_ref()
+            .map(|root| profile::acquire(root, session_id))
+            .transpose()?;
+        let session = BrowserSession::spawn(profile_lease).await?;
         let mut abort_guard = BrowserCallAbortGuard::new(
             session.clone(),
             Some((self.clone(), session_id.to_string())),
