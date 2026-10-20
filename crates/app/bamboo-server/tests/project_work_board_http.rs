@@ -68,7 +68,11 @@ async fn review_create_revalidates_inherited_project_and_keeps_exact_replays() {
             ],
         )
         .unwrap();
-    let seeded = state.tickets.update(principal.clone(), &seed).await.unwrap();
+    let seeded = state
+        .tickets
+        .update(principal.clone(), &seed)
+        .await
+        .unwrap();
     let parent = seeded.ids["parent"].clone();
     let chain = service
         .prepare_command(
@@ -86,7 +90,11 @@ async fn review_create_revalidates_inherited_project_and_keeps_exact_replays() {
             ],
         )
         .unwrap();
-    let receipt = state.tickets.update(principal.clone(), &chain).await.unwrap();
+    let receipt = state
+        .tickets
+        .update(principal.clone(), &chain)
+        .await
+        .unwrap();
     let snapshot = service.published().unwrap().1;
     for temp in ["root", "nested", "work", "spare"] {
         assert_eq!(snapshot.project.links[&receipt.ids[temp]], project.id);
@@ -158,7 +166,11 @@ async fn review_create_revalidates_inherited_project_and_keeps_exact_replays() {
         .unwrap();
     let before = service.published().unwrap();
     assert_eq!(
-        state.tickets.update(principal.clone(), &chain).await.unwrap(),
+        state
+            .tickets
+            .update(principal.clone(), &chain)
+            .await
+            .unwrap(),
         receipt
     );
     assert_eq!(service.published().unwrap().0, before.0);
@@ -171,7 +183,9 @@ async fn review_create_revalidates_inherited_project_and_keeps_exact_replays() {
         sprint_receipt
     );
     let mut changed = chain.clone();
-    changed.operations.push(create("changed-retry", TicketKind::Work, None));
+    changed
+        .operations
+        .push(create("changed-retry", TicketKind::Work, None));
     assert!(matches!(
         state.tickets.update(principal.clone(), &changed).await,
         Err(Error::IdempotencyConflict)
@@ -179,7 +193,10 @@ async fn review_create_revalidates_inherited_project_and_keeps_exact_replays() {
     let mut changed_sprint = sprint_create.clone();
     changed_sprint.source = "different retry input".into();
     assert!(matches!(
-        state.tickets.sprint_command(principal.clone(), &changed_sprint).await,
+        state
+            .tickets
+            .sprint_command(principal.clone(), &changed_sprint)
+            .await,
         Err(Error::IdempotencyConflict)
     ));
     assert_eq!(service.published().unwrap().0, before.0);
@@ -276,7 +293,10 @@ async fn review_create_revalidates_inherited_project_and_keeps_exact_replays() {
     .enumerate()
     {
         let command = sprint_command(&format!("archived-sprint-{index}"), id, action);
-        let result = state.tickets.sprint_command(principal.clone(), &command).await;
+        let result = state
+            .tickets
+            .sprint_command(principal.clone(), &command)
+            .await;
         assert!(
             matches!(&result, Err(Error::InvalidTransition(reason)) if reason.contains("archived")),
             "new Sprint mutations must revalidate the active Project: {result:?}"
