@@ -4,7 +4,10 @@ use bamboo_server::AppState;
 #[actix_web::test]
 async fn review_create_revalidates_inherited_project_and_keeps_exact_replays() {
     use bamboo_tickets::*;
-    use std::{collections::BTreeSet, sync::Arc};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        sync::Arc,
+    };
 
     fn create(temp_id: &str, kind: TicketKind, parent: Option<String>) -> Operation {
         Operation::Create {
@@ -79,13 +82,75 @@ async fn review_create_revalidates_inherited_project_and_keeps_exact_replays() {
                 },
                 create("nested", TicketKind::Goal, Some("root".into())),
                 create("work", TicketKind::Work, Some("nested".into())),
+                create("spare", TicketKind::Work, Some("root".into())),
             ],
         )
         .unwrap();
     let receipt = state.tickets.update(principal.clone(), &chain).await.unwrap();
     let snapshot = service.published().unwrap().1;
-    for temp in ["root", "nested", "work"] {
+    for temp in ["root", "nested", "work", "spare"] {
         assert_eq!(snapshot.project.links[&receipt.ids[temp]], project.id);
+    }
+    let definition = |name: &str| SprintDefinition {
+        name: name.into(),
+        goal: "Synthetic archive contract".into(),
+        starts_at: None,
+        ends_at: None,
+    };
+    let sprint_command = |operation_id: &str, id: &str, action| {
+        let snapshot = service.published().unwrap().1;
+        SprintCommand {
+            operation_id: operation_id.into(),
+            binding: snapshot.binding,
+            expected_seq: snapshot.seq,
+            expected_epoch: snapshot.authority_epoch,
+            project_id: project.id.clone(),
+            sprint_id: SprintId::parse(id).unwrap(),
+            source: "typed Host owner archive contract".into(),
+            action,
+        }
+    };
+    let sprint_create = sprint_command(
+        "create-first-sprint",
+        "one",
+        SprintAction::Create {
+            definition: definition("one"),
+        },
+    );
+    let sprint_receipt = state
+        .tickets
+        .sprint_command(principal.clone(), &sprint_create)
+        .await
+        .unwrap();
+    for (operation_id, id, action) in [
+        (
+            "create-second-sprint",
+            "two",
+            SprintAction::Create {
+                definition: definition("two"),
+            },
+        ),
+        (
+            "add-before-archive",
+            "one",
+            SprintAction::Add {
+                expected_revision: 1,
+                work_id: receipt.ids["work"].clone(),
+            },
+        ),
+        (
+            "start-before-archive",
+            "one",
+            SprintAction::Start {
+                expected_revision: 2,
+            },
+        ),
+    ] {
+        state
+            .tickets
+            .sprint_command(principal.clone(), &sprint_command(operation_id, id, action))
+            .await
+            .unwrap();
     }
     state
         .project_store
@@ -97,8 +162,39 @@ async fn review_create_revalidates_inherited_project_and_keeps_exact_replays() {
         receipt
     );
     assert_eq!(service.published().unwrap().0, before.0);
+    assert_eq!(
+        state
+            .tickets
+            .sprint_command(principal.clone(), &sprint_create)
+            .await
+            .unwrap(),
+        sprint_receipt
+    );
+    let mut changed = chain.clone();
+    changed.operations.push(create("changed-retry", TicketKind::Work, None));
+    assert!(matches!(
+        state.tickets.update(principal.clone(), &changed).await,
+        Err(Error::IdempotencyConflict)
+    ));
+    let mut changed_sprint = sprint_create.clone();
+    changed_sprint.source = "different retry input".into();
+    assert!(matches!(
+        state.tickets.sprint_command(principal.clone(), &changed_sprint).await,
+        Err(Error::IdempotencyConflict)
+    ));
+    assert_eq!(service.published().unwrap().0, before.0);
 
     for (operation_id, operations) in [
+        (
+            "archived-explicit-project",
+            vec![
+                create("child", TicketKind::Work, None),
+                Operation::AssociateProject {
+                    ticket_id: "child".into(),
+                    project_id: project.id.clone(),
+                },
+            ],
+        ),
         (
             "archived-existing-parent",
             vec![create("child", TicketKind::Work, Some(parent.clone()))],
@@ -122,6 +218,68 @@ async fn review_create_revalidates_inherited_project_and_keeps_exact_replays() {
         assert!(
             matches!(&result, Err(Error::InvalidTransition(reason)) if reason.contains("archived")),
             "Create must revalidate inherited Project membership before publication: {result:?}"
+        );
+        let after = service.published().unwrap();
+        assert_eq!(after.0, before.0);
+        assert_eq!(
+            canonical_bytes(&after.1).unwrap(),
+            canonical_bytes(&before.1).unwrap()
+        );
+    }
+    for (index, (id, action)) in [
+        (
+            "new",
+            SprintAction::Create {
+                definition: definition("new"),
+            },
+        ),
+        (
+            "one",
+            SprintAction::Edit {
+                expected_revision: 3,
+                definition: definition("edited"),
+            },
+        ),
+        (
+            "two",
+            SprintAction::Start {
+                expected_revision: 1,
+            },
+        ),
+        (
+            "one",
+            SprintAction::Add {
+                expected_revision: 3,
+                work_id: receipt.ids["spare"].clone(),
+            },
+        ),
+        (
+            "one",
+            SprintAction::Remove {
+                expected_revision: 3,
+                work_id: receipt.ids["work"].clone(),
+            },
+        ),
+        (
+            "one",
+            SprintAction::Close {
+                expected_revision: 3,
+                dispositions: BTreeMap::from([(
+                    receipt.ids["work"].clone(),
+                    SprintDestination::Backlog,
+                )]),
+                target_revisions: BTreeMap::new(),
+            },
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let command = sprint_command(&format!("archived-sprint-{index}"), id, action);
+        let result = state.tickets.sprint_command(principal.clone(), &command).await;
+        assert!(
+            matches!(&result, Err(Error::InvalidTransition(reason)) if reason.contains("archived")),
+            "new Sprint mutations must revalidate the active Project: {result:?}"
         );
         let after = service.published().unwrap();
         assert_eq!(after.0, before.0);
