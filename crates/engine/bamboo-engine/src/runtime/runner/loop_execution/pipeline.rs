@@ -1222,10 +1222,14 @@ async fn maybe_suspend_for_orphaned_children(
         crate::session_app::child_completion_coordinator::session_resume_lock(&session.id);
     let _parent_guard = parent_lock.lock().await;
 
+    // An unreadable index is not proof that this parent has no active children.
+    // Fail before changing an inherited wait or publishing terminal completion.
     let mut active: Vec<String> = storage
         .list_child_run_statuses(&session.id)
         .await
-        .unwrap_or_default()
+        .map_err(|_| {
+            AgentError::Tool("child status observation failed; refusing to complete parent".into())
+        })?
         .into_iter()
         .filter(|(_, status)| !status.as_deref().is_some_and(is_terminal_child_status))
         .map(|(id, _)| id)
@@ -11248,6 +11252,8 @@ mod tests {
             ..AgentLoopConfig::default()
         }
     }
+
+    include!("child_index_observation_tests.rs");
 
     #[tokio::test]
     async fn safety_net_suspends_on_orphaned_active_children() {
