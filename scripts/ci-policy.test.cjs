@@ -1161,6 +1161,53 @@ const actorWindowsPaths = [...actorWindowsPathBlock.matchAll(/^      - '([^']+)'
 const needsActorWindows = (files) => files.some((file) =>
   actorWindowsPaths.some((pattern) => path.posix.matchesGlob(file, pattern)))
 
+test("Supervisor driver self-tests cover dev, full validation and release platforms", () => {
+  const name = "Test Supervisor driver and owned loopback process binding"
+  const command = "node --test scripts/supervisor-native-acceptance.test.cjs"
+  const step = (source) => {
+    const block = actorWindowsStep(source, name)
+    assert.equal(block.match(/^        run: (.+)$/mu)?.[1], command)
+    assert.doesNotMatch(block, /continue-on-error:|\|\|\s*(?:true|exit 0)|--test-(?:name|skip)-pattern/u)
+    return { block, condition: block.match(/^        if: (.+)$/mu)?.[1] ?? "true" }
+  }
+  const verify = (quick, full, platform) => {
+    const fast = step(quick), comprehensive = step(full), native = step(platform)
+    const quickIf = quick.match(/^    if: (.+)$/mu)?.[1]
+    const platformIf = platform.match(/^    if: >-\n([\s\S]*?)(?=\n    [a-z])/u)?.[1].trim().replace(/\s*\n\s*/gu, " ")
+    assert.ok(quickIf && platformIf)
+    const evaluate = (expression, github, full, os = "Linux") => runInNewContext(
+      expression.replaceAll("needs.validation-source.outputs.full", "full"),
+      { github, full, runner: { os }, startsWith: (value, prefix) => value.startsWith(prefix) },
+    )
+    for (const [event, base, head, fullValue, expected] of [
+      ["pull_request", "dev", "feature/driver", "false", [true, false, false, false]],
+      ["pull_request", "main", "release/" + "a".repeat(40), "true", [false, true, true, true]],
+      ["workflow_dispatch", "", "", "true", [false, true, true, true]],
+      ["push", "", "", "true", [false, true, false, false]],
+    ]) {
+      const github = { event_name: event, base_ref: base, head_ref: head, repository: "bigduu/Bamboo-agent",
+        event: { pull_request: { head: { repo: { full_name: "bigduu/Bamboo-agent" } } } } }
+      const matrix = evaluate(platformIf, github, fullValue)
+      const actual = [
+        evaluate(quickIf, github, fullValue) && evaluate(fast.condition, github, fullValue),
+        evaluate(comprehensive.condition, github, fullValue),
+        matrix && evaluate(native.condition, github, fullValue, "macOS"),
+        matrix && evaluate(native.condition, github, fullValue, "Windows"),
+      ]
+      assert.deepEqual(actual, expected, event + ":" + base)
+      assert.equal(evaluate(native.condition, github, fullValue, "Linux"), false,
+        "the full Test job already runs the Linux suite")
+    }
+  }
+  const quick = job("quick-checks"), full = job("test"), platform = job("build")
+  verify(quick, full, platform)
+  assert.throws(() => verify(quick, full.replace(name, "Removed driver coverage"), platform))
+  const native = step(platform).block
+  assert.throws(() => verify(quick, full, platform.replace(native,
+    native.replace("runner.os != 'Linux'", "runner.os == 'Linux'"))))
+  assert.throws(() => verify(quick, full.replace(command, "true"), platform))
+})
+
 test("native Windows paths retain native sources while policy and release edits stay fast", () => {
   assert.match(actorWindowsWorkflow, /on:\n  workflow_dispatch:\n  pull_request:\n    branches: \[dev, main\]\n    paths:\n/u)
   assert.match(job("quick-checks"), /run: node --test scripts\/ci-policy\.test\.cjs(?: |\n)/u)
