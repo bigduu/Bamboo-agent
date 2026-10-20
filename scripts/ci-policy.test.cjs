@@ -1173,7 +1173,7 @@ test("Supervisor driver self-tests cover dev, full validation and release platfo
   const verify = (quick, full, platform) => {
     const fast = step(quick), comprehensive = step(full), native = step(platform)
     const quickIf = quick.match(/^    if: (.+)$/mu)?.[1]
-    const platformIf = platform.match(/^    if: >-\n([\s\S]*?)(?=\n    [a-z])/u)?.[1].trim().replace(/\s*\n\s*/gu, " ")
+    const platformIf = platform.match(/^    if: >-\n([\s\S]*?)(?=\n    [a-z])/mu)?.[1].trim().replace(/\s*\n\s*/gu, " ")
     assert.ok(quickIf && platformIf)
     const evaluate = (expression, github, full, os = "Linux") => runInNewContext(
       expression.replaceAll("needs.validation-source.outputs.full", "full"),
