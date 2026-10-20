@@ -473,6 +473,7 @@ impl TicketService {
             return Err(Error::ResyncRequired);
         }
         let refs = visible(authority, &snapshot)?;
+        let include_sprints = authority.supervisor().is_ok();
         let mut next = Some(commit.clone());
         let mut changes = Vec::new();
         let mut scanned = 0;
@@ -497,6 +498,20 @@ impl TicketService {
                     entity: "ticket".into(),
                     id: ticket.id.clone(),
                 });
+            }
+            if include_sprints {
+                for sprint in state
+                    .sprint
+                    .sprints
+                    .values()
+                    .filter(|s| s.updated_seq == state.seq)
+                {
+                    changes.push(WorkChange {
+                        seq: state.seq,
+                        entity: "sprint".into(),
+                        id: sprint.id.as_str().into(),
+                    });
+                }
             }
             for a in state.assignments.values().filter(|a| {
                 refs.contains(&a.work_id)

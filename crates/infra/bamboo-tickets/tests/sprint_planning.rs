@@ -1264,3 +1264,186 @@ fn legacy_snapshot_omits_planning_and_schema_downgrade_quarantines_existing_hist
         1
     );
 }
+
+#[test]
+fn review_sprint_only_changes_are_commit_consistent_and_visible_once() {
+    fn commit(f: &Fixture, request: &SprintCommand, ids: &[&str]) -> Vec<(u64, String)> {
+        let before = f.service.published().unwrap();
+        let receipt = f.service.execute_sprint(&owner(), request).unwrap();
+        let after = f.service.published().unwrap();
+        assert_eq!(after.1.seq, before.1.seq + 1);
+        assert_eq!(receipt.operation.committed_seq, after.1.seq);
+        unchanged_execution(&before.1, &after.1);
+        let changes = f
+            .service
+            .work_changes(&owner(), before.1.seq, 100, None)
+            .unwrap();
+        assert_eq!(changes.snapshot.commit, after.0);
+        let mut expected: Vec<_> = ids
+            .iter()
+            .map(|id| (after.1.seq, "sprint".to_string(), id.to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            changes
+                .data
+                .iter()
+                .map(|c| (c.seq, c.entity.clone(), c.id.clone()))
+                .collect::<Vec<_>>(),
+            expected,
+            "each committed Sprint update needs exactly one change marker"
+        );
+        assert_eq!(
+            f.service.execute_sprint(&owner(), request).unwrap(),
+            receipt
+        );
+        assert_eq!(f.service.published().unwrap().0, after.0);
+        assert_eq!(
+            canonical_bytes(
+                &f.service
+                    .work_changes(&owner(), before.1.seq, 100, None)
+                    .unwrap()
+                    .data
+            )
+            .unwrap(),
+            canonical_bytes(&changes.data).unwrap(),
+            "an exact replay cannot publish another change"
+        );
+        expected.into_iter().map(|(seq, _, id)| (seq, id)).collect()
+    }
+
+    let f = Fixture::new();
+    let (_, worker) = f.running(&f.seed);
+    let origin = f.service.published().unwrap();
+    let create = command(
+        &f.service,
+        "one",
+        SprintAction::Create {
+            definition: definition("one"),
+        },
+    );
+    f.service.set_publication_fault(Some(Arc::new(|point| {
+        if point == FaultPoint::BeforeHeadRename {
+            Err(std::io::Error::other("Sprint change publication rejected"))
+        } else {
+            Ok(())
+        }
+    })));
+    assert!(f.service.execute_sprint(&owner(), &create).is_err());
+    assert_eq!(f.service.published().unwrap().0, origin.0);
+    assert!(f
+        .service
+        .work_changes(&owner(), origin.1.seq, 100, None)
+        .unwrap()
+        .data
+        .is_empty());
+    f.service.set_publication_fault(None);
+    let mut expected = commit(&f, &create, &["one"]);
+    expected.extend(commit(
+        &f,
+        &command(
+            &f.service,
+            "two",
+            SprintAction::Create {
+                definition: definition("two"),
+            },
+        ),
+        &["two"],
+    ));
+    for action in [
+        SprintAction::Edit {
+            expected_revision: 1,
+            definition: definition("revised"),
+        },
+        SprintAction::Add {
+            expected_revision: 2,
+            work_id: f.seed.clone(),
+        },
+        SprintAction::Remove {
+            expected_revision: 3,
+            work_id: f.seed.clone(),
+        },
+        SprintAction::Add {
+            expected_revision: 4,
+            work_id: f.seed.clone(),
+        },
+        SprintAction::Start {
+            expected_revision: 5,
+        },
+    ] {
+        expected.extend(commit(&f, &command(&f.service, "one", action), &["one"]));
+    }
+    let close = close_command(
+        &f.service,
+        "one",
+        BTreeMap::from([(
+            f.seed.clone(),
+            SprintDestination::Sprint {
+                sprint_id: sprint_id("two"),
+            },
+        )]),
+    );
+    expected.extend(commit(&f, &close, &["one", "two"]));
+    let all = f
+        .service
+        .work_changes(&owner(), origin.1.seq, 100, None)
+        .unwrap();
+    assert_eq!(
+        all.data
+            .iter()
+            .map(|c| (c.seq, c.id.clone()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let supervisor = Authority::from_verified_host(
+        binding(),
+        Principal::Supervisor {
+            session_id: binding().supervisor_session_id,
+        },
+    );
+    assert_eq!(
+        canonical_bytes(
+            &f.service
+                .work_changes(&supervisor, origin.1.seq, 100, None)
+                .unwrap()
+                .data
+        )
+        .unwrap(),
+        canonical_bytes(&all.data).unwrap()
+    );
+    for restricted in [worker, runtime()] {
+        assert!(f
+            .service
+            .work_changes(&restricted, origin.1.seq, 100, None)
+            .unwrap()
+            .data
+            .is_empty());
+    }
+    let first = f
+        .service
+        .work_changes(&owner(), origin.1.seq, 1, None)
+        .unwrap();
+    let mut paged = first.data;
+    let mut cursor = first.next_cursor;
+    f.sprint("later");
+    while let Some(next) = cursor {
+        let page = f
+            .service
+            .work_changes(&owner(), origin.1.seq, 1, Some(&next))
+            .unwrap();
+        assert_eq!(page.snapshot.commit, all.snapshot.commit);
+        paged.extend(page.data);
+        cursor = page.next_cursor;
+    }
+    assert_eq!(
+        canonical_bytes(&paged).unwrap(),
+        canonical_bytes(&all.data).unwrap()
+    );
+    let later = f
+        .service
+        .work_changes(&owner(), all.snapshot.seq, 100, None)
+        .unwrap();
+    assert_eq!(later.data.len(), 1);
+    assert_eq!(later.data[0].entity, "sprint");
+    assert_eq!(later.data[0].id, "later");
+}

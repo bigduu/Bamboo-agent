@@ -133,6 +133,9 @@ async fn owner_http_planning_is_cas_idempotent_and_never_changes_work_or_dispatc
     let response = post!(app, "/api/v1/tickets/sprints/command", &create);
     assert_eq!(response.status(), StatusCode::OK);
     let receipt: Value = test::read_body_json(response).await;
+    let mut expected_changes = vec![json!({
+        "seq":receipt["operation"]["committed_seq"],"entity":"sprint","id":"a"
+    })];
     let replay = post!(app, "/api/v1/tickets/sprints/command", &create);
     assert_eq!(replay.status(), StatusCode::OK);
     assert_eq!(test::read_body_json::<Value, _>(replay).await, receipt);
@@ -164,6 +167,9 @@ async fn owner_http_planning_is_cas_idempotent_and_never_changes_work_or_dispatc
             post!(app, "/api/v1/tickets/sprints/command", &command).status(),
             StatusCode::OK
         );
+        expected_changes.push(json!({
+            "seq":command["expected_seq"].as_u64().unwrap()+1,"entity":"sprint","id":"a"
+        }));
     }
     let list = post!(
         app,
@@ -199,6 +205,9 @@ async fn owner_http_planning_is_cas_idempotent_and_never_changes_work_or_dispatc
     let response = post!(app, "/api/v1/tickets/sprints/command", &close);
     assert_eq!(response.status(), StatusCode::OK);
     let closed: Value = test::read_body_json(response).await;
+    expected_changes.push(json!({
+        "seq":closed["operation"]["committed_seq"],"entity":"sprint","id":"a"
+    }));
     assert_eq!(closed["closure"]["counts"]["unfinished"], 1);
     assert_eq!(closed["closure"]["counts"]["accepted"], 0);
     let inspect = post!(
@@ -226,6 +235,9 @@ async fn owner_http_planning_is_cas_idempotent_and_never_changes_work_or_dispatc
         post!(app, "/api/v1/tickets/sprints/command", &create_b).status(),
         StatusCode::OK
     );
+    expected_changes.push(json!({
+        "seq":create_b["expected_seq"].as_u64().unwrap()+1,"entity":"sprint","id":"b"
+    }));
     let replay = post!(app, "/api/v1/tickets/sprints/command", &close);
     assert_eq!(replay.status(), StatusCode::OK);
     assert_eq!(test::read_body_json::<Value, _>(replay).await, closed);
@@ -242,6 +254,15 @@ async fn owner_http_planning_is_cas_idempotent_and_never_changes_work_or_dispatc
     assert!(after.assignments.is_empty());
     assert!(after.intents.is_empty());
     assert!(after.submissions.is_empty());
+    let changes = post!(
+        app,
+        "/api/v1/tickets/changes",
+        json!({"since_seq":before.seq,"limit":100})
+    );
+    assert_eq!(changes.status(), StatusCode::OK);
+    let changes: Value = test::read_body_json(changes).await;
+    assert_eq!(changes["snapshot"]["seq"], after.seq);
+    assert_eq!(changes["data"], json!(expected_changes));
 }
 
 #[actix_web::test]
