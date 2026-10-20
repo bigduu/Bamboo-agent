@@ -885,6 +885,10 @@ mod tests {
         let (shutdown, _) = watch::channel(!alive);
         Arc::new(BrowserSession {
             child: Arc::new(Mutex::new(child)),
+            cleanup: Arc::new(BrowserCleanup {
+                session: Mutex::new(Weak::new()),
+                done: watch::channel(false).0,
+            }),
             profile_lease: Mutex::new(None),
             temp_dir: Mutex::new(None),
             process_group,
