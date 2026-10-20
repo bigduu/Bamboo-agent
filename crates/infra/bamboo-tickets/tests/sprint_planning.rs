@@ -1282,7 +1282,10 @@ fn review_sprint_only_changes_are_commit_consistent_and_visible_once() {
             expected,
             "each committed Sprint update needs exactly one change marker"
         );
-        assert_eq!(f.service.execute_sprint(&owner(), request).unwrap(), receipt);
+        assert_eq!(
+            f.service.execute_sprint(&owner(), request).unwrap(),
+            receipt
+        );
         assert_eq!(f.service.published().unwrap().0, after.0);
         assert_eq!(
             canonical_bytes(
