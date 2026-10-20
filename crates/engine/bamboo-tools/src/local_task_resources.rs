@@ -713,6 +713,13 @@ async fn drain_group(pid: u32) -> io::Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
+// Only an individual proc stat observation may disappear this way. Other
+// errors and every other cleanup phase must still fail closed.
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn proc_stat_task_vanished(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+}
+
 #[cfg(unix)]
 fn group_has_running_members(pid: u32) -> io::Result<bool> {
     #[cfg(target_os = "linux")]
@@ -726,7 +733,7 @@ fn group_has_running_members(pid: u32) -> io::Result<bool> {
             }
             let stat = match std::fs::read_to_string(entry.path().join("stat")) {
                 Ok(stat) => stat,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if proc_stat_task_vanished(&error) => continue,
                 Err(error) => return Err(error),
             };
             let Some((_, tail)) = stat.rsplit_once(')') else {
@@ -926,6 +933,46 @@ mod tests {
         drop(relay);
         scope.close_and_drain().await.unwrap();
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_task_resources_proc_stat_disappearance_is_narrow() {
+        for code in [libc::ENOENT, libc::ESRCH] {
+            assert!(
+                proc_stat_task_vanished(&io::Error::from_raw_os_error(code)),
+                "a vanished proc entry must not poison cleanup: errno {code}"
+            );
+        }
+        for code in [libc::EACCES, libc::EPERM, libc::EIO, libc::EINTR] {
+            assert!(
+                !proc_stat_task_vanished(&io::Error::from_raw_os_error(code)),
+                "non-disappearance errors must remain failures: errno {code}"
+            );
+        }
+        assert!(!proc_stat_task_vanished(&io::Error::other("unconfirmed")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_task_resources_proc_stat_held_fd_reports_vanished_task() {
+        use std::io::Read;
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        // Open while the owned child still exists, then deterministically
+        // reap it before read: proc_single_show returns ESRCH, not ENOENT.
+        let file = std::fs::File::open(format!("/proc/{}/stat", child.id()));
+        let killed = child.kill();
+        let waited = child.wait();
+        killed.unwrap();
+        waited.unwrap();
+        let mut stat = String::new();
+        let error = file.unwrap().read_to_string(&mut stat).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        assert!(proc_stat_task_vanished(&error));
     }
 
     #[cfg(unix)]
