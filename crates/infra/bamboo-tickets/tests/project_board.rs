@@ -266,7 +266,9 @@ fn review_context_adoption_rechecks_existing_answers_before_publication() {
         let started = f.exec(
             "context-after-answer-start",
             vec![
-                Operation::Ready { work_id: work.clone() },
+                Operation::Ready {
+                    work_id: work.clone(),
+                },
                 Operation::Start {
                     work_id: work,
                     temp_id: "assignment".into(),
@@ -274,11 +276,14 @@ fn review_context_adoption_rechecks_existing_answers_before_publication() {
                 },
             ],
         );
-        let packet = f.service.child_context_packet(
-            &f.authority,
-            &started.ids["assignment"],
-            WORK_CONTEXT_BYTES_LIMIT,
-        ).unwrap();
+        let packet = f
+            .service
+            .child_context_packet(
+                &f.authority,
+                &started.ids["assignment"],
+                WORK_CONTEXT_BYTES_LIMIT,
+            )
+            .unwrap();
         assert_eq!(packet.project_context, Some(bounded));
         assert_eq!(packet.answers.len(), 1);
         assert_eq!(packet.answers[0].answer.len(), 56000);
