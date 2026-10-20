@@ -252,6 +252,54 @@ fn explicit_membership_cas_replay_and_legacy_compatibility() {
 }
 
 #[test]
+fn review_initial_candidate_context_is_pending_until_first_start() {
+    let f = Fixture::new();
+    let work = f.create("initial-context", true);
+    let board = f.board(10, None);
+    assert!(board.data.rows[0].context.is_none());
+    assert!(board.data.rows[0].adopted_context.is_none());
+    assert!(board.data.rows[0].pending_context.is_none());
+
+    let context = f.context(&work);
+    f.exec(
+        "initial-candidate",
+        vec![Operation::SetProjectContext {
+            work_id: work.clone(),
+            context: context.clone(),
+        }],
+    );
+    let before_read = f.service.published().unwrap();
+    let board = f.board(10, None);
+    let row = &board.data.rows[0];
+    assert_eq!(row.context.as_ref(), Some(&context));
+    assert!(row.adopted_context.is_none());
+    assert_eq!(
+        row.pending_context.as_ref(),
+        Some(&context),
+        "a candidate without any actual adoption must be pending"
+    );
+    assert_eq!(f.service.published().unwrap().0, before_read.0);
+    assert!(before_read.1.assignments.is_empty());
+
+    f.exec(
+        "first-start",
+        vec![
+            Operation::Ready {
+                work_id: work.clone(),
+            },
+            Operation::Start {
+                work_id: work,
+                temp_id: "a".into(),
+                workspace: Some(f.execution()),
+            },
+        ],
+    );
+    let board = f.board(10, None);
+    assert_eq!(board.data.rows[0].adopted_context.as_ref(), Some(&context));
+    assert!(board.data.rows[0].pending_context.is_none());
+}
+
+#[test]
 fn linked_goals_inherit_membership_and_cross_project_edges_are_atomic_errors() {
     let f = Fixture::new();
     let r = f.exec(

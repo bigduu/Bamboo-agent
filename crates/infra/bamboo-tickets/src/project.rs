@@ -451,7 +451,7 @@ impl TicketService {
                     .and_then(|h| snapshot.project.contexts.get(h))
                     .cloned(),
                 pending_context: candidate_hash
-                    .filter(|hash| adopted_hash.is_some_and(|adopted| adopted != *hash))
+                    .filter(|hash| adopted_hash != Some(*hash))
                     .and_then(|h| snapshot.project.contexts.get(h))
                     .cloned(),
             });
