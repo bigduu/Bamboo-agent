@@ -21,14 +21,7 @@ impl TicketApplication {
             .receipts
             .contains_key(&command.operation_id)
         {
-            let store = bamboo_projects::ProjectStore::open(self.root.clone())
-                .map_err(|e| Error::AuthorityUnavailable(e.to_string()))?;
-            let project = store
-                .get(&command.project_id)
-                .map_err(|e| Error::InvalidTransition(e.to_string()))?;
-            if project.status != bamboo_domain::ProjectStatus::Active {
-                return Err(Error::InvalidTransition("Project is archived".into()));
-            }
+            self.validate_project_context(&command.project_id, None, false)?;
         }
         service.execute_sprint(&authority, command)
     }

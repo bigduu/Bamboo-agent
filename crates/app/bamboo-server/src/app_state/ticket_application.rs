@@ -400,9 +400,31 @@ impl TicketApplication {
         if snapshot.receipts.contains_key(&command.operation_id) {
             return Ok(());
         }
+        let mut links = snapshot.project.links.clone();
         for op in &command.operations {
             let (project_id, context, adopting) = match op {
-                Operation::AssociateProject { project_id, .. } => (project_id, None, false),
+                Operation::Create {
+                    temp_id, parent, ..
+                } => {
+                    // Allocation shadows earlier spellings, including canonical IDs.
+                    links.remove(temp_id);
+                    if let Some(project_id) = parent
+                        .as_ref()
+                        .and_then(|parent| links.get(parent))
+                        .cloned()
+                    {
+                        self.validate_project_context(&project_id, None, false)?;
+                        links.insert(temp_id.clone(), project_id);
+                    }
+                    continue;
+                }
+                Operation::AssociateProject {
+                    ticket_id,
+                    project_id,
+                } => {
+                    links.insert(ticket_id.clone(), project_id.clone());
+                    (project_id, None, false)
+                }
                 Operation::SetProjectContext { context, .. } => {
                     (&context.project_id, Some(context), true)
                 }
