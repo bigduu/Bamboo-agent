@@ -387,6 +387,18 @@ receipt changes, each crate publish attempt, release completion and each native
 asset upload. API failures stop the write. Manual and historical recovery entry
 contracts, signing authority and allocator remain unchanged.
 
+If GitHub returns an explicitly empty PR association for that release CI run
+after merge, the bootstrap additionally authenticates its GitHub Actions check
+suite, executed workflow file, exact run/attempt and source job. Only the pinned,
+reviewed checkout-free CI producer may supply one historical validation snapshot
+record. That snapshot must preserve the exact ordered base/head parents and the
+reviewed release/main tree. The source job is bound to its original attempt;
+later partial reruns do not relabel it. Missing, conflicting, duplicated or
+unknown producer evidence rejects publication. A nonempty conflicting association
+cannot use this route. This exception does not authorize ordinary test logs,
+artifacts, comments or local receipts as publication proof. Updating the pinned
+producer requires normal code/security review and regression coverage.
+
 An authenticated draft body reserves source, frontend and version before any
 crate upload. Original frontend assets and each package checksum are preserved
 for recovery. Every downloaded crate must match its reserved checksum, Git source
