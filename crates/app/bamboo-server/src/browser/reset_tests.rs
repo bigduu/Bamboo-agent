@@ -383,19 +383,23 @@ async fn partial_reset_preserves_a_still_canonical_root_and_its_runtime_state() 
         .join("sessions")
         .join(&session.id)
         .join("children");
-    assert!(!children.exists());
+    // Root persistence already creates this empty container. Replace only
+    // that private empty fixture directory, never a real Child tree.
+    std::fs::remove_dir(&children).unwrap();
     std::fs::write(&children, b"synthetic census obstruction").unwrap();
     let failed = crate::handlers::agent::dev::reset(state.clone())
         .await
         .is_err();
+    let retained =
+        profile.join("Default/Cookies").is_file() && state.sessions.contains_key(&session.id);
+    // The obstruction intentionally makes canonical observation uncertain.
+    // Restore it before independently checking the unchanged live Root.
+    std::fs::remove_file(&children).unwrap();
     let canonical = !state
         .session_store
         .session_is_canonically_absent(&session.id)
         .await
         .unwrap();
-    let retained =
-        profile.join("Default/Cookies").is_file() && state.sessions.contains_key(&session.id);
-    std::fs::remove_file(children).unwrap();
     state.shutdown().await;
     assert!(
         failed && canonical && retained,

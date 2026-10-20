@@ -62,7 +62,11 @@ time.sleep(0.4)
         ])
         .env(FIXTURE, &data)
         .env(MODE, mode)
-        .env("BAMBOO_BROWSER_NODE", "/usr/bin/python3")
+        .env(
+            "BAMBOO_BROWSER_NODE",
+            std::env::var_os("BAMBOO_BROWSER_TEST_PYTHON")
+                .unwrap_or_else(|| "/usr/bin/python3".into()),
+        )
         .env("BAMBOO_BROWSER_HOST_SCRIPT", script)
         // A pipe reader would also wait for a descendant retaining stderr,
         // concealing an executable that exits before its browser host does.
