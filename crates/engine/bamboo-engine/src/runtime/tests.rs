@@ -1401,7 +1401,10 @@ async fn direct_execute_persists_partial_stream_error_without_false_completion_o
         )
         .await
         .expect_err("stream must fail");
-    assert!(matches!(error, bamboo_agent_core::AgentError::LLM(_)));
+    assert!(matches!(
+        error,
+        bamboo_agent_core::AgentError::LLMNonRetryable(_)
+    ));
 
     let saved = storage
         .load_session(&session.id)
@@ -1513,7 +1516,7 @@ async fn direct_execute_mid_loop_error_persists_tool_round_and_interrupted_next_
         .expect_err("second round must fail");
     assert!(matches!(
         error,
-        bamboo_agent_core::AgentError::LLM(message)
+        bamboo_agent_core::AgentError::LLMNonRetryable(message)
             if message.contains("terminal second-round failure")
     ));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
@@ -1714,3 +1717,6 @@ async fn execution_input_real_direct_and_registered_wrappers_keep_explicit_data_
         "unwired transport neither appends nor publishes the explicit data"
     );
 }
+
+#[path = "tests/connector_retry.rs"]
+mod connector_retry;

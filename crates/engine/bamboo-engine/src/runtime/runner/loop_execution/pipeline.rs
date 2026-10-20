@@ -13391,8 +13391,8 @@ mod tests {
         .expect("run_pipeline did not return within 5s");
 
         assert!(
-            matches!(result, Err(AgentError::LLM(_))),
-            "the injected terminal error must surface as Err(LLM), got {result:?}"
+            matches!(result, Err(AgentError::LLMNonRetryable(_))),
+            "the injected authentication error must remain terminal, got {result:?}"
         );
         assert!(
             !cancel.is_cancelled(),
