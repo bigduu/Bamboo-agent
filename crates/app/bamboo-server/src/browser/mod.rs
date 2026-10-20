@@ -6,6 +6,8 @@ mod persistence_tests;
 mod profile;
 #[cfg(test)]
 mod retirement_tests;
+#[cfg(all(test, unix))]
+mod shutdown_tests;
 
 #[cfg(test)]
 pub(crate) fn test_profile_directory(root: &std::path::Path, session_id: &str) -> PathBuf {
