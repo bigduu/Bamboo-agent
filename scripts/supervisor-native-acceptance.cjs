@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 
-// Dependency-free, fixture-only acceptance driver. Native execution requires
+// No npm packages; fixture-only acceptance driver. Native execution requires
 // a producer receipt for the exact audited Host; --preflight never sends HTTP.
 // Framework self-tests are not native Bamboo acceptance.
 
@@ -20,7 +20,7 @@ const SOURCE = '3682cf35171316d3b281ea49b90dd722a32488cb';
 const TREE = '5e8cd3c84fa6fb2dae42868ebcaa5bf181319cf9';
 const LIMIT = 1024 * 1024;
 const SUPERVISOR = 'bamboo-default-supervisor';
-const HELP = `Fixture-only v2 Supervisor acceptance (Node 22+, no dependencies)
+const HELP = `Fixture-only v2 Supervisor acceptance (Node 22+, no npm packages)
   node scripts/supervisor-native-acceptance.cjs preflight [--receipt FILE]
   node scripts/supervisor-native-acceptance.cjs run --receipt FILE
   node --test scripts/supervisor-native-acceptance.test.cjs
@@ -44,6 +44,9 @@ Receipt schema bamboo.v2-native-fixture.v1:
 Each Host must already use its case's provider_port at /v1/chat/completions,
 have a fresh v2 Supervisor and ordinary Ultra Root, an explicit existing bound
 Project/workspace and its normal permissions. No auth/cookie/proof is accepted.
+Native process binding requires ps, plus macOS's system lsof or readable Linux
+procfs. Only an exact literal loopback listener is accepted, never a wildcard
+or a listener in another IP family/network namespace. Linux does not use lsof.
 The receipt is operator/build provenance, not authentication or a model grant.
 Use an independently audited producer handoff. A matching file hash alone does
 not prove how it was compiled; never edit an old build's source fields to fit.
@@ -131,6 +134,27 @@ async function verifyReceipt(file) {
   requireFact(await hashArtifact(config.binary.path, true) === config.binary.sha256, 'host_binary_hash_mismatch');
   return { config, receipt_sha256: sha(bytes) };
 }
+async function verifyLinuxListener(c) {
+  const prefix = '/proc/' + c.host_pid;
+  requireFact(await fs.readlink('/proc/self/ns/net') === await fs.readlink(prefix + '/ns/net'), 'host_network_namespace_changed');
+  const fds = await fs.readdir(prefix + '/fd');
+  requireFact(fds.length <= 4096 && fds.every(fd => /^\d+$/.test(fd)), 'host_socket_budget');
+  const links = await Promise.all(fds.map(async fd => {
+    try { return await fs.readlink(prefix + '/fd/' + fd); }
+    catch (e) { if (e.code === 'ENOENT') return ''; throw e; }
+  }));
+  const inodes = new Set(links.map(link => /^socket:\[(\d+)\]$/.exec(link)?.[1]).filter(Boolean));
+  const url = new URL(origin(c.api_base)), v6 = url.hostname === '[::1]';
+  const bytes = v6 ? Buffer.alloc(16) : Buffer.from([127, 0, 0, 1]); if (v6) bytes[15] = 1;
+  let address = '';
+  for (let i = 0; i < bytes.length; i += 4) address += bytes[os.endianness() === 'LE' ? 'readUInt32LE' : 'readUInt32BE'](i).toString(16).padStart(8, '0').toUpperCase();
+  const local = address + ':' + Number(url.port).toString(16).padStart(4, '0').toUpperCase();
+  const table = (await readBounded(prefix + '/net/' + (v6 ? 'tcp6' : 'tcp'))).toString();
+  requireFact(table.split('\n').some(line => {
+    const fields = line.trim().split(/\s+/);
+    return fields[1] === local && fields[3] === '0A' && inodes.has(fields[9]);
+  }), 'host_listener_unverified');
+}
 async function verifyProcess(config) {
   requireFact(['darwin', 'linux'].includes(process.platform), 'native_process_binding_unsupported');
   const binary = await fs.realpath(config.binary.path);
@@ -139,9 +163,16 @@ async function verifyProcess(config) {
     const command = process.platform === 'linux' ? `/proc/${c.host_pid}/exe`
       : (await exec('ps', ['-p', String(c.host_pid), '-o', 'comm='], { timeout: 2000, maxBuffer: 4096 })).stdout.trim();
     requireFact(started === c.host_started_at && await fs.realpath(command) === binary, 'host_process_changed');
-    const executable = process.platform === 'darwin' ? '/usr/sbin/lsof' : 'lsof';
-    const listen = (await exec(executable, ['-nP', '-a', '-p', String(c.host_pid), '-iTCP:' + new URL(c.api_base).port, '-sTCP:LISTEN', '-Fp'], { timeout: 2000, maxBuffer: 4096 })).stdout;
-    requireFact(listen.split('\n').includes('p' + c.host_pid), 'host_listener_unverified');
+    if (process.platform === 'linux') await verifyLinuxListener(c);
+    else {
+      const url = new URL(origin(c.api_base)), version = url.hostname === '[::1]' ? '6' : '4';
+      let listen;
+      try { listen = (await exec('/usr/sbin/lsof', ['-nP', '-a', '-p', String(c.host_pid), '-i' + version + 'TCP@' + url.hostname + ':' + url.port,
+        '-sTCP:LISTEN', '-Fpn'], { timeout: 2000, maxBuffer: 4096 })).stdout; }
+      catch (e) { if (e.code === 1) throw new Failure('host_listener_unverified'); throw e; }
+      requireFact(listen.split('\n').includes('p' + c.host_pid)
+        && listen.split('\n').includes('n' + url.hostname + ':' + url.port), 'host_listener_unverified');
+    }
   }
 }
 async function jsonRequest(base, route, body, signal) {

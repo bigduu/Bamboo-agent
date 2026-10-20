@@ -101,6 +101,9 @@ jobs:
       - name: Test fast workflow and release policies
         run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs
 
+      - name: Test Supervisor driver and owned loopback process binding
+        run: node --test scripts/supervisor-native-acceptance.test.cjs
+
   promotion-source:
     name: Promotion Source
     if: github.event_name == 'pull_request' && github.base_ref == 'main'
