@@ -538,6 +538,78 @@ fn membership_retries_do_not_duplicate_history_and_cross_project_scope_is_reject
 }
 
 #[test]
+fn review_archived_member_cannot_be_carried_into_another_sprint() {
+    let f = Fixture::new();
+    f.sprint("one");
+    f.sprint("next");
+    f.add("one", &f.seed);
+    f.start("one");
+    ticket_execute(
+        &f.service,
+        &owner(),
+        vec![Operation::Archive {
+            ticket_id: f.seed.clone(),
+            archived: true,
+        }],
+    );
+    let before = f.service.published().unwrap();
+    let direct_add = command(
+        &f.service,
+        "next",
+        SprintAction::Add {
+            expected_revision: revision(&f.service, "next"),
+            work_id: f.seed.clone(),
+        },
+    );
+    assert!(matches!(
+        f.service.execute_sprint(&owner(), &direct_add),
+        Err(Error::InvalidTransition(reason)) if reason.contains("archived")
+    ));
+    assert_eq!(f.service.published().unwrap().0, before.0);
+
+    let carry = close_command(
+        &f.service,
+        "one",
+        BTreeMap::from([(
+            f.seed.clone(),
+            SprintDestination::Sprint {
+                sprint_id: sprint_id("next"),
+            },
+        )]),
+    );
+    assert!(
+        matches!(
+            f.service.execute_sprint(&owner(), &carry),
+            Err(Error::InvalidTransition(reason)) if reason.contains("archived")
+        ),
+        "carry-over must reject archived Work just like direct Add"
+    );
+    let after_rejected = f.service.published().unwrap();
+    assert_eq!(after_rejected.0, before.0);
+    assert_eq!(
+        canonical_bytes(&after_rejected.1).unwrap(),
+        canonical_bytes(&before.1).unwrap()
+    );
+
+    let backlog = close_command(
+        &f.service,
+        "one",
+        BTreeMap::from([(f.seed.clone(), SprintDestination::Backlog)]),
+    );
+    let receipt = f.service.execute_sprint(&owner(), &backlog).unwrap();
+    assert_eq!(f.service.execute_sprint(&owner(), &backlog).unwrap(), receipt);
+    assert_eq!(
+        receipt.closure.unwrap().members[&f.seed].disposition,
+        SprintCloseDisposition::Backlog
+    );
+    let after = f.service.published().unwrap().1;
+    assert!(!after.sprint.sprints[&sprint_id("next")]
+        .members
+        .contains(&f.seed));
+    unchanged_execution(&before.1, &after);
+}
+
+#[test]
 fn close_requires_complete_dispositions_and_preserves_running_worker_and_all_execution_bytes() {
     let f = Fixture::new();
     f.sprint("one");
