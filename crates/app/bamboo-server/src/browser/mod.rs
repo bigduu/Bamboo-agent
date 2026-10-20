@@ -2023,8 +2023,11 @@ impl BrowserManager {
                 session.signal_stop();
             }
         }
-        for session in sessions {
-            if let Err(error) = Self::stop_session(session).await {
+        // Poll every stop before waiting for any one host's close deadline.
+        // join_all keeps draining the remaining hosts even if one close fails.
+        for result in futures::future::join_all(sessions.into_iter().map(Self::stop_session)).await
+        {
+            if let Err(error) = result {
                 // Terminal purge may finish an unconfirmed close after both
                 // stable locks prove that the actual host has been reaped.
                 tracing::warn!(%error, "browser reset did not confirm persistence");
@@ -2072,8 +2075,11 @@ impl BrowserManager {
                 session.signal_stop();
             }
         }
-        for session in sessions {
-            if let Err(error) = Self::stop_session(session).await {
+        // Poll every stop before waiting for any one host's close deadline.
+        // join_all keeps draining the remaining hosts even if one close fails.
+        for result in futures::future::join_all(sessions.into_iter().map(Self::stop_session)).await
+        {
+            if let Err(error) = result {
                 tracing::warn!(%error, "browser shutdown did not confirm persistence");
             }
         }
