@@ -136,7 +136,8 @@ async function verifyProcess(config) {
   const binary = await fs.realpath(config.binary.path);
   for (const c of config.cases) {
     const started = (await exec('ps', ['-p', String(c.host_pid), '-o', 'lstart='], { timeout: 2000, maxBuffer: 4096 })).stdout.trim();
-    const command = (await exec('ps', ['-p', String(c.host_pid), '-o', 'comm='], { timeout: 2000, maxBuffer: 4096 })).stdout.trim();
+    const command = process.platform === 'linux' ? `/proc/${c.host_pid}/exe`
+      : (await exec('ps', ['-p', String(c.host_pid), '-o', 'comm='], { timeout: 2000, maxBuffer: 4096 })).stdout.trim();
     requireFact(started === c.host_started_at && await fs.realpath(command) === binary, 'host_process_changed');
     const executable = process.platform === 'darwin' ? '/usr/sbin/lsof' : 'lsof';
     const listen = (await exec(executable, ['-nP', '-a', '-p', String(c.host_pid), '-iTCP:' + new URL(c.api_base).port, '-sTCP:LISTEN', '-Fp'], { timeout: 2000, maxBuffer: 4096 })).stdout;
@@ -439,5 +440,5 @@ async function main(argv = process.argv.slice(2)) {
   }
 }
 module.exports = { SOURCE, TREE, Failure, validateReceipt, readBounded, hashArtifact, origin, scenario, roleOf,
-  creationReceipt, nextReply, startProvider, validateComposition, messages, runSuite, parseArgs, verifyReceipt, jsonRequest };
+  creationReceipt, nextReply, startProvider, validateComposition, messages, runSuite, parseArgs, verifyReceipt, jsonRequest, verifyProcess };
 if (require.main === module) main();

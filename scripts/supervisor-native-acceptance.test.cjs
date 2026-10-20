@@ -301,3 +301,15 @@ test('artifact preflight verifies canonical temp paths and actual bytes while re
   await fs.writeFile(v.binary.path, '#!/bin/sh\nnot-a-native-host');
   await assert.rejects(d.verifyReceipt(file), e => e.code === 'native_host_artifact_required');
 });
+test('OS COMPONENT ONLY: bind the test process/listener and reject changed process identity before a write', async t => {
+  if (!['darwin', 'linux'].includes(process.platform)) {
+    await assert.rejects(d.verifyProcess({ cases: [] }), e => e.code === 'native_process_binding_unsupported'); return;
+  }
+  const server = http.createServer((req, res) => res.end('{}'));
+  const port = await listen(server); t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+  const started = spawnSync('ps', ['-p', String(process.pid), '-o', 'lstart='], { encoding: 'utf8' });
+  assert.equal(started.status, 0);
+  const config = { binary: { path: process.execPath }, cases: [{ host_pid: process.pid, host_started_at: started.stdout.trim(), api_base: 'http://127.0.0.1:' + port }] };
+  await d.verifyProcess(config);
+  await assert.rejects(d.verifyProcess({ ...config, cases: [{ ...config.cases[0], host_started_at: 'old process' }] }), e => e.code === 'host_process_changed');
+});
