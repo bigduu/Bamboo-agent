@@ -1,6 +1,44 @@
 use super::*;
 use std::sync::{Condvar, Mutex as StdMutex};
 
+async fn unindexed_child_fixture() -> (tempfile::TempDir, SessionStoreV2, Session, Session) {
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let root = Session::new("canonical-deletion-root", "model");
+    let child = Session::new_child_of("canonical-deletion-child", &root, "model", "child");
+    store.save_session(&root).await.unwrap();
+    store.save_session(&child).await.unwrap();
+    store.update_index(|index| {
+        index.sessions.remove(&child.id);
+        Ok(())
+    }).await.unwrap();
+    assert!(store.get_index_entry(&child.id).await.is_none());
+    assert!(store.load_session(&child.id).await.unwrap().is_none());
+    (home, store, root, child)
+}
+
+#[tokio::test]
+async fn root_deletion_progress_includes_canonical_children_missing_from_index() {
+    let (home, store, root, child) = unindexed_child_fixture().await;
+    let result = store.delete_session_recursive_with_progress(&root.id, true).await.unwrap();
+    assert!(result.deleted);
+    assert!(!home.path().join("sessions").join(&root.id).exists());
+    let mut expected = vec![root.id, child.id];
+    expected.sort();
+    assert_eq!(result.candidate_session_ids, expected);
+}
+
+#[tokio::test]
+async fn root_cleanup_progress_includes_canonical_children_missing_from_index() {
+    let (home, store, root, child) = unindexed_child_fixture().await;
+    let result = store.cleanup_with_progress(CleanupMode::All, false).await.unwrap();
+    assert!(!home.path().join("sessions").join(&root.id).exists());
+    let mut expected = vec![root.id, child.id];
+    expected.sort();
+    assert_eq!(result.deleted_session_ids, expected);
+    assert_eq!(result.deleted_count, 2);
+}
+
 #[tokio::test]
 async fn root_deletion_reports_late_children_without_relying_on_a_root_index_row() {
     let home = tempfile::tempdir().unwrap();
