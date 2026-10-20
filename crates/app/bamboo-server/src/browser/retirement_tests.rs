@@ -3,6 +3,45 @@
 use super::*;
 
 #[tokio::test]
+async fn durable_retirement_releases_memory_and_blocks_a_restarted_manager() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("profiles");
+    let owner = profile::acquire(&root, "deleted").unwrap();
+    let path = owner.path.clone();
+    drop(owner);
+    let browser = BrowserManager::with_profile_root(root.clone());
+    browser.retire("deleted").await.unwrap();
+    assert!(!path.exists());
+    assert!(browser.retired.lock().unwrap().is_empty(), "a durable retirement must not retain a RAM tombstone");
+    assert!(matches!(browser.open("deleted").await, Err(BrowserError::NotOpen)));
+    assert!(matches!(BrowserManager::with_profile_root(root).open("deleted").await, Err(BrowserError::NotOpen)));
+    assert!(!path.exists(), "a retired profile cannot be reconstructed on reopen");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn retirement_marker_barrier_failure_keeps_the_memory_fence_until_retry() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("profiles");
+    let owner = profile::acquire(&root, "deleted").unwrap();
+    drop(owner);
+    let browser = BrowserManager::with_profile_root(root.clone());
+    let leases = root.join(".bamboo-profile-leases");
+    std::fs::set_permissions(&leases, std::fs::Permissions::from_mode(0o300)).unwrap();
+    let result = browser.retire("deleted").await;
+    let retained = browser.retired.lock().unwrap().contains("deleted");
+    let blocked = matches!(browser.open("deleted").await, Err(BrowserError::NotOpen));
+    std::fs::set_permissions(&leases, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Recover and finish this fixture before asserting, including on RED.
+    browser.retire("deleted").await.unwrap();
+    assert!(result.is_err(), "retirement requires the stable marker's directory barrier");
+    assert!(retained && blocked, "an unconfirmed durable handoff must retain its RAM fence");
+    assert!(browser.retired.lock().unwrap().is_empty());
+    assert!(matches!(BrowserManager::with_profile_root(root).open("deleted").await, Err(BrowserError::NotOpen)));
+}
+
+#[tokio::test]
 async fn retiring_a_closed_chat_purges_only_its_persisted_profile() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("profiles");

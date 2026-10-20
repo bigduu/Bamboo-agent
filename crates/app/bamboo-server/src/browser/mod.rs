@@ -14,6 +14,11 @@ pub(crate) fn test_profile_directory(root: &std::path::Path, session_id: &str) -
     profile::directory(root, session_id).expect("isolated browser profile fixture")
 }
 
+#[cfg(test)]
+pub(crate) fn test_retired_count(browser: &BrowserManager) -> usize {
+    browser.retired.lock().unwrap().len()
+}
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;

@@ -268,6 +268,38 @@ mod tests {
     use bamboo_agent_core::storage::Storage;
     use bamboo_agent_core::Session;
 
+    #[tokio::test]
+    async fn unknown_session_deletes_do_not_allocate_terminal_state() {
+        fn names(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+            let mut names: Vec<_> = std::fs::read_dir(path)
+                .into_iter()
+                .flatten()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        }
+        let home = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(home.path().into()).await.unwrap());
+        let profiles = home.path().join("browser-profiles");
+        let real = crate::browser::test_profile_directory(&profiles, "unrelated-real-profile");
+        std::fs::write(real.join("Cookies"), b"unrelated synthetic state").unwrap();
+        let locks = home.path().join(".session-write-locks");
+        let leases = profiles.join(".bamboo-profile-leases");
+        let before = (names(&locks), names(&leases), names(&profiles));
+        // Three fixed synthetic IDs, repeated once: this is not a stress test.
+        for _ in 0..2 {
+            for id in ["never-created-alpha", "never-created-beta", "never-created-gamma"] {
+                let response = handler(state.clone(), web::Path::from(id.to_string())).await.unwrap();
+                assert_eq!(response.status(), actix_web::http::StatusCode::NOT_FOUND);
+            }
+        }
+        assert_eq!((names(&locks), names(&leases), names(&profiles)), before);
+        assert_eq!(crate::browser::test_retired_count(&state.browser), 0);
+        assert_eq!(std::fs::read(real.join("Cookies")).unwrap(), b"unrelated synthetic state");
+        state.shutdown().await;
+    }
+
     async fn unindexed_child_state() -> (tempfile::TempDir, web::Data<AppState>, Session, Session) {
         let home = tempfile::tempdir().unwrap();
         let root = Session::new("canonical-profile-root", "model");
