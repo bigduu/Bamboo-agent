@@ -1584,6 +1584,10 @@ pub(super) async fn execute_llm_stream(
                 let message = format_provider_error(error);
                 if is_llm_overflow_error(&message) {
                     AgentError::LLMOverflow(message)
+                } else if http_retry_observer.request_budget_managed() {
+                    // Terminal auth, request-validation and transport failures
+                    // must not reset the same provider-owned request budget.
+                    AgentError::LLMNonRetryable(message)
                 } else {
                     AgentError::LLM(message)
                 }

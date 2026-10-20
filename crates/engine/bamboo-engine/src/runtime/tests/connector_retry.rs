@@ -262,3 +262,130 @@ async fn cancelling_anthropic_backoff_stops_without_another_model_request() {
     assert!(matches!(result, Err(AgentError::Cancelled)));
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
+
+struct RecoveryThenRejected(AtomicUsize);
+impl Respond for RecoveryThenRejected {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        if self.0.fetch_add(1, Ordering::SeqCst) < 3 {
+            recovery()
+        } else {
+            ResponseTemplate::new(422).set_body_string("unprocessable model request")
+        }
+    }
+}
+
+#[tokio::test]
+async fn connector_recovery_then_terminal_422_does_not_reset_the_request_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(RecoveryThenRejected(AtomicUsize::new(0)))
+        .mount(&server)
+        .await;
+    let provider = Arc::new(AnthropicProvider::new("fixture-key").with_base_url(server.uri()));
+    let (_temp, agent, storage) = build_direct_execute_agent(provider, None, None).await;
+    let mut session = Session::new("connector-terminal-422", "test-model");
+    session.add_message(Message::user("once"));
+    storage.save_session(&session).await.unwrap();
+    let (tx, _rx) = mpsc::channel(128);
+    let error = agent
+        .execute(&mut session, direct_request(tx, CancellationToken::new()))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AgentError::LLMNonRetryable(_)));
+    assert!(error.to_string().contains("422"));
+    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn anthropic_bootstrap_watchdog_does_not_restart_a_managed_budget() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(recovery().insert_header("Retry-After", "5"))
+        .mount(&server)
+        .await;
+    let provider = Arc::new(AnthropicProvider::new("fixture-key").with_base_url(server.uri()));
+    let mut config = bamboo_llm::Config::default();
+    config.stream_timeout.transport_idle_timeout_secs = 1;
+    let (_temp, agent, storage) =
+        build_direct_execute_agent_with_config(provider, None, None, config).await;
+    let mut session = Session::new("connector-bootstrap-watchdog", "test-model");
+    session.add_message(Message::user("once"));
+    storage.save_session(&session).await.unwrap();
+    let (tx, _rx) = mpsc::channel(128);
+    let error = agent
+        .execute(&mut session, direct_request(tx, CancellationToken::new()))
+        .await
+        .unwrap_err();
+    match error {
+        AgentError::StreamTimeout(timeout) => {
+            assert!(!timeout.retry_safe());
+            assert_eq!(timeout.last_http_retry().unwrap().0, 401);
+        }
+        other => panic!("expected managed bootstrap timeout, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn anthropic_zero_semantic_stream_timeout_does_not_restart_a_managed_budget() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for attempt in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .unwrap()
+                        .trim()
+                        .parse::<usize>()
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            if attempt == 0 {
+                let body = serde_json::json!({"error":{"type":"auth_error","message":RECOVERY}})
+                    .to_string();
+                socket.write_all(format!("HTTP/1.1 401 Error\r\nContent-Length: {}\r\nRetry-After: 0\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            } else {
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 65536\r\n\r\n: ping\n\n").await.unwrap();
+                while socket.read(&mut buffer).await.unwrap_or(0) != 0 {}
+            }
+        }
+    });
+    let provider = Arc::new(AnthropicProvider::new("fixture-key").with_base_url(url));
+    let mut config = bamboo_llm::Config::default();
+    config.stream_timeout.transport_idle_timeout_secs = 1;
+    let (_temp, agent, storage) =
+        build_direct_execute_agent_with_config(provider, None, None, config).await;
+    let mut session = Session::new("connector-stream-watchdog", "test-model");
+    session.add_message(Message::user("once"));
+    storage.save_session(&session).await.unwrap();
+    let (tx, _rx) = mpsc::channel(128);
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        agent.execute(&mut session, direct_request(tx, CancellationToken::new())),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    match error {
+        AgentError::StreamTimeout(timeout) => assert!(!timeout.retry_safe()),
+        other => panic!("expected managed stream timeout, got {other:?}"),
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
