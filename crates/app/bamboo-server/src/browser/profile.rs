@@ -11,6 +11,13 @@ const LEASES: &str = ".bamboo-profile-leases";
 const RESET_GATE: &str = ".bamboo-profile-reset.lock";
 const RETIRED: &[u8] = b"BAMBOO_BROWSER_RETIRED_V1\n";
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static DIRECTORY_SYNC_FAILURE: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
 pub(super) struct Lease {
     pub(super) path: PathBuf,
     _lock: std::fs::File,
@@ -67,6 +74,10 @@ impl Lease {
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), BrowserError> {
     use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(test)]
+    if DIRECTORY_SYNC_FAILURE.with(|target| target.borrow().as_deref() == Some(path)) {
+        return Err(unavailable());
+    }
     // A file fsync does not persist creation/removal of its directory entry.
     // Never confirm the fence (or its removal) if this barrier fails.
     std::fs::OpenOptions::new()
@@ -380,6 +391,40 @@ pub(super) fn purge_all(root: &Path) -> Result<(), BrowserError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_creation_and_reuse_require_the_parent_directory_barrier() {
+        struct ClearFault;
+        impl Drop for ClearFault {
+            fn drop(&mut self) {
+                DIRECTORY_SYNC_FAILURE.with(|target| *target.borrow_mut() = None);
+            }
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temporary.path())
+            .unwrap()
+            .join("profiles");
+        private_directory(&root).unwrap();
+        let sibling = root.join("synthetic-unrelated-state");
+        std::fs::write(&sibling, b"preserve existing data").unwrap();
+        let fault = ClearFault;
+        DIRECTORY_SYNC_FAILURE.with(|target| *target.borrow_mut() = Some(root.clone()));
+        let created = directory(&root, "profile-parent-barrier");
+        let reused = directory(&root, "profile-parent-barrier");
+        drop(fault);
+        assert!(root.join(key("profile-parent-barrier")).is_dir());
+        assert_eq!(std::fs::read(sibling).unwrap(), b"preserve existing data");
+        assert!(
+            created.is_err(),
+            "profile creation returned before its parent directory barrier"
+        );
+        assert!(
+            reused.is_err(),
+            "profile reuse must confirm the parent after an earlier failed barrier"
+        );
+        assert!(directory(&root, "profile-parent-barrier").is_ok());
+    }
 
     #[cfg(unix)]
     #[test]
