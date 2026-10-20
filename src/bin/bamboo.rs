@@ -197,6 +197,11 @@ enum Commands {
         /// independent of the async runtime and of how the parent wired our stdio.
         #[arg(long)]
         parent_pid: Option<u32>,
+
+        /// Let Bamboo request its own native confirmation for each exact Supervisor
+        /// Project scope change over stdio. Does not grant consent or enable HTTP writes.
+        #[arg(long)]
+        supervisor_scope_native_confirmation: bool,
     },
 
     /// Full-screen terminal client (TUI) over a running server: chat,
@@ -1246,6 +1251,11 @@ fn subagent_worker_process_action(
 }
 
 fn main() {
+    // AppKit's views run on the initial main thread in a UI-only own-executable
+    // helper. It cannot initialize configuration, AppState, sockets or model work.
+    if let Some(code) = bamboo_agent::server::native_scope_confirmation_helper_entry() {
+        std::process::exit(code);
+    }
     // Session deserialization can run on Actix's own Rust worker threads as
     // well as Tokio workers. Establish one process-wide thread-stack floor
     // before either runtime can spawn threads, preserving a larger operator
@@ -1351,11 +1361,19 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
     // owns its quiet-by-default policy; embedding applications do not need to
     // pass a log-level argument based on how the binary was built.
     match &cli.command {
-        Some(Commands::Serve { data_dir, .. }) => {
+        Some(Commands::Serve {
+            data_dir,
+            supervisor_scope_native_confirmation,
+            ..
+        }) => {
             let home = data_dir
                 .clone()
                 .unwrap_or_else(bamboo_config::paths::resolve_bamboo_dir);
-            bamboo_agent::server::logging::init_server_logging_with_home(&home);
+            if *supervisor_scope_native_confirmation {
+                bamboo_agent::server::logging::init_server_logging_with_home_to_stderr(&home);
+            } else {
+                bamboo_agent::server::logging::init_server_logging_with_home(&home);
+            }
         }
         Some(Commands::Config { .. }) => {
             // No file logging for config subcommand; stdout only.
@@ -1495,6 +1513,7 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
             static_dir,
             workers,
             parent_pid,
+            supervisor_scope_native_confirmation,
         } => {
             let bamboo_home_dir = data_dir
                 .clone()
@@ -1553,11 +1572,24 @@ async fn run(telemetry: &mut bamboo_infrastructure::telemetry::TelemetryGuard) {
             bamboo_agent::server::notify_sinks::set_sidecar_mode(parent_pid.is_some());
 
             // Start server using the unified config
-            println!("Starting Bamboo server at {}", config.server_addr());
+            if supervisor_scope_native_confirmation {
+                eprintln!("Starting Bamboo server at {}", config.server_addr());
+            } else {
+                println!("Starting Bamboo server at {}", config.server_addr());
+            }
             // v2-P1 (#181): honor `server.tls` for in-process TLS termination
             // (fail-fast on bad/missing certs); absent → unchanged plaintext.
             let tls = config.server.tls.clone();
-            let result = if config.server.static_dir.is_some() {
+            let result = if supervisor_scope_native_confirmation {
+                bamboo_agent::server::run_with_native_scope_confirmation(
+                    bamboo_home_dir,
+                    config.server.port,
+                    &config.server.bind,
+                    config.server.static_dir.clone(),
+                    tls,
+                )
+                .await
+            } else if config.server.static_dir.is_some() {
                 bamboo_agent::server::run_with_bind_and_static_tls(
                     bamboo_home_dir,
                     config.server.port,
@@ -2246,6 +2278,27 @@ fn serialize_config_for_cli(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_supervisor_confirmation_is_explicit_serve_only_opt_in() {
+        use clap::Parser;
+        for (argv, expected) in [
+            (vec!["bamboo", "serve"], false),
+            (
+                vec!["bamboo", "serve", "--supervisor-scope-native-confirmation"],
+                true,
+            ),
+        ] {
+            let parsed = super::Cli::try_parse_from(argv).unwrap();
+            assert!(
+                matches!(parsed.command, Some(super::Commands::Serve {supervisor_scope_native_confirmation, ..}) if supervisor_scope_native_confirmation == expected)
+            );
+        }
+        assert!(
+            super::Cli::try_parse_from(["bamboo", "--supervisor-scope-native-confirmation"])
+                .is_err()
+        );
+    }
+
     use super::{
         log_level_to_seed, requested_log_level, resolve_config_data_dir, serialize_config_for_cli,
         subagent_worker_process_action, SubagentWorkerProcessAction,

@@ -851,6 +851,16 @@ test('interrupted initial frontend upload can recover before any crate, while pa
   assert.deepEqual(calls, ['atomic-body', 'upload'])
 })
 
+test('complete publication uses the canonical main CI source without release-PR log parsing', () => {
+  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+  const automatic = workflow.split('  automatic:\n')[1]
+  const preflight = automatic.split('      - uses: actions/checkout')[0]
+  assert.match(preflight, /assert event_name == "workflow_run"/)
+  assert.match(preflight, /run = event\["workflow_run"\]/)
+  assert.match(preflight, /source = run\["head_sha"\]/)
+  assert.doesNotMatch(preflight, /actions\/jobs\/|matches\[0\]|--method=GET|accepted_ci_run/)
+})
+
 test('trusted manual publication and automatic receipts share a queue while dry runs stay credential-free', () => {
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
   const manual = workflow.split('  manual:\n')[1].split('  dry-run:\n')[0]
@@ -889,9 +899,7 @@ test('trusted manual publication and automatic receipts share a queue while dry 
   assert.ok(automatic.indexOf('Authorize the exact source') < automatic.indexOf('uses: actions/checkout'))
   assert.ok(automatic.indexOf('Verify checkout matches') < automatic.indexOf('node scripts/'))
   assert.doesNotMatch(automatic, /inputs\.version/)
-  assert.match(automatic, /inputs\.complete_release/)
-  assert.match(automatic, /accepted_ci_run/)
-  assert.match(automatic, /SOURCE_VALIDATION/)
+  assert.doesNotMatch(automatic, /workflow_dispatch|inputs\.complete_release|accepted_ci_run|SOURCE_VALIDATION/)
   for (const name of ['BAMBOO_RELEASE_TOKEN', 'BAMBOO_RELEASE_SIGNING_KEY']) {
     assert.equal(automatic.split(`secrets.${name}`).length - 1, name === 'BAMBOO_RELEASE_TOKEN' ? 3 : 2)
   }

@@ -373,6 +373,182 @@ impl SessionStoreV2 {
         })
     }
 
+    /// A write-only compatibility preflight under the existing physical locks.
+    /// Keep bounded authority/history observations readable. Publications also
+    /// inspect Main's behavior stamp; a compatible sidecar cannot override it.
+    async fn check_management_session_compatibility(&self, current: &Session) -> io::Result<()> {
+        reject_incompatible_session_write(current)?;
+        let canonical = self
+            .load_session_from_dir_strict(
+                &self.sessions_dir.join(&current.id),
+                &current.id,
+                SessionKind::Root,
+                &current.id,
+            )
+            .await?
+            .ok_or_else(|| denied("Supervisor disappeared before management publication"))?;
+        reject_incompatible_session_write(&canonical)
+    }
+
+    async fn publish_management_state(
+        &self,
+        current: &mut Session,
+        state: &SupervisorManagementState,
+        guards: &Arc<SupervisorManagementGuards>,
+    ) -> io::Result<()> {
+        state.validate(state.incarnation_id).map_err(invalid)?;
+        reject_incompatible_session_write(current)?;
+        current.supervisor_management = Some(state.clone());
+        // The only writer that may change this field. Revalidation above
+        // and the complete lock set remain live through atomic publication.
+        // Do not call an ordinary save (which must reject relation changes),
+        // update a target, or publish a history-free snapshot into a cache.
+        let bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(current))
+            .map_err(|error| other_io_error(error.to_string()))?;
+        self.prepare_supervisor_management_proof(current, guards)
+            .await?;
+        self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Prepared)?;
+        self.write_management_bytes(
+            &self
+                .sessions_dir
+                .join(&current.id)
+                .join(RUNTIME_SIDECAR_FILE),
+            bytes,
+            supervisor_proof::SupervisorProofFault::Runtime,
+            guards,
+        )
+        .await?;
+        self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Runtime)?;
+        self.commit_supervisor_management_proof(current, guards)
+            .await?;
+        self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Committed)?;
+        Ok(())
+    }
+
+    /// Create and attach only the exact new Ordinary Root reserved by the
+    /// Host's existing session-create operation. No arbitrary attach/recreate
+    /// authority is exposed to the model. The caller's operation owns its UUID
+    /// and birth; both must survive retries unchanged.
+    pub async fn create_and_attach_supervised_root(
+        &self,
+        supervisor: &SupervisorReference,
+        expected_state_revision: u64,
+        candidate: &Session,
+    ) -> io::Result<SupervisorManagementReceipt> {
+        reference_is_valid(supervisor)?;
+        target_id_is_valid(&candidate.id)?;
+        let project = target_project(candidate)?;
+        if candidate.root_session_id != candidate.id
+            || candidate.parent_session_id.is_some()
+            || candidate.spawn_depth != 0
+            || candidate.root_orchestration_only_enabled()
+            || candidate.supervisor_management.is_some()
+            || candidate.metadata_version != 0
+            || candidate
+                .workspace_path_meta()
+                .is_none_or(|path| path.trim().is_empty())
+        {
+            return Err(denied(
+                "creation requires a new Standard Ordinary Root with an explicit workspace",
+            ));
+        }
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let sessions = self.management_session_locks(Some(&candidate.id)).await?;
+        let guards = Arc::new(SupervisorManagementGuards {
+            sessions,
+            _task: task,
+            _lifecycle: lifecycle,
+        });
+        let mut current = self.management_supervisor_locked(supervisor).await?;
+        self.check_management_session_compatibility(&current)
+            .await?;
+        let mut state = current
+            .supervisor_management
+            .clone()
+            .unwrap_or_else(|| empty_state(supervisor.incarnation_id));
+        if !state.allowed_projects.contains(&project) {
+            return Err(denied(
+                "creation Project is outside configured Supervisor scope",
+            ));
+        }
+        let existing = self.load_root_authority_unchecked(&candidate.id).await?;
+        if let Some(link) = state.links.get(&candidate.id) {
+            // Explicit detach/re-attach is a new relationship generation. An
+            // old creation operation can observe, never revive or use it.
+            if link.revision != 1
+                || !existing.as_ref().is_some_and(|target| {
+                    target.created_at == candidate.created_at
+                        && link_authorizes_target(&state, link, target)
+                })
+            {
+                return Err(denied(
+                    "creation relationship was revoked or its target lifetime changed",
+                ));
+            }
+            return Ok(SupervisorManagementReceipt {
+                supervisor: supervisor.clone(),
+                state_revision: state.revision,
+                changed: false,
+                link_revision: Some(link.revision),
+            });
+        }
+        if state.revision != expected_state_revision {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                SessionAuthorityConflict(
+                    "Supervisor scope changed before creation; reload scope for a new operation"
+                        .into(),
+                ),
+            ));
+        }
+        if state.links.len() >= MAX_SUPERVISOR_LINKS {
+            return Err(invalid("Supervisor link/tombstone capacity exceeded"));
+        }
+        let committed_revision = next_revision(state.revision)?;
+        match existing {
+            Some(target)
+                if target.created_at == candidate.created_at
+                    && target_project(&target)
+                        .is_ok_and(|target_project| target_project == project)
+                    && target.workspace_path_meta() == candidate.workspace_path_meta()
+                    && target.metadata_version == 0
+                    && !target.root_orchestration_only_enabled() => {}
+            Some(_) => {
+                return Err(denied(
+                    "reserved creation target has a different lifetime or context",
+                ))
+            }
+            None => {
+                // The same canonical writer and retained physical guards as a
+                // normal Root save. Revocation cannot slip between the scope
+                // decision and filesystem publication, including cancellation.
+                let writer = DefaultWriterGuards::supervised_creation(guards.clone());
+                self.save_session_after_lock(candidate, Instant::now(), &writer, None)
+                    .await?;
+            }
+        }
+        state.links.insert(
+            candidate.id.clone(),
+            SupervisorManagedLink {
+                revision: 1,
+                enabled: true,
+                target_created_at: candidate.created_at,
+                target_project_id: project,
+                target_metadata_version: candidate.metadata_version,
+            },
+        );
+        state.revision = committed_revision;
+        self.publish_management_state(&mut current, &state, &guards)
+            .await?;
+        Ok(SupervisorManagementReceipt {
+            supervisor: supervisor.clone(),
+            state_revision: state.revision,
+            changed: true,
+            link_revision: Some(1),
+        })
+    }
+
     pub(super) async fn management_mutate(
         &self,
         request: &SupervisorManagementRequest,
@@ -409,6 +585,8 @@ impl SessionStoreV2 {
         });
         let mut current = self
             .management_supervisor_locked(&request.supervisor)
+            .await?;
+        self.check_management_session_compatibility(&current)
             .await?;
         let mut state = current
             .supervisor_management
@@ -489,33 +667,8 @@ impl SessionStoreV2 {
         };
         if changed {
             state.revision = next_revision(state.revision)?;
-            state
-                .validate(request.supervisor.incarnation_id)
-                .map_err(invalid)?;
-            current.supervisor_management = Some(state.clone());
-            // The only writer that may change this field. Revalidation above
-            // and the complete lock set remain live through atomic publication.
-            // Do not call an ordinary save (which must reject relation changes),
-            // update a target, or publish a history-free snapshot into a cache.
-            let bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(&current))
-                .map_err(|error| other_io_error(error.to_string()))?;
-            self.prepare_supervisor_management_proof(&current, &guards)
+            self.publish_management_state(&mut current, &state, &guards)
                 .await?;
-            self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Prepared)?;
-            self.write_management_bytes(
-                &self
-                    .sessions_dir
-                    .join(&current.id)
-                    .join(RUNTIME_SIDECAR_FILE),
-                bytes,
-                supervisor_proof::SupervisorProofFault::Runtime,
-                &guards,
-            )
-            .await?;
-            self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Runtime)?;
-            self.commit_supervisor_management_proof(&current, &guards)
-                .await?;
-            self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Committed)?;
         }
         Ok(SupervisorManagementReceipt {
             supervisor: request.supervisor.clone(),

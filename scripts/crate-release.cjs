@@ -96,11 +96,7 @@ function assertManualVersion(version, now = new Date()) {
 
 function validateSource({ eventName, event, repository, sourceRevision, sourceTree, validation }) {
   assert.match(sourceRevision, SHA)
-  if (eventName === 'workflow_dispatch' && validation) {
-    assert.equal(repository, 'bigduu/Bamboo-agent')
-    require('./release-source.cjs').validateDispatch(event, validation, sourceRevision, sourceTree)
-    return true
-  }
+  // A caller-supplied historical dispatch proof is not new publication authority.
   assert.equal(eventName, 'workflow_run', 'Unsupported release trigger')
   const run = event.workflow_run
   assert.equal(run?.name, 'CI')

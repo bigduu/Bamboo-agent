@@ -256,6 +256,11 @@ pub struct AppState {
     /// Concrete session store implementation (for index/list/cleanup APIs).
     pub session_store: Arc<SessionStoreV2>,
 
+    /// Optional trusted embedding-host consent verifier. Never set by HTTP,
+    /// model arguments, access configuration, locality or credential fallback.
+    pub(crate) supervisor_project_scope_owner_authorizer:
+        Option<Arc<dyn supervisor_owner_authorization::SupervisorProjectScopeOwnerAuthorizer>>,
+
     /// Durable, Bamboo-home-scoped idempotency receipts for root-session
     /// creation. Kept outside each target session directory so deleting a
     /// session cannot erase retry truth during the retention window.
@@ -608,6 +613,7 @@ pub(crate) mod mutation_idempotency;
 pub(crate) mod session_create_operations;
 pub mod session_events;
 mod session_loader;
+pub mod supervisor_owner_authorization;
 pub mod ticket_application;
 mod tools;
 pub mod watchers;
@@ -638,3 +644,8 @@ mod local_task_assembly_tests;
 
 #[cfg(test)]
 mod local_task_conversation_tests;
+
+#[cfg(test)]
+mod supervised_root_create_tests;
+
+pub(super) mod supervised_root_create;

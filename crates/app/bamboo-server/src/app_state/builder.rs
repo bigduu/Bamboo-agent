@@ -1130,6 +1130,17 @@ impl AppState {
             None
         };
 
+        let root_creator = Arc::new(super::supervised_root_create::SupervisedRootCreator {
+            store: session_store.clone(),
+            operations: session_create_operations.clone(),
+            projects: project_store.clone(),
+            workspace: workspace_resolver.clone(),
+            project_context: project_context_resolver.clone(),
+            config: config.clone(),
+            repo: session_repo.clone(),
+            messenger: session_messenger.clone(),
+            account: account_sink.clone(),
+        });
         let (tools, canonical_subagent_tool) = build_root_tools(
             tools_with_task.clone(),
             schedule_store.clone(),
@@ -1138,6 +1149,7 @@ impl AppState {
             storage.clone(),
             persistence.clone(),
             session_messenger.clone(),
+            root_creator,
             spawn_scheduler.clone(),
             sessions.clone(),
             agent_runners.clone(),
@@ -1415,6 +1427,7 @@ impl AppState {
             sessions,
             storage,
             session_store,
+            supervisor_project_scope_owner_authorizer: None,
             session_create_operations,
             mutation_idempotency,
             project_store,

@@ -321,6 +321,21 @@ pub(crate) async fn reject_ambiguous_reentry(
     session: &Session,
     persistence: &dyn bamboo_domain::RuntimeSessionPersistence,
 ) -> Result<(), AgentError> {
+    session
+        .check_execution_compatibility()
+        .map_err(|error| AgentError::Tool(error.to_string()))?;
+    // Public raw execution can receive a caller snapshot older than the
+    // retained contract even without a counted loop. Inspect the canonical
+    // snapshot before hooks, marker changes or any final-checkpoint carrier.
+    let durable = persistence
+        .load_runtime_admission_snapshot(&session.id)
+        .await
+        .map_err(|_| invalid("cannot inspect durable state; recovery unsupported"))?;
+    if let Some(durable) = durable.as_ref() {
+        durable
+            .check_execution_compatibility()
+            .map_err(|error| AgentError::Tool(error.to_string()))?;
+    }
     reject_recovery(session)?;
     let Some(state) = read_loop_state(session)? else {
         return Ok(());
@@ -328,10 +343,6 @@ pub(crate) async fn reject_ambiguous_reentry(
     if state.iterations_started == state.iterations_completed {
         return Ok(());
     }
-    let durable = persistence
-        .load_runtime_admission_snapshot(&session.id)
-        .await
-        .map_err(|_| invalid("cannot inspect durable state; recovery unsupported"))?;
     let Some(durable) = durable else {
         return Err(invalid(
             "recovery unsupported; durable state missing; reload required",
@@ -394,12 +405,20 @@ pub(crate) async fn admit_registered(
     router: Option<&std::sync::Arc<crate::session_activation::SessionActivationRouter>>,
     persistence: &dyn bamboo_domain::RuntimeSessionPersistence,
 ) -> Result<(), AgentError> {
+    session
+        .check_execution_compatibility()
+        .map_err(|error| AgentError::Tool(error.to_string()))?;
     let presented = read_loop_state(session)?;
     // Always read, even when the caller predates the first counted admission.
     let durable = persistence
         .load_runtime_admission_snapshot(&session.id)
         .await
         .map_err(|_| invalid("cannot inspect durable state; execution not admitted"))?;
+    if let Some(durable) = durable.as_ref() {
+        durable
+            .check_execution_compatibility()
+            .map_err(|error| AgentError::Tool(error.to_string()))?;
+    }
     let stored = durable.as_ref().map(read_loop_state).transpose()?.flatten();
     if presented != stored
         || (stored.is_some()

@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict")
 const { createHash } = require("node:crypto")
-const { mkdtempSync, readFileSync, rmSync, writeFileSync } = require("node:fs")
+const { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require("node:fs")
 const { spawnSync } = require("node:child_process")
 const os = require("node:os")
 const path = require("node:path")
@@ -166,8 +166,8 @@ test("macOS link guard preserves Cargo failures and rejects lost or oversized di
   }
 })
 
-test("snapshots and PR gates retain validation without automatic post-merge main CI", () => {
-  assert.doesNotMatch(workflow, /^  push:/mu)
+test("main-push validation remains reachable by the existing automatic publisher", () => {
+  assert.match(workflow, /^  push:\n    branches: \[ main \]$/mu)
   assert.match(workflow, /pull_request:\n\s+branches: \[ dev, main \]/u)
 
   const testJob = job("test")
@@ -1154,6 +1154,80 @@ const actorWindowsStep = (source, name) => {
 }
 const actorWindowsCompileName = "Compile and verify all 41 selected native tests"
 const actorWindowsRunName = "Execute 9 snapshot, 3 gateway, 19 directory, 5 scoped and 5 initial process tests"
+
+const actorWindowsPathBlock = actorWindowsWorkflow.match(/    paths:\n([\s\S]*?)(?=\n\S)/u)[1]
+const actorWindowsPaths = [...actorWindowsPathBlock.matchAll(/^      - '([^']+)'$/gmu)]
+  .map(([, pattern]) => pattern)
+const needsActorWindows = (files) => files.some((file) =>
+  actorWindowsPaths.some((pattern) => path.posix.matchesGlob(file, pattern)))
+
+test("native Windows paths retain native sources while policy and release edits stay fast", () => {
+  assert.match(actorWindowsWorkflow, /on:\n  workflow_dispatch:\n  pull_request:\n    branches: \[dev, main\]\n    paths:\n/u)
+  assert.match(job("quick-checks"), /run: node --test scripts\/ci-policy\.test\.cjs(?: |\n)/u)
+  assert.match(job("test"), /Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs(?: |\n)/u)
+  const nativeInputs = [
+    ".github/workflows/actor-snapshot-windows.yml",
+    "scripts/actor-windows-native.ps1", "scripts/actor-windows-native.test.ps1",
+    ".cargo/config.toml", "Cargo.toml", "Cargo.lock",
+    "crates/Cargo.toml", "crates/app/bamboo-server/Cargo.toml",
+    "crates/core/bamboo-domain/Cargo.toml", "crates/infra/bamboo-storage/Cargo.toml",
+    "crates/engine/bamboo-tools/Cargo.toml", "crates/infra/bamboo-config/Cargo.toml",
+    "crates/infra/bamboo-storage/src/v2/actor_snapshot_windows_tests.rs",
+    "crates/infra/bamboo-storage/src/v2/actor_directory.rs",
+    "crates/infra/bamboo-storage/src/v2/mod.rs",
+    "crates/engine/bamboo-tools/src/local_task_resources/windows.rs",
+    "crates/engine/bamboo-tools/src/lib.rs", "crates/core/bamboo-domain/src/lib.rs",
+    "crates/app/bamboo-server/src/app_state/mod.rs", "crates/app/bamboo-server/src/lib.rs",
+    "crates/app/bamboo-server/src/routes/agent.rs", "crates/app/bamboo-server/src/routes/bamboo_v1.rs",
+    "crates/app/bamboo-server/src/routes/mod.rs", "crates/app/bamboo-server/src/codex_run_tokens.rs",
+    "crates/app/bamboo-server/src/error.rs", "crates/app/bamboo-server/src/handlers/agent/actor_snapshot.rs",
+    "crates/app/bamboo-server/src/handlers/agent/mod.rs", "crates/app/bamboo-server/src/handlers/settings/mod.rs",
+    "crates/app/bamboo-server/src/handlers/settings/access_control.rs",
+    "crates/engine/bamboo-engine/src/external_agents/actor_adapter.rs",
+    "crates/infra/bamboo-config/src/config.rs", "crates/infra/bamboo-config/src/encryption.rs",
+    "crates/infra/bamboo-config/src/lib.rs", "crates/app/bamboo-server/build.rs",
+    "crates/app/bamboo-server/frontend_build.rs",
+  ]
+  for (const file of nativeInputs) assert.equal(needsActorWindows([file]), true, file)
+  const fastInputs = [
+    "scripts/ci-policy.test.cjs", "scripts/ci-routing.test.cjs",
+    "scripts/crate-release.cjs", "scripts/crate-release.test.cjs",
+    "scripts/sidecar-release.cjs", "scripts/sidecar-release.test.cjs",
+    ".github/workflows/publish-crate.yml", "README.md", "docs/releases/shared-executable-assets.md",
+  ]
+  for (const file of fastInputs) assert.equal(needsActorWindows([file]), false, file)
+  assert.equal(needsActorWindows(fastInputs), false)
+  assert.equal(needsActorWindows([...fastInputs, nativeInputs[0]]), true)
+  assert.equal(needsActorWindows([]), false)
+})
+
+test("native Windows still uses cumulative PR changes after an unrelated last commit", (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-actor-paths-"))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const git = (...args) => {
+    const result = spawnSync("git", args, { cwd: directory, encoding: "utf8" })
+    assert.equal(result.status, 0, result.stderr)
+    return result.stdout.trim()
+  }
+  const commit = (file, content) => {
+    const target = path.join(directory, file)
+    mkdirSync(path.dirname(target), { recursive: true })
+    writeFileSync(target, content)
+    git("add", ".")
+    git("-c", "user.name=ci-policy", "-c", "user.email=ci-policy@example.invalid", "commit", "--quiet", "-m", file)
+    return git("rev-parse", "HEAD")
+  }
+  const changes = (range) => git("diff", "--name-only", range).split("\n").filter(Boolean)
+  git("init", "--quiet")
+  const base = commit("README.md", "base\n")
+  commit("scripts/ci-policy.test.cjs", "policy assertion\n")
+  commit("scripts/crate-release.cjs", "unrelated release fix\n")
+  assert.equal(needsActorWindows(changes(`${base}...HEAD`)), false)
+  commit("crates/infra/bamboo-storage/src/v2/mod.rs", "native reader change\n")
+  commit("scripts/crate-release.cjs", "another release fix\n")
+  assert.equal(needsActorWindows(changes("HEAD^...HEAD")), false, "latest commit alone misses the native input")
+  assert.equal(needsActorWindows(changes(`${base}...HEAD`)), true, "PR three-dot diff retains the earlier native input")
+})
 
 const assertActorWindowsAcceptance = (source) => {
   const compile = actorWindowsStep(source, actorWindowsCompileName)

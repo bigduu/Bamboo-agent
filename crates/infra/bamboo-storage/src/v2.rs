@@ -111,6 +111,8 @@ mod scoped_loop_control;
 #[cfg(test)]
 mod scoped_loop_control_tests;
 pub(crate) mod scoped_transport_expiry;
+#[cfg(test)]
+mod session_compatibility_tests;
 mod title_observations;
 pub use host_registry::FileHostRegistry;
 #[cfg(test)]
@@ -576,6 +578,37 @@ pub struct SessionCopyProjectionGuard {
     _runtime_task: RuntimeTaskTransactionWriteGuard,
 }
 
+fn reject_incompatible_session_write(session: &Session) -> io::Result<()> {
+    session.check_execution_compatibility().map_err(|error| {
+        // Existing publisher fences already suppress cache publication of a
+        // rejected Session snapshot; do not turn this refusal into a checkpoint.
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            bamboo_domain::SessionAuthorityConflict(error.to_string()),
+        )
+    })
+}
+
+fn reject_session_version_change(incoming: &Session, durable: &Session) -> io::Result<()> {
+    // Main owns the behavior stamp, while the runtime sidecar owns the latest
+    // retained control state. Do not mistake Main's older control snapshot for
+    // the current state when a valid, compatible sidecar exists.
+    if durable
+        .session_version
+        .is_some_and(|v| v != bamboo_domain::CURRENT_SESSION_VERSION)
+    {
+        reject_incompatible_session_write(durable)?;
+    }
+    if incoming.created_at == durable.created_at
+        && incoming.session_version != durable.session_version
+    {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, bamboo_domain::SessionAuthorityConflict(
+            "session_version_change_requires_new_session: existing behavior stamps are not migrated by ordinary saves".into(),
+        )));
+    }
+    Ok(())
+}
+
 /// Build the sidecar snapshot: the full session minus its `messages` history.
 /// Every field except `messages` is authoritative in the sidecar; on load the
 /// message history is taken back from `session.json`.
@@ -605,6 +638,7 @@ pub(crate) fn runtime_sidecar_snapshot(session: &Session) -> Session {
 fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
     match sidecar {
         Some(mut side) => {
+            side.observe_main_session_version(main.session_version);
             let admission = main
                 .runtime_metadata
                 .as_ref()
@@ -1493,6 +1527,8 @@ const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
 fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     let now = Utc::now();
     let mut copy = source.clone();
+    copy.session_version = Some(bamboo_domain::CURRENT_SESSION_VERSION);
+    copy.observed_runtime_session_version = None;
     copy.authority_identity = SessionAuthorityIdentity::Ordinary;
     copy.supervisor_management = None;
     copy.id = new_id.to_string();
@@ -3769,13 +3805,10 @@ impl SessionStoreV2 {
             .map_err(RuntimeTaskJournalFinalizeError::RecoveryRequired)
     }
 
-    async fn restore_runtime_task_undo(
+    async fn prepare_runtime_task_undo(
         &self,
         undo: &TaskControlPlaneUndo,
-        fault: RuntimeTaskTransactionFault,
-        guard: &RuntimeTaskTransactionWriteGuard,
-    ) -> io::Result<()> {
-        self.maybe_fail_runtime_task_transaction(fault)?;
+    ) -> io::Result<(PathBuf, Session)> {
         let Some((abs_dir, mut current)) = self
             .load_runtime_task_recovery_control_plane(&undo.session_id)
             .await?
@@ -3785,8 +3818,22 @@ impl SessionStoreV2 {
                 format!("cannot recover missing session {}", undo.session_id),
             ));
         };
+        reject_incompatible_session_write(&current)?;
         current.task_list = undo.task_list.clone();
         current.set_task_list_version_meta(undo.task_list_version.clone());
+        self.validate_runtime_task_recovery_write_target(&abs_dir, &current)
+            .await?;
+        Ok((abs_dir, current))
+    }
+
+    async fn restore_runtime_task_undo(
+        &self,
+        prepared: &(PathBuf, Session),
+        fault: RuntimeTaskTransactionFault,
+        guard: &RuntimeTaskTransactionWriteGuard,
+    ) -> io::Result<()> {
+        self.maybe_fail_runtime_task_transaction(fault)?;
+        let (abs_dir, current) = prepared;
         let event = match fault {
             RuntimeTaskTransactionFault::FirstRollbackWrite => {
                 RuntimeTaskDurabilityEvent::FirstRollbackSidecarPublished
@@ -3796,9 +3843,9 @@ impl SessionStoreV2 {
             }
             _ => unreachable!("rollback helper only accepts rollback write faults"),
         };
-        self.validate_runtime_task_recovery_write_target(&abs_dir, &current)
+        self.validate_runtime_task_recovery_write_target(abs_dir, current)
             .await?;
-        self.write_runtime_sidecar_durable(&abs_dir, &current, guard)
+        self.write_runtime_sidecar_durable(abs_dir, current, guard)
             .await?;
         self.record_runtime_task_durability_event(event);
         Ok(())
@@ -3809,10 +3856,14 @@ impl SessionStoreV2 {
         journal: &RuntimeTaskTransactionJournal,
         guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
+        // Preflight the entire undo before either publication. A guard only
+        // inside each physical write would still permit a partial rollback.
+        let first = self.prepare_runtime_task_undo(&journal.first).await?;
+        let second = self.prepare_runtime_task_undo(&journal.second).await?;
         let mut errors = Vec::new();
         if let Err(error) = self
             .restore_runtime_task_undo(
-                &journal.first,
+                &first,
                 RuntimeTaskTransactionFault::FirstRollbackWrite,
                 guard,
             )
@@ -3822,7 +3873,7 @@ impl SessionStoreV2 {
         }
         if let Err(error) = self
             .restore_runtime_task_undo(
-                &journal.second,
+                &second,
                 RuntimeTaskTransactionFault::SecondRollbackWrite,
                 guard,
             )
@@ -4194,6 +4245,31 @@ impl SessionStoreV2 {
         }
     }
 
+    /// Assess canonical Main and retained runtime under the caller's existing
+    /// exclusive Task guard. Keep the side-only snapshot as the narrow commit
+    /// source: reading history for this fence must not copy it into Task state
+    /// or change a compatible legacy sidecar's behavior-stamp encoding.
+    async fn validate_runtime_task_execution_contract(&self, current: &Session) -> io::Result<()> {
+        reject_incompatible_session_write(current)?;
+        let rel = self.resolve_rel_path(&current.id).await.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Task target has no canonical path")
+        })?;
+        let (kind, root_id) = Self::copy_source_identity_from_rel(&current.id, &rel)?;
+        // The public admission reader would reenter the Task shared lock.
+        let durable = self
+            .load_session_from_dir_strict(
+                &self.abs_path_from_rel(&rel),
+                &current.id,
+                kind,
+                &root_id,
+            )
+            .await?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Task target has no live Main")
+            })?;
+        reject_incompatible_session_write(&durable)
+    }
+
     async fn save_runtime_task_control_plane_if_matches(
         &self,
         original: &Session,
@@ -4208,6 +4284,8 @@ impl SessionStoreV2 {
                 "single Task snapshots must preserve the session id",
             ));
         }
+        reject_incompatible_session_write(original)?;
+        reject_incompatible_session_write(updated)?;
         if Self::runtime_task_non_task_snapshot(original)?
             != Self::runtime_task_non_task_snapshot(updated)?
         {
@@ -4228,6 +4306,8 @@ impl SessionStoreV2 {
         else {
             return Ok(false);
         };
+        self.validate_runtime_task_execution_contract(&current)
+            .await?;
         self.validate_root_context_for_save(&current).await?;
         if current.authority_identity != original.authority_identity
             || current.supervisor_management != original.supervisor_management
@@ -4266,6 +4346,7 @@ impl SessionStoreV2 {
             second_updated,
         ] {
             validate_session_id(&session.id)?;
+            reject_incompatible_session_write(session)?;
         }
         if first_original.id != first_updated.id
             || second_original.id != second_updated.id
@@ -4322,6 +4403,11 @@ impl SessionStoreV2 {
         else {
             return Ok(false);
         };
+        // Both members must pass before the journal or first sidecar exists.
+        self.validate_runtime_task_execution_contract(&current_first)
+            .await?;
+        self.validate_runtime_task_execution_contract(&current_second)
+            .await?;
         self.validate_root_context_for_save(&current_first).await?;
         self.validate_root_context_for_save(&current_second).await?;
         if current_first.authority_identity != first_original.authority_identity
@@ -4565,6 +4651,7 @@ impl SessionStoreV2 {
         session: &Session,
         guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
+        reject_incompatible_session_write(session)?;
         self.validate_root_context_for_save(session).await?;
         let path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let snapshot = runtime_sidecar_snapshot(session);
@@ -4742,6 +4829,7 @@ impl SessionStoreV2 {
         self.validate_root_context_for_save(&session).await?;
         self.check_actor_reconstruction(&session, &directory)
             .await?;
+        reject_incompatible_session_write(&session)?;
         let bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(&session))
             .map_err(|error| other_io_error(error.to_string()))?;
         self.write_default_bytes(&path, bytes, &guards).await?;
@@ -5376,6 +5464,7 @@ impl SessionStoreV2 {
             return Ok(false);
         };
 
+        reject_incompatible_session_write(&session)?;
         self.validate_root_context_for_save(&session).await?;
 
         // Keep only the first System message if present; drop all other messages.
@@ -6148,6 +6237,7 @@ impl SessionStoreV2 {
         publish: Option<bamboo_domain::RootActorRuntimePublisher>,
         inherited: Option<&bamboo_domain::InheritedChildWait>,
     ) -> io::Result<Option<Session>> {
+        reject_incompatible_session_write(session)?;
         if session
             .metadata
             .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY)
@@ -6178,6 +6268,51 @@ impl SessionStoreV2 {
         self.validate_child_project_for_write(session, false, Some(rel))
             .await?;
         self.reject_regressing_runtime_task(session).await?;
+        // Keep existing Actor/authority refusals typed before the additional
+        // strict read. Compatibility still precedes all physical/index writes.
+        // Main owns the behavior contract. A stale compatible caller and
+        // sidecar cannot authorize a checkpoint over a future Main. Reuse the
+        // internal strict reader while these physical writer guards are held;
+        // the public admission reader would acquire the same locks again.
+        // Legacy runtime-only saves now inspect Main too: this correctness
+        // check reads/decodes history and is not an O(1) checkpoint promise.
+        let expected_root_id = if session.kind == SessionKind::Root {
+            session.id.as_str()
+        } else {
+            session.root_session_id.as_str()
+        };
+        if let Some(durable) = self
+            .load_session_from_dir_strict(
+                &self.abs_path_from_rel(rel),
+                &session.id,
+                session.kind,
+                expected_root_id,
+            )
+            .await?
+        {
+            reject_incompatible_session_write(&durable)?;
+        }
+        if let Some(previous) = Self::read_runtime_sidecar_at(
+            &self.abs_path_from_rel(rel).join(RUNTIME_SIDECAR_FILE),
+            &session.id,
+        )
+        .await?
+        {
+            reject_incompatible_session_write(&previous)?;
+            // Runtime does not own Main's stamp. Legacy absence and v1 have
+            // identical semantics; never turn this compatible pair into a
+            // false conflict or rewrite Main from the runtime-only path.
+            if session.session_version != previous.session_version
+                && !(session
+                    .session_version
+                    .is_none_or(|v| v == bamboo_domain::CURRENT_SESSION_VERSION)
+                    && previous
+                        .session_version
+                        .is_none_or(|v| v == bamboo_domain::CURRENT_SESSION_VERSION))
+            {
+                reject_session_version_change(session, &previous)?;
+            }
+        }
         if session.kind == SessionKind::Root && self.get_index_entry(&session.id).await.is_none() {
             let index_bytes = fs::read(&self.index_path).await?;
             let global_index: SessionsIndex = serde_json::from_slice(&index_bytes)
@@ -6345,6 +6480,7 @@ impl SessionStoreV2 {
         answer_permit: Option<&ParentQuestion>,
         manual_title: bool,
     ) -> io::Result<()> {
+        reject_incompatible_session_write(session)?;
         if session
             .metadata
             .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY)
@@ -6381,6 +6517,21 @@ impl SessionStoreV2 {
                 compact_main::validate_full_main(raw.as_bytes())?;
                 let durable: Session = serde_json::from_str(&raw)
                     .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
+                reject_session_version_change(session, &durable)?;
+                if let Some(mut previous_runtime) = Self::read_runtime_sidecar_at(
+                    &current_main
+                        .parent()
+                        .expect("session.json has a parent")
+                        .join(RUNTIME_SIDECAR_FILE),
+                    &session.id,
+                )
+                .await?
+                {
+                    previous_runtime.observe_main_session_version(durable.session_version);
+                    reject_incompatible_session_write(&previous_runtime)?;
+                } else {
+                    reject_incompatible_session_write(&durable)?;
+                }
                 reject_regressing_direct_parent_terminals(session, &durable)?;
                 self.reject_rewriting_broker_receipts(
                     session,
@@ -6396,6 +6547,20 @@ impl SessionStoreV2 {
                     current_main.parent().expect("session.json has a parent"),
                 )
                 .await?;
+                // Repairing an interrupted Main creation may reuse this exact
+                // Root context, but cannot reset a future contract retained in
+                // the runtime sidecar just because Main is absent.
+                if let Some(previous_runtime) = Self::read_runtime_sidecar_at(
+                    &current_main
+                        .parent()
+                        .expect("session.json has a parent")
+                        .join(RUNTIME_SIDECAR_FILE),
+                    &session.id,
+                )
+                .await?
+                {
+                    reject_incompatible_session_write(&previous_runtime)?;
+                }
                 None
             }
             Err(error) => return Err(error),
