@@ -47,6 +47,9 @@ then closes Chromium. Shutdown has a bounded grace period. If final persistence
 cannot be confirmed by a clean host exit, a private close-pending marker blocks
 reopening that profile instead of importing a potentially stale cookie snapshot.
 Its existing site data is retained; an unconfirmed close is reported as such.
+On Unix, creating or removing that fence also syncs its containing directory;
+terminal profile removal syncs its parent directory. A failed directory barrier
+is reported, including on a retry where the marker/profile is already absent.
 Controlled command timeouts and cancellation also mark a persistent profile
 unconfirmed before killing the host. They do not replay a checkpoint that may
 precede a logout. If the marker itself cannot be written, ordinary close keeps

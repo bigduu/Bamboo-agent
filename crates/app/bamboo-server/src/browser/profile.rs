@@ -46,7 +46,8 @@ impl Lease {
                     .map_err(|_| unavailable())
             }
             Err(_) => Err(unavailable()),
-        }
+        }?;
+        sync_directory(&self.path)
     }
 
     pub(super) fn finish_close(&self) -> Result<(), BrowserError> {
@@ -54,8 +55,27 @@ impl Lease {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(unavailable()),
-        }
+        }?;
+        sync_directory(&self.path)
     }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), BrowserError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // A file fsync does not persist creation/removal of its directory entry.
+    // Never confirm the fence (or its removal) if this barrier fails.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| unavailable())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_: &Path) -> Result<(), BrowserError> {
+    Ok(())
 }
 
 fn unavailable() -> BrowserError {
@@ -180,19 +200,108 @@ pub(super) fn remove(root: &Path, session_id: &str) -> Result<(), BrowserError> 
     // Lock before even the absence check: an opener can own the lease before
     // creating the profile directory. Its startup is not an absent profile.
     match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return sync_directory(&root),
         Err(_) => return Err(unavailable()),
         Ok(_) => validate_private_directory(&path)?,
     }
     let _profile_lock = lock_file(&path.join(".bamboo-profile.lock"))?;
     // remove_dir_all unlinks internal symlinks; it does not follow their
     // targets. The selected root itself must have passed the checks above.
-    std::fs::remove_dir_all(path).map_err(|_| unavailable())
+    std::fs::remove_dir_all(path).map_err(|_| unavailable())?;
+    sync_directory(&root)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn close_fence_creation_and_reuse_require_the_directory_barrier() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profiles");
+        let lease = acquire(&root, "chat").unwrap();
+        // Write/search permits creating and syncing the marker itself, but
+        // opening its containing directory for the durability barrier fails.
+        std::fs::set_permissions(&lease.path, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let created = lease.begin_close();
+        let marker_exists = lease.path.join(CLOSE_PENDING).is_file();
+        let reused = lease.begin_close();
+        std::fs::set_permissions(&lease.path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            marker_exists,
+            "fixture must create the marker before the barrier fails"
+        );
+        assert!(
+            created.is_err(),
+            "file fsync alone cannot confirm a durable close fence"
+        );
+        assert!(
+            reused.is_err(),
+            "an existing marker still needs its directory barrier"
+        );
+        lease.begin_close().unwrap();
+        lease.finish_close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_fence_removal_and_absence_require_the_directory_barrier() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profiles");
+        let lease = acquire(&root, "chat").unwrap();
+        lease.begin_close().unwrap();
+        std::fs::set_permissions(&lease.path, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let removed = lease.finish_close();
+        let marker_absent = !lease.path.join(CLOSE_PENDING).exists();
+        let absent = lease.finish_close();
+        std::fs::set_permissions(&lease.path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            marker_absent,
+            "fixture must unlink the marker before the barrier fails"
+        );
+        assert!(
+            removed.is_err(),
+            "unlink alone cannot confirm a durable clean close"
+        );
+        assert!(
+            absent.is_err(),
+            "retry must also confirm the directory entry is durable"
+        );
+        lease.finish_close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_removal_and_absence_require_the_parent_directory_barrier() {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profiles");
+        let lease = acquire(&root, "chat").unwrap();
+        let path = lease.path.clone();
+        std::fs::write(path.join("Cookies"), b"synthetic state").unwrap();
+        drop(lease);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let removed = remove(&root, "chat");
+        let profile_absent = !path.exists();
+        let absent = remove(&root, "chat");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            profile_absent,
+            "fixture must remove the profile before the barrier fails"
+        );
+        assert!(
+            removed.is_err(),
+            "profile unlink alone cannot confirm durable removal"
+        );
+        assert!(
+            absent.is_err(),
+            "retry must still sync the parent of an absent profile"
+        );
+        remove(&root, "chat").unwrap();
+    }
 
     #[test]
     fn same_chat_reuses_its_profile_and_other_chats_are_separate() {
