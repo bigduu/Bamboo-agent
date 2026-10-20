@@ -369,9 +369,23 @@ the new queue retroactively.
 Both production jobs use the `bamboo-release` Environment; only the automatic
 job receives the GitHub/HMAC authority. Before
 checkout, a fixed bootstrap verifies the successful same-repository main push CI
-source and that source/workflow SHAs belong to protected dev/main history. The
+source and protected-dev controller history. It binds the server-recorded merged
+release PR's exact head/base, two-parent merge and unchanged release-head tree,
+cut → release-head → protected-dev ancestry, successful full pre-merge release CI
+(including all three platform builds and Promotion Source), and successful main
+push CI. Main push routing may skip platform builds already required before
+merge. Jobs must complete strictly before the merge; failed-only reruns may
+retain earlier successful job attempts. Missing, ambiguous, stale or failed
+evidence stops before checkout or publication credentials. The main branch's
+protection flag is not publication evidence. The existing exact-head review
+remains responsible for cut scope and original F versus integration U; ancestry
+alone cannot distinguish their roles. The
 checkout uses the tested CI SHA, which may differ from the workflow's SHA.
-Pre-policy main commits cannot acquire the new publication authority.
+Pre-policy main commits cannot acquire the new publication authority. Queued
+sources must still equal fresh main before authorization, reservation, tag or
+receipt changes, each crate publish attempt, release completion and each native
+asset upload. API failures stop the write. Manual and historical recovery entry
+contracts, signing authority and allocator remain unchanged.
 
 An authenticated draft body reserves source, frontend and version before any
 crate upload. Original frontend assets and each package checksum are preserved

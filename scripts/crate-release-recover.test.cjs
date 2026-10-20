@@ -58,6 +58,7 @@ function fixture() {
   let completions = 0
   const context = {automatic: true, identity, crates, frontendBytes: receipt.frontendBytes,
     releases: async () => [clone(release)], tags: async () => [TARGET.version], versions: async () => [],
+    assertCurrentMain: async () => {},
     assertSigningKey: () => {}, readReceipt: async (entry, options) => core.readAuthenticatedReceipt(entry, key, options),
     verifyReceipt: value => core.authenticateReceipt(value, key), tagSource: async () => TARGET.source,
     registryFrontier: async () => [], isAncestor: async () => false, ensureFrontend: async () => {},
