@@ -79,6 +79,24 @@ enum DeleteOutcome {
 
 async fn delete_owned(state: web::Data<AppState>, session_id: String) -> DeleteOutcome {
     let _persistence_guard = state.persistence.acquire_lock(&session_id).await;
+    // A 404 is not a terminal Session event. Admit cleanup only from observed
+    // canonical/revocation or browser state, before any target-specific disk
+    // lock, cancellation, retirement fence or profile lease can be created.
+    let evidenced = match state
+        .session_store
+        .session_has_canonical_cleanup_evidence(&session_id)
+        .await
+    {
+        Ok(true) => true,
+        Ok(false) => match state.browser.has_cleanup_evidence(&session_id).await {
+            Ok(evidenced) => evidenced,
+            Err(_) => return DeleteOutcome::StorageFailed(vec![session_id]),
+        },
+        Err(_) => return DeleteOutcome::StorageFailed(vec![session_id]),
+    };
+    if !evidenced {
+        return DeleteOutcome::Missing;
+    }
 
     // Best-effort pre-cancellation of the session (and its children if this is a root session).
     let mut ids_to_cancel: Vec<String> =
@@ -150,6 +168,8 @@ async fn delete_owned(state: web::Data<AppState>, session_id: String) -> DeleteO
     // The preflight may miss children added by another writer. Storage returns
     // its actual locked candidates; canonical absence, not a stale index or
     // the error alone, permits terminal browser cleanup.
+    // These pre-cancel IDs came from the observed canonical/profile target
+    // or stored subtree, after the unknown-ID admission check above.
     actual_candidates.extend(ids_to_cancel);
     actual_candidates.sort();
     actual_candidates.dedup();
@@ -179,7 +199,7 @@ async fn delete_owned(state: web::Data<AppState>, session_id: String) -> DeleteO
                 tracing::warn!(session_id = %id, %error, "deleted session activation cleanup incomplete");
             }
         }
-        if let Err(error) = state.browser.retire(id).await {
+        if let Err(error) = state.browser.retire_deleted_session(id).await {
             tracing::warn!(session_id = %id, %error, "deleted session browser cleanup incomplete; retry deletion");
             browser_cleanup_pending.push(id.clone());
         }
@@ -289,14 +309,23 @@ mod tests {
         let before = (names(&locks), names(&leases), names(&profiles));
         // Three fixed synthetic IDs, repeated once: this is not a stress test.
         for _ in 0..2 {
-            for id in ["never-created-alpha", "never-created-beta", "never-created-gamma"] {
-                let response = handler(state.clone(), web::Path::from(id.to_string())).await.unwrap();
+            for id in [
+                "never-created-alpha",
+                "never-created-beta",
+                "never-created-gamma",
+            ] {
+                let response = handler(state.clone(), web::Path::from(id.to_string()))
+                    .await
+                    .unwrap();
                 assert_eq!(response.status(), actix_web::http::StatusCode::NOT_FOUND);
             }
         }
         assert_eq!((names(&locks), names(&leases), names(&profiles)), before);
         assert_eq!(crate::browser::test_retired_count(&state.browser), 0);
-        assert_eq!(std::fs::read(real.join("Cookies")).unwrap(), b"unrelated synthetic state");
+        assert_eq!(
+            std::fs::read(real.join("Cookies")).unwrap(),
+            b"unrelated synthetic state"
+        );
         state.shutdown().await;
     }
 

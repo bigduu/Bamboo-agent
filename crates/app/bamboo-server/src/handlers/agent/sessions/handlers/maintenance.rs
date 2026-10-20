@@ -295,7 +295,7 @@ async fn finish_cleanup(
     let mut browser_cleanup_pending = Vec::new();
     if !result.deleted_session_ids.is_empty() {
         for session_id in &result.deleted_session_ids {
-            if let Err(error) = state.browser.retire(session_id).await {
+            if let Err(error) = state.browser.retire_deleted_session(session_id).await {
                 tracing::warn!(%session_id, %error, "deleted session browser cleanup incomplete; retry deletion by ID");
                 browser_cleanup_pending.push(session_id.clone());
             }

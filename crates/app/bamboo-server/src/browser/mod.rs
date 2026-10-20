@@ -2199,13 +2199,49 @@ impl BrowserManager {
         self.close_locked(session_id).await
     }
 
+    /// Pure observation for a missing-Session cleanup retry. Never create a
+    /// profile, lease or terminal fence from a caller-supplied ID here.
+    pub(crate) async fn has_cleanup_evidence(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, BrowserError> {
+        if self.retired.lock().unwrap().contains(session_id) {
+            return Ok(true);
+        }
+        if self.sessions.lock().await.contains_key(session_id) {
+            return Ok(true);
+        }
+        match &self.profile_root {
+            Some(root) => profile::has_evidence(root, session_id),
+            None => Ok(false),
+        }
+    }
+
     /// Permanently end a deleted chat's browser lifecycle and purge site data.
     /// Request cancellation must not abandon cleanup after storage deletion.
     pub async fn retire(&self, session_id: &str) -> Result<(), BrowserError> {
+        self.retire_requested(session_id, false).await
+    }
+
+    /// The caller observed a real storage/profile target and confirmed its
+    /// canonical deletion. Persist the terminal fence even if it never opened
+    /// Chromium, so a previously queued open cannot reconstruct its profile.
+    pub(crate) async fn retire_deleted_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(), BrowserError> {
+        self.retire_requested(session_id, true).await
+    }
+
+    async fn retire_requested(
+        &self,
+        session_id: &str,
+        known_deleted: bool,
+    ) -> Result<(), BrowserError> {
         let browser = self.clone();
         let session_id = session_id.to_string();
         tokio::spawn(async move {
-            let result = browser.retire_owned(&session_id).await;
+            let result = browser.retire_owned(&session_id, known_deleted).await;
             if let Err(error) = &result {
                 tracing::warn!(%error, "deleted chat browser profile cleanup failed");
             }
@@ -2215,9 +2251,22 @@ impl BrowserManager {
         .map_err(|_| BrowserError::Unavailable("browser profile cleanup interrupted".into()))?
     }
 
-    async fn retire_owned(&self, session_id: &str) -> Result<(), BrowserError> {
+    async fn retire_owned(
+        &self,
+        session_id: &str,
+        known_deleted: bool,
+    ) -> Result<(), BrowserError> {
         let gate = self.session_gate(session_id);
         let _guard = gate.lock().await;
+        if self.profile_root.is_some()
+            && !known_deleted
+            && !self.has_cleanup_evidence(session_id).await?
+        {
+            return Ok(());
+        }
+        // In production this RAM fence covers only close -> durable marker
+        // handoff, or a failed handoff awaiting retry. Ephemeral test managers
+        // have no disk authority and retain their fence for that instance.
         self.retired.lock().unwrap().insert(session_id.to_string());
         let closed = self.close_locked(session_id).await;
         if let Some(root) = &self.profile_root {
@@ -2226,11 +2275,16 @@ impl BrowserManager {
             // need to import or preserve the last cookie checkpoint.
             let root = root.clone();
             let session_id = session_id.to_string();
-            tokio::task::spawn_blocking(move || profile::remove(&root, &session_id))
-                .await
-                .map_err(|_| {
-                    BrowserError::Unavailable("browser profile cleanup interrupted".into())
-                })?
+            let retired = self.retired.clone();
+            tokio::task::spawn_blocking(move || {
+                profile::remove_notifying(&root, &session_id, || {
+                    // The same stable lease inode now carries a synced terminal
+                    // marker. RAM is no longer the queued/restart replay fence.
+                    retired.lock().unwrap().remove(&session_id);
+                })
+            })
+            .await
+            .map_err(|_| BrowserError::Unavailable("browser profile cleanup interrupted".into()))?
         } else {
             closed
         }

@@ -8,6 +8,7 @@ use super::BrowserError;
 
 const CLOSE_PENDING: &str = ".bamboo-profile-close-pending";
 const LEASES: &str = ".bamboo-profile-leases";
+const RETIRED: &[u8] = b"BAMBOO_BROWSER_RETIRED_V1\n";
 
 pub(super) struct Lease {
     pub(super) path: PathBuf,
@@ -173,9 +174,55 @@ fn lifecycle_lock(root: &Path, session_id: &str) -> Result<std::fs::File, Browse
     lock_file(&locks.join(format!("{}.lock", key(session_id))))
 }
 
+/// Metadata-only cleanup evidence. A missing ID must not mint a stable lock.
+pub(super) fn has_evidence(root: &Path, session_id: &str) -> Result<bool, BrowserError> {
+    let Some(root) = root_directory(root, false)? else {
+        return Ok(false);
+    };
+    let path = root.join(key(session_id));
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => {
+            validate_private_directory(&path)?;
+            return Ok(true);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(unavailable()),
+    }
+    let leases = root.join(LEASES);
+    match std::fs::symlink_metadata(&leases) {
+        Ok(_) => validate_private_directory(&leases)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(unavailable()),
+    }
+    match std::fs::symlink_metadata(leases.join(format!("{}.lock", key(session_id)))) {
+        Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        _ => Err(unavailable()),
+    }
+}
+
+fn is_retired(lock: &std::fs::File) -> Result<bool, BrowserError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = lock;
+    file.seek(SeekFrom::Start(0)).map_err(|_| unavailable())?;
+    let mut bytes = Vec::new();
+    file.take((RETIRED.len() + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| unavailable())?;
+    match bytes.as_slice() {
+        [] => Ok(false),
+        bytes if bytes == RETIRED => Ok(true),
+        // Partial writes and unknown nonempty formats never reopen a profile.
+        _ => Err(unavailable()),
+    }
+}
+
 pub(super) fn acquire(root: &Path, session_id: &str) -> Result<Lease, BrowserError> {
     let root = root_directory(root, true)?.ok_or_else(unavailable)?;
     let lifecycle_lock = lifecycle_lock(&root, session_id)?;
+    if is_retired(&lifecycle_lock)? {
+        return Err(BrowserError::NotOpen);
+    }
     let path = directory(&root, session_id)?;
     let lock = lock_file(&path.join(".bamboo-profile.lock"))?;
     match std::fs::symlink_metadata(path.join(CLOSE_PENDING)) {
@@ -191,24 +238,47 @@ pub(super) fn acquire(root: &Path, session_id: &str) -> Result<Lease, BrowserErr
 
 /// Purge only the derived chat directory, with no live owner. A pending-close
 /// marker prevents replay, not deletion. Never create a missing profile here.
+#[cfg(test)]
 pub(super) fn remove(root: &Path, session_id: &str) -> Result<(), BrowserError> {
-    let Some(root) = root_directory(root, false)? else {
-        return Ok(());
-    };
+    remove_notifying(root, session_id, || {})
+}
+
+pub(super) fn remove_notifying(
+    root: &Path,
+    session_id: &str,
+    retirement_persisted: impl FnOnce(),
+) -> Result<(), BrowserError> {
+    use std::io::{Seek, SeekFrom, Write};
+    let root = root_directory(root, true)?.ok_or_else(unavailable)?;
     let path = root.join(key(session_id));
-    let _lifecycle_lock = lifecycle_lock(&root, session_id)?;
-    // Lock before even the absence check: an opener can own the lease before
-    // creating the profile directory. Its startup is not an absent profile.
-    match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return sync_directory(&root),
+    let lifecycle_lock = lifecycle_lock(&root, session_id)?;
+    // Hold the original inode before observing absence or writing the marker.
+    // Existing/opening owners and preopened descriptors must still contend.
+    let present = match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => return Err(unavailable()),
-        Ok(_) => validate_private_directory(&path)?,
+        Ok(_) => {
+            validate_private_directory(&path)?;
+            true
+        }
+    };
+    let mut file = &lifecycle_lock;
+    file.seek(SeekFrom::Start(0)).map_err(|_| unavailable())?;
+    // Never unlink, rename or clear the lease inode. A partial marker is also
+    // fail-closed; authorized cleanup can complete it on the same inode.
+    file.write_all(RETIRED).map_err(|_| unavailable())?;
+    file.sync_all().map_err(|_| unavailable())?;
+    sync_directory(&root.join(LEASES))?;
+    if present {
+        let _profile_lock = lock_file(&path.join(".bamboo-profile.lock"))?;
+        std::fs::remove_dir_all(path).map_err(|_| unavailable())?;
     }
-    let _profile_lock = lock_file(&path.join(".bamboo-profile.lock"))?;
-    // remove_dir_all unlinks internal symlinks; it does not follow their
-    // targets. The selected root itself must have passed the checks above.
-    std::fs::remove_dir_all(path).map_err(|_| unavailable())?;
-    sync_directory(&root)
+    // Include the containing entries if this known terminal Session never
+    // opened Chromium and its profile/lease containers were just created.
+    sync_directory(&root)?;
+    sync_directory(root.parent().ok_or_else(unavailable)?)?;
+    retirement_persisted();
+    Ok(())
 }
 
 #[cfg(test)]

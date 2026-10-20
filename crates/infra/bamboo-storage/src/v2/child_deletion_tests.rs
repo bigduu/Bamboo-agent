@@ -1,9 +1,13 @@
 use super::*;
 
 #[tokio::test]
-async fn canonical_absence_observation_does_not_create_unknown_session_lock_files() {
+async fn cleanup_admission_does_not_create_unknown_session_lock_files() {
     fn names(path: &std::path::Path) -> Vec<std::ffi::OsString> {
-        let mut result: Vec<_> = std::fs::read_dir(path).into_iter().flatten().map(|entry| entry.unwrap().file_name()).collect();
+        let mut result: Vec<_> = std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
         result.sort();
         result
     }
@@ -11,8 +15,15 @@ async fn canonical_absence_observation_does_not_create_unknown_session_lock_file
     let store = SessionStoreV2::new(home.path().into()).await.unwrap();
     let path = home.path().join(".session-write-locks");
     let before = names(&path);
-    for id in ["never-created-one", "never-created-two", "never-created-three"] {
-        assert!(store.session_is_canonically_absent(id).await.unwrap());
+    for id in [
+        "never-created-one",
+        "never-created-two",
+        "never-created-three",
+    ] {
+        assert!(!store
+            .session_has_canonical_cleanup_evidence(id)
+            .await
+            .unwrap());
     }
     assert_eq!(names(&path), before);
     assert!(store.session_write_locks.is_empty());

@@ -383,6 +383,42 @@ impl SessionStoreV2 {
         }
     }
 
+    /// Tentative cleanup admission only. Observe canonical placement or an
+    /// existing Root revocation without creating a target-specific lock. This
+    /// does not grant absence, identity, execution or permission to purge.
+    pub async fn session_has_canonical_cleanup_evidence(&self, id: &str) -> io::Result<bool> {
+        validate_session_id(id)?;
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let guards = Arc::new((lifecycle, task));
+        let retained = guards.clone();
+        let mut collector = Collector {
+            home: self.bamboo_home_dir.clone(),
+            limits: Limits::default(),
+            counts: Counts::default(),
+            #[cfg(test)]
+            hook: None,
+        };
+        let target = id.to_owned();
+        let present = tokio::task::spawn_blocking(move || {
+            // Keep both global guards if the async waiter disappears. Ordinary
+            // saves may still use shared guards, so this is admission only.
+            let _guards = retained;
+            collector
+                .locate(&target)
+                .map(|location| location.is_some())
+                .map_err(|error| {
+                    other_io_error(format!(
+                        "canonical cleanup admission unavailable: {error:?}"
+                    ))
+                })
+        })
+        .await
+        .map_err(|_| other_io_error("canonical cleanup admission task failed"))??;
+        let _guards = guards;
+        Ok(present || self.root_revocation(id).await?.is_some())
+    }
+
     /// No current permission/lease/lineage proof and no durable vacancy grant.
     pub(crate) async fn canonical_birth_census(&self, id: &str) -> Result<BirthObservation> {
         self.census_with_limits(id, Limits::default()).await

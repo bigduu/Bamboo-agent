@@ -12,10 +12,24 @@ async fn durable_retirement_releases_memory_and_blocks_a_restarted_manager() {
     let browser = BrowserManager::with_profile_root(root.clone());
     browser.retire("deleted").await.unwrap();
     assert!(!path.exists());
-    assert!(browser.retired.lock().unwrap().is_empty(), "a durable retirement must not retain a RAM tombstone");
-    assert!(matches!(browser.open("deleted").await, Err(BrowserError::NotOpen)));
-    assert!(matches!(BrowserManager::with_profile_root(root).open("deleted").await, Err(BrowserError::NotOpen)));
-    assert!(!path.exists(), "a retired profile cannot be reconstructed on reopen");
+    assert!(
+        browser.retired.lock().unwrap().is_empty(),
+        "a durable retirement must not retain a RAM tombstone"
+    );
+    assert!(matches!(
+        browser.open("deleted").await,
+        Err(BrowserError::NotOpen)
+    ));
+    assert!(matches!(
+        BrowserManager::with_profile_root(root)
+            .open("deleted")
+            .await,
+        Err(BrowserError::NotOpen)
+    ));
+    assert!(
+        !path.exists(),
+        "a retired profile cannot be reconstructed on reopen"
+    );
 }
 
 #[cfg(unix)]
@@ -35,10 +49,21 @@ async fn retirement_marker_barrier_failure_keeps_the_memory_fence_until_retry() 
     std::fs::set_permissions(&leases, std::fs::Permissions::from_mode(0o700)).unwrap();
     // Recover and finish this fixture before asserting, including on RED.
     browser.retire("deleted").await.unwrap();
-    assert!(result.is_err(), "retirement requires the stable marker's directory barrier");
-    assert!(retained && blocked, "an unconfirmed durable handoff must retain its RAM fence");
+    assert!(
+        result.is_err(),
+        "retirement requires the stable marker's directory barrier"
+    );
+    assert!(
+        retained && blocked,
+        "an unconfirmed durable handoff must retain its RAM fence"
+    );
     assert!(browser.retired.lock().unwrap().is_empty());
-    assert!(matches!(BrowserManager::with_profile_root(root).open("deleted").await, Err(BrowserError::NotOpen)));
+    assert!(matches!(
+        BrowserManager::with_profile_root(root)
+            .open("deleted")
+            .await,
+        Err(BrowserError::NotOpen)
+    ));
 }
 
 #[tokio::test]
@@ -312,7 +337,16 @@ async fn retirement_keeps_the_stable_lock_inode_and_preopened_descriptors_exclus
     assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
     // A descriptor opened before deletion must contend with future owners of
     // this same path, rather than locking a now-unlinked obsolete inode.
-    let current = profile::acquire(&root, "deleted").unwrap();
+    assert!(matches!(
+        profile::acquire(&root, "deleted"),
+        Err(BrowserError::NotOpen)
+    ));
+    let current = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&stable)
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&current).unwrap();
     assert!(fs2::FileExt::try_lock_exclusive(&competing).is_err());
     drop(current);
     fs2::FileExt::try_lock_exclusive(&competing).unwrap();
