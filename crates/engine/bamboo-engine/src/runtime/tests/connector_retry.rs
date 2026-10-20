@@ -42,7 +42,7 @@ impl LLMProvider for ToolThenAnthropic {
         match self.calls.fetch_add(1, Ordering::SeqCst) {
             0 => Ok(Box::pin(stream::iter(vec![
                 Ok(LLMChunk::ToolCalls(vec![make_tool_call(
-                    "already-done",
+                    "mid-loop-call",
                     "Read",
                     "{}",
                 )])),
@@ -51,7 +51,7 @@ impl LLMProvider for ToolThenAnthropic {
             1 => {
                 assert!(messages
                     .iter()
-                    .any(|m| m.tool_call_id.as_deref() == Some("already-done")));
+                    .any(|m| m.tool_call_id.as_deref() == Some("mid-loop-call")));
                 self.provider.chat_stream(messages, tools, max, model).await
             }
             call => panic!("exhausted request budget must not replay turn: call {call}"),
@@ -102,7 +102,7 @@ async fn connector_exhaustion_preserves_context_and_never_replays_successful_too
         saved
             .messages
             .iter()
-            .filter(|m| m.tool_call_id.as_deref() == Some("already-done"))
+            .filter(|m| m.tool_call_id.as_deref() == Some("mid-loop-call"))
             .count(),
         1
     );
@@ -117,7 +117,20 @@ async fn connector_exhaustion_preserves_context_and_never_replays_successful_too
             errors += 1;
         }
     }
-    assert_eq!(errors, 1, "only the final exhausted error is published");
+    assert_eq!(
+        errors, 0,
+        "direct execution must not emit intermediate request failures"
+    );
+    let event =
+        crate::runtime::execution::agent_spawn::terminal_error_event_for_result(&Err(error))
+            .unwrap();
+    match event {
+        AgentEvent::Error { message } => {
+            assert!(message.contains("temporarily recovering"));
+            assert!(!message.contains("Please check your API key"));
+        }
+        other => panic!("expected the final error event, got {other:?}"),
+    }
 }
 
 struct RecoverThenStreamFailure(AtomicUsize);
@@ -388,4 +401,30 @@ async fn anthropic_zero_semantic_stream_timeout_does_not_restart_a_managed_budge
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn credential_and_permission_denials_with_overflow_text_remain_terminal() {
+    for status in [401, 403] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(ResponseTemplate::new(status).set_body_json(serde_json::json!({"error":{"type":"auth_error","message":"invalid API key; input is too long"}}))).mount(&server).await;
+        let provider = Arc::new(AnthropicProvider::new("fixture-key").with_base_url(server.uri()));
+        let (_temp, agent, storage) = build_direct_execute_agent(provider, None, None).await;
+        let mut session = Session::new(&format!("auth-overflow-{status}"), "test-model");
+        session.add_message(Message::user("preserve context"));
+        storage.save_session(&session).await.unwrap();
+        let (tx, _rx) = mpsc::channel(128);
+        let error = agent
+            .execute(&mut session, direct_request(tx, CancellationToken::new()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::LLMNonRetryable(_)), "{error:?}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let saved = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert!(saved
+            .messages
+            .iter()
+            .any(|m| m.content == "preserve context"));
+        assert!(saved.compression_events.is_empty());
+    }
 }

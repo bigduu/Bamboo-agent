@@ -1578,8 +1578,14 @@ pub(super) async fn execute_llm_stream(
         .await
         .and_then(|result| {
             result.map_err(|error| {
-                if let bamboo_llm::provider::LLMError::RequestFailed(message) = error {
-                    return AgentError::LLMNonRetryable(message);
+                if matches!(
+                    error,
+                    bamboo_llm::provider::LLMError::RequestFailed(_)
+                        | bamboo_llm::provider::LLMError::Auth(_)
+                ) {
+                    // Authentication types outrank text in an upstream body:
+                    // even overflow-looking text cannot authorize another call.
+                    return AgentError::LLMNonRetryable(error.to_string());
                 }
                 let message = format_provider_error(error);
                 if is_llm_overflow_error(&message) {
@@ -1706,16 +1712,14 @@ pub(super) async fn execute_llm_stream(
         Err(mut failure) => {
             // A generic SSE/body error is no safer to replay than a watchdog
             // expiry once text, reasoning or a tool-call delta was observed.
-            if matches!(failure.error, AgentError::LLM(_))
-                && (provider_manages_retry_budget
-                    || !failure.partial_output.content.is_empty()
-                    || !failure.partial_output.reasoning_content.is_empty()
-                    || !failure.partial_output.partial_tool_calls.is_empty())
-            {
-                if let AgentError::LLM(message) = &failure.error {
-                    failure.error = AgentError::LLMNonRetryable(message.clone());
-                }
-            }
+            let replay_unsafe = provider_manages_retry_budget
+                || !failure.partial_output.content.is_empty()
+                || !failure.partial_output.reasoning_content.is_empty()
+                || !failure.partial_output.partial_tool_calls.is_empty();
+            failure.error = match failure.error {
+                AgentError::LLM(message) if replay_unsafe => AgentError::LLMNonRetryable(message),
+                other => other,
+            };
             if let Some(usage) = failure.partial_output.provider_usage {
                 observation.usage(usage.input_tokens, usage.output_tokens);
             }

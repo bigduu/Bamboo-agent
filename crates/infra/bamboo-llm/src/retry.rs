@@ -19,6 +19,10 @@
 //!
 //! Everything else (other 4xx, JSON errors, success) is returned to the caller
 //! immediately and unchanged.
+//!
+//! Anthropic additionally opts into the bounded policy below: only an explicit
+//! connector database recovery diagnostic can make its 401 transient. That
+//! policy shares this retry driver and never resets its budget in the agent loop.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
