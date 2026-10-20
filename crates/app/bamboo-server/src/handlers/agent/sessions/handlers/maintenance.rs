@@ -357,6 +357,35 @@ mod tests {
     use bamboo_llm::Config;
     use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_legacy_child_cleanup_does_not_purge_a_surviving_canonical_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempdir().unwrap();
+        let state = web::Data::new(AppState::new(home.path().into()).await.unwrap());
+        let root = Session::new("canonical-kept-root", "model");
+        let child = Session::new_child_of("canonical-kept-child", &root, "model", "child");
+        state.session_store.save_session(&root).await.unwrap();
+        state.session_store.save_session(&child).await.unwrap();
+        state.session_store.flush_search_index().await;
+        state.sessions.insert(child.id.clone(), Arc::new(bamboo_engine::SessionSnapshot::new(child.clone())));
+        let directory = home.path().join("sessions").join(&root.id).join("children").join(&child.id);
+        let main = directory.join("session.json");
+        let before = std::fs::read(&main).unwrap();
+        let profile = crate::browser::test_profile_directory(&home.path().join("browser-profiles"), &child.id);
+        std::fs::write(profile.join("Cookies"), b"preserve synthetic state").unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let outcome = cleanup_owned(state.clone(), CleanupMode::Children, false).await;
+        if directory.exists() {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(std::fs::read(&main).unwrap(), before);
+        assert_eq!(std::fs::read(profile.join("Cookies")).unwrap(), b"preserve synthetic state");
+        assert!(state.sessions.contains_key(&child.id));
+        assert!(outcome.deleted.deleted_session_ids.is_empty());
+        assert_eq!(outcome.unconfirmed_session_ids, vec![child.id]);
+    }
+
     #[tokio::test]
     async fn partial_storage_cleanup_still_purges_canonically_deleted_profiles_only() {
         let directory = tempdir().unwrap();
