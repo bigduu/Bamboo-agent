@@ -249,9 +249,11 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use bamboo_domain::SupervisorManagementRequest;
+    use std::future::Future;
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Poll, Waker};
     struct NoStore(Arc<AtomicUsize>);
     #[async_trait]
     impl ScopeStore for NoStore {
@@ -280,6 +282,46 @@ mod tests {
         serde_json::from_str(line.trim_start_matches(std::str::from_utf8(FRAME_PREFIX).unwrap()))
             .unwrap()
     }
+
+    #[tokio::test]
+    async fn disconnect_wins_over_a_ready_output_ack_without_granting_authority() {
+        for close_before_ack_poll in [false, true] {
+            let connection = Connection::new();
+            let (queue, receiver) = std::sync::mpsc::sync_channel(1);
+            let output = FrameWriter {
+                queue,
+                connection: connection.clone(),
+            };
+            let response = Response::Ready {
+                version: VERSION,
+                launch_id: Uuid::new_v4(),
+                transport_ready: true,
+                owner_authorization_available: false,
+                authority_profile: NoProvider.profile(),
+            };
+            let mut sending = Box::pin(output.send(&response));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(sending.as_mut().poll(&mut context).is_pending());
+            let pending = receiver.try_recv().unwrap();
+            assert!(pending.bytes.starts_with(FRAME_PREFIX));
+            pending.ack.send(Ok(())).unwrap();
+            if close_before_ack_poll {
+                connection.close();
+            }
+            match sending.as_mut().poll(&mut context) {
+                Poll::Ready(Ok(())) => assert!(!close_before_ack_poll),
+                Poll::Ready(Err(error)) => {
+                    assert!(close_before_ack_poll);
+                    assert_eq!(error.kind(), io::ErrorKind::Other);
+                    assert_eq!(error.to_string(), "native channel closed");
+                }
+                Poll::Pending => panic!("the completed output acknowledgement must be ready"),
+            }
+            connection.close();
+            assert!(!connection.is_open());
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn actual_pipe_handshake_never_grants_or_bootstraps_and_eof_stops_channel() {
         let (mut client_input, input) = UnixStream::pair().unwrap();
@@ -327,11 +369,17 @@ mod tests {
             drop(client_input);
         });
         client.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), worker)
+        let finished = tokio::time::timeout(Duration::from_secs(5), worker)
             .await
             .unwrap()
-            .unwrap()
             .unwrap();
+        // EOF can win the biased close fence after the client reads the final
+        // frame but before `send` observes its writer acknowledgement. This is
+        // an intentional disconnect refusal, never permission or a new grant.
+        if let Err(error) = finished {
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(error.to_string(), "native channel closed");
+        }
         assert!(!end.is_open());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }

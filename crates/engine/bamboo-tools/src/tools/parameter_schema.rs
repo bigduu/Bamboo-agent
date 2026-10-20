@@ -98,7 +98,7 @@ mod tests {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute path to a local PNG, JPEG, GIF, or WebP image"
+                        "description": "Absolute local image path or exact image reference supplied by this conversation"
                     }
                 },
                 "required": ["path"],
