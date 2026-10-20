@@ -362,6 +362,27 @@ mod tests {
     use bamboo_llm::Config;
     use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
 
+    #[tokio::test]
+    async fn bulk_cleanup_retires_a_legacy_root_with_empty_root_session_id() {
+        let home = tempdir().unwrap();
+        let state = web::Data::new(AppState::new(home.path().into()).await.unwrap());
+        let mut root = Session::new("legacy-profile-root", "model");
+        root.root_session_id.clear();
+        state.session_store.save_session(&root).await.unwrap();
+        assert!(state.session_store.get_index_entry(&root.id).await.unwrap().root_session_id.is_empty());
+        state.sessions.insert(root.id.clone(), Arc::new(bamboo_engine::SessionSnapshot::new(root.clone())));
+        let profile = crate::browser::test_profile_directory(&home.path().join("browser-profiles"), &root.id);
+        std::fs::write(profile.join("Cookies"), b"synthetic legacy state").unwrap();
+        let outcome = cleanup_owned(state.clone(), CleanupMode::All, false).await;
+        assert!(state.storage.load_session(&root.id).await.unwrap().is_none());
+        assert_eq!(outcome.deleted.deleted_session_ids, vec![root.id.clone()]);
+        assert_eq!(outcome.deleted.deleted_count, 1);
+        assert!(outcome.unconfirmed_session_ids.is_empty());
+        assert!(outcome.browser_cleanup_pending.is_empty());
+        assert!(!profile.exists());
+        assert!(!state.sessions.contains_key(&root.id));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn successful_legacy_child_cleanup_does_not_purge_a_surviving_canonical_directory() {

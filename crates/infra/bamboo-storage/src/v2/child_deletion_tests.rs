@@ -39,6 +39,28 @@ async fn root_cleanup_progress_includes_canonical_children_missing_from_index() 
     assert_eq!(result.deleted_count, 2);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn root_deletion_progress_rejects_a_linked_sessions_container() {
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let root = Session::new("linked-canonical-root", "model");
+    store.save_session(&root).await.unwrap();
+    store.flush_search_index().await;
+    let sessions = home.path().join("sessions");
+    let outside = home.path().join("owned-outside-sessions");
+    let before = std::fs::read(sessions.join(&root.id).join("session.json")).unwrap();
+    std::fs::rename(&sessions, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &sessions).unwrap();
+    let result = store.delete_session_recursive_with_progress(&root.id, true).await;
+    let preserved = std::fs::read(outside.join(&root.id).join("session.json")).ok();
+    // Restore this fixture's container before asserting, including on RED.
+    std::fs::remove_file(&sessions).unwrap();
+    std::fs::rename(&outside, &sessions).unwrap();
+    assert!(result.is_err(), "linked canonical containers must fail closed");
+    assert_eq!(preserved, Some(before));
+}
+
 #[tokio::test]
 async fn root_deletion_reports_late_children_without_relying_on_a_root_index_row() {
     let home = tempfile::tempdir().unwrap();

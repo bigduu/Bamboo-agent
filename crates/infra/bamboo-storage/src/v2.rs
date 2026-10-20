@@ -5597,6 +5597,9 @@ impl SessionStoreV2 {
         // Pre-compute full deleted id set for a truthful response payload.
         let mut deleted_ids = HashSet::<String>::new();
         for root_id in delete_root_ids.iter() {
+            // Legacy Roots may have an empty root_session_id in their index
+            // row. The selected Root itself is always part of its deletion.
+            deleted_ids.insert(root_id.clone());
             for e in entries.iter().filter(|e| e.root_session_id == *root_id) {
                 deleted_ids.insert(e.id.clone());
             }
@@ -5733,7 +5736,7 @@ impl SessionStoreV2 {
         validate_session_id(root_id)?;
         let root = self.sessions_dir.join(root_id);
         let children = root.join("children");
-        for directory in [&root, &children] {
+        for directory in [&self.sessions_dir, &root, &children] {
             match fs::symlink_metadata(directory).await {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
                 Err(error) => return Err(error),
