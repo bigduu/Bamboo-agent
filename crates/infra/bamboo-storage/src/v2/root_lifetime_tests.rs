@@ -36,6 +36,49 @@ async fn reject(store: &SessionStoreV2, snapshot: &Session) {
     assert_eq!(store.persistence_metrics().full_save.total.count, revision);
 }
 
+async fn reject_corrupt_main(store: &SessionStoreV2, snapshot: &Session) {
+    let directory = store.sessions_root_dir().join(&snapshot.id);
+    let main = fs::read(directory.join("session.json")).await.unwrap();
+    let sidecar = fs::read(directory.join(RUNTIME_SIDECAR_FILE))
+        .await
+        .unwrap();
+    let index = fs::read(store.index_path()).await.unwrap();
+    let revision = store.persistence_metrics().full_save.total.count;
+    for runtime in [false, true] {
+        let error = if runtime {
+            store.save_runtime_state(snapshot).await
+        } else {
+            store.save_session(snapshot).await
+        }
+        .unwrap_err();
+        // Full saves report strict Main parsing directly. Runtime writes keep
+        // the typed Root context refusal; neither path may repair corruption.
+        // The lifetime-conflict oracle in `reject` remains unchanged.
+        if runtime {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error:?}");
+            assert!(error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
+            assert!(error.to_string().contains("invalid compact Main authority"));
+        } else {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error:?}");
+            assert_eq!(error.to_string(), "invalid compact Main authority");
+        }
+        assert_eq!(
+            fs::read(directory.join("session.json")).await.unwrap(),
+            main
+        );
+        assert_eq!(
+            fs::read(directory.join(RUNTIME_SIDECAR_FILE))
+                .await
+                .unwrap(),
+            sidecar
+        );
+        assert_eq!(fs::read(store.index_path()).await.unwrap(), index);
+    }
+    assert_eq!(store.persistence_metrics().full_save.total.count, revision);
+}
+
 async fn revoke_without_removing(store: &SessionStoreV2, id: &str) {
     let _lifecycle = store.lock_session_lifecycle_exclusive().await.unwrap();
     let _task = store
@@ -702,7 +745,12 @@ async fn startup_isolates_a_corrupt_recreated_root_until_canonical_pair_is_resto
             // independent evidence before an ordinary writer can proceed.
             // A parseable older runtime could otherwise overwrite a newer
             // Root tool restriction hidden by corrupt main bytes.
-            reject(&restarted, &recreated).await;
+            if corrupt_runtime {
+                reject(&restarted, &recreated).await;
+            } else {
+                reject_corrupt_main(&restarted, &recreated).await;
+            }
+            assert_eq!(fs::read(&child_main).await.unwrap(), before_child);
             if corrupt_runtime {
                 fs::write(&runtime_path, &before_runtime).await.unwrap();
             } else {
