@@ -40,7 +40,10 @@ impl Storage for OrphanChildIndexStorage {
     ) -> std::io::Result<Vec<(String, Option<String>)>> {
         self.index_reads.fetch_add(1, Ordering::SeqCst);
         match self.index_error {
-            Some(kind) => Err(std::io::Error::new(kind, "private child-index fixture detail")),
+            Some(kind) => Err(std::io::Error::new(
+                kind,
+                "private child-index fixture detail",
+            )),
             None => Ok(Vec::new()),
         }
     }
@@ -91,8 +94,12 @@ async fn orphan_child_index_failure_preserves_history_and_existing_wait_exactly(
                 .expect("an unreadable child index must not mean no active children");
 
             assert!(matches!(&error, AgentError::Tool(_)));
-            assert!(error.to_string().contains("child status observation failed"));
-            assert!(!error.to_string().contains("private child-index fixture detail"));
+            assert!(error
+                .to_string()
+                .contains("child status observation failed"));
+            assert!(!error
+                .to_string()
+                .contains("private child-index fixture detail"));
             assert_eq!(runtime, before_runtime);
             assert_eq!(serde_json::to_value(&session).unwrap(), before_session);
             assert_eq!(storage.index_reads.load(Ordering::SeqCst), 1);
@@ -129,6 +136,7 @@ async fn orphan_child_index_failure_stops_real_pipeline_without_retry_or_complet
     let config = orphan_child_index_runner_config(storage.clone());
     let mut session = Session::new("child-index-error-runner", "model");
     session.add_message(Message::user("finish the existing work"));
+    storage.inner.save_session(&session).await.unwrap();
     let mut state = e2e_loop_state(&session.id);
     let provider = Arc::new(ContextProbeProvider::default());
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
@@ -146,7 +154,9 @@ async fn orphan_child_index_failure_stops_real_pipeline_without_retry_or_complet
     .expect_err("the real terminal gate must reject unknown child state");
 
     assert!(matches!(&error, AgentError::Tool(_)));
-    assert!(error.to_string().contains("child status observation failed"));
+    assert!(error
+        .to_string()
+        .contains("child status observation failed"));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     assert!(storage.index_reads.load(Ordering::SeqCst) > 0);
     assert!(state.runtime_state.waiting_for_children.is_none());
@@ -165,6 +175,7 @@ async fn orphan_child_index_observed_empty_still_completes_real_pipeline() {
     let config = orphan_child_index_runner_config(storage.clone());
     let mut session = Session::new("child-index-empty-runner", "model");
     session.add_message(Message::user("finish the existing work"));
+    storage.inner.save_session(&session).await.unwrap();
     let mut state = e2e_loop_state(&session.id);
     let provider = Arc::new(ContextProbeProvider::default());
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
