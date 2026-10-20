@@ -1,6 +1,55 @@
 use super::*;
 use std::sync::{Condvar, Mutex as StdMutex};
 
+#[tokio::test]
+async fn root_deletion_reports_late_children_without_relying_on_a_root_index_row() {
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let root = Session::new("deletion-progress-root", "model");
+    store.save_session(&root).await.unwrap();
+    let preflight = store.list_index_entries().await;
+    assert_eq!(preflight.len(), 1);
+    let child = Session::new_child_of("deletion-progress-late-child", &root, "model", "child");
+    store.save_session(&child).await.unwrap();
+    // Exact interleaving: caller preflight precedes this admitted Child. The
+    // Root remains canonical even if its rebuildable index row is missing.
+    store.update_index(|index| { index.sessions.remove(&root.id); Ok(()) }).await.unwrap();
+    assert!(store.get_index_entry(&root.id).await.is_none());
+    let result = store.delete_session_recursive_with_progress(&root.id, true).await.unwrap();
+    assert!(result.deleted);
+    let mut expected = vec![root.id.clone(), child.id.clone()];
+    expected.sort();
+    assert_eq!(result.candidate_session_ids, expected);
+    assert!(store.load_session(&root.id).await.unwrap().is_none());
+    assert!(store.load_session(&child.id).await.unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_cleanup_retains_the_exact_locked_batch_for_terminal_resource_cleanup() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let blocked = Session::new("cleanup-progress-blocked", "model");
+    let other = Session::new("cleanup-progress-other", "model");
+    store.save_session(&blocked).await.unwrap();
+    store.save_session(&other).await.unwrap();
+    store.flush_search_index().await;
+    let directory = home.path().join("sessions").join(&blocked.id);
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = store.cleanup_with_progress(CleanupMode::All, false).await;
+    if directory.exists() {
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let failure = result.expect_err("fixture must fail a real directory removal");
+    assert_eq!(failure.error.kind(), io::ErrorKind::PermissionDenied);
+    let mut expected = vec![blocked.id, other.id];
+    expected.sort();
+    assert_eq!(failure.candidate_session_ids, expected);
+    // Whether the unordered batch reached the other Root first or not, the
+    // caller receives every actual candidate, including the failed step.
+}
+
 const ROOT: &str = "delete-guard-root";
 const CHILD: &str = "delete-guard-child";
 const SIBLING: &str = "delete-guard-sibling";

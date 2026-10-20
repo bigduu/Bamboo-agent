@@ -7,10 +7,14 @@ use sha2::{Digest, Sha256};
 use super::BrowserError;
 
 const CLOSE_PENDING: &str = ".bamboo-profile-close-pending";
+const LEASES: &str = ".bamboo-profile-leases";
 
 pub(super) struct Lease {
     pub(super) path: PathBuf,
     _lock: std::fs::File,
+    // Never unlink this lock with the profile: queued openers may already hold
+    // a descriptor to its inode. Open and deletion use the same stable lock.
+    _lifecycle_lock: std::fs::File,
 }
 
 impl Lease {
@@ -71,6 +75,10 @@ fn private_directory(path: &Path) -> Result<(), BrowserError> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(_) => return Err(unavailable()),
     }
+    validate_private_directory(path)
+}
+
+fn validate_private_directory(path: &Path) -> Result<(), BrowserError> {
     let metadata = std::fs::symlink_metadata(path).map_err(|_| unavailable())?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(unavailable());
@@ -87,24 +95,42 @@ fn private_directory(path: &Path) -> Result<(), BrowserError> {
     Ok(())
 }
 
-pub(super) fn directory(root: &Path, session_id: &str) -> Result<PathBuf, BrowserError> {
+fn root_directory(root: &Path, create: bool) -> Result<Option<PathBuf>, BrowserError> {
     let parent = root.parent().ok_or_else(unavailable)?;
-    let parent = std::fs::canonicalize(parent).map_err(|_| unavailable())?;
+    let parent = match std::fs::canonicalize(parent) {
+        Ok(parent) => parent,
+        Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(unavailable()),
+    };
     let root = parent.join(root.file_name().ok_or_else(unavailable)?);
-    private_directory(&root)?;
-    let key: String = Sha256::digest(session_id.as_bytes())
+    if create {
+        private_directory(&root)?;
+    } else {
+        match std::fs::symlink_metadata(&root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(unavailable()),
+            Ok(_) => validate_private_directory(&root)?,
+        }
+    }
+    Ok(Some(root))
+}
+
+fn key(session_id: &str) -> String {
+    Sha256::digest(session_id.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect();
-    let profile = root.join(key);
+        .collect()
+}
+
+pub(super) fn directory(root: &Path, session_id: &str) -> Result<PathBuf, BrowserError> {
+    let root = root_directory(root, true)?.ok_or_else(unavailable)?;
+    let profile = root.join(key(session_id));
     private_directory(&profile)?;
     std::fs::canonicalize(profile).map_err(|_| unavailable())
 }
 
-pub(super) fn acquire(root: &Path, session_id: &str) -> Result<Lease, BrowserError> {
-    let path = directory(root, session_id)?;
-    let lock_path = path.join(".bamboo-profile.lock");
-    if let Ok(metadata) = std::fs::symlink_metadata(&lock_path) {
+fn lock_file(lock_path: &Path) -> Result<std::fs::File, BrowserError> {
+    if let Ok(metadata) = std::fs::symlink_metadata(lock_path) {
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(unavailable());
         }
@@ -118,11 +144,44 @@ pub(super) fn acquire(root: &Path, session_id: &str) -> Result<Lease, BrowserErr
     }
     let lock = options.open(lock_path).map_err(|_| unavailable())?;
     fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| unavailable())?;
+    Ok(lock)
+}
+
+fn lifecycle_lock(root: &Path, session_id: &str) -> Result<std::fs::File, BrowserError> {
+    let locks = root.join(LEASES);
+    private_directory(&locks)?;
+    lock_file(&locks.join(format!("{}.lock", key(session_id))))
+}
+
+pub(super) fn acquire(root: &Path, session_id: &str) -> Result<Lease, BrowserError> {
+    let root = root_directory(root, true)?.ok_or_else(unavailable)?;
+    let lifecycle_lock = lifecycle_lock(&root, session_id)?;
+    let path = directory(&root, session_id)?;
+    let lock = lock_file(&path.join(".bamboo-profile.lock"))?;
     match std::fs::symlink_metadata(path.join(CLOSE_PENDING)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         _ => return Err(unavailable()),
     }
-    Ok(Lease { path, _lock: lock })
+    Ok(Lease { path, _lock: lock, _lifecycle_lock: lifecycle_lock })
+}
+
+/// Purge only the derived chat directory, with no live owner. A pending-close
+/// marker prevents replay, not deletion. Never create a missing profile here.
+pub(super) fn remove(root: &Path, session_id: &str) -> Result<(), BrowserError> {
+    let Some(root) = root_directory(root, false)? else { return Ok(()); };
+    let path = root.join(key(session_id));
+    let _lifecycle_lock = lifecycle_lock(&root, session_id)?;
+    // Lock before even the absence check: an opener can own the lease before
+    // creating the profile directory. Its startup is not an absent profile.
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(unavailable()),
+        Ok(_) => validate_private_directory(&path)?,
+    }
+    let _profile_lock = lock_file(&path.join(".bamboo-profile.lock"))?;
+    // remove_dir_all unlinks internal symlinks; it does not follow their
+    // targets. The selected root itself must have passed the checks above.
+    std::fs::remove_dir_all(path).map_err(|_| unavailable())
 }
 
 #[cfg(test)]

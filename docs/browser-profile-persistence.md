@@ -17,6 +17,22 @@ been reaped; another manager cannot concurrently open the same chat profile.
 Dropping the manager transfers the child, scratch directory and lease to a
 reaper that can finish even after the async runtime has shut down.
 
+Deleting a chat is terminal, including recursive root/child deletion and bulk
+cleanup. It reaps the owned host and removes that chat's entire profile, even
+when the browser was already closed or had an unconfirmed close. Normal close
+and idle reclamation keep the profile. Open and delete share a stable per-chat
+file lock outside the profile directory; deletion never removes that lock or
+follows a profile symlink into another directory. Another live owner's lease
+blocks deletion. Storage deletion and profile cleanup continue if the HTTP
+waiter disconnects. Cleanup failures return an error with the affected session
+IDs; retrying deletion by those IDs also retries profiles whose chat storage is
+already gone. Recursive and bulk storage operations report their actual
+candidate IDs under their lifecycle lock, including late children and partially
+failed batches. On partial failure the backend checks canonical absence before
+purging any candidate's browser data; existing or unreadable Sessions retain
+their data. This removes files, without promising physical secure erasure of
+underlying storage media or backups.
+
 Chromium persists cookies, localStorage and IndexedDB. The bundled headless shell
 does not restore session-only cookies by itself, so those cookies have a private,
 atomic checkpoint inside the same profile. A successful host command waits for

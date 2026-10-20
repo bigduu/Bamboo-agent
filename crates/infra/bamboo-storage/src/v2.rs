@@ -5495,6 +5495,18 @@ impl SessionStoreV2 {
     }
 
     pub async fn cleanup(&self, mode: CleanupMode, keep_pinned: bool) -> io::Result<CleanupResult> {
+        self.cleanup_with_progress(mode, keep_pinned)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// Preserve the actual locked batch on partial failure. Callers may then
+    /// confirm canonical absence and finish terminal resources for deleted IDs.
+    pub async fn cleanup_with_progress(
+        &self,
+        mode: CleanupMode,
+        keep_pinned: bool,
+    ) -> Result<CleanupResult, CleanupFailure> {
         let lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
         let guards = Arc::new(SessionDeletionGuards {
@@ -5592,20 +5604,26 @@ impl SessionStoreV2 {
         for child_id in delete_child_ids.iter() {
             deleted_ids.insert(child_id.clone());
         }
+        let mut deleted_session_ids: Vec<String> = deleted_ids.into_iter().collect();
+        deleted_session_ids.sort();
 
         // Apply deletions (roots first; they delete children implicitly).
         for root_id in delete_root_ids.iter() {
-            let _ = self
+            if let Err(error) = self
                 .delete_session_recursive_locked(root_id, true, &guards)
-                .await?;
+                .await
+            {
+                return Err(CleanupFailure { error, candidate_session_ids: deleted_session_ids });
+            }
         }
         for child_id in delete_child_ids.iter() {
-            let _ = self
+            if let Err(error) = self
                 .delete_session_recursive_locked(child_id, true, &guards)
-                .await?;
+                .await
+            {
+                return Err(CleanupFailure { error, candidate_session_ids: deleted_session_ids });
+            }
         }
-        let mut deleted_session_ids: Vec<String> = deleted_ids.into_iter().collect();
-        deleted_session_ids.sort();
         Ok(CleanupResult {
             deleted_count: deleted_session_ids.len(),
             deleted_session_ids,
@@ -5684,6 +5702,19 @@ impl SessionStoreV2 {
         session_id: &str,
         force: bool,
     ) -> io::Result<bool> {
+        self.delete_session_recursive_with_progress(session_id, force)
+            .await
+            .map(|result| result.deleted)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Report the true locked subtree candidates, including children admitted
+    /// after a caller's preflight and children whose Root index row is absent.
+    pub async fn delete_session_recursive_with_progress(
+        &self,
+        session_id: &str,
+        force: bool,
+    ) -> Result<SessionDeletionResult, CleanupFailure> {
         let lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
         let guards = Arc::new(SessionDeletionGuards {
@@ -5693,8 +5724,17 @@ impl SessionStoreV2 {
         self.recover_all_runtime_task_transactions_locked(&guards.runtime_task)
             .await?;
         self.recover_all_session_copy_transactions_locked().await?;
-        self.delete_session_recursive_locked(session_id, force, &guards)
-            .await
+        validate_session_id(session_id)?;
+        let mut candidate_session_ids: Vec<String> = self.index.read().await.sessions.values()
+            .filter(|entry| entry.id == session_id || entry.root_session_id == session_id)
+            .map(|entry| entry.id.clone()).collect();
+        candidate_session_ids.push(session_id.to_string());
+        candidate_session_ids.sort();
+        candidate_session_ids.dedup();
+        match self.delete_session_recursive_locked(session_id, force, &guards).await {
+            Ok(deleted) => Ok(SessionDeletionResult { deleted, candidate_session_ids }),
+            Err(error) => Err(CleanupFailure { error, candidate_session_ids }),
+        }
     }
 
     async fn remove_child_directory(
@@ -5842,6 +5882,26 @@ pub enum CleanupMode {
 pub struct CleanupResult {
     pub deleted_count: usize,
     pub deleted_session_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct CleanupFailure {
+    pub error: io::Error,
+    /// Selected while holding the same lifecycle lock as the actual deletes.
+    /// These are candidates, not proof that every ID was removed.
+    pub candidate_session_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct SessionDeletionResult {
+    pub deleted: bool,
+    pub candidate_session_ids: Vec<String>,
+}
+
+impl From<io::Error> for CleanupFailure {
+    fn from(error: io::Error) -> Self {
+        Self { error, candidate_session_ids: Vec::new() }
+    }
 }
 
 /// Atomically write `bytes` to `path`: write a uniquely-named temp file in the

@@ -3,7 +3,14 @@
 
 #[cfg(test)]
 mod persistence_tests;
+#[cfg(test)]
+mod retirement_tests;
 mod profile;
+
+#[cfg(test)]
+pub(crate) fn test_profile_directory(root: &std::path::Path, session_id: &str) -> PathBuf {
+    profile::directory(root, session_id).expect("isolated browser profile fixture")
+}
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -2052,13 +2059,39 @@ impl BrowserManager {
         self.close_locked(session_id).await
     }
 
-    /// Permanently end a deleted chat's browser lifecycle in this process.
-    /// A tool call queued behind deletion cannot create a late orphaned host.
+    /// Permanently end a deleted chat's browser lifecycle and purge site data.
+    /// Request cancellation must not abandon cleanup after storage deletion.
     pub async fn retire(&self, session_id: &str) -> Result<(), BrowserError> {
+        let browser = self.clone();
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            let result = browser.retire_owned(&session_id).await;
+            if let Err(error) = &result {
+                tracing::warn!(%error, "deleted chat browser profile cleanup failed");
+            }
+            result
+        })
+        .await
+        .map_err(|_| BrowserError::Unavailable("browser profile cleanup interrupted".into()))?
+    }
+
+    async fn retire_owned(&self, session_id: &str) -> Result<(), BrowserError> {
         let gate = self.session_gate(session_id);
         let _guard = gate.lock().await;
         self.retired.lock().unwrap().insert(session_id.to_string());
-        self.close_locked(session_id).await
+        let closed = self.close_locked(session_id).await;
+        if let Some(root) = &self.profile_root {
+            // Reacquiring both file locks proves that no host still owns the
+            // profile, even after a forced/unconfirmed close. Delete does not
+            // need to import or preserve the last cookie checkpoint.
+            let root = root.clone();
+            let session_id = session_id.to_string();
+            tokio::task::spawn_blocking(move || profile::remove(&root, &session_id))
+                .await
+                .map_err(|_| BrowserError::Unavailable("browser profile cleanup interrupted".into()))?
+        } else {
+            closed
+        }
     }
 
     async fn close_locked(&self, session_id: &str) -> Result<(), BrowserError> {
