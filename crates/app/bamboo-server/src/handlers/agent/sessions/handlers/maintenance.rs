@@ -216,7 +216,7 @@ pub async fn cleanup_sessions(
     let outcome = tokio::spawn(cleanup_owned(state, mode, req.keep_pinned))
         .await
         .map_err(|_| crate::error::json_internal_server_error("Session cleanup interrupted"))?;
-    if outcome.storage_error.is_some() || !outcome.browser_cleanup_pending.is_empty() {
+    if outcome.storage_error.is_some() || !outcome.browser_cleanup_pending.is_empty() || !outcome.unconfirmed_session_ids.is_empty() {
         return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
             "error": crate::error::error_value("Session cleanup incomplete. Check the reported session IDs before retrying deletion."),
             "storage_cleanup_error": outcome.storage_error,
@@ -255,29 +255,34 @@ async fn finish_cleanup(
     result: std::result::Result<CleanupResult, CleanupFailure>,
 ) -> CleanupOutcome {
     let mut unconfirmed_session_ids = Vec::new();
-    let (result, storage_error) = match result {
+    let (candidates, storage_error) = match result {
         Ok(result) => (result, None),
         Err(failure) => {
             tracing::warn!(error = %failure.error, "session cleanup partially failed; checking canonical deletions");
-            let mut deleted_session_ids = Vec::new();
-            for session_id in failure.candidate_session_ids {
-                // The index/cache alone is not proof of deletion. Purge only
-                // IDs whose canonical storage now confirms absence.
-                match state.storage.load_session(&session_id).await {
-                    Ok(None) => deleted_session_ids.push(session_id),
-                    Ok(Some(_)) => {}
-                    Err(_) => unconfirmed_session_ids.push(session_id),
-                }
-            }
-            deleted_session_ids.sort();
             (
                 CleanupResult {
-                    deleted_count: deleted_session_ids.len(),
-                    deleted_session_ids,
+                    deleted_count: failure.candidate_session_ids.len(),
+                    deleted_session_ids: failure.candidate_session_ids,
                 },
                 Some(failure.error.to_string()),
             )
         }
+    };
+    let mut deleted_session_ids = Vec::new();
+    for session_id in candidates.deleted_session_ids {
+        // Even a successful legacy result may only have removed an index row
+        // after a failed Child directory unlink. Never purge surviving state.
+        match state.session_store.session_is_canonically_absent(&session_id).await {
+            Ok(true) => deleted_session_ids.push(session_id),
+            Ok(false) if storage_error.is_none() => unconfirmed_session_ids.push(session_id),
+            Ok(false) => {},
+            Err(_) => unconfirmed_session_ids.push(session_id),
+        }
+    }
+    deleted_session_ids.sort();
+    let result = CleanupResult {
+        deleted_count: deleted_session_ids.len(),
+        deleted_session_ids,
     };
 
     let mut browser_cleanup_pending = Vec::new();

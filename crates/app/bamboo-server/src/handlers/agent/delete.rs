@@ -131,7 +131,7 @@ async fn delete_owned(state: web::Data<AppState>, session_id: String) -> DeleteO
 
     let pre_cancelled_ids: std::collections::HashSet<String> =
         ids_to_cancel.iter().cloned().collect();
-    let (deleted_from_storage, storage_failed, mut actual_candidates) = match state
+    let (deleted_from_storage, mut storage_failed, mut actual_candidates) = match state
         .session_store
         .delete_session_recursive_with_progress(&session_id, true)
         .await
@@ -156,9 +156,15 @@ async fn delete_owned(state: web::Data<AppState>, session_id: String) -> DeleteO
     let mut browser_cleanup_pending = Vec::new();
     ids_to_cancel = Vec::new();
     for id in actual_candidates {
-        match state.storage.load_session(&id).await {
-            Ok(None) => ids_to_cancel.push(id),
-            Ok(Some(_)) => {}
+        match state.session_store.session_is_canonically_absent(&id).await {
+            Ok(true) => ids_to_cancel.push(id),
+            Ok(false) if deleted_from_storage => {
+                // Legacy child deletion can remove only its index row after a
+                // filesystem failure. Preserve the still-canonical Session.
+                storage_failed = true;
+                browser_cleanup_pending.push(id);
+            }
+            Ok(false) => {}
             Err(_) => browser_cleanup_pending.push(id),
         }
     }

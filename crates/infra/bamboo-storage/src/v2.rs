@@ -5604,6 +5604,19 @@ impl SessionStoreV2 {
         for child_id in delete_child_ids.iter() {
             deleted_ids.insert(child_id.clone());
         }
+        // A Root removal unlinks the canonical children tree even if its
+        // rebuildable index omits a Child. Census before any batch deletion,
+        // under the same exclusive lifecycle guard as the physical removals.
+        for root_id in &delete_root_ids {
+            match self.canonical_root_child_ids(root_id).await {
+                Ok(children) => deleted_ids.extend(children),
+                Err(error) => {
+                    let mut candidate_session_ids: Vec<_> = deleted_ids.into_iter().collect();
+                    candidate_session_ids.sort();
+                    return Err(CleanupFailure { error, candidate_session_ids });
+                }
+            }
+        }
         let mut deleted_session_ids: Vec<String> = deleted_ids.into_iter().collect();
         deleted_session_ids.sort();
 
@@ -5714,6 +5727,33 @@ impl SessionStoreV2 {
             .map_err(|failure| failure.error)
     }
 
+    // The caller holds lifecycle/Task exclusivity. Do not trust derived index
+    // rows to describe everything remove_dir_all will unlink below a Root.
+    async fn canonical_root_child_ids(&self, root_id: &str) -> io::Result<Vec<String>> {
+        validate_session_id(root_id)?;
+        let root = self.sessions_dir.join(root_id);
+        let children = root.join("children");
+        for directory in [&root, &children] {
+            match fs::symlink_metadata(directory).await {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => return Err(other_io_error("canonical session tree is not a real directory")),
+            }
+        }
+        let mut entries = fs::read_dir(children).await?;
+        let mut ids = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
+                let id = entry.file_name().into_string().map_err(|_| other_io_error("invalid canonical Child directory name"))?;
+                validate_session_id(&id)?;
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
     /// Report the true locked subtree candidates, including children admitted
     /// after a caller's preflight and children whose Root index row is absent.
     pub async fn delete_session_recursive_with_progress(
@@ -5741,6 +5781,10 @@ impl SessionStoreV2 {
             .map(|entry| entry.id.clone())
             .collect();
         candidate_session_ids.push(session_id.to_string());
+        match self.canonical_root_child_ids(session_id).await {
+            Ok(children) => candidate_session_ids.extend(children),
+            Err(error) => return Err(CleanupFailure { error, candidate_session_ids }),
+        }
         candidate_session_ids.sort();
         candidate_session_ids.dedup();
         match self

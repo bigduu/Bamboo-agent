@@ -351,6 +351,35 @@ impl Collector {
 }
 
 impl SessionStoreV2 {
+    /// Read-only terminal-cleanup observation, never an execution/identity grant.
+    /// A missing rebuildable index row is not absence: inspect canonical Root
+    /// and Child locations with the existing bounded, no-symlink locator. A
+    /// remaining tree under a canonically revoked Root is logically deleted.
+    pub async fn session_is_canonically_absent(&self, id: &str) -> io::Result<bool> {
+        validate_session_id(id)?;
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let session = self.acquire_session_maintenance_lock(id).await?;
+        let guards = DefaultWriterGuards::shared(lifecycle, task, session);
+        let mut collector = Collector {
+            home: self.bamboo_home_dir.clone(),
+            limits: Limits::default(),
+            counts: Counts::default(),
+            #[cfg(test)]
+            hook: None,
+        };
+        let id = id.to_owned();
+        let location = Self::default_writer_job(&guards, move || {
+            collector.locate(&id).map_err(|error| {
+                other_io_error(format!("canonical cleanup observation unavailable: {error:?}"))
+            })
+        }).await?;
+        match location {
+            None => Ok(true),
+            Some((_, root, _)) => self.root_directory_is_revoked(&root).await,
+        }
+    }
+
     /// No current permission/lease/lineage proof and no durable vacancy grant.
     pub(crate) async fn canonical_birth_census(&self, id: &str) -> Result<BirthObservation> {
         self.census_with_limits(id, Limits::default()).await
