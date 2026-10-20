@@ -349,3 +349,20 @@ async fn dropping_during_error_body_read_closes_the_pending_request() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn disabled_connector_retries_issue_exactly_one_request() {
+    for attempts in [0, 1] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(recovery_body()))
+            .mount(&server)
+            .await;
+        let cfg = config(attempts);
+        let error = run(&server, &cfg, &InitialRequestBudget::new(&cfg))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, LLMError::RequestFailed(_)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
