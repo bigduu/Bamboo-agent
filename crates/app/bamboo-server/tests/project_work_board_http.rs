@@ -38,6 +38,8 @@ async fn review_semantic_project_preflight_precedes_intent_and_membership_public
                 "user.name=Fixture",
                 "-c",
                 "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "-m",
                 "fixture",
@@ -71,7 +73,13 @@ async fn review_semantic_project_preflight_precedes_intent_and_membership_public
         }
     }
 
-    for mutation in ["resource", "binding", "archived-start", "archived-create"] {
+    for mutation in [
+        "resource",
+        "binding",
+        "archived-start",
+        "archived-create",
+        "shadowed-start",
+    ] {
         let root = tempfile::tempdir().unwrap();
         let execution = workspace(root.path());
         let mut state = AppState::new_with_memory_store(
@@ -202,24 +210,47 @@ async fn review_semantic_project_preflight_precedes_intent_and_membership_public
                 item_ids: vec!["item".into()],
                 source_quote: text.into(),
                 clarification: None,
-                operations: vec![if mutation == "archived-create" {
-                    SemanticOperation::Create {
-                        temp_id: "child".into(),
-                        kind: TicketKind::Work,
-                        parent: Some(TicketReference::from_ticket(&snapshot.tickets[&goal])),
-                        contract: Contract {
-                            title: "child".into(),
-                            ..contract.clone()
+                operations: if mutation == "shadowed-start" {
+                    vec![
+                        SemanticOperation::Create {
+                            temp_id: work.clone(),
+                            kind: TicketKind::Work,
+                            parent: None,
+                            contract: Contract {
+                                title: "detached".into(),
+                                ..contract.clone()
+                            },
+                            depends_on: vec![],
                         },
-                        depends_on: vec![],
-                    }
+                        SemanticOperation::Ready {
+                            target: TicketReference::Temporary { id: work.clone() },
+                        },
+                        SemanticOperation::Start {
+                            target: TicketReference::Temporary { id: work.clone() },
+                            temp_id: "assignment".into(),
+                            workspace: Some(execution.clone()),
+                        },
+                    ]
                 } else {
-                    SemanticOperation::Start {
-                        target: TicketReference::from_ticket(&snapshot.tickets[&work]),
-                        temp_id: "assignment".into(),
-                        workspace: Some(execution.clone()),
-                    }
-                }],
+                    vec![if mutation == "archived-create" {
+                        SemanticOperation::Create {
+                            temp_id: "child".into(),
+                            kind: TicketKind::Work,
+                            parent: Some(TicketReference::from_ticket(&snapshot.tickets[&goal])),
+                            contract: Contract {
+                                title: "child".into(),
+                                ..contract.clone()
+                            },
+                            depends_on: vec![],
+                        }
+                    } else {
+                        SemanticOperation::Start {
+                            target: TicketReference::from_ticket(&snapshot.tickets[&work]),
+                            temp_id: "assignment".into(),
+                            workspace: Some(execution.clone()),
+                        }
+                    }]
+                },
             }],
         };
         match mutation {
@@ -247,6 +278,49 @@ async fn review_semantic_project_preflight_precedes_intent_and_membership_public
             .tickets
             .resolve_message("semantic-human", &proposal_for(&before.1))
             .await;
+        if mutation == "shadowed-start" {
+            let response = result.unwrap();
+            assert_eq!(
+                response["resolution"]["groups"][0]["status"], "committed",
+                "{response}"
+            );
+            let new_work = response["resolution"]["groups"][0]["receipt"]["ids"][work.as_str()]
+                .as_str()
+                .unwrap();
+            assert_ne!(new_work, work);
+            let committed = service.published().unwrap();
+            assert!(!committed.1.project.links.contains_key(new_work));
+            assert_eq!(committed.1.assignments.len(), 1);
+            assert_eq!(
+                committed.1.assignments.values().next().unwrap().work_id,
+                new_work
+            );
+            assert_eq!(
+                canonical_bytes(&committed.1.tickets[&work]).unwrap(),
+                canonical_bytes(&before.1.tickets[&work]).unwrap()
+            );
+            let proposal = proposal_for(&before.1);
+            let replay = state
+                .tickets
+                .resolve_message("semantic-human", &proposal)
+                .await
+                .unwrap();
+            assert_eq!(replay["resolution"], response["resolution"]);
+            assert_eq!(
+                canonical_bytes(&service.published().unwrap()).unwrap(),
+                canonical_bytes(&committed).unwrap()
+            );
+            let mut changed = proposal;
+            changed.groups[0].group_id = "different-group".into();
+            assert!(matches!(
+                state
+                    .tickets
+                    .resolve_message("semantic-human", &changed)
+                    .await,
+                Err(Error::IdempotencyConflict)
+            ));
+            continue;
+        }
         assert!(result.is_err(), "Semantic Project preflight must reject before publishing intent or inherited membership ({mutation}): {result:?}");
         assert!(matches!(
             result,
@@ -335,15 +409,21 @@ async fn review_semantic_project_preflight_precedes_intent_and_membership_public
             canonical_bytes(&service.published().unwrap()).unwrap(),
             canonical_bytes(&committed).unwrap()
         );
-        let mut changed = proposal;
-        changed.groups[0].source_quote = "changed retry".into();
-        assert!(matches!(
-            state
-                .tickets
-                .resolve_message("semantic-human", &changed)
-                .await,
-            Err(Error::IdempotencyConflict)
-        ));
+        for field in ["quote", "group_id"] {
+            let mut changed = proposal.clone();
+            if field == "quote" {
+                changed.groups[0].source_quote = "changed retry".into();
+            } else {
+                changed.groups[0].group_id = "different-group".into();
+            }
+            assert!(matches!(
+                state
+                    .tickets
+                    .resolve_message("semantic-human", &changed)
+                    .await,
+                Err(Error::IdempotencyConflict)
+            ));
+        }
     }
 }
 

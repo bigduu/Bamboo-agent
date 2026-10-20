@@ -400,14 +400,24 @@ impl TicketApplication {
         if snapshot.receipts.contains_key(&command.operation_id) {
             return Ok(());
         }
+        self.validate_project_snapshot_operations(&snapshot, &command.operations)
+    }
+
+    fn validate_project_snapshot_operations(
+        &self,
+        snapshot: &bamboo_tickets::Snapshot,
+        operations: &[Operation],
+    ) -> Result<()> {
         let mut links = snapshot.project.links.clone();
-        for op in &command.operations {
+        let mut created = BTreeSet::new();
+        for op in operations {
             let (project_id, context, adopting) = match op {
                 Operation::Create {
                     temp_id, parent, ..
                 } => {
                     // Allocation shadows earlier spellings, including canonical IDs.
                     links.remove(temp_id);
+                    created.insert(temp_id.clone());
                     if let Some(project_id) = parent
                         .as_ref()
                         .and_then(|parent| links.get(parent))
@@ -429,13 +439,14 @@ impl TicketApplication {
                     (&context.project_id, Some(context), true)
                 }
                 Operation::Start { work_id, .. } => {
-                    let Some(project_id) = snapshot.project.links.get(work_id) else {
+                    let Some(project_id) = links.get(work_id) else {
                         continue;
                     };
                     let context = snapshot
                         .project
                         .work_contexts
                         .get(work_id)
+                        .filter(|_| !created.contains(work_id))
                         .and_then(|hash| snapshot.project.contexts.get(hash))
                         .ok_or_else(|| {
                             Error::InvalidTransition("Project context is required".into())
