@@ -2,6 +2,432 @@ use actix_web::{http::StatusCode, web};
 use bamboo_server::AppState;
 
 #[actix_web::test]
+async fn review_semantic_project_preflight_precedes_intent_and_membership_publication() {
+    use bamboo_domain::WorkspaceBinding;
+    use bamboo_tickets::*;
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::Path,
+        sync::Arc,
+    };
+
+    fn git(path: &Path, args: &[&str]) -> String {
+        let result = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        String::from_utf8(result.stdout).unwrap().trim().into()
+    }
+    fn workspace(root: &Path) -> ExecutionWorkspace {
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-b", "fixture"]);
+        std::fs::write(repo.join("fixture.txt"), "fixture\n").unwrap();
+        git(&repo, &["add", "fixture.txt"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        );
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        let checkout = root.join("worktree");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "ticket-fixture",
+                checkout.to_str().unwrap(),
+                &base,
+            ],
+        );
+        let checkout = checkout
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        ExecutionWorkspace {
+            repo: repo.canonicalize().unwrap().to_string_lossy().into_owned(),
+            base_commit: base,
+            branch: "ticket-fixture".into(),
+            worktree: checkout.clone(),
+            write_roots: vec![checkout.clone()],
+            claims: BTreeSet::from([format!("worktree:{checkout}")]),
+        }
+    }
+
+    for mutation in [
+        "resource",
+        "binding",
+        "archived-start",
+        "archived-create",
+        "shadowed-start",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let execution = workspace(root.path());
+        let mut state = AppState::new_with_memory_store(
+            root.path().to_path_buf(),
+            bamboo_memory::memory_store::MemoryStore::new(root.path().join("jiandu")),
+        )
+        .await
+        .unwrap();
+        *state.config.write().await = serde_json::from_value(serde_json::json!({
+            "provider":"openai", "features":{"ticket_mutation":true,"ticket_dispatch":false},
+            "providers":{"openai":{"api_key":"synthetic-unused","model":"synthetic-unused"}}
+        }))
+        .unwrap();
+        state.tickets = Arc::new(
+            bamboo_server::app_state::ticket_application::TicketApplication::open(
+                root.path(),
+                state.storage.clone(),
+                state.config.clone(),
+            )
+            .await,
+        );
+        let project = state
+            .project_store
+            .create("Semantic preflight", None)
+            .unwrap();
+        let binding = WorkspaceBinding {
+            path: execution.repo.clone(),
+            label: None,
+            git_common_dir: None,
+        };
+        let manifest = state
+            .project_store
+            .bind_workspace(&project.id, project.revision, binding.clone())
+            .unwrap();
+        let principal = Principal::User {
+            user_id: "host-owner".into(),
+        };
+        let (service, owner) = state.tickets.authority(principal.clone()).await.unwrap();
+        let contract = Contract {
+            title: "work".into(),
+            objective: "Synthetic Project preflight".into(),
+            constraints: vec!["No provider or HTTP-derived authority".into()],
+            acceptance: vec!["Fresh Project facts before publication".into()],
+            user_acceptance_required: true,
+            allowed_tools: BTreeSet::from(["Task".into()]),
+        };
+        let context = ProjectContextSnapshot {
+            project_id: project.id.clone(),
+            project_revision: manifest.revision,
+            resource_revision: manifest.resource_revision,
+            workspace_binding: manifest.workspace_bindings[0].clone(),
+            contract_revision: 1,
+            contract: contract.clone(),
+            sources: BTreeMap::from([("fixture".into(), "v1".into())]),
+        };
+        let command = service
+            .prepare_command(
+                &owner,
+                "semantic-seed",
+                vec![
+                    Operation::Create {
+                        temp_id: "goal".into(),
+                        kind: TicketKind::Goal,
+                        parent: None,
+                        contract: Contract {
+                            title: "goal".into(),
+                            ..contract.clone()
+                        },
+                        depends_on: BTreeSet::new(),
+                    },
+                    Operation::AssociateProject {
+                        ticket_id: "goal".into(),
+                        project_id: project.id.clone(),
+                    },
+                    Operation::Create {
+                        temp_id: "work".into(),
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: contract.clone(),
+                        depends_on: BTreeSet::new(),
+                    },
+                    Operation::AssociateProject {
+                        ticket_id: "work".into(),
+                        project_id: project.id.clone(),
+                    },
+                    Operation::SetProjectContext {
+                        work_id: "work".into(),
+                        context: context.clone(),
+                    },
+                    Operation::Ready {
+                        work_id: "work".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        let seeded = state
+            .tickets
+            .update(principal.clone(), &command)
+            .await
+            .unwrap();
+        let work = seeded.ids["work"].clone();
+        let goal = seeded.ids["goal"].clone();
+        let text = if mutation == "archived-create" {
+            "create child"
+        } else {
+            "start work"
+        };
+        service
+            .register_user_ingress(
+                &owner,
+                &VerifiedUserIngress::from_verified_host(
+                    "semantic-human".into(),
+                    HumanIngressRecord {
+                        user_id: "host-owner".into(),
+                        source_ingress_seq: 1,
+                        text: text.into(),
+                        thread_id: None,
+                        in_reply_to: None,
+                        correlation_id: None,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let proposal_for = |snapshot: &Snapshot| MessageProposal {
+            groups: vec![SemanticGroup {
+                group_id: "group".into(),
+                item_ids: vec!["item".into()],
+                source_quote: text.into(),
+                clarification: None,
+                operations: if mutation == "shadowed-start" {
+                    vec![
+                        SemanticOperation::Create {
+                            temp_id: work.clone(),
+                            kind: TicketKind::Work,
+                            parent: None,
+                            contract: Contract {
+                                title: "detached".into(),
+                                ..contract.clone()
+                            },
+                            depends_on: vec![],
+                        },
+                        SemanticOperation::Ready {
+                            target: TicketReference::Temporary { id: work.clone() },
+                        },
+                        SemanticOperation::Start {
+                            target: TicketReference::Temporary { id: work.clone() },
+                            temp_id: "assignment".into(),
+                            workspace: Some(execution.clone()),
+                        },
+                    ]
+                } else {
+                    vec![if mutation == "archived-create" {
+                        SemanticOperation::Create {
+                            temp_id: "child".into(),
+                            kind: TicketKind::Work,
+                            parent: Some(TicketReference::from_ticket(&snapshot.tickets[&goal])),
+                            contract: Contract {
+                                title: "child".into(),
+                                ..contract.clone()
+                            },
+                            depends_on: vec![],
+                        }
+                    } else {
+                        SemanticOperation::Start {
+                            target: TicketReference::from_ticket(&snapshot.tickets[&work]),
+                            temp_id: "assignment".into(),
+                            workspace: Some(execution.clone()),
+                        }
+                    }]
+                },
+            }],
+        };
+        match mutation {
+            "resource" => {
+                state
+                    .project_store
+                    .bump_resource_revision(&project.id, manifest.revision)
+                    .unwrap();
+            }
+            "binding" => {
+                state
+                    .project_store
+                    .unbind_workspace(&project.id, manifest.revision, &binding.path)
+                    .unwrap();
+            }
+            _ => {
+                state
+                    .project_store
+                    .archive(&project.id, manifest.revision)
+                    .unwrap();
+            }
+        }
+        let before = service.published().unwrap();
+        let result = state
+            .tickets
+            .resolve_message("semantic-human", &proposal_for(&before.1))
+            .await;
+        if mutation == "shadowed-start" {
+            let response = result.unwrap();
+            assert_eq!(
+                response["resolution"]["groups"][0]["status"], "committed",
+                "{response}"
+            );
+            let new_work = response["resolution"]["groups"][0]["receipt"]["ids"][work.as_str()]
+                .as_str()
+                .unwrap();
+            assert_ne!(new_work, work);
+            let committed = service.published().unwrap();
+            assert!(!committed.1.project.links.contains_key(new_work));
+            assert_eq!(committed.1.assignments.len(), 1);
+            assert_eq!(
+                committed.1.assignments.values().next().unwrap().work_id,
+                new_work
+            );
+            assert_eq!(
+                canonical_bytes(&committed.1.tickets[&work]).unwrap(),
+                canonical_bytes(&before.1.tickets[&work]).unwrap()
+            );
+            let proposal = proposal_for(&before.1);
+            let replay = state
+                .tickets
+                .resolve_message("semantic-human", &proposal)
+                .await
+                .unwrap();
+            assert_eq!(replay["resolution"], response["resolution"]);
+            assert_eq!(
+                canonical_bytes(&service.published().unwrap()).unwrap(),
+                canonical_bytes(&committed).unwrap()
+            );
+            let mut changed = proposal;
+            changed.groups[0].group_id = "different-group".into();
+            assert!(matches!(
+                state
+                    .tickets
+                    .resolve_message("semantic-human", &changed)
+                    .await,
+                Err(Error::IdempotencyConflict)
+            ));
+            continue;
+        }
+        assert!(result.is_err(), "Semantic Project preflight must reject before publishing intent or inherited membership ({mutation}): {result:?}");
+        assert!(matches!(
+            result,
+            Err(Error::RevisionConflict | Error::InvalidTransition(_))
+        ));
+        assert_eq!(
+            canonical_bytes(&service.published().unwrap()).unwrap(),
+            canonical_bytes(&before).unwrap()
+        );
+        assert!(before.1.assignments.is_empty());
+        assert!(before.1.intents.is_empty());
+        assert!(before.1.resolutions["semantic-human"].proposal.is_none());
+
+        let mut fresh = state.project_store.get(&project.id).unwrap();
+        if mutation.starts_with("archived") {
+            fresh = state
+                .project_store
+                .unarchive(&project.id, fresh.revision)
+                .unwrap();
+        } else if mutation == "binding" {
+            fresh = state
+                .project_store
+                .bind_workspace(&project.id, fresh.revision, binding)
+                .unwrap();
+        }
+        if mutation != "archived-create" {
+            let command = service
+                .prepare_command(
+                    &owner,
+                    "adopt-current-context",
+                    vec![Operation::SetProjectContext {
+                        work_id: work.clone(),
+                        context: ProjectContextSnapshot {
+                            project_revision: fresh.revision,
+                            resource_revision: fresh.resource_revision,
+                            workspace_binding: fresh.workspace_bindings[0].clone(),
+                            ..context.clone()
+                        },
+                    }],
+                )
+                .unwrap();
+            state
+                .tickets
+                .update(principal.clone(), &command)
+                .await
+                .unwrap();
+        }
+        let proposal = proposal_for(&service.published().unwrap().1);
+        let response = state
+            .tickets
+            .resolve_message("semantic-human", &proposal)
+            .await
+            .unwrap();
+        assert_eq!(
+            response["resolution"]["groups"][0]["status"], "committed",
+            "{response}"
+        );
+        let committed = service.published().unwrap();
+        if mutation == "archived-create" {
+            let id = response["resolution"]["groups"][0]["receipt"]["ids"]["child"]
+                .as_str()
+                .unwrap();
+            assert_eq!(committed.1.project.links[id], project.id);
+            assert!(committed.1.assignments.is_empty());
+        } else {
+            assert_eq!(committed.1.assignments.len(), 1);
+            assert_eq!(committed.1.intents.len(), 1);
+            assert!(committed
+                .1
+                .assignments
+                .values()
+                .all(|a| a.runtime.is_none()));
+        }
+        let latest = state.project_store.get(&project.id).unwrap();
+        state
+            .project_store
+            .archive(&project.id, latest.revision)
+            .unwrap();
+        let replay = state
+            .tickets
+            .resolve_message("semantic-human", &proposal)
+            .await
+            .unwrap();
+        assert_eq!(replay["resolution"], response["resolution"]);
+        assert_eq!(
+            canonical_bytes(&service.published().unwrap()).unwrap(),
+            canonical_bytes(&committed).unwrap()
+        );
+        for field in ["quote", "group_id"] {
+            let mut changed = proposal.clone();
+            if field == "quote" {
+                changed.groups[0].source_quote = "changed retry".into();
+            } else {
+                changed.groups[0].group_id = "different-group".into();
+            }
+            assert!(matches!(
+                state
+                    .tickets
+                    .resolve_message("semantic-human", &changed)
+                    .await,
+                Err(Error::IdempotencyConflict)
+            ));
+        }
+    }
+}
+
+#[actix_web::test]
 async fn review_create_revalidates_inherited_project_and_keeps_exact_replays() {
     use bamboo_tickets::*;
     use std::{
