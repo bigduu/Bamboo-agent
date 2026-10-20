@@ -1,6 +1,8 @@
 //! Process-owned browser sessions shared by HTTP workbench requests and agent tools.
 //! Each chat session has one isolated Playwright context in a child Node process.
 
+#[cfg(all(test, unix))]
+mod concurrent_drain_tests;
 #[cfg(test)]
 mod persistence_tests;
 mod profile;
