@@ -597,7 +597,10 @@ fn review_archived_member_cannot_be_carried_into_another_sprint() {
         BTreeMap::from([(f.seed.clone(), SprintDestination::Backlog)]),
     );
     let receipt = f.service.execute_sprint(&owner(), &backlog).unwrap();
-    assert_eq!(f.service.execute_sprint(&owner(), &backlog).unwrap(), receipt);
+    assert_eq!(
+        f.service.execute_sprint(&owner(), &backlog).unwrap(),
+        receipt
+    );
     assert_eq!(
         receipt.closure.unwrap().members[&f.seed].disposition,
         SprintCloseDisposition::Backlog

@@ -674,6 +674,9 @@ fn apply(
                         SprintDestination::Sprint { sprint_id } => Some(sprint_id.clone()),
                     };
                     let w = work(snapshot, project, &work_id)?;
+                    if to.is_some() && w.archived {
+                        return Err(invalid("archived Work cannot join a Sprint"));
+                    }
                     outgoing.push(event(
                         command,
                         authority,
