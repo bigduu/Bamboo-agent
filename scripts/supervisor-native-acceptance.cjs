@@ -175,7 +175,7 @@ async function verifyProcess(config) {
     }
   }
 }
-async function jsonRequest(base, route, body, signal) {
+async function jsonRequest(base, route, body, signal, verifyConnected) {
   requireFact(route.startsWith('/api/v1/') && !route.includes('..') && !route.includes('?'), 'invalid_api_route');
   const url = new URL(origin(base)), data = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
   requireFact(data === undefined || data.length <= LIMIT, 'http_request_budget');
@@ -194,7 +194,17 @@ async function jsonRequest(base, route, body, signal) {
           resolve({ status: res.statusCode, body: JSON.parse(Buffer.concat(chunks)) });
         } catch (e) { reject(e instanceof Failure ? e : new Failure('invalid_http_json')); } });
       });
-      req.on('error', reject); req.end(data);
+      req.on('error', reject);
+      if (verifyConnected) req.once('socket', socket => {
+        const send = async () => {
+          try {
+            await verifyConnected(); requireFact(!signal?.aborted, 'fixture_deadline');
+            if (!req.destroyed) req.end(data);
+          } catch (e) { req.destroy(e); }
+        };
+        if (socket.connecting) socket.once('connect', send); else void send();
+      });
+      else req.end(data);
     });
   } finally { agent.destroy(); }
 }
@@ -437,8 +447,18 @@ async function runSuite(config, request = jsonRequest) {
 }
 function bindHostRequest(config, request = jsonRequest, verify = verifyProcess) {
   return async (base, route, body, signal) => {
-    if (body !== undefined) await verify({ ...config, cases: config.cases.filter(c => origin(c.api_base) === origin(base)) });
-    return request(base, route, body, signal);
+    const cases = config.cases.filter(c => origin(c.api_base) === origin(base));
+    requireFact(cases.length === 1, 'unbound_host_origin');
+    const bound = { ...config, cases };
+    const check = async () => {
+      requireFact(!signal?.aborted, 'fixture_deadline'); await verify(bound);
+      requireFact(!signal?.aborted, 'fixture_deadline');
+    };
+    // Every evidence read and write is checked before connection, after TCP
+    // connect but before any HTTP bytes, and after receiving the response.
+    await check();
+    const result = await request(base, route, body, signal, check);
+    await check(); return result;
   };
 }
 function parseArgs(argv) {
@@ -463,6 +483,7 @@ async function main(argv = process.argv.slice(2)) {
     nativeStarted = true;
     const boundRequest = bindHostRequest(verified.config);
     const result = await runSuite(verified.config, boundRequest);
+    await verifyProcess(verified.config);
     console.log(JSON.stringify({ schema_version: 1, evidence_kind: 'actual_native_host', source_sha: SOURCE,
       receipt_sha256: verified.receipt_sha256, binary_sha256: verified.config.binary.sha256, ...result }));
     process.exitCode = result.status === 'PASS' ? 0 : 3;
