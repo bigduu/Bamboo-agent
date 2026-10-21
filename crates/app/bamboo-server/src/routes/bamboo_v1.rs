@@ -27,6 +27,7 @@ use crate::handlers::{command, copilot_auth, settings, skill, tools, workflow_ru
 /// owns is the only pattern that works here.
 pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
     web::scope("")
+        .service(settings::config_share_routes())
         // Command routes
         .route("/commands", web::get().to(command::list_commands))
         .route(

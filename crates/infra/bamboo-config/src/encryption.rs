@@ -388,8 +388,12 @@ fn extract_quoted_property(content: &str, key: &str) -> Option<String> {
 /// Returns: nonce(12 bytes) + ciphertext.
 pub fn encrypt(plaintext: &str) -> Result<String> {
     let key = get_encryption_key();
+    encrypt_with_key(plaintext, &key)
+}
+
+fn encrypt_with_key(plaintext: &str, key: &[u8]) -> Result<String> {
     let cipher =
-        Aes256Gcm::new_from_slice(&key).map_err(|e| anyhow!("Failed to create cipher: {e}"))?;
+        Aes256Gcm::new_from_slice(key).map_err(|e| anyhow!("Failed to create cipher: {e}"))?;
 
     let mut nonce_bytes = [0u8; 12];
     rand::rng().fill(&mut nonce_bytes);
@@ -406,6 +410,12 @@ pub fn encrypt(plaintext: &str) -> Result<String> {
 
 /// Decrypt data.
 pub fn decrypt(encrypted: &str) -> Result<String> {
+    let (nonce, ciphertext) = parse_encrypted(encrypted)?;
+    let key = get_encryption_key();
+    decrypt_ciphertext(nonce, &ciphertext, &key)
+}
+
+fn parse_encrypted(encrypted: &str) -> Result<([u8; 12], Vec<u8>)> {
     let parts: Vec<&str> = encrypted.split(':').collect();
     if parts.len() != 2 {
         return Err(anyhow!("Invalid encrypted format"));
@@ -421,22 +431,64 @@ pub fn decrypt(encrypted: &str) -> Result<String> {
         ));
     }
 
-    let key = get_encryption_key();
-    let cipher =
-        Aes256Gcm::new_from_slice(&key).map_err(|e| anyhow!("Failed to create cipher: {e}"))?;
-
     let nonce_array: [u8; 12] = nonce_bytes.as_slice().try_into().map_err(|_| {
         anyhow!(
             "Invalid nonce length: expected 12, got {}",
             nonce_bytes.len()
         )
     })?;
+    Ok((nonce_array, ciphertext))
+}
+
+fn decrypt_with_key(encrypted: &str, key: &[u8]) -> Result<String> {
+    let (nonce, ciphertext) = parse_encrypted(encrypted)?;
+    decrypt_ciphertext(nonce, &ciphertext, key)
+}
+
+fn decrypt_ciphertext(nonce_array: [u8; 12], ciphertext: &[u8], key: &[u8]) -> Result<String> {
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|e| anyhow!("Failed to create cipher: {e}"))?;
     let nonce = Nonce::from(nonce_array);
     let plaintext = cipher
-        .decrypt(&nonce, ciphertext.as_ref())
+        .decrypt(&nonce, ciphertext)
         .map_err(|e| anyhow!("Decryption failed: {e}"))?;
 
     String::from_utf8(plaintext).map_err(|e| anyhow!("Invalid UTF-8: {e}"))
+}
+
+/// Share operations may use an already initialized runtime key, but must never
+/// trigger machine-identity discovery, process execution, or key creation.
+/// Keep the key inside this module; the sharing API cannot obtain its bytes.
+fn with_initialized_key<T>(operation: impl FnOnce(&[u8]) -> Result<T>) -> Result<T> {
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        TEST_KEY_OVERRIDE.with(|slot| {
+            let key = slot.borrow();
+            let key = key
+                .as_deref()
+                .ok_or_else(|| anyhow!("credential key is not initialized"))?;
+            operation(key)
+        })
+    }
+    #[cfg(not(any(test, feature = "test-utils")))]
+    {
+        let key = KEY_CACHE
+            .get()
+            .ok_or_else(|| anyhow!("credential key is not initialized"))?;
+        operation(key)
+    }
+}
+
+pub(crate) fn encrypt_initialized(plaintext: &str) -> Result<String> {
+    with_initialized_key(|key| encrypt_with_key(plaintext, key))
+}
+
+pub(crate) fn decrypt_initialized(encrypted: &str) -> Result<String> {
+    with_initialized_key(|key| decrypt_with_key(encrypted, key))
+}
+
+pub(crate) fn require_initialized_key() -> Result<()> {
+    with_initialized_key(|_| Ok(()))
 }
 
 #[cfg(test)]
