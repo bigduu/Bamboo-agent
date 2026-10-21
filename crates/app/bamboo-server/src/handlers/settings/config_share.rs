@@ -75,30 +75,36 @@ fn failure(status: StatusCode, code: &'static str) -> HttpResponse {
         .json(serde_json::json!({"error":{"type":"configuration_share_error","code":code,"message":"Configuration sharing could not complete"}}))
 }
 
-fn parse<T: DeserializeOwned>(request: &HttpRequest, bytes: &[u8]) -> Result<T, HttpResponse> {
+fn parse<T: DeserializeOwned>(request: &HttpRequest, bytes: &[u8]) -> Result<T, Box<HttpResponse>> {
     // Match the existing JSON endpoints' browser preflight boundary. A
     // text/plain/form cross-origin simple request must not perform a write.
     if !request
         .content_type()
         .eq_ignore_ascii_case("application/json")
     {
-        return Err(failure(
+        return Err(Box::new(failure(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "share_json_required",
-        ));
+        )));
     }
     if bytes.len() > MAX_BODY_BYTES {
-        return Err(failure(StatusCode::PAYLOAD_TOO_LARGE, "share_size_limit"));
+        return Err(Box::new(failure(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "share_size_limit",
+        )));
     }
     serde_json::from_slice(bytes)
-        .map_err(|_| failure(StatusCode::BAD_REQUEST, "invalid_share_request"))
+        .map_err(|_| Box::new(failure(StatusCode::BAD_REQUEST, "invalid_share_request")))
 }
 
-fn checked_input(share_string: &str, passphrase: Option<&str>) -> Result<(), HttpResponse> {
+fn checked_input(share_string: &str, passphrase: Option<&str>) -> Result<(), Box<HttpResponse>> {
     if share_string.len() > MAX_SHARE_STRING_BYTES
         || passphrase.is_some_and(|value| value.len() > 1024)
     {
-        return Err(failure(StatusCode::PAYLOAD_TOO_LARGE, "share_size_limit"));
+        return Err(Box::new(failure(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "share_size_limit",
+        )));
     }
     Ok(())
 }
@@ -156,10 +162,10 @@ async fn export(
 ) -> HttpResponse {
     let request: ExportRequest = match parse(&request, &bytes) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     if let Err(error) = checked_input("", request.passphrase.as_deref()) {
-        return error;
+        return *error;
     }
     let data_dir = state.app_data_dir.clone();
     run(move || {
@@ -181,10 +187,10 @@ async fn preview(
 ) -> HttpResponse {
     let request: PreviewRequest = match parse(&request, &bytes) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     if let Err(error) = checked_input(&request.share_string, request.passphrase.as_deref()) {
-        return error;
+        return *error;
     }
     let data_dir = state.app_data_dir.clone();
     run(move || {
@@ -204,10 +210,10 @@ async fn apply(
 ) -> HttpResponse {
     let request: ApplyRequest = match parse(&request, &bytes) {
         Ok(value) => value,
-        Err(error) => return error,
+        Err(error) => return *error,
     };
     if let Err(error) = checked_input(&request.share_string, request.passphrase.as_deref()) {
-        return error;
+        return *error;
     }
     let Ok(io_guard) = state.config_io_lock.clone().try_lock_owned() else {
         return failure(StatusCode::TOO_MANY_REQUESTS, "share_busy");
