@@ -1994,13 +1994,28 @@ mod tests {
     #[test]
     fn test_normalize_tool_ref_accepts_spawn_task_aliases() {
         for alias in [
-            "default::spawn_session",
             "default::sub_session",
             "default::sub_task",
             "default::team_agent",
             "default::child_session",
         ] {
             assert_eq!(normalize_tool_ref(alias), Some("SubAgent".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_normalize_tool_ref_preserves_spawn_session_for_session_resolution() {
+        for reference in [
+            "spawn_session",
+            "spawnSession",
+            "default::spawn_session",
+            "default::spawnSession",
+        ] {
+            assert_eq!(normalize_tool_ref(reference), Some("spawn_session".into()));
+            assert_eq!(
+                bamboo_domain::tool_names::canonical_tool_name(reference),
+                "SubAgent"
+            );
         }
     }
 
