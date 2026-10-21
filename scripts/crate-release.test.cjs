@@ -925,6 +925,24 @@ test('trusted manual publication and automatic receipts share a queue while dry 
   assert.match(ci, /node --test scripts\/ci-policy.test.cjs scripts\/crate-release.test.cjs/)
 })
 
+test('automatic publication grants only job-local Actions reads for its CI proof', () => {
+  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+  const automatic = workflow.split('  automatic:\n')[1].split('  executables:\n')[0]
+  const permissionBlock = automatic.match(/^    permissions:\n((?:      [a-z-]+: [a-z]+\n)+)/m)?.[1]
+  assert.ok(permissionBlock, 'automatic publication must declare its token permissions')
+  const verify = block => assert.deepEqual(Object.fromEntries(block.trim().split('\n')
+    .map(line => line.trim().split(': '))), { contents: 'write', actions: 'read' })
+  verify(permissionBlock)
+  for (const invalid of [
+    '      contents: write\n',
+    '      contents: write\n      actions: write\n',
+    '      contents: write\n      actions: read\n      checks: write\n',
+  ]) assert.throws(() => verify(invalid))
+  assert.match(automatic, /GH_TOKEN: \$\{\{ github\.token \}\}/)
+  assert.match(automatic, /actions\/runs\/\{/)
+  assert.match(automatic, /actions\/jobs\/\{job_id\}\/logs/)
+})
+
 test('the real manual version resolver has no signing or API dependency and never emits invalid output', (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-manual-version-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))

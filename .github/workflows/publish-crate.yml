@@ -384,6 +384,7 @@ jobs:
     environment: bamboo-release
     permissions:
       contents: write
+      actions: read
     outputs:
       source: ${{ steps.source.outputs.revision }}
       version: ${{ steps.version.outputs.version }}

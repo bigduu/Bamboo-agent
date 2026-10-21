@@ -280,9 +280,9 @@ async fn review_semantic_project_preflight_precedes_intent_and_membership_public
             .await;
         if mutation == "shadowed-start" {
             let response = result.unwrap();
-            assert_eq!(
-                response["resolution"]["groups"][0]["status"], "committed",
-                "{response}"
+            assert!(
+                response["resolution"]["groups"][0]["status"] == "committed",
+                "shadowed semantic group must commit"
             );
             let new_work = response["resolution"]["groups"][0]["receipt"]["ids"][work.as_str()]
                 .as_str()
@@ -321,7 +321,10 @@ async fn review_semantic_project_preflight_precedes_intent_and_membership_public
             ));
             continue;
         }
-        assert!(result.is_err(), "Semantic Project preflight must reject before publishing intent or inherited membership ({mutation}): {result:?}");
+        assert!(
+            result.is_err(),
+            "semantic Project preflight must reject before publication"
+        );
         assert!(matches!(
             result,
             Err(Error::RevisionConflict | Error::InvalidTransition(_))
@@ -374,9 +377,9 @@ async fn review_semantic_project_preflight_precedes_intent_and_membership_public
             .resolve_message("semantic-human", &proposal)
             .await
             .unwrap();
-        assert_eq!(
-            response["resolution"]["groups"][0]["status"], "committed",
-            "{response}"
+        assert!(
+            response["resolution"]["groups"][0]["status"] == "committed",
+            "semantic group must commit after adopting fresh Project context"
         );
         let committed = service.published().unwrap();
         if mutation == "archived-create" {
