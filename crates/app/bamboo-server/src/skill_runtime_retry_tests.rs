@@ -117,6 +117,16 @@ async fn error_retry_after_scope_revocation_starts_from_current_workspace() {
         );
         assert!(!trace.task_started && !trace.task_completed);
     }
+    // The terminal event precedes the router's final history/release
+    // handshake. Retry must respect that owner instead of racing its drain.
+    let router = state.agent.activation_router().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while router.current_run_id(id).await.is_some() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal owner must finish its release before Retry");
     provider.retrying.store(true, Ordering::Release);
     let before = state.storage.load_session(id).await.unwrap().unwrap();
     let before_user_ids: Vec<_> = before
