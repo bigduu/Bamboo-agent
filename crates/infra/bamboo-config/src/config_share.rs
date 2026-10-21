@@ -575,10 +575,35 @@ pub fn validate_env_name(name: &str) -> ShareResult<()> {
         || package_control_env(&upper)
         || utility_control_env(&upper)
         || cloud_control_env(&upper)
+        || vcs_control_env(&upper)
     {
         return Err(ShareError::Unsafe);
     }
     Ok(())
+}
+
+fn vcs_control_env(upper: &str) -> bool {
+    // VCS configuration, extension, hook and external-program controls. HG/P4
+    // use names without an underscore; Breezy documents BRZPATH while current
+    // external-command code still reads the historical BZRPATH. Reserve these
+    // known tool namespaces conservatively, including their identity/encoding
+    // settings, rather than claiming every member executes a program. Perforce
+    // also accepts bare DIFF/MERGE; Fossil's Tcl override is outside FOSSIL_.
+    // mercurial-scm.org/help/topics/environment
+    // mercurial-scm.org/help/topics/config#extensions
+    // github.com/apache/subversion/blob/trunk/subversion/libsvn_ra_svn/client.c
+    // github.com/apache/subversion/blob/trunk/subversion/libsvn_subr/cmdline_editor.c
+    // github.com/apache/subversion/blob/trunk/subversion/svn/util.c
+    // lists.ubuntu.com/archives/bazaar-commits/2010-October/018133.html
+    // breezy-vcs.org/doc/en/user-reference/env-variables-help.html
+    // github.com/breezy-team/breezy/blob/master/breezy/externalcommand.py
+    // fossil-scm.org/home/doc/tip/www/env-opts.md
+    // help.perforce.com/helix-core/server-apps/cmdref/current/Content/CmdRef/P4_port_SYSTEMIGNORE.html
+    // help.perforce.com/helix-core/server-apps/cmdref/current/Content/CmdRef/P4DIFF.html
+    // help.perforce.com/helix-core/server-apps/cmdref/current/Content/CmdRef/P4MERGE.html
+    let prefixes = ["HG", "SVN_", "BZR_", "BRZ_", "FOSSIL_", "P4"];
+    ["BZRPATH", "BRZPATH", "DIFF", "MERGE", "TH1_ENABLE_TCL"].contains(&upper)
+        || prefixes.iter().any(|prefix| upper.starts_with(prefix))
 }
 
 fn cloud_control_env(upper: &str) -> bool {
@@ -602,6 +627,8 @@ fn cloud_control_env(upper: &str) -> bool {
     // docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html
     // docs.aws.amazon.com/cli/latest/userguide/cli-configure-sourcing-external.html
     // github.com/boto/botocore/blob/develop/botocore/configprovider.py
+    // github.com/boto/botocore/blob/develop/botocore/session.py#L395-L427
+    // github.com/boto/botocore/blob/develop/botocore/credentials.py#L993
     // learn.microsoft.com/en-us/cli/azure/azure-cli-configuration
     // learn.microsoft.com/en-us/cli/azure/azure-cli-extensions-overview
     // docs.cloud.google.com/sdk/gcloud/reference/topic/startup
@@ -641,6 +668,7 @@ fn cloud_control_env(upper: &str) -> bool {
     [
         "KUBECONFIG",
         "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
         "AWS_PROFILE",
         "AWS_DEFAULT_PROFILE",
         "AWS_PAGER",

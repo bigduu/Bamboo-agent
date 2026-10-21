@@ -1411,8 +1411,8 @@ fn package_controls_are_rejected_as_inert_names_without_running_tools() {
 #[test]
 fn utility_controls_are_rejected_as_inert_names_without_running_tools() {
     // Inert names only: no configuration file, command, pager, shell, editor,
-    // cloud credential helper or plugin is opened or executed. Plain fixtures
-    // never need a password or KDF.
+    // cloud credential helper, VCS extension or plugin is opened or executed.
+    // Plain fixtures never need a password or KDF.
     let kdf_calls = codec::test_kdf_calls();
     let benign = env_bundle(&["AppToken"]);
     let original = benign.clone();
@@ -1467,6 +1467,7 @@ fn utility_controls_are_rejected_as_inert_names_without_running_tools() {
         "ANSIBLE_ACTION_PLUGINS",
         "ANSIBLE_VAULT_PASSWORD_FILE",
         "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
         "AWS_PROFILE",
         "AWS_DEFAULT_PROFILE",
         "AWS_PAGER",
@@ -1510,6 +1511,43 @@ fn utility_controls_are_rejected_as_inert_names_without_running_tools() {
         "VAGRANT_HOME",
         "VAGRANT_DOTFILE_PATH",
         "VAGRANT_LOCAL_PLUGINS_LOAD",
+        "HG",
+        "HGRCPATH",
+        "HGEDITOR",
+        "HGMERGE",
+        "HGUSER",
+        "HGENCODING",
+        "SVN_SSH",
+        "SVN_EDITOR",
+        "SVN_MERGE",
+        "BZRPATH",
+        "BZR_PLUGIN_PATH",
+        "BZR_PLUGINS_AT",
+        "BZR_HOME",
+        "BZR_REMOTE_PATH",
+        "BZR_SSH",
+        "BZR_EDITOR",
+        "BZR_EMAIL",
+        "BRZPATH",
+        "BRZ_PLUGIN_PATH",
+        "BRZ_PLUGINS_AT",
+        "BRZ_EDITOR",
+        "BRZ_EMAIL",
+        "FOSSIL_HOME",
+        "FOSSIL_TCL_PATH",
+        "FOSSIL_USER",
+        "P4CONFIG",
+        "P4ENVIRO",
+        "P4EDITOR",
+        "P4DIFF",
+        "P4MERGE",
+        "P4LOGINSSO",
+        "P4PAGER",
+        "P4USER",
+        "P4PORT",
+        "DIFF",
+        "MERGE",
+        "TH1_ENABLE_TCL",
     ]
     .into_iter()
     .map(str::to_string)
@@ -1517,6 +1555,9 @@ fn utility_controls_are_rejected_as_inert_names_without_running_tools() {
     for prefix in [
         "RIPGREP_", "FZF_", "BAT_", "DELTA_", "LESS_", "LESSKEY", "RSYNC_", "BASH_", "NVIM_",
     ] {
+        names.push(format!("{prefix}SYNTHETIC_RESERVED"));
+    }
+    for prefix in ["HG", "SVN_", "BZR_", "BRZ_", "FOSSIL_", "P4"] {
         names.push(format!("{prefix}SYNTHETIC_RESERVED"));
     }
     for prefix in [
@@ -1616,6 +1657,19 @@ fn utility_controls_are_rejected_as_inert_names_without_running_tools() {
         "TGLABEL",
         "NIXLABEL",
         "VAGRANTLABEL",
+        "APP_HGRCPATH",
+        "APP_HGEDITOR",
+        "MY_P4CONFIG",
+        "APP_FOSSIL_HOME",
+        "APP_DIFF",
+        "APP_MERGE",
+        "APP_TH1_ENABLE_TCL",
+        "SVNREPO_LABEL",
+        "BZRTEAM_LABEL",
+        "BRZTEAM_LABEL",
+        "FOSSILCOUNT",
+        "DIFFERENCE_LABEL",
+        "MERGED_LABEL",
     ] {
         for variant in [name.to_string(), name.to_ascii_lowercase()] {
             assert_eq!(validate_env_name(&variant), Ok(()));
