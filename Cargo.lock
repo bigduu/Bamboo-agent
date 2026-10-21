@@ -932,6 +932,7 @@ dependencies = [
  "notify",
  "rand 0.10.3",
  "regex",
+ "scrypt",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -941,6 +942,7 @@ dependencies = [
  "url",
  "uuid",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
