@@ -542,7 +542,7 @@ fn portable_environment_api_requires_case_conflict_choice_and_preserves_target_s
     std::fs::write(
         dir.path().join("env.json"),
         bytes(
-            serde_json::json!([{"name":"Token", "value":"synthetic-saved-case-value", "secret":false}]),
+            serde_json::json!([{"name":"Token", "value":"synthetic-saved-case-value", "secret":false, "configured":true}]),
             3,
         ),
     )
