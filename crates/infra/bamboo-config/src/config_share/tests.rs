@@ -684,3 +684,295 @@ fn portable_environment_target_duplicates_fail_closed_without_selecting_a_spelli
     }
     assert_eq!(serde_json::to_vec(&target).unwrap(), before);
 }
+
+fn provider_only_bundle() -> ShareBundle {
+    select_bundle(
+        &fixture(),
+        &ShareSelection {
+            providers: BTreeSet::from(["work".into()]),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn provider_preview_shows_replace_origins_and_retained_key_risk_without_secret_paths() {
+    let mut target = fixture();
+    target.provider_instances.get_mut("work").unwrap().base_url = Some(
+        "https://synthetic-user:synthetic-password@OLD.invalid:8443/private-target-path?target-query=synthetic#target-fragment".into()
+    );
+    let before = target.provider_instances.clone();
+    let mut bundle = provider_only_bundle();
+    bundle.providers[0].base_url = Some("https://NEW.invalid:9443/private-source-path".into());
+    let preview = preview_bundle(&bundle, &target).unwrap();
+    let provider = &preview.providers[0];
+    assert_eq!(
+        provider.source_origin.as_deref(),
+        Some("https://new.invalid:9443")
+    );
+    assert_eq!(
+        provider.target_origin.as_deref(),
+        Some("https://old.invalid:8443")
+    );
+    assert!(provider.retains_existing_api_key);
+    assert!(provider.credential_origin_risk);
+    for output in [
+        serde_json::to_string(&preview).unwrap(),
+        format!("{preview:?}"),
+    ] {
+        for omitted in [
+            FAKE_KEY,
+            "synthetic-user",
+            "synthetic-password",
+            "private-target-path",
+            "target-query",
+            "target-fragment",
+            "private-source-path",
+            "provider.work.api_key",
+        ] {
+            assert!(!output.contains(omitted));
+        }
+    }
+    assert_eq!(target.provider_instances, before);
+}
+
+#[test]
+fn provider_preview_marks_unknown_target_origins_for_all_retained_key_metadata() {
+    let mut bundle = provider_only_bundle();
+    bundle.providers[0].base_url = Some("https://source.invalid/v1".into());
+    for target_url in [
+        None,
+        Some("not-a-url"),
+        Some("file:///synthetic/private"),
+        Some("ftp://target.invalid/private"),
+    ] {
+        for key_kind in ["reference", "encrypted", "plaintext"] {
+            let mut target = fixture();
+            let instance = target.provider_instances.get_mut("work").unwrap();
+            instance.base_url = target_url.map(str::to_string);
+            instance.api_key.clear();
+            instance.api_key_encrypted = None;
+            instance.credential_ref = None;
+            match key_kind {
+                "reference" => {
+                    instance.credential_ref =
+                        Some(crate::CredentialRef::parse("provider.synthetic.key").unwrap())
+                }
+                "encrypted" => {
+                    instance.api_key_encrypted = Some("synthetic-ciphertext-metadata".into())
+                }
+                _ => instance.api_key = FAKE_KEY.into(),
+            }
+            let before = target.provider_instances.clone();
+            let preview = preview_bundle(&bundle, &target).unwrap();
+            let provider = &preview.providers[0];
+            assert_eq!(
+                provider.source_origin.as_deref(),
+                Some("https://source.invalid")
+            );
+            assert_eq!(provider.target_origin, None);
+            assert!(provider.retains_existing_api_key);
+            assert!(provider.credential_origin_risk);
+            let serialized = serde_json::to_value(provider).unwrap();
+            assert!(serialized.get("target_origin").is_none());
+            assert_eq!(target.provider_instances, before);
+        }
+    }
+}
+
+#[test]
+fn provider_preview_origin_risk_requires_a_changed_url_and_a_conflicting_target() {
+    let mut target = fixture();
+    target.provider_instances.get_mut("work").unwrap().base_url =
+        Some("https://source.invalid:443/target-private".into());
+    let mut bundle = provider_only_bundle();
+    bundle.providers[0].base_url = Some("https://SOURCE.invalid/source-private".into());
+    let preview = preview_bundle(&bundle, &target).unwrap();
+    assert!(preview.providers[0].retains_existing_api_key);
+    assert!(!preview.providers[0].credential_origin_risk); // equal normalized origins
+    bundle.providers[0].base_url = None;
+    let preview = preview_bundle(&bundle, &target).unwrap();
+    let provider = &preview.providers[0];
+    assert!(provider.retains_existing_api_key);
+    assert!(!provider.credential_origin_risk); // omitted URL preserves the host
+    assert!(serde_json::to_value(provider)
+        .unwrap()
+        .get("source_origin")
+        .is_none());
+    bundle.providers[0].base_url = Some("https://different.invalid/v1".into());
+    bundle.providers[0].api_key = Some("synthetic-incoming-key".into());
+    let preview = preview_bundle(&bundle, &target).unwrap();
+    assert!(!preview.providers[0].retains_existing_api_key);
+    assert!(preview.providers[0].credential_origin_risk);
+    bundle.providers[0].api_key = None;
+    let instance = target.provider_instances.get_mut("work").unwrap();
+    instance.api_key.clear();
+    instance.api_key_encrypted = None;
+    instance.credential_ref = None;
+    let preview = preview_bundle(&bundle, &target).unwrap();
+    assert!(!preview.providers[0].retains_existing_api_key);
+    assert!(preview.providers[0].credential_origin_risk);
+}
+
+#[test]
+fn provider_rename_does_not_reuse_the_previous_identity_key_or_replace_risk() {
+    let target = fixture();
+    let before = target.provider_instances.clone();
+    let mut bundle = provider_only_bundle();
+    bundle.providers[0].base_url = Some("https://different.invalid/private".into());
+    let decisions = ShareDecisions {
+        providers: BTreeMap::from([(
+            "work".into(),
+            ShareConflictChoice::Rename {
+                target: "renamed-work".into(),
+            },
+        )]),
+        ..Default::default()
+    };
+    let plan = plan_import(&bundle, &target, &decisions).unwrap();
+    assert_eq!(plan.providers[0].id, "renamed-work");
+    assert_eq!(plan.providers[0].api_key, None);
+    let preview = preview_bundle(&plan, &target).unwrap();
+    assert!(!preview.providers[0].retains_existing_api_key);
+    assert!(!preview.providers[0].credential_origin_risk);
+    assert_eq!(preview.providers[0].target_origin, None);
+    assert_eq!(target.provider_instances, before);
+}
+
+#[test]
+fn provider_preview_includes_possible_env_binding_reuse_with_or_without_an_incoming_key() {
+    let mut target = fixture();
+    let instance = target.provider_instances.get_mut("work").unwrap();
+    instance.api_key.clear();
+    instance.api_key_encrypted = None;
+    instance.credential_ref = None;
+    instance.extra.insert(
+        crate::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY.into(),
+        json!(true),
+    );
+    let before = target.provider_instances.clone();
+    for incoming_key in [None, Some("synthetic-incoming-key")] {
+        let mut bundle = provider_only_bundle();
+        bundle.providers[0].base_url = Some("https://different.invalid/private".into());
+        bundle.providers[0].api_key = incoming_key.map(str::to_string);
+        let preview = preview_bundle(&bundle, &target).unwrap();
+        let provider = &preview.providers[0];
+        assert_eq!(provider.has_api_key, incoming_key.is_some());
+        assert!(provider.retains_existing_api_key); // binding metadata, not an env-value probe
+        assert!(provider.credential_origin_risk);
+        let decisions = ShareDecisions {
+            providers: BTreeMap::from([(
+                "work".into(),
+                ShareConflictChoice::Rename {
+                    target: "fresh-work".into(),
+                },
+            )]),
+            ..Default::default()
+        };
+        let plan = plan_import(&bundle, &target, &decisions).unwrap();
+        assert!(serde_json::to_value(&plan.providers[0])
+            .unwrap()
+            .get("api_key_from_env")
+            .is_none());
+        let renamed = preview_bundle(&plan, &target).unwrap();
+        assert!(!renamed.providers[0].retains_existing_api_key);
+        assert!(!renamed.providers[0].credential_origin_risk);
+        assert_eq!(target.provider_instances, before);
+    }
+}
+
+#[test]
+fn provider_origin_change_warns_about_retained_overrides_even_with_a_new_api_key() {
+    let mut target = fixture();
+    let instance = target.provider_instances.get_mut("work").unwrap();
+    instance.api_key.clear();
+    instance.api_key_encrypted = None;
+    instance.credential_ref = None;
+    let overrides = instance.request_overrides.as_mut().unwrap();
+    overrides.common.headers.insert(
+        "Authorization".into(),
+        crate::TemplateExpr::Literal("synthetic-private-override".into()),
+    );
+    assert_eq!(
+        overrides.common.headers.get("Authorization"),
+        Some(&crate::TemplateExpr::Literal(
+            "synthetic-private-override".into()
+        ))
+    );
+    let before = target.provider_instances.clone();
+    let mut bundle = provider_only_bundle();
+    bundle.providers[0].base_url = Some("https://different.invalid/private-source-path".into());
+    bundle.providers[0].api_key = Some("synthetic-new-import-key".into());
+    let preview = preview_bundle(&bundle, &target).unwrap();
+    assert!(!preview.providers[0].retains_existing_api_key);
+    assert!(preview.providers[0].credential_origin_risk);
+    for output in [
+        serde_json::to_string(&preview).unwrap(),
+        format!("{preview:?}"),
+    ] {
+        for omitted in [
+            "Authorization",
+            "synthetic-private-override",
+            "synthetic-new-import-key",
+            "private-source-path",
+        ] {
+            assert!(!output.contains(omitted));
+        }
+    }
+    assert_eq!(target.provider_instances, before);
+}
+
+#[test]
+fn native_loader_environment_selectors_are_rejected_as_names_without_loading_modules() {
+    // No set_var, module loading, command execution or filesystem lookup.
+    for name in [
+        "GCONV_PATH",
+        "LOCPATH",
+        "NLSPATH",
+        "LIBPATH",
+        "SHLIB_PATH",
+        "GLIBC_TUNABLES",
+        "OPENSSL_MODULES",
+        "OPENSSL_CONF",
+        "CORECLR_PROFILER_PATH",
+        "COR_ENABLE_PROFILING",
+        "GIO_EXTRA_MODULES",
+        "GTK_PATH",
+        "QT_PLUGIN_PATH",
+        "LUA_CPATH",
+        "TCL_LIBRARY",
+        "TCLLIBPATH",
+        "JULIA_LOAD_PATH",
+        "R_PROFILE_USER",
+        "R_ENVIRON_USER",
+        "COMPlus_JitName",
+        "MONO_PATH",
+        "MONO_GAC_PREFIX",
+    ] {
+        for variant in [name.to_string(), name.to_ascii_lowercase()] {
+            assert_eq!(validate_env_name(&variant), Err(ShareError::Unsafe));
+            assert_eq!(env_bundle(&[&variant]).validate(), Err(ShareError::Unsafe));
+            let source = env_target(&[&variant]);
+            let selection = ShareSelection {
+                env: BTreeMap::from([(variant.clone(), false)]),
+                ..Default::default()
+            };
+            assert_eq!(select_bundle(&source, &selection), Err(ShareError::Unsafe));
+            let choices = ShareDecisions {
+                env: BTreeMap::from([(
+                    "AppToken".into(),
+                    ShareConflictChoice::Rename { target: variant },
+                )]),
+                ..Default::default()
+            };
+            assert_eq!(
+                plan_import(&env_bundle(&["AppToken"]), &Config::default(), &choices),
+                Err(ShareError::Unsafe)
+            );
+        }
+    }
+    for name in ["APP_LOCALE", "APP_MODULES", "RANGE_LIMIT"] {
+        assert_eq!(validate_env_name(name), Ok(()));
+    }
+}
