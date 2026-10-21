@@ -1,4 +1,5 @@
 //! Authenticated single-owner HTTP projections over the same Ticket service.
+pub mod sprints;
 use actix_web::{http::StatusCode, web, HttpMessage, HttpRequest, HttpResponse, ResponseError};
 use bamboo_engine::ticket_worker_plan::tickets::*;
 use serde::Deserialize;
@@ -88,6 +89,19 @@ pub async fn overview(
 ) -> std::result::Result<HttpResponse, TicketHttpError> {
     let (service, authority) = state.tickets.authority(user(&state, &req).await?).await?;
     Ok(HttpResponse::Ok().json(service.work_overview(&authority)?))
+}
+
+pub async fn project_board(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    body: web::Json<ProjectBoardRequest>,
+) -> std::result::Result<HttpResponse, TicketHttpError> {
+    let (service, authority) = state.tickets.authority(user(&state, &req).await?).await?;
+    state
+        .project_store
+        .get(&body.project_id)
+        .map_err(|e| Error::InvalidTransition(e.to_string()))?;
+    Ok(HttpResponse::Ok().json(service.project_board(&authority, &body)?))
 }
 
 #[derive(Deserialize)]

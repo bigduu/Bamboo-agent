@@ -1504,6 +1504,7 @@ dependencies = [
 name = "bamboo-tickets"
 version = "0.0.0"
 dependencies = [
+ "bamboo-domain",
  "fs2",
  "hex",
  "libc",

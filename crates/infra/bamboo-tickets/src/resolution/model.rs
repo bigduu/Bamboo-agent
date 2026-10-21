@@ -171,6 +171,14 @@ pub enum SemanticOperation {
     },
 }
 
+impl SemanticOperation {
+    /// The existing typed representation for trusted Host preflight. This data
+    /// conversion grants no authority and does not commit an operation.
+    pub fn to_typed_operation(&self) -> Operation {
+        operation(self)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticGroup {

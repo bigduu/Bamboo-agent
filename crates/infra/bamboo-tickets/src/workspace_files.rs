@@ -171,7 +171,7 @@ impl TicketService {
         let artifact = store.store_artifact(content.as_bytes())?;
         let mut started = snapshot.clone();
         started.seq += 1;
-        started.schema = 4;
+        started.schema = started.schema.max(4);
         let a = started
             .assignments
             .get_mut(assignment_id)

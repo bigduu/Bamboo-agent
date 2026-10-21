@@ -55,7 +55,7 @@ impl Authority {
             } => format!("worker:{assignment_id}:{generation}:{run_id}:{session_id}"),
         }
     }
-    fn supervisor(&self) -> Result<()> {
+    pub(crate) fn supervisor(&self) -> Result<()> {
         match &self.principal {
             Principal::Supervisor { session_id }
                 if session_id == &self.binding.supervisor_session_id =>
@@ -732,6 +732,17 @@ fn apply(
     use Operation::*;
     let seq = snapshot.seq;
     match operation {
+        AssociateProject {
+            ticket_id,
+            project_id,
+        } => {
+            authority.supervisor()?;
+            crate::project::associate(snapshot, &resolve(ticket_id, ids), project_id)?;
+        }
+        SetProjectContext { work_id, context } => {
+            authority.supervisor()?;
+            crate::project::set_context(snapshot, &resolve(work_id, ids), context)?;
+        }
         Create {
             temp_id,
             kind,
@@ -768,6 +779,15 @@ fn apply(
                     import_source: None,
                 },
             );
+            let created = ids[temp_id].clone();
+            if let Some(project_id) = snapshot.tickets[&created]
+                .parent
+                .as_ref()
+                .and_then(|parent| snapshot.project.links.get(parent))
+                .cloned()
+            {
+                snapshot.project.links.insert(created, project_id);
+            }
             snapshot.graph_revision += 1;
         }
         Ready { work_id } => {
@@ -916,11 +936,14 @@ fn apply(
                     ));
                 }
             }
+            let context_ref =
+                crate::project::context_for_start(snapshot, &work, workspace.as_ref())?;
             let inputs = dependencies(snapshot, &work)?;
             let id = allocate(temp_id, ids)?;
             let generation = work.generation + 1;
             let dispatch_key = format!("{}/{}/{generation}", snapshot.binding.scope_id, id);
             let spec = DispatchSpec {
+                project_context_hash: context_ref.clone(),
                 binding: snapshot.binding.clone(),
                 work_id: work_id.clone(),
                 assignment_id: id.clone(),
@@ -957,6 +980,12 @@ fn apply(
                     updated_seq: seq,
                 },
             );
+            if let Some(context_ref) = context_ref {
+                snapshot
+                    .project
+                    .assignment_contexts
+                    .insert(id.clone(), context_ref);
+            }
             snapshot.intents.insert(
                 dispatch_key.clone(),
                 DispatchIntent {
@@ -1870,8 +1899,8 @@ pub(crate) fn validate_new_assignment_contexts(
     Ok(())
 }
 
-/// An Answer must fit the next generation's complete packet before the request
-/// is permanently closed. Reuse the existing packet builder and artifact budget.
+/// Known answers and candidate Project context must fit the next generation's
+/// complete packet before either is published. Reuse its builder/artifact budget.
 pub(crate) fn validate_answer_contexts(
     before: &Snapshot,
     next: &Snapshot,
@@ -1883,10 +1912,15 @@ pub(crate) fn validate_answer_contexts(
         .filter(|request| {
             request.kind == RequestKind::Question
                 && request.status == RequestStatus::Answered
-                && before
+                && (before
                     .requests
                     .get(&request.id)
                     .is_none_or(|old| old.answer != request.answer)
+                    || (before.project.work_contexts.get(&request.work_id)
+                        != next.project.work_contexts.get(&request.work_id)
+                        && next.tickets.get(&request.work_id).is_some_and(|work| {
+                            work.contract_revision == request.contract_revision
+                        })))
         })
         .map(|request| request.work_id.clone())
         .collect::<BTreeSet<_>>();
@@ -1937,6 +1971,14 @@ pub(crate) fn validate_answer_contexts(
             updated_seq: next.seq,
         };
         let mut projected = next.clone();
+        // Count the context the next real Start will adopt; never publish this projection.
+        projected.project.assignment_contexts.remove(&assignment_id);
+        if let Some(context_hash) = next.project.work_contexts.get(&work_id) {
+            projected
+                .project
+                .assignment_contexts
+                .insert(assignment_id.clone(), context_hash.clone());
+        }
         let projected_work = projected.tickets.get_mut(&work_id).expect("answer Work");
         projected_work.generation = assignment.generation;
         projected_work.state = WorkState::Active;
@@ -2100,6 +2142,8 @@ fn valid_effect_transition(from: EffectState, to: EffectState) -> bool {
 }
 
 pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
+    crate::project::validate(snapshot)?;
+    crate::sprint::validate(snapshot)?;
     crate::migration::validate_migration(snapshot)?;
     crate::file_reconciliation::validate_file_intents(snapshot)?;
     crate::resolution::validate_history(snapshot)?;
