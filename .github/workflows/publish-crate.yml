@@ -545,6 +545,9 @@ jobs:
           # Pin the complete definition (including global env and the checkout-free
           # source job), not merely a job name or arbitrary repository-authored log.
           PRODUCER_V1 = "64ced424ec999ec332cbc926d52f1d541721a2f05c2a6361b59cdbb869973f24"
+          # #2109 adds Node driver checks; checkout-free source admission is unchanged.
+          PRODUCER_V2 = "987181c31ab13af8fe85ec46586d4cacdf5ba9f3acda38c14a2b0b72671a068a"
+          REVIEWED_PRODUCERS = frozenset((PRODUCER_V1, PRODUCER_V2))
           SUITE_QUERY = ("query($suite:ID!){node(id:$suite){... on CheckSuite{databaseId "
                          "repository{databaseId nameWithOwner} app{databaseId slug} commit{oid} "
                          "workflowRun{databaseId event runAttempt workflow{databaseId name} "
@@ -554,7 +557,7 @@ jobs:
               data = api(f"contents/.github/workflows/ci.yml?ref={revision}")
               assert data["encoding"] == "base64" and len(data["content"]) <= 180000
               raw = base64.b64decode(data["content"], validate=False)
-              assert len(raw) <= 128000 and hashlib.sha256(raw).hexdigest() == PRODUCER_V1, "Unknown source-admission producer"
+              assert len(raw) <= 128000 and hashlib.sha256(raw).hexdigest() in REVIEWED_PRODUCERS, "Unknown source-admission producer"
 
           def historical_binding(pre, jobs):
               assert pre.get("pull_requests") == [], "Historical proof is only for an empty association"
