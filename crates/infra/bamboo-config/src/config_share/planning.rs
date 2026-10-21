@@ -12,13 +12,31 @@ pub fn preview_bundle(bundle: &ShareBundle, target: &Config) -> ShareResult<Shar
         providers: bundle
             .providers
             .iter()
-            .map(|p| ShareProviderPreview {
-                id: p.id.clone(),
-                provider_type: p.provider_type,
-                label: p.label.clone(),
-                has_api_key: p.api_key.is_some(),
-                has_base_url: p.base_url.is_some(),
-                conflict: instances.contains_key(&p.id),
+            .map(|p| {
+                let existing = instances.get(&p.id);
+                let source_origin = safe_origin(p.base_url.as_deref());
+                let target_origin = safe_origin(existing.and_then(|p| p.base_url.as_deref()));
+                let retains_existing_api_key = existing.is_some_and(|target| {
+                    crate::provider_instance_api_key_from_env(target)
+                        || (p.api_key.is_none()
+                            && (target.credential_ref.is_some()
+                                || target.api_key_encrypted.is_some()
+                                || !target.api_key.is_empty()))
+                });
+                let credential_origin_risk =
+                    existing.is_some() && p.base_url.is_some() && source_origin != target_origin;
+                ShareProviderPreview {
+                    id: p.id.clone(),
+                    provider_type: p.provider_type,
+                    label: p.label.clone(),
+                    has_api_key: p.api_key.is_some(),
+                    has_base_url: p.base_url.is_some(),
+                    source_origin,
+                    target_origin,
+                    retains_existing_api_key,
+                    credential_origin_risk,
+                    conflict: existing.is_some(),
+                }
             })
             .collect(),
         scenarios: bundle
@@ -56,6 +74,12 @@ pub fn preview_bundle(bundle: &ShareBundle, target: &Config) -> ShareResult<Shar
             .collect(),
         contains_secrets: bundle.contains_secrets(),
     })
+}
+
+fn safe_origin(value: Option<&str>) -> Option<String> {
+    let url = url::Url::parse(value?).ok()?;
+    (matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+        .then(|| url.origin().ascii_serialization())
 }
 
 /// Resolve only imported data; return a write plan with omission semantics

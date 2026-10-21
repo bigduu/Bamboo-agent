@@ -227,6 +227,22 @@ pub struct ShareProviderPreview {
     pub label: Option<String>,
     pub has_api_key: bool,
     pub has_base_url: bool,
+    /// Scheme/host/port only; never credentials, a path, query or fragment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_origin: Option<String>,
+    /// Same-ID Replace may reuse the target's stored key or retained runtime
+    /// env binding. The binding can win even when an incoming key is included;
+    /// this metadata does not assert that an env value is currently present.
+    /// Rename never inherits the previous identity's key or binding.
+    #[serde(default)]
+    pub retains_existing_api_key: bool,
+    /// Replace changes/introduces an origin while retaining other destination
+    /// settings, which may include credentials. This is deliberately broader
+    /// than the API-key metadata above; Rename and Skip do not reuse settings.
+    #[serde(default)]
+    pub credential_origin_risk: bool,
     pub conflict: bool,
 }
 
@@ -486,7 +502,19 @@ pub fn validate_env_name(name: &str) -> ShareResult<()> {
         "BROWSER",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
+        "LOCPATH",
+        "NLSPATH",
+        "LIBPATH",
+        "SHLIB_PATH",
+        "TCLLIBPATH",
     ];
+    // Native conversion/provider/profiler and language module selectors:
+    // sourceware.org/glibc/manual/latest/html_node/Generic-Conversion-Interface.html
+    // github.com/bminor/glibc/blob/master/sysdeps/generic/unsecvars.h
+    // docs.openssl.org/master/man7/openssl-env/
+    // learn.microsoft.com/en-us/dotnet/core/runtime-config/debugging-profiling
+    // learn.microsoft.com/en-us/dotnet/core/runtime-config/garbage-collector
+    // github.com/mono/mono/blob/main/man/mono.1
     let prefixes = [
         "LD_",
         "DYLD_",
@@ -511,6 +539,20 @@ pub fn validate_env_name(name: &str) -> ShareResult<()> {
         "JDK_",
         "PHP_",
         "ELECTRON_",
+        "GCONV_",
+        "GLIBC_",
+        "OPENSSL_",
+        "CORECLR_",
+        "COR_",
+        "GIO_",
+        "GTK_",
+        "QT_",
+        "LUA_",
+        "TCL_",
+        "JULIA_",
+        "R_",
+        "COMPLUS_",
+        "MONO_",
     ];
     if forbidden.contains(&upper.as_str()) || prefixes.iter().any(|p| upper.starts_with(p)) {
         return Err(ShareError::Unsafe);
