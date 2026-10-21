@@ -1581,7 +1581,7 @@ async fn direct_registration_waits_for_activation_without_creating_a_phantom_own
 }
 
 #[tokio::test]
-async fn cancelled_manual_reservation_observed_by_activation_recovers_one_real_successor() {
+async fn cancelled_manual_waiter_preserves_the_sdk_activation_token() {
     let provider_calls = Arc::new(AtomicUsize::new(0));
     let provider_entered = Arc::new(Notify::new());
     let provider_release = Arc::new(Notify::new());
@@ -1599,7 +1599,7 @@ async fn cancelled_manual_reservation_observed_by_activation_recovers_one_real_s
         .messenger
         .admit(SessionMessageEnvelope::user_input(
             &harness.parent_session_id,
-            "recover an activation that observed a cancelled manual runner",
+            "deliver after a cancelled manual registration waiter",
         ))
         .await
         .unwrap();
@@ -1623,104 +1623,53 @@ async fn cancelled_manual_reservation_observed_by_activation_recovers_one_real_s
         &harness.parent_session_id,
     )
     .await;
-    let manual = {
-        let agent = harness.ctx.agent.clone();
-        let runners = harness.agent_runners.clone();
-        let senders = harness.ctx.session_event_senders.clone();
-        let session_id = harness.parent_session_id.clone();
-        let sender = sender.clone();
-        tokio::spawn(async move {
-            crate::execution::reserve_session_execution(
-                &agent,
-                &runners,
-                &senders,
-                &session_id,
-                &sender,
-            )
-            .await
-        })
-    };
-    let cancelled_run_id = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Some(run_id) = harness
-                .agent_runners
-                .read()
-                .await
-                .get(&harness.parent_session_id)
-                .map(|runner| runner.run_id.clone())
-            {
-                break run_id;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("manual entry must reserve a raw runner before waiting on the router token");
-
-    manual.abort();
-    match manual.await {
-        Err(error) => assert!(error.is_cancelled()),
-        Ok(_) => panic!("manual reservation unexpectedly completed before cancellation"),
+    let mut manual = Box::pin(crate::execution::reserve_session_execution(
+        &harness.ctx.agent,
+        &harness.agent_runners,
+        &harness.ctx.session_event_senders,
+        &harness.parent_session_id,
+        &sender,
+    ));
+    tokio::select! {
+        biased;
+        _ = &mut manual => panic!("manual registration must wait for the genuine SDK activation token"),
+        _ = tokio::task::yield_now() => {},
     }
-    assert!(matches!(
+    assert!(
         harness
             .agent_runners
             .read()
             .await
             .get(&harness.parent_session_id)
-            .map(|runner| &runner.status),
-        Some(crate::execution::AgentStatus::Running)
-    ));
-    let router = harness
-        .ctx
-        .agent
-        .activation_router()
-        .expect("delivery harness has an activation router")
-        .clone();
-    assert!(
-        !router
-            .owns_run(&harness.parent_session_id, &cancelled_run_id)
-            .await
+            .is_none(),
+        "a waiting manual entry must not install a raw runner"
     );
-
-    // The activation observes the still-protected raw runner and publishes its
-    // exact placeholder. Pending-registration Drop then adopts and abandons it,
-    // which releases both planes before requesting one bounded successor.
+    drop(manual);
+    let router = harness.ctx.agent.activation_router().unwrap().clone();
+    assert!(router
+        .current_run_id(&harness.parent_session_id)
+        .await
+        .is_none());
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        !activation.is_finished(),
+        "cancelling the manual waiter must preserve the SDK token"
+    );
     harness.allow_reservation.notify_one();
     let disposition = tokio::time::timeout(Duration::from_secs(5), activation)
         .await
-        .expect("the first activation attempt must settle")
-        .expect("activation task must not panic")
-        .expect("durable activation remains accepted");
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(
         disposition.activation,
-        bamboo_domain::SessionActivationDisposition::ActiveNotified
+        bamboo_domain::SessionActivationDisposition::ActivationReserved
     );
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        harness.reservation_entered.notified(),
-    )
-    .await
-    .expect("abandoned exact placeholder must request one bounded successor");
-    assert_eq!(harness.reservations.load(Ordering::SeqCst), 2);
-    assert!(
-        !router
-            .owns_run(&harness.parent_session_id, &cancelled_run_id)
-            .await,
-        "the cancelled manual run must not remain as a phantom router owner"
+    assert_eq!(
+        harness.reservations.load(Ordering::SeqCst),
+        1,
+        "a cancelled waiter must not manufacture an extra SDK activation"
     );
-    assert!(matches!(
-        harness
-            .agent_runners
-            .read()
-            .await
-            .get(&harness.parent_session_id)
-            .filter(|runner| runner.run_id == cancelled_run_id)
-            .map(|runner| &runner.status),
-        Some(crate::execution::AgentStatus::Cancelled)
-    ));
-
-    harness.allow_reservation.notify_one();
     tokio::time::timeout(Duration::from_secs(5), provider_entered.notified())
         .await
         .expect("the bounded successor must reach one real provider execution");
@@ -1729,7 +1678,6 @@ async fn cancelled_manual_reservation_observed_by_activation_recovers_one_real_s
         let runner = runners
             .get(&harness.parent_session_id)
             .expect("successor raw runner must be present");
-        assert_ne!(runner.run_id, cancelled_run_id);
         assert!(matches!(
             runner.status,
             crate::execution::AgentStatus::Running
@@ -1794,6 +1742,15 @@ async fn shared_execution_reservation_collides_before_entry_side_effects() {
     )
     .await;
 
+    let mut predecessor = crate::execution::AgentRunner::new();
+    predecessor.status = crate::execution::AgentStatus::Completed;
+    let previous_run = predecessor.run_id.clone();
+    let previous_publication = predecessor.event_publication.clone();
+    harness
+        .agent_runners
+        .write()
+        .await
+        .insert(harness.parent_session_id.clone(), predecessor);
     let outcome = crate::execution::reserve_session_execution(
         &harness.ctx.agent,
         &harness.agent_runners,
@@ -1807,15 +1764,19 @@ async fn shared_execution_reservation_collides_before_entry_side_effects() {
         crate::execution::SessionExecutionReserveOutcome::AlreadyRunning { run_id }
             if run_id == "sdk-owner"
     ));
-    assert!(matches!(
-        harness
-            .agent_runners
-            .read()
-            .await
-            .get(&harness.parent_session_id)
-            .map(|runner| &runner.status),
-        Some(crate::execution::AgentStatus::Error(_))
-    ));
+    {
+        let runners = harness.agent_runners.read().await;
+        let retained = runners.get(&harness.parent_session_id).unwrap();
+        assert!(matches!(
+            retained.status,
+            crate::execution::AgentStatus::Completed
+        ));
+        assert_eq!(retained.run_id, previous_run);
+        assert!(Arc::ptr_eq(
+            &retained.event_publication,
+            &previous_publication
+        ));
+    }
     assert!(
         router
             .owns_run(&harness.parent_session_id, "sdk-owner")
@@ -1977,77 +1938,37 @@ async fn cancelled_pending_registration_cleans_after_router_lock_releases() {
         &harness.parent_session_id,
     )
     .await;
-    let reservation_task = {
-        let agent = harness.ctx.agent.clone();
-        let runners = harness.agent_runners.clone();
-        let senders = harness.ctx.session_event_senders.clone();
-        let session_id = harness.parent_session_id.clone();
-        let sender = sender.clone();
-        tokio::spawn(async move {
-            crate::execution::reserve_session_execution(
-                &agent,
-                &runners,
-                &senders,
-                &session_id,
-                &sender,
-            )
-            .await
-        })
-    };
-    let run_id = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Some(run_id) = harness
-                .agent_runners
-                .read()
-                .await
-                .get(&harness.parent_session_id)
-                .map(|runner| runner.run_id.clone())
-            {
-                break run_id;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("raw runner reservation must become visible");
-
-    reservation_task.abort();
-    match reservation_task.await {
-        Err(error) => assert!(error.is_cancelled()),
-        Ok(_) => panic!("reservation task unexpectedly completed before abort"),
-    }
-    assert!(matches!(
-        harness
-            .agent_runners
-            .read()
-            .await
-            .get(&harness.parent_session_id)
-            .map(|runner| &runner.status),
-        Some(crate::execution::AgentStatus::Running)
+    let mut reservation = Box::pin(crate::execution::reserve_session_execution(
+        &harness.ctx.agent,
+        &harness.agent_runners,
+        &harness.ctx.session_event_senders,
+        &harness.parent_session_id,
+        &sender,
     ));
-
+    tokio::select! {
+        biased;
+        _ = &mut reservation => panic!("reservation must remain pending at the real router mutex"),
+        _ = tokio::task::yield_now() => {},
+    }
+    assert!(harness
+        .agent_runners
+        .read()
+        .await
+        .get(&harness.parent_session_id)
+        .is_none());
+    drop(reservation);
     release_lock.notify_one();
     lock_holder.await.unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let cancelled = matches!(
-                harness
-                    .agent_runners
-                    .read()
-                    .await
-                    .get(&harness.parent_session_id)
-                    .map(|runner| &runner.status),
-                Some(crate::execution::AgentStatus::Cancelled)
-            );
-            let owner_released = !router.owns_run(&harness.parent_session_id, &run_id).await;
-            if cancelled && owner_released {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("cancelled pending registration must clean both ownership planes");
+    assert!(router
+        .current_run_id(&harness.parent_session_id)
+        .await
+        .is_none());
+    assert!(harness
+        .agent_runners
+        .read()
+        .await
+        .get(&harness.parent_session_id)
+        .is_none());
 }
 
 #[tokio::test]

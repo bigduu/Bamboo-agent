@@ -9,7 +9,7 @@ fn session_version_new_root_and_child_are_explicitly_stamped() {
     for session in [root, child] {
         assert_eq!(
             serde_json::to_value(session).unwrap()["session_version"],
-            json!(1)
+            json!(super::CURRENT_SESSION_VERSION)
         );
     }
 }

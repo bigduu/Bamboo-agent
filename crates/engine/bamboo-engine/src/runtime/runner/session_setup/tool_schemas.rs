@@ -145,12 +145,26 @@ fn resolve_catalog_with_activation(
     session: &Session,
     activated: &std::collections::BTreeSet<String>,
 ) -> Vec<ClassifiedToolSchema> {
+    let bound = tools.for_session(session);
+    let tools = bound.as_deref().unwrap_or(tools);
     let mut tool_schemas = config.tool_registry.list_tools();
     if tool_schemas.is_empty() {
         tool_schemas = tools.list_tools();
     }
 
     tool_schemas.extend(config.additional_tool_schemas.clone());
+    // Config registries may be shared by old and new Sessions. Only an actually
+    // installed, version-bound Host port contributes the new Root schema.
+    if session.independent_root_spawn_contract() {
+        tool_schemas.retain(|schema| schema.function.name != "spawn_session");
+        tool_schemas.extend(
+            tools
+                .list_tools()
+                .into_iter()
+                .filter(|schema| schema.function.name == "spawn_session"),
+        );
+    }
+
     tool_schemas.sort_by(|left, right| left.function.name.cmp(&right.function.name));
     tool_schemas.dedup_by(|left, right| left.function.name == right.function.name);
     if config.ticket_worker_plan.is_some() {
@@ -193,6 +207,12 @@ fn resolve_catalog_with_activation(
         let Some(identity) = ClassifiedToolIdentity::from_schema_name(&schema.function.name) else {
             continue;
         };
+        // The guide shortener also canonicalizes legacy aliases internally.
+        // Keep the complete Root contract instead of turning its description
+        // back into the old Child-spawn guide through that compatibility path.
+        if session.independent_root_spawn_contract() && schema.function.name == "spawn_session" {
+            continue;
+        }
         let guide_name = identity.alias_fallback_name();
         if identity.loading_class() == CapabilityLoadingClass::Deferred
             && !activated.contains(guide_name)
@@ -240,9 +260,19 @@ fn resolve_catalog_with_activation(
     let disabled_execution_names = disabled_tools
         .iter()
         .filter_map(|reference| {
-            resolve_disabled_tool_reference_name(reference, |name| {
-                by_execution_name.contains_key(name)
-            })
+            if session.independent_root_spawn_contract()
+                && bamboo_domain::independent_root_spawn_reference(reference)
+            {
+                bamboo_domain::resolve_session_tool_reference(
+                    session.session_version,
+                    reference,
+                    |name| by_execution_name.contains_key(name),
+                )
+            } else {
+                resolve_disabled_tool_reference_name(reference, |name| {
+                    by_execution_name.contains_key(name)
+                })
+            }
         })
         .flat_map(|name| {
             let replacement = bamboo_domain::legacy_shell_replacement(&name).map(str::to_owned);
@@ -618,5 +648,84 @@ mod live_disabled_tests {
         assert!(!super::super::skill_context::explicit_activation_pending(
             &session
         ));
+    }
+    struct VersionedCatalog {
+        v2: bool,
+    }
+    #[async_trait::async_trait]
+    impl ToolExecutor for VersionedCatalog {
+        async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
+            unreachable!()
+        }
+        fn for_session(&self, session: &Session) -> Option<Arc<dyn ToolExecutor>> {
+            Some(Arc::new(Self {
+                v2: session.independent_root_spawn_contract(),
+            }))
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            let mut names = vec!["SubAgent", "session_control", "work_dispatch"];
+            if self.v2 {
+                names.push("spawn_session");
+            }
+            names
+                .into_iter()
+                .map(|name| {
+                    let mut s = schema(name);
+                    s.function.description = format!("actual {name} owner contract");
+                    s
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn versioned_spawn_catalog_keeps_root_schema_separate_and_native_disabled_exact() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let tools = VersionedCatalog { v2: false };
+        for version in [None, Some(1), Some(2)] {
+            for ultra in [false, true] {
+                for supervisor in [false, true] {
+                    let mut session = Session::new(
+                        if supervisor {
+                            DEFAULT_SUPERVISOR_SESSION_ID
+                        } else {
+                            "ordinary"
+                        },
+                        "model",
+                    );
+                    session.session_version = version;
+                    session.set_root_orchestration_only(ultra).unwrap();
+                    if supervisor {
+                        session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                            incarnation_id: uuid::Uuid::new_v4(),
+                        };
+                    }
+                    let config = AgentLoopConfig::default();
+                    let schemas =
+                        resolve_available_tool_schemas_for_session(&config, &tools, &session);
+                    let root = schemas.iter().find(|s| s.function.name == "spawn_session");
+                    assert_eq!(root.is_some(), version == Some(2) && supervisor);
+                    if let Some(root) = root {
+                        assert_eq!(
+                            root.function.description,
+                            "actual spawn_session owner contract"
+                        );
+                    }
+                    for reference in ["spawn_session", "spawnSession", "default::spawn_session"] {
+                        let config = AgentLoopConfig {
+                            disabled_tools: BTreeSet::from([reference.to_owned()]),
+                            ..Default::default()
+                        };
+                        let schemas =
+                            resolve_available_tool_schemas_for_session(&config, &tools, &session);
+                        assert!(schemas.iter().all(|s| s.function.name != "spawn_session"));
+                        assert_eq!(
+                            schemas.iter().any(|s| s.function.name == "SubAgent"),
+                            version == Some(2)
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -37,6 +37,11 @@ pub enum LLMError {
     #[error("Authentication error: {0}")]
     Auth(String),
 
+    /// The provider already applied its bounded request policy. Callers must
+    /// retain this terminal boundary instead of retrying the entire agent turn.
+    #[error("{0}")]
+    RequestFailed(String),
+
     /// Protocol conversion errors
     #[error("Protocol conversion error: {0}")]
     Protocol(#[from] crate::protocol::ProtocolError),

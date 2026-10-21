@@ -6,7 +6,7 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
 const { assertVersion, validateSource, readBodyReceipt, validateReceipt,
-  readAuthenticatedReceipt, assertSigningConfiguration, signReceipt, authenticateReceipt, spawnCommand } = require('./crate-release.cjs')
+  readAuthenticatedReceipt, assertSigningConfiguration, assertCurrentMain, currentMainWrite, signReceipt, authenticateReceipt, spawnCommand } = require('./crate-release.cjs')
 
 const REPOSITORY = 'bigduu/Bamboo-agent'
 const MANIFEST = 'bamboo-sidecars-v1.json'
@@ -431,6 +431,8 @@ async function publishAssets({ directory, release, readAsset, upload, listAssets
 async function main() {
   assert.equal(process.argv[2], 'publish')
   const identity = workflowIdentity()
+  const guard = () => assertCurrentMain(REPOSITORY, identity.sourceRevision)
+  await guard()
   const { release, receipt } = publishedRelease(identity, { signingKey: process.env.BAMBOO_RELEASE_SIGNING_KEY,
     signingKeyDigest: process.env.BAMBOO_RELEASE_SIGNING_KEY_SHA256 })
   assert.ok(process.env.BAMBOO_RELEASE_SIGNING_KEY, 'Final asset publication requires the existing protected signing authority')
@@ -445,7 +447,7 @@ async function main() {
   assert.equal(git(['rev-parse', 'HEAD']), identity.sourceRevision)
   assert.equal(git(['status', '--porcelain', '--untracked-files=all']), '', 'Source drift blocks asset uploads')
   await publishAssets({ directory, release, readAsset: assetBytes,
-    upload: (file) => execute('gh', ['release', 'upload', `v${identity.version}`, file, '--repo', REPOSITORY]),
+    upload: (file) => currentMainWrite(guard, () => execute('gh', ['release', 'upload', `v${identity.version}`, file, '--repo', REPOSITORY])),
     listAssets: () => JSON.parse(gh(`releases/${release.id}/assets?per_page=100`)) })
   assert.equal(git(['rev-parse', 'HEAD']), identity.sourceRevision)
   assert.equal(git(['status', '--porcelain', '--untracked-files=all']), '')
