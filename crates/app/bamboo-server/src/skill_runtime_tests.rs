@@ -953,3 +953,6 @@ mod ultra;
 
 #[path = "receipt_run_tests.rs"]
 mod receipt_run_tests;
+
+#[path = "skill_runtime_retry_tests.rs"]
+mod retry_tests;
