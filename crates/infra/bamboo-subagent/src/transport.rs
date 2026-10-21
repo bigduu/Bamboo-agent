@@ -538,6 +538,16 @@ pub fn client_config_trusting_cert(cert_file: &Path) -> Result<rustls::ClientCon
             .map_err(|e| format!("add trust anchor from '{cert_path}': {e}"))?;
     }
 
+    client_config_with_roots(roots)
+}
+
+fn standard_webpki_roots() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
+}
+
+fn client_config_with_roots(roots: rustls::RootCertStore) -> Result<rustls::ClientConfig, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let cfg = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -922,7 +932,7 @@ impl ChildClient {
     /// WS upgrade (`Authorization: Bearer <token>`). The token is never logged.
     ///
     /// A `wss://` endpoint is negotiated against the standard webpki CA roots
-    /// (the `rustls-tls-webpki-roots` feature) — i.e. a worker serving a
+    /// (the current Mozilla root set, with the explicit ring provider) — i.e. a worker serving a
     /// CA-signed cert (Let's Encrypt etc.) works with no extra configuration. To
     /// trust a self-signed worker cert (the typical P1 single-direction-TLS
     /// case), use [`connect_with_auth_tls`](Self::connect_with_auth_tls) with a
@@ -951,6 +961,15 @@ impl ChildClient {
                 value,
             );
         }
+        // Do not let the WebSocket dependency choose its obsolete bundled
+        // roots or fall back to the machine's OS trust store. A caller's pinned
+        // config is retained verbatim; plaintext ws needs no TLS config.
+        let tls_config = match tls_config {
+            None if request.uri().scheme_str() == Some("wss") => Some(
+                client_config_with_roots(standard_webpki_roots()).map_err(TransportError::Tls)?,
+            ),
+            other => other,
+        };
         let (ws, _resp) = match tls_config {
             Some(cfg) => {
                 let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(cfg));
