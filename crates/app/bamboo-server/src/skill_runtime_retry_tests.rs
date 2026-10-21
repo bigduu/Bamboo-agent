@@ -40,7 +40,7 @@ impl LLMProvider for RetryScopeProvider {
                     tool_type: "function".into(),
                     function: FunctionCall {
                         name: "Read".into(),
-                        arguments: json!({"file_path": self.inner.inner.task}).to_string(),
+                        arguments: json!({"file_path": "task.txt"}).to_string(),
                     },
                 }])),
                 Ok(LLMChunk::Done),
@@ -55,6 +55,7 @@ async fn error_retry_after_scope_revocation_starts_from_current_workspace() {
     let _proof = HTTP_PROOF.lock().await;
     let home = tempfile::tempdir().unwrap();
     write_skill(home.path(), "native-proof", true);
+    std::fs::write(home.path().join("task.txt"), "STALE_WORKSPACE_MUST_NOT_BE_READ").unwrap();
     let current = home.path().join("current-workspace");
     std::fs::create_dir(&current).unwrap();
     let id = "retry-current-source";
