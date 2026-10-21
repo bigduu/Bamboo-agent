@@ -14,7 +14,8 @@ const FULL = ['Validation Source', 'Test', 'E2E Tests', 'Lint',
 
 const PLATFORMS = ['Build (ubuntu-latest)', 'Build (macos-latest)', 'Build (windows-latest)']
 
-async function verify(t, bootstrap) {
+async function verify(t, bootstrap, producer = 'v1') {
+  assert.match(producer, /^v[12]$/)
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-main-authority-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const git = (...args) => {
@@ -24,7 +25,7 @@ async function verify(t, bootstrap) {
   }
   git('init', '-q')
   // Frozen producer bytes, not an active workflow or a caller-authored receipt.
-  const definition = fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-ci-v1.yml'))
+  const definition = fs.readFileSync(path.join(__dirname, `fixtures/main-authority-ci-${producer}.yml`))
   fs.mkdirSync(path.join(directory, '.github/workflows'), { recursive: true })
   fs.writeFileSync(path.join(directory, '.github/workflows/ci.yml'), definition)
   git('add', '.github/workflows/ci.yml')
