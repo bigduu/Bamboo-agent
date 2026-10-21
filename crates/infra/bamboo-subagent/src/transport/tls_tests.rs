@@ -311,6 +311,17 @@ async fn standard_roots_reject_untrusted_leaf_while_explicit_pin_still_works() {
                         rustls::CertificateError::UnknownIssuer
                     ))
                 );
+                if let Some(inner) = error
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::get_ref)
+                {
+                    unknown_issuer |= matches!(
+                        inner.downcast_ref::<rustls::Error>(),
+                        Some(rustls::Error::InvalidCertificate(
+                            rustls::CertificateError::UnknownIssuer
+                        ))
+                    );
+                }
                 cause = error.source();
             }
             assert!(unknown_issuer, "unexpected TLS failure: {failure}");
