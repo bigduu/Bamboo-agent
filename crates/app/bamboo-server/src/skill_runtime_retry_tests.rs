@@ -312,3 +312,92 @@ async fn error_retry_rejects_a_live_owner_without_history_or_provider_effects() 
     assert!(provider.trace.lock().unwrap().requests.is_empty());
     reservation.abandon().await;
 }
+
+#[actix_web::test]
+async fn dropped_retry_preparation_releases_writer_without_replacing_retained_runner() {
+    use bamboo_engine::execution::{
+        reserve_session_execution, reserve_session_preparation, SessionExecutionReserveOutcome,
+    };
+    let _proof = HTTP_PROOF.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let provider = provider(home.path(), 4096, false);
+    let state = state(home.path(), provider.clone()).await;
+    let original = interrupted_session("retry-dropped-preparation");
+    let mut initial = own_interrupted_root(&state, &original).await;
+    initial
+        .finish_root_actor(bamboo_domain::ActorActivationFinish::Failed)
+        .await;
+    initial.abandon().await;
+    let (run, publication, visible) = {
+        let runners = state.agent_runners.read().await;
+        let runner = runners.get(&original.id).unwrap();
+        (
+            runner.run_id.clone(),
+            runner.event_publication.clone(),
+            runner.visible_messages.clone(),
+        )
+    };
+    let current = state
+        .storage
+        .load_session(&original.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut preparation =
+        reserve_session_preparation(&state.agent, &state.agent_runners, &original.id)
+            .await
+            .unwrap();
+    preparation
+        .bind_root_actor(&state.agent, &current)
+        .await
+        .unwrap();
+    assert!(preparation.root_actor_writer().is_some());
+    let sender = state.get_session_event_sender(&original.id).await;
+    let collision = reserve_session_execution(
+        &state.agent,
+        &state.agent_runners,
+        &state.session_event_senders,
+        &original.id,
+        &sender,
+    )
+    .await;
+    assert!(matches!(
+        collision,
+        SessionExecutionReserveOutcome::AlreadyRunning { .. }
+    ));
+    {
+        let runners = state.agent_runners.read().await;
+        let retained = runners.get(&original.id).unwrap();
+        assert_eq!(retained.run_id, run);
+        assert!(matches!(retained.status, AgentStatus::Cancelled));
+        assert!(Arc::ptr_eq(&retained.event_publication, &publication));
+        assert!(Arc::ptr_eq(&retained.visible_messages, &visible));
+    }
+    drop(preparation);
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while state
+            .session_activation_router
+            .current_run_id(&original.id)
+            .await
+            .is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("preparation Drop must release only after its exact Root writer");
+    let mut next = reserve_session_preparation(&state.agent, &state.agent_runners, &original.id)
+        .await
+        .unwrap();
+    next.bind_root_actor(&state.agent, &current)
+        .await
+        .expect("the dropped preparation must release its actual Actor lease");
+    assert!(next.root_actor_writer().is_some());
+    next.abandon().await;
+    let runners = state.agent_runners.read().await;
+    let retained = runners.get(&original.id).unwrap();
+    assert_eq!(retained.run_id, run);
+    assert!(Arc::ptr_eq(&retained.event_publication, &publication));
+    assert!(Arc::ptr_eq(&retained.visible_messages, &visible));
+    assert!(provider.trace.lock().unwrap().requests.is_empty());
+}

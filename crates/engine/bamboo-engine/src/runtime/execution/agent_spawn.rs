@@ -25,7 +25,7 @@ use crate::runtime::execution::child_completion::ChildCompletion;
 use crate::runtime::execution::event_forwarder::HistoryCommitBarrier;
 use crate::runtime::execution::runner_lifecycle::{
     finalize_rejected_runner_if_distinct, finalize_runner_exact, reserve_runner_core,
-    ReserveOutcome, RunnerReservation,
+    reserve_runner_for_registration, ReserveOutcome, RunnerReservation,
 };
 use crate::runtime::execution::runner_state::AgentRunner;
 use crate::runtime::model_roster::ModelRoster;
@@ -44,9 +44,8 @@ enum SessionExecutionActivationOwnership {
     /// yet committed the matching owner or invoked the launch closure.
     UnpublishedActivation(Arc<SessionActivationRouter>),
     /// This exact raw runner is waiting to acquire or adopt its router
-    /// registration. Manual/server callers enter this state before awaiting an
-    /// in-flight activation token; router-dispatched launches enter it after
-    /// publishing their zero-registration placeholder.
+    /// registration. Queued internal launches use this state; normal manual
+    /// entries register before creating their raw runner.
     RegistrationPending(Arc<SessionActivationRouter>),
     /// Manual/server reservation acquired router ownership before any
     /// execution-specific mutation or external side effect.
@@ -465,6 +464,145 @@ impl Drop for SessionExecutionReservation {
     }
 }
 
+/// A fenced history preparation, deliberately unable to spawn an execution.
+/// Its private logical owner never installs or retires a shared runner.
+pub struct SessionPreparationReservation {
+    reservation: Option<SessionExecutionReservation>,
+}
+
+impl SessionPreparationReservation {
+    pub async fn bind_root_actor(
+        &mut self,
+        agent: &Agent,
+        session: &Session,
+    ) -> std::io::Result<()> {
+        self.reservation
+            .as_mut()
+            .expect("live preparation")
+            .bind_root_actor(agent, session)
+            .await
+    }
+
+    pub fn root_actor_writer(&self) -> Option<bamboo_domain::RootActorRuntimeWrite> {
+        self.reservation
+            .as_ref()
+            .and_then(SessionExecutionReservation::root_actor_writer)
+    }
+
+    pub async fn finish(mut self, outcome: bamboo_domain::ActorActivationFinish) {
+        let reservation = self.reservation.take().expect("live preparation");
+        let _ = Self::release(reservation, outcome).await;
+    }
+
+    pub async fn abandon(self) {
+        self.finish(bamboo_domain::ActorActivationFinish::Cancelled)
+            .await;
+    }
+
+    fn release(
+        mut reservation: SessionExecutionReservation,
+        outcome: bamboo_domain::ActorActivationFinish,
+    ) -> tokio::task::JoinHandle<()> {
+        // Cancellation of the HTTP waiter cannot release the router ahead of
+        // its actual Root writer, or interrupt exact-fence cleanup midway.
+        tokio::spawn(async move {
+            reservation.finish_root_actor(outcome).await;
+            reservation.abandon().await;
+        })
+    }
+}
+
+impl Drop for SessionPreparationReservation {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                drop(Self::release(
+                    reservation,
+                    bamboo_domain::ActorActivationFinish::Cancelled,
+                ));
+            }
+        }
+    }
+}
+
+/// Acquire only logical ownership for a durable preparation. A following real
+/// execution, not this operation, decides when to replace retained output.
+pub async fn reserve_session_preparation(
+    agent: &Arc<Agent>,
+    runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    session_id: &str,
+) -> std::io::Result<SessionPreparationReservation> {
+    let router = agent.activation_router().cloned().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Preparation requires its activation router",
+        )
+    })?;
+    let busy = || {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "Session has an active runner or logical owner",
+        )
+    };
+    if runners.read().await.get(session_id).is_some_and(|runner| {
+        matches!(
+            runner.status,
+            super::runner_state::AgentStatus::Pending | super::runner_state::AgentStatus::Running
+        )
+    }) {
+        return Err(busy());
+    }
+    // Restrict release to genuine producer wakeups; preparing history must
+    // not itself dispatch unrelated durable Inbox backlog.
+    let reservation = reserve_logical_session(router, runners, session_id, true)
+        .await
+        .map_err(|_| busy())?;
+    let preparation = SessionPreparationReservation {
+        reservation: Some(reservation),
+    };
+    if runners.read().await.get(session_id).is_some_and(|runner| {
+        matches!(
+            runner.status,
+            super::runner_state::AgentStatus::Pending | super::runner_state::AgentStatus::Running
+        )
+    }) {
+        preparation.abandon().await;
+        return Err(busy());
+    }
+    Ok(preparation)
+}
+
+async fn reserve_logical_session(
+    router: Arc<SessionActivationRouter>,
+    runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    session_id: &str,
+    selected_input: bool,
+) -> Result<SessionExecutionReservation, SessionRunRegistrationError> {
+    let mut reservation = SessionExecutionReservation {
+        session_id: session_id.to_owned(),
+        run_id: uuid::Uuid::new_v4().to_string(),
+        cancel_token: CancellationToken::new(),
+        runners: runners.clone(),
+        activation: SessionExecutionActivationOwnership::Unrouted,
+        root_actor: None,
+        execution_persistence: None,
+        persistence_bound: false,
+        selected_input: false,
+        armed: true,
+    };
+    let registration = register_reserved_activation(
+        router,
+        runners,
+        session_id,
+        &reservation.run_id,
+        selected_input,
+    )
+    .await?;
+    reservation.activation =
+        SessionExecutionActivationOwnership::Registered(Box::new(registration));
+    Ok(reservation)
+}
+
 /// Combined runner/router reservation result.
 pub enum SessionExecutionReserveOutcome {
     Reserved(SessionExecutionReservation),
@@ -608,6 +746,45 @@ async fn reserve_session_execution_inner(
     event_sender: &broadcast::Sender<AgentEvent>,
     selected_input: bool,
 ) -> SessionExecutionReserveOutcome {
+    if let Some(router) = agent.activation_router().cloned() {
+        if let Some(run_id) = runners
+            .read()
+            .await
+            .get(session_id)
+            .filter(|runner| matches!(runner.status, super::runner_state::AgentStatus::Running))
+            .map(|runner| runner.run_id.clone())
+        {
+            return SessionExecutionReserveOutcome::AlreadyRunning { run_id };
+        }
+        // Collide before touching the retained predecessor. This also excludes
+        // real Execute/respond while a history-only preparation owns the Root.
+        let mut reservation =
+            match reserve_logical_session(router, runners, session_id, selected_input).await {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    return SessionExecutionReserveOutcome::AlreadyRunning {
+                        run_id: error.existing_run_id().to_owned(),
+                    }
+                }
+            };
+        let identity = RunnerReservation {
+            run_id: reservation.run_id.clone(),
+            cancel_token: reservation.cancel_token.clone(),
+        };
+        match reserve_runner_for_registration(runners, senders, session_id, event_sender, identity)
+            .await
+        {
+            ReserveOutcome::Reserved(_) => {
+                reservation.selected_input = selected_input;
+                return SessionExecutionReserveOutcome::Reserved(reservation);
+            }
+            ReserveOutcome::AlreadyRunning(run_id) => {
+                reservation.abandon().await;
+                return SessionExecutionReserveOutcome::AlreadyRunning { run_id };
+            }
+        }
+    }
+
     let reservation = match reserve_runner_core(runners, senders, session_id, event_sender).await {
         ReserveOutcome::AlreadyRunning(run_id) => {
             return SessionExecutionReserveOutcome::AlreadyRunning { run_id };
@@ -615,12 +792,7 @@ async fn reserve_session_execution_inner(
         ReserveOutcome::Reserved(reservation) => reservation,
     };
 
-    // Construct the RAII handoff immediately after the raw runner mutation.
-    // If an activation router exists, publish `RegistrationPending` before the
-    // registration await. Cancellation cleanup then waits through any
-    // in-flight router token, adopts an exact placeholder if the activation
-    // observed this raw runner, and abandons both ownership planes together.
-    let mut execution_reservation = SessionExecutionReservation {
+    let execution_reservation = SessionExecutionReservation {
         session_id: session_id.to_string(),
         run_id: reservation.run_id,
         cancel_token: reservation.cancel_token,
@@ -632,23 +804,6 @@ async fn reserve_session_execution_inner(
         selected_input,
         armed: true,
     };
-
-    if let Some(router) = agent.activation_router().cloned() {
-        execution_reservation.activation =
-            SessionExecutionActivationOwnership::RegistrationPending(router);
-        if let Err(error) = execution_reservation.ensure_registered().await {
-            tracing::warn!(
-                %session_id,
-                attempted_run_id = %execution_reservation.run_id(),
-                existing_run_id = %error.existing_run_id(),
-                %error,
-                "runner reservation collided with an existing logical-session owner"
-            );
-            return SessionExecutionReserveOutcome::AlreadyRunning {
-                run_id: error.existing_run_id().to_string(),
-            };
-        }
-    }
     SessionExecutionReserveOutcome::Reserved(execution_reservation)
 }
 

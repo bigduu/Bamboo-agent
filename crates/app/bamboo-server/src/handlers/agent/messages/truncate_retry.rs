@@ -1,6 +1,6 @@
 use actix_web::{web, HttpResponse, Result};
 use bamboo_agent_core::Session;
-use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
+use bamboo_engine::execution::reserve_session_preparation;
 use bamboo_engine::session_app::errors::RespondError;
 use bamboo_engine::session_app::repository::SessionAccess;
 use std::sync::{
@@ -36,21 +36,18 @@ pub(super) async fn prepare(
         }
         crate::handlers::agent::events::begin_execute_startup(state, &id)
     };
-    let sender = state.get_session_event_sender(&id).await;
-    let mut reservation = match reserve_session_execution(
-        &state.agent,
-        &state.agent_runners,
-        &state.session_event_senders,
-        &id,
-        &sender,
-    )
-    .await
-    {
-        SessionExecutionReserveOutcome::Reserved(reservation) => reservation,
-        SessionExecutionReserveOutcome::AlreadyRunning { .. } => {
-            return Ok(conflict(&id, "Session is running; wait before Retry"));
-        }
-    };
+    let mut reservation =
+        match reserve_session_preparation(&state.agent, &state.agent_runners, &id).await {
+            Ok(reservation) => reservation,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(conflict(&id, "Session is running; wait before Retry"));
+            }
+            Err(error) => {
+                return Err(crate::error::json_internal_server_error(format!(
+                    "Retry preparation ownership unavailable: {error}"
+                )))
+            }
+        };
     if let Err(error) = reservation.bind_root_actor(&state.agent, &observed).await {
         reservation.abandon().await;
         return Ok(conflict(&id, &format!("Retry ownership changed: {error}")));
@@ -98,10 +95,11 @@ pub(super) async fn prepare(
         // The atomic mutation has awaited the durable save and fenced cache
         // publication. There are no queued model/forwarder events to replay.
         reservation
-            .finish_root_actor(bamboo_domain::ActorActivationFinish::Succeeded)
+            .finish(bamboo_domain::ActorActivationFinish::Succeeded)
             .await;
+    } else {
+        reservation.abandon().await;
     }
-    reservation.abandon().await;
     match saved {
         Ok(Some(session)) => {
             let removed = outcome.load(Ordering::Relaxed);
