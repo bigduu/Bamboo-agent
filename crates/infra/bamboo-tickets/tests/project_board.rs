@@ -187,6 +187,7 @@ impl Fixture {
                     include_cancelled: false,
                     include_archived: false,
                     sprint_filter: None,
+                    overdue_as_of: None,
                     limit,
                     cursor,
                     fixed_commit: None,
@@ -661,6 +662,7 @@ fn snapshot_pagination_counts_cancelled_and_filter_cursor_binding() {
         include_cancelled: false,
         include_archived: false,
         sprint_filter: None,
+        overdue_as_of: None,
         limit: 10,
         cursor: first.next_cursor,
         fixed_commit: None,
@@ -774,6 +776,7 @@ fn contract_change_requires_fresh_context_and_foreign_scope_cannot_read_board() 
                 include_cancelled: false,
                 include_archived: false,
                 sprint_filter: None,
+                overdue_as_of: None,
                 limit: 10,
                 cursor: None,
                 fixed_commit: None
@@ -845,6 +848,7 @@ fn submitted_stays_testing_until_exact_evidenced_user_acceptance() {
         include_cancelled: false,
         include_archived: false,
         sprint_filter: None,
+        overdue_as_of: None,
         limit: 10,
         cursor: None,
         fixed_commit: None,
@@ -1109,6 +1113,7 @@ fn pending_context_survives_stop_and_restart_and_next_start_adopts_once() {
         include_cancelled: false,
         include_archived: false,
         sprint_filter: None,
+        overdue_as_of: None,
         limit: 10,
         cursor: None,
         fixed_commit: None,
@@ -1209,4 +1214,203 @@ fn metadata_only_pending_does_not_stale_historical_submission_or_user_acceptance
     assert_eq!(row.stage, Some(ProjectBoardStage::Done));
     assert_eq!(row.adopted_context, Some(adopted));
     assert_eq!(row.pending_context, Some(pending));
+}
+
+fn overdue_request(as_of: Option<&str>) -> ProjectBoardRequest {
+    serde_json::from_value(serde_json::json!({
+        "project_id": project(), "limit": 100, "overdue_as_of": as_of
+    }))
+    .unwrap()
+}
+
+fn overdue_deadline(f: &Fixture, work: &str, value: &str) {
+    let snapshot = f.service.published().unwrap().1;
+    f.exec(
+        &format!("deadline-{}", snapshot.seq),
+        vec![Operation::SetPlanningMetadata {
+            ticket_id: work.into(),
+            expected_record_revision: snapshot.tickets[work].record_revision,
+            priority: bamboo_domain::TaskPriority::Medium,
+            expected_completion_at: Some(value.into()),
+        }],
+    );
+}
+
+fn overdue_ids(board: &ReadEnvelope<ProjectBoard>) -> BTreeSet<String> {
+    board.data.rows.iter().map(|r| r.ticket.id.clone()).collect()
+}
+
+fn overdue_sprint(f: &Fixture, action: SprintAction) {
+    let snapshot = f.service.published().unwrap().1;
+    f.service
+        .execute_sprint(
+            &f.authority,
+            &SprintCommand {
+                operation_id: format!("overdue-sprint-{}", snapshot.seq),
+                binding: snapshot.binding,
+                expected_seq: snapshot.seq,
+                expected_epoch: snapshot.authority_epoch,
+                project_id: project(),
+                sprint_id: SprintId::parse("overdue-sprint").unwrap(),
+                source: "owner planning".into(),
+                action,
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn overdue_instant_offsets_and_terminal_states_are_read_only() {
+    let f = Fixture::new();
+    let late = f.create("late", true);
+    let equal = f.create("equal-offset", true);
+    let future = f.create("future", true);
+    let undated = f.create("undated", true);
+    let cancelled = f.create("cancelled-late", true);
+    let archived = f.create("archived-late", true);
+    let paused = f.create("paused-late", true);
+    let done = f.create("accepted-late", true);
+    let foreign = f.create("foreign-late", false);
+    let unlinked = f.create("unlinked-late", false);
+    f.exec(
+        "foreign-project",
+        vec![Operation::AssociateProject {
+            ticket_id: foreign.clone(),
+            project_id: ProjectId::parse("project-b").unwrap(),
+        }],
+    );
+    for work in [&late, &cancelled, &archived, &paused, &done, &foreign, &unlinked] {
+        overdue_deadline(&f, work, "2026-10-21T09:59:59Z");
+    }
+    overdue_deadline(&f, &equal, "2026-10-21T12:00:00+02:00");
+    overdue_deadline(&f, &future, "2026-10-21T10:00:01Z");
+    f.exec(
+        "terminal-and-paused",
+        vec![
+            Operation::Cancel { work_id: cancelled.clone() },
+            Operation::Archive { ticket_id: archived.clone(), archived: true },
+            Operation::Pause { work_id: paused.clone(), reason: "owner pause".into() },
+        ],
+    );
+    let (assignment, _, worker) = f.running(&done);
+    let receipt = f.service.execute(
+        &worker,
+        &f.command("overdue-submit", vec![Operation::Submit {
+            assignment_id: assignment,
+            temp_id: "result".into(),
+            artifacts: vec![Artifact { uri: "artifact://proof/result".into(), sha256: "a".repeat(64) }],
+            evidence: vec!["tested".into()],
+        }]),
+    ).unwrap();
+    f.confirm_submission_stopped(&receipt.ids["result"]);
+    f.exec("overdue-accept", vec![Operation::Accept {
+        work_id: done.clone(),
+        submission_id: receipt.ids["result"].clone(),
+        evidence: vec!["owner verified".into()],
+    }]);
+    let before = canonical_bytes(&f.service.published().unwrap()).unwrap();
+    let mut request = overdue_request(Some("2026-10-21T10:00:00Z"));
+    request.include_cancelled = true;
+    let board = f.service.project_board(&f.authority, &request).unwrap();
+    assert_eq!(overdue_ids(&board), BTreeSet::from([late.clone(), paused.clone()]));
+    assert_eq!(board.data.counts.total, 2);
+    assert_eq!(board.data.counts.blocked, 1);
+    assert_eq!(board.data.counts.done, 0);
+    assert_eq!(board.data.counts.cancelled, 0);
+    let paused_row = board.data.rows.iter().find(|r| r.ticket.id == paused).unwrap();
+    assert!(paused_row.ticket.paused);
+    assert_eq!(paused_row.stage, Some(ProjectBoardStage::Todo));
+    request.overdue_as_of = Some("2026-10-21T14:00:00+04:00".into());
+    assert_eq!(overdue_ids(&f.service.project_board(&f.authority, &request).unwrap()), overdue_ids(&board));
+    request.include_archived = true;
+    assert_eq!(overdue_ids(&f.service.project_board(&f.authority, &request).unwrap()), BTreeSet::from([late.clone(), paused.clone(), archived]));
+    let later = f.service.project_board(&f.authority, &overdue_request(Some("2026-10-21T10:00:01Z"))).unwrap();
+    assert_eq!(overdue_ids(&later), BTreeSet::from([late, paused, equal]));
+    assert!(!overdue_ids(&later).contains(&undated));
+    assert_eq!(canonical_bytes(&f.service.published().unwrap()).unwrap(), before);
+}
+
+#[test]
+fn overdue_cursor_pins_literal_instant_and_snapshot_during_metadata_updates() {
+    let f = Fixture::new();
+    let a = f.create("page-a", true);
+    let b = f.create("page-b", true);
+    let future = f.create("page-future", true);
+    overdue_deadline(&f, &a, "2026-10-21T09:00:00Z");
+    overdue_deadline(&f, &b, "2026-10-21T09:00:00Z");
+    overdue_deadline(&f, &future, "2026-10-21T11:00:00Z");
+    let mut request = overdue_request(Some("2026-10-21T10:00:00Z"));
+    request.limit = 1;
+    let first = f.service.project_board(&f.authority, &request).unwrap();
+    assert_eq!(first.data.counts.total, 2);
+    let cursor = first.next_cursor.clone().unwrap();
+    overdue_deadline(&f, &a, "2026-10-21T12:00:00Z");
+    let added = f.create("page-added", true);
+    overdue_deadline(&f, &added, "2026-10-21T09:00:00Z");
+    request.cursor = Some(cursor);
+    request.limit = 100;
+    let second = f.service.project_board(&f.authority, &request).unwrap();
+    assert_eq!(second.snapshot.commit, first.snapshot.commit);
+    assert_eq!(second.data.counts.total, 2);
+    assert_eq!(overdue_ids(&first).union(&overdue_ids(&second)).cloned().collect::<BTreeSet<_>>(), BTreeSet::from([a, b.clone()]));
+    let fresh = f.service.project_board(&f.authority, &overdue_request(Some("2026-10-21T10:00:00Z"))).unwrap();
+    assert_eq!(overdue_ids(&fresh), BTreeSet::from([b, added]));
+    for as_of in [None, Some("2026-10-21T10:00:00+00:00"), Some("2026-10-21T11:00:00Z")] {
+        let mut changed = request.clone();
+        changed.overdue_as_of = as_of.map(str::to_owned);
+        assert!(matches!(f.service.project_board(&f.authority, &changed), Err(Error::ResyncRequired)));
+    }
+    request.fixed_commit = Some(f.service.published().unwrap().0);
+    assert!(matches!(f.service.project_board(&f.authority, &request), Err(Error::ResyncRequired)));
+}
+
+#[test]
+fn overdue_rejects_unbounded_unknown_or_invalid_instants_without_publication() {
+    let f = Fixture::new();
+    let work = f.create("validation", true);
+    overdue_deadline(&f, &work, "2026-10-21T09:00:00Z");
+    let before = canonical_bytes(&f.service.published().unwrap()).unwrap();
+    let too_long = "x".repeat(65);
+    for invalid in ["2026-10-21", "2026-10-21T10:00:00", "2026-10-21T10:00:00-00:00", "2026-02-30T10:00:00Z", "2026-10-21 10:00:00Z", "２０２６-10-21T10:00:00Z", too_long.as_str()] {
+        assert!(matches!(f.service.project_board(&f.authority, &overdue_request(Some(invalid))), Err(Error::InvalidTransition(_))));
+    }
+    let runtime = Authority::from_verified_host(f.service.published().unwrap().1.binding, Principal::Runtime);
+    assert!(matches!(f.service.project_board(&runtime, &overdue_request(Some("invalid"))), Err(Error::ScopeDenied(_))));
+    assert_eq!(canonical_bytes(&f.service.published().unwrap()).unwrap(), before);
+}
+
+#[test]
+fn overdue_omission_preserves_legacy_cursors_and_intersects_sprint_membership() {
+    let f = Fixture::new();
+    let member = f.create("sprint-late", true);
+    let future = f.create("sprint-future", true);
+    let backlog = f.create("backlog-late", true);
+    overdue_deadline(&f, &member, "2026-10-21T09:00:00Z");
+    overdue_deadline(&f, &future, "2026-10-21T11:00:00Z");
+    overdue_deadline(&f, &backlog, "2026-10-21T09:00:00Z");
+    let legacy: ProjectBoardRequest = serde_json::from_value(serde_json::json!({"project_id":project(),"limit":1})).unwrap();
+    assert!(legacy.overdue_as_of.is_none());
+    assert!(serde_json::to_value(&legacy).unwrap().get("overdue_as_of").is_none());
+    let first = f.service.project_board(&f.authority, &legacy).unwrap();
+    let expected_hash = content_hash(&canonical_bytes(&("project-board-v1", project(), false, false)).unwrap());
+    assert_eq!(first.next_cursor.as_ref().unwrap().query_hash, expected_hash);
+    let mut null = serde_json::to_value(&legacy).unwrap();
+    null["overdue_as_of"] = serde_json::Value::Null;
+    let null: ProjectBoardRequest = serde_json::from_value(null).unwrap();
+    assert_eq!(canonical_bytes(&f.service.project_board(&f.authority, &null).unwrap()).unwrap(), canonical_bytes(&first).unwrap());
+    overdue_sprint(&f, SprintAction::Create { definition: SprintDefinition { name: "overdue".into(), goal: "review".into(), starts_at: None, ends_at: None } });
+    for work in [&member, &future] {
+        let revision = f.service.published().unwrap().1.sprint.sprints[&SprintId::parse("overdue-sprint").unwrap()].revision;
+        overdue_sprint(&f, SprintAction::Add { expected_revision: revision, work_id: work.clone() });
+    }
+    let mut request = overdue_request(Some("2026-10-21T10:00:00Z"));
+    request.sprint_filter = Some(SprintBoardFilter::Sprint { sprint_id: SprintId::parse("overdue-sprint").unwrap() });
+    let board = f.service.project_board(&f.authority, &request).unwrap();
+    assert_eq!(overdue_ids(&board), BTreeSet::from([member]));
+    assert_eq!(board.data.counts.total, 1);
+    request.sprint_filter = Some(SprintBoardFilter::Backlog {});
+    assert_eq!(overdue_ids(&f.service.project_board(&f.authority, &request).unwrap()), BTreeSet::from([backlog]));
+    request.sprint_filter = Some(SprintBoardFilter::Sprint { sprint_id: SprintId::parse("overdue-sprint").unwrap() });
+    request.project_id = ProjectId::parse("other-project").unwrap();
+    assert!(matches!(f.service.project_board(&f.authority, &request), Err(Error::ScopeDenied(_))));
 }

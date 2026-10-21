@@ -347,6 +347,9 @@ pub struct ProjectBoardRequest {
     pub include_archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sprint_filter: Option<SprintBoardFilter>,
+    /// Owner deadline filter evaluated at an explicit instant, never the Host clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overdue_as_of: Option<String>,
     pub limit: usize,
     pub cursor: Option<ReadCursor>,
     pub fixed_commit: Option<String>,
