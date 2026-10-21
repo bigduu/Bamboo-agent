@@ -921,7 +921,9 @@ fn provider_only_import_preserves_case_distinct_environment_bytes_and_revisions(
     };
     // Env-free imports still reject decisions for absent source entries.
     let mut unrelated = decisions.clone();
-    unrelated.env.insert("Token".into(), ShareConflictChoice::Skip);
+    unrelated
+        .env
+        .insert("Token".into(), ShareConflictChoice::Skip);
     assert!(matches!(
         apply_config_share(
             dir.path(),
