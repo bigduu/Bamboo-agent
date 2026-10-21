@@ -313,7 +313,18 @@ pub fn apply_config_share(
             revisions: receipt.revisions,
         }),
         Err(ConfigStoreError::CommitIndeterminate(_)) => {
-            Ok(ShareOperationStatus::Pending { operation_id })
+            // Recovery can fail before this operation begins. A definite
+            // NotFound must not be exposed as Pending; failed reads remain
+            // indeterminate. Do not promote an older Committed receipt here:
+            // recovery may have failed before checking this request's digest.
+            if matches!(
+                share_transaction::read_share_operation(data_dir, operation_id),
+                Ok(ShareOperationStatus::NotFound { .. })
+            ) {
+                Err(ShareApiError::Unavailable)
+            } else {
+                Ok(ShareOperationStatus::Pending { operation_id })
+            }
         }
         Err(error) => Err(map_store(error)),
     }

@@ -1185,6 +1185,79 @@ fn preview_cancel_is_read_only_and_apply_replay_returns_original_receipt() {
 }
 
 #[test]
+fn failed_prior_recovery_does_not_report_unstarted_operation_as_pending() {
+    let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
+    let _key = crate::encryption::set_test_encryption_key([0x54; 32]);
+    for damage in 0..3 {
+        let dir = fixture();
+        let mut imported = bundle();
+        imported.providers[0].label = Some("First synthetic label".into());
+        let string = config_share::encode_bundle(&imported, None).unwrap();
+        let preview = preview_config_share(dir.path(), &string, None).unwrap();
+        let first = Uuid::new_v4();
+        assert!(matches!(
+            apply_config_share(
+                dir.path(),
+                &string,
+                None,
+                &choices(),
+                preview.expected_revisions,
+                &preview.preview_token,
+                first,
+            )
+            .unwrap(),
+            ShareOperationStatus::Committed { .. }
+        ));
+        imported.providers[0].label = Some("Second synthetic label".into());
+        let string = config_share::encode_bundle(&imported, None).unwrap();
+        let preview = preview_config_share(dir.path(), &string, None).unwrap();
+        assert!(!preview.apply_blocked);
+        let second = Uuid::new_v4();
+        // Only the prior receipt changes; all three preview-bound sections
+        // retain their bytes and revisions. The new import never starts.
+        let ledger_path = dir.path().join("config-share-operations.json");
+        if damage == 0 {
+            std::fs::remove_file(&ledger_path).unwrap();
+        } else {
+            let mut ledger: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
+            if damage == 1 {
+                ledger["operations"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(&first.to_string())
+                    .unwrap();
+            } else {
+                ledger["operations"][first.to_string()]["receipt"]["revisions"]["providers"] =
+                    serde_json::json!(preview.expected_revisions.providers + 1);
+            }
+            std::fs::write(&ledger_path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+        }
+        let before = tree(dir.path());
+        assert!(share_transaction::read_share_operation(dir.path(), first).is_err());
+        assert!(matches!(
+            apply_config_share(
+                dir.path(),
+                &string,
+                None,
+                &choices(),
+                preview.expected_revisions,
+                &preview.preview_token,
+                second,
+            ),
+            Err(ShareApiError::Unavailable)
+        ));
+        assert_eq!(
+            share_transaction::read_share_operation(dir.path(), second).unwrap(),
+            ShareOperationStatus::NotFound {
+                operation_id: second,
+            }
+        );
+        assert_tree_unchanged(&before, dir.path());
+    }
+}
+
+#[test]
 fn same_revision_edit_rejects_preview_token_before_any_import_write() {
     let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
     let _key = crate::encryption::set_test_encryption_key([0x42; 32]);
