@@ -40,6 +40,15 @@ async fn run(
     budget: &InitialRequestBudget,
 ) -> Result<InitialResponse, LLMError> {
     let client = reqwest::Client::new();
+    run_with_client(&client, server, config, budget).await
+}
+
+async fn run_with_client(
+    client: &reqwest::Client,
+    server: &MockServer,
+    config: &RetryConfig,
+    budget: &InitialRequestBudget,
+) -> Result<InitialResponse, LLMError> {
     send_anthropic_with_retry(config, budget, || {
         client
             .post(server.uri())
@@ -210,11 +219,13 @@ async fn retry_after_seconds_and_dates_beyond_budget_stop_instead_of_retrying_ea
             .mount(&server)
             .await;
         let cfg = config(4);
+        // Finish fixture setup before starting the short request deadline.
+        let client = reqwest::Client::new();
         let mut budget = InitialRequestBudget::new(&cfg);
         budget.deadline = Instant::now() + Duration::from_millis(50);
         let started = Instant::now();
         assert!(matches!(
-            run(&server, &cfg, &budget).await,
+            run_with_client(&client, &server, &cfg, &budget).await,
             Err(LLMError::RequestFailed(_))
         ));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
@@ -255,11 +266,13 @@ async fn elapsed_request_budget_bounds_waiting_for_response_headers() {
         .mount(&server)
         .await;
     let cfg = config(4);
+    // Measure waiting for headers, excluding synchronous client setup.
+    let client = reqwest::Client::new();
     let mut budget = InitialRequestBudget::new(&cfg);
     budget.deadline = Instant::now() + Duration::from_millis(30);
     let started = Instant::now();
     assert!(matches!(
-        run(&server, &cfg, &budget).await,
+        run_with_client(&client, &server, &cfg, &budget).await,
         Err(LLMError::RequestFailed(_))
     ));
     assert!(started.elapsed() < Duration::from_secs(1));
