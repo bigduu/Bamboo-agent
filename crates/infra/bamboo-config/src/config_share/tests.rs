@@ -705,7 +705,10 @@ fn env_free_bundles_ignore_unrelated_case_distinct_target_names_without_mutation
     }
     // Importing any environment entry still rejects ambiguous target names.
     let with_env = env_bundle(&["Fresh"]);
-    assert_eq!(preview_bundle(&with_env, &target), Err(ShareError::Conflict));
+    assert_eq!(
+        preview_bundle(&with_env, &target),
+        Err(ShareError::Conflict)
+    );
     assert_eq!(
         plan_import(&with_env, &target, &ShareDecisions::default()),
         Err(ShareError::Conflict)
@@ -1407,8 +1410,9 @@ fn package_controls_are_rejected_as_inert_names_without_running_tools() {
 
 #[test]
 fn utility_controls_are_rejected_as_inert_names_without_running_tools() {
-    // Inert names only: no configuration file, command, pager, shell or editor
-    // is opened or executed. Plain fixtures never need a password or KDF.
+    // Inert names only: no configuration file, command, pager, shell, editor,
+    // cloud credential helper or plugin is opened or executed. Plain fixtures
+    // never need a password or KDF.
     let kdf_calls = codec::test_kdf_calls();
     let benign = env_bundle(&["AppToken"]);
     let original = benign.clone();
@@ -1450,20 +1454,88 @@ fn utility_controls_are_rejected_as_inert_names_without_running_tools() {
         "NVIM_APPNAME",
         "NVIM_RPLUGIN_MANIFEST",
         "EMACSLOADPATH",
+        "KUBECONFIG",
+        "KUBE_EDITOR",
+        "KUBECTL_EXTERNAL_DIFF",
+        "HELM_PLUGINS",
+        "HELM_NO_PLUGINS",
+        "DOCKER_CONFIG",
+        "PODMAN_COMPOSE_PROVIDER",
+        "CONTAINERS_CONF",
+        "CONTAINERS_CONF_OVERRIDE",
+        "ANSIBLE_CONFIG",
+        "ANSIBLE_ACTION_PLUGINS",
+        "ANSIBLE_VAULT_PASSWORD_FILE",
+        "AWS_CONFIG_FILE",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_PAGER",
+        "AZURE_CONFIG_DIR",
+        "AZURE_EXTENSION_DIR",
+        "AZURE_EXTENSION_INDEX_URL",
+        "AZURE_EXTENSION_USE_DYNAMIC_INSTALL",
+        "AZURE_EXTENSION_RUN_AFTER_DYNAMIC_INSTALL",
+        "CLOUDSDK_PYTHON",
+        "CLOUDSDK_GSUTIL_PYTHON",
+        "CLOUDSDK_BQ_PYTHON",
+        "CLOUDSDK_CONFIG",
+        "CLOUDSDK_ACTIVE_CONFIG_NAME",
+        "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+        "TF_CLI_CONFIG_FILE",
+        "TERRAFORM_CONFIG",
+        "TF_CLI_ARGS",
+        "TF_CLI_ARGS_apply",
+        "TF_DATA_DIR",
+        "TF_PLUGIN_CACHE_DIR",
+        "TF_REATTACH_PROVIDERS",
+        "TG_CONFIG",
+        "TG_TF_PATH",
+        "TG_WORKING_DIR",
+        "TG_SOURCE",
+        "TG_SOURCE_MAP",
+        "TG_DOWNLOAD_DIR",
+        "TERRAGRUNT_CONFIG",
+        "TERRAGRUNT_TFPATH",
+        "TERRAGRUNT_WORKING_DIR",
+        "TERRAGRUNT_SOURCE",
+        "TERRAGRUNT_SOURCE_MAP",
+        "TERRAGRUNT_DOWNLOAD",
+        "NIX_CONFIG",
+        "NIX_USER_CONF_FILES",
+        "NIX_CONF_DIR",
+        "NIX_BUILD_SHELL",
+        "NIX_PATH",
+        "VAGRANT_VAGRANTFILE",
+        "VAGRANT_CWD",
+        "VAGRANT_HOME",
+        "VAGRANT_DOTFILE_PATH",
+        "VAGRANT_LOCAL_PLUGINS_LOAD",
     ]
     .into_iter()
     .map(str::to_string)
     .collect();
     for prefix in [
-        "RIPGREP_",
-        "FZF_",
-        "BAT_",
-        "DELTA_",
-        "LESS_",
-        "LESSKEY",
-        "RSYNC_",
-        "BASH_",
-        "NVIM_",
+        "RIPGREP_", "FZF_", "BAT_", "DELTA_", "LESS_", "LESSKEY", "RSYNC_", "BASH_", "NVIM_",
+    ] {
+        names.push(format!("{prefix}SYNTHETIC_RESERVED"));
+    }
+    for prefix in [
+        "KUBE_",
+        "KUBECTL_",
+        "HELM_",
+        "DOCKER_",
+        "PODMAN_",
+        "CONTAINERS_",
+        "ANSIBLE_",
+        "TG_",
+        "TERRAGRUNT_",
+        "NIX_",
+        "VAGRANT_",
+        "AZURE_EXTENSION_",
+        "CLOUDSDK_PYTHON",
+        "CLOUDSDK_GSUTIL_PYTHON",
+        "CLOUDSDK_BQ_PYTHON",
+        "TF_CLI_ARGS_",
     ] {
         names.push(format!("{prefix}SYNTHETIC_RESERVED"));
     }
@@ -1520,6 +1592,30 @@ fn utility_controls_are_rejected_as_inert_names_without_running_tools() {
         "FPATH_LABEL",
         "VIMINIT_LABEL",
         "EMACSLOADPATH_LABEL",
+        "APP_KUBECONFIG",
+        "APP_DOCKER_CONFIG",
+        "APP_ANSIBLE_CONFIG",
+        "APP_AWS_PROFILE",
+        "APP_CLOUDSDK_PYTHON",
+        "APP_TF_CLI_ARGS",
+        "KUBECONFIG_LABEL",
+        "DOCKERCOUNT",
+        "HELMCOUNT",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AZURE_TENANT_ID",
+        "AZURE_CLIENT_ID",
+        "AZURE_CLIENT_SECRET",
+        "CLOUDSDK_CORE_PROJECT",
+        "CLOUDSDK_COMPUTE_REGION",
+        "TF_VAR_location",
+        "TF_TOKEN_synthetic_example_test",
+        "TGLABEL",
+        "NIXLABEL",
+        "VAGRANTLABEL",
     ] {
         for variant in [name.to_string(), name.to_ascii_lowercase()] {
             assert_eq!(validate_env_name(&variant), Ok(()));

@@ -574,10 +574,89 @@ pub fn validate_env_name(name: &str) -> ShareResult<()> {
         || compiler_control_env(&upper)
         || package_control_env(&upper)
         || utility_control_env(&upper)
+        || cloud_control_env(&upper)
     {
         return Err(ShareError::Unsafe);
     }
     Ok(())
+}
+
+fn cloud_control_env(upper: &str) -> bool {
+    // A selected configuration can contain executable credential helpers,
+    // plugins, hooks or scripts even when the variable contains only a path.
+    // Reserve the known orchestration/plugin namespaces conservatively; for
+    // wider cloud/IaC namespaces keep ordinary region/identity/input data and
+    // reject their documented execution, config and code-resolution controls.
+    // Python interpreter-selector families are reserved as controls without
+    // claiming every suffix is an environment input in every SDK version.
+    // Execution depends on a later tool invocation, mode and platform. This
+    // bounded policy is not a sandbox for arbitrary future environment consumers.
+    // kubernetes.io/docs/reference/access-authn-authz/authentication/#client-go-credential-plugins
+    // kubernetes.io/docs/reference/kubectl/generated/kubectl_diff/
+    // helm.sh/docs/topics/plugins/
+    // docs.docker.com/reference/cli/docker/#configuration-files
+    // github.com/docker/cli/blob/master/cli-plugins/manager/candidate.go
+    // docs.podman.io/en/latest/markdown/podman-compose.1.html
+    // github.com/containers/common/blob/main/docs/containers.conf.5.md
+    // docs.ansible.com/projects/ansible/latest/reference_appendices/config.html
+    // docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html
+    // docs.aws.amazon.com/cli/latest/userguide/cli-configure-sourcing-external.html
+    // github.com/boto/botocore/blob/develop/botocore/configprovider.py
+    // learn.microsoft.com/en-us/cli/azure/azure-cli-configuration
+    // learn.microsoft.com/en-us/cli/azure/azure-cli-extensions-overview
+    // docs.cloud.google.com/sdk/gcloud/reference/topic/startup
+    // docs.cloud.google.com/sdk/docs/configurations
+    // docs.cloud.google.com/iam/docs/workload-identity-federation-with-other-providers#executable-sourced-credentials
+    // developer.hashicorp.com/terraform/cli/config/environment-variables
+    // developer.hashicorp.com/terraform/cli/config/config-file
+    // developer.hashicorp.com/terraform/plugin/debugging
+    // docs.terragrunt.com/reference/cli/commands/run/
+    // docs.terragrunt.com/reference/hcl/functions/#run_cmd
+    // github.com/gruntwork-io/terragrunt/blob/v0.67.16/docs/_docs/04_reference/cli-options.md
+    // nix.dev/manual/nix/2.33/command-ref/conf-file.html
+    // nix.dev/manual/nix/2.33/command-ref/nix-shell.html
+    // nix.dev/manual/nix/2.33/command-ref/env-common.html
+    // developer.hashicorp.com/vagrant/docs/other/environmental-variables
+    // developer.hashicorp.com/vagrant/docs/vagrantfile#load-order-and-merging
+    // github.com/hashicorp/vagrant/blob/main/lib/vagrant/environment.rb
+    // github.com/hashicorp/vagrant/blob/main/lib/vagrant/plugin/manager.rb
+    let prefixes = [
+        "KUBE_",
+        "KUBECTL_",
+        "HELM_",
+        "DOCKER_",
+        "PODMAN_",
+        "CONTAINERS_",
+        "ANSIBLE_",
+        "TG_",
+        "TERRAGRUNT_",
+        "NIX_",
+        "VAGRANT_",
+        "AZURE_EXTENSION_",
+        "CLOUDSDK_PYTHON",
+        "CLOUDSDK_GSUTIL_PYTHON",
+        "CLOUDSDK_BQ_PYTHON",
+        "TF_CLI_ARGS_",
+    ];
+    [
+        "KUBECONFIG",
+        "AWS_CONFIG_FILE",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_PAGER",
+        "AZURE_CONFIG_DIR",
+        "CLOUDSDK_CONFIG",
+        "CLOUDSDK_ACTIVE_CONFIG_NAME",
+        "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+        "TF_CLI_CONFIG_FILE",
+        "TERRAFORM_CONFIG",
+        "TF_CLI_ARGS",
+        "TF_DATA_DIR",
+        "TF_PLUGIN_CACHE_DIR",
+        "TF_REATTACH_PROVIDERS",
+    ]
+    .contains(&upper)
+        || prefixes.iter().any(|prefix| upper.starts_with(prefix))
 }
 
 fn utility_control_env(upper: &str) -> bool {
@@ -603,15 +682,7 @@ fn utility_control_env(upper: &str) -> bool {
     // github.com/neovim/neovim/blob/master/runtime/plugin/rplugin.vim
     // github.com/emacs-mirror/emacs/blob/master/doc/lispref/loading.texi
     let prefixes = [
-        "RIPGREP_",
-        "FZF_",
-        "BAT_",
-        "DELTA_",
-        "LESS_",
-        "LESSKEY",
-        "RSYNC_",
-        "BASH_",
-        "NVIM_",
+        "RIPGREP_", "FZF_", "BAT_", "DELTA_", "LESS_", "LESSKEY", "RSYNC_", "BASH_", "NVIM_",
     ];
     [
         "MANPAGER",
