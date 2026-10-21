@@ -777,3 +777,87 @@ async fn root_chat_receipt_real_coordinator_can_consume_before_execute_without_o
 
 #[path = "compat_activation_tests.rs"]
 mod compat_activation_tests;
+
+
+#[actix_web::test]
+async fn retry_preparation_keeps_retained_output_and_replay_until_execute() {
+    let _proof = HTTP_PROOF.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let provider = OutputProvider::new(false);
+    let state = state(home.path(), provider.clone()).await;
+    let _deferred = defer_root_activation(&state).await;
+    let id = "retry-retained-output";
+    seed(&state, id).await;
+    let (input, run) = start_output(&state, id, "RETAINED_BEFORE_RETRY", &provider).await;
+    let birth = input["session_created_at"].as_str().unwrap();
+    provider.release.notify_one();
+    assert!(matches!(done(&state, id).await, AgentStatus::Completed));
+    let before = committed_output(&state, id, &run, birth).await;
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while state.session_activation_router.current_run_id(id).await.is_some() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the previous real owner must finish before Retry preparation");
+    let (publication, visible, replay) = {
+        let mut runners = state.agent_runners.write().await;
+        let runner = runners.get_mut(id).unwrap();
+        // A synthetic critical observation exercises the retained replay cache;
+        // it does not create or run a Child or grant any authority.
+        runner.push_critical_event(AgentEvent::SubAgentCompleted {
+            parent_session_id: id.into(),
+            child_session_id: "synthetic-retained-child".into(),
+            status: "completed".into(),
+            error: None,
+        });
+        (
+            runner.event_publication.clone(),
+            runner.visible_messages.clone(),
+            serde_json::to_value(&runner.last_critical_events).unwrap(),
+        )
+    };
+    for _ in 0..2 {
+        let (status, prepared, _) = request_headers(
+            &state,
+            &format!("/api/v1/sessions/{id}/messages/truncate"),
+            json!({"mode":"error_retry"}),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{prepared}");
+        let (status, retained) = output(&state, id, &run, Some(birth)).await;
+        assert_eq!(status, StatusCode::OK, "Retry preparation lost the old run: {retained}");
+        assert_eq!(retained, before);
+        {
+            let runners = state.agent_runners.read().await;
+            let runner = runners.get(id).unwrap();
+            assert_eq!(runner.run_id, run);
+            assert!(matches!(runner.status, AgentStatus::Completed));
+            assert!(Arc::ptr_eq(&runner.event_publication, &publication));
+            assert!(Arc::ptr_eq(&runner.visible_messages, &visible));
+            assert_eq!(serde_json::to_value(&runner.last_critical_events).unwrap(), replay);
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(state.session_activation_router.current_run_id(id).await.is_none());
+    }
+    // A real successor reservation may replace this one retained output. Retry
+    // itself added no User input and did not dispatch an execution or a tool.
+    let (status, successor, _) = request_headers(
+        &state,
+        &format!("/api/v1/execute/{id}"),
+        json!({}),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{successor}");
+    assert_ne!(successor["run_id"].as_str().unwrap(), run);
+    let (status, _) = output(&state, id, &run, Some(birth)).await;
+    assert_eq!(status, StatusCode::GONE);
+    tokio::time::timeout(std::time::Duration::from_secs(30), provider.entered.notified())
+        .await
+        .expect("the actual successor must reach the synthetic provider");
+    provider.release.notify_one();
+    assert!(matches!(done(&state, id).await, AgentStatus::Completed));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+}
