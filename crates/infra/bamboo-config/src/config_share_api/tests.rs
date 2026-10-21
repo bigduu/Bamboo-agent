@@ -712,6 +712,14 @@ fn unsafe_or_case_duplicate_environment_bundles_are_rejected_before_any_api_writ
         (vec!["GIT_ASKPASS"], true),
         (vec!["git_askpass"], true),
         (vec!["Git_AskPass"], true),
+        (vec!["CCACHE_PREFIX"], true),
+        (vec!["ccache_prefix_cpp"], true),
+        (vec!["CCACHE_PATH"], true),
+        (vec!["SCCACHE_CONF"], true),
+        (vec!["sccache_conf"], true),
+        (vec!["DISTCC_SSH"], true),
+        (vec!["ICECC_CC"], true),
+        (vec!["icecc_cxx"], true),
         (vec!["Token", "TOKEN"], false),
     ] {
         // Names are inert data. Construct an untrusted envelope directly so
