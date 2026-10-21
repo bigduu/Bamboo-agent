@@ -468,7 +468,7 @@ fn prepare_import(
     crate::validate_runtime_model_admission(&current).map_err(|_| ShareApiError::Invalid)?;
     providers.data.provider_instances = current.provider_instances.clone();
     providers.data.defaults = current.defaults.clone();
-    env.data.0 = current.env_vars;
+    env.data.0 = std::mem::take(&mut current.env_vars);
     Ok(ShareTransactionCandidate {
         providers: encode_changed_section(providers, snapshot.providers.as_deref())?,
         env: encode_changed_section(env, snapshot.env.as_deref())?,
