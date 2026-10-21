@@ -1066,6 +1066,22 @@ fn compiler_controls_are_rejected_as_strings_without_running_tools() {
         "_CL_",
         "LINK",
         "_LINK_",
+        "GCC_EXEC_PREFIX",
+        "GCC_COMPARE_DEBUG",
+        "COMPILER_PATH",
+        "LIBRARY_PATH",
+        "MAKE",
+        "MAKEFLAGS",
+        "GNUMAKEFLAGS",
+        "MAKEFILES",
+        "CONFIG_SHELL",
+        "CONFIG_SITE",
+        "CMAKE_TOOLCHAIN_FILE",
+        "CMAKE_PROGRAM_PATH",
+        "CMAKE_PREFIX_PATH",
+        "CMAKE_GENERATOR_TOOLSET",
+        "CMAKE_C_COMPILER_LAUNCHER",
+        "CMAKE_CXX_LINKER_LAUNCHER",
     ]
     .into_iter()
     .map(str::to_string)
@@ -1140,6 +1156,9 @@ fn compiler_controls_are_rejected_as_strings_without_running_tools() {
         "APP_CFLAGS",
         "LANG",
         "LANGUAGE",
+        "MAKEUP",
+        "GCCOUNT",
+        "CMAKEAPP",
     ] {
         assert_eq!(validate_env_name(name), Ok(()));
     }

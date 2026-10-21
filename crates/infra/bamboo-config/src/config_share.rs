@@ -435,6 +435,8 @@ pub fn canonical_env_name(name: &str) -> String {
 
 /// Import changes only app-managed env entries. Reject runtime/loader/config
 /// selectors rather than letting a portable bundle change execution authority.
+/// This reserves known standard-tool control namespaces; it is not a sandbox
+/// for arbitrary or future consumers of otherwise permitted environment names.
 pub fn validate_env_name(name: &str) -> ShareResult<()> {
     if name.is_empty()
         || name.len() > 128
@@ -577,9 +579,37 @@ pub fn validate_env_name(name: &str) -> ShareResult<()> {
 }
 
 fn compiler_control_env(upper: &str) -> bool {
-    // Named executable/option controls and build-kind/target-qualified forms.
-    // Keep this bounded to tool namespaces, rather than rejecting HOST_/TARGET_
-    // application variables in general.
+    // Cargo -> cc-rs -> native tool/build-driver policy groups: executable and
+    // option selection; program/library search; startup scripts/toolchains.
+    // Reserve the documented GCC_/CMAKE_ namespaces and the other standard
+    // build-driver entry points. The share feature does not launch these tools.
+    // GNU Make does not interpret an environment-supplied MFLAGS value; it is
+    // historical output compatibility, so it is not added as an input control.
+    // gcc.gnu.org/onlinedocs/gcc/Environment-Variables.html
+    // gnu.org/software/make/manual/html_node/MAKEFILES-Variable.html
+    // gnu.org/software/make/manual/html_node/Options_002fRecursion.html
+    // gnu.org/software/autoconf/manual/autoconf-2.72/html_node/Site-Defaults.html
+    // gnu.org/software/autoconf/manual/autoconf-2.72/html_node/config_002estatus-Invocation.html
+    // cmake.org/cmake/help/latest/manual/cmake-env-variables.7.html
+    if [
+        "COMPILER_PATH",
+        "LIBRARY_PATH",
+        "MAKE",
+        "MAKEFLAGS",
+        "GNUMAKEFLAGS",
+        "MAKEFILES",
+        "CONFIG_SHELL",
+        "CONFIG_SITE",
+    ]
+    .contains(&upper)
+        || ["GCC_", "CMAKE_"]
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
+    {
+        return true;
+    }
+    // Tool/flags namespaces also reserve build-kind and target-qualified forms,
+    // without rejecting HOST_/TARGET_ application variables in general.
     // doc.rust-lang.org/cargo/reference/environment-variables.html
     // docs.rs/cc/latest/cc/#external-configuration-via-environment-variables
     // docs.rs/pkg-config/latest/pkg_config/#cross-compilation
