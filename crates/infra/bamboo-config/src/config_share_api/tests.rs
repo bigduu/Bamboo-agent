@@ -745,6 +745,34 @@ fn unsafe_or_case_duplicate_environment_bundles_are_rejected_before_any_api_writ
         (vec!["COREPACK_HOME"], true),
         (vec!["PNPM_CONFIG_SCRIPT_SHELL"], true),
         (vec!["DENO_V8_FLAGS"], true),
+        (vec!["RIPGREP_CONFIG_PATH"], true),
+        (vec!["ripgrep_config_path"], true),
+        (vec!["FZF_DEFAULT_COMMAND"], true),
+        (vec!["fzf_default_opts"], true),
+        (vec!["BAT_PAGER"], true),
+        (vec!["DELTA_PAGER"], true),
+        (vec!["MANPAGER"], true),
+        (vec!["MANOPT"], true),
+        (vec!["LESS"], true),
+        (vec!["LESSCLOSE"], true),
+        (vec!["LESSKEYIN"], true),
+        (vec!["LESSKEY_CONTENT"], true),
+        (vec!["lesssecure_allow"], true),
+        (vec!["TAR_OPTIONS"], true),
+        (vec!["RSYNC_RSH"], true),
+        (vec!["RSYNC_CONNECT_PROG"], true),
+        (vec!["AWKPATH"], true),
+        (vec!["AWKLIBPATH"], true),
+        (vec!["BASH_LOADABLES_PATH"], true),
+        (vec!["PS4"], true),
+        (vec!["FPATH"], true),
+        (vec!["VIMINIT"], true),
+        (vec!["EXINIT"], true),
+        (vec!["GVIMINIT"], true),
+        (vec!["VIMRUNTIME"], true),
+        (vec!["NVIM_APPNAME"], true),
+        (vec!["NVIM_RPLUGIN_MANIFEST"], true),
+        (vec!["EMACSLOADPATH"], true),
         (vec!["Token", "TOKEN"], false),
     ] {
         // Names are inert data. Construct an untrusted envelope directly so
@@ -797,6 +825,120 @@ fn unsafe_or_case_duplicate_environment_bundles_are_rejected_before_any_api_writ
         }
         assert_tree_unchanged(&before, dir.path());
     }
+}
+
+#[test]
+fn provider_only_import_preserves_case_distinct_environment_bytes_and_revisions() {
+    let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
+    let _key = crate::encryption::set_test_encryption_key([0x53; 32]);
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("env.json"),
+        bytes(
+            serde_json::json!([
+                {"name":"Token", "value":"synthetic-lower", "secret":false,
+                    "configured":true, "future_hint":"synthetic-retained"},
+                {"name":"TOKEN", "value":"synthetic-upper", "secret":false,
+                    "configured":true}
+            ]),
+            3,
+        ),
+    )
+    .unwrap();
+    let before = tree(dir.path());
+    let saved = share_transaction::read_share_snapshot(dir.path()).unwrap();
+    let string = config_share::encode_bundle(&bundle(), None).unwrap();
+    let preview = preview_config_share(dir.path(), &string, None).unwrap();
+    assert!(!preview.apply_blocked);
+    assert!(preview.preview.env.is_empty());
+    assert!(preview.preview.providers[0].conflict);
+    assert_tree_unchanged(&before, dir.path());
+    let decisions = ShareDecisions {
+        providers: BTreeMap::from([(
+            "relay".into(),
+            ShareConflictChoice::Rename {
+                target: "imported-relay".into(),
+            },
+        )]),
+        ..Default::default()
+    };
+    // Env-free imports still reject decisions for absent source entries.
+    let mut unrelated = decisions.clone();
+    unrelated.env.insert("Token".into(), ShareConflictChoice::Skip);
+    assert!(matches!(
+        apply_config_share(
+            dir.path(),
+            &string,
+            None,
+            &unrelated,
+            preview.expected_revisions,
+            &preview.preview_token,
+            Uuid::new_v4(),
+        ),
+        Err(ShareApiError::Invalid)
+    ));
+    assert_tree_unchanged(&before, dir.path());
+    // An env-bearing import remains blocked by the ambiguous target, using a
+    // valid snapshot token so rejection cannot be caused by a stale preview.
+    let with_env = ShareBundle {
+        env: vec![ShareEnvVar {
+            name: "APP_FRESH".into(),
+            value: None,
+            secret: false,
+        }],
+        ..Default::default()
+    };
+    let env_string = config_share::encode_bundle(&with_env, None).unwrap();
+    assert!(matches!(
+        preview_config_share(dir.path(), &env_string, None),
+        Err(ShareApiError::Share(ShareError::Conflict))
+    ));
+    assert!(matches!(
+        apply_config_share(
+            dir.path(),
+            &env_string,
+            None,
+            &ShareDecisions::default(),
+            saved.revisions,
+            &preview_token(&env_string, &saved),
+            Uuid::new_v4(),
+        ),
+        Err(ShareApiError::Invalid)
+    ));
+    assert_tree_unchanged(&before, dir.path());
+    let receipt = apply_config_share(
+        dir.path(),
+        &string,
+        None,
+        &decisions,
+        preview.expected_revisions,
+        &preview.preview_token,
+        Uuid::new_v4(),
+    )
+    .unwrap();
+    let expected = ShareRevisions {
+        providers: saved.revisions.providers + 1,
+        ..saved.revisions
+    };
+    assert!(matches!(
+        receipt,
+        ShareOperationStatus::Committed { revisions, .. } if revisions == expected
+    ));
+    let after = share_transaction::read_share_snapshot(dir.path()).unwrap();
+    assert_eq!(after.revisions, expected);
+    assert_eq!(after.env, saved.env);
+    assert_eq!(after.credentials, saved.credentials);
+    let providers: serde_json::Value =
+        serde_json::from_slice(after.providers.as_deref().unwrap()).unwrap();
+    assert!(providers["data"]["provider_instances"]["imported-relay"].is_object());
+    assert_eq!(
+        providers["data"]["provider_instances"]["relay"]["model"],
+        "good"
+    );
+    assert_eq!(
+        providers["data"]["provider_instances"]["relay"]["saved_custom_option"],
+        true
+    );
 }
 
 #[test]
