@@ -778,7 +778,6 @@ async fn root_chat_receipt_real_coordinator_can_consume_before_execute_without_o
 #[path = "compat_activation_tests.rs"]
 mod compat_activation_tests;
 
-
 #[actix_web::test]
 async fn retry_preparation_keeps_retained_output_and_replay_until_execute() {
     let _proof = HTTP_PROOF.lock().await;
@@ -794,7 +793,12 @@ async fn retry_preparation_keeps_retained_output_and_replay_until_execute() {
     assert!(matches!(done(&state, id).await, AgentStatus::Completed));
     let before = committed_output(&state, id, &run, birth).await;
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
-        while state.session_activation_router.current_run_id(id).await.is_some() {
+        while state
+            .session_activation_router
+            .current_run_id(id)
+            .await
+            .is_some()
+        {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
@@ -827,7 +831,11 @@ async fn retry_preparation_keeps_retained_output_and_replay_until_execute() {
         .await;
         assert_eq!(status, StatusCode::OK, "{prepared}");
         let (status, retained) = output(&state, id, &run, Some(birth)).await;
-        assert_eq!(status, StatusCode::OK, "Retry preparation lost the old run: {retained}");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "Retry preparation lost the old run: {retained}"
+        );
         assert_eq!(retained, before);
         {
             let runners = state.agent_runners.read().await;
@@ -836,27 +844,32 @@ async fn retry_preparation_keeps_retained_output_and_replay_until_execute() {
             assert!(matches!(runner.status, AgentStatus::Completed));
             assert!(Arc::ptr_eq(&runner.event_publication, &publication));
             assert!(Arc::ptr_eq(&runner.visible_messages, &visible));
-            assert_eq!(serde_json::to_value(&runner.last_critical_events).unwrap(), replay);
+            assert_eq!(
+                serde_json::to_value(&runner.last_critical_events).unwrap(),
+                replay
+            );
         }
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-        assert!(state.session_activation_router.current_run_id(id).await.is_none());
+        assert!(state
+            .session_activation_router
+            .current_run_id(id)
+            .await
+            .is_none());
     }
     // A real successor reservation may replace this one retained output. Retry
     // itself added no User input and did not dispatch an execution or a tool.
-    let (status, successor, _) = request_headers(
-        &state,
-        &format!("/api/v1/execute/{id}"),
-        json!({}),
-        &[],
-    )
-    .await;
+    let (status, successor, _) =
+        request_headers(&state, &format!("/api/v1/execute/{id}"), json!({}), &[]).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{successor}");
     assert_ne!(successor["run_id"].as_str().unwrap(), run);
     let (status, _) = output(&state, id, &run, Some(birth)).await;
     assert_eq!(status, StatusCode::GONE);
-    tokio::time::timeout(std::time::Duration::from_secs(30), provider.entered.notified())
-        .await
-        .expect("the actual successor must reach the synthetic provider");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        provider.entered.notified(),
+    )
+    .await
+    .expect("the actual successor must reach the synthetic provider");
     provider.release.notify_one();
     assert!(matches!(done(&state, id).await, AgentStatus::Completed));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
