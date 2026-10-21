@@ -2,6 +2,8 @@ use super::*;
 use serde_json::json;
 use tempfile::TempDir;
 
+mod native;
+
 fn fixture() -> TempDir {
     let key = crate::encryption::set_test_encryption_key([0x51; 32]);
     let dir = tempfile::tempdir().unwrap();
@@ -72,6 +74,13 @@ fn tree(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     result
 }
 
+fn assert_tree_unchanged(before: &BTreeMap<PathBuf, Vec<u8>>, dir: &Path) {
+    assert!(
+        before == &tree(dir),
+        "configuration tree changed; inspect config-share-operations.json.lock and its sibling members"
+    );
+}
+
 #[test]
 fn commit_replay_returns_original_receipt_without_replanning_or_revision_change() {
     let dir = fixture();
@@ -88,7 +97,7 @@ fn commit_replay_returns_original_receipt_without_replanning_or_revision_change(
     })
     .unwrap();
     assert_eq!(first, replay);
-    assert_eq!(after, tree(dir.path()));
+    assert_tree_unchanged(&after, dir.path());
     assert_eq!(
         read_share_operation(dir.path(), id).unwrap(),
         ShareOperationStatus::Committed {
@@ -104,14 +113,14 @@ fn commit_replay_returns_original_receipt_without_replanning_or_revision_change(
         |_| panic!("ID collision must not plan")
     )
     .is_err());
-    assert_eq!(after, tree(dir.path()));
+    assert_tree_unchanged(&after, dir.path());
 }
 
 #[test]
 fn stale_providers_env_or_credentials_and_cancelled_plans_change_no_configuration() {
     let dir = fixture();
     let expected = read_share_snapshot(dir.path()).unwrap().revisions;
-    let before = originals(dir.path());
+    let before = tree(dir.path());
     for stale in [
         ShareRevisions {
             providers: expected.providers + 1,
@@ -134,7 +143,7 @@ fn stale_providers_env_or_credentials_and_cancelled_plans_change_no_configuratio
             |_| panic!("CAS must precede planning"),
         );
         assert!(matches!(result, Err(ConfigStoreError::Conflict { .. })));
-        assert_eq!(before, originals(dir.path()));
+        assert_tree_unchanged(&before, dir.path());
     }
     assert!(commit_share_transaction(
         dir.path(),
@@ -144,7 +153,20 @@ fn stale_providers_env_or_credentials_and_cancelled_plans_change_no_configuratio
         |_| Err(invalid())
     )
     .is_err());
-    assert_eq!(before, originals(dir.path()));
+    assert_tree_unchanged(&before, dir.path());
+    assert!(commit_share_transaction(
+        dir.path(),
+        Uuid::new_v4(),
+        &sha256(b"invalid-candidate"),
+        expected,
+        |snapshot| {
+            let mut candidate = synthetic_candidate(snapshot);
+            candidate.env = b"{}".to_vec();
+            Ok(candidate)
+        }
+    )
+    .is_err());
+    assert_tree_unchanged(&before, dir.path());
 }
 
 #[test]
@@ -262,12 +284,12 @@ fn status_and_snapshot_reads_never_create_or_repair_files() {
         ShareOperationStatus::NotFound { operation_id: id }
     );
     assert!(read_share_snapshot(empty.path()).is_err());
-    assert_eq!(before, tree(empty.path()));
+    assert_tree_unchanged(&before, empty.path());
     let initialized = fixture();
     let before = tree(initialized.path());
     read_share_snapshot(initialized.path()).unwrap();
     read_share_operation(initialized.path(), id).unwrap();
-    assert_eq!(before, tree(initialized.path()));
+    assert_tree_unchanged(&before, initialized.path());
 }
 
 #[test]
@@ -580,7 +602,7 @@ fn receipt_capacity_rejects_new_operations_and_preserves_old_replay() {
         .unwrap(),
         old
     );
-    assert_eq!(before, tree(dir.path()));
+    assert_tree_unchanged(&before, dir.path());
 }
 
 fn ordinary_provider_section(dir: &Path) -> Arc<crate::LiveSection<ProvidersSection>> {

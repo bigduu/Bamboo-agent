@@ -66,8 +66,19 @@ pub(crate) fn lock_member(path: &Path) -> ConfigStoreResult<File> {
 }
 
 fn lock_members(data_dir: &Path) -> ConfigStoreResult<Vec<LockedShareFileStore>> {
+    let mut locks = lock_config_members(data_dir)?;
+    locks.push(lock_operations_member(data_dir)?);
+    Ok(locks)
+}
+
+fn lock_operations_member(data_dir: &Path) -> ConfigStoreResult<LockedShareFileStore> {
+    AtomicFileStore::new(data_dir.join(OPERATIONS_FILE)).lock_for_share_transaction()
+}
+
+fn lock_config_members(data_dir: &Path) -> ConfigStoreResult<Vec<LockedShareFileStore>> {
     MEMBERS
         .iter()
+        .take(3)
         .map(|name| {
             AtomicFileStore::new(data_dir.join(name))
                 .sensitive(*name == CREDENTIALS_FILE)
@@ -352,6 +363,7 @@ pub(crate) fn commit_share_transaction(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(PartialOrd, Ord))]
 enum ShareFault {
     None,
     AfterStage(usize),
@@ -382,9 +394,10 @@ fn commit_inner(
             None,
         )
         .map_err(|_| indeterminate())?;
-        // Normal commit and recovery use the same fixed member lock order.
-        // Keep all guards through snapshot, preparation and durable finish.
-        let member_locks = lock_members(data_dir)?;
+        // Hold the three existing config member locks through snapshot and
+        // preparation. The migration lock serializes all receipt writers, so
+        // replay/CAS/invalid plans need not create an operations lock file.
+        let mut member_locks = lock_config_members(data_dir)?;
         let ledger_original = bounded_read(&data_dir.join(OPERATIONS_FILE))?;
         let mut ledger = ledger_from_bytes(ledger_original.as_deref())?;
         if let Some(item) = ledger.operations.get(&operation_id) {
@@ -413,6 +426,10 @@ fn commit_inner(
         }
         let candidate = prepare(&snapshot)?;
         let revisions = validate_candidate(&snapshot, &candidate)?;
+        // Only a valid new transaction may create the fourth lock. The fixed
+        // credentials/providers/env/operations order is unchanged; staging,
+        // commit and finish hold all four, as does committed recovery.
+        member_locks.push(lock_operations_member(data_dir)?);
         let receipt = ShareOperationReceipt {
             operation_id,
             revisions,
@@ -475,11 +492,15 @@ fn commit_inner(
                 touched_env_names: Vec::new(),
             });
             if fault == ShareFault::AfterStage(index) {
+                #[cfg(test)]
+                run_test_hook(data_dir, ShareHookPoint::Fault(fault));
                 return Err(invalid());
             }
         }
         sync_dir(&stage_dir)?;
         if fault == ShareFault::AfterStaging {
+            #[cfg(test)]
+            run_test_hook(data_dir, ShareHookPoint::Fault(fault));
             return Err(invalid());
         }
         // A raw editor does not participate in the shared lock. Bind presence
@@ -502,6 +523,8 @@ fn commit_inner(
         validate_manifest(&manifest)?;
         write_manifest(data_dir.join(JOURNAL_FILE), &manifest)?;
         if fault == ShareFault::AfterJournal {
+            #[cfg(test)]
+            run_test_hook(data_dir, ShareHookPoint::Fault(fault));
             return Err(invalid());
         }
         // A failed atomic rename/fsync may already have crossed the commit
@@ -510,6 +533,8 @@ fn commit_inner(
         #[cfg(test)]
         run_test_hook(data_dir, ShareHookPoint::AfterManifest);
         if fault == ShareFault::AfterManifest {
+            #[cfg(test)]
+            run_test_hook(data_dir, ShareHookPoint::Fault(fault));
             return Err(indeterminate());
         }
         install_with_fault(data_dir, &manifest, &member_locks, fault)
@@ -763,6 +788,8 @@ fn install_with_fault(
             return Err(invalid());
         }
         if fault == ShareFault::AfterInstall(index) {
+            #[cfg(test)]
+            run_test_hook(data_dir, ShareHookPoint::Fault(fault));
             return Err(invalid());
         }
         #[cfg(test)]
@@ -816,14 +843,20 @@ fn finish_with_fault(
     manifest.state = MigrationState::Complete;
     write_manifest(data_dir.join(MANIFEST_FILE), &manifest)?;
     if fault == ShareFault::AfterComplete {
+        #[cfg(test)]
+        run_test_hook(data_dir, ShareHookPoint::Fault(fault));
         return Err(invalid());
     }
     remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
     if fault == ShareFault::AfterJournalCleanup {
+        #[cfg(test)]
+        run_test_hook(data_dir, ShareHookPoint::Fault(fault));
         return Err(invalid());
     }
     cleanup_transaction_dirs(data_dir, &manifest)?;
     if fault == ShareFault::AfterCleanup {
+        #[cfg(test)]
+        run_test_hook(data_dir, ShareHookPoint::Fault(fault));
         return Err(invalid());
     }
     Ok(())
@@ -837,6 +870,7 @@ mod tests;
 enum ShareHookPoint {
     AfterManifest,
     AfterProviderInstall,
+    Fault(ShareFault),
 }
 
 #[cfg(test)]
