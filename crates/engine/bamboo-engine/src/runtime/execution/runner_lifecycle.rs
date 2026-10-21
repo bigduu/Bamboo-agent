@@ -61,6 +61,28 @@ pub async fn reserve_runner_core(
     session_id: &str,
     event_sender: &broadcast::Sender<AgentEvent>,
 ) -> ReserveOutcome {
+    reserve_runner_inner(runners, senders, session_id, event_sender, None).await
+}
+
+/// The logical owner chooses this identity before replacing retained output.
+/// Router-native activation still uses its existing raw, two-phase primitive.
+pub(super) async fn reserve_runner_for_registration(
+    runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    senders: &Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+    session_id: &str,
+    event_sender: &broadcast::Sender<AgentEvent>,
+    identity: RunnerReservation,
+) -> ReserveOutcome {
+    reserve_runner_inner(runners, senders, session_id, event_sender, Some(identity)).await
+}
+
+async fn reserve_runner_inner(
+    runners: &Arc<RwLock<HashMap<String, AgentRunner>>>,
+    senders: &Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
+    session_id: &str,
+    event_sender: &broadcast::Sender<AgentEvent>,
+    identity: Option<RunnerReservation>,
+) -> ReserveOutcome {
     let mut runners_guard = runners.write().await;
     if let Some(runner) = runners_guard.get(session_id) {
         if matches!(runner.status, AgentStatus::Running) {
@@ -78,6 +100,10 @@ pub async fn reserve_runner_core(
     runners_guard.remove(session_id);
 
     let mut runner = AgentRunner::new();
+    if let Some(identity) = identity {
+        runner.run_id = identity.run_id;
+        runner.cancel_token = identity.cancel_token;
+    }
     runner.status = AgentStatus::Running;
     runner.event_sender = event_sender.clone();
     let reservation = RunnerReservation {
