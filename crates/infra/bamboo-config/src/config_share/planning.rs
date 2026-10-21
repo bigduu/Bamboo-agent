@@ -5,6 +5,7 @@ use crate::Config;
 /// authorization token; the apply boundary must validate again and use CAS.
 pub fn preview_bundle(bundle: &ShareBundle, target: &Config) -> ShareResult<SharePreview> {
     bundle.validate()?;
+    let env_names = target_env_names(target)?;
     let instances = selection::configured_instances(target);
     let scenarios = selection::scenario_refs(target);
     Ok(SharePreview {
@@ -50,7 +51,7 @@ pub fn preview_bundle(bundle: &ShareBundle, target: &Config) -> ShareResult<Shar
                 name: entry.name.clone(),
                 has_value: entry.value.is_some(),
                 secret: entry.secret,
-                conflict: target.env_vars.iter().any(|e| e.name == entry.name),
+                conflict: env_names.contains_key(&canonical_env_name(&entry.name)),
             })
             .collect(),
         contains_secrets: bundle.contains_secrets(),
@@ -66,8 +67,20 @@ pub fn plan_import(
     decisions: &ShareDecisions,
 ) -> ShareResult<ShareBundle> {
     bundle.validate()?;
+    let env_names = target_env_names(target)?;
     let source_ids: BTreeSet<_> = bundle.providers.iter().map(|p| p.id.as_str()).collect();
-    let env_ids: BTreeSet<_> = bundle.env.iter().map(|p| p.name.as_str()).collect();
+    let env_ids: BTreeSet<_> = bundle
+        .env
+        .iter()
+        .map(|p| canonical_env_name(&p.name))
+        .collect();
+    let mut env_decisions = BTreeMap::new();
+    for (name, choice) in &decisions.env {
+        let identity = canonical_env_name(name);
+        if !env_ids.contains(&identity) || env_decisions.insert(identity, choice).is_some() {
+            return Err(ShareError::Conflict);
+        }
+    }
     if decisions
         .providers
         .keys()
@@ -80,10 +93,6 @@ pub fn plan_import(
             .subagent_models
             .keys()
             .any(|name| !bundle.subagent_models.contains_key(name))
-        || decisions
-            .env
-            .keys()
-            .any(|id| !env_ids.contains(id.as_str()))
     {
         return Err(ShareError::Conflict);
     }
@@ -156,20 +165,28 @@ pub fn plan_import(
     }
     let mut assigned_env = BTreeSet::new();
     for entry in &bundle.env {
-        let exists = |name: &str| target.env_vars.iter().any(|e| e.name == name);
-        let name = choose_target(
-            &entry.name,
-            exists(&entry.name),
-            decisions.env.get(&entry.name),
-        )?;
-        let Some(name) = name else {
+        let source_identity = canonical_env_name(&entry.name);
+        let target_name = env_names.get(&source_identity);
+        let choice = env_decisions.get(&source_identity).copied();
+        let name = choose_target(&entry.name, target_name.is_some(), choice)?;
+        let Some(mut name) = name else {
             continue;
         };
         validate_env_name(&name)?;
-        if name != entry.name && (exists(&name) || env_ids.contains(name.as_str())) {
-            return Err(ShareError::Conflict);
+        let identity = canonical_env_name(&name);
+        if matches!(choice, Some(ShareConflictChoice::Rename { .. })) {
+            if identity == source_identity
+                || env_names.contains_key(&identity)
+                || env_ids.contains(&identity)
+            {
+                return Err(ShareError::Conflict);
+            }
+        } else if let Some(target_name) = target_name {
+            // B2 merges by exact stored spelling. A case-only Replace must
+            // update that entry rather than append a second portable identity.
+            name = (*target_name).to_string();
         }
-        if !assigned_env.insert(name.clone()) {
+        if !assigned_env.insert(identity) {
             return Err(ShareError::Conflict);
         }
         let mut entry = entry.clone();
@@ -178,6 +195,19 @@ pub fn plan_import(
     }
     plan.validate()?;
     Ok(plan)
+}
+
+fn target_env_names(target: &Config) -> ShareResult<BTreeMap<String, &str>> {
+    let mut names = BTreeMap::new();
+    for entry in &target.env_vars {
+        if names
+            .insert(canonical_env_name(&entry.name), entry.name.as_str())
+            .is_some()
+        {
+            return Err(ShareError::Conflict);
+        }
+    }
+    Ok(names)
 }
 
 fn remap_ref(reference: &ShareModelRef, remap: &BTreeMap<String, String>) -> Option<ShareModelRef> {

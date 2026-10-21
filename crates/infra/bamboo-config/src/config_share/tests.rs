@@ -479,3 +479,208 @@ fn sensitive_urls_and_dangerous_environment_names_are_rejected() {
     }
     assert_eq!(validate_env_name("DEMO_TOKEN"), Ok(()));
 }
+
+fn env_bundle(names: &[&str]) -> ShareBundle {
+    ShareBundle {
+        env: names
+            .iter()
+            .map(|name| ShareEnvVar {
+                name: (*name).into(),
+                value: None,
+                secret: false,
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+fn env_target(names: &[&str]) -> Config {
+    let mut target = Config::default();
+    target.env_vars = names
+        .iter()
+        .map(|name| EnvVarEntry {
+            name: (*name).into(),
+            value: "synthetic-saved-value".into(),
+            secret: false,
+            value_encrypted: None,
+            credential_ref: None,
+            configured: true,
+            description: None,
+        })
+        .collect();
+    target
+}
+
+#[test]
+fn git_control_environment_names_are_rejected_as_data_without_execution() {
+    // These strings are never used as commands or passed to a child process.
+    for name in [
+        "GIT_ASKPASS",
+        "git_askpass",
+        "Git_AskPass",
+        "GIT_SYNTHETIC_FUTURE_CONTROL",
+    ] {
+        assert_eq!(validate_env_name(name), Err(ShareError::Unsafe));
+        assert_eq!(env_bundle(&[name]).validate(), Err(ShareError::Unsafe));
+        let source = env_target(&[name]);
+        let selection = ShareSelection {
+            env: BTreeMap::from([(name.into(), false)]),
+            ..Default::default()
+        };
+        assert_eq!(select_bundle(&source, &selection), Err(ShareError::Unsafe));
+        let choices = ShareDecisions {
+            env: BTreeMap::from([(
+                "Token".into(),
+                ShareConflictChoice::Rename {
+                    target: name.into(),
+                },
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_import(&env_bundle(&["Token"]), &Config::default(), &choices),
+            Err(ShareError::Unsafe)
+        );
+    }
+}
+
+#[test]
+fn portable_environment_bundle_identity_rejects_case_only_duplicates_on_every_platform() {
+    for name in ["Token", "TOKEN", "token", "tOkEn"] {
+        assert_eq!(canonical_env_name(name), "TOKEN");
+        assert_eq!(validate_env_name(name), Ok(()));
+    }
+    let bundle = env_bundle(&["Token", "TOKEN"]);
+    assert_eq!(bundle.validate(), Err(ShareError::Invalid));
+    assert_eq!(
+        decode_bundle(&plain_json(serde_json::to_value(&bundle).unwrap()), None),
+        Err(ShareError::Invalid)
+    );
+    let source = env_target(&["Token", "TOKEN"]);
+    let before = serde_json::to_vec(&source).unwrap();
+    let selection = ShareSelection {
+        env: BTreeMap::from([("Token".into(), false), ("TOKEN".into(), false)]),
+        ..Default::default()
+    };
+    assert_eq!(select_bundle(&source, &selection), Err(ShareError::Invalid));
+    assert_eq!(serde_json::to_vec(&source).unwrap(), before);
+}
+
+#[test]
+fn portable_environment_conflicts_require_choices_and_replace_uses_target_spelling() {
+    let bundle = env_bundle(&["Token"]);
+    let original_bundle = bundle.clone();
+    for spelling in ["TOKEN", "tOkEn"] {
+        let target = env_target(&[spelling, "Other"]);
+        let before = serde_json::to_vec(&target).unwrap();
+        let preview = preview_bundle(&bundle, &target).unwrap();
+        assert_eq!(preview.env[0].name, "Token");
+        assert!(preview.env[0].conflict);
+        assert_eq!(
+            plan_import(&bundle, &target, &ShareDecisions::default()),
+            Err(ShareError::Conflict)
+        );
+        let mut decisions = ShareDecisions {
+            // Decision names use the same portable identity as bundle names.
+            env: BTreeMap::from([("toKEN".into(), ShareConflictChoice::Skip)]),
+            ..Default::default()
+        };
+        assert!(plan_import(&bundle, &target, &decisions)
+            .unwrap()
+            .env
+            .is_empty());
+        decisions
+            .env
+            .insert("toKEN".into(), ShareConflictChoice::Replace);
+        let replaced = plan_import(&bundle, &target, &decisions).unwrap();
+        assert_eq!(replaced.env.len(), 1);
+        assert_eq!(replaced.env[0].name, spelling);
+        assert_eq!(replaced.env[0].value, None); // omission is still not Clear
+        decisions.env.insert(
+            "toKEN".into(),
+            ShareConflictChoice::Rename {
+                target: "New_Token".into(),
+            },
+        );
+        assert_eq!(
+            plan_import(&bundle, &target, &decisions).unwrap().env[0].name,
+            "New_Token"
+        );
+        assert_eq!(serde_json::to_vec(&target).unwrap(), before);
+    }
+    assert_eq!(bundle, original_bundle);
+}
+
+#[test]
+fn portable_environment_rename_rejects_source_target_assigned_and_choice_collisions() {
+    let bundle = env_bundle(&["Token", "Second"]);
+    let target = env_target(&["EXISTING"]);
+    let before = serde_json::to_vec(&target).unwrap();
+    for name in ["TOKEN", "tOkEn", "second", "existing"] {
+        let decisions = ShareDecisions {
+            env: BTreeMap::from([(
+                "Token".into(),
+                ShareConflictChoice::Rename {
+                    target: name.into(),
+                },
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_import(&bundle, &target, &decisions),
+            Err(ShareError::Conflict)
+        );
+    }
+    let decisions = ShareDecisions {
+        env: BTreeMap::from([
+            (
+                "Token".into(),
+                ShareConflictChoice::Rename {
+                    target: "Shared".into(),
+                },
+            ),
+            (
+                "Second".into(),
+                ShareConflictChoice::Rename {
+                    target: "sHaReD".into(),
+                },
+            ),
+        ]),
+        ..Default::default()
+    };
+    assert_eq!(
+        plan_import(&bundle, &target, &decisions),
+        Err(ShareError::Conflict)
+    );
+    let decisions = ShareDecisions {
+        env: BTreeMap::from([
+            ("Token".into(), ShareConflictChoice::Skip),
+            ("TOKEN".into(), ShareConflictChoice::Replace),
+        ]),
+        ..Default::default()
+    };
+    assert_eq!(
+        plan_import(&bundle, &target, &decisions),
+        Err(ShareError::Conflict)
+    );
+    assert_eq!(serde_json::to_vec(&target).unwrap(), before);
+}
+
+#[test]
+fn portable_environment_target_duplicates_fail_closed_without_selecting_a_spelling() {
+    let target = env_target(&["Token", "TOKEN"]);
+    let before = serde_json::to_vec(&target).unwrap();
+    let bundle = env_bundle(&["Fresh"]);
+    assert_eq!(preview_bundle(&bundle, &target), Err(ShareError::Conflict));
+    for choice in [ShareConflictChoice::Skip, ShareConflictChoice::Replace] {
+        let decisions = ShareDecisions {
+            env: BTreeMap::from([("Fresh".into(), choice)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_import(&bundle, &target, &decisions),
+            Err(ShareError::Conflict)
+        );
+    }
+    assert_eq!(serde_json::to_vec(&target).unwrap(), before);
+}

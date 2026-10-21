@@ -323,7 +323,7 @@ impl ShareBundle {
         let mut names = BTreeSet::new();
         for entry in &self.env {
             validate_env_name(&entry.name)?;
-            if !names.insert(&entry.name) {
+            if !names.insert(canonical_env_name(&entry.name)) {
                 return Err(ShareError::Invalid);
             }
             if entry
@@ -407,6 +407,13 @@ fn validate_base_url(value: &str) -> ShareResult<()> {
     Ok(())
 }
 
+/// Portable identity for an already validated ASCII environment name. Every
+/// platform uses the same case-folding rule; keep the original name for display
+/// and use the target's existing spelling when replacing a matching entry.
+pub fn canonical_env_name(name: &str) -> String {
+    name.to_ascii_uppercase()
+}
+
 /// Import changes only app-managed env entries. Reject runtime/loader/config
 /// selectors rather than letting a portable bundle change execution authority.
 pub fn validate_env_name(name: &str) -> ShareResult<()> {
@@ -419,7 +426,7 @@ pub fn validate_env_name(name: &str) -> ShareResult<()> {
     {
         return Err(ShareError::Invalid);
     }
-    let upper = name.to_ascii_uppercase();
+    let upper = canonical_env_name(name);
     let forbidden = [
         "PATH",
         "HOME",
@@ -495,7 +502,7 @@ pub fn validate_env_name(name: &str) -> ShareResult<()> {
         "ANTHROPIC_",
         "GEMINI_",
         "GOOGLE_",
-        "GIT_CONFIG_",
+        "GIT_",
         "CARGO_",
         "RUSTUP_",
         "DOTNET_",
