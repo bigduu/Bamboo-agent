@@ -6,6 +6,7 @@ use super::*;
 struct RetryScopeProvider {
     inner: Arc<ScopeChangingProvider>,
     retrying: AtomicBool,
+    retry_workspaces: AtomicU64,
     retry_reads: AtomicU64,
     retry_results: AtomicU64,
 }
@@ -33,15 +34,27 @@ impl LLMProvider for RetryScopeProvider {
                     Ok(LLMChunk::Done),
                 ])));
             }
-            self.retry_reads.fetch_add(1, Ordering::Relaxed);
+            let (call_id, name, args) = match messages.iter().find(|m| {
+                m.tool_call_id.as_deref() == Some("retry-workspace-observation")
+            }) {
+                Some(result) => {
+                    assert_eq!(result.tool_success, Some(true), "{}", result.content);
+                    let observed: Value = serde_json::from_str(&result.content).unwrap();
+                    let path = Path::new(observed["workspace"].as_str().unwrap());
+                    assert_eq!(path.canonicalize().unwrap(), self.inner.workspace.canonicalize().unwrap());
+                    self.retry_reads.fetch_add(1, Ordering::Relaxed);
+                    ("retry-current-read", "Read", json!({"file_path":path.join("task.txt")}))
+                }
+                None => {
+                    self.retry_workspaces.fetch_add(1, Ordering::Relaxed);
+                    ("retry-workspace-observation", "Workspace", json!({}))
+                }
+            };
             return Ok(Box::pin(futures::stream::iter([
                 Ok(LLMChunk::ToolCalls(vec![ToolCall {
-                    id: "retry-current-read".into(),
+                    id: call_id.into(),
                     tool_type: "function".into(),
-                    function: FunctionCall {
-                        name: "Read".into(),
-                        arguments: json!({"file_path": "task.txt"}).to_string(),
-                    },
+                    function: FunctionCall { name: name.into(), arguments: args.to_string() },
                 }])),
                 Ok(LLMChunk::Done),
             ])));
@@ -69,6 +82,7 @@ async fn error_retry_after_scope_revocation_starts_from_current_workspace() {
             changed: AtomicBool::new(false),
         }),
         retrying: AtomicBool::new(false),
+        retry_workspaces: AtomicU64::new(0),
         retry_reads: AtomicU64::new(0),
         retry_results: AtomicU64::new(0),
     });
@@ -119,6 +133,7 @@ async fn error_retry_after_scope_revocation_starts_from_current_workspace() {
         .map(|m| m.id.clone()).collect::<Vec<_>>(), before_user_ids);
     assert_eq!(stored.messages.iter().filter(|m| m.id == input).count(), 1);
     assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
+    assert_eq!(provider.retry_workspaces.load(Ordering::Acquire), 1);
     assert_eq!(provider.retry_reads.load(Ordering::Acquire), 1);
     assert_eq!(provider.retry_results.load(Ordering::Acquire), 1);
     assert_eq!(stored.messages.iter()
