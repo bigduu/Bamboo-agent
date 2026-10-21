@@ -148,6 +148,7 @@ test('complete automatic publication has one route and never accepts the experim
 test('actual automatic preflight selects the successful main merge, never the separate release head', async (t) => {
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
   const source = workflow.split('  automatic:\n')[1].match(/python3 - <<'PY'\n([\s\S]*?)\n          PY/)[1]
+    .split('\n').map(line => line.replace(/^ {10}/, '')).join('\n')
   assert.doesNotMatch(source, /GITHUB_ENV/, 'Source authorization must not write environment state')
   // Use the existing real Git merge/CI transport fixture for the current dev
   // controller contract, including advanced dev and exact main output checks.
