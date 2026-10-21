@@ -976,3 +976,171 @@ fn native_loader_environment_selectors_are_rejected_as_names_without_loading_mod
         assert_eq!(validate_env_name(name), Ok(()));
     }
 }
+
+#[test]
+fn provider_type_changes_require_skip_or_fresh_rename_without_mutating_snapshots() {
+    let target = fixture();
+    let before = serde_json::to_vec(&target).unwrap();
+    for base_url in [None, Some("https://synthetic-other.invalid/private")] {
+        for api_key in [None, Some("synthetic-incoming-key")] {
+            let mut bundle = provider_only_bundle();
+            bundle.providers[0].provider_type = ShareProviderType::Anthropic;
+            bundle.providers[0].base_url = base_url.map(str::to_string);
+            bundle.providers[0].api_key = api_key.map(str::to_string);
+            let original = bundle.clone();
+            let preview = preview_bundle(&bundle, &target).unwrap();
+            let provider = &preview.providers[0];
+            assert!(provider.conflict);
+            assert!(!provider.replace_allowed);
+            assert_eq!(provider.credential_origin_risk, base_url.is_some());
+            let mut serialized = serde_json::to_value(provider).unwrap();
+            assert_eq!(serialized["replace_allowed"], false);
+            serialized
+                .as_object_mut()
+                .unwrap()
+                .remove("replace_allowed");
+            assert!(serde_json::from_value::<ShareProviderPreview>(serialized).is_err());
+            assert_eq!(
+                plan_import(&bundle, &target, &ShareDecisions::default()),
+                Err(ShareError::Conflict)
+            );
+            let mut decisions = ShareDecisions {
+                providers: BTreeMap::from([("work".into(), ShareConflictChoice::Replace)]),
+                ..Default::default()
+            };
+            assert_eq!(
+                plan_import(&bundle, &target, &decisions),
+                Err(ShareError::Invalid)
+            );
+            decisions
+                .providers
+                .insert("work".into(), ShareConflictChoice::Skip);
+            assert_eq!(
+                plan_import(&bundle, &target, &decisions).unwrap(),
+                ShareBundle::default()
+            );
+            decisions.providers.insert(
+                "work".into(),
+                ShareConflictChoice::Rename {
+                    target: "fresh-work".into(),
+                },
+            );
+            let renamed = plan_import(&bundle, &target, &decisions).unwrap();
+            let mut expected = bundle.clone();
+            expected.providers[0].id = "fresh-work".into();
+            assert_eq!(renamed, expected); // only imported fields, no old key/settings
+            let renamed_preview = preview_bundle(&renamed, &target).unwrap();
+            let provider = &renamed_preview.providers[0];
+            assert!(!provider.conflict);
+            assert!(provider.replace_allowed);
+            assert!(!provider.retains_existing_api_key);
+            assert!(!provider.credential_origin_risk);
+            assert_eq!(provider.target_origin, None);
+            let mut same_type = bundle.clone();
+            same_type.providers[0].provider_type = ShareProviderType::Openai;
+            assert!(preview_bundle(&same_type, &target).unwrap().providers[0].replace_allowed);
+            decisions
+                .providers
+                .insert("work".into(), ShareConflictChoice::Replace);
+            assert_eq!(
+                plan_import(&same_type, &target, &decisions).unwrap(),
+                same_type
+            );
+            assert_eq!(bundle, original);
+            assert_eq!(serde_json::to_vec(&target).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn compiler_controls_are_rejected_as_strings_without_running_tools() {
+    // The fixture supplies names only: no environment mutation or tool probe.
+    let mut names: Vec<String> = [
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTC_LINKER",
+        "RUSTDOCFLAGS",
+        "CROSS_COMPILE",
+        "LDSHARED",
+        "CL",
+        "_CL_",
+        "LINK",
+        "_LINK_",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    for tool in [
+        "CC",
+        "CXX",
+        "CPP",
+        "AR",
+        "AS",
+        "LD",
+        "FC",
+        "F77",
+        "F90",
+        "RANLIB",
+        "NM",
+        "STRIP",
+        "PKG_CONFIG",
+        "NVCC",
+        "CC_MASM_ASM",
+        "CFLAGS",
+        "CXXFLAGS",
+        "CPPFLAGS",
+        "LDFLAGS",
+        "ARFLAGS",
+        "RANLIBFLAGS",
+        "FCFLAGS",
+        "FFLAGS",
+        "F77FLAGS",
+        "F90FLAGS",
+        "ASFLAGS",
+    ] {
+        names.extend([
+            tool.to_string(),
+            format!("HOST_{tool}"),
+            format!("TARGET_{tool}"),
+            format!("{tool}_x86_64_unknown_linux_gnu"),
+        ]);
+    }
+    for name in names {
+        for variant in [name.clone(), name.to_ascii_lowercase()] {
+            assert_eq!(validate_env_name(&variant), Err(ShareError::Unsafe));
+            assert_eq!(env_bundle(&[&variant]).validate(), Err(ShareError::Unsafe));
+            let source = env_target(&[&variant]);
+            let before = serde_json::to_vec(&source).unwrap();
+            let selection = ShareSelection {
+                env: BTreeMap::from([(variant.clone(), false)]),
+                ..Default::default()
+            };
+            assert_eq!(select_bundle(&source, &selection), Err(ShareError::Unsafe));
+            let choices = ShareDecisions {
+                env: BTreeMap::from([(
+                    "AppToken".into(),
+                    ShareConflictChoice::Rename { target: variant },
+                )]),
+                ..Default::default()
+            };
+            assert_eq!(
+                plan_import(&env_bundle(&["AppToken"]), &Config::default(), &choices),
+                Err(ShareError::Unsafe)
+            );
+            assert_eq!(serde_json::to_vec(&source).unwrap(), before);
+        }
+    }
+    for name in [
+        "HOST_LABEL",
+        "TARGET_REGION",
+        "ACCOUNT_ID",
+        "CCOUNT",
+        "RUSTCURRENCY",
+        "APP_BUILD_FLAVOR",
+        "APP_CFLAGS",
+        "LANG",
+        "LANGUAGE",
+    ] {
+        assert_eq!(validate_env_name(name), Ok(()));
+    }
+}

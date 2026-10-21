@@ -36,6 +36,8 @@ pub fn preview_bundle(bundle: &ShareBundle, target: &Config) -> ShareResult<Shar
                     retains_existing_api_key,
                     credential_origin_risk,
                     conflict: existing.is_some(),
+                    replace_allowed: existing
+                        .is_none_or(|target| target.provider_type == p.provider_type.as_str()),
                 }
             })
             .collect(),
@@ -134,6 +136,13 @@ pub fn plan_import(
         let Some(id) = id else {
             continue;
         };
+        if id == provider.id
+            && existing
+                .get(&id)
+                .is_some_and(|target| target.provider_type != provider.provider_type.as_str())
+        {
+            return Err(ShareError::Invalid);
+        }
         validate_id(&id)?;
         if id != provider.id && (existing.contains_key(&id) || source_ids.contains(id.as_str())) {
             return Err(ShareError::Conflict);
