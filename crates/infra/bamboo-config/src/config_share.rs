@@ -573,10 +573,70 @@ pub fn validate_env_name(name: &str) -> ShareResult<()> {
         || prefixes.iter().any(|p| upper.starts_with(p))
         || compiler_control_env(&upper)
         || package_control_env(&upper)
+        || utility_control_env(&upper)
     {
         return Err(ShareError::Unsafe);
     }
     Ok(())
+}
+
+fn utility_control_env(upper: &str) -> bool {
+    // Known utility configuration, pager/preprocessor, extension and startup
+    // controls. Their execution paths have tool/mode/option conditions; keeping
+    // their namespaces reserved does not assert every setting executes code.
+    // github.com/BurntSushi/ripgrep/blob/master/GUIDE.md
+    // github.com/junegunn/fzf/blob/master/man/man1/fzf.1
+    // github.com/sharkdp/bat#using-a-different-pager
+    // dandavison.github.io/delta/environment-variables.html
+    // gitlab.com/man-db/man-db/-/blob/main/man/man1/man.man1
+    // github.com/gwsw/less/blob/master/less.nro.VER
+    // gnu.org/software/tar/manual/html_section/using-tar-options.html
+    // gnu.org/software/tar/manual/html_section/checkpoints.html
+    // download.samba.org/pub/rsync/rsync.1
+    // gnu.org/software/gawk/manual/html_node/AWKPATH-Variable.html
+    // gnu.org/software/gawk/manual/html_node/Options.html
+    // gnu.org/software/bash/manual/html_node/Bash-Builtins.html
+    // gnu.org/software/bash/manual/html_node/Controlling-the-Prompt.html
+    // zsh.sourceforge.io/Doc/Release/Parameters.html#Parameters-Used-By-The-Shell
+    // github.com/vim/vim/blob/master/runtime/doc/starting.txt
+    // github.com/vim/vim/blob/master/runtime/doc/gui.txt
+    // github.com/neovim/neovim/blob/master/runtime/plugin/rplugin.vim
+    // github.com/emacs-mirror/emacs/blob/master/doc/lispref/loading.texi
+    let prefixes = [
+        "RIPGREP_",
+        "FZF_",
+        "BAT_",
+        "DELTA_",
+        "LESS_",
+        "LESSKEY",
+        "RSYNC_",
+        "BASH_",
+        "NVIM_",
+    ];
+    [
+        "MANPAGER",
+        "MANOPT",
+        "LESS",
+        "LESSCLOSE",
+        "LESSSECURE",
+        "LESSSECURE_ALLOW",
+        "LESSSECURE_DISALLOW",
+        "TAR_OPTIONS",
+        "AWKPATH",
+        "AWKLIBPATH",
+        "PS0",
+        "PS1",
+        "PS2",
+        "PS4",
+        "FPATH",
+        "VIMINIT",
+        "EXINIT",
+        "GVIMINIT",
+        "VIMRUNTIME",
+        "EMACSLOADPATH",
+    ]
+    .contains(&upper)
+        || prefixes.iter().any(|prefix| upper.starts_with(prefix))
 }
 
 fn package_control_env(upper: &str) -> bool {
