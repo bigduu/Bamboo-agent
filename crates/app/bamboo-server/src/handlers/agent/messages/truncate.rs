@@ -12,6 +12,9 @@ use bamboo_engine::session_app::truncation::{
     unresolved_tool_call_ids,
 };
 
+#[path = "truncate_retry.rs"]
+mod retry;
+
 const RETRY_RESUME_PENDING_KEY: &str = "retry_resume_pending";
 const RETRY_RESUME_REASON_KEY: &str = "retry_resume_reason";
 
@@ -33,6 +36,13 @@ pub async fn truncate_messages(
             "session_id": session_id
         })));
     };
+
+    if matches!(&*req, TruncateRequest::ErrorRetry)
+        && session.kind == bamboo_domain::SessionKind::Root
+        && session.authority_identity.is_ordinary()
+    {
+        return retry::prepare(&state, session).await;
+    }
 
     let (removed, new_len, should_clear_derived_state, should_persist) = match req.into_inner() {
         TruncateRequest::AfterLastUser => {
@@ -56,76 +66,14 @@ pub async fn truncate_messages(
                 removed > 0 || cleared_retry_flags,
             )
         }
-        TruncateRequest::ErrorRetry => {
-            let unresolved_before = unresolved_tool_call_ids(&session.messages);
-            if unresolved_before.is_empty() {
-                session
-                    .metadata
-                    .insert(RETRY_RESUME_PENDING_KEY.to_string(), "true".to_string());
-                session.metadata.insert(
-                    RETRY_RESUME_REASON_KEY.to_string(),
-                    "error_retry".to_string(),
-                );
-                mark_startup_handoff(&mut session);
-                (0, session.messages.len(), false, true)
-            } else {
-                let removed_via_sanitization = sanitize_malformed_tool_chains(&mut session);
-                let unresolved_after_sanitization = unresolved_tool_call_ids(&session.messages);
-                if unresolved_after_sanitization.is_empty() {
-                    tracing::warn!(
-                        "[{}] error_retry recovered by sanitizing malformed tool chain data: unresolved_before={}, removed_entries={}",
-                        session_id,
-                        unresolved_before.len(),
-                        removed_via_sanitization
-                    );
-                    session
-                        .metadata
-                        .insert(RETRY_RESUME_PENDING_KEY.to_string(), "true".to_string());
-                    session.metadata.insert(
-                        RETRY_RESUME_REASON_KEY.to_string(),
-                        "error_retry".to_string(),
-                    );
-                    mark_startup_handoff(&mut session);
-                    (
-                        removed_via_sanitization,
-                        session.messages.len(),
-                        removed_via_sanitization > 0,
-                        true,
-                    )
-                } else {
-                    tracing::warn!(
-                        "[{}] error_retry unresolved tool calls remain after sanitization (before={}, after={}); falling back to truncation",
-                        session_id,
-                        unresolved_before.len(),
-                        unresolved_after_sanitization.len()
-                    );
-                    let Some(removed) = truncate_for_unresolved_tool_calls(&mut session) else {
-                        return Ok(HttpResponse::BadRequest().json(serde_json::json!({
-                            "error": crate::error::error_value(
-                                "Found unresolved tool calls but no prior user message to retry from"
-                            ),
-                            "session_id": session_id
-                        })));
-                    };
-
-                    let cleared_pending_flag =
-                        session.metadata.remove(RETRY_RESUME_PENDING_KEY).is_some();
-                    let cleared_reason_flag =
-                        session.metadata.remove(RETRY_RESUME_REASON_KEY).is_some();
-                    let cleared_retry_flags = cleared_pending_flag || cleared_reason_flag;
-                    if cleared_retry_flags {
-                        clear_startup_handoff(&mut session);
-                    }
-
-                    (
-                        removed,
-                        session.messages.len(),
-                        removed > 0,
-                        removed > 0 || cleared_retry_flags,
-                    )
-                }
+        TruncateRequest::ErrorRetry => match prepare_error_retry(&mut session) {
+            Ok(prepared) => prepared,
+            Err(message) => {
+                return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+                    "error": crate::error::error_value(message), "session_id": session_id,
+                })))
             }
-        }
+        },
     };
 
     if should_clear_derived_state {
@@ -143,4 +91,79 @@ pub async fn truncate_messages(
         "messages_removed": removed,
         "message_count": new_len,
     })))
+}
+
+// Shared transformation only. An activated Root must commit it through its
+// exact Actor writer; deriving another run's input or tool grant is forbidden.
+fn prepare_error_retry(
+    session: &mut bamboo_agent_core::Session,
+) -> std::result::Result<(usize, usize, bool, bool), &'static str> {
+    let session_id = session.id.clone();
+    Ok({
+        let unresolved_before = unresolved_tool_call_ids(&session.messages);
+        if unresolved_before.is_empty() {
+            session
+                .metadata
+                .insert(RETRY_RESUME_PENDING_KEY.to_string(), "true".to_string());
+            session.metadata.insert(
+                RETRY_RESUME_REASON_KEY.to_string(),
+                "error_retry".to_string(),
+            );
+            mark_startup_handoff(session);
+            (0, session.messages.len(), false, true)
+        } else {
+            let removed_via_sanitization = sanitize_malformed_tool_chains(session);
+            let unresolved_after_sanitization = unresolved_tool_call_ids(&session.messages);
+            if unresolved_after_sanitization.is_empty() {
+                tracing::warn!(
+                    "[{}] error_retry recovered by sanitizing malformed tool chain data: unresolved_before={}, removed_entries={}",
+                    session_id,
+                    unresolved_before.len(),
+                    removed_via_sanitization
+                );
+                session
+                    .metadata
+                    .insert(RETRY_RESUME_PENDING_KEY.to_string(), "true".to_string());
+                session.metadata.insert(
+                    RETRY_RESUME_REASON_KEY.to_string(),
+                    "error_retry".to_string(),
+                );
+                mark_startup_handoff(session);
+                (
+                    removed_via_sanitization,
+                    session.messages.len(),
+                    removed_via_sanitization > 0,
+                    true,
+                )
+            } else {
+                tracing::warn!(
+                    "[{}] error_retry unresolved tool calls remain after sanitization (before={}, after={}); falling back to truncation",
+                    session_id,
+                    unresolved_before.len(),
+                    unresolved_after_sanitization.len()
+                );
+                let Some(removed) = truncate_for_unresolved_tool_calls(session) else {
+                    return Err(
+                        "Found unresolved tool calls but no prior user message to retry from",
+                    );
+                };
+
+                let cleared_pending_flag =
+                    session.metadata.remove(RETRY_RESUME_PENDING_KEY).is_some();
+                let cleared_reason_flag =
+                    session.metadata.remove(RETRY_RESUME_REASON_KEY).is_some();
+                let cleared_retry_flags = cleared_pending_flag || cleared_reason_flag;
+                if cleared_retry_flags {
+                    clear_startup_handoff(session);
+                }
+
+                (
+                    removed,
+                    session.messages.len(),
+                    removed > 0,
+                    removed > 0 || cleared_retry_flags,
+                )
+            }
+        }
+    })
 }
