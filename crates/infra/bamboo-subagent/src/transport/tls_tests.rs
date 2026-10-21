@@ -254,3 +254,73 @@ fn server_rejects_empty_or_malformed_private_keys() {
             .contains(expected_error));
     }
 }
+
+#[test]
+fn standard_roots_keep_public_cas_and_exclude_distrusted_emsign_root() {
+    let roots = super::standard_webpki_roots();
+    assert!(!roots.is_empty(), "default wss must retain public CA trust");
+    let distrusted = b"emSign ECC Root CA - G3";
+    assert!(roots.roots.iter().all(|anchor| !anchor
+        .subject
+        .as_ref()
+        .windows(distrusted.len())
+        .any(|part| part == distrusted)));
+}
+
+#[tokio::test]
+async fn standard_roots_reject_untrusted_leaf_while_explicit_pin_still_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((cert, key)) = fixture(dir.path(), false) else {
+        eprintln!("skipping: openssl unavailable");
+        return;
+    };
+    let pinned = client_config_trusting_cert(&cert).unwrap();
+    for (config, trusted) in [(None, false), (Some(pinned), true)] {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let endpoint = format!("wss://localhost:{}", listener.local_addr().unwrap().port());
+        let acceptor = TlsAcceptor::from(Arc::new(build_server_config(&cert, &key).unwrap()));
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            match acceptor.accept(socket).await {
+                Ok(stream) => tokio_tungstenite::accept_async(stream).await.is_ok(),
+                Err(_) => false,
+            }
+        });
+        let client = tokio::time::timeout(
+            Duration::from_secs(5),
+            super::ChildClient::connect_with_auth_tls(&endpoint, None, config),
+        )
+        .await
+        .expect("WebSocket TLS handshake should settle");
+        if trusted {
+            assert!(client.is_ok(), "explicit pin must still connect");
+            drop(client);
+        } else {
+            let failure = match client {
+                Ok(_) => panic!("default roots must reject a generated leaf"),
+                Err(error) => error,
+            };
+            let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&failure);
+            let mut unknown_issuer = false;
+            while let Some(error) = cause {
+                unknown_issuer |= matches!(
+                    error.downcast_ref::<rustls::Error>(),
+                    Some(rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::UnknownIssuer
+                    ))
+                );
+                cause = error.source();
+            }
+            assert!(unknown_issuer, "unexpected TLS failure: {failure}");
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .expect("owned TLS server should settle")
+                .unwrap(),
+            trusted
+        );
+    }
+}
