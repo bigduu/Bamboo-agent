@@ -317,9 +317,16 @@ pub fn read_share_operation(
             super::validate_manifest(&manifest)?;
             if manifest.migration_scope == Some(MigrationScope::ConfigShare)
                 && manifest.transaction_id == operation_id.to_string()
-                && manifest.state != MigrationState::Complete
             {
-                return Ok(ShareOperationStatus::Pending { operation_id });
+                if manifest.state != MigrationState::Complete {
+                    return Ok(ShareOperationStatus::Pending { operation_id });
+                }
+                let ledger = ledger_from_bytes(ledger_bytes.as_deref())?;
+                let receipt = receipt_for_manifest(&manifest, &ledger)?;
+                return Ok(ShareOperationStatus::Committed {
+                    operation_id,
+                    revisions: receipt.revisions,
+                });
             }
         }
         return Ok(

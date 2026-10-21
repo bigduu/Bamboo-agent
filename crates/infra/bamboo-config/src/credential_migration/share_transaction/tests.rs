@@ -293,6 +293,67 @@ fn status_and_snapshot_reads_never_create_or_repair_files() {
 }
 
 #[test]
+fn completed_current_operation_query_rejects_missing_ledger_or_receipt_without_writes() {
+    for remove_ledger in [false, true] {
+        let dir = fixture();
+        let expected = read_share_snapshot(dir.path()).unwrap().revisions;
+        let id = Uuid::new_v4();
+        commit_share_transaction(
+            dir.path(),
+            id,
+            &sha256(b"synthetic-envelope"),
+            expected,
+            |snapshot| Ok(synthetic_candidate(snapshot)),
+        )
+        .unwrap();
+        let ledger_path = dir.path().join(OPERATIONS_FILE);
+        if remove_ledger {
+            std::fs::remove_file(&ledger_path).unwrap();
+        } else {
+            let mut ledger =
+                ledger_from_bytes(Some(&std::fs::read(&ledger_path).unwrap())).unwrap();
+            ledger.operations.remove(&id).unwrap();
+            std::fs::write(&ledger_path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+        }
+        let before = tree(dir.path());
+        assert!(read_share_operation(dir.path(), id).is_err());
+        assert_tree_unchanged(&before, dir.path());
+        assert!(recover_pending_config_transaction(dir.path()).is_err());
+        assert_tree_unchanged(&before, dir.path());
+    }
+}
+
+#[test]
+fn completed_current_operation_query_rejects_mismatched_receipt_revisions_without_writes() {
+    let dir = fixture();
+    let expected = read_share_snapshot(dir.path()).unwrap().revisions;
+    let id = Uuid::new_v4();
+    commit_share_transaction(
+        dir.path(),
+        id,
+        &sha256(b"synthetic-envelope"),
+        expected,
+        |snapshot| Ok(synthetic_candidate(snapshot)),
+    )
+    .unwrap();
+    let ledger_path = dir.path().join(OPERATIONS_FILE);
+    let mut ledger = ledger_from_bytes(Some(&std::fs::read(&ledger_path).unwrap())).unwrap();
+    ledger
+        .operations
+        .get_mut(&id)
+        .unwrap()
+        .receipt
+        .revisions
+        .providers += 1;
+    std::fs::write(&ledger_path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+    let before = tree(dir.path());
+    assert!(read_share_operation(dir.path(), id).is_err());
+    assert_tree_unchanged(&before, dir.path());
+    assert!(recover_pending_config_transaction(dir.path()).is_err());
+    assert_tree_unchanged(&before, dir.path());
+}
+
+#[test]
 fn raw_editor_change_before_manifest_is_detected_without_overwriting_it() {
     let dir = fixture();
     let expected = read_share_snapshot(dir.path()).unwrap().revisions;
