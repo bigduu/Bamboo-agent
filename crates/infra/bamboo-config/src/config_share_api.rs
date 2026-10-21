@@ -471,17 +471,28 @@ fn prepare_import(
     providers.data.defaults = current.defaults.clone();
     env.data.0 = std::mem::take(&mut current.env_vars);
     Ok(ShareTransactionCandidate {
-        providers: encode_changed_section(providers, snapshot.providers.as_deref())?,
-        env: encode_changed_section(env, snapshot.env.as_deref())?,
+        providers: encode_changed_section(
+            ShareStoredSection::Providers,
+            providers,
+            snapshot.providers.as_deref(),
+        )?,
+        env: encode_changed_section(ShareStoredSection::Env, env, snapshot.env.as_deref())?,
         credentials: credentials.encode().map_err(map_store)?,
     })
 }
 
+#[derive(Clone, Copy)]
+enum ShareStoredSection {
+    Providers,
+    Env,
+}
+
 fn encode_changed_section<T: Serialize + DeserializeOwned + Default>(
+    kind: ShareStoredSection,
     mut section: Stored<T>,
     original: Option<&[u8]>,
 ) -> Result<Vec<u8>, ShareApiError> {
-    let candidate = serde_json::to_value(&section.data).map_err(|_| ShareApiError::Invalid)?;
+    let mut candidate = serde_json::to_value(&section.data).map_err(|_| ShareApiError::Invalid)?;
     let old: Stored<T> = decode_section(original)?;
     let old = serde_json::to_value(old.data).map_err(|_| ShareApiError::Invalid)?;
     if old == candidate {
@@ -493,8 +504,137 @@ fn encode_changed_section<T: Serialize + DeserializeOwned + Default>(
             .revision
             .checked_add(1)
             .ok_or(ShareApiError::Invalid)?;
+        if let Some(original) = original {
+            let mut raw: Stored<serde_json::Value> =
+                serde_json::from_slice(original).map_err(|_| ShareApiError::Invalid)?;
+            // Serialize projections omit modeled read-only fields as well as
+            // unknown fields. Exclude only the exact schema-owned locations;
+            // never recover an old credential that this plan already removed.
+            discard_read_only_fields(kind, &mut raw.data);
+            discard_read_only_fields(kind, &mut candidate);
+            preserve_unmodeled_fields(&raw.data, &old, &mut candidate)?;
+        }
     }
-    serde_json::to_vec_pretty(&section).map_err(|_| ShareApiError::Invalid)
+    serde_json::to_vec_pretty(&Stored {
+        schema_version: section.schema_version,
+        revision: section.revision,
+        data: candidate,
+    })
+    .map_err(|_| ShareApiError::Invalid)
+}
+
+fn discard_read_only_fields(kind: ShareStoredSection, data: &mut serde_json::Value) {
+    match kind {
+        ShareStoredSection::Providers => {
+            if let Some(instances) = data
+                .get_mut("provider_instances")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                for instance in instances.values_mut() {
+                    if let Some(instance) = instance.as_object_mut() {
+                        instance.remove("api_key");
+                    }
+                }
+            }
+            for name in ["openai", "anthropic", "gemini", "bodhi"] {
+                if let Some(provider) = data
+                    .get_mut(name)
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    provider.remove("api_key");
+                    if name != "bodhi" {
+                        // Legacy runtime-only flag. The instance extra field
+                        // with this name is a durable binding and stays intact.
+                        provider.remove("api_key_from_env");
+                    }
+                }
+            }
+        }
+        ShareStoredSection::Env => {
+            if let Some(entries) = data.as_array_mut() {
+                for entry in entries {
+                    if let Some(entry) = entry.as_object_mut() {
+                        entry.remove("value_encrypted");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Keep saved metadata outside the share allowlist without restoring modeled
+/// fields removed by an edit (for example plaintext on a secret env upgrade).
+/// Unchanged subtrees retain sparse/default/null spellings from the raw JSON.
+fn preserve_unmodeled_fields(
+    raw: &serde_json::Value,
+    old: &serde_json::Value,
+    candidate: &mut serde_json::Value,
+) -> Result<(), ShareApiError> {
+    if old == &*candidate {
+        *candidate = raw.clone();
+        return Ok(());
+    }
+    match (raw, old, candidate) {
+        (
+            serde_json::Value::Object(raw),
+            serde_json::Value::Object(old),
+            serde_json::Value::Object(candidate),
+        ) => {
+            for (name, value) in raw {
+                // DefaultsConfig accepts this existing alias. When a role is
+                // edited, do not restore it beside the canonical field and
+                // create a duplicate; keep any nested unmodeled metadata.
+                let modeled_name = if name == "sub_session"
+                    && !old.contains_key(name)
+                    && (old.contains_key("sub_agent") || candidate.contains_key("sub_agent"))
+                {
+                    "sub_agent"
+                } else {
+                    name.as_str()
+                };
+                match old.get(modeled_name) {
+                    Some(previous) => {
+                        if let Some(next) = candidate.get_mut(modeled_name) {
+                            preserve_unmodeled_fields(value, previous, next)?;
+                        }
+                    }
+                    None => {
+                        // A candidate-provided value always wins at this key.
+                        candidate
+                            .entry(modeled_name.to_owned())
+                            .or_insert_with(|| value.clone());
+                    }
+                }
+            }
+        }
+        (
+            serde_json::Value::Array(raw),
+            serde_json::Value::Array(old),
+            serde_json::Value::Array(candidate),
+        ) if old.iter().any(serde_json::Value::is_object)
+            || candidate.iter().any(serde_json::Value::is_object) =>
+        {
+            // Sharing only changes an object array for env entries: existing
+            // entries retain their exact names/order and new entries append.
+            // Fail closed rather than attach saved metadata to another entry.
+            if raw.len() != old.len() || candidate.len() < old.len() {
+                return Err(ShareApiError::Invalid);
+            }
+            for ((raw, old), candidate) in raw.iter().zip(old).zip(candidate) {
+                let name = old.get("name").and_then(serde_json::Value::as_str);
+                if name.is_none()
+                    || raw.get("name").and_then(serde_json::Value::as_str) != name
+                    || candidate.get("name").and_then(serde_json::Value::as_str) != name
+                {
+                    return Err(ShareApiError::Invalid);
+                }
+                preserve_unmodeled_fields(raw, old, candidate)?;
+            }
+        }
+        // Scalar model arrays remain explicitly replaceable by the import.
+        _ => {}
+    }
+    Ok(())
 }
 
 fn requires_local_key(bundle: &ShareBundle, target: &Config) -> bool {

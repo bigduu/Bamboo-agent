@@ -76,6 +76,234 @@ fn omitted_fields_preserve_destination_and_revision() {
 }
 
 #[test]
+fn adding_env_preserves_saved_unmodeled_fields_without_restoring_upgraded_plaintext() {
+    let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
+    let _key = crate::encryption::set_test_encryption_key([0x48; 32]);
+    let mut original = snapshot();
+    let saved = serde_json::json!([
+        {"name":"APP_MODE", "value":"synthetic-mode", "secret":false, "configured":true,
+            "description":null, "future_hint":{"source":"synthetic", "enabled":true}},
+        {"name":"APP_UPGRADE", "value":"synthetic-old-cleartext", "secret":false,
+            "configured":true, "future_hint":["synthetic-retained-hint"]}
+    ]);
+    original.env = Some(bytes(saved.clone(), 3));
+    let imported = ShareBundle {
+        env: vec![
+            ShareEnvVar {
+                name: "APP_OTHER".into(),
+                value: Some("synthetic-added".into()),
+                secret: false,
+            },
+            ShareEnvVar {
+                name: "APP_UPGRADE".into(),
+                value: Some("synthetic-upgraded-secret".into()),
+                secret: true,
+            },
+        ],
+        ..Default::default()
+    };
+    let decisions = ShareDecisions {
+        env: BTreeMap::from([("APP_UPGRADE".into(), ShareConflictChoice::Replace)]),
+        ..Default::default()
+    };
+    let candidate = prepare_import(&imported, &decisions, &original).unwrap();
+    let env: serde_json::Value = serde_json::from_slice(&candidate.env).unwrap();
+    assert_eq!(env["revision"], 4);
+    assert_eq!(env["data"].as_array().unwrap().len(), 3);
+    assert_eq!(env["data"][0], saved[0]);
+    assert_eq!(env["data"][1]["future_hint"], saved[1]["future_hint"]);
+    assert_eq!(env["data"][1]["name"], "APP_UPGRADE");
+    assert_eq!(env["data"][1]["secret"], true);
+    assert!(env["data"][1].get("value").is_none());
+    assert_eq!(env["data"][2]["name"], "APP_OTHER");
+    assert_eq!(env["data"][2]["value"], "synthetic-added");
+    assert_eq!(candidate.providers, original.providers.unwrap());
+    assert!(!String::from_utf8_lossy(&candidate.env).contains("synthetic-old-cleartext"));
+    assert!(!String::from_utf8_lossy(&candidate.env).contains("synthetic-upgraded-secret"));
+    let credentials = ShareCredentialSnapshot::from_bytes(Some(&candidate.credentials)).unwrap();
+    let reference =
+        crate::CredentialRef::parse(env["data"][1]["credential_ref"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        credentials.resolve_selected(&reference).unwrap(),
+        "synthetic-upgraded-secret"
+    );
+}
+
+#[test]
+fn provider_label_edit_preserves_saved_feature_default_and_modelref_metadata() {
+    let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
+    let mut original = snapshot();
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(original.providers.as_deref().unwrap()).unwrap();
+    saved["data"]["features"] = serde_json::json!({
+        "provider_model_ref":true, "future_toggle":{"mode":"synthetic"}
+    });
+    saved["data"]["defaults"] = serde_json::json!({
+        "chat":{"provider":"relay", "model":"good", "future_route":{"hint":"synthetic"}},
+        "fast":null, "future_policy":{"enabled":true},
+        "sub_session":{"provider":"relay", "model":"good", "future_agent_route":"synthetic"}
+    });
+    original.providers = Some(serde_json::to_vec(&saved).unwrap());
+    // Normal sparse/default/null data remains admissible, with exact no-op bytes.
+    let unchanged = prepare_import(&bundle(), &choices(), &original).unwrap();
+    assert_eq!(unchanged.providers, original.providers.clone().unwrap());
+    let mut imported = bundle();
+    imported.providers[0].label = Some("Imported synthetic label".into());
+    let candidate = prepare_import(&imported, &choices(), &original).unwrap();
+    let providers: serde_json::Value = serde_json::from_slice(&candidate.providers).unwrap();
+    saved["revision"] = serde_json::json!(8);
+    saved["data"]["provider_instances"]["relay"]["label"] =
+        serde_json::json!("Imported synthetic label");
+    assert_eq!(providers, saved);
+    assert_eq!(candidate.env.as_slice(), original.env.as_deref().unwrap());
+    assert_eq!(
+        candidate.credentials.as_slice(),
+        original.credentials.as_deref().unwrap()
+    );
+
+    // A later role edit must not reinsert the legacy alias beside sub_agent.
+    imported.scenarios.insert(
+        ShareScenario::Fast,
+        ShareModelRef {
+            provider: "relay".into(),
+            model: "good".into(),
+            reasoning_effort: None,
+        },
+    );
+    let candidate = prepare_import(&imported, &choices(), &original).unwrap();
+    let providers: serde_json::Value = serde_json::from_slice(&candidate.providers).unwrap();
+    let defaults = saved["data"]["defaults"].as_object_mut().unwrap();
+    let sub_agent = defaults.remove("sub_session").unwrap();
+    defaults.insert("sub_agent".into(), sub_agent);
+    defaults.insert(
+        "fast".into(),
+        serde_json::json!({"provider":"relay", "model":"good"}),
+    );
+    assert_eq!(providers, saved);
+}
+
+#[test]
+fn provider_key_replacement_never_restores_read_only_plaintext() {
+    let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
+    let _key = crate::encryption::set_test_encryption_key([0x49; 32]);
+    let mut original = snapshot();
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(original.providers.as_deref().unwrap()).unwrap();
+    let relay = &mut saved["data"]["provider_instances"]["relay"];
+    relay["api_key"] = serde_json::json!("synthetic-old-provider-plaintext");
+    relay["api_key_encrypted"] = serde_json::json!("synthetic-old-provider-inline");
+    relay["api_key_from_env"] = serde_json::json!(true);
+    relay["future_hint"] = serde_json::json!({"api_key":false});
+    for name in ["openai", "anthropic", "gemini", "bodhi"] {
+        saved["data"][name] = serde_json::json!({"api_key":""});
+        if name != "bodhi" {
+            saved["data"][name]["api_key_from_env"] = serde_json::json!(true);
+        }
+    }
+    original.providers = Some(serde_json::to_vec(&saved).unwrap());
+    let mut imported = bundle();
+    imported.providers[0].api_key = Some("synthetic-new-provider-secret".into());
+    let candidate = prepare_import(&imported, &choices(), &original).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("providers.json"), &candidate.providers).unwrap();
+    std::fs::write(dir.path().join("credentials.json"), &candidate.credentials).unwrap();
+    let persisted = std::fs::read(dir.path().join("providers.json")).unwrap();
+    let providers: serde_json::Value = serde_json::from_slice(&persisted).unwrap();
+    let relay = &providers["data"]["provider_instances"]["relay"];
+    assert!(relay.get("api_key").is_none());
+    assert!(relay.get("api_key_encrypted").is_none());
+    assert_eq!(relay["api_key_from_env"], true);
+    assert_eq!(relay["future_hint"]["api_key"], false);
+    for name in ["openai", "anthropic", "gemini", "bodhi"] {
+        assert!(providers["data"][name].get("api_key").is_none());
+        assert!(providers["data"][name].get("api_key_from_env").is_none());
+    }
+    for value in [
+        "synthetic-old-provider-plaintext",
+        "synthetic-old-provider-inline",
+        "synthetic-new-provider-secret",
+    ] {
+        assert!(!String::from_utf8_lossy(&persisted).contains(value));
+    }
+    let reference = crate::CredentialRef::parse(relay["credential_ref"].as_str().unwrap()).unwrap();
+    let credential_bytes = std::fs::read(dir.path().join("credentials.json")).unwrap();
+    let credentials = ShareCredentialSnapshot::from_bytes(Some(&credential_bytes)).unwrap();
+    assert_eq!(
+        credentials.resolve_selected(&reference).unwrap(),
+        "synthetic-new-provider-secret"
+    );
+}
+
+#[test]
+fn env_value_replacement_never_restores_inline_ciphertext_or_previous_binding() {
+    let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
+    let _key = crate::encryption::set_test_encryption_key([0x50; 32]);
+    let mut original = snapshot();
+    let old_reference = crate::CredentialRef::parse("env.synthetic.previous.value").unwrap();
+    let mut credentials =
+        ShareCredentialSnapshot::from_bytes(original.credentials.as_deref()).unwrap();
+    credentials
+        .insert_share_secret(old_reference.clone(), "synthetic-old-stored-secret")
+        .unwrap();
+    original.credentials = Some(credentials.encode().unwrap());
+    original.revisions.credentials += 1;
+    original.env = Some(bytes(
+        serde_json::json!([{
+            "name":"APP_TOKEN", "value":"synthetic-old-env-plaintext", "secret":true,
+            "configured":true, "credential_ref":old_reference,
+            "value_encrypted":"synthetic-old-env-inline-ciphertext",
+            "future_hint":{"value_encrypted":false}
+        }]),
+        3,
+    ));
+    let imported = ShareBundle {
+        env: vec![ShareEnvVar {
+            name: "APP_TOKEN".into(),
+            value: Some("synthetic-new-env-secret".into()),
+            secret: false,
+        }],
+        ..Default::default()
+    };
+    let decisions = ShareDecisions {
+        env: BTreeMap::from([("APP_TOKEN".into(), ShareConflictChoice::Replace)]),
+        ..Default::default()
+    };
+    let candidate = prepare_import(&imported, &decisions, &original).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("env.json"), &candidate.env).unwrap();
+    std::fs::write(dir.path().join("credentials.json"), &candidate.credentials).unwrap();
+    let persisted = std::fs::read(dir.path().join("env.json")).unwrap();
+    let env: serde_json::Value = serde_json::from_slice(&persisted).unwrap();
+    let entry = &env["data"][0];
+    assert!(entry.get("value").is_none());
+    assert!(entry.get("value_encrypted").is_none());
+    assert_eq!(entry["future_hint"]["value_encrypted"], false);
+    assert_eq!(entry["secret"], true);
+    assert_eq!(entry["configured"], true);
+    for value in [
+        "synthetic-old-env-plaintext",
+        "synthetic-old-env-inline-ciphertext",
+        "synthetic-new-env-secret",
+        old_reference.as_str(),
+    ] {
+        assert!(!String::from_utf8_lossy(&persisted).contains(value));
+    }
+    let reference = crate::CredentialRef::parse(entry["credential_ref"].as_str().unwrap()).unwrap();
+    assert_ne!(reference, old_reference);
+    let credential_bytes = std::fs::read(dir.path().join("credentials.json")).unwrap();
+    let credentials = ShareCredentialSnapshot::from_bytes(Some(&credential_bytes)).unwrap();
+    assert_eq!(
+        credentials.resolve_selected(&reference).unwrap(),
+        "synthetic-new-env-secret"
+    );
+    // Removing an old config binding never deletes its stored credential.
+    assert_eq!(
+        credentials.resolve_selected(&old_reference).unwrap(),
+        "synthetic-old-stored-secret"
+    );
+}
+
+#[test]
 fn provider_type_change_is_rejected_without_reusing_old_key() {
     let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
     let mut imported = bundle();
@@ -363,7 +591,7 @@ fn unchanged_missing_empty_env_stays_revision_zero() {
         revision: 0,
         data: EnvSection::default(),
     };
-    let candidate = encode_changed_section(section, None).unwrap();
+    let candidate = encode_changed_section(ShareStoredSection::Env, section, None).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&candidate).unwrap();
     assert_eq!(value["revision"], 0);
 }
