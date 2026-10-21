@@ -310,8 +310,52 @@ fn provider_type_change_is_rejected_without_reusing_old_key() {
     imported.providers[0].provider_type = ShareProviderType::Anthropic;
     assert!(matches!(
         prepare_import(&imported, &choices(), &snapshot()),
+        Err(ShareApiError::Share(ShareError::Invalid))
+    ));
+}
+
+#[test]
+fn type_changing_replace_preview_disallows_apply_without_changing_saved_bytes() {
+    let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
+    let _key = crate::encryption::set_test_encryption_key([0x51; 32]);
+    let dir = fixture();
+    let mut imported = bundle();
+    imported.providers[0].provider_type = ShareProviderType::Anthropic;
+    // Omitting a URL must not allow a new provider type to reuse its target.
+    assert!(imported.providers[0].base_url.is_none());
+    assert!(matches!(
+        config_share::plan_import(&imported, &target(&snapshot()).unwrap(), &choices()),
+        Err(ShareError::Invalid)
+    ));
+    let string = config_share::encode_bundle(&imported, None).unwrap();
+    let before = tree(dir.path());
+    let preview = preview_config_share(dir.path(), &string, None).unwrap();
+    assert!(!preview.apply_blocked); // Skip and Rename remain valid choices.
+    assert_eq!(preview.preview.providers.len(), 1);
+    let provider = &preview.preview.providers[0];
+    assert!(provider.conflict);
+    assert!(!provider.has_base_url);
+    assert!(!provider.credential_origin_risk);
+    assert!(!provider.replace_allowed);
+    assert_tree_unchanged(&before, dir.path());
+    let operation_id = Uuid::new_v4();
+    assert!(matches!(
+        apply_config_share(
+            dir.path(),
+            &string,
+            None,
+            &choices(),
+            preview.expected_revisions,
+            &preview.preview_token,
+            operation_id,
+        ),
         Err(ShareApiError::Invalid)
     ));
+    assert!(matches!(
+        share_transaction::read_share_operation(dir.path(), operation_id).unwrap(),
+        ShareOperationStatus::NotFound { operation_id: id } if id == operation_id
+    ));
+    assert_tree_unchanged(&before, dir.path());
 }
 
 #[test]
