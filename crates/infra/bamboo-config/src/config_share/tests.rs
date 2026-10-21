@@ -1205,3 +1205,174 @@ fn compiler_controls_are_rejected_as_strings_without_running_tools() {
         }
     }
 }
+
+#[test]
+fn package_controls_are_rejected_as_inert_names_without_running_tools() {
+    // No Ruby/package manager, interpreter, environment mutation, file or process
+    // probe. Source values are synthetic and excluded from the plain roundtrip.
+    let kdf_calls = codec::test_kdf_calls();
+    let benign = env_bundle(&["AppToken"]);
+    let original_benign = benign.clone();
+    let mut names: Vec<String> = [
+        "BUNDLE_GEMFILE",
+        "BUNDLE_APP_CONFIG",
+        "BUNDLE_PATH",
+        "GEM_HOME",
+        "GEM_PATH",
+        "GEMRC",
+        "RAKEOPT",
+        "RAKE_SYSTEM",
+        "RBENV_VERSION",
+        "RBENV_ROOT",
+        "RBENV_HOOK_PATH",
+        "RUBYGEMS_HOST",
+        "RUBYOPT",
+        "PIP_EDITOR",
+        "PIP_CONFIG_FILE",
+        "UV_PYTHON",
+        "UV_ENV_FILE",
+        "UV_CONFIG_FILE",
+        "PIPENV_PYTHON",
+        "PIPENV_VIRTUALENV",
+        "PIPENV_DOTENV_LOCATION",
+        "POETRY_CONFIG_DIR",
+        "POETRY_VIRTUALENVS_PATH",
+        "GRADLE_USER_HOME",
+        "GRADLE_OPTS",
+        "MAVEN_OPTS",
+        "MAVEN_ARGS",
+        "ANT_OPTS",
+        "ANT_ARGS",
+        "JAVACMD",
+        "COMPOSER",
+        "COMPOSER_HOME",
+        "COMPOSER_VENDOR_DIR",
+        "YARN_YARN_PATH",
+        "BUN_OPTIONS",
+        "COREPACK_HOME",
+        "COREPACK_ENV_FILE",
+        "COREPACK_INTEGRITY_KEYS",
+        "PNPM_CONFIG_SCRIPT_SHELL",
+        "DENO_V8_FLAGS",
+        "DENO_CONDITIONS",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    for prefix in [
+        "BUNDLE_",
+        "GEM_",
+        "RBENV_",
+        "RAKE_",
+        "PIP_",
+        "UV_",
+        "PIPENV_",
+        "POETRY_",
+        "GRADLE_",
+        "MAVEN_",
+        "ANT_",
+        "COMPOSER_",
+        "YARN_",
+        "BUN_",
+        "COREPACK_",
+        "PNPM_",
+        "DENO_",
+    ] {
+        names.push(format!("{prefix}SYNTHETIC_RESERVED"));
+    }
+    for name in names {
+        for variant in [name.clone(), name.to_ascii_lowercase()] {
+            assert_eq!(validate_env_name(&variant), Err(ShareError::Unsafe));
+            let bundle = env_bundle(&[&variant]);
+            assert_eq!(bundle.validate(), Err(ShareError::Unsafe));
+            assert_eq!(encode_bundle(&bundle, None), Err(ShareError::Unsafe));
+            let encoded = plain_json(serde_json::to_value(&bundle).unwrap());
+            assert_eq!(decode_bundle(&encoded, None), Err(ShareError::Unsafe));
+            assert_eq!(
+                preview_bundle(&bundle, &Config::default()),
+                Err(ShareError::Unsafe)
+            );
+            let source = env_target(&[&variant]);
+            let before = serde_json::to_vec(&source).unwrap();
+            let selection = ShareSelection {
+                env: BTreeMap::from([(variant.clone(), false)]),
+                ..Default::default()
+            };
+            assert_eq!(select_bundle(&source, &selection), Err(ShareError::Unsafe));
+            let choices = ShareDecisions {
+                env: BTreeMap::from([(
+                    "AppToken".into(),
+                    ShareConflictChoice::Rename { target: variant },
+                )]),
+                ..Default::default()
+            };
+            assert_eq!(
+                plan_import(&benign, &Config::default(), &choices),
+                Err(ShareError::Unsafe)
+            );
+            assert_eq!(serde_json::to_vec(&source).unwrap(), before);
+        }
+    }
+    for name in [
+        "APP_BUNDLE_GEMFILE",
+        "APP_GEM_PATH",
+        "APP_PACKAGE_MODE",
+        "APP_PIP_EDITOR",
+        "APP_UV_PYTHON",
+        "BUNDLECOUNT",
+        "GEMSTONE",
+        "GEMRC_LABEL",
+        "RBENVLABEL",
+        "RAKELIB", // Current Rake reads the CLI option, not this env name.
+        "RAKEOPTIONAL",
+        "PIPCOUNT",
+        "UVCOUNT",
+        "PIPENVCOUNT",
+        "POETRYCOUNT",
+        "GRADLECOUNT",
+        "MAVENCOUNT",
+        "ANTCOUNT",
+        "COMPOSERCOUNT",
+        "JAVACMD_LABEL",
+        "YARNCOUNT",
+        "BUNCOUNT",
+        "COREPACKCOUNT",
+        "PNPMCOUNT",
+        "DENOCOUNT",
+        "LANG",
+    ] {
+        for variant in [name.to_string(), name.to_ascii_lowercase()] {
+            assert_eq!(validate_env_name(&variant), Ok(()));
+            let source = env_target(&[&variant]);
+            let before = serde_json::to_vec(&source).unwrap();
+            let selection = ShareSelection {
+                env: BTreeMap::from([(variant.clone(), false)]),
+                ..Default::default()
+            };
+            let selected = select_bundle(&source, &selection).unwrap();
+            assert_eq!(selected.env[0].name, variant);
+            assert_eq!(selected.env[0].value, None);
+            let encoded = encode_bundle(&selected, None).unwrap();
+            let decoded = decode_bundle(&encoded, None).unwrap();
+            assert_eq!(decoded, selected);
+            assert_eq!(
+                plan_import(&decoded, &Config::default(), &ShareDecisions::default()).unwrap(),
+                selected
+            );
+            let choices = ShareDecisions {
+                env: BTreeMap::from([(
+                    "AppToken".into(),
+                    ShareConflictChoice::Rename {
+                        target: variant.clone(),
+                    },
+                )]),
+                ..Default::default()
+            };
+            let renamed = plan_import(&benign, &Config::default(), &choices).unwrap();
+            assert_eq!(renamed.env[0].name, variant);
+            assert_eq!(serde_json::to_vec(&source).unwrap(), before);
+        }
+    }
+    assert_eq!(benign, original_benign);
+    assert_eq!(codec::test_kdf_calls(), kdf_calls);
+}

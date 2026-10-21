@@ -572,10 +572,61 @@ pub fn validate_env_name(name: &str) -> ShareResult<()> {
     if forbidden.contains(&upper.as_str())
         || prefixes.iter().any(|p| upper.starts_with(p))
         || compiler_control_env(&upper)
+        || package_control_env(&upper)
     {
         return Err(ShareError::Unsafe);
     }
     Ok(())
+}
+
+fn package_control_env(upper: &str) -> bool {
+    // Standard package/language config, script, interpreter, hook and runtime
+    // resolution/trust controls. Reserving these tool namespaces is conservative;
+    // it does not assert that every setting executes a program. RUBYGEMS_ is
+    // already covered by the RUBY prefix. RAKELIB is a CLI parameter in current
+    // Rake, not an automatically read environment setting.
+    // guides.rubygems.org/command-reference/bundle-config/
+    // guides.rubygems.org/command-reference/#gem-environment
+    // github.com/rubygems/rubygems/blob/master/lib/rubygems/config_file.rb
+    // ruby.github.io/rake/doc/command_line_usage_rdoc.html
+    // github.com/ruby/rake/blob/master/lib/rake/application.rb
+    // github.com/rbenv/rbenv#environment-variables
+    // pip.pypa.io/en/stable/cli/pip_config/
+    // docs.astral.sh/uv/reference/environment/
+    // pipenv.pypa.io/en/latest/configuration.html
+    // python-poetry.org/docs/configuration/
+    // docs.gradle.org/current/userguide/init_scripts.html
+    // maven.apache.org/configure.html
+    // ant.apache.org/manual/running.html
+    // getcomposer.org/doc/articles/plugins.md
+    // getcomposer.org/doc/03-cli.md#environment-variables
+    // yarnpkg.com/configuration/yarnrc#yarnPath
+    // bun.com/docs/runtime/environment-variables#configuring-bun
+    // github.com/nodejs/corepack#environment-variables
+    // pnpm.io/configuring#environment-variables
+    // pnpm.io/cli/run#scriptshell
+    // docs.deno.com/runtime/reference/env_variables/
+    let prefixes = [
+        "BUNDLE_",
+        "GEM_",
+        "RBENV_",
+        "RAKE_",
+        "PIP_",
+        "UV_",
+        "PIPENV_",
+        "POETRY_",
+        "GRADLE_",
+        "MAVEN_",
+        "ANT_",
+        "COMPOSER_",
+        "YARN_",
+        "BUN_",
+        "COREPACK_",
+        "PNPM_",
+        "DENO_",
+    ];
+    ["GEMRC", "RAKEOPT", "COMPOSER", "JAVACMD"].contains(&upper)
+        || prefixes.iter().any(|prefix| upper.starts_with(prefix))
 }
 
 fn compiler_control_env(upper: &str) -> bool {
