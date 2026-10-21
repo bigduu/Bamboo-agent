@@ -809,7 +809,7 @@ async fn retry_preparation_keeps_retained_output_and_replay_until_execute() {
         let runner = runners.get_mut(id).unwrap();
         // A synthetic critical observation exercises the retained replay cache;
         // it does not create or run a Child or grant any authority.
-        runner.push_critical_event(AgentEvent::SubAgentCompleted {
+        runner.push_critical_event(bamboo_agent_core::AgentEvent::SubAgentCompleted {
             parent_session_id: id.into(),
             child_session_id: "synthetic-retained-child".into(),
             status: "completed".into(),
