@@ -349,6 +349,13 @@ fn tree(dir: &Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
     files
 }
 
+fn assert_tree_unchanged(before: &BTreeMap<std::path::PathBuf, Vec<u8>>, dir: &Path) {
+    assert!(
+        before == &tree(dir),
+        "share API changed the saved configuration tree"
+    );
+}
+
 #[test]
 fn preview_cancel_is_read_only_and_apply_replay_returns_original_receipt() {
     let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
@@ -360,7 +367,7 @@ fn preview_cancel_is_read_only_and_apply_replay_returns_original_receipt() {
     let before = tree(dir.path());
     let preview = preview_config_share(dir.path(), &string, None).unwrap();
     assert!(!preview.apply_blocked);
-    assert_eq!(before, tree(dir.path())); // cancelling here needs no rollback
+    assert_tree_unchanged(&before, dir.path()); // cancelling here needs no rollback
     let id = Uuid::new_v4();
     let receipt = apply_config_share(
         dir.path(),
@@ -388,7 +395,7 @@ fn preview_cancel_is_read_only_and_apply_replay_returns_original_receipt() {
         serde_json::to_value(&receipt).unwrap(),
         serde_json::to_value(&replay).unwrap()
     );
-    assert_eq!(after, tree(dir.path()));
+    assert_tree_unchanged(&after, dir.path());
     assert_eq!(
         serde_json::to_value(&receipt).unwrap(),
         serde_json::to_value(share_transaction::read_share_operation(dir.path(), id).unwrap())
@@ -426,7 +433,7 @@ fn same_revision_edit_rejects_preview_token_before_any_import_write() {
         ),
         Err(ShareApiError::Conflict)
     ));
-    assert_eq!(before, tree(dir.path()));
+    assert_tree_unchanged(&before, dir.path());
 }
 
 #[test]
@@ -486,7 +493,7 @@ fn explicit_sensitive_export_preview_apply_replay_and_query_use_only_synthetic_s
     let preview =
         preview_config_share(dir.path(), &string, Some("synthetic strong passphrase")).unwrap();
     assert!(!preview.apply_blocked);
-    assert_eq!(before, tree(dir.path()));
+    assert_tree_unchanged(&before, dir.path());
     assert!(!serde_json::to_string(&preview)
         .unwrap()
         .contains("synthetic-export-canary"));
@@ -517,7 +524,7 @@ fn explicit_sensitive_export_preview_apply_replay_and_query_use_only_synthetic_s
         serde_json::to_value(&receipt).unwrap(),
         serde_json::to_value(replay).unwrap()
     );
-    assert_eq!(after, tree(dir.path()));
+    assert_tree_unchanged(&after, dir.path());
     assert_eq!(
         serde_json::to_value(&receipt).unwrap(),
         serde_json::to_value(share_transaction::read_share_operation(dir.path(), id).unwrap())
