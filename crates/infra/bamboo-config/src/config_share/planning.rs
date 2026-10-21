@@ -5,7 +5,7 @@ use crate::Config;
 /// authorization token; the apply boundary must validate again and use CAS.
 pub fn preview_bundle(bundle: &ShareBundle, target: &Config) -> ShareResult<SharePreview> {
     bundle.validate()?;
-    let env_names = target_env_names(target)?;
+    let env_names = target_env_names(bundle, target)?;
     let instances = selection::configured_instances(target);
     let scenarios = selection::scenario_refs(target);
     Ok(SharePreview {
@@ -93,7 +93,7 @@ pub fn plan_import(
     decisions: &ShareDecisions,
 ) -> ShareResult<ShareBundle> {
     bundle.validate()?;
-    let env_names = target_env_names(target)?;
+    let env_names = target_env_names(bundle, target)?;
     let source_ids: BTreeSet<_> = bundle.providers.iter().map(|p| p.id.as_str()).collect();
     let env_ids: BTreeSet<_> = bundle
         .env
@@ -230,8 +230,16 @@ pub fn plan_import(
     Ok(plan)
 }
 
-fn target_env_names(target: &Config) -> ShareResult<BTreeMap<String, &str>> {
+fn target_env_names<'a>(
+    bundle: &ShareBundle,
+    target: &'a Config,
+) -> ShareResult<BTreeMap<String, &'a str>> {
     let mut names = BTreeMap::new();
+    // Provider/model imports leave existing env entries untouched. Portable
+    // name conflicts matter only when this bundle imports environment entries.
+    if bundle.env.is_empty() {
+        return Ok(names);
+    }
     for entry in &target.env_vars {
         if names
             .insert(canonical_env_name(&entry.name), entry.name.as_str())

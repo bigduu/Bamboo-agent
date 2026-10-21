@@ -685,6 +685,34 @@ fn portable_environment_target_duplicates_fail_closed_without_selecting_a_spelli
     assert_eq!(serde_json::to_vec(&target).unwrap(), before);
 }
 
+#[test]
+fn env_free_bundles_ignore_unrelated_case_distinct_target_names_without_mutation() {
+    let target = env_target(&["Token", "TOKEN"]);
+    let before = serde_json::to_vec(&target).unwrap();
+    let mut mappings = selection();
+    mappings.env.clear();
+    for bundle in [
+        provider_only_bundle(),
+        select_bundle(&fixture(), &mappings).unwrap(),
+    ] {
+        assert!(bundle.env.is_empty());
+        let preview = preview_bundle(&bundle, &target).unwrap();
+        assert_eq!(preview.providers.len(), bundle.providers.len());
+        assert!(preview.env.is_empty());
+        let plan = plan_import(&bundle, &target, &ShareDecisions::default()).unwrap();
+        assert_eq!(plan, bundle);
+        assert_eq!(serde_json::to_vec(&target).unwrap(), before);
+    }
+    // Importing any environment entry still rejects ambiguous target names.
+    let with_env = env_bundle(&["Fresh"]);
+    assert_eq!(preview_bundle(&with_env, &target), Err(ShareError::Conflict));
+    assert_eq!(
+        plan_import(&with_env, &target, &ShareDecisions::default()),
+        Err(ShareError::Conflict)
+    );
+    assert_eq!(serde_json::to_vec(&target).unwrap(), before);
+}
+
 fn provider_only_bundle() -> ShareBundle {
     select_bundle(
         &fixture(),
@@ -1374,5 +1402,151 @@ fn package_controls_are_rejected_as_inert_names_without_running_tools() {
         }
     }
     assert_eq!(benign, original_benign);
+    assert_eq!(codec::test_kdf_calls(), kdf_calls);
+}
+
+#[test]
+fn utility_controls_are_rejected_as_inert_names_without_running_tools() {
+    // Inert names only: no configuration file, command, pager, shell or editor
+    // is opened or executed. Plain fixtures never need a password or KDF.
+    let kdf_calls = codec::test_kdf_calls();
+    let benign = env_bundle(&["AppToken"]);
+    let original = benign.clone();
+    let mut names: Vec<String> = [
+        "RIPGREP_CONFIG_PATH",
+        "FZF_DEFAULT_COMMAND",
+        "FZF_DEFAULT_OPTS",
+        "FZF_DEFAULT_OPTS_FILE",
+        "BAT_PAGER",
+        "BAT_CONFIG_PATH",
+        "DELTA_PAGER",
+        "MANPAGER",
+        "MANOPT",
+        "LESS",
+        "LESSOPEN",
+        "LESSCLOSE",
+        "LESSKEYIN",
+        "LESSKEYIN_SYSTEM",
+        "LESSKEY_CONTENT",
+        "LESSSECURE",
+        "LESSSECURE_ALLOW",
+        "LESSSECURE_DISALLOW",
+        "TAR_OPTIONS",
+        "RSYNC_RSH",
+        "RSYNC_CONNECT_PROG",
+        "RSYNC_SHELL",
+        "AWKPATH",
+        "AWKLIBPATH",
+        "BASH_LOADABLES_PATH",
+        "PS0",
+        "PS1",
+        "PS2",
+        "PS4",
+        "FPATH",
+        "VIMINIT",
+        "EXINIT",
+        "GVIMINIT",
+        "VIMRUNTIME",
+        "NVIM_APPNAME",
+        "NVIM_RPLUGIN_MANIFEST",
+        "EMACSLOADPATH",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    for prefix in [
+        "RIPGREP_",
+        "FZF_",
+        "BAT_",
+        "DELTA_",
+        "LESS_",
+        "LESSKEY",
+        "RSYNC_",
+        "BASH_",
+        "NVIM_",
+    ] {
+        names.push(format!("{prefix}SYNTHETIC_RESERVED"));
+    }
+    for name in names {
+        for variant in [name.clone(), name.to_ascii_lowercase()] {
+            assert_eq!(validate_env_name(&variant), Err(ShareError::Unsafe));
+            let bundle = env_bundle(&[&variant]);
+            assert_eq!(bundle.validate(), Err(ShareError::Unsafe));
+            assert_eq!(encode_bundle(&bundle, None), Err(ShareError::Unsafe));
+            let encoded = plain_json(serde_json::to_value(&bundle).unwrap());
+            assert_eq!(decode_bundle(&encoded, None), Err(ShareError::Unsafe));
+            assert_eq!(
+                preview_bundle(&bundle, &Config::default()),
+                Err(ShareError::Unsafe)
+            );
+            let source = env_target(&[&variant]);
+            let before = serde_json::to_vec(&source).unwrap();
+            let selected = ShareSelection {
+                env: BTreeMap::from([(variant.clone(), false)]),
+                ..Default::default()
+            };
+            assert_eq!(select_bundle(&source, &selected), Err(ShareError::Unsafe));
+            let choices = ShareDecisions {
+                env: BTreeMap::from([(
+                    "AppToken".into(),
+                    ShareConflictChoice::Rename { target: variant },
+                )]),
+                ..Default::default()
+            };
+            assert_eq!(
+                plan_import(&benign, &Config::default(), &choices),
+                Err(ShareError::Unsafe)
+            );
+            assert_eq!(serde_json::to_vec(&source).unwrap(), before);
+        }
+    }
+    for name in [
+        "APP_RIPGREP_CONFIG_PATH",
+        "APP_PAGER",
+        "APP_FZF_DEFAULT_COMMAND",
+        "APP_TAR_OPTIONS",
+        "APP_VIMINIT",
+        "RIPGREPCOUNT",
+        "FZFCOUNT",
+        "BATCOUNT",
+        "DELTACOUNT",
+        "LESSON",
+        "RSYNCED_LABEL",
+        "BASHFUL_LABEL",
+        "NVIMLABEL",
+        "MANAGER_ID",
+        "AWKWARD_TAG",
+        "PSALM_COUNT",
+        "FPATH_LABEL",
+        "VIMINIT_LABEL",
+        "EMACSLOADPATH_LABEL",
+    ] {
+        for variant in [name.to_string(), name.to_ascii_lowercase()] {
+            assert_eq!(validate_env_name(&variant), Ok(()));
+            let source = env_target(&[&variant]);
+            let before = serde_json::to_vec(&source).unwrap();
+            let selection = ShareSelection {
+                env: BTreeMap::from([(variant.clone(), false)]),
+                ..Default::default()
+            };
+            let selected = select_bundle(&source, &selection).unwrap();
+            assert_eq!(selected.env[0].name, variant);
+            let encoded = encode_bundle(&selected, None).unwrap();
+            assert_eq!(decode_bundle(&encoded, None).unwrap(), selected);
+            let choices = ShareDecisions {
+                env: BTreeMap::from([(
+                    "AppToken".into(),
+                    ShareConflictChoice::Rename {
+                        target: variant.clone(),
+                    },
+                )]),
+                ..Default::default()
+            };
+            let renamed = plan_import(&benign, &Config::default(), &choices).unwrap();
+            assert_eq!(renamed.env[0].name, variant);
+            assert_eq!(serde_json::to_vec(&source).unwrap(), before);
+        }
+    }
+    assert_eq!(benign, original);
     assert_eq!(codec::test_kdf_calls(), kdf_calls);
 }
