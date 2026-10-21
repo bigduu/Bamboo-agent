@@ -145,14 +145,13 @@ test('complete automatic publication has one route and never accepts the experim
   assert.match(workflow.split('  automatic:\n')[0], /  dry-run:\n/)
 })
 
-test('actual automatic preflight selects the successful main merge, never the separate release head', () => {
-  const result = runActualPreflight('accepted_after_main_advances')
-  assert.equal(result.status, 0, result.stderr)
-  const emitted = JSON.parse(result.stdout.trim().split('\n').at(-1))
-  assert.equal(emitted.output, `revision=${sha}\n`)
-  assert.equal(emitted.envCreated, false)
-  assert.ok(emitted.apiCalls.includes(`compare/${sha}...${'f'.repeat(40)}`))
-  assert.ok(!emitted.output.includes('e'.repeat(40)), 'Do not create a second release-head publication identity')
+test('actual automatic preflight selects the successful main merge, never the separate release head', async (t) => {
+  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+  const source = workflow.split('  automatic:\n')[1].match(/python3 - <<'PY'\n([\s\S]*?)\n          PY/)[1]
+  assert.doesNotMatch(source, /GITHUB_ENV/, 'Source authorization must not write environment state')
+  // Use the existing real Git merge/CI transport fixture for the current dev
+  // controller contract, including advanced dev and exact main output checks.
+  await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t, source, 'v2')
 })
 
 test('actual manual complete dispatch fails before API or output even with owner and accepted-CI inputs', () => {
