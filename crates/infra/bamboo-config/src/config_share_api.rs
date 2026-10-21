@@ -412,10 +412,11 @@ fn prepare_import(
     }
     merge_scenarios(&mut current, &plan)?;
     for entry in plan.env {
+        let identity = config_share::canonical_env_name(&entry.name);
         if let Some(existing) = current
             .env_vars
             .iter_mut()
-            .find(|item| item.name == entry.name)
+            .find(|item| config_share::canonical_env_name(&item.name) == identity)
         {
             let Some(value) = entry.value else {
                 continue;
@@ -504,10 +505,11 @@ fn requires_local_key(bundle: &ShareBundle, target: &Config) -> bool {
         || bundle.env.iter().any(|entry| {
             entry.value.is_some()
                 && (entry.secret
-                    || target
-                        .env_vars
-                        .iter()
-                        .any(|saved| saved.name == entry.name && saved.secret))
+                    || target.env_vars.iter().any(|saved| {
+                        saved.secret
+                            && config_share::canonical_env_name(&saved.name)
+                                == config_share::canonical_env_name(&entry.name)
+                    }))
         })
 }
 

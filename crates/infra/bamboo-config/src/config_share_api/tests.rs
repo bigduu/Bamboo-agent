@@ -183,6 +183,78 @@ fn missing_import_values_never_clear_existing_secret_or_create_one() {
 }
 
 #[test]
+fn portable_environment_case_replace_preserves_one_secret_destination_and_key_precheck() {
+    let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
+    let _key = crate::encryption::set_test_encryption_key([0x29; 32]);
+    let mut original = snapshot();
+    let reference = crate::CredentialRef::parse("env.synthetic.case.value").unwrap();
+    let mut credentials =
+        ShareCredentialSnapshot::from_bytes(original.credentials.as_deref()).unwrap();
+    credentials
+        .insert_share_secret(reference.clone(), "synthetic-saved-case-canary")
+        .unwrap();
+    original.credentials = Some(credentials.encode().unwrap());
+    original.revisions.credentials += 1;
+    original.env = Some(bytes(
+        serde_json::json!([{
+            "name":"Token", "secret":true, "configured":true,
+            "credential_ref":reference, "description":"Saved description"
+        }]),
+        3,
+    ));
+    let before = (
+        original.providers.clone(),
+        original.env.clone(),
+        original.credentials.clone(),
+    );
+    let imported = ShareBundle {
+        env: vec![ShareEnvVar {
+            name: "TOKEN".into(),
+            value: Some("synthetic-imported-case-canary".into()),
+            // The destination's classification must survive this input.
+            secret: false,
+        }],
+        ..Default::default()
+    };
+    assert!(requires_local_key(&imported, &target(&original).unwrap()));
+    let decisions = ShareDecisions {
+        env: BTreeMap::from([("tOkEn".into(), ShareConflictChoice::Replace)]),
+        ..Default::default()
+    };
+    let candidate = prepare_import(&imported, &decisions, &original).unwrap();
+    assert_eq!(candidate.providers, original.providers.clone().unwrap());
+    let env: serde_json::Value = serde_json::from_slice(&candidate.env).unwrap();
+    let entries = env["data"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "Token");
+    assert_eq!(entries[0]["secret"], true);
+    assert_eq!(entries[0]["configured"], true);
+    assert_eq!(entries[0]["description"], "Saved description");
+    assert!(entries[0].get("value").is_none());
+    let new_reference = entries[0]["credential_ref"].as_str().unwrap();
+    assert_ne!(new_reference, "env.synthetic.case.value");
+    let credentials = ShareCredentialSnapshot::from_bytes(Some(&candidate.credentials)).unwrap();
+    assert_eq!(
+        credentials
+            .resolve_selected(&crate::CredentialRef::parse(new_reference).unwrap())
+            .unwrap(),
+        "synthetic-imported-case-canary"
+    );
+    for bytes in [&candidate.env, &candidate.credentials] {
+        assert!(!String::from_utf8_lossy(bytes).contains("synthetic-imported-case-canary"));
+    }
+    assert!(
+        before
+            == (
+                original.providers.clone(),
+                original.env.clone(),
+                original.credentials.clone(),
+            ),
+        "planning changed its supplied snapshot"
+    );
+}
+
+#[test]
 fn runtime_boundary_rejects_legacy_unchanged_copilot_and_provider_override() {
     let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
     let mut current = target(&snapshot()).unwrap();
@@ -353,6 +425,176 @@ fn assert_tree_unchanged(before: &BTreeMap<std::path::PathBuf, Vec<u8>>, dir: &P
     assert!(
         before == &tree(dir),
         "share API changed the saved configuration tree"
+    );
+}
+
+#[test]
+fn unsafe_or_case_duplicate_environment_bundles_are_rejected_before_any_api_write() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
+    let _key = crate::encryption::set_test_encryption_key([0x45; 32]);
+    let dir = fixture();
+    let before = tree(dir.path());
+    for (names, unsafe_name) in [
+        (vec!["GIT_ASKPASS"], true),
+        (vec!["git_askpass"], true),
+        (vec!["Git_AskPass"], true),
+        (vec!["Token", "TOKEN"], false),
+    ] {
+        // Names are inert data. Construct an untrusted envelope directly so
+        // this exercises the inbound boundary rather than the safe exporter.
+        let imported = ShareBundle {
+            env: names
+                .into_iter()
+                .map(|name| ShareEnvVar {
+                    name: name.into(),
+                    value: None,
+                    secret: false,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let envelope = serde_json::json!({"mode":"plain", "bundle":imported});
+        let string = format!(
+            "{}{}",
+            config_share::SHARE_PREFIX,
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&envelope).unwrap())
+        );
+        let preview = preview_config_share(dir.path(), &string, None);
+        let apply = apply_config_share(
+            dir.path(),
+            &string,
+            None,
+            &ShareDecisions::default(),
+            snapshot().revisions,
+            &"0".repeat(64),
+            Uuid::new_v4(),
+        );
+        if unsafe_name {
+            assert!(matches!(
+                preview,
+                Err(ShareApiError::Share(ShareError::Unsafe))
+            ));
+            assert!(matches!(
+                apply,
+                Err(ShareApiError::Share(ShareError::Unsafe))
+            ));
+        } else {
+            assert!(matches!(
+                preview,
+                Err(ShareApiError::Share(ShareError::Invalid))
+            ));
+            assert!(matches!(
+                apply,
+                Err(ShareApiError::Share(ShareError::Invalid))
+            ));
+        }
+        assert_tree_unchanged(&before, dir.path());
+    }
+}
+
+#[test]
+fn portable_environment_preview_warns_when_case_replace_requires_uninitialized_key() {
+    let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
+    let dir = {
+        let _key = crate::encryption::set_test_encryption_key([0x47; 32]);
+        fixture()
+    };
+    assert!(crate::encryption::require_initialized_key().is_err());
+    std::fs::write(
+        dir.path().join("env.json"),
+        bytes(
+            serde_json::json!([{"name":"Token", "secret":true, "configured":false}]),
+            3,
+        ),
+    )
+    .unwrap();
+    let imported = ShareBundle {
+        env: vec![ShareEnvVar {
+            name: "TOKEN".into(),
+            value: Some("synthetic-preview-case-canary".into()),
+            secret: false,
+        }],
+        ..Default::default()
+    };
+    let passphrase = "synthetic preview case passphrase";
+    let string = config_share::encode_bundle(&imported, Some(passphrase)).unwrap();
+    let before = tree(dir.path());
+    let preview = preview_config_share(dir.path(), &string, Some(passphrase)).unwrap();
+    assert!(preview.preview.env[0].conflict);
+    assert!(preview.apply_blocked);
+    assert!(preview
+        .warnings
+        .iter()
+        .any(|warning| matches!(warning, ShareWarning::CredentialKeyUninitialized)));
+    assert!(!serde_json::to_string(&preview)
+        .unwrap()
+        .contains("synthetic-preview-case-canary"));
+    assert_tree_unchanged(&before, dir.path());
+}
+
+#[test]
+fn portable_environment_api_requires_case_conflict_choice_and_preserves_target_spelling() {
+    let _provider = crate::test_support::override_runtime_env_var("BAMBOO_PROVIDER", None);
+    let _key = crate::encryption::set_test_encryption_key([0x46; 32]);
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("env.json"),
+        bytes(
+            serde_json::json!([{"name":"Token", "value":"synthetic-saved-case-value", "secret":false}]),
+            3,
+        ),
+    )
+    .unwrap();
+    let imported = ShareBundle {
+        env: vec![ShareEnvVar {
+            name: "TOKEN".into(),
+            value: None,
+            secret: false,
+        }],
+        ..Default::default()
+    };
+    let string = config_share::encode_bundle(&imported, None).unwrap();
+    let before = tree(dir.path());
+    let preview = preview_config_share(dir.path(), &string, None).unwrap();
+    assert!(!preview.apply_blocked);
+    assert_eq!(preview.preview.env.len(), 1);
+    assert!(preview.preview.env[0].conflict);
+    assert_tree_unchanged(&before, dir.path());
+    assert!(matches!(
+        apply_config_share(
+            dir.path(),
+            &string,
+            None,
+            &ShareDecisions::default(),
+            preview.expected_revisions,
+            &preview.preview_token,
+            Uuid::new_v4(),
+        ),
+        Err(ShareApiError::Invalid)
+    ));
+    assert_tree_unchanged(&before, dir.path());
+    let decisions = ShareDecisions {
+        env: BTreeMap::from([("token".into(), ShareConflictChoice::Replace)]),
+        ..Default::default()
+    };
+    assert!(matches!(
+        apply_config_share(
+            dir.path(),
+            &string,
+            None,
+            &decisions,
+            preview.expected_revisions,
+            &preview.preview_token,
+            Uuid::new_v4(),
+        )
+        .unwrap(),
+        ShareOperationStatus::Committed { .. }
+    ));
+    assert_eq!(
+        std::fs::read(dir.path().join("env.json")).unwrap(),
+        before[Path::new("env.json")]
     );
 }
 
