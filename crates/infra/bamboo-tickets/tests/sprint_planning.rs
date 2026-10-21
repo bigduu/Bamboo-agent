@@ -297,6 +297,17 @@ impl Fixture {
             .clone()
     }
     fn accept(&self, work: &str, submission: &str) {
+        let snapshot = self.service.published().unwrap().1;
+        let assignment = &snapshot.assignments[&snapshot.submissions[submission].assignment_id];
+        ticket_execute(
+            &self.service,
+            &runtime(),
+            vec![Operation::RuntimeStopped {
+                assignment_id: assignment.id.clone(),
+                receipt: assignment.runtime.clone().unwrap(),
+                completed: true,
+            }],
+        );
         ticket_execute(
             &self.service,
             &owner(),
