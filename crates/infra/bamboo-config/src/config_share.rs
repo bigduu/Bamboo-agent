@@ -244,6 +244,9 @@ pub struct ShareProviderPreview {
     #[serde(default)]
     pub credential_origin_risk: bool,
     pub conflict: bool,
+    /// Same-ID Replace must retain the provider type. A different type can
+    /// only be skipped or renamed to a fresh identity with no target settings.
+    pub replace_allowed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,9 +463,19 @@ pub fn validate_env_name(name: &str) -> ShareResult<()> {
         "ENV",
         "BASH_ENV",
         "ZDOTDIR",
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTC_LINKER",
         "RUSTC_WRAPPER",
         "RUSTC_WORKSPACE_WRAPPER",
         "RUSTFLAGS",
+        "RUSTDOCFLAGS",
+        "CROSS_COMPILE",
+        "LDSHARED",
+        "CL",
+        "_CL_",
+        "LINK",
+        "_LINK_",
         "GIT_CONFIG",
         "GIT_CONFIG_COUNT",
         "GIT_SSH",
@@ -554,10 +567,65 @@ pub fn validate_env_name(name: &str) -> ShareResult<()> {
         "COMPLUS_",
         "MONO_",
     ];
-    if forbidden.contains(&upper.as_str()) || prefixes.iter().any(|p| upper.starts_with(p)) {
+    if forbidden.contains(&upper.as_str())
+        || prefixes.iter().any(|p| upper.starts_with(p))
+        || compiler_control_env(&upper)
+    {
         return Err(ShareError::Unsafe);
     }
     Ok(())
+}
+
+fn compiler_control_env(upper: &str) -> bool {
+    // Named executable/option controls and build-kind/target-qualified forms.
+    // Keep this bounded to tool namespaces, rather than rejecting HOST_/TARGET_
+    // application variables in general.
+    // doc.rust-lang.org/cargo/reference/environment-variables.html
+    // docs.rs/cc/latest/cc/#external-configuration-via-environment-variables
+    // docs.rs/pkg-config/latest/pkg_config/#cross-compilation
+    // gnu.org/software/make/manual/html_node/Implicit-Variables.html
+    // gnu.org/software/automake/manual/html_node/Flag-Variables-Ordering.html
+    // github.com/numpy/numpy/blob/v1.26.4/numpy/distutils/fcompiler/__init__.py
+    // learn.microsoft.com/en-us/cpp/build/reference/cl-environment-variables
+    // learn.microsoft.com/en-us/cpp/build/reference/linking
+    let name = upper
+        .strip_prefix("HOST_")
+        .or_else(|| upper.strip_prefix("TARGET_"))
+        .unwrap_or(upper);
+    [
+        "CC",
+        "CXX",
+        "CPP",
+        "AR",
+        "AS",
+        "LD",
+        "FC",
+        "F77",
+        "F90",
+        "RANLIB",
+        "NM",
+        "STRIP",
+        "PKG_CONFIG",
+        "NVCC",
+        "CFLAGS",
+        "CXXFLAGS",
+        "CPPFLAGS",
+        "LDFLAGS",
+        "ARFLAGS",
+        "RANLIBFLAGS",
+        "FCFLAGS",
+        "FFLAGS",
+        "F77FLAGS",
+        "F90FLAGS",
+        "ASFLAGS",
+    ]
+    .iter()
+    .any(|tool| {
+        name == *tool
+            || name
+                .strip_prefix(*tool)
+                .is_some_and(|suffix| suffix.starts_with('_'))
+    })
 }
 
 fn unique_map<'de, D, K, V>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
