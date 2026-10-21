@@ -1082,6 +1082,20 @@ fn compiler_controls_are_rejected_as_strings_without_running_tools() {
         "CMAKE_GENERATOR_TOOLSET",
         "CMAKE_C_COMPILER_LAUNCHER",
         "CMAKE_CXX_LINKER_LAUNCHER",
+        "CCACHE_PREFIX",
+        "CCACHE_PREFIX_CPP",
+        "CCACHE_PATH",
+        "CCACHE_CONFIGPATH",
+        "SCCACHE_CONF",
+        "DISTCC_SSH",
+        "ICECC_CC",
+        "ICECC_CXX",
+        "ICECC_VERSION",
+        // Reserve each known control family, independent of individual spelling.
+        "CCACHE_SYNTHETIC_RESERVED",
+        "SCCACHE_SYNTHETIC_RESERVED",
+        "DISTCC_SYNTHETIC_RESERVED",
+        "ICECC_SYNTHETIC_RESERVED",
     ]
     .into_iter()
     .map(str::to_string)
@@ -1159,7 +1173,35 @@ fn compiler_controls_are_rejected_as_strings_without_running_tools() {
         "MAKEUP",
         "GCCOUNT",
         "CMAKEAPP",
+        "CCACHEAPP",
+        "SCCACHEAPP",
+        "DISTCCAPP",
+        "ICECCAPP",
+        "APP_CCACHE_PREFIX",
     ] {
-        assert_eq!(validate_env_name(name), Ok(()));
+        for variant in [name.to_string(), name.to_ascii_lowercase()] {
+            assert_eq!(validate_env_name(&variant), Ok(()));
+            let source = env_target(&[&variant]);
+            let before = serde_json::to_vec(&source).unwrap();
+            let selection = ShareSelection {
+                env: BTreeMap::from([(variant.clone(), false)]),
+                ..Default::default()
+            };
+            let selected = select_bundle(&source, &selection).unwrap();
+            assert_eq!(selected.env[0].name, variant);
+            let choices = ShareDecisions {
+                env: BTreeMap::from([(
+                    "AppToken".into(),
+                    ShareConflictChoice::Rename {
+                        target: variant.clone(),
+                    },
+                )]),
+                ..Default::default()
+            };
+            let plan =
+                plan_import(&env_bundle(&["AppToken"]), &Config::default(), &choices).unwrap();
+            assert_eq!(plan.env[0].name, variant);
+            assert_eq!(serde_json::to_vec(&source).unwrap(), before);
+        }
     }
 }

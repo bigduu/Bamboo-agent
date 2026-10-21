@@ -581,8 +581,8 @@ pub fn validate_env_name(name: &str) -> ShareResult<()> {
 fn compiler_control_env(upper: &str) -> bool {
     // Cargo -> cc-rs -> native tool/build-driver policy groups: executable and
     // option selection; program/library search; startup scripts/toolchains.
-    // Reserve the documented GCC_/CMAKE_ namespaces and the other standard
-    // build-driver entry points. The share feature does not launch these tools.
+    // Reserve standard compiler/cache/build-driver control namespaces and
+    // entry points. The share feature does not launch these tools.
     // GNU Make does not interpret an environment-supplied MFLAGS value; it is
     // historical output compatibility, so it is not added as an input control.
     // gcc.gnu.org/onlinedocs/gcc/Environment-Variables.html
@@ -591,6 +591,10 @@ fn compiler_control_env(upper: &str) -> bool {
     // gnu.org/software/autoconf/manual/autoconf-2.72/html_node/Site-Defaults.html
     // gnu.org/software/autoconf/manual/autoconf-2.72/html_node/config_002estatus-Invocation.html
     // cmake.org/cmake/help/latest/manual/cmake-env-variables.7.html
+    // ccache.dev/manual/4.11.3.html
+    // github.com/mozilla/sccache/blob/main/docs/Configuration.md
+    // distcc.org/man/distcc_1.html
+    // github.com/icecc/icecream/blob/master/README.md
     if [
         "COMPILER_PATH",
         "LIBRARY_PATH",
@@ -602,7 +606,7 @@ fn compiler_control_env(upper: &str) -> bool {
         "CONFIG_SITE",
     ]
     .contains(&upper)
-        || ["GCC_", "CMAKE_"]
+        || ["GCC_", "CMAKE_", "CCACHE_", "SCCACHE_", "DISTCC_", "ICECC_"]
             .iter()
             .any(|prefix| upper.starts_with(prefix))
     {
