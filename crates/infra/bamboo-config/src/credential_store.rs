@@ -2854,6 +2854,62 @@ impl CredentialStore {
             .collect())
     }
 
+    /// An import may replace only referenced provider/env entries and may
+    /// never clear an existing credential through omission.
+    pub(crate) fn validate_share_document_change(
+        original: &[u8],
+        candidate: &[u8],
+        allowed_refs: &BTreeSet<CredentialRef>,
+    ) -> ConfigStoreResult<u64> {
+        let original = Self::parse_transaction_document(original, true)?;
+        let candidate = Self::parse_transaction_document(candidate, false)?;
+        if original
+            .data
+            .entries
+            .keys()
+            .any(|reference| !candidate.data.entries.contains_key(reference))
+            || candidate.data.entries.iter().any(|(reference, entry)| {
+                original.data.entries.get(reference) != Some(entry)
+                    && (!allowed_refs.contains(reference) || is_internal_recovery_ref(reference))
+            })
+        {
+            return Err(ConfigStoreError::Validation(
+                "share import cannot clear or modify unrelated credentials".to_string(),
+            ));
+        }
+        let changed = original.data != candidate.data;
+        let expected = original
+            .revision
+            .checked_add(u64::from(changed))
+            .ok_or_else(|| {
+                ConfigStoreError::Validation("configuration revision counter exhausted".into())
+            })?;
+        if candidate.revision != expected {
+            return Err(ConfigStoreError::Validation(
+                "share credential candidate has an invalid revision".to_string(),
+            ));
+        }
+        Ok(candidate.revision)
+    }
+
+    /// Presence check for already-prepared encrypted share candidates. The
+    /// import planner separately validates plaintext using an initialized key;
+    /// journal recovery must never initialize keys or invoke discovery.
+    pub(crate) fn ensure_share_refs_present(
+        bytes: &[u8],
+        references: &BTreeSet<CredentialRef>,
+    ) -> ConfigStoreResult<()> {
+        let document = Self::parse_transaction_document(bytes, false)?;
+        if references.iter().any(|reference| {
+            is_internal_recovery_ref(reference) || !document.data.entries.contains_key(reference)
+        }) {
+            return Err(ConfigStoreError::Validation(
+                "share credential reference is unavailable".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn ensure_required_refs_in_bytes(
         bytes: &[u8],
         required_refs: &[String],
