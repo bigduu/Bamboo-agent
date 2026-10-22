@@ -2440,7 +2440,9 @@ mod tests {
         assert!(
             final_request.0.iter().any(|message| {
                 message.role == Role::System
-                    && message.content.starts_with("You are the final reduce stage")
+                    && message
+                        .content
+                        .starts_with("You are the final reduce stage")
             }),
             "this fixture must reach a single final reduce, not a multipart section"
         );
