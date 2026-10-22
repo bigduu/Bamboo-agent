@@ -31,7 +31,8 @@ fn check_process_exit(mode: &str) {
     let script = directory.path().join("synthetic-host.py");
     std::fs::write(
         &script,
-        test_shared_protocol(r#"import json, os, pathlib, sys, time
+        test_shared_protocol(
+            r#"import json, os, pathlib, sys, time
 profile = pathlib.Path(os.environ['BAMBOO_BROWSER_PROFILE_DIR'])
 (profile / 'fixture-pid').write_text(str(os.getpid()))
 hold_readiness = FIXTURE_HOLD
@@ -46,10 +47,11 @@ for line in sys.stdin:
 time.sleep(0.4)
 (profile / 'fixture-checkpoint').write_text('synthetic session cookie checkpoint')
 "#
-        .replace(
-            "FIXTURE_HOLD",
-            if mode == "startup" { "True" } else { "False" },
-        )),
+            .replace(
+                "FIXTURE_HOLD",
+                if mode == "startup" { "True" } else { "False" },
+            ),
+        ),
     )
     .unwrap();
     let log_path = directory.path().join("fixture.log");
@@ -163,8 +165,7 @@ fn browser_shutdown_process_fixture() {
             if mode == "detached" {
                 let session = state.browser.shared.drain().await;
                 drop(session);
-                let path =
-                    profile::shared_directory(&data.join("browser-profiles")).unwrap();
+                let path = profile::shared_directory(&data.join("browser-profiles")).unwrap();
                 tokio::time::timeout(Duration::from_secs(2), async {
                     while !path.join(".bamboo-profile-close-pending").is_file() {
                         tokio::time::sleep(Duration::from_millis(5)).await;

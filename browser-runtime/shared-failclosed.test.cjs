@@ -100,3 +100,26 @@ test('a native mutation queued before policy failure cannot escape the runtime f
   assert.equal(results[1].reason.code, 'browser_unavailable');
   assert.equal(navigations, 0, 'queued work must not issue a native page navigation after the fence');
 });
+
+test('ordinary backpressure preserves all chat cleanup slots without retiring the host', () => {
+  const sandbox = vm.createContext({
+    require(name) { return name === 'playwright-core' ? { chromium: {} } : require(name); },
+    module: { exports: {} }, process: { env: {}, platform: process.platform },
+    Buffer, URL, setTimeout, clearTimeout, setInterval, clearInterval,
+  });
+  new vm.Script(fs.readFileSync(path.join(__dirname, 'host.cjs'), 'utf8')).runInContext(sandbox);
+  const api = vm.runInContext(`({ budget:createRequestBudget(), retired:()=>retireAfterReply,
+    cleanup:request=>isScopeCleanup(request,'a'.repeat(24)) })`, sandbox);
+  const ordinary = Array.from({ length: 48 }, () => api.budget.acquire(false));
+  assert.throws(() => api.budget.acquire(false), error => error.code === 'browser_busy');
+  const cleanup = Array.from({ length: 16 }, () => api.budget.acquire(true));
+  assert.throws(() => api.budget.acquire(true), error => error.code === 'browser_busy');
+  assert.equal(api.retired(), false, 'known backpressure cannot retire a healthy browser');
+  ordinary.forEach(release => { release(); release(); });
+  const later = Array.from({ length: 48 }, () => api.budget.acquire(false));
+  cleanup.forEach(release => release()); later.forEach(release => release());
+  const request = { action: 'scope_close', host_generation: 'a'.repeat(24), scope_id: 'b'.repeat(24), scope_generation: 'c'.repeat(24) };
+  assert.equal(api.cleanup(request), true);
+  for (const invalid of [{ ...request, action: 'state' }, { ...request, host_generation: 'd'.repeat(24) },
+    { ...request, scope_id: 'other' }, { ...request, scope_generation: null }]) assert.equal(api.cleanup(invalid), false);
+});

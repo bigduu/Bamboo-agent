@@ -168,7 +168,9 @@ async fn marker_io_failure_keeps_drop_and_the_lease_until_a_durable_fence_exists
         "an I/O failure must not release an unmarked profile"
     );
     assert!(fs2::FileExt::try_lock_exclusive(&competing).is_ok());
-    assert!(path.join(".bamboo-profile-writer-exit-unconfirmed").is_file());
+    assert!(path
+        .join(".bamboo-profile-writer-exit-unconfirmed")
+        .is_file());
     drop(competing);
     assert!(profile::acquire(&root, "chat").is_err());
 }
@@ -656,12 +658,20 @@ async fn interrupted_logout_is_not_replayed(cancel: bool) {
     // final account checkpoint may legitimately have persisted the logout.
     // If the older cookie is still present, account admission must be fenced.
     let saved: Value = serde_json::from_slice(&std::fs::read(checkpoint).unwrap()).unwrap();
-    let stale = saved["cookies"].as_array().unwrap().iter()
+    let stale = saved["cookies"]
+        .as_array()
+        .unwrap()
+        .iter()
         .any(|cookie| cookie["name"] == "fixture-session");
     if stale {
-        assert!(profile::acquire_shared(&root).is_err(), "an interrupted scope must never replay the old cookie");
+        assert!(
+            profile::acquire_shared(&root).is_err(),
+            "an interrupted scope must never replay the old cookie"
+        );
     } else {
-        assert!(session.clean_host_exit.load(Ordering::Acquire) || session.cleanup.is_quarantined());
+        assert!(
+            session.clean_host_exit.load(Ordering::Acquire) || session.cleanup.is_quarantined()
+        );
     }
 }
 

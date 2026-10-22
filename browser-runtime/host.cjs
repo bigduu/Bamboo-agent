@@ -3482,6 +3482,31 @@ function replyEnvelope(request, payload, v2, hostGeneration) {
       scope_id: request?.scope_id, scope_generation: request?.scope_generation } : {}) };
 }
 
+function isScopeCleanup(request, hostGeneration) {
+  return request?.action === 'scope_close' && request.host_generation === hostGeneration &&
+    typeof request.scope_id === 'string' && /^[0-9a-f]{24}$/.test(request.scope_id) &&
+    typeof request.scope_generation === 'string' && /^[0-9a-f]{24}$/.test(request.scope_generation);
+}
+
+function createRequestBudget() {
+  let total = 0; let ordinary = 0;
+  return {
+    acquire(cleanup) {
+      // Reserve one cleanup slot per admitted chat. Cancelled read waiters can
+      // leave native work pending, so this bound also lives in the actual host.
+      if (total >= 64 || !cleanup && ordinary >= 48) {
+        throw Object.assign(new Error('browser request capacity unavailable'), { code: 'browser_busy' });
+      }
+      total++; if (!cleanup) ordinary++;
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true; total--; if (!cleanup) ordinary--;
+      };
+    },
+  };
+}
+
 function closeHost() {
   if (hostClose) return hostClose;
   shuttingDown = true;
@@ -3556,6 +3581,7 @@ async function main() {
   if (!v2) await hostRuntime.handle({ ...legacy, action: 'scope_open', args: {} });
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   const pending = new Set();
+  const budget = createRequestBudget();
   let lastRequestId = 0;
   const disconnected = () => {
     lines.close(); process.stdin.pause(); closing = true;
@@ -3579,6 +3605,7 @@ async function main() {
     if (shuttingDown) break;
     let request;
     let envelopeValid = false;
+    let release;
     try {
       if (Buffer.byteLength(line) > 2 * 1024 * 1024) throw new Error('browser request too large');
       request = JSON.parse(line);
@@ -3586,9 +3613,9 @@ async function main() {
           typeof request.action !== 'string' || v2 && request.version !== 2) throw new Error('invalid browser request envelope');
       lastRequestId = request.id;
       envelopeValid = true;
-      if (pending.size >= 64) throw new Error('browser request capacity unavailable');
+      release = budget.acquire(v2 && isScopeCleanup(request, hostRuntime.generation));
     } catch (error) {
-      emit(replyEnvelope(request, { ok: false, code: 'invalid_request', error: error.message }, v2, hostRuntime.generation));
+      emit(replyEnvelope(request, { ok: false, code: error.code || 'invalid_request', error: error.message }, v2, hostRuntime.generation));
       if (v2 && !envelopeValid) {
         // An unbindable/replayed internal frame is a protocol failure, not a
         // request that can safely be left waiting behind an anonymous error.
@@ -3602,6 +3629,7 @@ async function main() {
     const work = answer(request); pending.add(work);
     void work.finally(() => {
       pending.delete(work);
+      release();
       if (retireAfterReply) { process.exitCode = 1; disconnected(); }
     });
     if (!v2) {

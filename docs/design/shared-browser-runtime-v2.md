@@ -7,9 +7,9 @@ chat does not launch another complete browser.
 
 `shared` is the default profile mode. These chats use the same persistent default
 BrowserContext and therefore the same account site storage. Separate pages are
-not a security boundary: shared cookies, localStorage, IndexedDB and service
-workers intentionally remain shared. Document memory and sessionStorage retain
-their normal page/session behavior.
+not a security boundary: cookies, localStorage and IndexedDB intentionally remain
+shared. Document memory and sessionStorage retain their normal page/session
+behavior. The existing service-worker block remains in effect.
 
 `clean` creates a fresh temporary BrowserContext in that same browser. It imports
 neither the account profile nor a previous clean context's state. Closing it
@@ -48,9 +48,11 @@ Every scoped request/reply/event carries version, host generation, opaque scope
 ID and scope generation. Pending native requests bind the complete tuple.
 Request IDs are allocated while holding the physical stdin write lock; the lock
 is released before waiting for replies. Native buffering is bounded to 2 MiB,
-pending requests to 64, and the host admits at most 16 chat scopes and 32 owned
-pages. Late retired-generation frames are discarded, never assigned to another
-chat. A known reply with a mismatched tuple fails the physical transport.
+pending requests to 64 (48 ordinary plus 16 cleanup slots), and the host admits at
+most 16 chat scopes and 32 owned pages. Known backpressure returns `browser_busy`
+without retiring a healthy runtime. Late retired-generation frames are discarded,
+never assigned to another chat. A known reply with a mismatched tuple fails the
+physical transport.
 
 Cancelling a mutating caller fences and closes its own scope through an owned
 task. Cancelling a read removes only its waiter. A partial write, corrupt
@@ -73,6 +75,8 @@ cross-platform process-domain containment claim.
 - Omitted mode defaults to shared for a new scope and preserves an active
   scope's mode. An explicit active mode change returns 409
   `browser_profile_mode_conflict`, with no automatic close, switch or retry.
+- Known request/scope capacity exhaustion returns 503 `browser_busy`. It does not
+  imply the browser was closed; mutations are never automatically retried.
 - Successful state responses include `profile_mode` and `storage_shared`, true
   exactly for shared mode. Existing navigation, tab and dialog responses retain
   those fields.

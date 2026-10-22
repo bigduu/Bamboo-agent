@@ -10,10 +10,10 @@ mod shared;
 pub use shared::BrowserProfileMode;
 #[cfg(test)]
 mod reset_tests;
-#[cfg(all(test, unix))]
-mod shared_manager_tests;
 #[cfg(test)]
 mod retirement_tests;
+#[cfg(all(test, unix))]
+mod shared_manager_tests;
 #[cfg(all(test, unix))]
 mod shutdown_tests;
 #[cfg(test)]
@@ -101,6 +101,8 @@ pub enum BrowserError {
     NotOpen,
     #[error("close this chat browser before changing profile mode")]
     ProfileModeConflict,
+    #[error("browser runtime busy")]
+    Busy,
     #[error("browser page changed; refresh state and retry")]
     StaleEpoch,
     #[error("browser dialog is no longer pending")]
@@ -151,7 +153,9 @@ struct BrowserLifecycle {
 impl BrowserLifecycle {
     fn ensure_writer_admission(&self) -> Result<(), BrowserError> {
         if self.unconfirmed_writers.load(Ordering::Acquire) {
-            return Err(BrowserError::Unavailable("browser writer exit unconfirmed".into()));
+            return Err(BrowserError::Unavailable(
+                "browser writer exit unconfirmed".into(),
+            ));
         }
         Ok(())
     }
@@ -159,7 +163,9 @@ impl BrowserLifecycle {
     fn spawn_child(&self, command: &mut Command) -> Result<Child, BrowserError> {
         let _admission = self.writer_admission.lock().unwrap();
         self.ensure_writer_admission()?;
-        command.spawn().map_err(|error| BrowserError::Unavailable(error.to_string()))
+        command
+            .spawn()
+            .map_err(|error| BrowserError::Unavailable(error.to_string()))
     }
 }
 
@@ -411,7 +417,8 @@ impl BrowserReaper {
                     std::thread::sleep(Duration::from_millis(250));
                 }
             }
-            self.cleanup.quarantine(self.lease.take(), self.temp_dir.take());
+            self.cleanup
+                .quarantine(self.lease.take(), self.temp_dir.take());
             return;
         }
         if let Some(directory) = self.temp_dir.take() {
@@ -542,17 +549,25 @@ async fn read_host_line<R: tokio::io::AsyncRead + Unpin>(
             return if line.is_empty() {
                 Ok(None)
             } else {
-                Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "incomplete browser frame"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "incomplete browser frame",
+                ))
             };
         }
         let end = bytes.iter().position(|byte| *byte == b'\n');
         let length = end.map_or(bytes.len(), |index| index + 1);
         if line.len().saturating_add(length) > shared::MAX_FRAME_BYTES {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "browser frame too large"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "browser frame too large",
+            ));
         }
         line.extend_from_slice(&bytes[..length]);
         reader.consume(length);
-        if end.is_some() { return Ok(Some(line)); }
+        if end.is_some() {
+            return Ok(Some(line));
+        }
     }
 }
 
@@ -612,7 +627,9 @@ impl BrowserSession {
         let mut abort_guard = BrowserCallAbortGuard::new(session.clone(), None);
         // The first state request doubles as a readiness probe. A missing
         // Playwright package or Chromium binary fails here, not on first click.
-        let readiness = session.call(if shared { "runtime_state" } else { "state" }, json!({})).await;
+        let readiness = session
+            .call(if shared { "runtime_state" } else { "state" }, json!({}))
+            .await;
         if readiness.is_err() {
             session.terminate("browser host unavailable").await;
         }
@@ -622,7 +639,9 @@ impl BrowserSession {
         if shared && !shared::valid_handshake(&readiness, generation.as_deref()) {
             let _ = session.begin_retirement("incompatible shared browser host");
             session.terminate("incompatible shared browser host").await;
-            return Err(BrowserError::Unavailable("incompatible shared browser host".into()));
+            return Err(BrowserError::Unavailable(
+                "incompatible shared browser host".into(),
+            ));
         }
         Ok(session)
     }
@@ -725,7 +744,9 @@ impl BrowserSession {
             if let Some(router) = router {
                 if !router.deliver(&message) {
                     session.signal_stop();
-                    session.terminate("invalid shared browser owner tuple").await;
+                    session
+                        .terminate("invalid shared browser owner tuple")
+                        .await;
                     return;
                 }
                 continue;
@@ -913,12 +934,9 @@ impl BrowserSession {
             return;
         }
         let mut lease = self.profile_lease.lock().unwrap();
-        if self.retiring.load(Ordering::Acquire)
-            && !self.close_confirmed.load(Ordering::Acquire)
-            && lease
-                .as_ref()
-                .is_some_and(|lease| lease.begin_close().is_err())
-        {
+        if self.retiring.load(Ordering::Acquire) && !self.close_confirmed.load(Ordering::Acquire) {
+            // A failed unlink-directory barrier cannot release the writer
+            // lease, even if restoring a pending-close marker would succeed.
             return;
         }
         lease.take();
@@ -953,6 +971,17 @@ impl BrowserSession {
         let _guard = self.termination.lock().await;
         if self.reaped.load(Ordering::Acquire) {
             if self.clean_host_exit.load(Ordering::Acquire) {
+                if self.retiring.load(Ordering::Acquire)
+                    && !self.close_confirmed.load(Ordering::Acquire)
+                {
+                    let confirmed = self
+                        .profile_lease
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|lease| lease.finish_close().is_ok());
+                    self.close_confirmed.store(confirmed, Ordering::Release);
+                }
                 self.cleanup_temp_dir().await;
                 self.release_profile();
             } else {
@@ -986,6 +1015,7 @@ impl BrowserSession {
                 None
             };
             if let Some(clean) = graceful {
+                let clean = clean && !self.kill_issued.load(Ordering::Acquire);
                 self.reaped.store(true, Ordering::Release);
                 self.clean_host_exit.store(clean, Ordering::Release);
                 let confirmed = clean
@@ -2289,18 +2319,25 @@ impl BrowserManager {
         }
         // Poll every stop before waiting for any one host's close deadline.
         // join_all keeps draining the remaining hosts even if one close fails.
+        let mut close_error = None;
         for result in futures::future::join_all(sessions.into_iter().map(Self::stop_session)).await
         {
             if let Err(error) = result {
                 // Terminal purge may finish an unconfirmed close after both
                 // stable locks prove that the actual host has been reaped.
                 tracing::warn!(%error, "browser reset did not confirm persistence");
+                close_error = Some(error);
             }
+        }
+        if let Some(error) = close_error {
+            return Err(error);
         }
         for owner in owners {
             owner.wait().await;
             if owner.is_quarantined() {
-                return Err(BrowserError::Unavailable("browser writer exit unconfirmed".into()));
+                return Err(BrowserError::Unavailable(
+                    "browser writer exit unconfirmed".into(),
+                ));
             }
         }
         if let Some(root) = &self.profile_root {
@@ -2361,7 +2398,9 @@ impl BrowserManager {
         for owner in owners {
             owner.wait().await;
             if owner.is_quarantined() {
-                tracing::warn!("browser shutdown retained an unconfirmed writer's locks and scratch");
+                tracing::warn!(
+                    "browser shutdown retained an unconfirmed writer's locks and scratch"
+                );
             }
         }
     }
@@ -2443,9 +2482,12 @@ impl BrowserManager {
     }
 
     pub async fn open_with_mode(
-        &self, session_id: &str, mode: Option<BrowserProfileMode>,
+        &self,
+        session_id: &str,
+        mode: Option<BrowserProfileMode>,
     ) -> Result<Value, BrowserError> {
-        self.open_with_mode_in_epoch(session_id, self.open_epoch(), mode).await
+        self.open_with_mode_in_epoch(session_id, self.open_epoch(), mode)
+            .await
     }
 
     pub(crate) async fn open_in_epoch(
@@ -2457,7 +2499,10 @@ impl BrowserManager {
     }
 
     pub(crate) async fn open_with_mode_in_epoch(
-        &self, session_id: &str, epoch: u64, mode: Option<BrowserProfileMode>,
+        &self,
+        session_id: &str,
+        epoch: u64,
+        mode: Option<BrowserProfileMode>,
     ) -> Result<Value, BrowserError> {
         let _opens = self.lifecycle.opens.read().await;
         if epoch != self.open_epoch() {
@@ -2478,14 +2523,21 @@ impl BrowserManager {
             return Err(BrowserError::NotOpen);
         }
         if let Some(root) = &self.profile_root {
-            let result = self.shared.open(root, &self.lifecycle, session_id, mode).await;
-            if result.is_ok() { self.start_idle_cleanup(); }
+            let result = self
+                .shared
+                .open(root, &self.lifecycle, session_id, mode)
+                .await;
+            if result.is_ok() {
+                self.start_idle_cleanup();
+            }
             return result;
         }
         // Explicit standalone managers retain the old ephemeral protocol for
         // callers without an account data root; production never falls back.
         if mode.is_some_and(|mode| mode != BrowserProfileMode::Shared) {
-            return Err(BrowserError::Unavailable("clean mode requires an account browser root".into()));
+            return Err(BrowserError::Unavailable(
+                "clean mode requires an account browser root".into(),
+            ));
         }
         let existing = {
             let sessions = self.sessions.lock().await;
@@ -2572,7 +2624,10 @@ impl BrowserManager {
         deadline: Duration,
     ) -> Result<Value, BrowserError> {
         if self.profile_root.is_some() && self.shared.contains(session_id) {
-            return self.shared.command(session_id, action, args, deadline).await;
+            return self
+                .shared
+                .command(session_id, action, args, deadline)
+                .await;
         }
         let session = {
             let sessions = self.sessions.lock().await;
@@ -2767,13 +2822,19 @@ impl BrowserManager {
             let retirements = candidates.into_iter().map(|id| async move {
                 let gate = self.session_gate(&id);
                 let _guard = gate.lock().await;
-                if !self.shared.is_idle(&id, ttl) { return false; }
+                if !self.shared.is_idle(&id, ttl) {
+                    return false;
+                }
                 if let Err(error) = self.shared.close(&id).await {
                     tracing::warn!(%error, "shared chat idle close unconfirmed");
                 }
                 true
             });
-            shared_closed = futures::future::join_all(retirements).await.into_iter().filter(|closed| *closed).count();
+            shared_closed = futures::future::join_all(retirements)
+                .await
+                .into_iter()
+                .filter(|closed| *closed)
+                .count();
         }
         let candidates: Vec<String> = self
             .sessions
@@ -2816,11 +2877,12 @@ impl BrowserManager {
                 false
             }
         });
-        shared_closed + futures::future::join_all(retirements)
-            .await
-            .into_iter()
-            .filter(|reaped| *reaped)
-            .count()
+        shared_closed
+            + futures::future::join_all(retirements)
+                .await
+                .into_iter()
+                .filter(|reaped| *reaped)
+                .count()
     }
 
     pub async fn frame(

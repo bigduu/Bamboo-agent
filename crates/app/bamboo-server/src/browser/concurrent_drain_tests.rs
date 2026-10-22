@@ -204,7 +204,10 @@ fn concurrent_drain_process_fixture() {
                 }
             }
             for session in old {
-                assert!(session.call("state", json!({}), BROWSER_COMMAND_DEADLINE).await.is_err());
+                assert!(session
+                    .call("state", json!({}), BROWSER_COMMAND_DEADLINE)
+                    .await
+                    .is_err());
             }
             std::fs::write(fixture.join("old-arcs-fenced"), b"fenced").unwrap();
             // Unrelated destructors/runtime shutdown must not conceal an

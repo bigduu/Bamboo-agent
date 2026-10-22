@@ -39,14 +39,19 @@ pub(super) struct ChatLease {
 }
 
 pub(super) fn acquire_chat(root: &Path, session_id: &str) -> Result<ChatLease, BrowserError> {
-    if session_id.contains('\0') { return Err(unavailable()); }
+    if session_id.contains('\0') {
+        return Err(unavailable());
+    }
     let root = root_directory(root, true)?.ok_or_else(unavailable)?;
     let reset_gate = admission_gate(&root, false)?;
     let lifecycle_lock = lifecycle_lock(&root, session_id)?;
     if is_retired(&lifecycle_lock)? {
         return Err(BrowserError::NotOpen);
     }
-    Ok(ChatLease { _lifecycle_lock: lifecycle_lock, _reset_gate: reset_gate })
+    Ok(ChatLease {
+        _lifecycle_lock: lifecycle_lock,
+        _reset_gate: reset_gate,
+    })
 }
 
 pub(super) fn acquire_shared(root: &Path) -> Result<Lease, BrowserError> {
@@ -85,7 +90,10 @@ impl Lease {
                     use std::os::unix::fs::OpenOptionsExt;
                     options.custom_flags(libc::O_NOFOLLOW);
                 }
-                options.open(&marker).and_then(|file| file.sync_all()).map_err(|_| unavailable())?;
+                options
+                    .open(&marker)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|_| unavailable())?;
             }
             Err(_) => return Err(unavailable()),
         }
@@ -222,7 +230,9 @@ fn key(session_id: &str) -> String {
 
 #[cfg(test)]
 pub(super) fn directory(root: &Path, session_id: &str) -> Result<PathBuf, BrowserError> {
-    if session_id.contains('\0') { return Err(unavailable()); }
+    if session_id.contains('\0') {
+        return Err(unavailable());
+    }
     directory_key(root, &key(session_id))
 }
 
@@ -294,7 +304,9 @@ fn reject_unconfirmed_writers(path: &Path) -> Result<(), BrowserError> {
     match std::fs::symlink_metadata(path.join(WRITER_EXIT_UNCONFIRMED)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         // Existing, malformed, linked or unreadable markers all fail closed.
-        _ => Err(BrowserError::Unavailable("browser writer exit unconfirmed".into())),
+        _ => Err(BrowserError::Unavailable(
+            "browser writer exit unconfirmed".into(),
+        )),
     }
 }
 
@@ -352,7 +364,9 @@ fn is_retired(lock: &std::fs::File) -> Result<bool, BrowserError> {
 }
 
 pub(super) fn acquire(root: &Path, session_id: &str) -> Result<Lease, BrowserError> {
-    if session_id.contains('\0') { return Err(unavailable()); }
+    if session_id.contains('\0') {
+        return Err(unavailable());
+    }
     acquire_key(root, &key(session_id))
 }
 
@@ -390,7 +404,9 @@ pub(super) fn remove_notifying(
     session_id: &str,
     retirement_persisted: impl FnOnce(),
 ) -> Result<(), BrowserError> {
-    if session_id.contains('\0') { return Err(unavailable()); }
+    if session_id.contains('\0') {
+        return Err(unavailable());
+    }
     remove_key_notifying(root, &key(session_id), retirement_persisted)
 }
 
@@ -523,7 +539,10 @@ mod tests {
         assert!(remove_notifying(&root, "canonical-chat", || {}).is_err());
         drop(chat);
         remove_notifying(&root, "canonical-chat", || {}).unwrap();
-        assert!(matches!(acquire_chat(&root, "canonical-chat"), Err(BrowserError::NotOpen)));
+        assert!(matches!(
+            acquire_chat(&root, "canonical-chat"),
+            Err(BrowserError::NotOpen)
+        ));
         assert!(remove_notifying(&root, SHARED_ACCOUNT, || {}).is_err());
         assert!(acquire_chat(&root, SHARED_ACCOUNT).is_err());
         assert_eq!(std::fs::read(sentinel).unwrap(), b"synthetic account state");
@@ -535,7 +554,10 @@ mod tests {
         let root = temporary.path().join("profiles");
         let owner = acquire_shared(&root).unwrap();
         let path = owner.path.clone();
-        let stable = root.join(LEASES).join(format!("{}.lock", path.file_name().unwrap().to_str().unwrap()));
+        let stable = root.join(LEASES).join(format!(
+            "{}.lock",
+            path.file_name().unwrap().to_str().unwrap()
+        ));
         let before = std::fs::metadata(&stable).unwrap();
         drop(owner);
         let reset = begin_reset(&root).unwrap();
@@ -559,30 +581,51 @@ mod tests {
     async fn a_clean_physical_exit_keeps_its_lease_until_the_directory_barrier_recovers() {
         struct ClearFault;
         impl Drop for ClearFault {
-            fn drop(&mut self) { DIRECTORY_SYNC_FAILURE.with(|fault| *fault.borrow_mut() = None); }
+            fn drop(&mut self) {
+                DIRECTORY_SYNC_FAILURE.with(|fault| *fault.borrow_mut() = None);
+            }
         }
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("profiles");
         let lease = acquire_shared(&root).unwrap();
         let path = lease.path.clone();
         let mut command = tokio::process::Command::new("/bin/cat");
-        command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
-            .kill_on_drop(true).process_group(0);
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
         let lifecycle = super::super::BrowserLifecycle::default();
-        let session = super::super::BrowserSession::from_child_tracked(command.spawn().unwrap(), None, &lifecycle).unwrap();
+        let session = super::super::BrowserSession::from_child_tracked(
+            command.spawn().unwrap(),
+            None,
+            &lifecycle,
+        )
+        .unwrap();
         *session.profile_lease.lock().unwrap() = Some(lease);
-        session.begin_retirement("synthetic directory barrier").unwrap();
+        session
+            .begin_retirement("synthetic directory barrier")
+            .unwrap();
         let fault = ClearFault;
         DIRECTORY_SYNC_FAILURE.with(|target| *target.borrow_mut() = Some(path));
         session.terminate("synthetic directory barrier").await;
         assert!(session.reaped.load(std::sync::atomic::Ordering::Acquire));
-        assert!(!session.close_confirmed.load(std::sync::atomic::Ordering::Acquire));
-        assert!(session.profile_lease.lock().unwrap().is_some(), "unlink without its directory barrier released the lease");
+        assert!(!session
+            .close_confirmed
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            session.profile_lease.lock().unwrap().is_some(),
+            "unlink without its directory barrier released the lease"
+        );
         assert!(!*session.cleanup.done.borrow());
         assert!(acquire_shared(&root).is_err());
         drop(fault);
-        session.terminate("synthetic directory barrier recovered").await;
-        assert!(session.close_confirmed.load(std::sync::atomic::Ordering::Acquire));
+        session
+            .terminate("synthetic directory barrier recovered")
+            .await;
+        assert!(session
+            .close_confirmed
+            .load(std::sync::atomic::Ordering::Acquire));
         assert!(session.profile_lease.lock().unwrap().is_none());
         assert!(*session.cleanup.done.borrow());
         assert!(acquire_shared(&root).is_ok());

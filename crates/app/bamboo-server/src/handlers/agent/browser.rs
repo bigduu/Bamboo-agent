@@ -19,6 +19,10 @@ fn error_response(error: BrowserError) -> HttpResponse {
             actix_web::http::StatusCode::CONFLICT,
             "browser_profile_mode_conflict",
         ),
+        BrowserError::Busy => (
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+            "browser_busy",
+        ),
         BrowserError::StaleEpoch => (actix_web::http::StatusCode::CONFLICT, "stale_epoch"),
         BrowserError::StaleDialog => (actix_web::http::StatusCode::CONFLICT, "stale_dialog"),
         BrowserError::DialogPending => (actix_web::http::StatusCode::CONFLICT, "dialog_pending"),
@@ -73,13 +77,18 @@ fn parse_open_request(body: &[u8]) -> Result<BrowserOpenRequest, BrowserError> {
         return Ok(BrowserOpenRequest::default());
     }
     if body.len() > 256 {
-        return Err(BrowserError::Invalid("browser open request too large".into()));
+        return Err(BrowserError::Invalid(
+            "browser open request too large".into(),
+        ));
     }
-    serde_json::from_slice(body).map_err(|_| BrowserError::Invalid("profile_mode must be shared or clean".into()))
+    serde_json::from_slice(body)
+        .map_err(|_| BrowserError::Invalid("profile_mode must be shared or clean".into()))
 }
 
 pub async fn open(
-    state: web::Data<AppState>, path: web::Path<String>, body: web::Bytes,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Bytes,
 ) -> HttpResponse {
     let session_id = path.into_inner();
     let epoch = state.browser.open_epoch();
@@ -90,7 +99,11 @@ pub async fn open(
         Ok(request) => request,
         Err(error) => return error_response(error),
     };
-    match state.browser.open_with_mode_in_epoch(&session_id, epoch, request.profile_mode).await {
+    match state
+        .browser
+        .open_with_mode_in_epoch(&session_id, epoch, request.profile_mode)
+        .await
+    {
         Ok(value) => HttpResponse::Ok().json(value),
         Err(error) => error_response(error),
     }
@@ -105,12 +118,32 @@ mod profile_contract_tests {
         for bytes in [b"".as_slice(), b"{}"] {
             assert_eq!(parse_open_request(bytes).unwrap().profile_mode, None);
         }
-        assert_eq!(parse_open_request(br#"{"profile_mode":"shared"}"#).unwrap().profile_mode, Some(BrowserProfileMode::Shared));
-        assert_eq!(parse_open_request(br#"{"profile_mode":"clean"}"#).unwrap().profile_mode, Some(BrowserProfileMode::Clean));
-        for bytes in [b"null".as_slice(), b"[]", b" ", b"true", br#"{"profile_mode":null}"#,
-            br#"{"profile_mode":"unknown"}"#, br#"{"profile_mode":"clean","session_id":"other"}"#,
-            br#"{"profile_mode":"shared","profile_mode":"clean"}"#] {
-            assert!(matches!(parse_open_request(bytes), Err(BrowserError::Invalid(_))));
+        assert_eq!(
+            parse_open_request(br#"{"profile_mode":"shared"}"#)
+                .unwrap()
+                .profile_mode,
+            Some(BrowserProfileMode::Shared)
+        );
+        assert_eq!(
+            parse_open_request(br#"{"profile_mode":"clean"}"#)
+                .unwrap()
+                .profile_mode,
+            Some(BrowserProfileMode::Clean)
+        );
+        for bytes in [
+            b"null".as_slice(),
+            b"[]",
+            b" ",
+            b"true",
+            br#"{"profile_mode":null}"#,
+            br#"{"profile_mode":"unknown"}"#,
+            br#"{"profile_mode":"clean","session_id":"other"}"#,
+            br#"{"profile_mode":"shared","profile_mode":"clean"}"#,
+        ] {
+            assert!(matches!(
+                parse_open_request(bytes),
+                Err(BrowserError::Invalid(_))
+            ));
         }
     }
 
@@ -118,7 +151,14 @@ mod profile_contract_tests {
     fn mode_conflict_keeps_the_existing_409_error_envelope() {
         let response = error_response(BrowserError::ProfileModeConflict);
         assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
-        assert_eq!(error_response(BrowserError::NotOpen).status(), actix_web::http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            error_response(BrowserError::NotOpen).status(),
+            actix_web::http::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            error_response(BrowserError::Busy).status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }
 
