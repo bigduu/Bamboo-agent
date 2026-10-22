@@ -892,3 +892,40 @@ fn actual_dependent_publication_retains_unapplied_policy_source() {
         );
     });
 }
+
+#[test]
+fn safe_observed_receipts_exclude_digests_and_credential_bindings() {
+    let mut state = ConfigApplicationState::default();
+    state.receipts.insert(
+        ConfigConsumer::ProviderRuntime,
+        ConsumerReceipt {
+            applied: Some(AppliedReceipt {
+                revisions: BTreeMap::from([(SectionId::Providers, 7)]),
+                digest: InputDigest([123; 32]),
+                applied_at: Utc::now(),
+                credentials: CredentialBinding::Observed(987654321),
+            }),
+            last_error: Some(ConfigApplyError::ProviderInitializationFailed),
+            failed_section: Some(SectionId::Providers),
+        },
+    );
+    let report = state.safe_observed_receipts();
+    let text = report.to_string();
+    assert!(!text.contains("987654321"));
+    assert!(!text.contains("digest"));
+    assert!(!text.contains("credentials"));
+    assert_eq!(report["desired_vs_applied"], "not_evaluated");
+    let provider = report["consumers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["consumer"] == "provider-runtime")
+        .unwrap();
+    assert_eq!(provider["receipt_status"], "recorded");
+    assert_eq!(provider["applied_revisions"]["providers"], 7);
+    assert_eq!(
+        provider["last_error_code"],
+        "provider_initialization_failed"
+    );
+    assert_eq!(report, state.safe_observed_receipts());
+}

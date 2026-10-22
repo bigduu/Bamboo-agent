@@ -7,7 +7,7 @@ use bamboo_engine::project_context::ProjectContextResolver;
 use bamboo_memory::memory_store::MemoryStore;
 use bamboo_storage::{CleanupMode, CleanupResult};
 
-use super::super::types::CleanupRequest;
+use super::super::types::{CleanupRequest, SessionSummary};
 
 /// `POST /api/v1/sessions/{session_id}/clear`
 pub async fn clear_session(
@@ -16,13 +16,38 @@ pub async fn clear_session(
 ) -> Result<HttpResponse> {
     let session_id = path.into_inner();
     let _persistence_guard = state.persistence.acquire_lock(&session_id).await;
-    let cleared = state
-        .session_store
-        .clear_session(&session_id)
+    // A warm cache is an observation, never permission to rewrite a newer
+    // durable contract. Storage rechecks under its cross-process writer guards.
+    if let Some(canonical) = state
+        .storage
+        .load_session(&session_id)
         .await
         .map_err(|error| {
-            crate::error::json_internal_server_error(format!("Failed to clear session: {error}"))
-        })?;
+            crate::error::json_internal_server_error(format!(
+                "Failed to load session before clear: {error}"
+            ))
+        })?
+    {
+        if let Some(conflict) = SessionSummary::execution_conflict(&canonical) {
+            return Ok(conflict);
+        }
+    }
+    let cleared = match state.session_store.clear_session(&session_id).await {
+        Ok(cleared) => cleared,
+        Err(error) => {
+            // Another process may publish a future contract after preflight.
+            // Present its precise report, without classifying arbitrary IO or
+            // Actor authority errors as compatibility conflicts.
+            if let Ok(Some(canonical)) = state.storage.load_session(&session_id).await {
+                if let Some(conflict) = SessionSummary::execution_conflict(&canonical) {
+                    return Ok(conflict);
+                }
+            }
+            return Err(crate::error::json_internal_server_error(format!(
+                "Failed to clear session: {error}"
+            )));
+        }
+    };
 
     if !cleared {
         return Ok(HttpResponse::NotFound().json(serde_json::json!({

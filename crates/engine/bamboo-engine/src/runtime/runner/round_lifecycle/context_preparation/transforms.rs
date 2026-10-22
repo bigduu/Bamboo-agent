@@ -19,15 +19,22 @@ pub(super) async fn apply_message_transforms(
 ) -> Result<(), AgentError> {
     normalize_tool_chains(&mut prepared_context.messages, session_id);
     if !llm.supports_vision(model_name).await {
-        if prepared_context.messages.iter().any(|message| {
+        let has_images = prepared_context.messages.iter().any(|message| {
             message.content_parts.as_ref().is_some_and(|parts| {
                 parts
                     .iter()
                     .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
             })
-        }) {
-            return Err(AgentError::LLM(format!("Model '{model_name}' does not support Vision; image history was preserved but cannot be sent. Select a Vision-capable model or enable supports_vision for this model in provider settings.")));
+        });
+        if has_images && config.vision_model_resolver.is_none() {
+            return Err(AgentError::LLM(
+                super::super::super::image_fallback::VISION_CONFIGURATION_ERROR.into(),
+            ));
         }
+        super::super::super::image_fallback::project_nonvision_images(
+            &mut prepared_context.messages,
+            session_id,
+        );
     } else if llm.vision_support_override(model_name).await != Some(true) {
         // Vision remains enabled by default. Preserve a legacy fallback only
         // when the user independently opted into that transform; it is not a
@@ -212,6 +219,9 @@ mod vision_tests {
                 mode: crate::runtime::config::ImageFallbackMode::Placeholder,
                 vision_model: None,
             }),
+            vision_model_resolver: Some(Arc::new(|| {
+                panic!("reference preparation must not resolve or call a Vision provider")
+            })),
             ..Default::default()
         };
         let llm: Arc<dyn LLMProvider> = Arc::new(SwitchingProvider);
@@ -220,17 +230,21 @@ mod vision_tests {
             .await
             .unwrap();
         assert!(messages.messages[0].content_parts.is_some());
-        let error = apply_message_transforms(&config, &mut messages, &llm, "switch", "text")
+        let original = serde_json::to_vec(&image).unwrap();
+        apply_message_transforms(&config, &mut messages, &llm, "switch", "text")
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("does not support Vision"));
-        assert!(
-            messages.messages[0].content_parts.is_some(),
-            "images are not silently removed"
-        );
+            .unwrap();
+        assert!(messages.messages[0].content_parts.is_none());
+        assert!(messages.messages[0]
+            .content
+            .contains("bamboo-image://switch/"));
+        assert!(messages.messages[0].content.contains("not inspected"));
+        assert_eq!(serde_json::to_vec(&image).unwrap(), original);
+        let mut messages = prepared();
         apply_message_transforms(&config, &mut messages, &llm, "switch", "image")
             .await
             .unwrap();
+        assert!(messages.messages[0].content_parts.is_some());
         assert!(llm.supports_vision("old").await);
         let mut default_on = prepared();
         apply_message_transforms(

@@ -303,6 +303,11 @@ async fn handle_chat(
         existing_workspace_source,
     ) = match state.storage.load_session(&session_id).await {
         Ok(Some(existing)) => {
+            if let Some(response) =
+                crate::handlers::agent::sessions::SessionSummary::execution_conflict(&existing)
+            {
+                return response;
+            }
             let project_id = match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(&existing) {
                     bamboo_engine::project_context::SessionProjectIdentity::Assigned(project_id) => Some(project_id),
                     bamboo_engine::project_context::SessionProjectIdentity::Unassigned => None,
@@ -616,6 +621,12 @@ async fn handle_chat(
     // An existing Root changes tool authority through the recoverable
     // mode-only operation. Keeping an unfenced inline path would allow a late
     // chat POST to undo a recovery result after the client has read detail.
+    if let Some(response) = authoritative_session
+        .as_ref()
+        .and_then(crate::handlers::agent::sessions::SessionSummary::execution_conflict)
+    {
+        return response;
+    }
     let existing_root = authoritative_session.as_ref().is_some_and(|session| {
         session.kind == bamboo_domain::SessionKind::Root && session.parent_session_id.is_none()
     });
@@ -677,6 +688,9 @@ async fn handle_chat(
                 .map(String::as_str)
                 != Some(bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str())
     });
+    let source_scope_checkpoint = authoritative_session
+        .as_ref()
+        .map(|session| (session.workspace_path_meta(), session.project_id_meta()));
     if req.project_id.is_none() {
         input.project_id = authoritative_session.as_ref().and_then(|session| {
             match bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
@@ -838,6 +852,47 @@ async fn handle_chat(
     {
         return project_context_error_response(error);
     }
+    // A plain follow-up must not revoke a live Native Source before its input
+    // is admitted. Compare after Project-default resolution, before the first
+    // save or hook. Idle legacy paths may still be repaired without resolving
+    // the unavailable old directory.
+    let source_scope_guard = if let Some((workspace, project)) = source_scope_checkpoint {
+        if workspace != session.workspace_path_meta() || project != session.project_id_meta() {
+            let runners = state.agent_runners.clone().read_owned().await;
+            let active = workflow_runner_is_active(runners.get(&session_id))
+                || crate::handlers::agent::events::execute_startup_is_in_flight(
+                    state.as_ref(),
+                    &session_id,
+                );
+            if active {
+                let same_workspace = workspace
+                    .as_deref()
+                    .map(std::fs::canonicalize)
+                    .transpose()
+                    .ok()
+                    .zip(crate::skill_runtime::workspace_identity(&session).ok())
+                    .is_some_and(|(before, after)| before == after);
+                if project != session.project_id_meta() || !same_workspace {
+                    return HttpResponse::Conflict().json(serde_json::json!({
+                        "error": {
+                            "type": "api_error",
+                            "code": "session_project_running_conflict",
+                            "message": "A running or starting session cannot change Project or Workspace"
+                        },
+                        "session_id": session_id,
+                    }));
+                }
+            }
+            // The session lock excludes HTTP startup. Retain the runners read
+            // guard through the owned commit to exclude other reservations
+            // between this check and publication, including caller disconnect.
+            Some(runners)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut staged_workflow_activation = match legacy_selection::stage_selection(
         state.as_ref(),
         &session,
@@ -928,6 +983,7 @@ async fn handle_chat(
         if let Some(staging) = staged_workflow_activation.as_mut() {
             staging.release().await;
         }
+        drop(source_scope_guard);
         drop(persistence_guard);
         return handle_goal_command(state.as_ref(), &session_id, &goal_cmd).await;
     }
@@ -942,7 +998,10 @@ async fn handle_chat(
     // linearizes HTTP execute startup; the runners guard closes reservation
     // races from resume, schedule and connect entry points.
     let workflow_commit_guard = if staged_workflow_activation.is_some() || retire_workflow {
-        let runners = state.agent_runners.clone().read_owned().await;
+        let runners = match source_scope_guard {
+            Some(runners) => runners,
+            None => state.agent_runners.clone().read_owned().await,
+        };
         let runner_is_active = workflow_runner_is_active(runners.get(&session_id));
         let startup_is_active = crate::handlers::agent::events::execute_startup_is_in_flight(
             state.as_ref(),
@@ -956,7 +1015,7 @@ async fn handle_chat(
         }
         Some(runners)
     } else {
-        None
+        source_scope_guard
     };
 
     let native_skills = crate::skill_runtime::registered_main(&session)

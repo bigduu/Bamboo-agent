@@ -109,11 +109,21 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::post().to(agent::supervisor::open_default),
         )
         .service(
+            web::resource("/supervisor/default/scope")
+                .route(web::get().to(agent::supervisor::inspect_project_scope))
+                .route(web::put().to(agent::supervisor::configure_project_scope)),
+        )
+        .service(
             web::scope("/tickets")
+                .configure(agent::tickets::sprints::configure)
                 .route("/scope", web::get().to(agent::tickets::scope))
                 .route("/initialize", web::post().to(agent::tickets::initialize))
                 .route("/overview", web::get().to(agent::tickets::overview))
                 .route("/search", web::post().to(agent::tickets::search))
+                .route(
+                    "/project-board",
+                    web::post().to(agent::tickets::project_board),
+                )
                 .route("/inspect", web::post().to(agent::tickets::inspect))
                 .route("/changes", web::post().to(agent::tickets::changes))
                 .route("/update", web::post().to(agent::tickets::update))

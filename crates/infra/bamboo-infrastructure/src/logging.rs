@@ -112,6 +112,15 @@ pub fn init_server_logging_with_home(home: &Path) {
     init_logging_with_options(options_for_server_home(home, cfg!(debug_assertions)));
 }
 
+/// Retain normal rotating file logs while keeping a protocol process's stdout clean.
+pub fn init_server_logging_with_home_to_stderr(home: &Path) {
+    init_logging_with_options_and_console(
+        options_for_server_home(home, cfg!(debug_assertions)),
+        std::io::stderr,
+        "stderr",
+    );
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogContext {
     Server,
@@ -421,13 +430,24 @@ fn make_filter(default_level: &str, explicit: Option<&str>) -> EnvFilter {
 
 /// Initialize file + stdout logging from explicit [`LogOptions`].
 pub fn init_logging_with_options(opts: LogOptions) {
+    init_logging_with_options_and_console(opts, std::io::stdout, "stdout");
+}
+
+fn init_logging_with_options_and_console<W>(opts: LogOptions, console: W, name: &str)
+where
+    W: for<'writer> tracing_subscriber::fmt::writer::MakeWriter<'writer>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
     let explicit = std::env::var(EnvFilter::DEFAULT_ENV).ok();
 
     match build_appender(&opts) {
         Ok(file_writer) => {
             // `RollingFileAppender` implements `MakeWriter`, so it drives the file
             // layer directly — no background worker, hence no guard to keep alive.
-            let stdout_layer = fmt::layer().with_target(true);
+            let stdout_layer = fmt::layer().with_target(true).with_writer(console.clone());
             let file_layer = fmt::layer()
                 .with_target(true)
                 .with_ansi(false)
@@ -443,8 +463,9 @@ pub fn init_logging_with_options(opts: LogOptions) {
                 .try_init();
         }
         Err(e) => {
-            eprintln!("warning: file logging disabled ({e}); using stdout only");
+            eprintln!("warning: file logging disabled ({e}); using {name} only");
             let _ = fmt()
+                .with_writer(console)
                 .with_target(true)
                 .with_env_filter(make_filter(&opts.default_level, explicit.as_deref()))
                 .try_init();

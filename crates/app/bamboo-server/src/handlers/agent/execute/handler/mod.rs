@@ -85,6 +85,17 @@ async fn handle_execute_inner(
     req: web::Json<ExecuteRequest>,
     selected: Option<receipt::Selection>,
 ) -> HttpResponse {
+    match state.storage.load_session(&session_id).await {
+        Ok(Some(session)) => {
+            if let Some(response) = crate::handlers::agent::sessions::SessionSummary::execution_conflict(&session) {
+                return response;
+            }
+        }
+        Ok(None) => {},
+        Err(error) => return HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": crate::error::error_value(format!("Failed to inspect session compatibility: {error}")),
+        })),
+    }
     // Linearize startup ownership against an abandoned-turn reconciliation.
     // Reconciliation holds the same persistence lock through its durable CAS
     // and broadcast; whichever acquires it first becomes the authoritative

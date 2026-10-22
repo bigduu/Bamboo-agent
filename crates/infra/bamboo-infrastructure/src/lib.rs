@@ -10,6 +10,7 @@
 pub mod logging;
 pub mod metrics;
 pub mod process;
+pub mod telemetry;
 
 // Flat re-exports for process utilities (commonly used by bamboo-tools, bamboo-mcp)
 pub use process::process_utils::{

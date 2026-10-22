@@ -243,6 +243,7 @@ name = "bamboo"
 path = "src/bin/bamboo.rs"
 
 [features]
+otel-otlp = ["bamboo-infrastructure/otel-otlp"]
 ticket-runtime-fixtures = ["bamboo-server/ticket-runtime-fixtures"]
 
 [dev-dependencies]
@@ -268,7 +269,7 @@ bamboo-projects = { path = "crates/infra/bamboo-projects" }
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "off"
 
 # Analytics is outside bamboo-agent's published closure. This source-audited
 # sys patch actually upgrades ZIP6 to ZIP9; it never renames/ignores old ZIP.

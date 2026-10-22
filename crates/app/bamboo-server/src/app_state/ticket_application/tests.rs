@@ -968,10 +968,14 @@ async fn ticket_application_store_init_failure_preserves_ordinary_supervisor_aut
         .unwrap()
         .unwrap();
     assert!(!canonical.root_orchestration_only_enabled());
-    assert!(canonical.allows_model_tool_execution("Write"));
+    assert!(canonical.model_orchestration_only_enabled());
+    assert!(canonical.allows_model_tool_execution("SubAgent"));
+    assert!(canonical.allows_model_tool_execution("session_control"));
+    assert!(!canonical.allows_model_tool_execution("Write"));
+    assert!(!canonical.allows_model_tool_execution("exec_command"));
 
     // A later open still requires explicit attach, but must not leave the
-    // ordinary Supervisor restricted by the failed optional initialization.
+    // standard Supervisor with changed authority after optional init failure.
     std::fs::remove_file(root.path().join("tickets")).unwrap();
     let reopened = TicketApplication::open(root.path(), storage.clone(), config(true)).await;
     assert!(reopened.service().is_err());
@@ -981,6 +985,15 @@ async fn ticket_application_store_init_failure_preserves_ordinary_supervisor_aut
         .unwrap()
         .unwrap();
     assert!(!recovered.root_orchestration_only_enabled());
+    assert!(recovered.model_orchestration_only_enabled());
+    assert!(recovered.allows_model_tool_execution("SubAgent"));
+    assert!(recovered.allows_model_tool_execution("session_control"));
+    assert!(!recovered.allows_model_tool_execution("Write"));
+    assert!(!recovered.allows_model_tool_execution("exec_command"));
+    assert_eq!(
+        recovered.supervisor_incarnation_id(),
+        canonical.supervisor_incarnation_id()
+    );
     assert_eq!(
         recovered.root_tool_authority_revision,
         canonical.root_tool_authority_revision

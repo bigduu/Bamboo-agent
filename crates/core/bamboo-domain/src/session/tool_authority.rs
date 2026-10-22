@@ -79,7 +79,8 @@ pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
 
 /// Exact management tools with their own live Supervisor/target authority gate.
 /// The history executor restricts Supervisor reads to this scope too.
-pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 2] = ["session_control", "session_history"];
+pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 3] =
+    ["session_control", "session_history", "spawn_session"];
 
 pub fn orchestration_only_allows_execution_name_for_supervisor(
     execution_name: &str,
@@ -165,6 +166,15 @@ impl Session {
 
     /// Defense in depth at both catalog projection and final dispatch.
     pub fn allows_model_tool_execution(&self, execution_name: &str) -> bool {
+        if execution_name == "spawn_session" {
+            return if self.independent_root_spawn_contract() {
+                self.supervisor_incarnation_id().is_some()
+            } else {
+                // An old exact custom registration is not the new framework
+                // capability; existing Standard ordinary execution is retained.
+                !self.model_orchestration_only_enabled()
+            };
+        }
         !self.model_orchestration_only_enabled()
             || orchestration_only_allows_execution_name_for_supervisor(
                 execution_name,
@@ -188,7 +198,10 @@ impl Session {
                 session.root_session_id.as_str()
             }
         }
-        if self.id != latest.id
+        if !super::compatibility::same_session_tool_contract(
+            self.session_version,
+            latest.session_version,
+        ) || self.id != latest.id
             || self.kind != latest.kind
             || self.created_at != latest.created_at
             || self.authority_identity != latest.authority_identity

@@ -1,4 +1,387 @@
-//! Narrow model control over already attached independent Roots.
+//! Narrow model control over explicitly scoped independent Roots.
+
+pub mod root_creation;
+pub mod versioned {
+    //! Versioned registration of the scoped independent-Root creation port.
+    //!
+    //! Legacy Sessions retain the SubAgent alias. Binding selects an installed
+    //! owner and never creates a Project grant, checkout, execution or permission.
+
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use bamboo_agent_core::tools::{
+        ExecutingSupervisorObservation, Tool, ToolCall, ToolClass, ToolCtx, ToolError,
+        ToolExecutionContext, ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
+    };
+    use bamboo_domain::{Session, Storage};
+    use serde_json::Value;
+    use tokio::sync::RwLock;
+
+    use super::root_creation::{SupervisedRootCreatePort, SupervisedRootCreateRequest};
+    use crate::overlay_executor::OverlayToolExecutor;
+
+    pub struct SpawnSessionTool {
+        creator: Arc<dyn SupervisedRootCreatePort>,
+        storage: Arc<dyn Storage>,
+        config: Arc<RwLock<bamboo_llm::Config>>,
+        installed: Arc<dyn ToolExecutor>,
+    }
+
+    impl SpawnSessionTool {
+        pub fn new(
+            creator: Arc<dyn SupervisedRootCreatePort>,
+            storage: Arc<dyn Storage>,
+            config: Arc<RwLock<bamboo_llm::Config>>,
+            installed: Arc<dyn ToolExecutor>,
+        ) -> Self {
+            Self {
+                creator,
+                storage,
+                config,
+                installed,
+            }
+        }
+
+        async fn validate_context(&self, ctx: &ToolCtx) -> Result<(), ToolError> {
+            if ctx.plan_read_only {
+                return Err(ToolError::Execution(
+                    "spawn_session is unavailable in Plan mode".into(),
+                ));
+            }
+            let caller = ctx.session_id().ok_or_else(|| {
+                ToolError::Execution(
+                    "spawn_session requires the original executing Supervisor Session".into(),
+                )
+            })?;
+            let observation = ctx.executing_supervisor_for(caller).ok_or_else(|| {
+                ToolError::Execution(
+                    "spawn_session requires the original executing Supervisor identity".into(),
+                )
+            })?;
+            let canonical = load_canonical(self.storage.as_ref(), caller).await?;
+            if !canonical.independent_root_spawn_contract()
+                || ExecutingSupervisorObservation::capture_from_executing_session(&canonical)
+                    != Some(observation)
+            {
+                return Err(ToolError::Execution(
+                    "spawn_session requires the same live v2 Supervisor lifetime".into(),
+                ));
+            }
+            // Recheck live configuration after a permission pause, too. A disabled
+            // Root operation cannot become a Child operation or consume its request.
+            let config = self.config.read().await;
+            if config.disabled_tool_references().iter().any(|reference| {
+                bamboo_domain::resolve_session_tool_reference(
+                    canonical.session_version,
+                    reference,
+                    |name| name == "spawn_session" || self.installed.owns_exact_tool(name),
+                )
+                .as_deref()
+                    == Some("spawn_session")
+            }) {
+                return Err(ToolError::Execution(
+                    "spawn_session is disabled by this Host".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    async fn load_canonical(storage: &dyn Storage, id: &str) -> Result<Session, ToolError> {
+        let session = storage
+            .load_execution_admission_snapshot(id)
+            .await
+            .map_err(|error| {
+                ToolError::Execution(format!("spawn contract admission failed: {error}"))
+            })?
+            .ok_or_else(|| ToolError::Execution("spawn contract Session is unavailable".into()))?;
+        session
+            .check_execution_compatibility()
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        Ok(session)
+    }
+
+    #[async_trait]
+    impl Tool for SpawnSessionTool {
+        fn name(&self) -> &str {
+            "spawn_session"
+        }
+        fn description(&self) -> &str {
+            "v2 Supervisor-only creation of an independent Ordinary Root in an explicit, existing Host-authorized Project/workspace. Read session_control(action=scope) for allowed_projects/state_revision; supply that revision, a stable operation UUID and one first instruction. Use a different Host-bound checkout when isolation is needed; this tool does not create or bind worktrees. SubAgent creates a Child sharing its parent's workspace. Exact retries reuse every request field and recover the existing creation/link/Inbox admission/activation; receipts do not mean task completion. No history, model, permissions or Project grants are inherited. A missing, disabled, stale or denied Root entry is a blocker, never an alias for Child spawning."
+        }
+        fn parameters_schema(&self) -> Value {
+            super::root_creation::request_schema()
+        }
+        fn classify(&self, _args: &Value) -> ToolClass {
+            ToolClass::MUTATING_SERIAL
+        }
+        async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
+            self.validate_context(&ctx).await?;
+            let request: SupervisedRootCreateRequest =
+                serde_json::from_value(args).map_err(|error| {
+                    ToolError::InvalidArguments(format!("invalid spawn_session request: {error}"))
+                })?;
+            request.validate()?;
+            let supervisor = ctx
+                .executing_supervisor_for(ctx.session_id().expect("validated caller"))
+                .expect("validated observation")
+                .supervisor_reference();
+            self.creator
+                .create(&supervisor, request)
+                .await
+                .map(ToolOutcome::Completed)
+        }
+    }
+
+    struct RootSpawnPermissionGate(Arc<bamboo_tools::BuiltinToolExecutor>);
+
+    #[async_trait]
+    impl ToolExecutor for RootSpawnPermissionGate {
+        async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+            Err(ToolError::Execution(
+                "permission-only Root operation gate".into(),
+            ))
+        }
+        async fn check_permissions_for_resolved(
+            &self,
+            call: &ToolCall,
+            execution_name: &str,
+            args: &Value,
+            ctx: &ToolExecutionContext<'_>,
+        ) -> Result<Option<ToolOutcome>, ToolError> {
+            if execution_name != "spawn_session" {
+                return Err(ToolError::Execution(
+                    "Root operation permission owner differs".into(),
+                ));
+            }
+            self.0
+                .check_framework_root_spawn_permissions(call, args, ctx)
+                .await
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            Vec::new()
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct VersionedRootTools {
+        legacy: Arc<dyn ToolExecutor>,
+        independent: Arc<dyn ToolExecutor>,
+        spawn: Arc<SpawnSessionTool>,
+        storage: Arc<dyn Storage>,
+        contract: Option<bool>,
+    }
+
+    impl VersionedRootTools {
+        pub fn new(
+            legacy: Arc<dyn ToolExecutor>,
+            spawn: Arc<SpawnSessionTool>,
+            storage: Arc<dyn Storage>,
+            permission_executor: Arc<bamboo_tools::BuiltinToolExecutor>,
+        ) -> Self {
+            let independent = Arc::new(
+                OverlayToolExecutor::new(legacy.clone(), spawn.clone())
+                    .with_additional_permission_gate(Arc::new(RootSpawnPermissionGate(
+                        permission_executor,
+                    ))),
+            );
+            Self {
+                legacy,
+                independent,
+                spawn,
+                storage,
+                contract: None,
+            }
+        }
+        fn selected(&self) -> &Arc<dyn ToolExecutor> {
+            if self.contract == Some(true) {
+                &self.independent
+            } else {
+                &self.legacy
+            }
+        }
+        fn classification_reference(&self, reference: &str) -> String {
+            if self.contract == Some(true)
+                && bamboo_domain::independent_root_spawn_reference(reference)
+            {
+                bamboo_domain::resolve_session_tool_reference(Some(2), reference, |name| {
+                    self.independent.owns_exact_tool(name)
+                })
+                .unwrap_or_else(|| "spawn_session".into())
+            } else {
+                reference.to_owned()
+            }
+        }
+        async fn route<'a>(
+            &'a self,
+            reference: &str,
+            ctx: &ToolExecutionContext<'_>,
+        ) -> Result<(&'a Arc<dyn ToolExecutor>, String), ToolError> {
+            let version = if bamboo_domain::independent_root_spawn_reference(reference) {
+                let id = ctx.session_id.ok_or_else(|| {
+                    ToolError::Execution(
+                        "spawn_session requires a canonical Session context".into(),
+                    )
+                })?;
+                let session = load_canonical(self.storage.as_ref(), id).await?;
+                if self
+                    .contract
+                    .is_some_and(|v2| v2 != session.independent_root_spawn_contract())
+                {
+                    return Err(ToolError::Execution(
+                        "spawn contract changed; reload the original Session".into(),
+                    ));
+                }
+                session.session_version
+            } else if self.contract == Some(true) {
+                Some(2)
+            } else {
+                Some(1)
+            };
+            let tools = if version == Some(2) {
+                &self.independent
+            } else {
+                &self.legacy
+            };
+            let name = bamboo_domain::resolve_session_tool_reference(version, reference, |name| {
+                tools.owns_exact_tool(name)
+            })
+            .ok_or_else(|| ToolError::NotFound(reference.to_owned()))?;
+            if name == "spawn_session" && version == Some(2) {
+                self.spawn.validate_context(&ctx.to_tool_ctx()).await?;
+            }
+            Ok((tools, name))
+        }
+    }
+
+    #[async_trait]
+    impl ToolExecutor for VersionedRootTools {
+        fn for_session(&self, session: &Session) -> Option<Arc<dyn ToolExecutor>> {
+            let mut bound = self.clone();
+            bound.contract = Some(session.independent_root_spawn_contract());
+            Some(Arc::new(bound))
+        }
+        async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+            self.execute_with_context_outcome(call, ToolExecutionContext::none(&call.id))
+                .await
+                .map(ToolOutcome::into_tool_result)
+        }
+        async fn execute_with_context(
+            &self,
+            call: &ToolCall,
+            ctx: ToolExecutionContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            self.execute_with_context_outcome(call, ctx)
+                .await
+                .map(ToolOutcome::into_tool_result)
+        }
+        async fn execute_with_context_outcome(
+            &self,
+            call: &ToolCall,
+            ctx: ToolExecutionContext<'_>,
+        ) -> Result<ToolOutcome, ToolError> {
+            let (tools, name) = self.route(&call.function.name, &ctx).await?;
+            tools
+                .execute_exact_with_context_outcome(call, &name, ctx)
+                .await
+        }
+        async fn execute_exact_with_context_outcome(
+            &self,
+            call: &ToolCall,
+            execution_name: &str,
+            ctx: ToolExecutionContext<'_>,
+        ) -> Result<ToolOutcome, ToolError> {
+            let (tools, name) = self.route(&call.function.name, &ctx).await?;
+            if name != execution_name {
+                return Err(ToolError::Execution(
+                    "approved execution owner differs from the Session spawn contract".into(),
+                ));
+            }
+            tools
+                .execute_exact_with_context_outcome(call, execution_name, ctx)
+                .await
+        }
+        async fn check_permissions_for(
+            &self,
+            call: &ToolCall,
+            ctx: &ToolExecutionContext<'_>,
+        ) -> Result<Option<ToolOutcome>, ToolError> {
+            let (tools, name) = self.route(&call.function.name, ctx).await?;
+            tools.check_permissions_for_exact(call, &name, ctx).await
+        }
+        async fn check_permissions_for_exact(
+            &self,
+            call: &ToolCall,
+            execution_name: &str,
+            ctx: &ToolExecutionContext<'_>,
+        ) -> Result<Option<ToolOutcome>, ToolError> {
+            let (tools, name) = self.route(&call.function.name, ctx).await?;
+            if name != execution_name {
+                return Err(ToolError::Execution(
+                    "permission owner differs from the Session spawn contract".into(),
+                ));
+            }
+            tools
+                .check_permissions_for_exact(call, execution_name, ctx)
+                .await
+        }
+        async fn check_permissions_for_resolved(
+            &self,
+            call: &ToolCall,
+            execution_name: &str,
+            args: &Value,
+            ctx: &ToolExecutionContext<'_>,
+        ) -> Result<Option<ToolOutcome>, ToolError> {
+            // Outer Work/broker overlays still use the real inner permission gate,
+            // even though their registration is outside this wrapper's catalog.
+            if execution_name == "spawn_session" {
+                let (tools, name) = self.route(&call.function.name, ctx).await?;
+                if name != execution_name {
+                    return Err(ToolError::Execution(
+                        "permission owner differs from the Session spawn contract".into(),
+                    ));
+                }
+                return tools
+                    .check_permissions_for_resolved(call, execution_name, args, ctx)
+                    .await;
+            }
+            self.selected()
+                .check_permissions_for_resolved(call, execution_name, args, ctx)
+                .await
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            self.selected().list_tools()
+        }
+        fn owns_exact_tool(&self, name: &str) -> bool {
+            self.selected().owns_exact_tool(name)
+        }
+        fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+            self.selected().exact_tool_owner(name)
+        }
+        fn tool_guidance(&self) -> Option<String> {
+            self.selected().tool_guidance()
+        }
+        fn tool_mutability(&self, name: &str) -> bamboo_agent_core::ToolMutability {
+            self.selected()
+                .tool_mutability(&self.classification_reference(name))
+        }
+        fn tool_concurrency_safe(&self, name: &str) -> bool {
+            self.selected()
+                .tool_concurrency_safe(&self.classification_reference(name))
+        }
+        fn call_parallel_classification(
+            &self,
+            call: &ToolCall,
+        ) -> (bamboo_agent_core::ToolMutability, bool) {
+            let mut selected = call.clone();
+            selected.function.name = self.classification_reference(&call.function.name);
+            self.selected().call_parallel_classification(&selected)
+        }
+    }
+}
+
+use root_creation::{SupervisedRootCreatePort, SupervisedRootCreateRequest};
 
 use std::sync::Arc;
 
@@ -12,6 +395,10 @@ use serde_json::{json, Value};
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum SessionControlArgs {
+    Scope,
+    Create {
+        request: SupervisedRootCreateRequest,
+    },
     Followup {
         target_session_id: String,
         operation_id: String,
@@ -29,11 +416,20 @@ enum SessionControlArgs {
 
 pub struct SessionControlTool {
     messenger: Arc<SessionMessenger>,
+    root_creator: Option<Arc<dyn SupervisedRootCreatePort>>,
 }
 
 impl SessionControlTool {
     pub fn new(messenger: Arc<SessionMessenger>) -> Self {
-        Self { messenger }
+        Self {
+            messenger,
+            root_creator: None,
+        }
+    }
+
+    pub fn with_root_creator(mut self, creator: Arc<dyn SupervisedRootCreatePort>) -> Self {
+        self.root_creator = Some(creator);
+        self
     }
 }
 
@@ -44,11 +440,14 @@ impl Tool for SessionControlTool {
     }
 
     fn description(&self) -> &str {
+        if self.root_creator.is_some() {
+            return "Supervisor-only control of independent Ordinary Roots in explicitly Host-authorized Projects. scope reads current allowed_projects/state_revision. create requires that revision, an explicit Project and existing Host-bound workspace, a stable operation UUID and first instruction; creates a new Standard Ordinary Root, attaches only that new lifetime and durably submits the instruction. Reuse the complete request on uncertain results; receipts report creation/link/admission/activation, never completion. No Supervisor history, prompt, model, permissions or Project grants are inherited. It does not create a Ticket/Work or isolated worktree. SubAgent creates a bounded Child instead. Existing followup continues an explicitly attached Root using stable operation_id/message. loop retains its separate live-owner Host grant and finite loop opt-in; mutations need exact link/generation/control CAS. No arbitrary attach, permission change, approval answer, successor or cadence. Report actual blocked stage/reason; never substitute shell execution or create another overlapping worker.";
+        }
         "Supervisor-only control of an already attached independent Root, preserving its original context and authority. followup: use a stable operation_id per target and exactly the same message on retry; returns durable admission/activation status, not task completion. loop: requires a separate explicit host grant for the target's current active execution and its existing finite loop opt-in. command is status/start/update/stop; only status may omit expected_link_revision or query receipt_operation_id. Mutations require the exact nonzero link revision and command generation/control CAS. A target-owner receipt distinguishes queued delivery, committed control and any objective still pending its next iteration. No new session, attachment, successor, cadence, approval answer or permission is created. Plan and approval replay cannot issue loop commands. Pending human questions remain unanswered; use session_history.read_messages for bounded history."
     }
 
     fn parameters_schema(&self) -> Value {
-        json!({
+        let mut schema = json!({
             "type": "object", "additionalProperties": false,
             "properties": {
                 "action": {"type": "string", "enum": ["followup", "loop"],
@@ -99,15 +498,51 @@ impl Tool for SessionControlTool {
                     ]
                 }
             ]
-        })
+        });
+        if self.root_creator.is_some() {
+            schema["properties"]["action"]["enum"] = json!(["followup", "loop", "scope", "create"]);
+            schema["properties"]["action"]["description"] = json!("scope needs only action; create needs request; followup/loop need the existing target_session_id and action-specific fields.");
+            schema["properties"]["request"] = root_creation::request_schema();
+            schema["required"] = json!(["action"]);
+            let variants = schema["oneOf"].as_array_mut().unwrap();
+            for variant in variants.iter_mut() {
+                variant["properties"]["request"] = Value::Bool(false);
+                variant["required"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("target_session_id"));
+            }
+            let forbidden = [
+                "target_session_id",
+                "operation_id",
+                "message",
+                "expected_link_revision",
+                "command",
+                "receipt_operation_id",
+            ];
+            let mut scope = json!({"properties":{"action":{"const":"scope"},"request":false}});
+            let mut create =
+                json!({"properties":{"action":{"const":"create"}},"required":["request"]});
+            for field in forbidden {
+                scope["properties"][field] = Value::Bool(false);
+                create["properties"][field] = Value::Bool(false);
+            }
+            variants.push(scope);
+            variants.push(create);
+        }
+        schema
     }
 
-    fn classify(&self, _args: &Value) -> ToolClass {
-        ToolClass::MUTATING_SERIAL
+    fn classify(&self, args: &Value) -> ToolClass {
+        if args["action"] == "scope" {
+            ToolClass::READONLY_PARALLEL
+        } else {
+            ToolClass::MUTATING_SERIAL
+        }
     }
 
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
-        if ctx.plan_read_only {
+        if ctx.plan_read_only && args["action"] != "scope" {
             return Err(ToolError::Execution(
                 "session_control is unavailable in Plan mode".into(),
             ));
@@ -127,6 +562,22 @@ impl Tool for SessionControlTool {
             .map_err(|error| {
                 ToolError::InvalidArguments(format!("invalid session_control arguments: {error}"))
             })? {
+            SessionControlArgs::Scope => {
+                let creator = self.root_creator.as_ref().ok_or_else(|| ToolError::Execution(
+                    "supervised_root_create_unavailable: this Host has no scoped Root creation port".into(),
+                ))?;
+                return creator.scope(&supervisor).await.map(ToolOutcome::Completed);
+            }
+            SessionControlArgs::Create { request } => {
+                request.validate()?;
+                let creator = self.root_creator.as_ref().ok_or_else(|| ToolError::Execution(
+                    "supervised_root_create_unavailable: this Host has no scoped Root creation port".into(),
+                ))?;
+                return creator
+                    .create(&supervisor, request)
+                    .await
+                    .map(ToolOutcome::Completed);
+            }
             SessionControlArgs::Followup {
                 target_session_id,
                 operation_id,

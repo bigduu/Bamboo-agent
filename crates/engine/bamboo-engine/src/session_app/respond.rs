@@ -410,6 +410,9 @@ fn apply_pending_response(
     response_source: ResponseSource,
     permission_receipt: Option<&PermissionDecisionReceipt>,
 ) -> Result<AppliedPendingResponse, RespondError> {
+    session
+        .check_execution_compatibility()
+        .map_err(|error| RespondError::InvalidResponse(error.to_string()))?;
     let pending = session
         .pending_question
         .take()

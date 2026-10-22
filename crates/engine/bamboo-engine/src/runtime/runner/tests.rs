@@ -33,6 +33,7 @@ fn task_list_with_in_progress_item(session_id: &str, description: &str) -> TaskL
 /// with `session_id=Some(...)`. This is required by server-only tools like `spawn_session`.
 #[tokio::test]
 async fn agent_loop_passes_session_id_into_tool_execution_context() {
+    let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
     struct QueueProvider {
         // Each `chat_stream` call pops one pre-baked stream.
         queue: Mutex<Vec<Vec<bamboo_llm::provider::Result<LLMChunk>>>>,
@@ -128,6 +129,10 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
     });
 
     let mut session = Session::new("session-ctx-test", "ignored");
+    // This pre-existing custom-tool probe retains its historical contract.
+    // v2 reserves this spelling for genuine Supervisor Root creation; that
+    // identity boundary is covered by the versioned_spawn dispatch matrix.
+    session.session_version = Some(1);
 
     let (event_tx, _event_rx) = mpsc::channel(64);
     let config = AgentLoopConfig {
@@ -140,21 +145,48 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
         ..Default::default()
     };
 
-    super::run_agent_loop_with_config(
-        &mut session,
-        "hello".to_string(),
-        event_tx,
-        provider,
-        Arc::new(tools),
-        CancellationToken::new(),
-        config,
-    )
-    .await
-    .expect("agent loop should succeed");
+    trace
+        .scope(super::run_agent_loop_with_config(
+            &mut session,
+            "hello".to_string(),
+            event_tx,
+            provider,
+            Arc::new(tools),
+            CancellationToken::new(),
+            config,
+        ))
+        .await
+        .expect("agent loop should succeed");
 
     assert_eq!(
         seen_session_id.lock().await.clone(),
         Some("session-ctx-test".to_string())
+    );
+    let spans = trace.spans();
+    let agent = spans
+        .iter()
+        .find(|s| s.name == "invoke_agent")
+        .expect("real invocation span");
+    let calls: Vec<_> = spans
+        .iter()
+        .filter(|s| s.name.starts_with("chat "))
+        .collect();
+    let tools: Vec<_> = spans
+        .iter()
+        .filter(|s| s.name.starts_with("execute_tool "))
+        .collect();
+    assert_eq!(calls.len(), 2, "one span per actual provider request");
+    assert_eq!(tools.len(), 1, "one span per actual tool dispatch");
+    assert_eq!(tools[0].name, "execute_tool spawn_session");
+    for span in calls.into_iter().chain(tools) {
+        assert_eq!(span.parent_span_id, agent.span_context.span_id());
+        assert_eq!(span.span_context.trace_id(), agent.span_context.trace_id());
+        assert!(span.events.is_empty());
+    }
+    let exported = format!("{spans:?}");
+    assert!(
+        !exported.contains("do it"),
+        "tool arguments must not be exported"
     );
 }
 
@@ -338,6 +370,7 @@ async fn agent_loop_uses_refreshed_fast_model_for_between_round_task_evaluation(
 
 #[tokio::test]
 async fn cancelled_pipeline_releases_activation_without_false_completion() {
+    let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
     struct NeverCalledProvider;
 
     #[async_trait]
@@ -389,16 +422,17 @@ async fn cancelled_pipeline_releases_activation_without_false_completion() {
     let cancel = CancellationToken::new();
     cancel.cancel();
     let (event_tx, mut event_rx) = mpsc::channel(16);
-    let result = super::run_agent_loop_with_config(
-        &mut session,
-        "cancel".to_string(),
-        event_tx,
-        Arc::new(NeverCalledProvider),
-        Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
-        cancel,
-        config,
-    )
-    .await;
+    let result = trace
+        .scope(super::run_agent_loop_with_config(
+            &mut session,
+            "cancel".to_string(),
+            event_tx,
+            Arc::new(NeverCalledProvider),
+            Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+            cancel,
+            config,
+        ))
+        .await;
 
     assert!(matches!(
         result,
@@ -418,6 +452,17 @@ async fn cancelled_pipeline_releases_activation_without_false_completion() {
             "cancelled pipeline must not emit Complete"
         );
     }
+    let spans = trace.spans();
+    assert_eq!(
+        spans.len(),
+        1,
+        "pre-cancelled invocation must not fabricate provider/tool spans"
+    );
+    assert_eq!(spans[0].name, "invoke_agent");
+    assert!(spans[0]
+        .attributes
+        .iter()
+        .any(|kv| kv.key.as_str() == "error.type" && kv.value.to_string() == "cancelled"));
 }
 
 #[tokio::test]
@@ -972,6 +1017,7 @@ async fn wait_for_runner_metrics(
 
 #[tokio::test]
 async fn repeated_execution_of_one_session_keeps_both_metric_rounds() {
+    let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
     let session_id = "metrics-repeated-execution";
     let (_directory, collector, storage) = create_runner_metrics().await;
     let provider = Arc::new(MetricsQueueProvider {
@@ -994,17 +1040,18 @@ async fn repeated_execution_of_one_session_keeps_both_metric_rounds() {
     let mut session = Session::new(session_id, "test-model");
 
     let (first_tx, _first_rx) = mpsc::channel(64);
-    super::run_agent_loop_with_config(
-        &mut session,
-        "first request".to_string(),
-        first_tx,
-        provider.clone(),
-        tools.clone(),
-        CancellationToken::new(),
-        runner_metrics_config(&collector),
-    )
-    .await
-    .expect("first execution");
+    trace
+        .scope(super::run_agent_loop_with_config(
+            &mut session,
+            "first request".to_string(),
+            first_tx,
+            provider.clone(),
+            tools.clone(),
+            CancellationToken::new(),
+            runner_metrics_config(&collector),
+        ))
+        .await
+        .expect("first execution");
 
     let first_detail = wait_for_runner_metrics(
         storage.as_ref(),
@@ -1024,17 +1071,18 @@ async fn repeated_execution_of_one_session_keeps_both_metric_rounds() {
     );
 
     let (second_tx, _second_rx) = mpsc::channel(64);
-    super::run_agent_loop_with_config(
-        &mut session,
-        "second request".to_string(),
-        second_tx,
-        provider,
-        tools,
-        CancellationToken::new(),
-        runner_metrics_config(&collector),
-    )
-    .await
-    .expect("second execution");
+    trace
+        .scope(super::run_agent_loop_with_config(
+            &mut session,
+            "second request".to_string(),
+            second_tx,
+            provider,
+            tools,
+            CancellationToken::new(),
+            runner_metrics_config(&collector),
+        ))
+        .await
+        .expect("second execution");
 
     let detail = wait_for_runner_metrics(
         storage.as_ref(),
@@ -1094,6 +1142,41 @@ async fn repeated_execution_of_one_session_keeps_both_metric_rounds() {
             .and_then(|state| state.round.last_round_id.as_deref()),
         Some(second.round_id.as_str())
     );
+    let spans = trace.spans();
+    let agents: Vec<_> = spans.iter().filter(|s| s.name == "invoke_agent").collect();
+    let calls: Vec<_> = spans
+        .iter()
+        .filter(|s| s.name == "chat test-model")
+        .collect();
+    assert_eq!(agents.len(), 2);
+    assert_eq!(calls.len(), 2);
+    assert_ne!(
+        agents[0].span_context.trace_id(),
+        agents[1].span_context.trace_id()
+    );
+    for ((agent, call), (input, output)) in agents.iter().zip(&calls).zip([(10, 2), (20, 3)]) {
+        assert_eq!(call.parent_span_id, agent.span_context.span_id());
+        assert!(call
+            .attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == "gen_ai.usage.input_tokens"
+                && kv.value.to_string() == input.to_string()));
+        assert!(call
+            .attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == "gen_ai.usage.output_tokens"
+                && kv.value.to_string() == output.to_string()));
+        assert!(agent
+            .attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == "bamboo.execution.id"));
+        assert!(agent
+            .attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == "bamboo.run.id"));
+    }
+    assert!(!format!("{spans:?}").contains("first request"));
+    assert!(!format!("{spans:?}").contains("first answer"));
 }
 
 #[tokio::test]

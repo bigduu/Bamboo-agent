@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Allow temporary workspace version stamping without unlocking tested dependencies."""
 from pathlib import Path
+import json
 import re
 import subprocess
 import sys
@@ -19,10 +20,14 @@ def assert_external_lock_unchanged(source, stamped):
         raise ValueError("External dependency lock changed while stamping the release; refusing to publish")
 
 
-def stamp_manifests(target_version):
+def managed_manifest_paths():
     root = Path(".")
     # Workspace members live two levels below crates/.
-    manifest_paths = [root / "Cargo.toml", *sorted((root / "crates").glob("*/*/Cargo.toml"))]
+    return [root / "Cargo.toml", *sorted((root / "crates").glob("*/*/Cargo.toml"))]
+
+
+def stamp_manifests(target_version):
+    manifest_paths = managed_manifest_paths()
 
     workspace_crates = set()
     for path in manifest_paths:
@@ -81,6 +86,12 @@ def stamp_manifests(target_version):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["manifests"]:
+        print(json.dumps([
+            path.as_posix() for path in managed_manifest_paths()
+            if tomllib.loads(path.read_text()).get("package", {}).get("name")
+        ]))
+        sys.exit(0)
     if len(sys.argv) > 1:
         assert len(sys.argv) == 3 and sys.argv[1] == "stamp"
         stamp_manifests(sys.argv[2])

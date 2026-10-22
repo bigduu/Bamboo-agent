@@ -110,6 +110,31 @@ fn vision_configuration_requires_an_explicit_exact_enabled_admitted_target() {
 }
 
 #[test]
+fn image_reference_preflight_validates_configuration_without_constructing_a_provider() {
+    // This provider type cannot be constructed by the provider factory. Pure
+    // metadata admission must still succeed and must not contact this endpoint.
+    let config = config_for("not-a-provider", "http://127.0.0.1:1");
+    let before = serde_json::to_vec(&config).unwrap();
+    validate_configured_vision_target(&config, "main-account").unwrap();
+    crate::model_config_helper::validate_image_reference_vision_config(&config, "main-account")
+        .unwrap();
+    assert_eq!(serde_json::to_vec(&config).unwrap(), before);
+
+    let mut missing = config;
+    missing.defaults.as_mut().unwrap().vision = None;
+    let error = crate::model_config_helper::validate_image_reference_vision_config(
+        &missing,
+        "main-account",
+    )
+    .unwrap_err();
+    assert!(error.contains("Original images"));
+    assert!(error.contains("preserved"));
+    assert!(error.contains("defaults.vision"));
+    assert!(error.contains("vision_model"));
+    assert!(error.contains("genuinely Vision-capable main"));
+}
+
+#[test]
 fn vision_configuration_preserves_default_on_null_and_legacy_selections() {
     for capability in [
         json!({}),

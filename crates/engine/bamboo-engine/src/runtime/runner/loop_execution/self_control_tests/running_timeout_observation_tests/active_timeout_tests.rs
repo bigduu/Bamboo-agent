@@ -81,12 +81,46 @@ async fn self_control_active_parallel_safe_running_timeout_is_terminal_before_si
     // The actual configured per-tool deadline is one second. Five seconds is
     // only the test's outer fail bound, not a substitute for that production
     // deadline. A forced-serial preview lacking timeout fails here finitely.
+    let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
     let (result, events) = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        run_timeout_observation_fixture(&mut fixture, provider.clone(), Arc::new(tools)),
+        trace.scope(run_timeout_observation_fixture(
+            &mut fixture,
+            provider.clone(),
+            Arc::new(tools),
+        )),
     )
     .await
     .expect("active serial dispatch must retain its former ParallelSafe one-second bound");
+    let spans = trace.spans();
+    let pending_spans = spans
+        .iter()
+        .filter(|span| {
+            span.attributes.iter().any(|kv| {
+                kv.key.as_str() == "gen_ai.tool.call.id" && kv.value.to_string() == PENDING_CALL
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(pending_spans.len(), 1);
+    for (key, value) in [("error.type", "timeout"), ("bamboo.outcome", "error")] {
+        assert!(pending_spans[0]
+            .attributes
+            .iter()
+            .any(|kv| kv.key.as_str() == key && kv.value.to_string() == value));
+    }
+    let control_spans = spans
+        .iter()
+        .filter(|span| {
+            span.attributes.iter().any(|kv| {
+                kv.key.as_str() == "gen_ai.tool.call.id" && kv.value.to_string() == CONTROL_CALL
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        control_spans.is_empty(),
+        "the denied sibling must not have a dispatch span"
+    );
+
     assert_eq!(probe.pending_invoked.load(Ordering::SeqCst), 1);
     // Reliable first RED on 8da: its real parallel timeout finishes the run,
     // but the old public collapse does not invoke the supplied kill callback.

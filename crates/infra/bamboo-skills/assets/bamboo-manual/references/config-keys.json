@@ -1,0 +1,659 @@
+{
+  "coverage": "bounded_typed_catalog_not_full_schema",
+  "default_scope": "typed input defaults, not effective instance values; required TLS children have no documented default",
+  "dynamic_maps": [
+    "server.<unknown>",
+    "tools.<unknown>",
+    "skills.<unknown>",
+    "worktrees.project_roots.<project>"
+  ],
+  "entries": [
+    {
+      "aliases": [],
+      "default": "summary",
+      "example": "retrieval_window",
+      "key": "context_management.strategy",
+      "meaning": "Context strategy; retrieval-window validation and history-tool requirements still apply.",
+      "section": "core",
+      "type": "enum",
+      "values": [
+        "summary",
+        "message_summary",
+        "retrieval_window"
+      ]
+    },
+    {
+      "aliases": [],
+      "default": false,
+      "example": true,
+      "key": "lifecycle_hooks.enabled",
+      "meaning": "Native lifecycle-hook switch; handler configuration and authorization remain separate.",
+      "section": "hooks",
+      "type": "bool"
+    },
+    {
+      "aliases": [],
+      "default": true,
+      "example": false,
+      "key": "memory.auto_dream_enabled",
+      "meaning": "Automatic Dream ticks; configured models, eligible work and runtime gates still matter.",
+      "section": "memory",
+      "type": "bool"
+    },
+    {
+      "aliases": [],
+      "default": 1800,
+      "example": 3600,
+      "key": "memory.auto_dream_interval_secs",
+      "meaning": "Seconds between automatic Dream ticks; does not force work or a model call.",
+      "section": "memory",
+      "type": "u64"
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "example": "example-background-model",
+      "key": "memory.background_model",
+      "meaning": "Optional background-model selector; null falls back to the provider fast model.",
+      "section": "memory",
+      "type": "option<string>"
+    },
+    {
+      "aliases": [],
+      "default": 50,
+      "example": 2,
+      "key": "memory.capacity_max_archivals_per_run",
+      "meaning": "Maximum reversible capacity archivals in one pass; not deletion.",
+      "section": "memory",
+      "type": "usize"
+    },
+    {
+      "aliases": [
+        "memory.memory_dedup_gardener_enabled"
+      ],
+      "default": true,
+      "example": false,
+      "key": "memory.dedup_gardener_enabled",
+      "meaning": "Allow bounded model-backed consolidation of near-duplicate memories.",
+      "section": "memory",
+      "type": "bool"
+    },
+    {
+      "aliases": [],
+      "default": 8,
+      "example": 2,
+      "key": "memory.dedup_gardener_max_merges_per_run",
+      "meaning": "Maximum model-backed consolidations in one dedup pass.",
+      "section": "memory",
+      "type": "usize"
+    },
+    {
+      "aliases": [],
+      "default": 0.6,
+      "example": 0.9,
+      "key": "memory.dedup_gardener_min_score",
+      "meaning": "Content-keyword Jaccard threshold for dedup candidates; not embedding similarity.",
+      "section": "memory",
+      "type": "f64"
+    },
+    {
+      "aliases": [
+        "memory.memory_dream_refine_mode"
+      ],
+      "default": false,
+      "example": true,
+      "key": "memory.dream_refine_mode",
+      "meaning": "Deprecated compatibility input, ignored: it does not enable a Dream rewrite mode.",
+      "section": "memory",
+      "status": "deprecated_ignored",
+      "type": "bool"
+    },
+    {
+      "aliases": [
+        "memory.memory_gardener_enabled"
+      ],
+      "default": true,
+      "example": false,
+      "key": "memory.gardener_enabled",
+      "meaning": "Allow model-backed splitting of candidate blob memories subject to runtime gates and caps.",
+      "section": "memory",
+      "type": "bool"
+    },
+    {
+      "aliases": [],
+      "default": 86400,
+      "example": 172800,
+      "key": "memory.gardener_interval_secs",
+      "meaning": "Seconds between time-triggered gardener passes.",
+      "section": "memory",
+      "type": "u64"
+    },
+    {
+      "aliases": [],
+      "default": 8,
+      "example": 2,
+      "key": "memory.gardener_max_splits_per_run",
+      "meaning": "Maximum model-backed splits in one gardener run.",
+      "section": "memory",
+      "type": "usize"
+    },
+    {
+      "aliases": [],
+      "default": 5,
+      "example": 8,
+      "key": "memory.gardener_min_sections",
+      "meaning": "Minimum separator-delimited sections for a split candidate.",
+      "section": "memory",
+      "type": "usize"
+    },
+    {
+      "aliases": [],
+      "default": 25,
+      "example": 0,
+      "key": "memory.gardener_volume_trigger",
+      "meaning": "New-memory threshold for early gardening; zero disables the volume trigger, not timed passes.",
+      "section": "memory",
+      "type": "usize"
+    },
+    {
+      "aliases": [],
+      "default": true,
+      "example": false,
+      "key": "memory.granularity_freshness_gardener_enabled",
+      "meaning": "Allow deterministic granularity freshness demotion from Active to Stale; no model call.",
+      "section": "memory",
+      "type": "bool"
+    },
+    {
+      "aliases": [
+        "memory.memory_ledger_agenda_injection"
+      ],
+      "default": true,
+      "example": false,
+      "key": "memory.ledger_agenda_injection",
+      "meaning": "Inject the applicable ledger agenda; an empty agenda adds no section.",
+      "section": "memory",
+      "type": "bool"
+    },
+    {
+      "aliases": [],
+      "default": true,
+      "example": false,
+      "key": "memory.ledger_distillation_enabled",
+      "meaning": "Allow model-backed distillation of completed ledger records when a model is available.",
+      "section": "memory",
+      "type": "bool"
+    },
+    {
+      "aliases": [],
+      "default": true,
+      "example": false,
+      "key": "memory.ledger_gardener_enabled",
+      "meaning": "Enable background ledger maintenance; expiry and reconciliation are deterministic.",
+      "section": "memory",
+      "type": "bool"
+    },
+    {
+      "aliases": [],
+      "default": 21600,
+      "example": 43200,
+      "key": "memory.ledger_gardener_interval_secs",
+      "meaning": "Seconds between ledger gardener runs.",
+      "section": "memory",
+      "type": "u64"
+    },
+    {
+      "aliases": [],
+      "default": 0,
+      "example": 1000,
+      "key": "memory.memory_active_capacity",
+      "meaning": "Recallable-memory capacity per scope; zero disables capacity archiving, exempt types remain protected.",
+      "section": "memory",
+      "type": "usize"
+    },
+    {
+      "aliases": [
+        "memory.memory_project_first_dream"
+      ],
+      "default": true,
+      "example": false,
+      "key": "memory.project_first_dream",
+      "meaning": "Prefer project Dream over the global fallback.",
+      "section": "memory",
+      "type": "bool"
+    },
+    {
+      "aliases": [
+        "memory.memory_project_prompt_injection"
+      ],
+      "default": true,
+      "example": false,
+      "key": "memory.project_prompt_injection",
+      "meaning": "Inject the project durable-memory index into the main prompt.",
+      "section": "memory",
+      "type": "bool"
+    },
+    {
+      "aliases": [
+        "memory.memory_relevant_recall"
+      ],
+      "default": true,
+      "example": false,
+      "key": "memory.relevant_recall",
+      "meaning": "Enable automatic relevant durable-memory recall.",
+      "section": "memory",
+      "type": "bool"
+    },
+    {
+      "aliases": [
+        "memory.memory_relevant_recall_rerank"
+      ],
+      "default": false,
+      "example": true,
+      "key": "memory.relevant_recall_rerank",
+      "meaning": "Optional model reranking of lexical candidates; fallback remains lexical.",
+      "section": "memory",
+      "type": "bool"
+    },
+    {
+      "aliases": [],
+      "default": 80,
+      "example": 60,
+      "key": "memory.summary_safe_window_percent",
+      "meaning": "Rendered summarization request safety budget as a percent of model context.",
+      "section": "memory",
+      "type": "u8"
+    },
+    {
+      "aliases": [],
+      "default": 0.2,
+      "example": 0.3,
+      "key": "memory.summary_target_ratio",
+      "meaning": "Desired summary size as a fraction of source tokens.",
+      "section": "memory",
+      "type": "f64"
+    },
+    {
+      "aliases": [],
+      "default": "127.0.0.1",
+      "example": "0.0.0.0",
+      "key": "server.bind",
+      "meaning": "Listener bind address; changing it can expose the service and needs separate authorization.",
+      "section": "core",
+      "type": "string"
+    },
+    {
+      "aliases": [],
+      "default": 9562,
+      "example": 9652,
+      "key": "server.port",
+      "meaning": "HTTP listener port; a serve CLI override can change runtime state.",
+      "section": "core",
+      "type": "u16"
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "example": "example-static",
+      "key": "server.static_dir",
+      "meaning": "Optional static-files directory, not an observed user path.",
+      "section": "core",
+      "type": "option<path>"
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "example": {
+        "cert_file": "example-cert.pem",
+        "key_file": "example-key.pem"
+      },
+      "key": "server.tls",
+      "meaning": "Optional TLS configuration. Paths identify files, never embedded private-key contents. Missing or invalid files fail startup.",
+      "section": "core",
+      "type": "option<object>"
+    },
+    {
+      "aliases": [],
+      "example": "example-cert.pem",
+      "key": "server.tls.cert_file",
+      "meaning": "PEM certificate-chain file path, applicable only when server.tls is present.",
+      "required_when": "server.tls is present",
+      "section": "core",
+      "type": "path"
+    },
+    {
+      "aliases": [],
+      "example": "example-key.pem",
+      "key": "server.tls.key_file",
+      "meaning": "PEM private-key file path, applicable only when server.tls is present; never include key contents.",
+      "required_when": "server.tls is present",
+      "section": "core",
+      "type": "path"
+    },
+    {
+      "aliases": [],
+      "default": 10,
+      "example": 2,
+      "key": "server.workers",
+      "meaning": "Actix HTTP worker count.",
+      "section": "core",
+      "type": "usize"
+    },
+    {
+      "aliases": [],
+      "default": [],
+      "example": [
+        "bamboo-manual"
+      ],
+      "key": "skills.disabled",
+      "meaning": "Globally unavailable skill IDs, including the manual if listed.",
+      "section": "tools-skills",
+      "type": "array<string>"
+    },
+    {
+      "aliases": [],
+      "default": 600,
+      "example": 900,
+      "key": "stream_timeout.first_semantic_timeout_secs",
+      "meaning": "Deadline to the first semantic chunk after request dispatch; accepted range 1..86400 seconds.",
+      "section": "core",
+      "type": "u64"
+    },
+    {
+      "aliases": [],
+      "default": 600,
+      "example": 900,
+      "key": "stream_timeout.semantic_idle_timeout_secs",
+      "meaning": "Maximum gap between semantic progress after the first chunk; accepted range 1..86400 seconds.",
+      "section": "core",
+      "type": "u64"
+    },
+    {
+      "aliases": [],
+      "default": 120,
+      "example": 300,
+      "key": "stream_timeout.transport_idle_timeout_secs",
+      "meaning": "Maximum gap between valid transport frames, including keepalives; accepted range 1..86400 seconds.",
+      "section": "core",
+      "type": "u64"
+    },
+    {
+      "aliases": [],
+      "default": [],
+      "example": [
+        "WebFetch"
+      ],
+      "key": "tools.disabled",
+      "meaning": "Globally omitted tool names; does not grant permissions.",
+      "section": "tools-skills",
+      "type": "array<string>"
+    },
+    {
+      "aliases": [],
+      "default": null,
+      "example": "example-worktrees",
+      "key": "worktrees.default_root",
+      "meaning": "Optional default root for user-created worktrees, not a runtime path observation.",
+      "section": "core",
+      "type": "option<string>"
+    },
+    {
+      "aliases": [],
+      "default": {},
+      "example": {
+        "example-project": "example-worktrees"
+      },
+      "key": "worktrees.project_roots",
+      "meaning": "Per-project worktree root overrides; dynamic map keys are project identifiers, not config-field names.",
+      "section": "core",
+      "type": "map<string,string>"
+    }
+  ],
+  "exhaustive_typed_groups": [
+    "memory",
+    "server",
+    "server.tls",
+    "stream_timeout",
+    "tools",
+    "skills",
+    "worktrees"
+  ],
+  "format_version": 2,
+  "generator": "manual/config_catalog.rs; cargo run -p bamboo-skills --example generate_manual_catalog -- --check",
+  "representation": "Config compatibility view; not section-file envelopes",
+  "root_coverage": [
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "access_control",
+      "section": "access-control"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "anthropic_model_mapping",
+      "section": "model-policy"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "cluster_fabric",
+      "section": "cluster-fabric"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "connect",
+      "section": "connect"
+    },
+    {
+      "coverage": "selected_fields",
+      "documented_entries": 1,
+      "kind": "compatibility_dto_field",
+      "root": "context_management",
+      "section": "core"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "default_provider_instance",
+      "section": "providers"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "default_work_area",
+      "section": "core"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "defaults",
+      "section": "providers"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "env_vars",
+      "section": "env"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "flattened_dynamic_map_not_literal_key",
+      "root": "extra",
+      "section": "core"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "features",
+      "section": "providers"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "gemini_model_mapping",
+      "section": "model-policy"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "headless_auth",
+      "section": "core"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "hooks",
+      "section": "hooks"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "http_proxy",
+      "section": "core"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "https_proxy",
+      "section": "core"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "keyword_masking",
+      "section": "model-policy"
+    },
+    {
+      "coverage": "selected_fields",
+      "documented_entries": 1,
+      "kind": "compatibility_dto_field",
+      "root": "lifecycle_hooks",
+      "section": "hooks"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "mcp",
+      "section": "mcp"
+    },
+    {
+      "coverage": "typed_fields",
+      "documented_entries": 25,
+      "root": "memory",
+      "section": "memory"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "notifications",
+      "section": "notifications"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "plugin_trust",
+      "section": "tools-skills"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "provider",
+      "section": "providers"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "provider_instances",
+      "section": "providers"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "proxy_auth",
+      "section": "core"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "proxy_auth_credential_ref",
+      "section": "core"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "proxy_auth_encrypted",
+      "section": "core"
+    },
+    {
+      "coverage": "not_documented",
+      "documented_entries": 0,
+      "kind": "compatibility_dto_field",
+      "root": "run_budget",
+      "section": "core"
+    },
+    {
+      "coverage": "selected_fields",
+      "documented_entries": 7,
+      "kind": "compatibility_dto_field",
+      "root": "server",
+      "section": "core"
+    },
+    {
+      "coverage": "selected_fields",
+      "documented_entries": 1,
+      "kind": "compatibility_dto_field",
+      "root": "skills",
+      "section": "tools-skills"
+    },
+    {
+      "coverage": "selected_fields",
+      "documented_entries": 3,
+      "kind": "compatibility_dto_field",
+      "root": "stream_timeout",
+      "section": "core"
+    },
+    {
+      "coverage": "selected_fields",
+      "documented_entries": 1,
+      "kind": "compatibility_dto_field",
+      "root": "tools",
+      "section": "tools-skills"
+    },
+    {
+      "coverage": "selected_fields",
+      "documented_entries": 2,
+      "kind": "compatibility_dto_field",
+      "root": "worktrees",
+      "section": "core"
+    }
+  ],
+  "root_coverage_scope": "ConfigValues ownership inventory plus memory; not an exhaustive list of sidecars, environment variables or sections",
+  "source": "crates/infra/bamboo-config/src/config.rs",
+  "unknown_key_meaning": "not covered here; absence does not mean unsupported"
+}

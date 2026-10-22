@@ -47,9 +47,11 @@ pub(super) fn build_base_tools(
     tool_event_publisher: Arc<dyn ToolEventPublisher>,
     memory_store: bamboo_memory::memory_store::MemoryStore,
     session_messenger: Arc<bamboo_engine::SessionMessenger>,
+    diagnostics: Arc<crate::tools::diagnostics::DiagnosticsSource>,
 ) -> (
     Arc<dyn ToolExecutor>,
     Arc<dyn bamboo_engine::external_agents::runtime::NativeToolCeilingSource>,
+    Arc<bamboo_tools::BuiltinToolExecutor>,
 ) {
     let ceiling_config = config.clone();
     let ceiling_projects = project_store.clone();
@@ -204,13 +206,19 @@ pub(super) fn build_base_tools(
         with_legacy_history,
         current_history_tool,
     ));
+    let base: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
+        base,
+        Arc::new(crate::tools::diagnostics::BambooDiagnosticsTool::new(
+            diagnostics,
+        )),
+    ));
     let ceiling = Arc::new(HostNativeToolCeiling {
-        builtin: builtin_executor,
+        builtin: builtin_executor.clone(),
         base: base.clone(),
         config: ceiling_config,
         projects: ceiling_projects,
     });
-    (base, ceiling)
+    (base, ceiling, builtin_executor)
 }
 
 /// Keep the actual instances and complete resolver assembled above. No Root
@@ -348,12 +356,16 @@ impl bamboo_engine::external_agents::runtime::NativeToolCeilingSource for HostNa
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_root_tools(
     base_tools: Arc<dyn ToolExecutor>,
+    permission_executor: Arc<bamboo_tools::BuiltinToolExecutor>,
     schedule_store: Arc<ScheduleStore>,
     schedule_manager: Arc<ScheduleManager>,
     session_store: Arc<SessionStoreV2>,
     storage: Arc<dyn Storage>,
     persistence: Arc<LockedSessionStore>,
     session_messenger: Arc<bamboo_engine::SessionMessenger>,
+    root_creator: Arc<
+        dyn bamboo_server_tools::session_control::root_creation::SupervisedRootCreatePort,
+    >,
     spawn_scheduler: Arc<SpawnScheduler>,
     sessions: bamboo_engine::SessionCache,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
@@ -435,6 +447,9 @@ pub(super) fn build_root_tools(
 
     // Intentional same-name overlay replacement: Root keeps every privileged
     // cross-session action while Base/Child expose only current-Session reads.
+    let spawn_creator = root_creator.clone();
+    let spawn_storage = storage.clone();
+    let spawn_config = config.clone();
     let session_inspector_tool = Arc::new(crate::tools::SessionInspectorTool::new(
         session_store.clone(),
         storage,
@@ -445,9 +460,10 @@ pub(super) fn build_root_tools(
     let tools_with_control: Arc<dyn ToolExecutor> =
         Arc::new(crate::tools::OverlayToolExecutor::new(
             tools_with_inspector,
-            Arc::new(bamboo_server_tools::SessionControlTool::new(
-                session_messenger.clone(),
-            )),
+            Arc::new(
+                bamboo_server_tools::SessionControlTool::new(session_messenger.clone())
+                    .with_root_creator(root_creator),
+            ),
         ));
 
     // Keep these exact-name compatibility calls registered. The per-session
@@ -490,6 +506,22 @@ pub(super) fn build_root_tools(
         }
         _ => tools_with_control,
     };
+    let spawn_session = Arc::new(
+        bamboo_server_tools::session_control::versioned::SpawnSessionTool::new(
+            spawn_creator,
+            spawn_storage.clone(),
+            spawn_config,
+            tools.clone(),
+        ),
+    );
+    let tools = Arc::new(
+        bamboo_server_tools::session_control::versioned::VersionedRootTools::new(
+            tools,
+            spawn_session,
+            spawn_storage,
+            permission_executor,
+        ),
+    );
     (tools, sub_agent_tool)
 }
 

@@ -45,6 +45,18 @@ use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::ReasoningEffort;
 
+fn anthropic_auth_error(status: reqwest::StatusCode, body: String) -> LLMError {
+    let guidance = if status == reqwest::StatusCode::FORBIDDEN {
+        "Access denied. Check the account/model access permissions or gateway policy."
+    } else {
+        "Authentication was rejected. Check the configured credentials or gateway authentication service."
+    };
+    LLMError::Auth(format!(
+        "Anthropic HTTP {}: {guidance} {body}",
+        status.as_u16()
+    ))
+}
+
 static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
     LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
 
@@ -594,16 +606,19 @@ impl AnthropicProvider {
         // (429/5xx, connect/timeout). The closure rebuilds a fresh request each
         // attempt; the returned response body is unread, so streaming below is
         // unaffected (issue #18).
+        let request_budget = crate::retry::InitialRequestBudget::new(crate::retry::global());
         let messages_url = format!("{}/messages", self.base_url);
-        let mut response =
-            crate::retry::send_with_retry(crate::retry::global(), "Anthropic", || {
+        let mut response = crate::retry::send_anthropic_with_retry(
+            crate::retry::global(),
+            &request_budget,
+            || {
                 self.client
                     .post(&messages_url)
                     .headers(headers.clone())
                     .json(&body)
-            })
-            .await
-            .map_err(LLMError::Http)?;
+            },
+        )
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -639,24 +654,23 @@ impl AnthropicProvider {
                 );
                 apply_required_tool_auto_fallback(&mut fallback_body, required_tool);
                 crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
-                response =
-                    crate::retry::send_with_retry(crate::retry::global(), "Anthropic", || {
+                response = crate::retry::send_anthropic_with_retry(
+                    crate::retry::global(),
+                    &request_budget,
+                    || {
                         self.client
                             .post(&messages_url)
                             .headers(headers.clone())
                             .json(&fallback_body)
-                    })
-                    .await
-                    .map_err(LLMError::Http)?;
+                    },
+                )
+                .await?;
 
                 if !response.status().is_success() {
                     let fallback_status = response.status();
                     let fallback_text = response.text().await.map_err(LLMError::Http)?;
                     if fallback_status == 401 || fallback_status == 403 {
-                        return Err(LLMError::Auth(format!(
-                            "Anthropic authentication failed: {}. Please check your API key.",
-                            fallback_text
-                        )));
+                        return Err(anthropic_auth_error(fallback_status, fallback_text));
                     }
                     return Err(LLMError::Api(format!(
                         "Anthropic API error after tool_choice=auto activation fallback: HTTP {}: {}",
@@ -704,25 +718,24 @@ impl AnthropicProvider {
                     max_tokens,
                     log_identity(request_purpose)
                 );
-                response =
-                    crate::retry::send_with_retry(crate::retry::global(), "Anthropic", || {
+                response = crate::retry::send_anthropic_with_retry(
+                    crate::retry::global(),
+                    &request_budget,
+                    || {
                         self.client
                             .post(&messages_url)
                             .headers(headers.clone())
                             .json(&fallback_body)
-                    })
-                    .await
-                    .map_err(LLMError::Http)?;
+                    },
+                )
+                .await?;
 
                 if !response.status().is_success() {
                     let status = response.status();
                     let text = response.text().await.map_err(LLMError::Http)?;
 
                     if status == 401 || status == 403 {
-                        return Err(LLMError::Auth(format!(
-                            "Anthropic authentication failed: {}. Please check your API key.",
-                            text
-                        )));
+                        return Err(anthropic_auth_error(status, text));
                     }
 
                     return Err(LLMError::Api(format!(
@@ -732,10 +745,7 @@ impl AnthropicProvider {
                 }
             } else {
                 if status == 401 || status == 403 {
-                    return Err(LLMError::Auth(format!(
-                        "Anthropic authentication failed: {}. Please check your API key.",
-                        text
-                    )));
+                    return Err(anthropic_auth_error(status, text));
                 }
 
                 return Err(LLMError::Api(format!(
@@ -754,7 +764,7 @@ impl AnthropicProvider {
         };
 
         let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
-            response,
+            response.into_response(),
             move |event, data| parse_anthropic_sse_event_multi(&mut state, event, data),
         );
 
@@ -7572,3 +7582,6 @@ mod anthropic_provider_tests {
         assert_eq!(provider.max_tokens, 2048);
     }
 }
+
+#[cfg(test)]
+mod retry_tests;

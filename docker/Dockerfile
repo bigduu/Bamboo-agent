@@ -18,8 +18,8 @@ FROM rust:1-bookworm AS chef
 # source-only changes) and a workspace layer. Without it, `COPY . .`
 # immediately before `cargo build` invalidates the single build layer on ANY
 # source change, forcing a full recompile of ~25 workspace crates' worth of
-# dependencies every time (worsened by `lto = true` + `opt-level = 3`). Pinned
-# version, `--locked`, matches the repo's build reproducibility conventions.
+# dependencies every time. Release builds retain `opt-level = 3` with LTO off.
+# The pinned version and `--locked` preserve build reproducibility.
 RUN cargo install cargo-chef --version 0.1.77 --locked
 
 WORKDIR /app

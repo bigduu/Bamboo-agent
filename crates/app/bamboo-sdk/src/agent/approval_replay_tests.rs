@@ -28,6 +28,9 @@ const SECOND: &str = "generation-b";
 #[path = "approval_supervisor_tests.rs"]
 mod supervisor;
 
+#[path = "session_compatibility_tests.rs"]
+mod session_compatibility;
+
 #[derive(Debug)]
 struct Invocation {
     name: String,
@@ -1501,3 +1504,6 @@ async fn output_repark_and_plan_save_failures_stop_provider_and_success_events()
         );
     }
 }
+
+#[path = "versioned_spawn_replay_tests.rs"]
+mod versioned_spawn;

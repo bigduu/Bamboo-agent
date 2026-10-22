@@ -138,3 +138,6 @@ fn reasoning_effort_from_request_falls_back_to_provider_default() {
         None
     );
 }
+
+#[path = "compatibility_tests.rs"]
+mod compatibility;

@@ -298,12 +298,19 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../builtin_skills");
         for (relative, _) in super::BUILTIN_SKILL_FILES {
-            let source_executable = std::fs::metadata(root.join(relative))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o111
-                != 0;
+            if *relative == "bamboo-manual/manifest.json" {
+                assert!(!super::BUILTIN_SKILL_EXECUTABLE_FILES.contains(relative));
+                continue; // Generated metadata is never executable.
+            }
+            let source = if relative.starts_with("bamboo-manual/") {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("assets")
+                    .join(relative)
+            } else {
+                root.join(relative)
+            };
+            let source_executable =
+                std::fs::metadata(source).unwrap().permissions().mode() & 0o111 != 0;
             assert_eq!(
                 super::BUILTIN_SKILL_EXECUTABLE_FILES.contains(relative),
                 source_executable,

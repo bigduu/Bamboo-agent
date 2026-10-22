@@ -36,10 +36,14 @@ fn provider_hint_count(messages: &[Message]) -> usize {
     messages
         .iter()
         .filter(|message| message.role == Role::User)
-        .map(|message| message.content.matches(HINT_TEXT).count())
+        .map(|message| {
+            message.content.matches(HINT_TEXT).count()
+                + message.content.matches(FEEDBACK_PREFIX).count()
+        })
         .sum()
 }
 
+const FEEDBACK_PREFIX: &str = "[runtime_progress_feedback_v1]\n";
 const HINT_TEXT: &str = "The same successful file observations returned unchanged information for three consecutive rounds.";
 
 struct ObservationProvider {
@@ -87,12 +91,12 @@ impl LLMProvider for ObservationProvider {
         let wire_count = wire_blocks
             .iter()
             .filter_map(|block| block["text"].as_str())
-            .map(|text| text.matches(HINT_TEXT).count())
+            .map(|text| text.matches(HINT_TEXT).count() + text.matches(FEEDBACK_PREFIX).count())
             .sum::<usize>();
         for (index, block) in wire_blocks.iter().enumerate() {
             if block["text"]
                 .as_str()
-                .is_some_and(|text| text.contains(HINT_TEXT))
+                .is_some_and(|text| text.contains(HINT_TEXT) || text.contains(FEEDBACK_PREFIX))
             {
                 assert!(index >= 2);
                 for offset in [2, 1] {
@@ -305,46 +309,26 @@ async fn run_observation_loop_with_retry(
         completes, 1,
         "the existing terminal event is sent for completed and suspended runs"
     );
-    let should_pause = session.kind == bamboo_domain::SessionKind::Root
-        && tool_name == "Read"
-        && changed_round.is_none();
-    assert_eq!(questions, usize::from(should_pause));
-    if should_pause {
-        assert_eq!(
-            provider.calls.load(Ordering::SeqCst),
-            6,
-            "no seventh provider request after pause"
-        );
-        assert_eq!(
-            session.agent_runtime_state.as_ref().unwrap().status,
-            bamboo_domain::AgentStatusState::Suspended
-        );
-        let pending = session
-            .pending_question
-            .as_ref()
-            .expect("runtime progress question");
-        assert!(crate::session_app::no_progress::is_no_progress_question(
-            session, pending
-        ));
-        assert!(pending.allow_custom);
-        assert_eq!(pending.options, ["Continue", "Stop"]);
-        // A pause must neither replace real observations nor manufacture tool
-        // execution. Every original call keeps its own successful result.
-        for call in session
+    assert_eq!(
+        questions, 0,
+        "new repeat feedback never asks Human to Continue"
+    );
+    assert!(session.pending_question.is_none());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 7);
+    // Model feedback must neither replace a real observation nor manufacture
+    // execution. Every original call still keeps its successful paired result.
+    for call in session
+        .messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+    {
+        let result = session
             .messages
             .iter()
-            .filter_map(|message| message.tool_calls.as_ref())
-            .flatten()
-        {
-            assert_eq!(call.function.name, "Read");
-            let result = session
-                .messages
-                .iter()
-                .find(|message| message.tool_call_id.as_deref() == Some(call.id.as_str()))
-                .unwrap();
-            assert_eq!(result.content, "same evidence");
-            assert_eq!(result.tool_success, Some(true));
-        }
+            .find(|message| message.tool_call_id.as_deref() == Some(call.id.as_str()))
+            .expect("every real call remains paired");
+        assert_eq!(result.tool_success, Some(true));
     }
     let hints = provider.hint_counts.lock().unwrap().clone();
     hints
@@ -355,7 +339,7 @@ async fn observation_progress_request_retry_keeps_the_same_one_shot_hint() {
     let mut session = Session::new("observation-progress-retry", "model");
     assert_eq!(
         run_observation_loop_with_retry(&mut session, "Read", None, true).await,
-        [0, 0, 0, 1, 1, 0, 0]
+        [0, 0, 0, 1, 1, 1, 1, 1]
     );
     assert!(session
         .messages
@@ -365,12 +349,11 @@ async fn observation_progress_request_retry_keeps_the_same_one_shot_hint() {
 }
 
 #[tokio::test]
-async fn observation_progress_real_loop_hints_then_pauses_after_paired_results_and_resets_on_user_message(
-) {
+async fn observation_progress_real_loop_feedback_keeps_pairs_and_resets_on_user_message() {
     let mut session = Session::new("observation-progress", "model");
     assert_eq!(
         run_observation_loop(&mut session, "Read", None).await,
-        [0, 0, 0, 1, 0, 0]
+        [0, 0, 0, 1, 1, 1, 1]
     );
     assert_eq!(hint_count(&session.messages), 0);
     assert!(session
@@ -379,7 +362,7 @@ async fn observation_progress_real_loop_hints_then_pauses_after_paired_results_a
         .all(|message| !message.content.contains(HINT_TEXT)));
     assert_eq!(
         run_observation_loop(&mut session, "Read", None).await,
-        [0, 0, 0, 1, 0, 0]
+        [0, 0, 0, 1, 1, 1, 1]
     );
     assert_eq!(hint_count(&session.messages), 0);
     assert!(session
@@ -591,7 +574,7 @@ async fn observation_progress_real_loop_resets_when_output_changes_and_leaves_po
 }
 
 #[tokio::test]
-async fn observation_progress_new_human_input_resets_streak_before_pause() {
+async fn observation_progress_new_human_input_resets_streak_before_exhaustion() {
     for wrapped in [false, true] {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(
@@ -677,7 +660,28 @@ async fn observation_progress_new_human_input_resets_streak_before_pause() {
 #[tokio::test]
 async fn observation_progress_hidden_resume_keeps_question_with_zero_model_dispatch() {
     let mut session = Session::new("progress-hidden-resume", "model");
-    run_observation_loop(&mut session, "Read", None).await;
+    // A legacy pause snapshot remains valid history. The new detector must
+    // not be run to manufacture it or leave new exhaustion metadata behind.
+    session.add_message(Message::system(
+        "Complete the bounded task using collected evidence.",
+    ));
+    session.add_message(Message::user("Inspect the file and finish the task."));
+    session.add_message(Message::assistant(
+        "",
+        Some(vec![ToolCall {
+            id: "legacy-progress-read".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "Read".into(),
+                arguments: serde_json::json!({"path":"file","offset":1}).to_string(),
+            },
+        }]),
+    ));
+    let mut result = Message::tool_result("legacy-progress-read", "same evidence");
+    result.tool_success = Some(true);
+    session.add_message(result);
+    let mut runtime = bamboo_domain::AgentRuntimeState::new(&session.id);
+    crate::session_app::no_progress::create_question(&mut session, &mut runtime);
     let question_id = session
         .pending_question
         .as_ref()
@@ -733,8 +737,8 @@ async fn observation_progress_hidden_resume_keeps_question_with_zero_model_dispa
         bamboo_domain::AgentStatusState::Suspended
     );
     let original_count = evidence.as_array().unwrap().len();
-    // System prompt setup may refresh its own body; the original real tool
-    // pairs and runtime question remain byte-for-byte identical.
+    // System prompt setup may refresh its own body; the retained historical
+    // tool pair and runtime question remain byte-for-byte identical.
     for original in evidence
         .as_array()
         .unwrap()

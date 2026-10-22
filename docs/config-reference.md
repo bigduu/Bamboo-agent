@@ -258,6 +258,20 @@ on the primary response stream is marked retry-safe and may use the agent
 loop's existing bounded turn retry policy. Auxiliary model calls are bounded by
 the same watchdogs but never replay the containing agent turn.
 
+Anthropic request establishment shares the HTTP retry schedule, with at most
+four requests and 60 seconds across a call and its compatibility fallbacks.
+`BAMBOO_LLM_MAX_RETRIES=0` permits only the initial request. Numeric and HTTP-date
+`Retry-After` hints are respected; a hint beyond the remaining budget stops
+automatic retry instead of sending early. The 60-second limit ends when a
+successful stream is established; stream consumption uses the watchdogs above.
+An Anthropic stream error or timeout cannot restart this bounded request policy.
+Only the specifically recognized structured 401 connector database recovery
+diagnostic is transient. Other 401s and every 403 remain terminal and report
+credentials, permissions or gateway configuration as possible causes. Bamboo
+never rotates identities to work around authentication. Any provider stream
+failure after text, reasoning or tool-call output preserves the interrupted
+output and stops rather than replaying the turn.
+
 ### OpenAI-compatible proxy heartbeats
 
 An OpenAI-compatible proxy should establish the response stream within

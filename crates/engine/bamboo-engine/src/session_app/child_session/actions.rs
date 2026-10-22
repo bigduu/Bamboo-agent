@@ -19,6 +19,23 @@ pub async fn create_child_action(
     port: &dyn ChildSessionPort,
     input: CreateChildInput,
 ) -> Result<CreateChildResult, ChildSessionError> {
+    create_unbound_child(port, input, false).await
+}
+
+/// Compact delegation: reuse the canonical creator with a shared-directory
+/// constraint. No new persistence, placement or lifecycle protocol is added.
+pub async fn create_shared_child_action(
+    port: &dyn ChildSessionPort,
+    input: CreateChildInput,
+) -> Result<CreateChildResult, ChildSessionError> {
+    create_unbound_child(port, input, true).await
+}
+
+async fn create_unbound_child(
+    port: &dyn ChildSessionPort,
+    input: CreateChildInput,
+    shared_workspace: bool,
+) -> Result<CreateChildResult, ChildSessionError> {
     if input
         .runtime_metadata
         .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
@@ -27,7 +44,7 @@ pub async fn create_child_action(
             "Ticket LocalPlan binding requires the trusted work-child entry point".into(),
         ));
     }
-    create_child_action_inner(port, input, None, None).await
+    create_child_action_inner(port, input, None, None, shared_workspace).await
 }
 
 /// Host-only fresh work assignment creation; no model tool deserializes this port.
@@ -86,7 +103,7 @@ pub async fn create_ticket_child_action(
         serde_json::to_string(&required_packet)
             .map_err(|e| ChildSessionError::Execution(e.to_string()))?,
     );
-    create_child_action_inner(port, input, Some(packet), None).await
+    create_child_action_inner(port, input, Some(packet), None, false).await
 }
 
 pub(super) async fn create_profile_child_action(
@@ -102,7 +119,7 @@ pub(super) async fn create_profile_child_action(
             "invalid Workflow child input".into(),
         ));
     }
-    create_child_action_inner(port, input, None, Some(profile)).await
+    create_child_action_inner(port, input, None, Some(profile), false).await
 }
 
 async fn create_child_action_inner(
@@ -110,11 +127,18 @@ async fn create_child_action_inner(
     mut input: CreateChildInput,
     ticket_context: Option<bamboo_tickets::WorkContextPacket>,
     pinned_profile: Option<super::named_profile::ResolvedChildProfile>,
+    shared_workspace: bool,
 ) -> Result<CreateChildResult, ChildSessionError> {
     use crate::runner::refresh_prompt_snapshot;
     use bamboo_agent_core::Message;
 
     input.parent_session = super::validate_spawn_parent(port, &input.parent_session).await?;
+    if shared_workspace {
+        // Recompute from this creator's own durable reload, not the tool's
+        // earlier observation. A parent change must not leave a stale pin.
+        (input.workspace, input.workspace_source) =
+            super::resolve_shared_child_workspace(port, &input.parent_session).await?;
+    }
 
     let workflow_usage_requested = pinned_profile.is_some()
         && input
@@ -276,6 +300,11 @@ async fn create_child_action_inner(
     let final_workspace = port
         .validate_child_workspace(inherited_project_id.as_ref(), &input.workspace)
         .await?;
+    if shared_workspace {
+        // Host policy can change across the async preparation above. Retain
+        // the second validation, but never accept its relocation as sharing.
+        super::shared_workspace::require_same_workspace(&input.workspace, &final_workspace)?;
+    }
 
     // Use `new_child_of` so the child inherits the parent's tree root and a
     // depth of parent+1. For a root parent this is identical to the old

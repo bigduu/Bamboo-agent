@@ -749,6 +749,14 @@ pub struct PromptSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
+    /// Behavior contract selected at creation. Missing is supported legacy data,
+    /// never an automatic upgrade or a permission grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_version: Option<u32>,
+    /// Storage-only observation; Main remains the canonical behavior stamp.
+    /// Retaining a conflicting sidecar version prevents a silent downgrade.
+    #[serde(skip)]
+    pub observed_runtime_session_version: Option<Option<u32>>,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
@@ -920,6 +928,8 @@ impl Session {
         let id = id.into();
         Self {
             id: id.clone(),
+            session_version: Some(super::compatibility::CURRENT_SESSION_VERSION),
+            observed_runtime_session_version: None,
             title: "New Session".to_string(),
             pinned: false,
             title_version: 0,
@@ -1015,6 +1025,8 @@ impl Session {
         let id = id.into();
         Self {
             id: id.clone(),
+            session_version: Some(super::compatibility::CURRENT_SESSION_VERSION),
+            observed_runtime_session_version: None,
             title: title.into(),
             pinned: false,
             title_version: 0,

@@ -120,7 +120,7 @@ fn interruption_kind(error: &AgentError) -> &'static str {
         AgentError::StreamTimeout(_) => "stream_timeout",
         AgentError::LLMOverflow(_) => "llm_overflow",
         AgentError::EmptyAssistantResponse { .. } => "empty_assistant_response",
-        AgentError::LLM(_) => "llm_error",
+        AgentError::LLM(_) | AgentError::LLMNonRetryable(_) => "llm_error",
         _ => "execution_error",
     }
 }
@@ -858,7 +858,13 @@ fn build_request_envelope_reconciled_for_loading_mode(
     // Advisory context belongs only to this request, after the complete tool
     // result batch. Reconcile it before ledger/native transcript anchoring.
     if let Some(hint) = observation_progress_hint {
-        conversation_messages.push(Message::user(hint));
+        let mut message = Message::user(hint);
+        if crate::runtime::runner::tool_execution::is_required_progress_feedback(hint) {
+            message.metadata = Some(
+                serde_json::json!({"runtime_kind":"observation_progress_feedback", "source":"runtime"}),
+            );
+        }
+        conversation_messages.push(message);
     }
 
     // Canonical prompt structure — where Bamboo OWNS assembly and providers are
@@ -1389,9 +1395,12 @@ pub(super) async fn execute_llm_stream(
         {
             session.model_context_state = previous_model_context_state;
             session.provider_transcript = previous_provider_transcript;
-            // Advice is optional. Reuse the existing candidate snapshots and
-            // rebuild without it before rejecting an otherwise sendable request.
-            if observation_progress_hint.take().is_some() {
+            // Legacy optional advice can be omitted, but the exact recovery
+            // control facts must reach the model or fail before dispatch. A
+            // budget retry must never silently claim that feedback was sent.
+            let required_progress_feedback = observation_progress_hint
+                .is_some_and(crate::runtime::runner::tool_execution::is_required_progress_feedback);
+            if !required_progress_feedback && observation_progress_hint.take().is_some() {
                 continue;
             }
             return Err(AgentError::Budget(format!(
@@ -1514,7 +1523,7 @@ pub(super) async fn execute_llm_stream(
     planned.render.log(session_id);
     persist_request_render_metadata(session, &planned.render);
 
-    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
+    let mut timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
         config.stream_timeout,
         provider_name,
         Some(model),
@@ -1542,27 +1551,65 @@ pub(super) async fn execute_llm_stream(
             ));
         }
     }
-    let stream = crate::runtime::stream::handler::await_stream_bootstrap(
-        llm.chat_stream_ir(
-            &prepared_envelope.ir,
-            tool_schemas,
-            Some(max_output_tokens),
-            model,
-            Some(&planned.request_options),
-        ),
-        cancel_token,
-        session_id,
-        &timeout_context,
-    )
-    .await?
-    .map_err(|error| {
-        let message = format_provider_error(error);
-        if is_llm_overflow_error(&message) {
-            AgentError::LLMOverflow(message)
-        } else {
-            AgentError::LLM(message)
+    if cancel_token.is_cancelled() {
+        return Err(AgentError::Cancelled);
+    }
+    // Start only at the actual dispatch boundary: failed prompt preflight is
+    // not an LLM request. The same span remains alive through stream consumption.
+    let observation =
+        bamboo_infrastructure::telemetry::Observation::llm(provider_type, model, session_id);
+    let http_retry_observer = Arc::new(bamboo_llm::retry::InitialHttpRetryObserver::default());
+    let stream = observation
+        .scope(
+            crate::runtime::stream::handler::await_stream_bootstrap_observed(
+                llm.chat_stream_ir(
+                    &prepared_envelope.ir,
+                    tool_schemas,
+                    Some(max_output_tokens),
+                    model,
+                    Some(&planned.request_options),
+                ),
+                cancel_token,
+                session_id,
+                &timeout_context,
+                http_retry_observer.clone(),
+            ),
+        )
+        .await
+        .and_then(|result| {
+            result.map_err(|error| {
+                if matches!(
+                    error,
+                    bamboo_llm::provider::LLMError::RequestFailed(_)
+                        | bamboo_llm::provider::LLMError::Auth(_)
+                ) {
+                    // Authentication types outrank text in an upstream body:
+                    // even overflow-looking text cannot authorize another call.
+                    return AgentError::LLMNonRetryable(error.to_string());
+                }
+                let message = format_provider_error(error);
+                if is_llm_overflow_error(&message) {
+                    AgentError::LLMOverflow(message)
+                } else if http_retry_observer.request_budget_managed() {
+                    // Terminal auth, request-validation and transport failures
+                    // must not reset the same provider-owned request budget.
+                    AgentError::LLMNonRetryable(message)
+                } else {
+                    AgentError::LLM(message)
+                }
+            })
+        });
+    let stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            observation.finish(crate::runtime::runner::telemetry_error_outcome(&error));
+            return Err(error);
         }
-    })?;
+    };
+    let provider_manages_retry_budget = http_retry_observer.request_budget_managed();
+    if provider_manages_retry_budget {
+        timeout_context.disable_turn_retry();
+    }
 
     // A successful stream bootstrap is the first point at which the final
     // provider-visible PromptIR is known to have been accepted. Capture the
@@ -1638,27 +1685,47 @@ pub(super) async fn execute_llm_stream(
         );
     // The opt-in evidence check must publish only the final, checked answer.
     // Buffer this response until tool calls tell us whether it is a candidate.
-    let stream_output_result = if activation_pending || config.features_final_evidence_check {
-        crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
-            stream,
-            cancel_token,
-            session_id,
-            &timeout_context,
-        )
-        .await
-    } else {
-        crate::runtime::stream::handler::consume_llm_stream_with_context_and_partial(
-            stream,
-            event_tx,
-            cancel_token,
-            session_id,
-            &timeout_context,
-        )
-        .await
-    };
+    let stream_output_result = observation
+        .scope(async {
+            if activation_pending || config.features_final_evidence_check {
+                crate::runtime::stream::handler::consume_llm_stream_silent_with_context_and_partial(
+                    stream,
+                    cancel_token,
+                    session_id,
+                    &timeout_context,
+                )
+                .await
+            } else {
+                crate::runtime::stream::handler::consume_llm_stream_with_context_and_partial(
+                    stream,
+                    event_tx,
+                    cancel_token,
+                    session_id,
+                    &timeout_context,
+                )
+                .await
+            }
+        })
+        .await;
     let mut stream_output = match stream_output_result {
         Ok(output) => output,
-        Err(failure) => {
+        Err(mut failure) => {
+            // A generic SSE/body error is no safer to replay than a watchdog
+            // expiry once text, reasoning or a tool-call delta was observed.
+            let replay_unsafe = provider_manages_retry_budget
+                || !failure.partial_output.content.is_empty()
+                || !failure.partial_output.reasoning_content.is_empty()
+                || !failure.partial_output.partial_tool_calls.is_empty();
+            failure.error = match failure.error {
+                AgentError::LLM(message) if replay_unsafe => AgentError::LLMNonRetryable(message),
+                other => other,
+            };
+            if let Some(usage) = failure.partial_output.provider_usage {
+                observation.usage(usage.input_tokens, usage.output_tokens);
+            }
+            observation.finish(crate::runtime::runner::telemetry_error_outcome(
+                &failure.error,
+            ));
             let appended = append_interrupted_assistant_output(
                 session,
                 *failure.partial_output,
@@ -1673,6 +1740,11 @@ pub(super) async fn execute_llm_stream(
             return Err(failure.error);
         }
     };
+
+    if let Some(usage) = stream_output.provider_usage {
+        observation.usage(usage.input_tokens, usage.output_tokens);
+    }
+    observation.finish(bamboo_infrastructure::telemetry::Outcome::Success);
 
     if config.features_final_evidence_check
         && !activation_pending

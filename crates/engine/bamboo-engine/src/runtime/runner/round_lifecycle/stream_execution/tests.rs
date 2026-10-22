@@ -626,30 +626,51 @@ async fn prompt_exposure_starts_only_after_successful_provider_bootstrap() {
         let provider: Arc<dyn LLMProvider> = Arc::new(BoundaryProvider(case));
         let mut session = Session::new(&session_id, "test-model");
 
-        let result = execute_llm_stream(
-            &mut session,
-            &config,
-            &provider,
-            &prepared_context,
-            &[],
-            &LlmStreamFrame {
-                event_tx: &event_tx,
-                cancel_token: &cancel,
-                session_id: &session_id,
-                model: "test-model",
-                provider_name: None,
-                provider_type: None,
-                reasoning_effort: None,
-                max_context_tokens: 400_000,
-                max_output_tokens: 128,
-                observation_progress_hint: None,
-                prompt_memory_exposure: Some(PromptMemoryExposureFrame {
-                    round_id: &round_id,
-                    provenance: &provenance,
-                }),
-            },
-        )
-        .await;
+        let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+        let result = trace
+            .scope(execute_llm_stream(
+                &mut session,
+                &config,
+                &provider,
+                &prepared_context,
+                &[],
+                &LlmStreamFrame {
+                    event_tx: &event_tx,
+                    cancel_token: &cancel,
+                    session_id: &session_id,
+                    model: "test-model",
+                    provider_name: None,
+                    provider_type: None,
+                    reasoning_effort: None,
+                    max_context_tokens: 400_000,
+                    max_output_tokens: 128,
+                    observation_progress_hint: None,
+                    prompt_memory_exposure: Some(PromptMemoryExposureFrame {
+                        round_id: &round_id,
+                        provenance: &provenance,
+                    }),
+                },
+            ))
+            .await;
+        let spans = trace.spans();
+        if case == BoundaryCase::PreCancelled {
+            assert!(
+                spans.is_empty(),
+                "cancelled before dispatch must not fabricate an LLM request"
+            );
+        } else {
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].name, "chat test-model");
+            assert!(spans[0]
+                .attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == "error.type"
+                    && kv.value.to_string() == "provider_error"));
+            assert!(
+                !format!("{spans:?}").contains("injected"),
+                "raw provider errors must not be exported"
+            );
+        }
         assert!(result.is_err(), "{case:?} must fail the stream execution");
 
         if case == BoundaryCase::StreamError {
@@ -995,6 +1016,90 @@ async fn observation_progress_over_budget_advice_is_dropped_before_dispatch() {
     assert_eq!(
         serde_json::to_value(&session.messages).unwrap(),
         serde_json::to_value(&original_messages).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn required_progress_feedback_over_budget_rejects_before_any_provider_dispatch() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("required-progress-budget", "test-model");
+    session.add_message(Message::user("original request"));
+    let original_messages = serde_json::to_value(&session.messages).unwrap();
+    let original_context = session.model_context_state.clone();
+    let original_transcript = serde_json::to_value(&session.provider_transcript).unwrap();
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), session.messages[0].clone()],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let mut expected = session.clone();
+    let baseline = super::build_request_envelope_reconciled(
+        &mut expected,
+        &prepared_context,
+        &config,
+        &[],
+        "test-model",
+    );
+    let baseline_usage = super::measure_request_usage(
+        &expected,
+        &baseline,
+        &ProviderVisibleToolFootprint::default(),
+    );
+    let feedback = format!(
+        "[runtime_progress_feedback_v1]\n{}",
+        serde_json::json!({
+            "schema":"runtime_progress_feedback_v1", "source":"runtime",
+            "reason":"quiet_command", "evidence":{"last_status":"running", "exit_observed":false},
+            "recovery":{"episode":1,"episode_limit":3,"rounds_remaining":3,"round_limit":4},
+            "guidance":"Use real evidence; this diagnostic grants no permission.",
+        })
+    );
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let result = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "required-progress-budget",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: baseline_usage.input_tokens + 128,
+            max_output_tokens: 128,
+            observation_progress_hint: Some(&feedback),
+            prompt_memory_exposure: None,
+        },
+    )
+    .await;
+    let error = result
+        .err()
+        .expect("required progress facts cannot be silently dropped");
+    assert!(matches!(error, bamboo_agent_core::AgentError::Budget(_)));
+    assert_eq!(
+        llm.ir_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(llm.requested_messages.lock().unwrap().is_empty());
+    assert_eq!(session.model_context_state, original_context);
+    assert_eq!(
+        serde_json::to_value(&session.provider_transcript).unwrap(),
+        original_transcript
+    );
+    assert_eq!(
+        serde_json::to_value(&session.messages).unwrap(),
+        original_messages
     );
 }
 
@@ -1882,30 +1987,36 @@ async fn final_ir_guard_rejects_unbudgeted_large_ledger_before_provider_dispatch
     let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
     let llm = mock_llm(vec![LLMChunk::Done]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
-    let result = execute_llm_stream(
-        &mut session,
-        &config,
-        &llm_dyn,
-        &prepared_context,
-        &[],
-        &LlmStreamFrame {
-            event_tx: &event_tx,
-            cancel_token: &CancellationToken::new(),
-            session_id,
-            model: "test-model",
-            provider_name: Some("openai"),
-            provider_type: Some("openai"),
-            reasoning_effort: None,
-            max_context_tokens: 2_000,
-            max_output_tokens: 200,
-            observation_progress_hint: None,
-            prompt_memory_exposure: Some(PromptMemoryExposureFrame {
-                round_id,
-                provenance: &provenance,
-            }),
-        },
-    )
-    .await;
+    let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+    let result = trace
+        .scope(execute_llm_stream(
+            &mut session,
+            &config,
+            &llm_dyn,
+            &prepared_context,
+            &[],
+            &LlmStreamFrame {
+                event_tx: &event_tx,
+                cancel_token: &CancellationToken::new(),
+                session_id,
+                model: "test-model",
+                provider_name: Some("openai"),
+                provider_type: Some("openai"),
+                reasoning_effort: None,
+                max_context_tokens: 2_000,
+                max_output_tokens: 200,
+                observation_progress_hint: None,
+                prompt_memory_exposure: Some(PromptMemoryExposureFrame {
+                    round_id,
+                    provenance: &provenance,
+                }),
+            },
+        ))
+        .await;
+    assert!(
+        trace.spans().is_empty(),
+        "failed prompt preflight must not fabricate provider spans"
+    );
 
     assert!(matches!(result, Err(AgentError::Budget(_))));
     assert!(llm

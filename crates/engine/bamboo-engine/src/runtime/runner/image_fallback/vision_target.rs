@@ -75,9 +75,19 @@ fn configured_target(
     let overrides =
         bamboo_config::model_vision_overrides(&instance).map_err(|_| configuration_error())?;
     if overrides.get(&target.model) == Some(&false) {
-        return Err(AgentError::LLM("Configured Vision model does not support Vision. Enable supports_vision for that exact provider/model or select another configured Vision model. No image was sent.".into()));
+        return Err(AgentError::LLM(format!(
+            "Configured Vision model does not support Vision. {VISION_CONFIGURATION_ERROR}"
+        )));
     }
     Ok((target, instance))
+}
+
+/// Validate explicit configuration only; never construct/probe a provider here.
+pub(crate) fn validate_configured_vision_target(
+    config: &Config,
+    active_provider: &str,
+) -> Result<(), AgentError> {
+    configured_target(config, active_provider).map(|_| ())
 }
 
 pub(crate) fn configured_vision_resolver(

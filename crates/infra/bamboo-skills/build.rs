@@ -3,6 +3,9 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+#[path = "build/product_manual.rs"]
+mod product_manual;
+
 const BUILTIN_SKILL_WHITELIST: &[&str] = &[
     "debug",
     "personal-assistant",
@@ -114,6 +117,9 @@ fn main() -> io::Result<()> {
             relative = relative_unix
         )?;
     }
+    // These canonical, crate-local resources also survive `cargo package`.
+    // They join the same builtin table and existing permission-aware reader.
+    product_manual::embed(&manifest_dir, &out_dir, &mut file)?;
     writeln!(file, "];")?;
     // Preserve the existing public byte-table shape; modes are a companion.
     writeln!(

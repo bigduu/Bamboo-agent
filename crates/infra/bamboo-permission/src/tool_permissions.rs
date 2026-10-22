@@ -466,6 +466,20 @@ fn browser_semantic_target(args: &Value) -> Result<Option<(String, String)>, Per
     Ok(Some((format!("semantic:{identity}"), description)))
 }
 
+/// The independent-Root owner opts into this operation explicitly. A custom
+/// tool named spawn_session is not classified as this framework operation.
+pub fn framework_root_spawn_permissions(
+    args: &Value,
+) -> Result<Option<Vec<PermissionContext>>, PermissionError> {
+    let project = required_string_arg(args, "project_id")?;
+    let workspace = required_string_arg(args, "workspace_path")?;
+    Ok(Some(vec![PermissionContext::new(
+        PermissionType::ExecuteCommand,
+        format!("session_control create {project} {workspace}"),
+        "spawn_session: create an independent Root in the explicit Host-authorized Project/workspace and submit its first instruction",
+    )]))
+}
+
 pub fn check_permissions(
     tool_name: &str,
     args: &Value,
@@ -1265,6 +1279,26 @@ pub fn check_permissions(
         }
         "session_control" => {
             let action = required_string_arg(args, "action")?;
+            if action == "scope" {
+                return Ok(None);
+            }
+            if action == "create" {
+                let request = args
+                    .get("request")
+                    .filter(|request| request.is_object())
+                    .ok_or_else(|| {
+                        PermissionError::CheckFailed(
+                            "session_control create requires request".into(),
+                        )
+                    })?;
+                let project = required_string_arg(request, "project_id")?;
+                let workspace = required_string_arg(request, "workspace_path")?;
+                return Ok(Some(vec![PermissionContext::new(
+                    PermissionType::ExecuteCommand,
+                    format!("session_control create {project} {workspace}"),
+                    "session_control create: create an independent Root in the explicit Host-authorized Project/workspace and submit its first instruction",
+                )]));
+            }
             if action != "followup" {
                 return Err(PermissionError::CheckFailed(
                     "unsupported session_control action".into(),
@@ -1486,6 +1520,35 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+
+    #[test]
+    fn versioned_root_spawn_retains_the_existing_scoped_permission_ceiling() {
+        let args = serde_json::json!({"project_id":"explicit-project", "workspace_path":"/explicit/worker"});
+        let new = framework_root_spawn_permissions(&args).unwrap().unwrap();
+        let old = check_permissions(
+            "session_control",
+            &serde_json::json!({"action":"create", "request":args}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].permission_type, old[0].permission_type);
+        assert_eq!(new[0].resource, old[0].resource);
+        assert_eq!(
+            new[0].resource,
+            "session_control create explicit-project /explicit/worker"
+        );
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"project_id":"p"}),
+            serde_json::json!({"workspace_path":"/p"}),
+        ] {
+            assert!(framework_root_spawn_permissions(&invalid).is_err());
+            assert!(check_permissions("spawn_session", &invalid)
+                .unwrap()
+                .is_none());
+        }
+    }
 
     #[test]
     fn browser_eval_fingerprint_child_process() {
@@ -2828,6 +2891,46 @@ mod tests {
     }
 
     // ── Server/overlay tool classification (#395) ──────────────────────────
+    #[test]
+    fn supervised_root_create_requires_native_compute_permission_for_explicit_project_workspace() {
+        let args = json!({"action":"create", "request":{
+            "project_id":"project-a", "workspace_path":"/explicit/worker",
+            "operation_id":"00000000-0000-0000-0000-000000000001",
+            "message":"private first instruction", "expected_state_revision":1
+        }});
+        let contexts = check_permissions("session_control", &args)
+            .unwrap()
+            .unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].permission_type, PermissionType::ExecuteCommand);
+        assert_eq!(
+            contexts[0].resource,
+            "session_control create project-a /explicit/worker"
+        );
+        assert!(!contexts[0].resource.contains("private first instruction"));
+        assert!(
+            check_permissions("session_control", &json!({"action":"scope"}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(check_permissions(
+            "session_control",
+            &json!({"action":"attach", "target_session_id":"existing"})
+        )
+        .is_err());
+        for request in [
+            json!({}),
+            json!({"project_id":"project-a"}),
+            json!({"workspace_path":"/explicit/worker"}),
+        ] {
+            assert!(check_permissions(
+                "session_control",
+                &json!({"action":"create", "request":request})
+            )
+            .is_err());
+        }
+    }
+
     #[test]
     fn overlay_tools_gate_compute_spinning_actions() {
         // deploy_agent / cluster deploy+stop and SubAgent create spin up compute →

@@ -162,6 +162,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "memory_note",
     "session_history",
     "session_history_current",
+    "bamboo_diagnostics",
     "recall",
     "session_inspector",
     "archive_context",
@@ -217,6 +218,17 @@ pub fn plan_mode_allows_tool(tool_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_is_read_only_in_shared_plan_gate() {
+        assert_eq!(
+            classify_tool("bamboo_diagnostics"),
+            ToolMutability::ReadOnly
+        );
+        assert!(plan_mode_allows_tool("bamboo_diagnostics"));
+        assert!(plan_mode_allows_tool("BAMBOO_DIAGNOSTICS"));
+        assert!(!plan_mode_allows_tool("bamboo_diagnostics_repair"));
+    }
 
     #[test]
     fn classify_compact_context_as_read_only() {

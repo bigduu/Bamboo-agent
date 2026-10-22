@@ -933,8 +933,9 @@ pub struct AgentLoopConfig {
     /// (placeholder / OCR / error) without leaking into stored session history or UI.
     pub(crate) image_fallback: Option<ImageFallbackConfig>,
     /// Host-owned resolver only for ViewImage tool-result fallback. Direct
-    /// conversation uploads/history never invoke it; their original Vision
-    /// capability rejection remains in place. It never changes the main model.
+    /// conversation uploads/history never invoke it during preparation: a
+    /// non-Vision main receives scoped references instead. Only a requested
+    /// ViewImage call resolves the target; it never changes the main model.
     pub(crate) vision_model_resolver: Option<super::runner::image_fallback::VisionModelResolver>,
     /// Feature flags controlling prompt-time memory injection behavior.
     pub(crate) prompt_memory_flags: PromptMemoryFlags,

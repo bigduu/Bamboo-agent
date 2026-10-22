@@ -44,5 +44,14 @@ pub async fn open_default(
     }
 }
 
+mod project_scope;
+pub use project_scope::{configure_project_scope, inspect_project_scope};
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod project_scope_tests;
+
+#[cfg(test)]
+mod project_scope_web_tests;

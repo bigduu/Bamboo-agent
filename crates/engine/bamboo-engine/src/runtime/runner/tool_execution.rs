@@ -18,8 +18,11 @@ use bamboo_domain::{
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
 
-pub(crate) use no_progress::{pause_for_no_progress, pause_for_quiet_polling};
+pub(crate) use no_progress::{
+    finish_exhausted_progress, quiet_poll_guard_active as progress_feedback_active,
+};
 pub(crate) use policy::ToolPolicyGuard;
+pub(crate) use progress_feedback::{is_required_progress_feedback, FeedbackDecision};
 
 fn build_context_pressure(session: &Session) -> Option<output_compressor::ContextPressure> {
     let usage = session.token_usage.as_ref()?;
@@ -58,10 +61,13 @@ mod clarification;
 mod events;
 mod execution_paths;
 mod loop_state;
+#[cfg(test)]
+mod model_progress_feedback_tests;
 mod no_progress;
 mod output_compressor;
 mod per_call;
 mod policy;
+mod progress_feedback;
 #[cfg(test)]
 mod progress_hint_tests;
 mod quiet_poll;
@@ -170,8 +176,12 @@ async fn execute_and_apply_single_tool_call(
     let executing_supervisor =
         ExecutingSupervisorObservation::capture_from_executing_session(session);
     let root_orchestration_only = session.root_orchestration_only_enabled();
-    let admitted_execution_name =
-        effective_callable_set.resolve_callable_reference(&tool_call.function.name);
+    let session_behavior_version = session.session_version;
+    let admitted_execution_name = per_call::resolve_callable_for_session(
+        session_behavior_version,
+        effective_callable_set,
+        &tool_call.function.name,
+    );
     // Plan mode gate: block mutating tools (except pause/clarification tools)
     if session_flags.plan_read_only {
         let tool_name = tool_call.function.name.trim();
@@ -259,6 +269,7 @@ async fn execute_and_apply_single_tool_call(
             permission_replay_origin: None,
             needs_human: None,
             portable_tool: per_call::portable_tool_for_admitted_call(
+                session_behavior_version,
                 effective_callable_set,
                 tool_call,
             ),
@@ -274,6 +285,7 @@ async fn execute_and_apply_single_tool_call(
             let dispatch = per_call::execute_model_requested_tool_call_only(
                 effective_callable_set,
                 per_call::ToolExecutionOnlyContext {
+                    session_behavior_version,
                     vision_support,
                     output_cap: None,
                     tool_call,
@@ -304,7 +316,7 @@ async fn execute_and_apply_single_tool_call(
                         .per_tool_timeout_secs
                         .min(config.parallel_batch_timeout_secs),
                 );
-                match tokio::time::timeout(timeout, dispatch).await {
+                match bamboo_infrastructure::telemetry::with_timeout(timeout, dispatch).await {
                     Ok(result) => result?,
                     Err(_) => {
                         let violation = bamboo_agent_core::tools::suspension_running_violated();
@@ -320,6 +332,7 @@ async fn execute_and_apply_single_tool_call(
                             permission_replay_origin: None,
                             needs_human: None,
                             portable_tool: per_call::portable_tool_for_admitted_call(
+                                session_behavior_version,
                                 effective_callable_set,
                                 tool_call,
                             ),
@@ -566,7 +579,34 @@ pub(crate) async fn execute_round_tool_calls(
     // Retain observation outside the pre-Start parallel timeouts. Per-call
     // observers share this token, even if their futures are dropped.
     let control = execution.frame.config.loop_control.as_ref();
-    let dispatch = execute_round_tool_calls_inner(execution);
+    let session_id = execution.session.id.clone();
+    let reader = super::image_fallback::round_needs_image_references(
+        execution.tool_calls,
+        execution.effective_callable_set,
+        execution
+            .frame
+            .config
+            .hook_runner
+            .has_hooks_for(AgentHookPoint::BeforeToolExecution),
+    )
+    .then(|| {
+        super::image_fallback::image_reference_reader(
+            &*execution.session,
+            execution.frame.config.attachment_reader.clone(),
+        )
+    });
+    let dispatch = async move {
+        if let Some(reader) = reader {
+            bamboo_tools::tools::view_image::with_image_reference_reader(
+                &session_id,
+                reader,
+                execute_round_tool_calls_inner(execution),
+            )
+            .await
+        } else {
+            execute_round_tool_calls_inner(execution).await
+        }
+    };
     if let Some(control) = control {
         let (result, observation) =
             bamboo_agent_core::tools::observe_tool_suspension(false, dispatch).await;
@@ -648,9 +688,12 @@ async fn execute_round_tool_calls_inner(
             .iter()
             .map(|tc| {
                 if no_progress::quiet_poll_guard_active(session, runtime_state, config)
-                    && effective_callable_set
-                        .resolve_callable_reference(&tc.function.name)
-                        .as_deref()
+                    && per_call::resolve_callable_for_session(
+                        session.session_version,
+                        effective_callable_set,
+                        &tc.function.name,
+                    )
+                    .as_deref()
                         == Some("write_stdin")
                 {
                     ToolSchedulingMode::Sequential
@@ -684,9 +727,12 @@ async fn execute_round_tool_calls_inner(
                     .check_before_execution_for_name(
                         call,
                         offset,
-                        effective_callable_set
-                            .resolve_callable_reference(&call.function.name)
-                            .as_deref(),
+                        per_call::resolve_callable_for_session(
+                            session.session_version,
+                            effective_callable_set,
+                            &call.function.name,
+                        )
+                        .as_deref(),
                     )
                     .err()
             });
@@ -810,19 +856,21 @@ async fn execute_round_tool_calls_inner(
             let executing_supervisor =
                 ExecutingSupervisorObservation::capture_from_executing_session(session);
             let root_orchestration_only = session.root_orchestration_only_enabled();
+            let session_behavior_version = session.session_version;
             let output_cap = session
                 .effective_token_budget()
                 .map(|budget| budget.max_tool_output_tokens);
-            let outcomes = tokio::time::timeout(
+            let outcomes = bamboo_infrastructure::telemetry::with_timeout(
                 batch_timeout,
                 join_all(batch.iter().map(|tool_call| {
                     let timeout = per_tool_timeout;
                     async move {
-                        tokio::time::timeout(
+                        bamboo_infrastructure::telemetry::with_timeout(
                             timeout,
                             per_call::execute_model_requested_tool_call_only(
                                 effective_callable_set,
                                 per_call::ToolExecutionOnlyContext {
+                                    session_behavior_version,
                                     vision_support,
                                     output_cap,
                                     tool_call,
@@ -850,6 +898,7 @@ async fn execute_round_tool_calls_inner(
                                 permission_replay_origin: None,
                                 needs_human: None,
                                 portable_tool: per_call::portable_tool_for_admitted_call(
+                                    session_behavior_version,
                                     effective_callable_set,
                                     tool_call,
                                 ),
@@ -881,6 +930,7 @@ async fn execute_round_tool_calls_inner(
                             permission_replay_origin: None,
                             needs_human: None,
                             portable_tool: per_call::portable_tool_for_admitted_call(
+                                session_behavior_version,
                                 effective_callable_set,
                                 batch_call,
                             ),
@@ -964,8 +1014,11 @@ async fn execute_round_tool_calls_inner(
                 .await;
 
             for (batch_call, outcome) in batch.iter().zip(compressed) {
-                let admitted_execution_name =
-                    effective_callable_set.resolve_callable_reference(&batch_call.function.name);
+                let admitted_execution_name = per_call::resolve_callable_for_session(
+                    session.session_version,
+                    effective_callable_set,
+                    &batch_call.function.name,
+                );
 
                 let should_break = per_call::apply_tool_execution_outcome(
                     per_call::ToolExecutionApplyContext {
@@ -3001,13 +3054,34 @@ mod tests {
                 parallel_batch_timeout_secs: if batch_timeout { 1 } else { 10 },
                 ..Default::default()
             };
-            cap_fixture_round(&mut session, executor.clone(), config).await;
+            let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+            trace
+                .scope(cap_fixture_round(&mut session, executor.clone(), config))
+                .await;
+            let spans = trace.spans();
+            assert_eq!(spans.len(), 2);
             assert_eq!(
                 executor.seen.lock().unwrap().len(),
                 2,
                 "both actual dispatch scopes started"
             );
             for id in ["cap-a", "cap-b"] {
+                let matching = spans
+                    .iter()
+                    .filter(|span| {
+                        span.attributes.iter().any(|kv| {
+                            kv.key.as_str() == "gen_ai.tool.call.id" && kv.value.to_string() == id
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(matching.len(), 1);
+                assert_eq!(matching[0].name, "execute_tool cap_probe");
+                for (key, value) in [("error.type", "timeout"), ("bamboo.outcome", "error")] {
+                    assert!(matching[0]
+                        .attributes
+                        .iter()
+                        .any(|kv| kv.key.as_str() == key && kv.value.to_string() == value));
+                }
                 let replies: Vec<_> = session
                     .messages
                     .iter()
@@ -3037,6 +3111,33 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|(_, cap)| *cap == Some(0)));
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn telemetry_cancelled_tool_dispatches_are_not_timeouts() {
+        for parallel in [false, true] {
+            let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
+            let mut session = Session::new("cap-cancelled", "model");
+            let executor = cap_executor(parallel, true);
+            let mut run = Box::pin(trace.scope(cap_fixture_round(
+                &mut session,
+                executor.clone(),
+                Default::default(),
+            )));
+            assert!(futures::poll!(run.as_mut()).is_pending());
+            let expected = if parallel { 2 } else { 1 };
+            assert_eq!(executor.seen.lock().unwrap().len(), expected);
+            drop(run);
+            let spans = trace.spans();
+            assert_eq!(spans.len(), expected);
+            for span in spans {
+                for key in ["error.type", "bamboo.outcome"] {
+                    assert!(span
+                        .attributes
+                        .iter()
+                        .any(|kv| kv.key.as_str() == key && kv.value.to_string() == "cancelled"));
+                }
+            }
         }
     }
 }

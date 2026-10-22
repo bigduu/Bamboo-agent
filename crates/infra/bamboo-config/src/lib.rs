@@ -15,6 +15,8 @@ pub mod cluster_fabric;
 pub mod config;
 pub mod config_crypto;
 pub mod config_module;
+pub mod config_share;
+pub mod config_share_api;
 pub mod config_store;
 pub mod credential_migration;
 pub mod credential_store;

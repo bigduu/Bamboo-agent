@@ -71,6 +71,10 @@ where
 #[derive(Debug, Serialize)]
 pub struct SessionSummary {
     pub id: String,
+    /// Authoritative detail-only assessment; absent index/list data is not a
+    /// reason to disable a legacy session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_compatibility: Option<bamboo_domain::SessionCompatibilityReport>,
     #[serde(default)]
     pub project_id: Option<bamboo_domain::ProjectId>,
     pub kind: bamboo_agent_core::SessionKind,
@@ -175,6 +179,18 @@ pub struct SessionSummary {
 }
 
 impl SessionSummary {
+    /// Common HTTP presentation only; Domain owns the compatibility decision.
+    pub(crate) fn execution_conflict(
+        session: &bamboo_domain::Session,
+    ) -> Option<actix_web::HttpResponse> {
+        let error = session.check_execution_compatibility().err()?;
+        Some(actix_web::HttpResponse::Conflict().json(serde_json::json!({
+            "error": {"type":"api_error", "code":"session_execution_incompatible", "message":error.to_string()},
+            "session_id":session.id,
+            "compatibility":error.compatibility,
+        })))
+    }
+
     pub(crate) fn from_entry(entry: SessionIndexEntry, is_running: bool) -> Self {
         let project_id = entry.project_id.as_deref().and_then(|raw| {
             raw.trim()
@@ -200,6 +216,7 @@ impl SessionSummary {
         };
         Self {
             id: entry.id,
+            execution_compatibility: None,
             project_id,
             kind: entry.kind,
             title: entry.title,
@@ -660,6 +677,7 @@ mod tests {
     #[test]
     fn test_create_session_response_serialization() {
         let summary = SessionSummary {
+            execution_compatibility: None,
             id: "test-id".to_string(),
             project_id: Some("project-1".parse().unwrap()),
             bypass_permissions: false,
@@ -716,6 +734,7 @@ mod tests {
     #[test]
     fn test_get_session_response_serialization() {
         let summary = SessionSummary {
+            execution_compatibility: None,
             id: "session-123".to_string(),
             project_id: Some("project-1".parse().unwrap()),
             bypass_permissions: false,
@@ -859,6 +878,7 @@ mod tests {
     #[test]
     fn test_session_summary_debug() {
         let summary = SessionSummary {
+            execution_compatibility: None,
             id: "test".to_string(),
             project_id: None,
             bypass_permissions: false,

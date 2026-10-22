@@ -24,9 +24,9 @@ pub mod spawn;
 pub mod visible_messages;
 
 pub use agent_spawn::{
-    log_base_system_prompt_snapshot, reserve_session_execution, spawn_session_execution,
-    SessionCompletionHook, SessionExecutionArgs, SessionExecutionOutcome,
-    SessionExecutionReservation, SessionExecutionReserveOutcome,
+    log_base_system_prompt_snapshot, reserve_session_execution, reserve_session_preparation,
+    spawn_session_execution, SessionCompletionHook, SessionExecutionArgs, SessionExecutionOutcome,
+    SessionExecutionReservation, SessionExecutionReserveOutcome, SessionPreparationReservation,
 };
 pub use child_completion::{ChildCompletion, ChildCompletionHandler, ChildCompletionSource};
 pub use event_forwarder::{

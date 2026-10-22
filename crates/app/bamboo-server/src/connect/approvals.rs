@@ -785,9 +785,8 @@ impl ResumeExecutionPort for ConnectResumePort {
                 let tool_call = replay_target.tool_call().clone();
                 let tool_name = tool_call.function.name.clone();
                 let executor = ctx.tools.clone();
-                let replay_owner = bamboo_domain::resolve_tool_reference_name(&tool_name, |name| {
-                    executor.owns_exact_tool(name)
-                });
+                let executor = executor.for_session(&session).unwrap_or(executor);
+                let replay_owner = executor.resolve_reference_for_session(&session, &tool_name);
                 if replay_owner.is_none() && reexecute_request_generation.is_some() {
                     tracing::error!(%session_id, %tool_name, "connect approved replay has no registered execution owner; markers retained");
                     return;
@@ -1190,25 +1189,24 @@ mod tests {
     #[tokio::test]
     async fn connect_resume_consumes_approved_call_after_root_tool_tightening() {
         use crate::app_state::resume_adapter::supervisor_tests::{Fixture, CALL};
-        let fixture = Box::pin(Fixture::pending()).await;
+        let fixture = Box::pin(Fixture::ordinary_root_pending()).await;
         fixture.prepare_workspace_catalog().await;
-        fixture.formal_approve().await;
-        let mut selected = fixture.reload().await;
-        selected.set_root_orchestration_only(true).unwrap();
-        fixture.state.storage.save_session(&selected).await.unwrap();
+        let handoff = fixture.ordinary_root_approval_handoff().await;
+        let session = fixture.tighten_ordinary_root().await;
 
         let ctx = supervisor_context(&fixture.state);
-        let session = fixture.reload().await;
         let config = resolve_resume_config_snapshot(
             &*ctx.config.read().await,
             &ctx.provider_registry,
             &session,
             None,
         );
-        let outcome = bamboo_engine::session_app::resume::resume_session_execution(
+        let outcome = bamboo_engine::session_app::resume::resume_session_execution_with_handoff(
             &ConnectResumePort { ctx },
             &session.id,
+            session.clone(),
             config,
+            handoff,
         )
         .await;
         assert!(matches!(

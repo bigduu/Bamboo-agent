@@ -31,6 +31,7 @@ pub struct TicketApplication {
 mod initialization;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
 mod resolution;
+mod sprints;
 #[cfg(test)]
 mod tests;
 
@@ -372,6 +373,7 @@ impl TicketApplication {
             ));
         }
         let (service, authority) = self.authority(principal.clone()).await?;
+        self.validate_project_operations(&service, command)?;
         let receipt = service.work_update(&authority, command)?;
         self.cancel_after_commit(&service, command);
         if matches!(principal, Principal::User { .. })
@@ -385,6 +387,119 @@ impl TicketApplication {
             self.wake_after_receipt(&receipt).await?;
         }
         Ok(receipt)
+    }
+
+    /// Project references are observed metadata, not grants. Replays retain the
+    /// original immutable receipt; new admissions re-read resource/binding facts.
+    fn validate_project_operations(
+        &self,
+        service: &TicketService,
+        command: &Command,
+    ) -> Result<()> {
+        let snapshot = service.published()?.1;
+        if snapshot.receipts.contains_key(&command.operation_id) {
+            return Ok(());
+        }
+        self.validate_project_snapshot_operations(&snapshot, &command.operations)
+    }
+
+    fn validate_project_snapshot_operations(
+        &self,
+        snapshot: &bamboo_tickets::Snapshot,
+        operations: &[Operation],
+    ) -> Result<()> {
+        let mut links = snapshot.project.links.clone();
+        let mut created = BTreeSet::new();
+        for op in operations {
+            let (project_id, context, adopting) = match op {
+                Operation::Create {
+                    temp_id, parent, ..
+                } => {
+                    // Allocation shadows earlier spellings, including canonical IDs.
+                    links.remove(temp_id);
+                    created.insert(temp_id.clone());
+                    if let Some(project_id) = parent
+                        .as_ref()
+                        .and_then(|parent| links.get(parent))
+                        .cloned()
+                    {
+                        self.validate_project_context(&project_id, None, false)?;
+                        links.insert(temp_id.clone(), project_id);
+                    }
+                    continue;
+                }
+                Operation::AssociateProject {
+                    ticket_id,
+                    project_id,
+                } => {
+                    links.insert(ticket_id.clone(), project_id.clone());
+                    (project_id, None, false)
+                }
+                Operation::SetProjectContext { context, .. } => {
+                    (&context.project_id, Some(context), true)
+                }
+                Operation::Start { work_id, .. } => {
+                    let Some(project_id) = links.get(work_id) else {
+                        continue;
+                    };
+                    let context = snapshot
+                        .project
+                        .work_contexts
+                        .get(work_id)
+                        .filter(|_| !created.contains(work_id))
+                        .and_then(|hash| snapshot.project.contexts.get(hash))
+                        .ok_or_else(|| {
+                            Error::InvalidTransition("Project context is required".into())
+                        })?;
+                    (project_id, Some(context), false)
+                }
+                _ => continue,
+            };
+            self.validate_project_context(project_id, context, adopting)?;
+        }
+        Ok(())
+    }
+
+    fn validate_project_context(
+        &self,
+        project_id: &bamboo_domain::ProjectId,
+        context: Option<&bamboo_tickets::ProjectContextSnapshot>,
+        adopting: bool,
+    ) -> Result<()> {
+        let store = bamboo_projects::ProjectStore::open(self.root.clone())
+            .map_err(|e| Error::AuthorityUnavailable(e.to_string()))?;
+        let manifest = store
+            .get(project_id)
+            .map_err(|e| Error::InvalidTransition(e.to_string()))?;
+        if manifest.status != bamboo_domain::ProjectStatus::Active {
+            return Err(Error::InvalidTransition("Project is archived".into()));
+        }
+        if let Some(context) = context {
+            if (adopting && context.project_revision != manifest.revision)
+                || context.resource_revision != manifest.resource_revision
+                || !manifest
+                    .workspace_roots()
+                    .any(|p| p == context.workspace_binding.path)
+            {
+                return Err(Error::RevisionConflict);
+            }
+            if let Some(binding) = manifest
+                .workspace_bindings
+                .iter()
+                .find(|b| b.path == context.workspace_binding.path)
+            {
+                if binding != &context.workspace_binding {
+                    return Err(Error::RevisionConflict);
+                }
+            } else if context.workspace_binding.git_common_dir.is_some()
+                || context.workspace_binding.label.is_some()
+            {
+                return Err(Error::InvalidTransition(
+                    "primary binding has no auxiliary metadata".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Commit before enqueue, return admission observations without waiting for
@@ -417,6 +532,7 @@ impl TicketApplication {
             )
             .await?;
         }
+        self.validate_project_operations(&service, command)?;
         let receipt = service.work_dispatch(&authority, command)?;
         self.enqueue_receipt(&service, command, receipt).await
     }
@@ -604,6 +720,27 @@ impl TicketApplication {
         }
     }
 
+    fn validate_dispatch_project_context(
+        &self,
+        snapshot: &bamboo_tickets::Snapshot,
+        spec: &DispatchSpec,
+    ) -> Result<()> {
+        if let Some(project_id) = snapshot.project.links.get(&spec.work_id) {
+            let context = spec
+                .project_context_hash
+                .as_ref()
+                .and_then(|hash| snapshot.project.contexts.get(hash))
+                .ok_or_else(|| {
+                    Error::InvalidTransition("adopted Project context missing".into())
+                })?;
+            if &context.project_id != project_id {
+                return Err(Error::InvalidTransition("adopted Project mismatch".into()));
+            }
+            self.validate_project_context(project_id, Some(context), false)?;
+        }
+        Ok(())
+    }
+
     async fn ensure(
         &self,
         key: &str,
@@ -612,6 +749,17 @@ impl TicketApplication {
         let service = self.service()?;
         let enabled = self.config.read().await.features.ticket_dispatch;
         if enabled {
+            // All paths, including semantic resolution and recovered pending
+            // intents, pass here before fresh admission. Existing receipts keep
+            // their adopted historical context and never acquire new grants.
+            let snapshot = service.published()?.1;
+            if snapshot
+                .assignments
+                .get(&spec.assignment_id)
+                .is_some_and(|a| a.runtime.is_none())
+            {
+                self.validate_dispatch_project_context(&snapshot, spec)?;
+            }
             // Also guard a previously published pending intent when operator
             // placement changes before its admission/retry.
             self.preflight_ticket_starts(vec![None]).await?;

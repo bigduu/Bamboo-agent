@@ -181,6 +181,17 @@ pub(crate) fn adopt_durable_actor_parent_question_handoff(
 /// A failed scoped checkpoint whose strict reload also failed cannot enter
 /// ordinary merge/cache publication. Keep the volatile fence in the caller;
 /// only a separately observed canonical snapshot may replace it.
+fn ensure_session_execution_compatible(session: &Session) -> std::io::Result<()> {
+    session.check_execution_compatibility().map_err(|error| {
+        // Use the existing rejected-snapshot publication fence. Refusal must
+        // not turn an unknown schema into an adopted or cached replacement.
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            bamboo_domain::SessionAuthorityConflict(error.to_string()),
+        )
+    })
+}
+
 fn ensure_scoped_loop_checkpoint_known(session: &Session) -> std::io::Result<()> {
     if session
         .metadata
@@ -1011,9 +1022,17 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session) + Send,
     {
+        ensure_session_execution_compatible(session)?;
         ensure_scoped_loop_checkpoint_known(session)?;
         let _guard = self.acquire_lock(&session.id).await;
+        // A compatible sidecar can coexist with a future Main. Merge into a
+        // private candidate so the physical writer's strict refusal cannot
+        // first replace fields in the caller's older compatible snapshot.
+        let original = session;
+        let mut candidate = original.clone();
+        let session = &mut candidate;
         if let Some(latest) = self.storage.load_runtime_control_plane(&session.id).await? {
+            ensure_session_execution_compatible(&latest)?;
             apply_authoritative_metadata(session, &latest);
             // The control-plane sidecar carries `agent_runtime_state`, so a
             // concurrent mid-run bypass flip is here too — don't revert it. #540.
@@ -1027,8 +1046,11 @@ impl LockedSessionStore {
         let result = self
             .save_runtime_state_rebasing_task_conflicts(session)
             .await;
-        if result.is_ok() || (publish_on_failure && may_publish_runtime_result(&result)) {
-            publish(session);
+        if may_publish_runtime_result(&result) {
+            *original = candidate;
+            if result.is_ok() || publish_on_failure {
+                publish(original);
+            }
         }
         result
     }
@@ -1748,8 +1770,12 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
+        ensure_session_execution_compatible(session)?;
         ensure_scoped_loop_checkpoint_known(session)?;
         let _guard = self.acquire_lock(&session.id).await;
+        let original = session;
+        let mut candidate = original.clone();
+        let session = &mut candidate;
 
         // Single disk read serves BOTH the SHRINK diagnostic and the
         // authoritative-metadata merge below. Previously this path loaded the
@@ -1758,6 +1784,9 @@ impl LockedSessionStore {
         // deserialization cost of every runtime save, which is the hot path
         // during sub-agent spawn.
         let latest = self.storage.load_session(&session.id).await?;
+        if let Some(latest) = latest.as_ref() {
+            ensure_session_execution_compatible(latest)?;
+        }
 
         // DIAGNOSTIC: merge_save_runtime overwrites the whole `messages` array
         // (it only merges authoritative metadata, not messages). If the incoming
@@ -1819,7 +1848,8 @@ impl LockedSessionStore {
             .save_session_rebasing_task_conflicts_with_input(session, None, inherited)
             .await;
         if may_publish_runtime_result(&result) {
-            publish(session, result.is_ok());
+            *original = candidate;
+            publish(original, result.is_ok());
         }
         result
     }
@@ -2067,6 +2097,12 @@ impl LockedSessionStore {
     {
         let cached_candidate = load_cached();
         let durable = self.storage.load_session(session_id).await?;
+        if let Some(cached) = cached_candidate.as_ref() {
+            ensure_session_execution_compatible(cached)?;
+        }
+        if let Some(durable) = durable.as_ref() {
+            ensure_session_execution_compatible(durable)?;
+        }
         let Some(mut session) = (match (cached_candidate, durable.as_ref()) {
             (Some(cached), Some(durable)) => {
                 let prefer_durable = durable.updated_at > cached.updated_at

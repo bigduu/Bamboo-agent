@@ -568,7 +568,8 @@ impl AppState {
             ))
         })?;
 
-        let (base_tools, native_tool_ceiling) = build_base_tools(
+        let diagnostics = Arc::new(crate::tools::diagnostics::DiagnosticsSource::default());
+        let (base_tools, native_tool_ceiling, builtin_permission_executor) = build_base_tools(
             config.clone(),
             permission_checker.clone(),
             mcp_manager.clone(),
@@ -587,6 +588,7 @@ impl AppState {
             tool_event_publisher.clone(),
             memory_store.clone(),
             session_messenger.clone(),
+            diagnostics.clone(),
         );
 
         // The workflow engine executes against the base tool surface. The
@@ -1129,14 +1131,27 @@ impl AppState {
             None
         };
 
+        let root_creator = Arc::new(super::supervised_root_create::SupervisedRootCreator {
+            store: session_store.clone(),
+            operations: session_create_operations.clone(),
+            projects: project_store.clone(),
+            workspace: workspace_resolver.clone(),
+            project_context: project_context_resolver.clone(),
+            config: config.clone(),
+            repo: session_repo.clone(),
+            messenger: session_messenger.clone(),
+            account: account_sink.clone(),
+        });
         let (tools, canonical_subagent_tool) = build_root_tools(
             tools_with_task.clone(),
+            builtin_permission_executor,
             schedule_store.clone(),
             schedule_manager.clone(),
             session_store.clone(),
             storage.clone(),
             persistence.clone(),
             session_messenger.clone(),
+            root_creator,
             spawn_scheduler.clone(),
             sessions.clone(),
             agent_runners.clone(),
@@ -1384,6 +1399,13 @@ impl AppState {
                 account_sink.clone(),
                 config_application.clone(),
             );
+        diagnostics.bind(crate::tools::diagnostics::ReadSources {
+            providers: config_live_health.clone(),
+            mcp: mcp_config_live_health.clone(),
+            application: config_application.clone(),
+            sessions: sessions.clone(),
+            config_io_lock: config_io_lock.clone(),
+        });
         Ok(Self {
             browser,
             app_data_dir: bamboo_home_dir,
@@ -1407,6 +1429,7 @@ impl AppState {
             sessions,
             storage,
             session_store,
+            supervisor_project_scope_owner_authorizer: None,
             session_create_operations,
             mutation_idempotency,
             project_store,

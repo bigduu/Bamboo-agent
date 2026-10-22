@@ -6,6 +6,7 @@
 mod access_control;
 mod bamboo_config;
 mod cluster_fabric;
+mod config_share;
 mod credential_action;
 mod env_vars;
 mod keyword_masking;
@@ -42,6 +43,7 @@ pub use cluster_fabric::{
     create_cluster, create_node, delete_cluster, delete_node, get_node, list_nodes, node_deploy,
     node_logs, node_status, node_stop, node_test, update_cluster, update_node,
 };
+pub use config_share::config_share_routes;
 pub use env_vars::{delete_env_var, list_env_vars, replace_env_vars, upsert_env_var};
 pub use keyword_masking::{
     get_keyword_masking_config, update_keyword_masking_config, validate_keyword_entries,
