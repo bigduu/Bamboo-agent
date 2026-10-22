@@ -51,6 +51,51 @@ fn target_project(target: &Session) -> io::Result<ProjectId> {
         .map_err(|_| denied("target has an invalid Project"))
 }
 
+/// Shared canonical candidate check for both existing Supervisor creation and
+/// explicitly scoped Host creation. Neither route can create an elevated Root.
+pub(super) fn new_root_candidate_project(candidate: &Session) -> io::Result<ProjectId> {
+    let project = target_project(candidate)?;
+    candidate
+        .check_execution_compatibility()
+        .map_err(|error| denied(&error.to_string()))?;
+    candidate
+        .validate_conversation_state()
+        .map_err(|error| denied(&error.to_string()))?;
+    if candidate.root_session_id != candidate.id
+        || candidate.parent_session_id.is_some()
+        || candidate.parent_created_at.is_some()
+        || candidate.spawn_depth != 0
+        || candidate.root_orchestration_only_enabled()
+        || candidate.supervisor_management.is_some()
+        || candidate.conversation_reset.is_some()
+        || candidate.metadata_version != 0
+        || candidate
+            .workspace_path_meta()
+            .is_none_or(|path| path.trim().is_empty())
+    {
+        return Err(denied(
+            "creation requires a new Standard Ordinary Root with an explicit workspace",
+        ));
+    }
+    Ok(project)
+}
+
+pub(super) fn reserved_root_matches(target: &Session, candidate: &Session) -> bool {
+    target.id == candidate.id
+        && target.created_at == candidate.created_at
+        && target_project(target).ok() == target_project(candidate).ok()
+        && target.workspace_path_meta() == candidate.workspace_path_meta()
+        && target.metadata_version == 0
+        && target.root_session_id == target.id
+        && target.parent_session_id.is_none()
+        && target.parent_created_at.is_none()
+        && target.spawn_depth == 0
+        && target.supervisor_management.is_none()
+        && !target.root_orchestration_only_enabled()
+        && target.session_version == candidate.session_version
+        && candidate.check_conversation_generation(target).is_ok()
+}
+
 fn empty_state(incarnation_id: Uuid) -> SupervisorManagementState {
     SupervisorManagementState {
         schema_version: SUPERVISOR_MANAGEMENT_SCHEMA_VERSION,
@@ -437,21 +482,7 @@ impl SessionStoreV2 {
     ) -> io::Result<SupervisorManagementReceipt> {
         reference_is_valid(supervisor)?;
         target_id_is_valid(&candidate.id)?;
-        let project = target_project(candidate)?;
-        if candidate.root_session_id != candidate.id
-            || candidate.parent_session_id.is_some()
-            || candidate.spawn_depth != 0
-            || candidate.root_orchestration_only_enabled()
-            || candidate.supervisor_management.is_some()
-            || candidate.metadata_version != 0
-            || candidate
-                .workspace_path_meta()
-                .is_none_or(|path| path.trim().is_empty())
-        {
-            return Err(denied(
-                "creation requires a new Standard Ordinary Root with an explicit workspace",
-            ));
-        }
+        let project = new_root_candidate_project(candidate)?;
         let lifecycle = self.lock_default_writer_lifecycle().await?;
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let sessions = self.management_session_locks(Some(&candidate.id)).await?;
@@ -507,13 +538,7 @@ impl SessionStoreV2 {
         }
         let committed_revision = next_revision(state.revision)?;
         match existing {
-            Some(target)
-                if target.created_at == candidate.created_at
-                    && target_project(&target)
-                        .is_ok_and(|target_project| target_project == project)
-                    && target.workspace_path_meta() == candidate.workspace_path_meta()
-                    && target.metadata_version == 0
-                    && !target.root_orchestration_only_enabled() => {}
+            Some(target) if reserved_root_matches(&target, candidate) => {}
             Some(_) => {
                 return Err(denied(
                     "reserved creation target has a different lifetime or context",
