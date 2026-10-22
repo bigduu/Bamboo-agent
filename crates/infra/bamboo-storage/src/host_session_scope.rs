@@ -116,17 +116,24 @@ impl HostSessionScopeRegistry {
     }
 
     /// Lookup supplies a candidate token, never final read/write authority.
+    /// Only never-installed absence is None. A stale/revoked installation is
+    /// an explicit refusal; callers must not fall through to a broader adapter.
     pub(crate) async fn lookup(
         &self,
         caller: &SessionCallerReference,
-    ) -> Option<HostSessionScopeToken> {
-        let slot = self.slot(&caller.session_id).await?;
+    ) -> io::Result<Option<HostSessionScopeToken>> {
+        let Some(slot) = self.slot(&caller.session_id).await else {
+            return Ok(None);
+        };
         let publication = slot.read().await;
-        publication
-            .token
-            .as_ref()
-            .filter(|token| token.binding().caller.identity.matches_caller(caller))
-            .cloned()
+        match &publication.token {
+            Some(token) if token.binding().caller.identity.matches_caller(caller) => {
+                Ok(Some(token.clone()))
+            }
+            Some(_) => Err(denied("host_session_scope_caller_changed")),
+            None if publication.revision == 0 => Ok(None),
+            None => Err(denied("host_session_scope_revoked")),
+        }
     }
 
     pub(crate) async fn retain(
