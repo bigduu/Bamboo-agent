@@ -1802,7 +1802,7 @@ async fn versioned_spawn_framework_owner_keeps_typed_approval_and_deny_before_si
         .is_err());
     assert_eq!(checks.load(Ordering::SeqCst), checks_before);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    f.creator.config.write().await.disabled_tools = vec!["spawn_session".into()];
+    f.creator.config.write().await.tools.disabled = vec!["spawn_session".into()];
     assert!(with_caller_fixture(
         &session,
         installed.check_permissions_for_exact(&call, "spawn_session", &context())
@@ -1817,7 +1817,7 @@ async fn versioned_spawn_framework_owner_keeps_typed_approval_and_deny_before_si
     .is_err());
     assert_eq!(checks.load(Ordering::SeqCst), checks_before);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    f.creator.config.write().await.disabled_tools.clear();
+    f.creator.config.write().await.tools.disabled.clear();
 
     let asks = with_caller_fixture(&session, async {
         [

@@ -139,7 +139,7 @@ fn authority(
 }
 
 async fn reserved_record(
-    f: &Fixture,
+    _f: &Fixture,
     caller: &SessionCallerReference,
     token: &HostSessionScopeToken,
     request: &SupervisedRootCreateRequest,
