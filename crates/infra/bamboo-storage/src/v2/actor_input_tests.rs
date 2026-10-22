@@ -42,6 +42,7 @@ fn request(
         fence,
         claim,
         expected_created_at: session.created_at,
+        expected_conversation_generation: session.conversation_generation_observation(),
         expected_messages: session.messages.clone(),
         expected_provider_transcript: session.provider_transcript.clone(),
         expected_admission: session
@@ -283,6 +284,7 @@ async fn unowned_actor_claim_seed_then_confirmation_preserves_cursor_and_ack_ord
     let request = |session: &Session| ActorClaimContextSeed {
         fence: fence.clone(),
         expected_created_at: session.created_at,
+        expected_conversation_generation: session.conversation_generation_observation(),
         expected_messages: session.messages.clone(),
         expected_provider_transcript: session.provider_transcript.clone(),
         expected_admission: session.session_inbox_admission().cloned(),
@@ -375,6 +377,7 @@ async fn unowned_actor_claim_context_keeps_expected_run_at_seed_and_confirmation
     let request = |session: &Session| ActorClaimContextSeed {
         fence: fence.clone(),
         expected_created_at: session.created_at,
+        expected_conversation_generation: session.conversation_generation_observation(),
         expected_messages: session.messages.clone(),
         expected_provider_transcript: session.provider_transcript.clone(),
         expected_admission: session.session_inbox_admission().cloned(),

@@ -658,6 +658,7 @@ async fn running_root_writer(
     bamboo_domain::RootActorRuntimeWrite {
         fence: activation.fence(),
         created_at: base.created_at,
+        conversation_generation: base.conversation_generation_observation(),
     }
 }
 

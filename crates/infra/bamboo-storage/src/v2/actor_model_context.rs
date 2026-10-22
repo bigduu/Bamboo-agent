@@ -463,6 +463,10 @@ impl SessionStoreV2 {
             })())
         })
         .await??;
+        request
+            .expected
+            .check_conversation_generation(&original.main)
+            .map_err(|_| Error::SnapshotConflict)?;
         let lineage = self.validate_actor_lineage(&original.entry.actor).await?;
         actor_checkpoint_lineage::validate_recorded_observations(
             &original.entry.actor.ancestor_observations,

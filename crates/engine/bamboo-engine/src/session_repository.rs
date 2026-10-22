@@ -106,6 +106,9 @@ impl SessionRepository {
                 "Root identity changed before activation",
             ));
         }
+        session
+            .check_conversation_generation(&durable)
+            .map_err(root_actor_binding_error)?;
         let lease_duration = std::time::Duration::from_secs(15);
         let now = chrono::Utc::now();
         let claimed = directory
@@ -125,6 +128,7 @@ impl SessionRepository {
         let owner = bamboo_domain::RootActorRuntimeWrite {
             fence: claimed.fence(),
             created_at: durable.created_at,
+            conversation_generation: session.conversation_generation_observation(),
         };
         let bound = self.bind_root_response_writer(owner.clone())?;
         let live_owner = bound

@@ -332,6 +332,7 @@ mod tests {
                     root_owner = Some(RootActorRuntimeWrite {
                         fence: activation.fence(),
                         created_at: parent.created_at,
+                        conversation_generation: parent.conversation_generation_observation(),
                     });
                 }
             }

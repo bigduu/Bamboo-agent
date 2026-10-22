@@ -248,6 +248,8 @@ mod supported {
         #[serde(default)]
         supervisor_management: Option<SupervisorManagementState>,
         #[serde(default)]
+        conversation_reset: Option<bamboo_domain::ConversationResetState>,
+        #[serde(default)]
         root_orchestration_only: bool,
         #[serde(default)]
         root_tool_authority_revision: u64,
@@ -274,6 +276,7 @@ mod supported {
             session.spawn_depth = self.spawn_depth;
             session.authority_identity = self.authority_identity;
             session.supervisor_management = self.supervisor_management;
+            session.conversation_reset = self.conversation_reset;
             session.root_orchestration_only = self.root_orchestration_only;
             session.root_tool_authority_revision = self.root_tool_authority_revision;
             session.root_mode_transition_epoch = self.root_mode_transition_epoch;

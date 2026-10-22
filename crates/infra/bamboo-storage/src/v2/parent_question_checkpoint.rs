@@ -384,6 +384,7 @@ mod tests {
         let owner = RootActorRuntimeWrite {
             fence: claim.fence(),
             created_at: parent.created_at,
+            conversation_generation: parent.conversation_generation_observation(),
         };
         let child_path = store
             .sessions_dir
@@ -453,6 +454,7 @@ mod tests {
         let owner = RootActorRuntimeWrite {
             fence: successor.fence(),
             created_at: parent.created_at,
+            conversation_generation: parent.conversation_generation_observation(),
         };
         let (saved, wrote) = other
             .answer_parent_question_with_root_writer(&question, "B", Some(&owner), |_| {})
