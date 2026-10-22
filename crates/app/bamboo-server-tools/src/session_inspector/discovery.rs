@@ -9,16 +9,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ExecutingSupervisorObservation, ToolCtx, ToolError};
 use bamboo_domain::{
-    ProjectId, Role, Session, Storage, SupervisorManagementState, SupervisorReference,
-    TaskItemStatus, MAX_SUPERVISOR_LINKS,
+    ProjectId, Role, Session, SessionCallerReference, Storage, SupervisorManagementState,
+    SupervisorReference, TaskItemStatus, MAX_SUPERVISOR_LINKS,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub const MAX_DIRECTORY_PAGE_SIZE: usize = 20;
 pub const MAX_PROGRESS_EXCERPT_CHARS: usize = 8_000;
 const MAX_QUERY_BYTES: usize = 128;
-const MAX_CURSOR_BYTES: usize = 4_096;
+pub(super) const MAX_CURSOR_BYTES: usize = 4_096;
 
 #[derive(Debug, Clone, Default)]
 pub struct AuthorizedSessionListRequest {
@@ -77,6 +78,10 @@ pub struct AuthorizedSessionTarget {
     pub created_at: DateTime<Utc>,
     pub metadata_version: u64,
     pub link_revision: u64,
+    /// Host scopes have no Supervisor link. Their link_revision is zero and
+    /// this field records the explicitly installed Host authorization revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_revision: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -166,6 +171,15 @@ impl SupervisorSessionDiscovery {
         {
             return Err(authority_required());
         }
+        let original_caller_sha256 = ctx
+            .executing_caller_for(id)
+            .map(|original| {
+                if !original.matches_session(&session) {
+                    return Err(authority_required());
+                }
+                caller_fingerprint(original)
+            })
+            .transpose()?;
         let state = session.supervisor_management.clone();
         if let Some(state) = &state {
             state
@@ -179,6 +193,7 @@ impl SupervisorSessionDiscovery {
                 tool_revision: session.root_tool_authority_revision,
                 session_version: session.session_version,
                 scope_revision: state.as_ref().map_or(0, |state| state.revision),
+                original_caller_sha256,
             },
             state,
         })
@@ -202,6 +217,8 @@ struct CallerBinding {
     tool_revision: u64,
     session_version: Option<u32>,
     scope_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_caller_sha256: Option<String>,
 }
 
 struct CallerSnapshot {
@@ -301,6 +318,7 @@ impl SessionDiscoveryPort for SupervisorSessionDiscovery {
                         created_at: link.target_created_at,
                         metadata_version: link.target_metadata_version,
                         link_revision: link.revision,
+                        authorization_revision: None,
                     });
                 }
             }
@@ -371,7 +389,7 @@ impl SessionDiscoveryPort for SupervisorSessionDiscovery {
     }
 }
 
-fn progress_observation(
+pub(super) fn progress_observation(
     session: &Session,
     scope_revision: u64,
     max_chars: usize,
@@ -436,20 +454,27 @@ fn progress_observation(
     }
 }
 
-fn arguments(message: impl std::fmt::Display) -> ToolError {
+pub(super) fn caller_fingerprint(caller: &SessionCallerReference) -> Result<String, ToolError> {
+    // Includes the complete original conversation-reset state without putting
+    // its bounded receipt ledger or caller workspace bytes into model context.
+    let bytes = serde_json::to_vec(caller).map_err(authority_unavailable)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+pub(super) fn arguments(message: impl std::fmt::Display) -> ToolError {
     ToolError::InvalidArguments(format!("session_discovery_invalid_request: {message}"))
 }
-fn authority_required() -> ToolError {
+pub(super) fn authority_required() -> ToolError {
     ToolError::Execution(
         "session_discovery_authority_required: original authorized caller identity is required"
             .into(),
     )
 }
-fn authority_unavailable(message: impl std::fmt::Display) -> ToolError {
+pub(super) fn authority_unavailable(message: impl std::fmt::Display) -> ToolError {
     ToolError::Execution(format!(
         "session_discovery_authority_unavailable: {message}"
     ))
 }
-fn stale(message: &str) -> ToolError {
+pub(super) fn stale(message: &str) -> ToolError {
     ToolError::Execution(format!("session_discovery_cursor_stale: {message}"))
 }

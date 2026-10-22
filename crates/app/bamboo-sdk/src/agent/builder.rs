@@ -805,6 +805,20 @@ impl AgentBuilder {
                     )
                     .map_err(|error| SdkError::Build(error.to_string()))?;
             }
+            if let Some(store) = self.session_store.clone() {
+                let storage: Arc<dyn bamboo_agent_core::storage::Storage> = store.clone();
+                builtin_tools
+                    .register_tool(bamboo_server_tools::SessionInspectorTool::host_routed(
+                        store.clone(),
+                        storage.clone(),
+                    ))
+                    .map_err(|error| SdkError::Build(error.to_string()))?;
+                builtin_tools
+                    .register_tool(bamboo_server_tools::SessionInspectorTool::current(
+                        store, storage,
+                    ))
+                    .map_err(|error| SdkError::Build(error.to_string()))?;
+            }
             if let (Some(manager), Some(sessions), Some(projects)) = (
                 self.assembled_skill_manager.clone(),
                 self.project_sessions.clone(),
@@ -1800,6 +1814,87 @@ mod tests {
             .unwrap()
             .messages
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn defaults_host_discovery_uses_read_scope_with_configless_sdk_without_granting_raw_history(
+    ) {
+        use bamboo_agent_core::tools::with_executing_session_caller;
+        use bamboo_agent_core::Session;
+        use bamboo_domain::{
+            HostScopeSessionObservation, HostSessionRight, HostSessionScopeBinding,
+            HostSessionTargetScope, SessionCallerReference, HOST_SESSION_SCOPE_VERSION,
+        };
+
+        let home = tempfile::tempdir().unwrap();
+        let agent = AgentBuilder::new()
+            .provider(Arc::new(NeverCalledProvider))
+            .with_defaults_for_data_dir(home.path().into())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(agent.permission_checker.is_none());
+        let tools = agent.inner.default_tools();
+        assert!(tools.owns_exact_tool("session_history_current"));
+        let caller = Session::new("sdk-host-reader", "model");
+        let mut target = Session::new("sdk-host-target", "model");
+        target.set_project_id_meta("explicit-target-project");
+        for session in [&caller, &target] {
+            agent.storage().save_session(session).await.unwrap();
+        }
+        agent
+            .session_store
+            .as_ref()
+            .unwrap()
+            .install_host_session_scope(
+                0,
+                HostSessionScopeBinding {
+                    schema_version: HOST_SESSION_SCOPE_VERSION,
+                    grant_id: uuid::Uuid::new_v4(),
+                    revision: 1,
+                    caller: HostScopeSessionObservation::capture(&caller, vec![]).unwrap(),
+                    targets: [(
+                        target.id.clone(),
+                        HostSessionTargetScope {
+                            observation: HostScopeSessionObservation::capture(&target, vec![])
+                                .unwrap(),
+                            rights: [HostSessionRight::ListMetadata].into(),
+                        },
+                    )]
+                    .into(),
+                    creates: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        for (action, allowed) in [("list", true), ("read_messages", false)] {
+            let args = if action == "list" {
+                serde_json::json!({"action":"list"})
+            } else {
+                serde_json::json!({"action":action,"session_id":target.id})
+            };
+            let call = ToolCall {
+                id: format!("sdk-host-{action}"),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "session_history".into(),
+                    arguments: args.to_string(),
+                },
+            };
+            let observed = with_executing_session_caller(
+                Some(Arc::new(SessionCallerReference::from(&caller))),
+                tools.execute_with_context(&call, execution_context(&caller.id, &call.id)),
+            )
+            .await;
+            if allowed {
+                let page: serde_json::Value =
+                    serde_json::from_str(&observed.unwrap().result).unwrap();
+                assert_eq!(page["sessions"][0]["session_id"], target.id);
+            } else {
+                assert!(observed.is_err());
+            }
+        }
     }
 
     #[test]

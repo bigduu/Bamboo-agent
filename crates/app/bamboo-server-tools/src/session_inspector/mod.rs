@@ -11,6 +11,7 @@ mod context_view;
 pub mod discovery;
 mod handlers;
 mod helpers;
+pub mod host_discovery;
 mod self_history;
 
 use args::SessionInspectorArgs;
@@ -29,6 +30,8 @@ enum SessionHistoryAccess {
     SelfOnly,
     /// Preserve the complete Root viewer in addition to self-history reads.
     Full,
+    /// Self reads plus Host-routed list/inspect. No ordinary raw peer history.
+    HostRouted,
     /// Only metadata discovery and bounded progress through an installed grant adapter.
     Authorized,
 }
@@ -49,6 +52,18 @@ pub struct SessionInspectorTool {
 }
 
 impl SessionInspectorTool {
+    /// Production discovery routing: installed Host scopes take precedence for
+    /// every role. Legacy Supervisor history requires never-installed absence.
+    pub fn host_routed(session_store: Arc<SessionStoreV2>, storage: Arc<dyn Storage>) -> Self {
+        Self {
+            session_store,
+            discovery: Arc::new(host_discovery::SessionDiscoveryRouter::new(storage.clone())),
+            storage,
+            access: SessionHistoryAccess::HostRouted,
+            tool_name: SESSION_HISTORY_TOOL_NAME,
+        }
+    }
+
     pub fn new(session_store: Arc<SessionStoreV2>, storage: Arc<dyn Storage>) -> Self {
         Self {
             session_store,
@@ -130,6 +145,9 @@ impl Tool for SessionInspectorTool {
             SessionHistoryAccess::Full => {
                 "Read-only viewer over local session history. A Supervisor can list only its explicitly authorized targets with a small limit and cursor, inspect bounded persisted progress, or read_messages/get_meta for an attached Root. Directory queries match target IDs or Projects; stale cursors require a new first page. Inspect reports session-scoped persisted evidence, never verified live or input-specific completion. Ordinary legacy viewers retain current-Session search/paging, local history listing and same-tree export_context. This viewer has no runtime control. Send follow-up through session_message(action=send) and its separately installed Host authority; a directory entry does not grant sending rights."
             }
+            SessionHistoryAccess::HostRouted => {
+                "Read-only discovery through explicitly installed Host Session scopes. list returns metadata-only pages and inspect returns bounded persisted progress, never live/input-specific completion or full peer history. Scope is revalidated at the canonical read; IDs, Projects and cursors grant nothing. Use session_history_current or search_current/read_current/read_around for filtered current-Session history. Ordinary callers cannot read another Session's raw history, compressed cache or global search. Only an original real Supervisor with never-installed Host scope retains its existing managed read_messages/get_meta; installed/stale/revoked/unsupported scope never falls back. This tool attaches no history, sends no input and grants no create/send authority."
+            }
             SessionHistoryAccess::Authorized => {
                 "Read-only discovery of explicitly Host-authorized Sessions. list returns metadata-only pages (limit <=20, query matches target ID/Project); reuse the returned cursor with the same query and limit. inspect returns bounded persisted progress and a visible assistant excerpt, never verified live or input-specific completion. Caller identity and grants come from the installed Host adapter. Missing/stale authority is a blocker; this surface never falls back to all local Sessions, attaches history or sends work. Use session_message(action=send) with its own Host authority for delivery; this listing is not a sending grant."
             }
@@ -207,7 +225,7 @@ impl Tool for SessionInspectorTool {
         }
 
         // Keep schema permissive; Rust parsing enforces action-specific requirements.
-        json!({
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "action": {
@@ -245,7 +263,44 @@ impl Tool for SessionInspectorTool {
                 "max_matches": { "type": "number" }
             },
             "required": ["action"]
-        })
+        });
+        if self.access == SessionHistoryAccess::HostRouted {
+            schema["properties"]["action"]["enum"] = json!([
+                "search_current",
+                "read_current",
+                "read_around",
+                "list",
+                "inspect",
+                "get_meta",
+                "read_messages",
+                "read_compressed_cache",
+                "export_context"
+            ]);
+            schema["properties"]["session_id"]["description"] = json!(
+                "inspect uses explicit Host bounded-progress authority. Other actions are self-only, except existing managed get_meta/read_messages for a real Supervisor with never-installed Host scope."
+            );
+            schema["properties"]["query"]["description"] = json!(
+                "Target ID/Project filter for list, or text in current-Session search_current."
+            );
+            schema["properties"]["max_chars"]["description"] = json!("Bounded progress excerpt for inspect (1..8000), or existing current-turn budget for read_current/read_around.");
+            if let Some(properties) = schema["properties"].as_object_mut() {
+                for key in [
+                    "kind",
+                    "pinned",
+                    "parent_session_id",
+                    "root_session_id",
+                    "created_by_schedule_id",
+                    "mode",
+                    "max_sessions",
+                    "tail_messages",
+                    "case_sensitive",
+                    "max_matches",
+                ] {
+                    properties.remove(key);
+                }
+            }
+        }
+        schema
     }
 
     fn classify(&self, _args: &serde_json::Value) -> ToolClass {
@@ -265,10 +320,12 @@ impl Tool for SessionInspectorTool {
         })?;
 
         let action = args.get("action").and_then(serde_json::Value::as_str);
-        let scoped_discovery = self.access == SessionHistoryAccess::Authorized
-            || (self.access == SessionHistoryAccess::Full
-                && (ctx.executing_supervisor.is_some()
-                    || caller_session_id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID));
+        let scoped_discovery = matches!(
+            self.access,
+            SessionHistoryAccess::Authorized | SessionHistoryAccess::HostRouted
+        ) || (self.access == SessionHistoryAccess::Full
+            && (ctx.executing_supervisor.is_some()
+                || caller_session_id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID));
         if self.access == SessionHistoryAccess::Authorized
             && !matches!(action, Some("list" | "inspect"))
         {
@@ -364,6 +421,47 @@ impl Tool for SessionInspectorTool {
             ToolError::InvalidArguments(format!("Invalid {} args: {e}", self.name()))
         })?;
 
+        let routed = self.access == SessionHistoryAccess::HostRouted;
+        let guarded_self =
+            self.access == SessionHistoryAccess::SelfOnly && ctx.executing_caller.is_some();
+        let mut legacy_supervisor_history = false;
+        if routed || guarded_self {
+            host_discovery::validate_original_caller(self.storage.as_ref(), &ctx).await?;
+        }
+        if routed {
+            let other_target = match &parsed {
+                SessionInspectorArgs::GetMeta { session_id }
+                | SessionInspectorArgs::ReadMessages { session_id, .. }
+                | SessionInspectorArgs::ReadCompressedCache { session_id, .. }
+                | SessionInspectorArgs::ExportContext { session_id } => {
+                    session_id != caller_session_id
+                }
+                _ => false,
+            };
+            if matches!(&parsed, SessionInspectorArgs::Search { .. }) {
+                return Err(ToolError::Execution("session_discovery_bounded_scope: global history search is unavailable; use authorized list/inspect or search_current".into()));
+            }
+            if other_target {
+                if matches!(
+                    &parsed,
+                    SessionInspectorArgs::GetMeta { .. }
+                        | SessionInspectorArgs::ReadMessages { .. }
+                ) {
+                    if ctx.executing_supervisor_for(caller_session_id).is_none() {
+                        return Err(ToolError::Execution("session_discovery_bounded_scope: another Session's raw history/metadata is unavailable; use authorized list/inspect".into()));
+                    }
+                    host_discovery::require_absent_host_for_legacy_history(
+                        self.storage.as_ref(),
+                        &ctx,
+                    )
+                    .await?;
+                    legacy_supervisor_history = true;
+                } else {
+                    return Err(ToolError::Execution("session_discovery_bounded_scope: peer raw history/cache/export is unavailable; use authorized list/inspect".into()));
+                }
+            }
+        }
+
         if scoped_discovery
             && matches!(
                 &parsed,
@@ -406,7 +504,7 @@ impl Tool for SessionInspectorTool {
             ));
         }
 
-        if self.access == SessionHistoryAccess::Full
+        if (self.access == SessionHistoryAccess::Full || legacy_supervisor_history)
             && (ctx.executing_supervisor.is_some()
                 || caller_session_id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID)
         {
@@ -445,10 +543,14 @@ impl Tool for SessionInspectorTool {
                 }}).to_string()),
                 _ => unreachable!("scoped action checked before the physical read"),
             };
+            if routed {
+                host_discovery::require_absent_host_for_legacy_history(self.storage.as_ref(), &ctx)
+                    .await?;
+            }
             return Ok(ToolOutcome::Completed(result));
         }
 
-        match parsed {
+        let outcome = match parsed {
             SessionInspectorArgs::SearchCurrent { query, limit } => {
                 handlers::handle_search_current(
                     self,
@@ -601,6 +703,12 @@ impl Tool for SessionInspectorTool {
                 .await
             }
         }
-        .map(ToolOutcome::Completed)
+        .map(ToolOutcome::Completed)?;
+        if routed || guarded_self {
+            // Existing current/self readers retain their own filtering/bounds;
+            // do not return a result from a replaced/reset original caller.
+            host_discovery::validate_original_caller(self.storage.as_ref(), &ctx).await?;
+        }
+        Ok(outcome)
     }
 }

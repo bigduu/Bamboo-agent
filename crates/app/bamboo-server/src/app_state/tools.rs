@@ -452,12 +452,12 @@ pub(super) fn build_root_tools(
         crate::tools::OverlayToolExecutor::new(tools_with_plan, schedule_tasks_tool),
     );
 
-    // Intentional same-name overlay replacement: Root keeps every privileged
-    // cross-session action while Base/Child expose only current-Session reads.
+    // Root discovery uses explicit Host final-read scopes. Base/Child keep
+    // current-Session reads until their separately owned surface integration.
     let spawn_creator = root_creator.clone();
     let spawn_storage = storage.clone();
     let spawn_config = config.clone();
-    let session_inspector_tool = Arc::new(crate::tools::SessionInspectorTool::new(
+    let session_inspector_tool = Arc::new(crate::tools::SessionInspectorTool::host_routed(
         session_store.clone(),
         storage,
     ));
@@ -989,6 +989,87 @@ mod session_message_assembly_tests {
             .unwrap()
             .messages
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn root_installed_history_routes_explicit_host_scope_without_opening_raw_peer_history() {
+        use bamboo_agent_core::tools::with_executing_session_caller;
+        use bamboo_domain::{
+            HostScopeSessionObservation, HostSessionRight, HostSessionScopeBinding,
+            HostSessionTargetScope, SessionCallerReference, HOST_SESSION_SCOPE_VERSION,
+        };
+
+        let home = tempfile::tempdir().unwrap();
+        let state = super::super::AppState::new_with_provider(
+            home.path().into(),
+            Config::default(),
+            Arc::new(super::super::UnconfiguredProvider {
+                message: "Host discovery must never call a model".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let caller = Session::new("installed-host-reader", "model");
+        let mut target = Session::new("installed-host-target", "model");
+        target.set_project_id_meta("explicit-target-project");
+        for session in [&caller, &target] {
+            state.storage.save_session(session).await.unwrap();
+        }
+        state
+            .session_store
+            .install_host_session_scope(
+                0,
+                HostSessionScopeBinding {
+                    schema_version: HOST_SESSION_SCOPE_VERSION,
+                    grant_id: uuid::Uuid::new_v4(),
+                    revision: 1,
+                    caller: HostScopeSessionObservation::capture(&caller, vec![]).unwrap(),
+                    targets: [(
+                        target.id.clone(),
+                        HostSessionTargetScope {
+                            observation: HostScopeSessionObservation::capture(&target, vec![])
+                                .unwrap(),
+                            rights: [HostSessionRight::ListMetadata].into(),
+                        },
+                    )]
+                    .into(),
+                    creates: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let tools = state.tools_for(crate::tools::ToolSurface::Root);
+        for (action, allowed) in [("list", true), ("get_meta", false)] {
+            let args = if action == "list" {
+                json!({"action":"list"})
+            } else {
+                json!({"action":action,"session_id":target.id})
+            };
+            let call = ToolCall {
+                id: format!("installed-host-{action}"),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "session_history".into(),
+                    arguments: args.to_string(),
+                },
+            };
+            let mut ctx = ToolExecutionContext::none(&call.id);
+            ctx.session_id = Some(&caller.id);
+            ctx.plan_read_only = true;
+            let observed = with_executing_session_caller(
+                Some(Arc::new(SessionCallerReference::from(&caller))),
+                tools.execute_with_context(&call, ctx),
+            )
+            .await;
+            if allowed {
+                let page: serde_json::Value =
+                    serde_json::from_str(&observed.unwrap().result).unwrap();
+                assert_eq!(page["sessions"][0]["session_id"], target.id);
+                assert_eq!(page["sessions"][0]["authorization_revision"], 1);
+            } else {
+                assert!(observed.is_err());
+            }
+        }
     }
 }
 
