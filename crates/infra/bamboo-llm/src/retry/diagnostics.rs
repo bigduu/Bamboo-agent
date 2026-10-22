@@ -91,9 +91,7 @@ fn push_bounded(events: &mut VecDeque<InitialRequestDiagnostic>, event: InitialR
 }
 
 fn public_summary(event: &InitialRequestDiagnostic) -> Option<bamboo_domain::LlmRequestDiagnostic> {
-    if event.stop_reason.is_none() {
-        return None;
-    }
+    event.stop_reason?;
     bamboo_domain::LlmRequestDiagnostic::from_json(&serde_json::to_string(event).ok()?)
 }
 
