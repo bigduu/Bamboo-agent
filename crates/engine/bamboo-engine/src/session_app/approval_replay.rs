@@ -166,6 +166,17 @@ fn retained_operation(
     .map_err(|error| AgentError::Tool(error.into()))
 }
 
+/// Restore the original generic caller only from the validated host record.
+/// Legacy readable history has no generic observation; do not mint one from
+/// the Session that happened to be reloaded for this replay.
+pub fn restore_permission_replay_caller(
+    session: &Session,
+    target: &PermissionReplayTarget,
+) -> Result<Option<bamboo_domain::SessionCallerReference>, AgentError> {
+    retained_operation(session, target)
+        .map(|operation| operation.map(|operation| operation.caller().clone()))
+}
+
 fn retained_request(
     session: &Session,
     target: &PermissionReplayTarget,
@@ -1690,6 +1701,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn replay_caller_requires_its_original_host_record_and_never_recaptures() {
+        let session = frozen_spawn_session(None, "SubAgent");
+        let target =
+            find_permission_replay_target(&session, "call-1", Some("generation-1")).unwrap();
+        let original = bamboo_domain::SessionCallerReference::from(&session);
+        assert_eq!(
+            restore_permission_replay_caller(&session, &target).unwrap(),
+            Some(original)
+        );
+
+        let mut replacement = session.clone();
+        replacement.created_at += chrono::Duration::seconds(1);
+        let before = serde_json::to_value(&replacement).unwrap();
+        assert!(restore_permission_replay_caller(&replacement, &target).is_err());
+        assert_eq!(serde_json::to_value(&replacement).unwrap(), before);
+
+        let mut legacy = session.clone();
+        legacy
+            .messages
+            .last_mut()
+            .unwrap()
+            .metadata
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove(PENDING_TOOL_OPERATION_METADATA_KEY);
+        assert!(restore_permission_replay_caller(&legacy, &target)
+            .unwrap()
+            .is_none());
+        let mut forged = legacy;
+        forged.messages.last_mut().unwrap().content = session
+            .messages
+            .last()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()
+            .to_string();
+        assert!(restore_permission_replay_caller(&forged, &target).is_err());
     }
 
     #[test]

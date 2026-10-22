@@ -115,7 +115,8 @@ pub use agentic::{
 };
 pub use bash_completion::{BashCompletionInfo, BashCompletionSink};
 pub use context::{
-    ExecutingSupervisorObservation, ToolExecutionContext, ToolExecutionSessionFlags,
+    with_executing_session_caller, ExecutingSupervisorObservation, ToolExecutionContext,
+    ToolExecutionSessionFlags,
 };
 pub use executor::{execute_tool_call, execute_tool_call_with_context, ToolError, ToolExecutor};
 pub use output_cap_observation::{observed_tool_output_cap, scope_tool_output_cap};

@@ -526,6 +526,7 @@ async fn execute_sub_actions_with_persistence(
     // appended after an awaited tool. Configuration reloads cannot rebind it.
     let executing_supervisor =
         ExecutingSupervisorObservation::capture_from_executing_session(session);
+    let executing_caller = Arc::new(bamboo_domain::SessionCallerReference::from(&*session));
     let mut pending: VecDeque<ToolCall> = actions.iter().cloned().collect();
     let mut processed = 0usize;
     let available_tools = tools.list_tools();
@@ -648,31 +649,34 @@ async fn execute_sub_actions_with_persistence(
         )
         .with_executing_supervisor(executing_supervisor);
 
-        match super::context::with_root_actor_tool_writer(None, async {
-            if let Some(execution_name) = execution_name.as_deref() {
-                tools
-                    .execute_exact_with_context_outcome(&action, execution_name, tool_ctx)
+        match super::context::with_executing_session_caller(
+            Some(Arc::clone(&executing_caller)),
+            super::context::with_root_actor_tool_writer(None, async {
+                if let Some(execution_name) = execution_name.as_deref() {
+                    tools
+                        .execute_exact_with_context_outcome(&action, execution_name, tool_ctx)
+                        .await
+                        .map(crate::tools::ToolOutcome::into_tool_result)
+                } else if crate::tools::capture_suspension_restriction().is_some() {
+                    crate::tools::executor::execute_tool_call_with_context_outcome(
+                        &action,
+                        tools,
+                        composition_executor.clone(),
+                        tool_ctx,
+                    )
                     .await
                     .map(crate::tools::ToolOutcome::into_tool_result)
-            } else if crate::tools::capture_suspension_restriction().is_some() {
-                crate::tools::executor::execute_tool_call_with_context_outcome(
-                    &action,
-                    tools,
-                    composition_executor.clone(),
-                    tool_ctx,
-                )
-                .await
-                .map(crate::tools::ToolOutcome::into_tool_result)
-            } else {
-                execute_tool_call_with_context(
-                    &action,
-                    tools,
-                    composition_executor.clone(),
-                    tool_ctx,
-                )
-                .await
-            }
-        })
+                } else {
+                    execute_tool_call_with_context(
+                        &action,
+                        tools,
+                        composition_executor.clone(),
+                        tool_ctx,
+                    )
+                    .await
+                }
+            }),
+        )
         .await
         {
             Ok(result) => {

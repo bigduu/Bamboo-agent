@@ -343,7 +343,11 @@ async fn execute_tool_call_only_with_execution_name(
 ) -> Result<ToolExecutionOutcome, AgentError> {
     let noninteractive = crate::runtime::loop_control::suspension::active(ctx.config);
     let control = ctx.config.loop_control.as_ref();
-    let dispatch = execute_tool_call_only_with_execution_name_inner(execution_name, ctx);
+    let caller = ctx.executing_caller.cloned().map(Arc::new);
+    let dispatch = bamboo_agent_core::tools::with_executing_session_caller(
+        caller,
+        execute_tool_call_only_with_execution_name_inner(execution_name, ctx),
+    );
     if let Some(control) = control {
         let (outcome, observation) =
             bamboo_agent_core::tools::observe_tool_suspension(noninteractive, dispatch).await;

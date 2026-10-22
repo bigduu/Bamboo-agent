@@ -33,8 +33,8 @@ use bamboo_engine::runtime::execution::agent_spawn::{
 use bamboo_engine::session_app::approval_replay::{
     apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
     repark_permission_replay, resolve_permission_replay_owner,
-    restore_permission_replay_authorization, validate_permission_replay_authority,
-    ApprovalReplayDecision, PermissionReplayTarget,
+    restore_permission_replay_authorization, restore_permission_replay_caller,
+    validate_permission_replay_authority, ApprovalReplayDecision, PermissionReplayTarget,
 };
 use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
 use bamboo_engine::session_app::repository::SessionAccess;
@@ -813,6 +813,16 @@ impl ResumeExecutionPort for ConnectResumePort {
                         return;
                     }
                 };
+                let executing_caller = match restore_permission_replay_caller(
+                    &session,
+                    &replay_target,
+                ) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        tracing::error!(%session_id, %error, "original caller replay binding failed closed; markers preserved");
+                        return;
+                    }
+                };
                 let configured_mode = ctx
                     .permission_checker
                     .permission_config()
@@ -918,7 +928,9 @@ impl ResumeExecutionPort for ConnectResumePort {
                             session.id.as_str(),
                             reexecute_tool_call_id.as_str(),
                             reexecute_request_generation.as_deref(),
-                            executor.execute_exact_with_context_outcome(
+                            bamboo_agent_core::tools::with_executing_session_caller(
+                                executing_caller.map(std::sync::Arc::new),
+                                executor.execute_exact_with_context_outcome(
                                 &tool_call,
                                 replay_owner,
                                 ToolExecutionContext {
@@ -941,6 +953,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                                     bash_completion_sink: None,
                                     pre_parsed_args: None,
                                 },
+                                ),
                             ),
                         )
                         .await.map(bamboo_agent_core::tools::ToolOutcome::into_tool_result);

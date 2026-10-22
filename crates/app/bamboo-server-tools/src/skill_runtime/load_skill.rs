@@ -393,7 +393,10 @@ impl LoadSkillTool {
             let timeout_ms = declaration.timeout_ms.clamp(1, MAX_TIMEOUT_MS);
             let result = tokio::time::timeout(
                 Duration::from_millis(timeout_ms),
-                tools.execute_with_context_outcome(&call, execution_context),
+                bamboo_agent_core::tools::with_executing_session_caller(
+                    ctx.executing_caller_for(&session.id).cloned().map(Arc::new),
+                    tools.execute_with_context_outcome(&call, execution_context),
+                ),
             )
             .await
             .map(|outcome| outcome.map(ToolOutcome::enforce_suspension_restriction));

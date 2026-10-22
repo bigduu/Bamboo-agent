@@ -21,6 +21,11 @@ impl Tool for VersionedProbeTool {
         bamboo_agent_core::ToolClass::MUTATING_SERIAL
     }
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
+        assert!(
+            ctx.executing_caller_for(ctx.session_id().expect("real SDK caller"))
+                .is_some(),
+            "fresh and retained SDK invocation must carry the original host observation"
+        );
         self.probe.calls.lock().unwrap().push(Invocation {
             name: self.name.into(),
             arguments: args,

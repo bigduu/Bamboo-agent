@@ -43,6 +43,12 @@ impl PendingToolOperation {
         &self.execution_name
     }
 
+    /// Original host-captured identity, available only after `restore` validates
+    /// the retained occurrence. It must never be refreshed from current config.
+    pub fn caller(&self) -> &SessionCallerReference {
+        &self.caller
+    }
+
     pub fn metadata_value(&self) -> Value {
         serde_json::to_value(self).expect("pending operation binding serializes")
     }
