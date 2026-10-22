@@ -127,6 +127,8 @@ mod startup_sidecar_tests;
 mod task_publication_lifetime_tests;
 use default_actor_context::DefaultWriterGuards;
 pub(crate) use default_actor_context::DefaultWriterPhysicalGuards;
+#[cfg(test)]
+mod conversation_generation_tests;
 mod root_context;
 #[cfg(test)]
 mod root_context_tests;
@@ -586,7 +588,27 @@ fn reject_incompatible_session_write(session: &Session) -> io::Result<()> {
             io::ErrorKind::Unsupported,
             bamboo_domain::SessionAuthorityConflict(error.to_string()),
         )
+    })?;
+    session.validate_conversation_state().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            bamboo_domain::SessionAuthorityConflict(error.to_string()),
+        )
     })
+}
+
+fn reject_conversation_generation_change(
+    incoming: &Session,
+    canonical: &Session,
+) -> io::Result<()> {
+    incoming
+        .check_conversation_generation(canonical)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                bamboo_domain::SessionAuthorityConflict(error.to_string()),
+            )
+        })
 }
 
 fn reject_session_version_change(incoming: &Session, durable: &Session) -> io::Result<()> {
@@ -1531,6 +1553,7 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     copy.observed_runtime_session_version = None;
     copy.authority_identity = SessionAuthorityIdentity::Ordinary;
     copy.supervisor_management = None;
+    copy.conversation_reset = None;
     copy.id = new_id.to_string();
     copy.kind = SessionKind::Root;
     copy.parent_session_id = None;
@@ -5467,6 +5490,11 @@ impl SessionStoreV2 {
         reject_incompatible_session_write(&session)?;
         self.validate_root_context_for_save(&session).await?;
 
+        if session.conversation_reset.is_some() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, bamboo_domain::SessionAuthorityConflict(
+                "conversation generation requires a fenced reset transaction; legacy clear is unavailable".into(),
+            )));
+        }
         // Keep only the first System message if present; drop all other messages.
         let system_msg = session
             .messages
@@ -6291,6 +6319,7 @@ impl SessionStoreV2 {
             .await?
         {
             reject_incompatible_session_write(&durable)?;
+            reject_conversation_generation_change(session, &durable)?;
         }
         if let Some(previous) = Self::read_runtime_sidecar_at(
             &self.abs_path_from_rel(rel).join(RUNTIME_SIDECAR_FILE),
@@ -6299,6 +6328,7 @@ impl SessionStoreV2 {
         .await?
         {
             reject_incompatible_session_write(&previous)?;
+            reject_conversation_generation_change(session, &previous)?;
             // Runtime does not own Main's stamp. Legacy absence and v1 have
             // identical semantics; never turn this compatible pair into a
             // false conflict or rewrite Main from the runtime-only path.
@@ -6515,6 +6545,7 @@ impl SessionStoreV2 {
                 compact_main::validate_full_main(raw.as_bytes())?;
                 let durable: Session = serde_json::from_str(&raw)
                     .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
+                reject_conversation_generation_change(session, &durable)?;
                 reject_session_version_change(session, &durable)?;
                 if let Some(mut previous_runtime) = Self::read_runtime_sidecar_at(
                     &current_main

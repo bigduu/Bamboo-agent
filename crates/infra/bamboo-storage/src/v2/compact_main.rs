@@ -6,8 +6,8 @@ use std::fmt;
 use std::io::{self, Write};
 
 use bamboo_domain::{
-    RootModeOperationReceipt, Session, SessionAuthorityIdentity, SessionKind,
-    SupervisorManagementState, ROOT_MODE_OPERATION_HISTORY_LIMIT,
+    ConversationResetState, RootModeOperationReceipt, Session, SessionAuthorityIdentity,
+    SessionKind, SupervisorManagementState, ROOT_MODE_OPERATION_HISTORY_LIMIT,
 };
 use chrono::{DateTime, Utc};
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -19,6 +19,8 @@ pub(super) const SECTION_CAP: usize = 512 * 1024;
 pub(super) const PREFIX: &[u8] = b"{\"_bamboo_main_authority\":{\"version\":1,\"payload_bytes\":\"";
 pub(super) const PREFIX_V2: &[u8] =
     b"{\"_bamboo_main_authority\":{\"version\":2,\"payload_bytes\":\"";
+pub(super) const PREFIX_V3: &[u8] =
+    b"{\"_bamboo_main_authority\":{\"version\":3,\"payload_bytes\":\"";
 const MIDDLE: &[u8] = b"\",\"payload\":";
 const CLOSE: &[u8] = b"},";
 pub(super) const HEADER_BYTES: usize = PREFIX.len() + 10 + MIDDLE.len();
@@ -47,6 +49,8 @@ pub(super) struct CompactMainAuthority {
     root_mode_transition_epoch: u64,
     root_mode_operations: Vec<RootModeOperationReceipt>,
     supervisor_management: Option<SupervisorManagementState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_reset: Option<ConversationResetState>,
     title_label: String,
 }
 
@@ -78,6 +82,7 @@ impl CompactMainAuthority {
             root_mode_transition_epoch: session.root_mode_transition_epoch,
             root_mode_operations: session.root_mode_operations.clone(),
             supervisor_management: session.supervisor_management.clone(),
+            conversation_reset: session.conversation_reset.clone(),
             title_label: public_title(&session.title),
         }
     }
@@ -99,6 +104,7 @@ impl CompactMainAuthority {
         session.root_mode_transition_epoch = self.root_mode_transition_epoch;
         session.root_mode_operations = self.root_mode_operations;
         session.supervisor_management = self.supervisor_management;
+        session.conversation_reset = self.conversation_reset;
         if let Some(project) = self.project_id {
             session.set_project_id_meta(project);
         }
@@ -119,6 +125,10 @@ impl CompactMainAuthority {
             };
             management.validate(incarnation_id).map_err(|_| invalid())?;
         }
+        self.clone()
+            .into_snapshot_session()
+            .validate_conversation_state()
+            .map_err(|_| invalid())?;
         Ok(())
     }
 }
@@ -158,7 +168,9 @@ pub(super) fn serialize_main(session: &Session) -> io::Result<Vec<u8>> {
     let suffix = flat.strip_prefix(b"{").ok_or_else(invalid)?;
     let capacity = section_len.checked_add(suffix.len()).ok_or_else(invalid)?;
     let mut output = Vec::with_capacity(capacity);
-    output.extend_from_slice(if session.parent_created_at.is_some() {
+    output.extend_from_slice(if session.conversation_reset.is_some() {
+        PREFIX_V3
+    } else if session.parent_created_at.is_some() {
         PREFIX_V2
     } else {
         PREFIX
@@ -174,7 +186,10 @@ pub(super) fn serialize_main(session: &Session) -> io::Result<Vec<u8>> {
 /// Checked framing shared by full-buffer compatibility and retained-FD readers.
 /// This observes only the fixed header; callers enforce their own section budget.
 pub(super) fn section_length(header: &[u8]) -> io::Result<usize> {
-    if !header.starts_with(PREFIX) && !header.starts_with(PREFIX_V2) {
+    if !header.starts_with(PREFIX)
+        && !header.starts_with(PREFIX_V2)
+        && !header.starts_with(PREFIX_V3)
+    {
         return Err(invalid());
     }
     let digits_end = PREFIX.len().checked_add(10).ok_or_else(invalid)?;
@@ -214,7 +229,10 @@ pub(super) fn decode_v1_section(bytes: &[u8], cap: usize) -> io::Result<CompactM
     if serde_json::to_value(&authority).map_err(|_| invalid())? != value.0 {
         return Err(invalid());
     }
-    if bytes.starts_with(PREFIX_V2) != authority.parent_created_at.is_some() {
+    if bytes.starts_with(PREFIX_V3) != authority.conversation_reset.is_some()
+        || (!bytes.starts_with(PREFIX_V3)
+            && bytes.starts_with(PREFIX_V2) != authority.parent_created_at.is_some())
+    {
         return Err(invalid());
     }
     authority.validate()?;
@@ -275,6 +293,7 @@ impl<'de> Deserialize<'de> for MainFields<'de> {
                             | "root_mode_transition_epoch"
                             | "root_mode_operations"
                             | "supervisor_management"
+                            | "conversation_reset"
                             | "title"
                             | "metadata"
                             | "runtime_metadata"
@@ -373,6 +392,7 @@ impl FlatAuthority {
             root_mode_transition_epoch: default(fields, "root_mode_transition_epoch")?,
             root_mode_operations: get_or_unique_default(fields, "root_mode_operations")?,
             supervisor_management: get_or_unique_default(fields, "supervisor_management")?,
+            conversation_reset: get_or_unique_default(fields, "conversation_reset")?,
             title_label: public_title(&default::<String>(fields, "title")?),
         })
     }
