@@ -10,6 +10,7 @@ use crate::Session;
 
 pub const LAST_RUN_LLM_DIAGNOSTIC_KEY: &str = "runtime.llm_request_diagnostic";
 const MAX_DIAGNOSTIC_BYTES: usize = 4096;
+const DIAGNOSTIC_RUN_FINGERPRINT_KEY: &str = "runtime.llm_request_diagnostic_run";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -171,6 +172,28 @@ impl LlmRequestDiagnostic {
 }
 
 impl Session {
+    fn llm_diagnostic_run_fingerprint(&self) -> Option<String> {
+        self.agent_runtime_state.as_ref().map(|state| {
+            let mut digest = Sha256::new();
+            digest.update(b"bamboo-llm-diagnostic-run-v1\0");
+            digest.update((state.run_id.len() as u64).to_be_bytes());
+            digest.update(state.run_id.as_bytes());
+            if let Some(execution) = &state.execution_id {
+                digest.update([1]);
+                digest.update((execution.len() as u64).to_be_bytes());
+                digest.update(execution.as_bytes());
+            } else {
+                digest.update([0]);
+            }
+            hex::encode(&digest.finalize()[..16])
+        })
+    }
+
+    pub(crate) fn clear_llm_request_diagnostic(&mut self) {
+        self.metadata.remove(LAST_RUN_LLM_DIAGNOSTIC_KEY);
+        self.metadata.remove(DIAGNOSTIC_RUN_FINGERPRINT_KEY);
+    }
+
     fn stored_llm_request_diagnostic(&self) -> Option<LlmRequestDiagnostic> {
         let diagnostic =
             LlmRequestDiagnostic::from_json(self.metadata.get(LAST_RUN_LLM_DIAGNOSTIC_KEY)?)?;
@@ -178,8 +201,11 @@ impl Session {
             .agent_runtime_state
             .as_ref()
             .and_then(|state| Uuid::parse_str(&state.run_id).ok());
-        (diagnostic.matches_session(&self.id) && diagnostic.0.run_id == run_id)
-            .then_some(diagnostic)
+        let expected_run = self.llm_diagnostic_run_fingerprint();
+        (diagnostic.matches_session(&self.id)
+            && diagnostic.0.run_id == run_id
+            && self.metadata.get(DIAGNOSTIC_RUN_FINGERPRINT_KEY) == expected_run.as_ref())
+        .then_some(diagnostic)
     }
 
     /// Capture only the observer for this actual provider call; existing final
@@ -200,6 +226,15 @@ impl Session {
         }
         self.metadata
             .insert(LAST_RUN_LLM_DIAGNOSTIC_KEY.into(), raw);
+        match self.llm_diagnostic_run_fingerprint() {
+            Some(fingerprint) => {
+                self.metadata
+                    .insert(DIAGNOSTIC_RUN_FINGERPRINT_KEY.into(), fingerprint);
+            }
+            None => {
+                self.metadata.remove(DIAGNOSTIC_RUN_FINGERPRINT_KEY);
+            }
+        }
         true
     }
 
@@ -208,7 +243,7 @@ impl Session {
             .stored_llm_request_diagnostic()
             .is_some_and(|d| d.matches_error_message(error))
         {
-            self.metadata.remove(LAST_RUN_LLM_DIAGNOSTIC_KEY);
+            self.clear_llm_request_diagnostic();
         }
     }
 
@@ -291,5 +326,28 @@ mod tests {
         session.agent_runtime_state =
             Some(crate::AgentRuntimeState::new(Uuid::new_v4().to_string()));
         assert!(session.last_run_diagnostic().is_none());
+    }
+
+    #[test]
+    fn non_uuid_run_and_execution_replacement_cannot_reuse_the_old_receipt() {
+        let mut session = Session::new("diagnostic-current", "model");
+        let mut runtime = crate::AgentRuntimeState::new("private-non-uuid-run-a");
+        runtime.execution_id = Some("private-execution-a".into());
+        session.agent_runtime_state = Some(runtime);
+        let diagnostic = sample(&session);
+        session.record_llm_request_diagnostic(diagnostic.clone());
+        session.set_last_run_error(diagnostic.error_message());
+        let encoded = serde_json::to_string(&session).unwrap();
+        let mut cold: Session = serde_json::from_str(&encoded).unwrap();
+        assert!(cold.last_run_diagnostic().is_some());
+        let public = serde_json::to_string(&cold.last_run_diagnostic().unwrap()).unwrap();
+        assert!(!public.contains("private-non-uuid-run-a"));
+        assert!(!public.contains("private-execution-a"));
+        cold.agent_runtime_state.as_mut().unwrap().run_id = "private-non-uuid-run-b".into();
+        assert!(cold.last_run_diagnostic().is_none());
+        let mut cold: Session = serde_json::from_str(&encoded).unwrap();
+        cold.agent_runtime_state.as_mut().unwrap().execution_id =
+            Some("private-execution-b".into());
+        assert!(cold.last_run_diagnostic().is_none());
     }
 }

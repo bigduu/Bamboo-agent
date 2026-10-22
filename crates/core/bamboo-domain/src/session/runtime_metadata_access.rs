@@ -92,7 +92,7 @@ impl Session {
     }
 
     pub fn clear_last_run_error(&mut self) {
-        self.metadata.remove(crate::LAST_RUN_LLM_DIAGNOSTIC_KEY);
+        self.clear_llm_request_diagnostic();
         if let Some(rm) = self.runtime_metadata.as_mut() {
             rm.last_run_error = None;
         }
