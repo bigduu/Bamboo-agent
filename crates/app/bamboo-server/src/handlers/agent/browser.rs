@@ -81,6 +81,18 @@ fn parse_open_request(body: &[u8]) -> Result<BrowserOpenRequest, BrowserError> {
             "browser open request too large".into(),
         ));
     }
+    // Derived struct decoding also accepts sequences such as [] with default
+    // fields. The HTTP contract allows only an object (or no body at all).
+    if body
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        != Some(b'{')
+    {
+        return Err(BrowserError::Invalid(
+            "browser open request must be an object".into(),
+        ));
+    }
     serde_json::from_slice(body)
         .map_err(|_| BrowserError::Invalid("profile_mode must be shared or clean".into()))
 }
@@ -115,7 +127,7 @@ mod profile_contract_tests {
 
     #[test]
     fn open_accepts_only_empty_or_strict_optional_profile_mode() {
-        for bytes in [b"".as_slice(), b"{}"] {
+        for bytes in [b"".as_slice(), b"{}", b" \n{}\r\n"] {
             assert_eq!(parse_open_request(bytes).unwrap().profile_mode, None);
         }
         assert_eq!(
@@ -133,6 +145,9 @@ mod profile_contract_tests {
         for bytes in [
             b"null".as_slice(),
             b"[]",
+            br#"["clean"]"#,
+            b"[null]",
+            br#"[{"profile_mode":"clean"}]"#,
             b" ",
             b"true",
             br#"{"profile_mode":null}"#,
@@ -140,10 +155,11 @@ mod profile_contract_tests {
             br#"{"profile_mode":"clean","session_id":"other"}"#,
             br#"{"profile_mode":"shared","profile_mode":"clean"}"#,
         ] {
-            assert!(matches!(
-                parse_open_request(bytes),
-                Err(BrowserError::Invalid(_))
-            ));
+            assert!(
+                matches!(parse_open_request(bytes), Err(BrowserError::Invalid(_))),
+                "unexpectedly accepted request: {}",
+                String::from_utf8_lossy(bytes)
+            );
         }
     }
 
