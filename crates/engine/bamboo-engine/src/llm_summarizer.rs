@@ -2357,7 +2357,13 @@ mod tests {
     #[tokio::test]
     async fn bounded_pipeline_chunks_large_source_and_never_compounds_twenty_percent_target() {
         let provider = Arc::new(BoundedRequestCaptureProvider::default());
-        let budget = bounded_budget(3_000, 800, 100, 600);
+        // Provenance and source-boundary guidance count toward the request.
+        // This final fixture needs about 2,540 tokens including its 600-token
+        // output and safety margin; a 3,000-token window permits only 2,400.
+        // Leave enough room for a single final reduce while still requiring
+        // multiple maps and an intermediate reduce. Multipart tests retain
+        // their smaller windows.
+        let budget = bounded_budget(3_300, 800, 100, 600);
         let summarizer = LlmSummarizer::new(
             provider.clone(),
             "small-summary-model".to_string(),
@@ -2399,6 +2405,7 @@ mod tests {
             .summarize_with_report(&messages)
             .await
             .expect("chunked summary");
+        assert_eq!(report.target_summary_tokens, 600);
         assert!(report.map_calls > 1, "large source must use multiple maps");
         assert!(
             report.reduce_calls >= 1,
@@ -2430,6 +2437,13 @@ mod tests {
             "large ordered partials should be recursively reduced before the final merge"
         );
         let final_request = requests.last().expect("final reduce request");
+        assert!(
+            final_request.0.iter().any(|message| {
+                message.role == Role::System
+                    && message.content.starts_with("You are the final reduce stage")
+            }),
+            "this fixture must reach a single final reduce, not a multipart section"
+        );
         let final_rendered = final_request
             .0
             .iter()
