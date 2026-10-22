@@ -1,11 +1,13 @@
-//! Process-owned browser sessions shared by HTTP workbench requests and agent tools.
-//! Each chat session has one isolated Playwright context in a child Node process.
+//! One account browser process with chat-owned pages and optional clean contexts.
+//! The HTTP workbench and agent tools share the same canonical chat scope.
 
 #[cfg(all(test, unix))]
 mod concurrent_drain_tests;
 #[cfg(test)]
 mod persistence_tests;
 mod profile;
+mod shared;
+pub use shared::BrowserProfileMode;
 #[cfg(test)]
 mod reset_tests;
 #[cfg(all(test, unix))]
@@ -27,6 +29,46 @@ pub(crate) fn test_profile_directory(root: &std::path::Path, session_id: &str) -
 #[cfg(test)]
 pub(crate) fn test_retired_count(browser: &BrowserManager) -> usize {
     browser.retired.lock().unwrap().len()
+}
+
+/// Existing EOF/marker fixtures model persistence, not browser pages. Adapt
+/// their wire envelope to the production v2 owner contract without replacing
+/// any physical EOF, checkpoint or filesystem-failure behavior they exercise.
+#[cfg(all(test, unix))]
+fn test_shared_protocol(script: String) -> String {
+    const ADAPTER: &str = r#"import json
+_fixture_loads = json.loads
+_fixture_dumps = json.dumps
+_fixture_requests = {}
+_fixture_modes = {}
+def _fixture_decode(line, *args, **kwargs):
+    request = _fixture_loads(line, *args, **kwargs)
+    if isinstance(request, dict) and request.get('version') == 2:
+        _fixture_requests[request['id']] = request
+    return request
+def _fixture_encode(value, *args, **kwargs):
+    if isinstance(value, dict) and 'id' in value:
+        request = _fixture_requests.pop(value['id'], None)
+        if request is not None:
+            value = dict(value, version=2, host_generation='a' * 24)
+            action = request.get('action')
+            if action == 'runtime_state':
+                value['result'] = {'protocol_version':2, 'host_generation':'a' * 24,
+                    'browser_instance_id':'b' * 24, 'scope_count':0, 'profile_modes':['shared','clean']}
+            else:
+                owner = request['scope_id']
+                value.update(scope_id=owner, scope_generation=request['scope_generation'])
+                if action == 'scope_close':
+                    _fixture_modes.pop(owner, None)
+                    value['result'] = {'closed':True}
+                else:
+                    mode = _fixture_modes.setdefault(owner, request.get('args', {}).get('profile_mode', 'shared'))
+                    value['result'] = dict(value.get('result', {}), profile_mode=mode, storage_shared=mode == 'shared')
+    return _fixture_dumps(value, *args, **kwargs)
+json.loads = _fixture_decode
+json.dumps = _fixture_encode
+"#;
+    [ADAPTER, &script].join("\n")
 }
 
 use std::collections::{HashMap, HashSet};
@@ -57,6 +99,8 @@ pub enum BrowserError {
     Unavailable(String),
     #[error("browser session not open")]
     NotOpen,
+    #[error("close this chat browser before changing profile mode")]
+    ProfileModeConflict,
     #[error("browser page changed; refresh state and retry")]
     StaleEpoch,
     #[error("browser dialog is no longer pending")]
@@ -82,6 +126,7 @@ pub struct BrowserFrame {
 #[derive(Clone, Default)]
 pub struct BrowserManager {
     profile_root: Option<Arc<PathBuf>>,
+    shared: Arc<shared::SharedManager>,
     sessions: Arc<AsyncMutex<HashMap<String, Arc<BrowserSession>>>>,
     session_gates: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
     retired: Arc<Mutex<HashSet<String>>>,
@@ -208,6 +253,9 @@ impl BrowserCleanup {
 struct BrowserSession {
     child: Arc<Mutex<Child>>,
     cleanup: Arc<BrowserCleanup>,
+    protocol_v2: AtomicBool,
+    shared_router: Mutex<Weak<shared::SharedRuntime>>,
+    handshake_generation: Mutex<Option<String>>,
     profile_lease: Mutex<Option<profile::Lease>>,
     /// Owns the host's TMPDIR, including Chromium's download scratch files.
     temp_dir: Mutex<Option<tempfile::TempDir>>,
@@ -482,10 +530,44 @@ fn restrict_host_environment(command: &mut Command) {
     }
 }
 
+/// Bound native buffering before allocation, including an unterminated record.
+/// A compromised or broken host cannot make lines() grow without a limit.
+async fn read_host_line<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let bytes = reader.fill_buf().await?;
+        if bytes.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "incomplete browser frame"))
+            };
+        }
+        let end = bytes.iter().position(|byte| *byte == b'\n');
+        let length = end.map_or(bytes.len(), |index| index + 1);
+        if line.len().saturating_add(length) > shared::MAX_FRAME_BYTES {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "browser frame too large"));
+        }
+        line.extend_from_slice(&bytes[..length]);
+        reader.consume(length);
+        if end.is_some() { return Ok(Some(line)); }
+    }
+}
+
 impl BrowserSession {
     async fn spawn(
         profile_lease: Option<profile::Lease>,
         lifecycle: &BrowserLifecycle,
+    ) -> Result<Arc<Self>, BrowserError> {
+        Self::spawn_protocol(profile_lease, lifecycle, false).await
+    }
+
+    async fn spawn_protocol(
+        profile_lease: Option<profile::Lease>,
+        lifecycle: &BrowserLifecycle,
+        shared: bool,
     ) -> Result<Arc<Self>, BrowserError> {
         let script = host_script();
         if !script.is_file() {
@@ -497,6 +579,9 @@ impl BrowserSession {
         let node = std::env::var_os("BAMBOO_BROWSER_NODE").unwrap_or_else(|| "node".into());
         let mut command = Command::new(node);
         restrict_host_environment(&mut command);
+        if shared {
+            command.env("BAMBOO_BROWSER_HOST_PROTOCOL", "2");
+        }
         if let Some(lease) = &profile_lease {
             command.env("BAMBOO_BROWSER_PROFILE_DIR", &lease.path);
         }
@@ -523,15 +608,22 @@ impl BrowserSession {
         let child = lifecycle.spawn_child(&mut command)?;
         let session = Self::from_child_tracked(child, Some(temp_dir), lifecycle)?;
         *session.profile_lease.lock().unwrap() = profile_lease;
+        session.protocol_v2.store(shared, Ordering::Release);
         let mut abort_guard = BrowserCallAbortGuard::new(session.clone(), None);
         // The first state request doubles as a readiness probe. A missing
         // Playwright package or Chromium binary fails here, not on first click.
-        let readiness = session.call("state", json!({})).await;
+        let readiness = session.call(if shared { "runtime_state" } else { "state" }, json!({})).await;
         if readiness.is_err() {
             session.terminate("browser host unavailable").await;
         }
         abort_guard.disarm();
-        readiness?;
+        let readiness = readiness?;
+        let generation = session.handshake_generation.lock().unwrap().clone();
+        if shared && !shared::valid_handshake(&readiness, generation.as_deref()) {
+            let _ = session.begin_retirement("incompatible shared browser host");
+            session.terminate("incompatible shared browser host").await;
+            return Err(BrowserError::Unavailable("incompatible shared browser host".into()));
+        }
         Ok(session)
     }
 
@@ -569,6 +661,9 @@ impl BrowserSession {
         });
         let session = Arc::new(Self {
             cleanup: cleanup.clone(),
+            protocol_v2: AtomicBool::new(false),
+            shared_router: Mutex::new(Weak::new()),
+            handshake_generation: Mutex::new(None),
             child: Arc::new(Mutex::new(child)),
             profile_lease: Mutex::new(None),
             temp_dir: Mutex::new(temp_dir),
@@ -602,8 +697,8 @@ impl BrowserSession {
     }
 
     async fn read_messages(weak: Weak<Self>, stdout: tokio::process::ChildStdout) {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut reader = BufReader::new(stdout);
+        while let Ok(Some(line)) = read_host_line(&mut reader).await {
             let Some(session) = weak.upgrade() else {
                 continue;
             };
@@ -613,10 +708,45 @@ impl BrowserSession {
                 // shutdown; no late frame/reply is published to retired Arcs.
                 continue;
             }
-            let Ok(message) = serde_json::from_str::<Value>(&line) else {
-                tracing::warn!("browser host sent malformed JSON");
-                continue;
+            let parsed = serde_json::from_slice::<Value>(&line);
+            let message = match parsed {
+                Ok(value) if line.len() <= shared::MAX_FRAME_BYTES => value,
+                _ if session.protocol_v2.load(Ordering::Acquire) => {
+                    session.signal_stop();
+                    session.terminate("invalid shared browser transport").await;
+                    return;
+                }
+                _ => {
+                    tracing::warn!("browser host sent malformed JSON");
+                    continue;
+                }
             };
+            let router = session.shared_router.lock().unwrap().upgrade();
+            if let Some(router) = router {
+                if !router.deliver(&message) {
+                    session.signal_stop();
+                    session.terminate("invalid shared browser owner tuple").await;
+                    return;
+                }
+                continue;
+            }
+            if session.protocol_v2.load(Ordering::Acquire) {
+                // Only the initial unscoped runtime_state reply is legal until
+                // the router is installed. Handshake never admits a chat.
+                let generation = message.get("host_generation").and_then(Value::as_str);
+                if message.get("version").and_then(Value::as_u64) != Some(2)
+                    || message.get("id").and_then(Value::as_u64) != Some(1)
+                    || !generation.is_some_and(shared::valid_handle)
+                    || message.get("scope_id").is_some()
+                    || message.get("scope_generation").is_some()
+                    || message.get("event").is_some()
+                {
+                    session.signal_stop();
+                    session.terminate("invalid shared browser handshake").await;
+                    return;
+                }
+                *session.handshake_generation.lock().unwrap() = generation.map(str::to_owned);
+            }
             if message.get("event").and_then(Value::as_str) == Some("frame") {
                 session.accept_frame(&message);
                 continue;
@@ -735,6 +865,10 @@ impl BrowserSession {
             return;
         }
         self.shutdown.send_replace(true);
+        let router = self.shared_router.lock().unwrap().upgrade();
+        if let Some(router) = router {
+            router.fail_all(reason);
+        }
         self.frames.send_replace(None);
         *self.active_tab_id.lock().unwrap() = None;
         let pending = std::mem::take(&mut *self.pending.lock().unwrap());
@@ -943,7 +1077,11 @@ impl BrowserSession {
             return Err(BrowserError::Unavailable("browser host exited".into()));
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let line = serde_json::to_vec(&json!({"id": id, "action": action, "args": args}))
+        let mut request = json!({"id": id, "action": action, "args": args});
+        if self.protocol_v2.load(Ordering::Acquire) {
+            request["version"] = json!(2);
+        }
+        let line = serde_json::to_vec(&request)
             .map_err(|error| BrowserError::Invalid(error.to_string()))?;
         let (sender, receiver) = oneshot::channel();
         let mut shutdown = self.shutdown.subscribe();
@@ -1049,6 +1187,9 @@ mod tests {
         let (frames, _) = watch::channel(None);
         let (shutdown, _) = watch::channel(!alive);
         Arc::new(BrowserSession {
+            protocol_v2: AtomicBool::new(false),
+            shared_router: Mutex::new(Weak::new()),
+            handshake_generation: Mutex::new(None),
             child: Arc::new(Mutex::new(child)),
             cleanup: Arc::new(BrowserCleanup {
                 session: Mutex::new(Weak::new()),
@@ -1929,7 +2070,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires the Playwright Chromium runtime"]
-    async fn persistent_manager_recreates_owned_hosts_without_resetting_or_sharing_site_state() {
+    async fn shared_manager_reuses_account_state_across_chats_and_restart() {
         use tokio::io::AsyncReadExt as _;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1956,12 +2097,12 @@ mod tests {
         let root = directory.path().join("browser-profiles");
         let browser = BrowserManager::with_profile_root(root.clone());
         let opened = browser.open("chat-a").await.unwrap();
-        let old_host = browser.sessions.lock().await["chat-a"].clone();
+        assert_eq!(opened["profile_mode"], "shared");
         assert_eq!(
             browser.open("chat-a").await.unwrap()["page_epoch"],
             opened["page_epoch"]
         );
-        assert!(profile::acquire(&root, "chat-a").is_err());
+        assert!(profile::acquire_shared(&root).is_err());
         let page = browser
             .command(
                 "chat-a",
@@ -2030,12 +2171,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             other_state["value"],
-            json!({"sessionCookie":false,"persistentCookie":false,"localStorage":false,"indexedDB":false})
+            json!({"sessionCookie":true,"persistentCookie":true,"localStorage":true,"indexedDB":true})
         );
         browser.close("chat-b").await.unwrap();
         browser.close("chat-a").await.unwrap();
-        assert!(old_host.reaped.load(Ordering::Acquire));
-        assert!(old_host.profile_lease.lock().unwrap().is_none());
+        assert!(profile::acquire_shared(&root).is_ok());
 
         let restarted = BrowserManager::with_profile_root(root);
         let opened = restarted.open("chat-a").await.unwrap();
@@ -2127,6 +2267,11 @@ impl BrowserManager {
         let mut sessions: Vec<_> = std::mem::take(&mut *self.sessions.lock().await)
             .into_values()
             .collect();
+        if let Some(core) = self.shared.drain().await {
+            if !sessions.iter().any(|known| Arc::ptr_eq(known, &core)) {
+                sessions.push(core);
+            }
+        }
         let owners = self.lifecycle.owners.lock().unwrap().clone();
         for owner in &owners {
             if let Some(session) = owner.session.lock().unwrap().upgrade() {
@@ -2181,6 +2326,11 @@ impl BrowserManager {
         let mut sessions: Vec<_> = std::mem::take(&mut *self.sessions.lock().await)
             .into_values()
             .collect();
+        if let Some(core) = self.shared.drain().await {
+            if !sessions.iter().any(|known| Arc::ptr_eq(known, &core)) {
+                sessions.push(core);
+            }
+        }
         let owners = self.lifecycle.owners.lock().unwrap().clone();
         for owner in &owners {
             let session = owner.session.lock().unwrap().upgrade();
@@ -2227,6 +2377,7 @@ impl BrowserManager {
         let weak_retired = Arc::downgrade(&self.retired);
         let weak_started = Arc::downgrade(&self.cleanup_started);
         let weak_lifecycle = Arc::downgrade(&self.lifecycle);
+        let weak_shared = Arc::downgrade(&self.shared);
         let profile_root = self.profile_root.clone();
         tokio::spawn(async move {
             loop {
@@ -2237,12 +2388,14 @@ impl BrowserManager {
                     Some(retired),
                     Some(cleanup_started),
                     Some(lifecycle),
+                    Some(shared),
                 ) = (
                     weak_sessions.upgrade(),
                     weak_gates.upgrade(),
                     weak_retired.upgrade(),
                     weak_started.upgrade(),
                     weak_lifecycle.upgrade(),
+                    weak_shared.upgrade(),
                 )
                 else {
                     break;
@@ -2252,6 +2405,7 @@ impl BrowserManager {
                 }
                 let browser = BrowserManager {
                     profile_root: profile_root.clone(),
+                    shared,
                     sessions,
                     session_gates,
                     retired,
@@ -2288,10 +2442,22 @@ impl BrowserManager {
         self.open_in_epoch(session_id, self.open_epoch()).await
     }
 
+    pub async fn open_with_mode(
+        &self, session_id: &str, mode: Option<BrowserProfileMode>,
+    ) -> Result<Value, BrowserError> {
+        self.open_with_mode_in_epoch(session_id, self.open_epoch(), mode).await
+    }
+
     pub(crate) async fn open_in_epoch(
         &self,
         session_id: &str,
         epoch: u64,
+    ) -> Result<Value, BrowserError> {
+        self.open_with_mode_in_epoch(session_id, epoch, None).await
+    }
+
+    pub(crate) async fn open_with_mode_in_epoch(
+        &self, session_id: &str, epoch: u64, mode: Option<BrowserProfileMode>,
     ) -> Result<Value, BrowserError> {
         let _opens = self.lifecycle.opens.read().await;
         if epoch != self.open_epoch() {
@@ -2310,6 +2476,16 @@ impl BrowserManager {
         self.lifecycle.ensure_writer_admission()?;
         if self.retired.lock().unwrap().contains(session_id) {
             return Err(BrowserError::NotOpen);
+        }
+        if let Some(root) = &self.profile_root {
+            let result = self.shared.open(root, &self.lifecycle, session_id, mode).await;
+            if result.is_ok() { self.start_idle_cleanup(); }
+            return result;
+        }
+        // Explicit standalone managers retain the old ephemeral protocol for
+        // callers without an account data root; production never falls back.
+        if mode.is_some_and(|mode| mode != BrowserProfileMode::Shared) {
+            return Err(BrowserError::Unavailable("clean mode requires an account browser root".into()));
         }
         let existing = {
             let sessions = self.sessions.lock().await;
@@ -2395,6 +2571,9 @@ impl BrowserManager {
         args: Value,
         deadline: Duration,
     ) -> Result<Value, BrowserError> {
+        if self.profile_root.is_some() && self.shared.contains(session_id) {
+            return self.shared.command(session_id, action, args, deadline).await;
+        }
         let session = {
             let sessions = self.sessions.lock().await;
             let session = sessions
@@ -2446,9 +2625,15 @@ impl BrowserManager {
     }
 
     pub async fn close(&self, session_id: &str) -> Result<(), BrowserError> {
-        let gate = self.session_gate(session_id);
-        let _guard = gate.lock().await;
-        self.close_locked(session_id).await
+        let browser = self.clone();
+        let session_id = session_id.to_owned();
+        tokio::spawn(async move {
+            let gate = browser.session_gate(&session_id);
+            let _guard = gate.lock().await;
+            browser.close_locked(&session_id).await
+        })
+        .await
+        .map_err(|_| BrowserError::Unavailable("browser close interrupted".into()))?
     }
 
     /// Pure observation for a missing-Session cleanup retry. Never create a
@@ -2460,7 +2645,7 @@ impl BrowserManager {
         if self.retired.lock().unwrap().contains(session_id) {
             return Ok(true);
         }
-        if self.sessions.lock().await.contains_key(session_id) {
+        if self.sessions.lock().await.contains_key(session_id) || self.shared.contains(session_id) {
             return Ok(true);
         }
         match &self.profile_root {
@@ -2469,7 +2654,8 @@ impl BrowserManager {
         }
     }
 
-    /// Permanently end a deleted chat's browser lifecycle and purge site data.
+    /// Permanently end a deleted chat's browser lifecycle. Shared account site
+    /// data belongs to the account and survives individual chat deletion.
     /// Request cancellation must not abandon cleanup after storage deletion.
     pub async fn retire(&self, session_id: &str) -> Result<(), BrowserError> {
         self.retire_requested(session_id, false).await
@@ -2522,16 +2708,15 @@ impl BrowserManager {
         self.retired.lock().unwrap().insert(session_id.to_string());
         let closed = self.close_locked(session_id).await;
         if let Some(root) = &self.profile_root {
-            // Reacquiring both file locks proves that no host still owns the
-            // profile, even after a forced/unconfirmed close. Delete does not
-            // need to import or preserve the last cookie checkpoint.
+            // A canonical chat deletion retains account-wide data. This old
+            // chat key can purge only its own legacy directory; the reserved
+            // shared account key is never derived from a canonical Session ID.
+            closed?;
             let root = root.clone();
             let session_id = session_id.to_string();
             let retired = self.retired.clone();
             tokio::task::spawn_blocking(move || {
                 profile::remove_notifying(&root, &session_id, || {
-                    // The same stable lease inode now carries a synced terminal
-                    // marker. RAM is no longer the queued/restart replay fence.
                     retired.lock().unwrap().remove(&session_id);
                 })
             })
@@ -2543,6 +2728,9 @@ impl BrowserManager {
     }
 
     async fn close_locked(&self, session_id: &str) -> Result<(), BrowserError> {
+        if self.profile_root.is_some() && self.shared.contains(session_id) {
+            return self.shared.close(session_id).await;
+        }
         let session = {
             let mut sessions = self.sessions.lock().await;
             if let Some(session) = sessions.get(session_id) {
@@ -2573,6 +2761,20 @@ impl BrowserManager {
     }
 
     async fn sweep_idle(&self, ttl: Duration) -> usize {
+        let mut shared_closed = 0;
+        if self.profile_root.is_some() {
+            let candidates = self.shared.idle_candidates(ttl);
+            let retirements = candidates.into_iter().map(|id| async move {
+                let gate = self.session_gate(&id);
+                let _guard = gate.lock().await;
+                if !self.shared.is_idle(&id, ttl) { return false; }
+                if let Err(error) = self.shared.close(&id).await {
+                    tracing::warn!(%error, "shared chat idle close unconfirmed");
+                }
+                true
+            });
+            shared_closed = futures::future::join_all(retirements).await.into_iter().filter(|closed| *closed).count();
+        }
         let candidates: Vec<String> = self
             .sessions
             .lock()
@@ -2614,7 +2816,7 @@ impl BrowserManager {
                 false
             }
         });
-        futures::future::join_all(retirements)
+        shared_closed + futures::future::join_all(retirements)
             .await
             .into_iter()
             .filter(|reaped| *reaped)
@@ -2627,6 +2829,9 @@ impl BrowserManager {
         after: u64,
         wait_ms: u64,
     ) -> Result<Option<Arc<BrowserFrame>>, BrowserError> {
+        if self.profile_root.is_some() && self.shared.contains(session_id) {
+            return self.shared.frame(session_id, after, wait_ms).await;
+        }
         let session = {
             let sessions = self.sessions.lock().await;
             let session = sessions

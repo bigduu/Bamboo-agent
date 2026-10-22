@@ -29,7 +29,13 @@ async fn clean_reaper_holds_lease_until_close_directory_barrier_recovers() {
     let process_group = child.id().and_then(|id| i32::try_from(id).ok());
     let stdin = child.stdin.take();
     let reaper = BrowserReaper {
-        cleanup: None,
+        cleanup: Arc::new(BrowserCleanup {
+            session: Mutex::new(Weak::new()),
+            done: watch::channel(false).0,
+            quarantined: Mutex::new(Vec::new()),
+            unconfirmed_writers: Arc::new(AtomicBool::new(false)),
+            writer_admission: Arc::new(Mutex::new(())),
+        }),
         child: Arc::new(Mutex::new(child)),
         lease: Some(lease),
         temp_dir: None,
@@ -37,6 +43,7 @@ async fn clean_reaper_holds_lease_until_close_directory_barrier_recovers() {
         process_group,
         graceful: true,
         marked: true,
+        clean_host_exit: false,
     };
     // The fence was established before the clean host exit. Unlink can now
     // succeed, while opening the directory to confirm it must fail.
@@ -161,6 +168,7 @@ async fn marker_io_failure_keeps_drop_and_the_lease_until_a_durable_fence_exists
         "an I/O failure must not release an unmarked profile"
     );
     assert!(fs2::FileExt::try_lock_exclusive(&competing).is_ok());
+    assert!(path.join(".bamboo-profile-writer-exit-unconfirmed").is_file());
     drop(competing);
     assert!(profile::acquire(&root, "chat").is_err());
 }
@@ -300,6 +308,7 @@ async fn nonzero_host_exit_cannot_claim_a_confirmed_profile_close() {
     assert!(manager.close("chat").await.is_err());
     assert!(session.reaped.load(Ordering::Acquire));
     assert!(session.profile_lease.lock().unwrap().is_none());
+    assert!(session.cleanup.is_quarantined());
     assert!(profile::acquire(&root, "chat").is_err());
 }
 
@@ -483,7 +492,7 @@ async fn prepare_immediate_logout() -> (
         "expected_epoch":page["page_epoch"], "expected_url":format!("{}seed", site.url),
         "code":"void fetch('/gate').then(() => fetch('/logout')).then(() => fetch('/observed')); true"
     })).await.unwrap();
-    let checkpoint = profile::directory(&root, "logout-chat")
+    let checkpoint = profile::shared_directory(&root)
         .unwrap()
         .join(".bamboo-session-cookies-v1.json");
     site.release.notify_one();
@@ -506,10 +515,7 @@ async fn immediate_logout_then_retire(mode: &str) {
     match mode {
         "close" => manager.close("logout-chat").await.unwrap(),
         "idle" => {
-            *manager.sessions.lock().await["logout-chat"]
-                .last_used
-                .lock()
-                .unwrap() = Instant::now() - BROWSER_IDLE_TTL;
+            manager.shared.test_age("logout-chat", BROWSER_IDLE_TTL);
             assert_eq!(manager.sweep_idle(BROWSER_IDLE_TTL).await, 1);
         }
         "drop" => {}
@@ -565,7 +571,7 @@ fn streaming_profile_finishes_logout_when_the_runtime_and_stdout_reader_stop() {
     drop(manager);
     let started = Instant::now();
     loop {
-        if let Ok(lease) = profile::acquire(&root, "logout-chat") {
+        if let Ok(lease) = profile::acquire_shared(&root) {
             drop(lease);
             break;
         }
@@ -610,9 +616,10 @@ async fn immediate_cookie_logout_survives_manager_drop() {
 #[cfg(unix)]
 async fn interrupted_logout_is_not_replayed(cancel: bool) {
     let (site, _directory, root, manager, checkpoint) = prepare_immediate_logout().await;
-    let session = manager.sessions.lock().await["logout-chat"].clone();
+    let session = manager.shared.test_core().await.unwrap();
+    let epoch = manager.shared.test_epoch("logout-chat");
     let args = json!({
-        "expected_epoch":session.frame_epoch.load(Ordering::Acquire),
+        "expected_epoch":epoch,
         "expected_url":format!("{}seed", site.url), "code":"new Promise(() => {})"
     });
     if cancel {
@@ -621,7 +628,7 @@ async fn interrupted_logout_is_not_replayed(cancel: bool) {
             tokio::spawn(async move { manager.eval("logout-chat", args).await })
         };
         tokio::time::timeout(Duration::from_secs(1), async {
-            while session.pending.lock().unwrap().is_empty() {
+            while manager.shared.test_pending().await == 0 {
                 tokio::task::yield_now().await;
             }
         })
@@ -630,7 +637,7 @@ async fn interrupted_logout_is_not_replayed(cancel: bool) {
         pending.abort();
         assert!(pending.await.unwrap_err().is_cancelled());
         tokio::time::timeout(Duration::from_secs(4), async {
-            while manager.sessions.lock().await.contains_key("logout-chat") {
+            while manager.shared.contains("logout-chat") {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -645,18 +652,17 @@ async fn interrupted_logout_is_not_replayed(cancel: bool) {
         );
     }
     assert!(session.reaped.load(Ordering::Acquire));
-    // Verify this was the vulnerable interval, rather than an already-updated
-    // checkpoint. The site observed logout before the controlled interruption.
+    // Scope cancellation now first attempts a clean owned page close. A
+    // final account checkpoint may legitimately have persisted the logout.
+    // If the older cookie is still present, account admission must be fenced.
     let saved: Value = serde_json::from_slice(&std::fs::read(checkpoint).unwrap()).unwrap();
-    assert!(saved["cookies"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|cookie| cookie["name"] == "fixture-session"));
-    assert!(
-        profile::acquire(&root, "logout-chat").is_err(),
-        "a controlled interruption must block stale-cookie replay"
-    );
+    let stale = saved["cookies"].as_array().unwrap().iter()
+        .any(|cookie| cookie["name"] == "fixture-session");
+    if stale {
+        assert!(profile::acquire_shared(&root).is_err(), "an interrupted scope must never replay the old cookie");
+    } else {
+        assert!(session.clean_host_exit.load(Ordering::Acquire) || session.cleanup.is_quarantined());
+    }
 }
 
 #[cfg(unix)]

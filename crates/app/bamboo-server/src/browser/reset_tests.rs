@@ -118,7 +118,7 @@ pub(super) fn check_owned_host_entry(mode: &str) {
     let pids = data.join("owned-host-pids");
     std::fs::write(
         &script,
-        format!(
+        test_shared_protocol(format!(
             r#"import json, os, pathlib, sys, time
 profile = pathlib.Path(os.environ['BAMBOO_BROWSER_PROFILE_DIR'])
 with pathlib.Path({:?}).open('a') as owned:
@@ -130,7 +130,7 @@ time.sleep(0.2)
 (profile / 'fixture-checkpoint').write_text('synthetic checkpoint')
 "#,
             pids.to_string_lossy()
-        ),
+        )),
     )
     .unwrap();
     let log = std::fs::File::create(data.join("fixture.log")).unwrap();
@@ -170,7 +170,8 @@ time.sleep(0.2)
     }
     assert_eq!(observed["reaped_before_success"], true);
     assert_eq!(observed["old_arc_fenced"], true);
-    assert_eq!(observed["profile_purged"], true);
+    assert_eq!(observed["profile_purged"], mode == "reset");
+    assert_eq!(observed["account_preserved"], mode == "subagent");
     if mode == "reset" {
         assert_eq!(observed["queued_open_fenced"], true);
     }
@@ -227,15 +228,8 @@ fn dev_reset_active_host_fixture() {
             };
             state.session_store.save_session(&active).await.unwrap();
             state.browser.open("reset-active").await.unwrap();
-            let old = state
-                .browser
-                .sessions
-                .lock()
-                .await
-                .get("reset-active")
-                .unwrap()
-                .clone();
-            let path = profile::directory(&data.join("browser-profiles"), "reset-active").unwrap();
+            let old = state.browser.shared.test_core().await.unwrap();
+            let path = profile::shared_directory(&data.join("browser-profiles")).unwrap();
             std::fs::write(path.join("Cookies"), b"synthetic login").unwrap();
             let (succeeded, queued_fenced) = if entry == "subagent" {
                 let deleted = super::terminal_entry_tests::delete_via_subagent_tool(
@@ -278,6 +272,7 @@ fn dev_reset_active_host_fixture() {
                     "reaped_before_success": succeeded && reaped,
                     "old_arc_fenced": fenced,
                     "profile_purged": purged,
+                    "account_preserved": !purged,
                 "queued_open_fenced": queued_fenced,
                     "new_chat_usable": usable
                 }))

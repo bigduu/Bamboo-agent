@@ -11,6 +11,8 @@ const WRITER_EXIT_UNCONFIRMED: &str = ".bamboo-profile-writer-exit-unconfirmed";
 const LEASES: &str = ".bamboo-profile-leases";
 const RESET_GATE: &str = ".bamboo-profile-reset.lock";
 const RETIRED: &[u8] = b"BAMBOO_BROWSER_RETIRED_V1\n";
+// Not a Session ID. Shared account state has a separate lifecycle from chats.
+const SHARED_ACCOUNT: &str = "bamboo-browser-shared-account-v1\0";
 
 #[cfg(all(test, unix))]
 thread_local! {
@@ -27,6 +29,33 @@ pub(super) struct Lease {
     _lifecycle_lock: std::fs::File,
     // Shared through actual host reaping; reset holds the same inode exclusively.
     _reset_gate: std::fs::File,
+}
+
+/// Serializes a canonical chat's generations without creating a site-data
+/// directory. Its stable inode also carries the terminal deletion fence.
+pub(super) struct ChatLease {
+    _lifecycle_lock: std::fs::File,
+    _reset_gate: std::fs::File,
+}
+
+pub(super) fn acquire_chat(root: &Path, session_id: &str) -> Result<ChatLease, BrowserError> {
+    if session_id.contains('\0') { return Err(unavailable()); }
+    let root = root_directory(root, true)?.ok_or_else(unavailable)?;
+    let reset_gate = admission_gate(&root, false)?;
+    let lifecycle_lock = lifecycle_lock(&root, session_id)?;
+    if is_retired(&lifecycle_lock)? {
+        return Err(BrowserError::NotOpen);
+    }
+    Ok(ChatLease { _lifecycle_lock: lifecycle_lock, _reset_gate: reset_gate })
+}
+
+pub(super) fn acquire_shared(root: &Path) -> Result<Lease, BrowserError> {
+    acquire_key(root, &key(SHARED_ACCOUNT))
+}
+
+#[cfg(test)]
+pub(super) fn shared_directory(root: &Path) -> Result<PathBuf, BrowserError> {
+    directory_key(root, &key(SHARED_ACCOUNT))
 }
 
 impl Lease {
@@ -191,9 +220,15 @@ fn key(session_id: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn directory(root: &Path, session_id: &str) -> Result<PathBuf, BrowserError> {
+    if session_id.contains('\0') { return Err(unavailable()); }
+    directory_key(root, &key(session_id))
+}
+
+fn directory_key(root: &Path, profile_key: &str) -> Result<PathBuf, BrowserError> {
     let root = root_directory(root, true)?.ok_or_else(unavailable)?;
-    let profile = root.join(key(session_id));
+    let profile = root.join(profile_key);
     private_directory(&profile)?;
     sync_directory(&root)?;
     std::fs::canonicalize(profile).map_err(|_| unavailable())
@@ -317,13 +352,18 @@ fn is_retired(lock: &std::fs::File) -> Result<bool, BrowserError> {
 }
 
 pub(super) fn acquire(root: &Path, session_id: &str) -> Result<Lease, BrowserError> {
+    if session_id.contains('\0') { return Err(unavailable()); }
+    acquire_key(root, &key(session_id))
+}
+
+fn acquire_key(root: &Path, profile_key: &str) -> Result<Lease, BrowserError> {
     let root = root_directory(root, true)?.ok_or_else(unavailable)?;
     let reset_gate = admission_gate(&root, false)?;
-    let lifecycle_lock = lifecycle_lock(&root, session_id)?;
+    let lifecycle_lock = lifecycle_lock_key(&root, profile_key)?;
     if is_retired(&lifecycle_lock)? {
         return Err(BrowserError::NotOpen);
     }
-    let path = directory(&root, session_id)?;
+    let path = directory_key(&root, profile_key)?;
     let lock = lock_file(&path.join(".bamboo-profile.lock"))?;
     reject_unconfirmed_writers(&path)?;
     match std::fs::symlink_metadata(path.join(CLOSE_PENDING)) {
@@ -350,6 +390,7 @@ pub(super) fn remove_notifying(
     session_id: &str,
     retirement_persisted: impl FnOnce(),
 ) -> Result<(), BrowserError> {
+    if session_id.contains('\0') { return Err(unavailable()); }
     remove_key_notifying(root, &key(session_id), retirement_persisted)
 }
 
@@ -443,7 +484,25 @@ pub(super) fn purge_all(root: &Path) -> Result<(), BrowserError> {
         }
     }
     for profile_key in keys {
-        remove_key_notifying(&root, &profile_key, || {})?;
+        if profile_key == key(SHARED_ACCOUNT) {
+            // The reset gate has excluded every owner. Keep the stable lock
+            // inode empty: an account reset is not a permanently deleted chat.
+            let _lifecycle_lock = lifecycle_lock_key(&root, &profile_key)?;
+            let path = root.join(&profile_key);
+            match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(unavailable()),
+                Ok(_) => {
+                    validate_private_directory(&path)?;
+                    reject_unconfirmed_writers(&path)?;
+                    let _profile_lock = lock_file(&path.join(".bamboo-profile.lock"))?;
+                    std::fs::remove_dir_all(&path).map_err(|_| unavailable())?;
+                    sync_directory(&root)?;
+                }
+            }
+        } else {
+            remove_key_notifying(&root, &profile_key, || {})?;
+        }
     }
     Ok(())
 }
@@ -451,6 +510,49 @@ pub(super) fn purge_all(root: &Path) -> Result<(), BrowserError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_account_namespace_survives_chat_retirement_and_rejects_reserved_ids() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profiles");
+        let owner = acquire_shared(&root).unwrap();
+        let sentinel = owner.path.join("synthetic-account-data");
+        std::fs::write(&sentinel, b"synthetic account state").unwrap();
+        assert_eq!(shared_directory(&root).unwrap(), owner.path);
+        let chat = acquire_chat(&root, "canonical-chat").unwrap();
+        assert!(remove_notifying(&root, "canonical-chat", || {}).is_err());
+        drop(chat);
+        remove_notifying(&root, "canonical-chat", || {}).unwrap();
+        assert!(matches!(acquire_chat(&root, "canonical-chat"), Err(BrowserError::NotOpen)));
+        assert!(remove_notifying(&root, SHARED_ACCOUNT, || {}).is_err());
+        assert!(acquire_chat(&root, SHARED_ACCOUNT).is_err());
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"synthetic account state");
+    }
+
+    #[test]
+    fn explicit_account_reset_keeps_the_key_reopenable_and_the_stable_lock() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profiles");
+        let owner = acquire_shared(&root).unwrap();
+        let path = owner.path.clone();
+        let stable = root.join(LEASES).join(format!("{}.lock", path.file_name().unwrap().to_str().unwrap()));
+        let before = std::fs::metadata(&stable).unwrap();
+        drop(owner);
+        let reset = begin_reset(&root).unwrap();
+        purge_all(&root).unwrap();
+        assert!(!path.exists());
+        drop(reset);
+        let reopened = acquire_shared(&root).unwrap();
+        assert_eq!(reopened.path, path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let after = std::fs::metadata(stable).unwrap();
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        }
+        #[cfg(not(unix))]
+        let _ = before;
+    }
 
     #[cfg(unix)]
     #[test]

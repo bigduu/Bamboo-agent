@@ -1,4 +1,4 @@
-//! All owned hosts must receive EOF before waiting for any checkpoint.
+//! All chat retirements converge on one account-owned EOF/checkpoint.
 
 use super::*;
 use bamboo_agent_core::{Session, Storage};
@@ -7,27 +7,27 @@ const FIXTURE: &str = "BAMBOO_BROWSER_CONCURRENT_DRAIN_FIXTURE";
 const MODE: &str = "BAMBOO_BROWSER_CONCURRENT_DRAIN_MODE";
 
 #[test]
-fn app_state_shutdown_overlaps_all_host_checkpoints() {
+fn app_state_shutdown_drains_one_shared_account_host() {
     check_concurrent_drain("shutdown");
 }
 
 #[test]
-fn dev_reset_overlaps_all_host_checkpoints() {
+fn dev_reset_drains_one_shared_account_host() {
     check_concurrent_drain("reset");
 }
 
 #[test]
-fn recursive_delete_overlaps_all_host_retirements() {
+fn recursive_delete_retires_scopes_then_the_shared_host() {
     check_concurrent_drain("delete");
 }
 
 #[test]
-fn bulk_cleanup_overlaps_all_host_retirements() {
+fn bulk_cleanup_retires_scopes_then_the_shared_host() {
     check_concurrent_drain("bulk");
 }
 
 #[test]
-fn idle_sweep_overlaps_all_host_checkpoints() {
+fn idle_sweep_retires_scopes_then_the_shared_host() {
     check_concurrent_drain("idle");
 }
 
@@ -40,7 +40,7 @@ fn check_concurrent_drain(mode: &str) {
     let owned_pids = temporary.path().join("owned-pids");
     std::fs::write(
         &script,
-        format!(
+        test_shared_protocol(format!(
             r#"import json, os, pathlib, sys, time
 profile = pathlib.Path(os.environ['BAMBOO_BROWSER_PROFILE_DIR'])
 events = pathlib.Path({:?})
@@ -50,17 +50,13 @@ for line in sys.stdin:
     request = json.loads(line)
     print(json.dumps({{'id':request['id'], 'ok':True, 'result':{{'tabs':[]}}}}), flush=True)
 (events / (profile.name + '.eof')).write_text('EOF received')
-deadline = time.monotonic() + 2
-while len(list(events.glob('*.eof'))) < 2 and time.monotonic() < deadline:
-    time.sleep(0.005)
-if len(list(events.glob('*.eof'))) == 2:
-    (events / (profile.name + '.overlap')).write_text('all EOF before checkpoint')
+(events / (profile.name + '.overlap')).write_text('one shared EOF before account checkpoint')
 (profile / 'fixture-checkpoint').write_text('synthetic checkpoint')
 (events / (profile.name + '.checkpoint')).write_text('checkpoint finished')
 "#,
             events.to_string_lossy(),
             owned_pids.to_string_lossy()
-        ),
+        )),
     )
     .unwrap();
     let log_path = temporary.path().join("fixture.log");
@@ -104,7 +100,7 @@ if len(list(events.glob('*.eof'))) == 2:
     let profile_root = data.join("browser-profiles");
     let profiles_correct = records.iter().all(|(_, key)| {
         let profile = profile_root.join(key);
-        if matches!(mode, "reset" | "delete" | "bulk") {
+        if mode == "reset" {
             !profile.exists()
         } else {
             profile.join("fixture-checkpoint").is_file()
@@ -124,14 +120,14 @@ if len(list(events.glob('*.eof'))) == 2:
     );
     assert_eq!(
         records.len(),
-        2,
-        "fixture must start two actual owned hosts"
+        1,
+        "two chats must reuse one actual account host"
     );
     assert!(all_reaped_at_return && all_checkpointed && profiles_correct);
     assert!(temporary.path().join("old-arcs-fenced").is_file());
     assert!(
         all_overlapped,
-        "a host waited for another checkpoint before receiving EOF"
+        "shared account host did not receive its single EOF"
     );
 }
 
@@ -165,7 +161,7 @@ fn concurrent_drain_process_fixture() {
                 };
                 state.session_store.save_session(&session).await.unwrap();
                 state.browser.open(id).await.unwrap();
-                old.push(state.browser.sessions.lock().await.get(id).unwrap().clone());
+                old.push(state.browser.shared.test_chat(id).unwrap());
             }
             match mode.as_str() {
                 "reset" => {
@@ -208,7 +204,7 @@ fn concurrent_drain_process_fixture() {
                 }
             }
             for session in old {
-                assert!(session.call("state", json!({})).await.is_err());
+                assert!(session.call("state", json!({}), BROWSER_COMMAND_DEADLINE).await.is_err());
             }
             std::fs::write(fixture.join("old-arcs-fenced"), b"fenced").unwrap();
             // Unrelated destructors/runtime shutdown must not conceal an

@@ -11,7 +11,7 @@ fn app_state_shutdown_flushes_browser_before_process_exit() {
 }
 
 #[test]
-fn app_state_shutdown_drains_previously_detached_browser_reaper() {
+fn app_state_shutdown_drains_previously_detached_account_close() {
     check_process_exit("detached");
 }
 
@@ -31,7 +31,7 @@ fn check_process_exit(mode: &str) {
     let script = directory.path().join("synthetic-host.py");
     std::fs::write(
         &script,
-        r#"import json, os, pathlib, sys, time
+        test_shared_protocol(r#"import json, os, pathlib, sys, time
 profile = pathlib.Path(os.environ['BAMBOO_BROWSER_PROFILE_DIR'])
 (profile / 'fixture-pid').write_text(str(os.getpid()))
 hold_readiness = FIXTURE_HOLD
@@ -49,7 +49,7 @@ time.sleep(0.4)
         .replace(
             "FIXTURE_HOLD",
             if mode == "startup" { "True" } else { "False" },
-        ),
+        )),
     )
     .unwrap();
     let log_path = directory.path().join("fixture.log");
@@ -75,10 +75,10 @@ time.sleep(0.4)
         .status()
         .unwrap();
     let root = data.join("browser-profiles");
-    let path = profile::directory(&root, "shutdown-chat").unwrap();
+    let path = profile::shared_directory(&root).unwrap();
     // Capture state at actual executable exit, before cleaning the RED case.
     let checkpoint_at_exit = path.join("fixture-checkpoint").is_file();
-    let profile_reusable_at_exit = profile::acquire(&root, "shutdown-chat").is_ok();
+    let profile_reusable_at_exit = profile::acquire_shared(&root).is_ok();
     let reopen_refused = data.join("reopen-refused").is_file();
     let startup_escaped = data.join("startup-escaped").is_file();
     let pid: i32 = std::fs::read_to_string(path.join("fixture-pid"))
@@ -136,7 +136,7 @@ fn browser_shutdown_process_fixture() {
         if mode == "startup" {
             let browser = state.browser.clone();
             let opening = tokio::spawn(async move { browser.open("shutdown-chat").await });
-            let path = profile::directory(&data.join("browser-profiles"), "shutdown-chat").unwrap();
+            let path = profile::shared_directory(&data.join("browser-profiles")).unwrap();
             tokio::time::timeout(Duration::from_secs(2), async {
                 while !path.join("fixture-readiness-entered").is_file() {
                     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -161,10 +161,10 @@ fn browser_shutdown_process_fixture() {
         } else {
             state.browser.open("shutdown-chat").await.unwrap();
             if mode == "detached" {
-                let session = state.browser.sessions.lock().await.remove("shutdown-chat");
+                let session = state.browser.shared.drain().await;
                 drop(session);
                 let path =
-                    profile::directory(&data.join("browser-profiles"), "shutdown-chat").unwrap();
+                    profile::shared_directory(&data.join("browser-profiles")).unwrap();
                 tokio::time::timeout(Duration::from_secs(2), async {
                     while !path.join(".bamboo-profile-close-pending").is_file() {
                         tokio::time::sleep(Duration::from_millis(5)).await;
