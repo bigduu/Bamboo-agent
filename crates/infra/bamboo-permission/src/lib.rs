@@ -37,6 +37,8 @@ pub mod hierarchy;
 pub mod policy;
 mod replay;
 pub mod rule_parser;
+#[cfg(test)]
+mod scoped_send_permission_tests;
 pub mod storage;
 pub mod tool_permissions;
 

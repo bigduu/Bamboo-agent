@@ -123,11 +123,18 @@ pub(super) fn build_base_tools(
     ));
     // One logical-session delivery plane serves Root, Child, nested Child and
     // scheduled/headless executions through their shared Base tool surface.
+    let scoped_sender = Arc::new(
+        bamboo_server_tools::scoped_session_messaging::CanonicalSessionSendAdapter::new(
+            storage.clone(),
+            session_messenger.clone(),
+        ),
+    );
     let with_messages: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_memory,
-        Arc::new(bamboo_server_tools::SessionMessageTool::new(
-            session_messenger,
-        )),
+        Arc::new(
+            bamboo_server_tools::SessionMessageTool::new(session_messenger)
+                .with_scoped_sender(scoped_sender),
+        ),
     ));
 
     // `ledger` sits in the base layer (not root-only) so headless reminder
@@ -810,6 +817,12 @@ mod session_message_assembly_tests {
         }
         let expected =
             bamboo_server_tools::SessionMessageTool::new(state.session_messenger.clone())
+                .with_scoped_sender(Arc::new(
+                    bamboo_server_tools::scoped_session_messaging::CanonicalSessionSendAdapter::new(
+                        state.storage.clone(),
+                        state.session_messenger.clone(),
+                    ),
+                ))
                 .to_schema();
         assert_eq!(
             bamboo_domain::capability_loading_class_for_reference("session_message"),
@@ -828,6 +841,13 @@ mod session_message_assembly_tests {
         ] {
             let tools = state.tools_for(surface);
             assert!(tools.owns_exact_tool("session_message"));
+            assert_eq!(
+                tools.execution_contract_for_exact("session_message"),
+                Some(bamboo_server_tools::session_message::SCOPED_SESSION_SEND_EXECUTION_CONTRACT)
+            );
+            assert!(tools
+                .execution_contract_for_exact("default::session_message")
+                .is_none());
             let schemas = tools.list_tools();
             let matching: Vec<_> = schemas
                 .iter()
@@ -874,6 +894,101 @@ mod session_message_assembly_tests {
             let inbox = state.session_inbox.inspect(&session.id).await.unwrap();
             assert_eq!(inbox.pending + inbox.claimed, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn installed_scoped_send_requires_original_caller_and_retains_legacy_deny() {
+        use bamboo_agent_core::tools::with_executing_session_caller;
+        use bamboo_domain::SessionCallerReference;
+        use bamboo_tools::permission::{PermissionRule, PermissionType};
+
+        let home = tempfile::tempdir().unwrap();
+        let state = super::super::AppState::new_with_provider(
+            home.path().to_path_buf(),
+            Config::default(),
+            Arc::new(super::super::UnconfiguredProvider {
+                message: "no model in scoped send assembly".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let root = Session::new("installed-root", "model");
+        let source = Session::new_child_of("installed-source", &root, "model", "source");
+        let target = Session::new_child_of("installed-target", &root, "model", "target");
+        for session in [&root, &source, &target] {
+            state.storage.save_session(session).await.unwrap();
+        }
+        let tools = state.tools_for(crate::tools::ToolSurface::Base);
+        let config = state.permission_checker.permission_config().unwrap();
+        config.set_enabled(false);
+        let legacy_resource = format!("session_control followup {}", target.id);
+        config.add_rule(PermissionRule::new(
+            PermissionType::ExecuteCommand,
+            &legacy_resource,
+            false,
+        ));
+        let call = ToolCall {
+            id: "installed-original-send".into(), tool_type: "function".into(),
+            function: FunctionCall { name: "session_message".into(), arguments: json!({
+                "action":"send", "target_session_id":target.id, "operation_id":"installed-operation",
+                "message":"bounded assembly input", "delivery_intent":"queue_only",
+            }).to_string() },
+        };
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.session_id = Some(&source.id);
+        let error = with_executing_session_caller(
+            Some(Arc::new(SessionCallerReference::from(&source))),
+            tools.execute_with_context(&call, ctx),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("legacy followup policy"));
+        assert_eq!(
+            state
+                .session_inbox
+                .inspect(&target.id)
+                .await
+                .unwrap()
+                .generation,
+            0
+        );
+        assert!(config.remove_rule(PermissionType::ExecuteCommand, &legacy_resource));
+        let mut missing = ToolExecutionContext::none(&call.id);
+        missing.session_id = Some(&source.id);
+        assert!(tools
+            .execute_with_context(&call, missing)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("authority_unavailable"));
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.session_id = Some(&source.id);
+        let receipt = with_executing_session_caller(
+            Some(Arc::new(SessionCallerReference::from(&source))),
+            tools.execute_with_context(&call, ctx),
+        )
+        .await
+        .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&receipt.result).unwrap();
+        assert_eq!(receipt["admitted"], true);
+        assert_eq!(receipt["terminal"], "not_observed");
+        assert_eq!(
+            state
+                .session_inbox
+                .inspect(&target.id)
+                .await
+                .unwrap()
+                .generation,
+            1
+        );
+        assert!(state
+            .storage
+            .load_session(&target.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .messages
+            .is_empty());
     }
 }
 

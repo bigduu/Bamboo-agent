@@ -1,7 +1,7 @@
 //! Final reads for finite Host scopes. Never borrow Supervisor authority.
 
 use super::*;
-use crate::host_session_scope::HostSessionScopeUse;
+use crate::host_session_scope::{HostSessionScopeAbsence, HostSessionScopeUse};
 use bamboo_domain::{
     HostScopeSessionObservation, HostSessionRight, HostSessionScopeBinding, HostSessionScopeToken,
     HostSessionTargetScope, SessionCallerReference,
@@ -42,7 +42,92 @@ impl Drop for HostScopedSessionGuards {
     }
 }
 
+/// A SendPeer check is inseparable from these original physical guards. The
+/// existing Inbox owns this value until every started filesystem job completes.
+pub(crate) struct HostScopedDeliveryGuards {
+    pub(crate) inbox_dir: PathBuf,
+    _authority: HostScopedSessionGuards,
+}
+
+enum LegacySessionDeliveryAuthority {
+    Peer { _guard: PeerDeliveryGuard },
+    Supervisor { _guard: SupervisorFollowupGuard },
+}
+
+/// Compatibility authority, with a retained never-installed publication fence.
+/// Physical authority drops before its publication guard.
+pub(crate) struct LegacySessionDeliveryGuards {
+    pub(crate) inbox_dir: PathBuf,
+    _authority: LegacySessionDeliveryAuthority,
+    _absence: HostSessionScopeAbsence,
+}
+
 impl SessionStoreV2 {
+    pub(crate) async fn lock_unscoped_peer_delivery(
+        &self,
+        caller: &SessionCallerReference,
+        source: &bamboo_domain::ActorSession,
+        target: &bamboo_domain::ActorSession,
+    ) -> io::Result<LegacySessionDeliveryGuards> {
+        validate_session_id(&caller.session_id)?;
+        if caller.session_id != source.actor_id
+            || caller.authority_identity != bamboo_domain::SessionAuthorityIdentity::Ordinary
+        {
+            return Err(denied("host_session_legacy_caller_mismatch"));
+        }
+        let absence = self
+            .host_scope_registry
+            .retain_never_installed(&caller.session_id)
+            .await?;
+        let authority = self.lock_peer_delivery(source, target, None).await?;
+        let current = self
+            .peer_delivery_session(&caller.session_id, &caller.root_session_id)
+            .await?;
+        if !caller.matches_session(&current) {
+            return Err(denied("host_session_operation_caller_changed"));
+        }
+        Ok(LegacySessionDeliveryGuards {
+            inbox_dir: authority.inbox_dir.clone(),
+            _authority: LegacySessionDeliveryAuthority::Peer { _guard: authority },
+            _absence: absence,
+        })
+    }
+
+    pub(crate) async fn lock_unscoped_supervisor_delivery(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target_id: &str,
+    ) -> io::Result<LegacySessionDeliveryGuards> {
+        validate_session_id(&caller.session_id)?;
+        if caller.session_id != supervisor.session_id
+            || caller.authority_identity
+                != (bamboo_domain::SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: supervisor.incarnation_id,
+                })
+        {
+            return Err(denied("host_session_legacy_caller_mismatch"));
+        }
+        let absence = self
+            .host_scope_registry
+            .retain_never_installed(&caller.session_id)
+            .await?;
+        let authority = self.lock_supervisor_followup(supervisor, target_id).await?;
+        let current = self
+            .peer_delivery_session(&caller.session_id, &caller.root_session_id)
+            .await?;
+        if !caller.matches_session(&current) {
+            return Err(denied("host_session_operation_caller_changed"));
+        }
+        Ok(LegacySessionDeliveryGuards {
+            inbox_dir: self
+                .abs_path_from_rel(&Self::root_rel_path(target_id))
+                .join("inbox"),
+            _authority: LegacySessionDeliveryAuthority::Supervisor { _guard: authority },
+            _absence: absence,
+        })
+    }
+
     /// Explicit trusted in-process Host installation, never a model tool/HTTP
     /// capability. Empty/default stores and ordinary save paths install nothing.
     pub async fn install_host_session_scope(
@@ -256,6 +341,83 @@ impl SessionStoreV2 {
             &target.identity.root_session_id,
         )
         .await
+    }
+
+    pub(crate) async fn lock_host_scoped_peer_delivery(
+        &self,
+        token: &HostSessionScopeToken,
+        caller: &SessionCallerReference,
+        envelope: &bamboo_domain::SessionMessageEnvelope,
+    ) -> io::Result<HostScopedDeliveryGuards> {
+        use bamboo_domain::{SessionMessageBody, SessionMessageKind, SessionMessageSource};
+        envelope
+            .validate()
+            .map_err(|error| denied(error.to_string()))?;
+        let scope = self.host_scope_registry.retain(token, caller).await?;
+        let binding = scope.token().binding();
+        let target = binding
+            .target(&envelope.target_session_id, HostSessionRight::SendPeer)
+            .map_err(|error| denied(error.to_string()))?
+            .observation
+            .clone();
+        let operation = envelope
+            .correlation_id
+            .as_deref()
+            .ok_or_else(|| denied("host_session_send_operation_missing"))?;
+        bamboo_domain::SessionMessageId::parse(operation)
+            .map_err(|error| denied(error.to_string()))?;
+        let id = bamboo_domain::session_peer_message_id(
+            &caller.session_id,
+            caller.created_at,
+            &target.identity.session_id,
+            target.identity.created_at,
+            operation,
+        );
+        let text = match &envelope.body {
+            SessionMessageBody::Content(content)
+                if content.parts.is_empty() && content.skill_request.is_none() =>
+            {
+                &content.text
+            }
+            _ => return Err(denied("host_session_send_requires_bounded_text")),
+        };
+        if envelope.source
+            != (SessionMessageSource::Session {
+                session_id: caller.session_id.clone(),
+            })
+            || envelope.kind != SessionMessageKind::PeerMessage
+            || envelope.id != id
+            || envelope.thread_id.as_deref() != Some(id.as_str())
+            || envelope.in_reply_to.is_some()
+            || envelope.attempt.is_some()
+            || text.trim().is_empty()
+            || text.contains('\0')
+            || text.len() > bamboo_domain::MAX_SESSION_PEER_MESSAGE_BYTES
+        {
+            return Err(denied("host_session_send_envelope_mismatch"));
+        }
+        let observations = [binding.caller.clone(), target.clone()];
+        let guards = self
+            .lock_host_scope_observations(&observations, Some(scope), &[])
+            .await?;
+        let current = self
+            .peer_delivery_session(&caller.session_id, &caller.root_session_id)
+            .await?;
+        if !caller.matches_session(&current) {
+            return Err(denied("host_session_operation_caller_changed"));
+        }
+        let rel = if target.identity.session_id == target.identity.root_session_id {
+            Self::root_rel_path(&target.identity.session_id)
+        } else {
+            Self::child_rel_path(
+                &target.identity.root_session_id,
+                &target.identity.session_id,
+            )
+        };
+        Ok(HostScopedDeliveryGuards {
+            inbox_dir: self.abs_path_from_rel(&rel).join("inbox"),
+            _authority: guards,
+        })
     }
 }
 

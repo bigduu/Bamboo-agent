@@ -271,3 +271,211 @@ async fn opposite_cross_root_reads_use_one_canonical_lock_order() {
     assert!(a_read.is_ok());
     assert!(b_read.is_ok());
 }
+
+#[tokio::test]
+async fn host_send_keeps_the_stable_grant_but_never_upgrades_an_original_conversation_ledger() {
+    use bamboo_domain::{
+        conversation_reset_snapshot_sha256, prepare_conversation_reset,
+        ConversationResetPreparation, ConversationResetReadSafety, ConversationResetRequest,
+        SessionInboxLimits, SessionInboxPort, SessionMessageBody, SessionMessageContent,
+        SessionMessageDeliveryIntent, SessionMessageEnvelope, SessionMessageKind,
+        SessionMessageSource,
+    };
+    let (_home, store, caller, target) = fixture().await;
+    let original = SessionCallerReference::from(&caller);
+    let token = store
+        .install_host_session_scope(
+            0,
+            binding(&caller, vec![], &target, [HostSessionRight::SendPeer], 1),
+        )
+        .await
+        .unwrap();
+    let request = ConversationResetRequest {
+        session_id: caller.id.clone(),
+        operation_id: format!("0:{}", uuid::Uuid::new_v4()),
+        expected_birth_token: caller.root_mode_birth_token(),
+        expected_conversation_revision: 0,
+        expected_snapshot_sha256: conversation_reset_snapshot_sha256(&caller).unwrap(),
+    };
+    let ConversationResetPreparation::Prepared(prepared) = prepare_conversation_reset(
+        &caller,
+        &Default::default(),
+        &request,
+        ConversationResetReadSafety::IdleObserved,
+        Utc::now(),
+    )
+    .unwrap() else {
+        panic!("pure synthetic preparation")
+    };
+    let mut canonical = prepared.proposed_session;
+    canonical.conversation_reset = Some(prepared.proposed_state);
+    // Synthetic future-producer bytes in this fresh TempDir, with no actor.
+    // This fixture does not invoke a reset endpoint or add a production writer.
+    let directory = store.sessions_root_dir().join(&caller.id);
+    fs::write(
+        directory.join("session.json"),
+        compact_main::serialize_main(&canonical).unwrap(),
+    )
+    .await
+    .unwrap();
+    fs::write(
+        directory.join(RUNTIME_SIDECAR_FILE),
+        serde_json::to_vec_pretty(&runtime_sidecar_snapshot(&canonical)).unwrap(),
+    )
+    .await
+    .unwrap();
+    SessionStoreV2::write_staged_root_tool_proof(&directory, &canonical)
+        .await
+        .unwrap();
+    let id = bamboo_domain::session_peer_message_id(
+        &caller.id,
+        caller.created_at,
+        &target.id,
+        target.created_at,
+        "ledger-operation",
+    );
+    let envelope = SessionMessageEnvelope {
+        thread_id: Some(id.to_string()),
+        id,
+        source: SessionMessageSource::Session {
+            session_id: caller.id.clone(),
+        },
+        target_session_id: target.id.clone(),
+        kind: SessionMessageKind::PeerMessage,
+        body: SessionMessageBody::Content(SessionMessageContent::text("bounded instruction")),
+        created_at: Utc::now(),
+        in_reply_to: None,
+        attempt: None,
+        correlation_id: Some("ledger-operation".into()),
+    };
+    let store = std::sync::Arc::new(store);
+    assert!(store
+        .find_host_session_scope(&original)
+        .await
+        .unwrap()
+        .unwrap()
+        .same_installation(&token));
+    let inbox = crate::FileSessionInbox::new(store, SessionInboxLimits::default());
+    assert!(inbox
+        .deliver_host_scoped_peer_message(
+            &token,
+            &original,
+            &envelope,
+            SessionMessageDeliveryIntent::QueueOnly
+        )
+        .await
+        .is_err());
+    assert_eq!(inbox.inspect(&target.id).await.unwrap().generation, 0);
+    let current = SessionCallerReference::from(&canonical);
+    let first = inbox
+        .deliver_host_scoped_peer_message(
+            &token,
+            &current,
+            &envelope,
+            SessionMessageDeliveryIntent::QueueOnly,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.delivery.generation, 1);
+    let mut different_ledger = current;
+    let receipt = different_ledger
+        .conversation_reset
+        .as_mut()
+        .unwrap()
+        .receipts
+        .last_mut()
+        .unwrap();
+    receipt.expected_snapshot_sha256 = if receipt.expected_snapshot_sha256 == "a".repeat(64) {
+        "b".repeat(64)
+    } else {
+        "a".repeat(64)
+    };
+    assert!(inbox
+        .deliver_host_scoped_peer_message(
+            &token,
+            &different_ledger,
+            &envelope,
+            SessionMessageDeliveryIntent::QueueOnly
+        )
+        .await
+        .is_err());
+    assert_eq!(inbox.inspect(&target.id).await.unwrap().generation, 1);
+}
+
+#[tokio::test]
+async fn host_send_hint_and_physical_writer_ignore_missing_or_wrong_global_index() {
+    use bamboo_domain::{
+        SessionInboxLimits, SessionInboxPort, SessionMessageDeliveryIntent, SessionMessageEnvelope,
+        SessionMessageKind, SessionMessageSource,
+    };
+    for mode in ["missing", "wrong"] {
+        let (_home, store, caller, target) = fixture().await;
+        let poison = Session::new("ungranted-poison", "model");
+        store.save_session(&poison).await.unwrap();
+        let poison_dir = store.sessions_root_dir().join(&poison.id).join("inbox");
+        fs::create_dir_all(&poison_dir).await.unwrap();
+        // Reading a wrong transport directory as a hint would fail with
+        // NotADirectory. A SendOnly operation must never inspect this path.
+        fs::write(poison_dir.join("new"), b"untouched poison marker")
+            .await
+            .unwrap();
+        let token = store
+            .install_host_session_scope(
+                0,
+                binding(&caller, vec![], &target, [HostSessionRight::SendPeer], 1),
+            )
+            .await
+            .unwrap();
+        {
+            let mut index = store.index.write().await;
+            if mode == "missing" {
+                index.sessions.remove(&target.id);
+            } else {
+                index.sessions.get_mut(&target.id).unwrap().rel_path =
+                    SessionStoreV2::root_rel_path(&poison.id);
+            }
+        }
+        let id = bamboo_domain::session_peer_message_id(
+            &caller.id,
+            caller.created_at,
+            &target.id,
+            target.created_at,
+            "index-operation",
+        );
+        let mut envelope = SessionMessageEnvelope::user_input(&target.id, "canonical-only input");
+        envelope.id = id.clone();
+        envelope.source = SessionMessageSource::Session {
+            session_id: caller.id.clone(),
+        };
+        envelope.kind = SessionMessageKind::PeerMessage;
+        envelope.thread_id = Some(id.to_string());
+        envelope.correlation_id = Some("index-operation".into());
+        let target_dir = store.sessions_root_dir().join(&target.id).join("inbox");
+        let inbox =
+            crate::FileSessionInbox::new(std::sync::Arc::new(store), SessionInboxLimits::default());
+        let receipt = inbox
+            .deliver_host_scoped_peer_message(
+                &token,
+                &SessionCallerReference::from(&caller),
+                &envelope,
+                SessionMessageDeliveryIntent::QueueOnly,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.delivery.generation, 1, "{mode}");
+        assert_eq!(
+            fs::read_to_string(target_dir.join("generation"))
+                .await
+                .unwrap()
+                .trim(),
+            "1"
+        );
+        let mut reader = fs::read_dir(target_dir.join("new")).await.unwrap();
+        assert!(reader.next_entry().await.unwrap().is_some());
+        assert!(reader.next_entry().await.unwrap().is_none());
+        assert_eq!(
+            fs::read(poison_dir.join("new")).await.unwrap(),
+            b"untouched poison marker"
+        );
+    }
+}
