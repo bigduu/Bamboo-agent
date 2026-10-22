@@ -8,11 +8,16 @@ use bamboo_storage::SessionStoreV2;
 
 mod args;
 mod context_view;
+pub mod discovery;
 mod handlers;
 mod helpers;
 mod self_history;
 
 use args::SessionInspectorArgs;
+use discovery::{
+    AuthorizedSessionInspectRequest, AuthorizedSessionListRequest, SessionDiscoveryPort,
+    SupervisorSessionDiscovery,
+};
 
 const SESSION_HISTORY_TOOL_NAME: &str = "session_history";
 const SESSION_HISTORY_CURRENT_TOOL_NAME: &str = "session_history_current";
@@ -24,6 +29,8 @@ enum SessionHistoryAccess {
     SelfOnly,
     /// Preserve the complete Root viewer in addition to self-history reads.
     Full,
+    /// Only metadata discovery and bounded progress through an installed grant adapter.
+    Authorized,
 }
 
 /// Server-only tool for inspecting V2 sessions stored under the Bamboo home dir.
@@ -38,15 +45,33 @@ pub struct SessionInspectorTool {
     pub(super) storage: Arc<dyn Storage>,
     access: SessionHistoryAccess,
     tool_name: &'static str,
+    discovery: Arc<dyn SessionDiscoveryPort>,
 }
 
 impl SessionInspectorTool {
     pub fn new(session_store: Arc<SessionStoreV2>, storage: Arc<dyn Storage>) -> Self {
         Self {
             session_store,
+            discovery: Arc::new(SupervisorSessionDiscovery::new(storage.clone())),
             storage,
             access: SessionHistoryAccess::Full,
             tool_name: SESSION_HISTORY_TOOL_NAME,
+        }
+    }
+
+    /// A role-neutral, restricted surface. The installed Host adapter must
+    /// authorize every page/read; unsupported callers never reach the global index.
+    pub fn authorized(
+        session_store: Arc<SessionStoreV2>,
+        storage: Arc<dyn Storage>,
+        discovery: Arc<dyn SessionDiscoveryPort>,
+    ) -> Self {
+        Self {
+            session_store,
+            storage,
+            access: SessionHistoryAccess::Authorized,
+            tool_name: SESSION_HISTORY_TOOL_NAME,
+            discovery,
         }
     }
 
@@ -54,6 +79,7 @@ impl SessionInspectorTool {
     pub fn self_only(session_store: Arc<SessionStoreV2>, storage: Arc<dyn Storage>) -> Self {
         Self {
             session_store,
+            discovery: Arc::new(SupervisorSessionDiscovery::new(storage.clone())),
             storage,
             access: SessionHistoryAccess::SelfOnly,
             tool_name: SESSION_HISTORY_TOOL_NAME,
@@ -67,6 +93,7 @@ impl SessionInspectorTool {
     pub fn current(session_store: Arc<SessionStoreV2>, storage: Arc<dyn Storage>) -> Self {
         Self {
             session_store,
+            discovery: Arc::new(SupervisorSessionDiscovery::new(storage.clone())),
             storage,
             access: SessionHistoryAccess::SelfOnly,
             tool_name: SESSION_HISTORY_CURRENT_TOOL_NAME,
@@ -101,12 +128,42 @@ impl Tool for SessionInspectorTool {
                 "Read-only search and bounded exact-turn retrieval over the current Bamboo Session's own stored messages, including compressed history. Scope is derived from trusted runtime context; no Session ID or compressed-state recovery is accepted from the caller. Use search_current, then read_around or read_current; raw Session history is transcript authority while memory is selective and may be stale."
             }
             SessionHistoryAccess::Full => {
-                "Read-only viewer over local session history. Search/page/read around the current Session directly (including compressed messages), or list sessions, inspect metadata, read bounded message slices/compressed history, and search prior conversations. A Root caller can use export_context for itself or a same-tree, same-Project target: it materializes bounded immutable status/brief files for Read offset/limit, without changing session state. Exported status is a last persisted observation, not verified live progress. This viewer has no runtime control. Distinct from memory, which manages durable cross-session knowledge."
+                "Read-only viewer over local session history. A Supervisor can list only its explicitly authorized targets with a small limit and cursor, inspect bounded persisted progress, or read_messages/get_meta for an attached Root. Directory queries match target IDs or Projects; stale cursors require a new first page. Inspect reports session-scoped persisted evidence, never verified live or input-specific completion. Ordinary legacy viewers retain current-Session search/paging, local history listing and same-tree export_context. This viewer has no runtime control."
+            }
+            SessionHistoryAccess::Authorized => {
+                "Read-only discovery of explicitly Host-authorized Sessions. list returns metadata-only pages (limit <=20, query matches target ID/Project); reuse the returned cursor with the same query and limit. inspect returns bounded persisted progress and a visible assistant excerpt, never verified live or input-specific completion. Caller identity and grants come from the installed Host adapter. Missing/stale authority is a blocker; this surface never falls back to all local Sessions, attaches history or sends work."
             }
         }
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        if self.access == SessionHistoryAccess::Authorized {
+            return json!({
+                "oneOf": [
+                    {
+                        "type":"object",
+                        "properties": {
+                            "action":{"const":"list"},
+                            "query":{"type":"string","maxLength":128,"description":"Target ID or Project filter."},
+                            "limit":{"type":"integer","minimum":1,"maximum":20},
+                            "cursor":{"type":"string","maxLength":4096}
+                        },
+                        "required":["action"],
+                        "additionalProperties":false
+                    },
+                    {
+                        "type":"object",
+                        "properties": {
+                            "action":{"const":"inspect"},
+                            "session_id":{"type":"string","minLength":1,"maxLength":256},
+                            "max_chars":{"type":"integer","minimum":1,"maximum":8000}
+                        },
+                        "required":["action","session_id"],
+                        "additionalProperties":false
+                    }
+                ]
+            });
+        }
         if self.access == SessionHistoryAccess::SelfOnly {
             return json!({
                 "type": "object",
@@ -142,7 +199,7 @@ impl Tool for SessionInspectorTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["search_current", "read_current", "read_around", "list", "get_meta", "read_messages", "read_compressed_cache", "search", "export_context"],
+                    "enum": ["search_current", "read_current", "read_around", "list", "inspect", "get_meta", "read_messages", "read_compressed_cache", "search", "export_context"],
                     "description": "Which inspection action to perform."
                 },
                 "query": { "type": "string", "description": "Search string (search_current/list/search)." },
@@ -152,7 +209,7 @@ impl Tool for SessionInspectorTool {
                 "root_session_id": { "type": "string", "description": "Filter by root session (list)." },
                 "created_by_schedule_id": { "type": "string", "description": "Filter sessions created by a schedule (list)." },
                 "limit": { "type": "number", "description": "Max items/messages to return (search_current/list/read_messages)." },
-                "cursor": { "type": "string", "description": "Opaque continuation cursor returned by read_current." },
+                "cursor": { "type": "string", "description": "Opaque continuation from read_current or an authorized list. Authorized list cursors require the original query and limit." },
                 "direction": { "type": "string", "enum": ["backward", "forward"] },
                 "max_chars": { "type": "number", "description": "Hard total content budget for read_current/read_around." },
                 "archived_only": { "type": "boolean", "description": "Select logical turns containing archived messages for read_current." },
@@ -195,6 +252,35 @@ impl Tool for SessionInspectorTool {
         })?;
 
         let action = args.get("action").and_then(serde_json::Value::as_str);
+        let scoped_discovery = self.access == SessionHistoryAccess::Authorized
+            || (self.access == SessionHistoryAccess::Full
+                && (ctx.executing_supervisor.is_some()
+                    || caller_session_id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID));
+        if self.access == SessionHistoryAccess::Authorized
+            && !matches!(action, Some("list" | "inspect"))
+        {
+            return Err(ToolError::InvalidArguments(
+                "authorized Session discovery permits only list and inspect".into(),
+            ));
+        }
+        if scoped_discovery
+            && matches!(action, Some("list" | "inspect"))
+            && args.as_object().is_some_and(|fields| {
+                fields.keys().any(|key| match action {
+                    Some("list") => {
+                        !matches!(key.as_str(), "action" | "query" | "limit" | "cursor")
+                    }
+                    Some("inspect") => {
+                        !matches!(key.as_str(), "action" | "session_id" | "max_chars")
+                    }
+                    _ => false,
+                })
+            })
+        {
+            return Err(ToolError::InvalidArguments(
+                "authorized list accepts only action/query/limit/cursor; inspect accepts only action/session_id/max_chars".into(),
+            ));
+        }
         if self.access == SessionHistoryAccess::SelfOnly
             && !matches!(
                 action,
@@ -265,6 +351,48 @@ impl Tool for SessionInspectorTool {
             ToolError::InvalidArguments(format!("Invalid {} args: {e}", self.name()))
         })?;
 
+        if scoped_discovery
+            && matches!(
+                &parsed,
+                SessionInspectorArgs::List { .. } | SessionInspectorArgs::Inspect { .. }
+            )
+        {
+            let value = match parsed {
+                SessionInspectorArgs::List {
+                    query,
+                    limit,
+                    cursor,
+                    ..
+                } => {
+                    let request = AuthorizedSessionListRequest {
+                        query,
+                        limit,
+                        cursor,
+                    };
+                    request.validate()?;
+                    serde_json::to_value(self.discovery.list(&ctx, request).await?)
+                }
+                SessionInspectorArgs::Inspect {
+                    session_id,
+                    max_chars,
+                } => {
+                    let request = AuthorizedSessionInspectRequest {
+                        session_id,
+                        max_chars,
+                    };
+                    request.validate()?;
+                    serde_json::to_value(self.discovery.inspect(&ctx, request).await?)
+                }
+                _ => unreachable!("discovery actions checked"),
+            }
+            .map_err(|error| {
+                ToolError::Execution(format!("serialize Session discovery: {error}"))
+            })?;
+            return Ok(ToolOutcome::Completed(
+                bamboo_agent_core::tools::ToolResult::text(true, value.to_string()),
+            ));
+        }
+
         if self.access == SessionHistoryAccess::Full
             && (ctx.executing_supervisor.is_some()
                 || caller_session_id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID)
@@ -281,7 +409,7 @@ impl Tool for SessionInspectorTool {
                 SessionInspectorArgs::ReadMessages { session_id, .. }
                 | SessionInspectorArgs::GetMeta { session_id } => session_id,
                 _ => return Err(ToolError::InvalidArguments(
-                    "Supervisor history supports only bounded read_messages/get_meta for its own Session or an explicitly attached Root; use session_history_current for current-turn paging".into(),
+                    "Supervisor history supports authorized list/inspect and bounded read_messages/get_meta for its own Session or an explicitly attached Root; use session_history_current for current-turn paging".into(),
                 )),
             };
             let session = self
@@ -366,7 +494,13 @@ impl Tool for SessionInspectorTool {
                 created_by_schedule_id,
                 limit,
                 offset,
+                cursor,
             } => {
+                if cursor.is_some() {
+                    return Err(ToolError::InvalidArguments(
+                        "list cursors require an installed authorized Session discovery adapter".into(),
+                    ));
+                }
                 handlers::handle_list(
                     self,
                     query,
@@ -380,6 +514,10 @@ impl Tool for SessionInspectorTool {
                 )
                 .await
             }
+
+            SessionInspectorArgs::Inspect { .. } => Err(ToolError::Execution(
+                "session_discovery_authority_required: inspect requires an installed authorized Session discovery adapter".into(),
+            )),
 
             SessionInspectorArgs::GetMeta { session_id } => {
                 handlers::handle_get_meta(self, session_id).await
