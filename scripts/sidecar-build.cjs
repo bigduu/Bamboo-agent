@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// BAMBOO_SHARED_EXECUTABLES_V1
+// BAMBOO_SHARED_EXECUTABLES_V2
 // Build the standard release executable once per native target. The output is
 // shared by Bamboo users and Bodhi; no desktop-specific Cargo variant exists.
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
-const { TARGETS, artifactName, targetOutputKey, fileIdentity, sha256, binaryArchitecture,
+const { contractForVersion, boundSourceContract, artifactName, targetOutputKey, fileIdentity, sha256, binaryArchitecture,
   execute, git, workflowIdentity, publishedRelease, assetBytes } = require('./sidecar-release.cjs')
 
 function nativeTarget(platform = process.platform, arch = process.arch) {
@@ -89,8 +89,9 @@ function verifyStampedVersions(metadata, version, { root = process.cwd(), manife
 
 async function main() {
   const identity = workflowIdentity()
+  const contractVersion = boundSourceContract()
   const target = process.env.BAMBOO_RELEASE_TARGET
-  assert.ok(TARGETS.includes(target))
+  assert.ok(contractForVersion(contractVersion).targets.includes(target))
   assert.equal(nativeTarget(), target, 'Build and runtime verification require a native target')
   const { release, receipt } = publishedRelease(identity)
   const temporary = path.resolve(process.env.RUNNER_TEMP)
