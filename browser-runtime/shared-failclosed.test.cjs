@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 
@@ -52,7 +53,9 @@ test('normal backpressure replies preserve the complete v2 owner tuple', () => {
   });
 });
 
-test('a native mutation queued before policy failure cannot escape the runtime fence', async () => {
+test('a native mutation queued before policy failure cannot escape the runtime fence', async t => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-queued-policy-'));
+  t.after(() => fs.rmSync(scratch, { recursive: true, force: true }));
   let release;
   const gate = new Promise(resolve => { release = resolve; });
   let navigations = 0;
@@ -72,7 +75,7 @@ test('a native mutation queued before policy failure cannot escape the runtime f
     require(name) { return name === 'playwright-core' ? { chromium: {} } : require(name); },
     module: { exports: {} }, process: { env: {}, platform: process.platform },
     Buffer, URL, setTimeout, clearTimeout, setInterval, clearInterval,
-    fixture: { cdp, context, page, gate },
+    fixture: { cdp, context, page, gate, scratch },
   });
   new vm.Script(fs.readFileSync(path.join(__dirname, 'host.cjs'), 'utf8')).runInContext(sandbox);
   const api = vm.runInContext(`
@@ -80,7 +83,7 @@ test('a native mutation queued before policy failure cannot escape the runtime f
     const download = runtime.withDownload;
     runtime.withDownload = (scope) => download(scope,async()=>{await fixture.gate;return {};});
     const scope = createChatScope({id:'a'.repeat(24),generation:'b'.repeat(24),profileMode:'shared',
-      context:fixture.context,downloadDir:'/synthetic-only/no-filesystem-access',runtime});
+      context:fixture.context,downloadDir:fixture.scratch,runtime});
     scope.adoptPage(fixture.page);
     ({state:()=>scope.invoke('state',{}),run:()=>scope.invoke('download',{}),
       queue:epoch=>scope.invoke('navigate',{url:'https://synthetic.invalid',expected_epoch:epoch}),
