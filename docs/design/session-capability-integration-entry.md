@@ -45,6 +45,24 @@ missing/expired activation, and `not running` do not prove physical idle.
 Lotus C1 (#397) is already merged; it must not call C2 until that backend API and
 its readback/error/revision contract are frozen and synthetically verified.
 
+C4a is now included as an independently reviewed source checkpoint from
+`7d40171b730f0fd6c6dfbc5f8a0272c1a4ae5107`: actual outer task handles are retained
+and joined past Actor/finalization/callback tail, and installed-slot admission
+reservations deny common removal/idle eviction. It still returns Unsupported
+for complete physical resource closure and signs no reset write. The logical
+router/preparation handshake, resource issuer, recovery writer and API remain
+separate requirements. Its six new fixtures are UNRUN, including the corrected
+real Actor-directory fixture.
+
+Rust source compatibility impact of C4a: `AgentRunner` and `RunnerReservation`
+now contain private physical-admission ownership. External struct literals,
+including update syntax, require migration to `AgentRunner::new()`/`Default`
+and the existing runner reservation functions. Repository literals were
+inventoried; external consumers and integrated typechecking are unverified.
+Publishing proof fields to preserve literals would weaken the intended private
+ownership, so this checkpoint does not do that. This API impact needs review
+before admission or publication.
+
 All new Rust fixtures, compilation, Cargo checks, actual provider payload and
 cross-client acceptance are **UNRUN**. Direct rustfmt and diff checks are only
 source checks. The next Rust window must verify one recorded integration SHA,
