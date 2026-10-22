@@ -3,7 +3,7 @@
 // only client: newline-delimited JSON over stdio never exposes a CDP port.
 const { chromium } = require('playwright-core');
 const { createHash, randomBytes } = require('node:crypto');
-const { rmSync, constants: fsConstants } = require('node:fs');
+const { constants: fsConstants } = require('node:fs');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
@@ -3172,8 +3172,13 @@ async function finishCloseHost() {
     if (context) await Promise.all(context.pages().map(page => page.close()));
   } catch (error) { checkpointError = error; }
   try { await checkpointProfile(); } catch (error) { checkpointError = error; }
-  try { await context?.close(); } catch (error) { checkpointError ||= error; }
-  try { await browser?.close(); } catch (error) { checkpointError ||= error; }
+  let writerCloseError;
+  try { await context?.close(); } catch (error) { writerCloseError = error; }
+  try { await browser?.close(); } catch (error) { writerCloseError ||= error; }
+  // A rejected close is not evidence that the writer stopped. Preserve the
+  // scratch and do not publish browserClosed; the native owner must retain its
+  // resources until the independent writer domain is actually confirmed.
+  if (writerCloseError) throw writerCloseError;
   browserClosed = true;
   downloadCdp = undefined;
   downloadContextId = undefined;
@@ -3318,13 +3323,9 @@ async function main() {
   process.stdin.pause();
   if (retireAfterReply) {
     // Never keep a timed-out Chromium transfer alive for the next request.
-    // Rust also kills/reaps this host's process group and removes its TMPDIR.
+    // A winning timer does not prove closeHost or detached writers finished.
+    // Native forced retirement must quarantine the unconfirmed writer domain.
     await Promise.race([closeHost(), new Promise(resolve => setTimeout(resolve, 250))]);
-    // closeHost may still be waiting on Chromium when the bounded race ends.
-    // Remove this host's private directory before forcing Node to exit.
-    if (downloadDir) {
-      try { rmSync(downloadDir, { recursive: true, force: true }); } catch { /* Rust owns the fallback. */ }
-    }
     process.exit(1);
   }
   await closeHost();
