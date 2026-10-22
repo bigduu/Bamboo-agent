@@ -179,7 +179,7 @@ pub fn conversation_reset_snapshot_sha256(session: &Session) -> Result<String, s
 }
 
 impl ConversationResetState {
-    fn valid_for(&self, birth_token: &str) -> bool {
+    pub(crate) fn valid_for(&self, birth_token: &str) -> bool {
         if self.schema_version != CONVERSATION_RESET_SCHEMA_VERSION
             || self.receipts.len() > CONVERSATION_RESET_RECEIPT_LIMIT
             || (self.conversation_revision == 0) != self.receipts.is_empty()
