@@ -72,8 +72,14 @@ async fn cached_ticket_tools_do_not_own_or_recreate_a_dropped_application() {
         let service = fixture.app.service().unwrap();
         (service.published().unwrap().1, Arc::downgrade(&service))
     };
-    let Fixture { _root: root, app, session } = fixture;
-    let writer_root = root.path().join("tickets")
+    let Fixture {
+        _root: root,
+        app,
+        session,
+    } = fixture;
+    let writer_root = root
+        .path()
+        .join("tickets")
         .join(before.binding.scope_id.strip_prefix("supervisor/").unwrap());
     let head = std::fs::read(writer_root.join("HEAD")).unwrap();
     drop(app);
@@ -91,9 +97,18 @@ async fn cached_ticket_tools_do_not_own_or_recreate_a_dropped_application() {
     let reopened = TicketService::open(&writer_root, before.binding.clone()).unwrap();
     assert!(old_writer.upgrade().is_none());
     let after = reopened.published().unwrap().1;
-    assert_eq!(after.authority_epoch, before.authority_epoch.checked_add(1).unwrap());
-    assert_eq!(canonical_bytes(&after.assignments).unwrap(), canonical_bytes(&before.assignments).unwrap());
-    assert_eq!(canonical_bytes(&after.intents).unwrap(), canonical_bytes(&before.intents).unwrap());
+    assert_eq!(
+        after.authority_epoch,
+        before.authority_epoch.checked_add(1).unwrap()
+    );
+    assert_eq!(
+        canonical_bytes(&after.assignments).unwrap(),
+        canonical_bytes(&before.assignments).unwrap()
+    );
+    assert_eq!(
+        canonical_bytes(&after.intents).unwrap(),
+        canonical_bytes(&before.intents).unwrap()
+    );
 }
 
 #[tokio::test]

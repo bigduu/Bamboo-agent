@@ -1205,7 +1205,11 @@ impl ExternalChildRunner for LocalTaskChildRunner {
                 queue: &self.coordinators,
                 handle: Some(coordinator),
             };
-            let result = retained.handle.as_mut().expect("retained coordinator").await;
+            let result = retained
+                .handle
+                .as_mut()
+                .expect("retained coordinator")
+                .await;
             retained.handle.take();
             // Record each observed error before the next await, so cancelling
             // this caller cannot discard a completed coordinator's failure.

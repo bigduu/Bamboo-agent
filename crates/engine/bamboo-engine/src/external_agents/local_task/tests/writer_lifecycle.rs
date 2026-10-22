@@ -33,7 +33,10 @@ fn assert_lifecycle_writer_still_locked(
     // an accidental temporary external Arc cannot make this probe pass.
     match TicketService::open(root, binding.clone()) {
         Err(bamboo_tickets::Error::AuthorityUnavailable(reason)) => {
-            assert!(reason.contains("another local writer holds the process lock"), "{reason}");
+            assert!(
+                reason.contains("another local writer holds the process lock"),
+                "{reason}"
+            );
         }
         Err(error) => panic!("same-root writer failed for an unrelated reason: {error}"),
         Ok(_) => panic!("same-root writer reopened while the old owner must remain live"),
@@ -43,8 +46,16 @@ fn assert_lifecycle_writer_still_locked(
         assert_eq!(service.health(), Health::Writable);
         canonical_bytes(&service.published().unwrap()).unwrap()
     };
-    assert_eq!(actual.as_slice(), published_before, "failed reopen cannot change HEAD, epoch or Ticket facts");
-    assert_eq!(owner.strong_count(), 1, "only the runner's cache owns this Ticket writer");
+    assert_eq!(
+        actual.as_slice(),
+        published_before,
+        "failed reopen cannot change HEAD, epoch or Ticket facts"
+    );
+    assert_eq!(
+        owner.strong_count(),
+        1,
+        "only the runner's cache owns this Ticket writer"
+    );
     assert!(root.join("writer.lock").is_file());
 }
 
@@ -63,7 +74,11 @@ struct LifecycleTailRelease(Option<oneshot::Sender<()>>);
 
 impl LifecycleTailRelease {
     fn release(&mut self) {
-        self.0.take().unwrap().send(()).expect("actual coordinator still awaits its tail");
+        self.0
+            .take()
+            .unwrap()
+            .send(())
+            .expect("actual coordinator still awaits its tail");
     }
 }
 
@@ -87,7 +102,9 @@ async fn idle_shutdown_releases_ticket_writer_and_closed_late_binding_cannot_res
     assert!(lock(&harness.runner.coordinators).is_empty());
 
     tokio::time::timeout(WAIT, harness.runner.shutdown())
-        .await.expect("idle shutdown completes").unwrap();
+        .await
+        .expect("idle shutdown completes")
+        .unwrap();
     assert!(harness.runner.closed.load(Ordering::Acquire));
     // A late scope publisher still holding its own legitimate handle must not
     // reattach that handle to a runtime whose shutdown already succeeded.
@@ -96,15 +113,27 @@ async fn idle_shutdown_releases_ticket_writer_and_closed_late_binding_cannot_res
     // Obtain the actual physical-open result before asserting Weak, preserving
     // the genuine lock error as RED evidence if the runner retained its cache.
     let reopened = TicketService::open(&root, binding.clone()).unwrap_or_else(|error| {
-        panic!("idle closed runtime retained/rebound its writer: {error}; old strong count={}", old_writer.strong_count())
+        panic!(
+            "idle closed runtime retained/rebound its writer: {error}; old strong count={}",
+            old_writer.strong_count()
+        )
     });
     assert_eq!(reopened.health(), Health::Writable);
     assert!(old_writer.upgrade().is_none());
     let after = reopened.published().unwrap().1;
     assert_eq!(after.binding, binding);
-    assert_eq!(after.authority_epoch, before.authority_epoch.checked_add(1).unwrap());
-    assert_eq!(canonical_bytes(&after.assignments).unwrap(), canonical_bytes(&before.assignments).unwrap());
-    assert_eq!(canonical_bytes(&after.intents).unwrap(), canonical_bytes(&before.intents).unwrap());
+    assert_eq!(
+        after.authority_epoch,
+        before.authority_epoch.checked_add(1).unwrap()
+    );
+    assert_eq!(
+        canonical_bytes(&after.assignments).unwrap(),
+        canonical_bytes(&before.assignments).unwrap()
+    );
+    assert_eq!(
+        canonical_bytes(&after.intents).unwrap(),
+        canonical_bytes(&before.intents).unwrap()
+    );
     assert!(root.join("writer.lock").is_file());
     assert_lifecycle_provider_unused(&mut control);
 }
@@ -119,37 +148,71 @@ async fn unknown_unstarted_stop_keeps_the_unique_ticket_writer_across_shutdown_r
     let old_writer = Arc::downgrade(&service);
     drop(service);
     assert_eq!(old_writer.strong_count(), 1);
-    let child = harness.child("writer-unknown-stop", "never enters the Agent").await;
+    let child = harness
+        .child("writer-unknown-stop", "never enters the Agent")
+        .await;
     let run_id = "writer-accepted-unstarted-cleanup-failure";
-    let registration = harness.router.register_run(&child.id, run_id).await.unwrap();
-    harness.runner.prepare_child_execution(&child, run_id, CancellationToken::new()).await.unwrap();
+    let registration = harness
+        .router
+        .register_run(&child.id, run_id)
+        .await
+        .unwrap();
+    harness
+        .runner
+        .prepare_child_execution(&child, run_id, CancellationToken::new())
+        .await
+        .unwrap();
     let execution = harness.runner.execution(&child, run_id).unwrap();
     // Same actual resource-domain fault as the existing unknown-stop test:
     // abandon really attempts cleanup and cannot obtain a confirmed stop.
-    execution.resources.record_unconfirmed("owned setup resource stop cannot be confirmed");
-    assert!(harness.runner.abandon_child_execution(&child, run_id).await.is_err());
-    let cold = bamboo_storage::SessionStoreV2::new(home.path().to_path_buf()).await.unwrap();
+    execution
+        .resources
+        .record_unconfirmed("owned setup resource stop cannot be confirmed");
+    assert!(harness
+        .runner
+        .abandon_child_execution(&child, run_id)
+        .await
+        .is_err());
+    let cold = bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
     let saved = cold.load_session(&child.id).await.unwrap().unwrap();
-    assert_eq!(saved.metadata["runtime.local_task.state"], "stop_unconfirmed");
+    assert_eq!(
+        saved.metadata["runtime.local_task.state"],
+        "stop_unconfirmed"
+    );
     assert_eq!(saved.metadata["runtime.local_task.run_id"], run_id);
-    assert_eq!(saved.metadata["runtime.local_task.child_birth"], child.created_at.to_rfc3339());
-    assert_eq!(saved.metadata["runtime.local_task.reason"], "execution_stop_unconfirmed");
+    assert_eq!(
+        saved.metadata["runtime.local_task.child_birth"],
+        child.created_at.to_rfc3339()
+    );
+    assert_eq!(
+        saved.metadata["runtime.local_task.reason"],
+        "execution_stop_unconfirmed"
+    );
     assert!(!saved.metadata.contains_key("runtime.local_task.instance"));
     assert!(!saved.metadata.contains_key("ticket.runtime.owned_stop.v1"));
     assert!(lock(&execution.stop).is_none());
     assert!(execution.task.lock().await.is_none());
     registration.quarantine().await;
-    assert_eq!(harness.router.current_run_id(&child.id).await.as_deref(), Some(run_id));
+    assert_eq!(
+        harness.router.current_run_id(&child.id).await.as_deref(),
+        Some(run_id)
+    );
 
     for attempt in 1..=2 {
         let error = tokio::time::timeout(WAIT, harness.runner.shutdown())
-            .await.expect("unknown-stop shutdown reports instead of hanging")
+            .await
+            .expect("unknown-stop shutdown reports instead of hanging")
             .expect_err("unknown stop must not release the writer or report successful shutdown");
         assert!(error.contains("unconfirmed"), "shutdown {attempt}: {error}");
         assert!(harness.runner.closed.load(Ordering::Acquire));
         assert_lifecycle_writer_still_locked(&root, &binding, &old_writer, &original);
         assert!(lock(&execution.stop).is_none());
-        assert_eq!(harness.router.current_run_id(&child.id).await.as_deref(), Some(run_id));
+        assert_eq!(
+            harness.router.current_run_id(&child.id).await.as_deref(),
+            Some(run_id)
+        );
         assert_lifecycle_provider_unused(&mut control);
     }
 }
@@ -165,10 +228,20 @@ async fn concurrent_and_aborted_shutdown_keep_the_actual_publication_tail_for_re
     let old_writer = Arc::downgrade(&service);
     drop(service);
     assert_eq!(old_writer.strong_count(), 1);
-    let child = harness.child("writer-publication-tail", "unused unstarted input").await;
+    let child = harness
+        .child("writer-publication-tail", "unused unstarted input")
+        .await;
     let run_id = "writer-actual-publication-tail-coordinator";
-    let registration = harness.router.register_run(&child.id, run_id).await.unwrap();
-    harness.runner.prepare_child_execution(&child, run_id, CancellationToken::new()).await.unwrap();
+    let registration = harness
+        .router
+        .register_run(&child.id, run_id)
+        .await
+        .unwrap();
+    harness
+        .runner
+        .prepare_child_execution(&child, run_id, CancellationToken::new())
+        .await
+        .unwrap();
     let execution = harness.runner.execution(&child, run_id).unwrap();
     let (release_finish, finish_released) = oneshot::channel();
     let (finished, finish_observed) = oneshot::channel();
@@ -180,22 +253,39 @@ async fn concurrent_and_aborted_shutdown_keep_the_actual_publication_tail_for_re
         let child = child.clone();
         tokio::spawn(async move {
             finish_released.await.unwrap();
-            let stopped = checkpoint_unstarted_cancellation(&runner, &execution, child, run_id).await;
-            runner.finish_child_execution(&stopped, run_id, true).await.unwrap();
+            let stopped =
+                checkpoint_unstarted_cancellation(&runner, &execution, child, run_id).await;
+            runner
+                .finish_child_execution(&stopped, run_id, true)
+                .await
+                .unwrap();
             finished.send(()).unwrap();
             // No execution remains in the map, but this actual coordinator
             // still owns a live publication tail until the private gate opens.
             tail_released.await.unwrap();
         })
     };
-    assert!(harness.runner.track_child_task(&child.id, run_id, coordinator).is_none());
+    assert!(harness
+        .runner
+        .track_child_task(&child.id, run_id, coordinator)
+        .is_none());
     release_finish.send(()).unwrap();
-    tokio::time::timeout(WAIT, finish_observed).await.unwrap().unwrap();
+    tokio::time::timeout(WAIT, finish_observed)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(lock(&execution.stop).is_some());
     assert!(execution.finalized.load(Ordering::Acquire));
     assert!(lock(&harness.runner.executions).is_empty());
     assert_eq!(
-        harness.store.inspect_actor(&child.id).await.unwrap().activation.unwrap().status,
+        harness
+            .store
+            .inspect_actor(&child.id)
+            .await
+            .unwrap()
+            .activation
+            .unwrap()
+            .status,
         ActorActivationStatus::Cancelled
     );
     assert_eq!(lock(&harness.runner.coordinators).len(), 1);
@@ -206,10 +296,15 @@ async fn concurrent_and_aborted_shutdown_keep_the_actual_publication_tail_for_re
     };
     tokio::time::timeout(WAIT, async {
         while !lock(&harness.runner.coordinators).is_empty() {
-            assert!(!first_shutdown.is_finished(), "first shutdown must await the actual closed tail gate");
+            assert!(
+                !first_shutdown.is_finished(),
+                "first shutdown must await the actual closed tail gate"
+            );
             tokio::task::yield_now().await;
         }
-    }).await.expect("first shutdown takes/pops the retained coordinator before waiting");
+    })
+    .await
+    .expect("first shutdown takes/pops the retained coordinator before waiting");
     assert!(!first_shutdown.is_finished());
     assert_lifecycle_writer_still_locked(&root, &binding, &old_writer, &original);
 
@@ -218,37 +313,63 @@ async fn concurrent_and_aborted_shutdown_keep_the_actual_publication_tail_for_re
     let mut retry = Box::pin(harness.runner.shutdown());
     let parallel_poll = std::future::poll_fn(|cx| {
         std::task::Poll::Ready(std::future::Future::poll(retry.as_mut(), cx))
-    }).await;
-    assert!(parallel_poll.is_pending(), "parallel shutdown bypassed the active drain: {parallel_poll:?}");
+    })
+    .await;
+    assert!(
+        parallel_poll.is_pending(),
+        "parallel shutdown bypassed the active drain: {parallel_poll:?}"
+    );
     assert_lifecycle_writer_still_locked(&root, &binding, &old_writer, &original);
     first_shutdown.abort();
-    assert!(first_shutdown.await.expect_err("owned first shutdown is explicitly aborted").is_cancelled());
+    assert!(first_shutdown
+        .await
+        .expect_err("owned first shutdown is explicitly aborted")
+        .is_cancelled());
 
     // Poll the retry itself, so Pending proves it really entered shutdown while
     // the actual tail is closed; merely spawning an unpolled future is weaker.
     let first_poll = std::future::poll_fn(|cx| {
         std::task::Poll::Ready(std::future::Future::poll(retry.as_mut(), cx))
-    }).await;
-    assert!(first_poll.is_pending(), "cancelled shutdown lost its unjoined coordinator: {first_poll:?}");
+    })
+    .await;
+    assert!(
+        first_poll.is_pending(),
+        "cancelled shutdown lost its unjoined coordinator: {first_poll:?}"
+    );
     assert!(lock(&harness.runner.executions).is_empty());
     assert_lifecycle_writer_still_locked(&root, &binding, &old_writer, &original);
     assert_lifecycle_provider_unused(&mut control);
 
     tail.release();
-    tokio::time::timeout(WAIT, retry).await.expect("retry joins the released actual tail").unwrap();
+    tokio::time::timeout(WAIT, retry)
+        .await
+        .expect("retry joins the released actual tail")
+        .unwrap();
     registration.finish(0).await.unwrap();
     // First probe the real writer, then check retained references: a successful
     // result requires both the joined tail and removal of the runner's cache.
     let reopened = TicketService::open(&root, binding.clone()).unwrap_or_else(|error| {
-        panic!("joined shutdown retained its writer: {error}; old strong count={}", old_writer.strong_count())
+        panic!(
+            "joined shutdown retained its writer: {error}; old strong count={}",
+            old_writer.strong_count()
+        )
     });
     assert_eq!(reopened.health(), Health::Writable);
     assert!(old_writer.upgrade().is_none());
     let after = reopened.published().unwrap().1;
     assert_eq!(after.binding, binding);
-    assert_eq!(after.authority_epoch, before.authority_epoch.checked_add(1).unwrap());
-    assert_eq!(canonical_bytes(&after.assignments).unwrap(), canonical_bytes(&before.assignments).unwrap());
-    assert_eq!(canonical_bytes(&after.intents).unwrap(), canonical_bytes(&before.intents).unwrap());
+    assert_eq!(
+        after.authority_epoch,
+        before.authority_epoch.checked_add(1).unwrap()
+    );
+    assert_eq!(
+        canonical_bytes(&after.assignments).unwrap(),
+        canonical_bytes(&before.assignments).unwrap()
+    );
+    assert_eq!(
+        canonical_bytes(&after.intents).unwrap(),
+        canonical_bytes(&before.intents).unwrap()
+    );
     assert!(root.join("writer.lock").is_file());
     assert_lifecycle_provider_unused(&mut control);
 }
@@ -270,8 +391,13 @@ async fn failed_publication_join_keeps_the_writer_across_shutdown_retries() {
     }));
     for attempt in 1..=2 {
         let error = tokio::time::timeout(WAIT, harness.runner.shutdown())
-            .await.expect("failed join shutdown returns").expect_err("failed publication is retained");
-        assert!(error.contains("controlled publication-tail failure"), "attempt {attempt}: {error}");
+            .await
+            .expect("failed join shutdown returns")
+            .expect_err("failed publication is retained");
+        assert!(
+            error.contains("controlled publication-tail failure"),
+            "attempt {attempt}: {error}"
+        );
         assert_lifecycle_writer_still_locked(&root, &binding, &old_writer, &original);
     }
     assert_lifecycle_provider_unused(&mut control);

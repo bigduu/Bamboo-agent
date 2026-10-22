@@ -152,7 +152,8 @@ impl TicketTool {
             "work_update" | "work_dispatch" => {
                 if self.name == "work_update" && args.get("message_id").is_some() {
                     let request: SemanticMutation = decode(args)?;
-                    return app.resolve_message(&request.message_id, &request.proposal)
+                    return app
+                        .resolve_message(&request.message_id, &request.proposal)
                         .await;
                 }
                 if app.oldest_unresolved_human()?.is_some() {
