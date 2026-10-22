@@ -22,6 +22,9 @@ pub struct SessionCallerReference {
     pub root_tool_authority_revision: u64,
     pub session_version: Option<u32>,
     pub workspace: Option<String>,
+    /// Original operation generation; scope permissions use a separate stable identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_reset: Option<super::ConversationResetState>,
 }
 
 impl From<&Session> for SessionCallerReference {
@@ -40,13 +43,14 @@ impl From<&Session> for SessionCallerReference {
             root_tool_authority_revision: session.root_tool_authority_revision,
             session_version: session.session_version,
             workspace: session.workspace.clone(),
+            conversation_reset: session.conversation_reset.clone(),
         }
     }
 }
 
 impl SessionCallerReference {
     pub fn matches_session(&self, session: &Session) -> bool {
-        self == &Self::from(session)
+        session.validate_conversation_state().is_ok() && self == &Self::from(session)
     }
 }
 

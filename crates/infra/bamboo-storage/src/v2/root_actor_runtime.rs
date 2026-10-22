@@ -35,6 +35,12 @@ impl RootActorWriteProof {
         let mut main: Session = actor_transcript::decode(&main_bytes).map_err(conflict)?;
         let mut side: Session = actor_transcript::decode(&side_bytes).map_err(conflict)?;
         supervisor::validate_overlay(&main, Some(&side)).map_err(conflict)?;
+        main.check_conversation_generation(&side)
+            .map_err(conflict)?;
+        self.owner
+            .conversation_generation
+            .check_canonical(&side)
+            .map_err(conflict)?;
         // Normalize the ordinary Root serializer's legacy empty root id. This
         // port retains the existing full/runtime validators and does not import
         // the bounded transcript append port's separate metadata/payload limits.
@@ -75,6 +81,9 @@ impl RootActorWriteProof {
 
     pub(super) fn validate_candidate(&self, incoming: &Session) -> io::Result<()> {
         let durable = self.validate()?;
+        incoming
+            .check_conversation_generation(&durable)
+            .map_err(conflict)?;
         if incoming.id != durable.id
             || incoming.kind != SessionKind::Root
             || incoming.created_at != durable.created_at

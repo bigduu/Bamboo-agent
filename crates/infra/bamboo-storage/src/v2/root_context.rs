@@ -12,6 +12,9 @@ const ROOT_TOOL_AUTHORITY_PROOF_MIGRATION_MARKER: &str = ".root_tool_authority_p
 const ROOT_TOOL_AUTHORITY_PROOF_MAX_BYTES: u64 = 4096;
 
 fn root_tool_proof_version(session: &Session) -> u32 {
+    if session.conversation_reset.is_some() {
+        return 3;
+    }
     // Pre-mode Roots retain their readable v1 proof. The first terminal mode
     // operation upgrades it to v2, which an older v1-only final writer rejects
     // instead of dropping the operation epoch/history during a mixed rollout.
@@ -50,11 +53,34 @@ struct RootToolAuthorityProof {
     root_mode_transition_epoch: u64,
     #[serde(default)]
     root_mode_operations: Vec<RootModeOperationReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_reset: Option<ConversationResetProof>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ConversationResetProof {
+    revision: u64,
+    sha256: String,
+}
+
+impl ConversationResetProof {
+    fn from_session(session: &Session) -> io::Result<Option<Self>> {
+        session
+            .conversation_reset_sha256()
+            .map(|digest| {
+                digest.map(|sha256| Self {
+                    revision: session.conversation_revision(),
+                    sha256,
+                })
+            })
+            .map_err(|error| conflict(error.to_string()))
+    }
 }
 
 impl RootToolAuthorityProof {
-    fn from_session(session: &Session, state: ProofState) -> Self {
-        Self {
+    fn from_session(session: &Session, state: ProofState) -> io::Result<Self> {
+        Ok(Self {
             version: root_tool_proof_version(session),
             state,
             id: session.id.clone(),
@@ -64,7 +90,8 @@ impl RootToolAuthorityProof {
             root_tool_authority_revision: session.root_tool_authority_revision,
             root_mode_transition_epoch: session.root_mode_transition_epoch,
             root_mode_operations: session.root_mode_operations.clone(),
-        }
+            conversation_reset: ConversationResetProof::from_session(session)?,
+        })
     }
 
     fn matches(&self, session: &Session) -> bool {
@@ -76,6 +103,8 @@ impl RootToolAuthorityProof {
             && self.root_tool_authority_revision == session.root_tool_authority_revision
             && self.root_mode_transition_epoch == session.root_mode_transition_epoch
             && self.root_mode_operations == session.root_mode_operations
+            && ConversationResetProof::from_session(session)
+                .is_ok_and(|expected| self.conversation_reset == expected)
     }
 }
 
@@ -103,6 +132,8 @@ struct RootToolAuthorityMain {
     root_mode_transition_epoch: u64,
     #[serde(default)]
     root_mode_operations: Vec<RootModeOperationReceipt>,
+    #[serde(default)]
+    conversation_reset: Option<bamboo_domain::ConversationResetState>,
 }
 
 impl From<&Session> for RootToolAuthorityMain {
@@ -119,6 +150,7 @@ impl From<&Session> for RootToolAuthorityMain {
             root_tool_authority_revision: session.root_tool_authority_revision,
             root_mode_transition_epoch: session.root_mode_transition_epoch,
             root_mode_operations: session.root_mode_operations.clone(),
+            conversation_reset: session.conversation_reset.clone(),
         }
     }
 }
@@ -418,7 +450,7 @@ impl SessionStoreV2 {
         session: &Session,
         state: ProofState,
     ) -> io::Result<()> {
-        let bytes = serde_json::to_vec(&RootToolAuthorityProof::from_session(session, state))
+        let bytes = serde_json::to_vec(&RootToolAuthorityProof::from_session(session, state)?)
             .map_err(|error| conflict(error.to_string()))?;
         durable_atomic_write(&directory.join(ROOT_TOOL_AUTHORITY_PROOF_FILE), &bytes).await
     }
@@ -442,7 +474,7 @@ impl SessionStoreV2 {
         state: ProofState,
         guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<()> {
-        let bytes = serde_json::to_vec(&RootToolAuthorityProof::from_session(session, state))
+        let bytes = serde_json::to_vec(&RootToolAuthorityProof::from_session(session, state)?)
             .map_err(|error| conflict(error.to_string()))?;
         self.write_default_bytes(
             &directory.join(ROOT_TOOL_AUTHORITY_PROOF_FILE),
@@ -536,6 +568,14 @@ impl SessionStoreV2 {
                 compact_main::validate_full_main(&main_bytes)?;
                 let main: Session = serde_json::from_slice(&main_bytes)?;
                 let side: Session = serde_json::from_slice(&side_bytes)?;
+                // A nonzero conversation already belongs to the new reset
+                // protocol. Missing proof is recovery-required, never a legacy
+                // migration even when both files happen to match.
+                if main.conversation_reset.is_some() || side.conversation_reset.is_some() {
+                    return Err(conflict(
+                        "nonzero conversation proof cannot be reconstructed by migration",
+                    ));
+                }
                 Self::validate_root_tool_authority_pair(
                     &RootToolAuthorityMain::from(&main),
                     &side,
@@ -609,6 +649,8 @@ impl SessionStoreV2 {
         main: &RootToolAuthorityMain,
         side: &Session,
     ) -> io::Result<()> {
+        side.validate_conversation_state()
+            .map_err(|error| conflict(error.to_string()))?;
         if main.kind != SessionKind::Root
             || main.parent_session_id.is_some()
             || main.spawn_depth != 0
@@ -626,6 +668,7 @@ impl SessionStoreV2 {
                 && side.root_orchestration_only != main.root_orchestration_only)
             || side.root_mode_transition_epoch != main.root_mode_transition_epoch
             || side.root_mode_operations != main.root_mode_operations
+            || side.conversation_reset != main.conversation_reset
             || (side.root_orchestration_only && side.root_tool_authority_revision == 0)
         {
             return Err(conflict(
@@ -707,6 +750,9 @@ impl SessionStoreV2 {
         full: bool,
     ) -> io::Result<()> {
         validate_session_id(&incoming.id)?;
+        incoming
+            .validate_conversation_state()
+            .map_err(|error| conflict(error.to_string()))?;
         if incoming.root_orchestration_only && incoming.root_tool_authority_revision == 0 {
             return Err(conflict("Root tool authority has no selection revision"));
         }
@@ -714,7 +760,14 @@ impl SessionStoreV2 {
         self.validate_root_lifetime_for_write(incoming).await?;
         let directory = self.sessions_dir.join(&incoming.id);
         match fs::symlink_metadata(&directory).await {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if incoming.conversation_reset.is_some() {
+                    return Err(conflict(
+                        "a new Root cannot inherit conversation reset receipts",
+                    ));
+                }
+                return Ok(());
+            }
             Err(error) => return Err(conflict(error.to_string())),
             Ok(metadata) if !metadata.file_type().is_dir() => {
                 return Err(conflict("canonical Root directory is not a real directory"));
@@ -730,6 +783,11 @@ impl SessionStoreV2 {
         let runtime = directory.join(RUNTIME_SIDECAR_FILE);
         let has_runtime = regular_file_exists(&runtime).await?;
         if !has_main {
+            if incoming.conversation_reset.is_some() {
+                return Err(conflict(
+                    "a generation-bearing Root requires canonical Main for an ordinary write",
+                ));
+            }
             if !full {
                 return Err(conflict("canonical main file is missing"));
             }
@@ -749,6 +807,9 @@ impl SessionStoreV2 {
             .map_err(|error| conflict(error.to_string()))?;
         let current: Session = serde_json::from_slice(&bytes)
             .map_err(|error| conflict(format!("invalid canonical runtime: {error}")))?;
+        incoming
+            .check_conversation_generation(&current)
+            .map_err(|error| conflict(error.to_string()))?;
         supervisor::validate_identity(&current).map_err(|error| conflict(error.to_string()))?;
         if current.supervisor_management != incoming.supervisor_management {
             return Err(conflict(

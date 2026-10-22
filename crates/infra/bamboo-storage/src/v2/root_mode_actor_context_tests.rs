@@ -57,6 +57,7 @@ async fn activate(store: &SessionStoreV2, root: &Session) -> RootActorRuntimeWri
     RootActorRuntimeWrite {
         fence: activation.fence(),
         created_at: root.created_at,
+        conversation_generation: root.conversation_generation_observation(),
     }
 }
 

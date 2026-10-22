@@ -127,6 +127,9 @@ mod startup_sidecar_tests;
 mod task_publication_lifetime_tests;
 use default_actor_context::DefaultWriterGuards;
 pub(crate) use default_actor_context::DefaultWriterPhysicalGuards;
+#[cfg(test)]
+mod conversation_generation_tests;
+pub(crate) mod host_session_scope;
 mod root_context;
 #[cfg(test)]
 mod root_context_tests;
@@ -586,7 +589,27 @@ fn reject_incompatible_session_write(session: &Session) -> io::Result<()> {
             io::ErrorKind::Unsupported,
             bamboo_domain::SessionAuthorityConflict(error.to_string()),
         )
+    })?;
+    session.validate_conversation_state().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            bamboo_domain::SessionAuthorityConflict(error.to_string()),
+        )
     })
+}
+
+fn reject_conversation_generation_change(
+    incoming: &Session,
+    canonical: &Session,
+) -> io::Result<()> {
+    incoming
+        .check_conversation_generation(canonical)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                bamboo_domain::SessionAuthorityConflict(error.to_string()),
+            )
+        })
 }
 
 fn reject_session_version_change(incoming: &Session, durable: &Session) -> io::Result<()> {
@@ -1434,6 +1457,8 @@ pub struct SessionStoreV2 {
     /// the dedicated fs2 file lock covers independent store instances and
     /// processes sharing this Bamboo home.
     runtime_task_transaction_gate: std::sync::Arc<RwLock<()>>,
+    /// Empty unless a trusted Host explicitly installs a finite caller scope.
+    host_scope_registry: crate::host_session_scope::HostSessionScopeRegistry,
     /// When true, ordinary control-plane access fails closed until the retained
     /// undo journal has restored both sides of an interrupted transaction.
     runtime_task_recovery_required: AtomicBool,
@@ -1531,6 +1556,7 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     copy.observed_runtime_session_version = None;
     copy.authority_identity = SessionAuthorityIdentity::Ordinary;
     copy.supervisor_management = None;
+    copy.conversation_reset = None;
     copy.id = new_id.to_string();
     copy.kind = SessionKind::Root;
     copy.parent_session_id = None;
@@ -1767,6 +1793,7 @@ impl SessionStoreV2 {
             persistence_metrics,
             session_lifecycle_lock: std::sync::Arc::new(RwLock::new(())),
             runtime_task_transaction_gate: std::sync::Arc::new(RwLock::new(())),
+            host_scope_registry: crate::host_session_scope::HostSessionScopeRegistry::default(),
             runtime_task_recovery_required: AtomicBool::new(false),
             #[cfg(test)]
             runtime_task_faults: std::sync::Mutex::new(Vec::new()),
@@ -5467,6 +5494,11 @@ impl SessionStoreV2 {
         reject_incompatible_session_write(&session)?;
         self.validate_root_context_for_save(&session).await?;
 
+        if session.conversation_reset.is_some() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, bamboo_domain::SessionAuthorityConflict(
+                "conversation generation requires a fenced reset transaction; legacy clear is unavailable".into(),
+            )));
+        }
         // Keep only the first System message if present; drop all other messages.
         let system_msg = session
             .messages
@@ -6291,6 +6323,7 @@ impl SessionStoreV2 {
             .await?
         {
             reject_incompatible_session_write(&durable)?;
+            reject_conversation_generation_change(session, &durable)?;
         }
         if let Some(previous) = Self::read_runtime_sidecar_at(
             &self.abs_path_from_rel(rel).join(RUNTIME_SIDECAR_FILE),
@@ -6299,6 +6332,7 @@ impl SessionStoreV2 {
         .await?
         {
             reject_incompatible_session_write(&previous)?;
+            reject_conversation_generation_change(session, &previous)?;
             // Runtime does not own Main's stamp. Legacy absence and v1 have
             // identical semantics; never turn this compatible pair into a
             // false conflict or rewrite Main from the runtime-only path.
@@ -6515,6 +6549,7 @@ impl SessionStoreV2 {
                 compact_main::validate_full_main(raw.as_bytes())?;
                 let durable: Session = serde_json::from_str(&raw)
                     .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
+                reject_conversation_generation_change(session, &durable)?;
                 reject_session_version_change(session, &durable)?;
                 if let Some(mut previous_runtime) = Self::read_runtime_sidecar_at(
                     &current_main
@@ -6705,6 +6740,31 @@ impl SessionStoreV2 {
 
 #[async_trait::async_trait]
 impl Storage for SessionStoreV2 {
+    async fn find_host_session_scope(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+    ) -> io::Result<Option<bamboo_domain::HostSessionScopeToken>> {
+        Ok(self.host_scope_registry.lookup(caller).await)
+    }
+
+    async fn list_host_scoped_targets(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &bamboo_domain::SessionCallerReference,
+    ) -> io::Result<Vec<bamboo_domain::HostSessionTargetScope>> {
+        self.list_host_scoped_targets_impl(token, caller).await
+    }
+
+    async fn load_host_scoped_target(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<Session> {
+        self.load_host_scoped_target_impl(token, caller, target_id)
+            .await
+    }
+
     async fn save_manual_title(&self, session: &Session) -> io::Result<()> {
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
