@@ -92,6 +92,8 @@ mod actor_snapshot_tests;
 mod actor_snapshot_windows_tests;
 #[cfg(test)]
 mod actor_transcript_tests;
+#[cfg(test)]
+mod browser_cleanup_observation_tests;
 mod child_actor_runtime;
 #[cfg(test)]
 mod child_actor_runtime_tests;
