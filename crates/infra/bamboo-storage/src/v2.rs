@@ -129,6 +129,7 @@ use default_actor_context::DefaultWriterGuards;
 pub(crate) use default_actor_context::DefaultWriterPhysicalGuards;
 #[cfg(test)]
 mod conversation_generation_tests;
+mod host_root_create;
 pub(crate) mod host_session_scope;
 mod root_context;
 #[cfg(test)]
@@ -6621,8 +6622,10 @@ impl SessionStoreV2 {
         } else {
             session.root_session_id.as_str()
         };
-        let tree = self.acquire_actor_tree_write_guard(root_id).await?;
-        guards.hold_tree(tree);
+        if !guards.retains_tree_for(root_id) {
+            let tree = self.acquire_actor_tree_write_guard(root_id).await?;
+            guards.hold_tree(tree);
+        }
         let title_observations = if manual_title {
             self.prepare_title_observations(session).await?
         } else {
