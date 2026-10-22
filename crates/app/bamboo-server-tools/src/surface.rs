@@ -1,7 +1,7 @@
 //! Tool surface selection semantics.
 //!
-//! Different session types require different tool sets. This module provides
-//! an enum-based way to select the appropriate tool surface at execution time.
+//! Session capability tools share the Base assembly; role-specific management
+//! and restricted Child execution keep their independent boundaries.
 
 use std::sync::Arc;
 
@@ -9,23 +9,22 @@ use bamboo_agent_core::tools::ToolExecutor;
 
 /// Tool surface variants for different session types.
 ///
-/// | Surface  | Base + current history + messaging | +SubAgent | +scheduler | full history |
-/// |----------|------------------------|-----------|------------|--------------|
-/// | Base     | ✓                      |           |            |              |
-/// | Child    | ✓                      |           |            |              |
-/// | WithTask | ✓                      | ✓         |            |              |
-/// | Root     | ✓                      | ✓         | ✓          | ✓            |
+/// Every variant starts with Host-routed history, current-history retrieval,
+/// fresh independent Root creation and the configured scoped message plane.
+/// Registration grants no scope. LocalChildTools additionally applies its own
+/// admitted native/framework tool boundary after this factory selects Base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolSurface {
-    /// Base tool set: builtin + MCP + memory + skills + self-history retrieval
-    /// and authorized logical-session peer messaging.
+    /// Base tool set: builtin + MCP + memory + skills and caller-scoped Session
+    /// capabilities. Used by defaults and headless/scheduled execution.
     /// Used by the agent runtime as default_tools.
     Base,
-    /// Same as Base — child sessions cannot recursively spawn.
+    /// Same stored executor as Base, before the local Child's separate ceiling.
     Child,
     /// Base + SubAgent tool — used by schedule runs.
     WithTask,
-    /// Full root tool set: WithTask + scheduler + full session_history viewer.
+    /// Root management additions: SubAgent, planning, scheduler and Supervisor
+    /// controls; ordinary Session capabilities already belong to Base.
     Root,
 }
 

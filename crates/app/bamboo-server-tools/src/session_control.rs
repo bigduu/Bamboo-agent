@@ -93,9 +93,13 @@ pub mod versioned {
             // has no implicit grant from its Project or management links.
             let scope = self.creator.scope(observation).await?;
             if !scope.success {
-                return Err(ToolError::Execution(
-                    "session_root_scope_unavailable: Host Root creation scope is blocked".into(),
-                ));
+                // Preserve the Host's precise unavailable stage/code. In
+                // particular, an unconfigured first-input writer must not look
+                // like a missing Project grant or invite another operation.
+                return Err(ToolError::Execution(format!(
+                    "session_root_scope_unavailable: {}",
+                    scope.result
+                )));
             }
             // The scope read may await another Host boundary. Retain the
             // original observation; never refresh it from the later snapshot.

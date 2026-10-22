@@ -2,9 +2,9 @@
 //!
 //! These functions compose the tool executor chain:
 //! ```text
-//! base_tools (builtin + MCP + memory + session messaging + skills + context controls + legacy self-only
-//!             session_history + exact self-only session_history_current)
-//!   └─> root_tools (base + Plan + SubAgent + scheduler + full legacy session_history)
+//! base_tools (builtin + MCP + memory + scoped session messaging + skills + context controls
+//!             + Host-routed session_history + current history + fresh independent Root spawn)
+//!   └─> root_tools (base + Plan + SubAgent + scheduler + Supervisor controls)
 //! ```
 
 use std::collections::HashMap;
@@ -47,6 +47,9 @@ pub(super) fn build_base_tools(
     tool_event_publisher: Arc<dyn ToolEventPublisher>,
     memory_store: bamboo_memory::memory_store::MemoryStore,
     session_messenger: Arc<bamboo_engine::SessionMessenger>,
+    root_creator: Option<
+        Arc<dyn bamboo_server_tools::session_control::root_creation::SessionRootCreatePort>,
+    >,
     diagnostics: Arc<crate::tools::diagnostics::DiagnosticsSource>,
 ) -> (
     Arc<dyn ToolExecutor>,
@@ -184,7 +187,7 @@ pub(super) fn build_base_tools(
         notification_service,
         session_event_senders,
         session_watchers,
-        config,
+        config.clone(),
     ));
     let notify_tool = Arc::new(crate::tools::NotifyTool::new(notify_dispatcher));
     let with_notify: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
@@ -192,33 +195,23 @@ pub(super) fn build_base_tools(
         notify_tool,
     ));
 
-    // Preserve the legacy self-only name for Base/Child compatibility. Root
-    // replaces only this exact name with the full viewer below.
-    let self_history_tool = Arc::new(crate::tools::SessionInspectorTool::self_only(
-        session_store.clone(),
-        storage.clone(),
-    ));
-    let with_legacy_history: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(with_notify, self_history_tool),
-    );
-
-    // A distinct exact identity keeps the least-privilege schema Core under
-    // Progressive and StickyFallback loading. It is not an alias for the broad
-    // Root viewer and therefore cannot inherit cross-Session actions.
-    let current_history_tool = Arc::new(crate::tools::SessionInspectorTool::current(
-        session_store,
-        storage,
-    ));
     let base: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        with_legacy_history,
-        current_history_tool,
-    ));
-    let base: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        base,
+        with_notify,
         Arc::new(crate::tools::diagnostics::BambooDiagnosticsTool::new(
             diagnostics,
         )),
     ));
+    // One real assembly serves Agent defaults, schedules and the Base supplied
+    // to Child execution. LocalChildTools still applies its own immutable
+    // native ceiling; registration here does not widen that separate boundary.
+    let base = bamboo_server_tools::framework_session_tools::assemble_framework_session_tools(
+        base,
+        builtin_executor.clone(),
+        session_store,
+        storage,
+        config,
+        root_creator,
+    );
     let ceiling = Arc::new(HostNativeToolCeiling {
         builtin: builtin_executor.clone(),
         base: base.clone(),
@@ -363,7 +356,6 @@ impl bamboo_engine::external_agents::runtime::NativeToolCeilingSource for HostNa
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_root_tools(
     base_tools: Arc<dyn ToolExecutor>,
-    permission_executor: Arc<bamboo_tools::BuiltinToolExecutor>,
     schedule_store: Arc<ScheduleStore>,
     schedule_manager: Arc<ScheduleManager>,
     session_store: Arc<SessionStoreV2>,
@@ -452,21 +444,11 @@ pub(super) fn build_root_tools(
         crate::tools::OverlayToolExecutor::new(tools_with_plan, schedule_tasks_tool),
     );
 
-    // Root discovery uses explicit Host final-read scopes. Base/Child keep
-    // current-Session reads until their separately owned surface integration.
-    let spawn_creator = root_creator.clone();
-    let spawn_storage = storage.clone();
-    let spawn_config = config.clone();
-    let session_inspector_tool = Arc::new(crate::tools::SessionInspectorTool::host_routed(
-        session_store.clone(),
-        storage,
-    ));
-    let tools_with_inspector: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(tools_with_schedule, session_inspector_tool),
-    );
+    // Session discovery and fresh Root creation already belong to the shared
+    // Base. The Supervisor control port keeps its separate legacy authority.
     let tools_with_control: Arc<dyn ToolExecutor> =
         Arc::new(crate::tools::OverlayToolExecutor::new(
-            tools_with_inspector,
+            tools_with_schedule,
             Arc::new(
                 bamboo_server_tools::SessionControlTool::new(session_messenger.clone())
                     .with_root_creator(root_creator),
@@ -513,22 +495,6 @@ pub(super) fn build_root_tools(
         }
         _ => tools_with_control,
     };
-    let spawn_session = Arc::new(
-        bamboo_server_tools::session_control::versioned::SpawnSessionTool::new(
-            spawn_creator,
-            spawn_storage.clone(),
-            spawn_config,
-            tools.clone(),
-        ),
-    );
-    let tools = Arc::new(
-        bamboo_server_tools::session_control::versioned::VersionedRootTools::new(
-            tools,
-            spawn_session,
-            spawn_storage,
-            permission_executor,
-        ),
-    );
     (tools, sub_agent_tool)
 }
 
@@ -1038,38 +1004,112 @@ mod session_message_assembly_tests {
             )
             .await
             .unwrap();
-        let tools = state.tools_for(crate::tools::ToolSurface::Root);
-        for (action, allowed) in [("list", true), ("get_meta", false)] {
-            let args = if action == "list" {
-                json!({"action":"list"})
-            } else {
-                json!({"action":action,"session_id":target.id})
-            };
-            let call = ToolCall {
-                id: format!("installed-host-{action}"),
-                tool_type: "function".into(),
-                function: FunctionCall {
-                    name: "session_history".into(),
-                    arguments: args.to_string(),
-                },
-            };
-            let mut ctx = ToolExecutionContext::none(&call.id);
-            ctx.session_id = Some(&caller.id);
-            ctx.plan_read_only = true;
-            let observed = with_executing_session_caller(
-                Some(Arc::new(SessionCallerReference::from(&caller))),
-                tools.execute_with_context(&call, ctx),
-            )
-            .await;
-            if allowed {
-                let page: serde_json::Value =
-                    serde_json::from_str(&observed.unwrap().result).unwrap();
-                assert_eq!(page["sessions"][0]["session_id"], target.id);
-                assert_eq!(page["sessions"][0]["authorization_revision"], 1);
-            } else {
-                assert!(observed.is_err());
+        for surface in [
+            crate::tools::ToolSurface::Base,
+            crate::tools::ToolSurface::Root,
+            crate::tools::ToolSurface::Child,
+            crate::tools::ToolSurface::WithTask,
+        ] {
+            let tools = state.tools_for(surface);
+            for (action, allowed) in [("list", true), ("get_meta", false)] {
+                let args = if action == "list" {
+                    json!({"action":"list"})
+                } else {
+                    json!({"action":action,"session_id":target.id})
+                };
+                let call = ToolCall {
+                    id: format!("installed-host-{action}"),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "session_history".into(),
+                        arguments: args.to_string(),
+                    },
+                };
+                let mut ctx = ToolExecutionContext::none(&call.id);
+                ctx.session_id = Some(&caller.id);
+                ctx.plan_read_only = true;
+                let observed = with_executing_session_caller(
+                    Some(Arc::new(SessionCallerReference::from(&caller))),
+                    tools.execute_with_context(&call, ctx),
+                )
+                .await;
+                if allowed {
+                    let page: serde_json::Value =
+                        serde_json::from_str(&observed.unwrap().result).unwrap();
+                    assert_eq!(page["sessions"][0]["session_id"], target.id);
+                    assert_eq!(page["sessions"][0]["authorization_revision"], 1);
+                } else {
+                    assert!(observed.is_err());
+                }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn base_defaults_and_schedule_surface_share_framework_instances_without_implicit_root_scope(
+    ) {
+        use bamboo_agent_core::tools::{
+            with_executing_session_caller, FRAMEWORK_ROOT_SPAWN_CONTRACT_V1,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let state = super::super::AppState::new_with_provider(
+            home.path().into(),
+            Config::default(),
+            Arc::new(super::super::UnconfiguredProvider {
+                message: "assembly must not call a model".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let base = state.tools_for(crate::tools::ToolSurface::Base);
+        assert!(Arc::ptr_eq(state.agent.default_tools(), &base));
+        let caller = Session::new("base-default-fresh-caller", "model");
+        state.storage.save_session(&caller).await.unwrap();
+        for surface in [
+            crate::tools::ToolSurface::Base,
+            crate::tools::ToolSurface::Root,
+            crate::tools::ToolSurface::Child,
+            crate::tools::ToolSurface::WithTask,
+        ] {
+            let tools = state.tools_for(surface);
+            for name in [
+                "session_history",
+                "session_history_current",
+                "spawn_session",
+                "session_message",
+            ] {
+                assert!(
+                    std::ptr::addr_eq(
+                        base.exact_tool_owner(name).unwrap(),
+                        tools.exact_tool_owner(name).unwrap()
+                    ),
+                    "shared actual owner {surface:?}/{name}"
+                );
+            }
+            assert_eq!(
+                tools.execution_contract_for_exact("spawn_session"),
+                Some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+            );
+            let call = ToolCall { id:format!("blocked-base-spawn-{surface:?}"), tool_type:"function".into(), function:FunctionCall {
+                name:"spawnSession".into(), arguments:json!({
+                    "operation_id":uuid::Uuid::new_v4(), "expected_state_revision":0,
+                    "project_id":"ungranted-project", "workspace_path":"/ungranted/workspace", "message":"must remain blocked"
+                }).to_string(),
+            }};
+            let mut ctx = ToolExecutionContext::none(&call.id);
+            ctx.session_id = Some(&caller.id);
+            let error = with_executing_session_caller(
+                Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+                    &caller,
+                ))),
+                tools.execute_with_context(&call, ctx),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("scope_unavailable"));
+        }
+        // This tests the stored application surfaces. LocalChildTools still
+        // needs its separate Host framework proof; no native ceiling is widened.
     }
 }
 
