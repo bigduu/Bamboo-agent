@@ -536,6 +536,25 @@ mod execution_input_http {
         }
     }
 
+    fn owned_http_session(
+        state: &web::Data<crate::AppState>,
+        id: &str,
+    ) -> bamboo_agent_core::Session {
+        // Establish this disposable fixture's canonical scope before its real
+        // Root is reserved; a same-scope Chat must not introduce a workspace.
+        let workspace = state.app_data_dir.join("owned-http-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let mut session = bamboo_agent_core::Session::new(id, "test-model");
+        session.title_generated = true;
+        session.set_workspace_path_meta(workspace.to_string_lossy());
+        session.metadata.insert(
+            bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.into(),
+            "explicit".into(),
+        );
+        session
+    }
+
     async fn reserve_owned_root(
         state: &web::Data<crate::AppState>,
         id: &str,
@@ -742,8 +761,7 @@ mod execution_input_http {
         } else {
             "owned-http-input-arrives-after-selection"
         };
-        let mut session = bamboo_agent_core::Session::new(id, "test-model");
-        session.title_generated = true;
+        let mut session = owned_http_session(&state, id);
         state.storage.save_session(&session).await.unwrap();
         let mut owner = Some(reserve_owned_root(&state, id).await);
         let reservation = owner.as_ref().unwrap();
@@ -1784,8 +1802,7 @@ mod execution_input_http {
             .set_spawner(Arc::new(ManualHttpOnly))
             .await;
         let id = "owned-root-http-active-owner";
-        let mut session = bamboo_agent_core::Session::new(id, "test-model");
-        session.title_generated = true;
+        let mut session = owned_http_session(&state, id);
         state.storage.save_session(&session).await.unwrap();
         let reservation = reserve_owned_root(&state, id).await;
         let owner = reservation.root_actor_writer().unwrap();
@@ -1860,8 +1877,7 @@ mod execution_input_http {
             .set_spawner(Arc::new(ManualHttpOnly))
             .await;
         let id = "owned-root-http-lost-owner";
-        let mut session = bamboo_agent_core::Session::new(id, "test-model");
-        session.title_generated = true;
+        let mut session = owned_http_session(&state, id);
         state.storage.save_session(&session).await.unwrap();
         let mut reservation = reserve_owned_root(&state, id).await;
         let admission = reservation
