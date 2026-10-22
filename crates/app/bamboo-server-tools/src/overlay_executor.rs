@@ -142,11 +142,12 @@ impl OverlayToolExecutor {
             None => resolve_tool_reference_name(reference, contains),
         };
         if resolved.is_none()
-            && self.session_behavior_version == Some(Some(2))
+            && self.session_behavior_version.is_some()
             && bamboo_domain::independent_root_spawn_reference(reference)
         {
-            // Keep an unavailable v2 Root reference exact on the way down. Raw
-            // fallback would let a lower legacy executor reinterpret it as Child.
+            // A retained version is already bound, including None/v1. Keep an
+            // unresolved Root reference exact so raw fallback cannot reinterpret
+            // the bound invocation through a lower executor as a Child.
             return OverlayRoute::BaseExact("spawn_session".into());
         }
         match resolved {
@@ -1490,5 +1491,41 @@ mod tests {
                     }));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn bound_missing_root_reference_never_enters_a_raw_alias_child_fallback() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct LegacyAliasBase(std::sync::Arc<AtomicUsize>);
+        #[async_trait]
+        impl ToolExecutor for LegacyAliasBase {
+            async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+                if call.function.name == "spawnSession" {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    return Ok(ToolResult::text(true, "legacy Child fallback"));
+                }
+                Err(ToolError::NotFound(call.function.name.clone()))
+            }
+            fn list_tools(&self) -> Vec<ToolSchema> {
+                Vec::new()
+            }
+        }
+        let entered = std::sync::Arc::new(AtomicUsize::new(0));
+        let tools = OverlayToolExecutor::new(
+            std::sync::Arc::new(LegacyAliasBase(entered.clone())),
+            std::sync::Arc::new(NamedOverlayTool("memory")),
+        );
+        let call = make_call("spawnSession");
+        for version in [None, Some(1), Some(2), Some(3)] {
+            let mut session = bamboo_domain::Session::new("bound-root", "model");
+            session.session_version = version;
+            let bound = tools.for_session(&session).unwrap();
+            assert!(bound.execute(&call).await.is_err());
+        }
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+        // Unbound Host compatibility is outside an already frozen invocation.
+        assert!(tools.execute(&call).await.is_ok());
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
     }
 }
