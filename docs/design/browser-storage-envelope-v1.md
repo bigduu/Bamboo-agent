@@ -29,6 +29,10 @@ quota of 402653184 bytes. The one shared account profile and all temporary clean
 context data share that envelope, so each is bounded by the same aggregate
 ceiling. This is a candidate based on the small synthetic experiment, not an
 approved production default or two independent per-profile quota levels.
+`imageBytes` is the logical backing-file bound, not proof that host snapshots,
+clones, filesystem metadata or retained old extents fit in that many physical
+bytes. The actual backing allocation and those overheads need separate target
+storage acceptance. No backup exclusions or host snapshot policy are changed.
 
 The plan maps profile, HOME, XDG cache/config/data, TMPDIR/TEMP/TMP and downloads
 to that volume. The inspector joins actual `hdiutil imageinfo/info` fields with
