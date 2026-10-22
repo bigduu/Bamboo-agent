@@ -16,10 +16,19 @@ fn denied(message: impl Into<String>) -> io::Error {
 /// The same set is retained by any owned physical Inbox job using this scope.
 pub(crate) struct HostScopedSessionGuards {
     trees: Vec<ActorTreeWriteGuard>,
+    tree_roots: BTreeSet<String>,
     sessions: Vec<SessionWriteGuard>,
     _task: RuntimeTaskTransactionReadGuard,
     _lifecycle: SessionLifecycleReadGuard,
     _scope: Option<HostSessionScopeUse>,
+}
+
+impl HostScopedSessionGuards {
+    /// Report only the physical tree guards successfully acquired by this set.
+    /// Writers use this owned authority to avoid reacquiring the same lock.
+    pub(super) fn holds_tree(&self, root_id: &str) -> bool {
+        self.tree_roots.contains(root_id)
+    }
 }
 
 impl Drop for HostScopedSessionGuards {
@@ -161,11 +170,14 @@ impl SessionStoreV2 {
             sessions.push(self.acquire_session_maintenance_lock(&id).await?);
         }
         let mut trees = Vec::with_capacity(roots.len());
+        let mut tree_roots = BTreeSet::new();
         for root in roots {
             trees.push(self.acquire_actor_tree_write_guard(&root).await?);
+            tree_roots.insert(root);
         }
         let guards = HostScopedSessionGuards {
             trees,
+            tree_roots,
             sessions,
             _task: task,
             _lifecycle: lifecycle,
