@@ -70,6 +70,30 @@ test('native owner settings bind one actual account profile, outside control and
   assert.equal(f.calls[0].quotaBytes, 402653184);
 });
 
+test('bounded scratch rejects the observed 0755 mode without changing storage', () => {
+  const f = fixture();
+  const original = f.readers.filesystem.lstatSync;
+  f.readers.filesystem.lstatSync = target => ({ ...original(target),
+    ...(target === f.env.TMPDIR ? { mode: 0o40755 } : {}) });
+  assert.throws(() => f.api.settings(f.env, f.readers), error =>
+    error.reason === 'browser_storage_observation_failed' &&
+    error.cause.code === 'ERR_ASSERTION' && error.cause.actual === 0o755 &&
+    error.cause.expected === 0o700);
+  assert.equal(f.calls.length, 1);
+});
+
+test('bounded scratch admits exact 0700 but refuses group access and a wrong device', () => {
+  const f = fixture();
+  assert.equal(f.api.settings(f.env, f.readers).scratch, f.env.TMPDIR);
+  const original = f.readers.filesystem.lstatSync;
+  for (const changed of [{ mode: 0o40770 }, { dev: 11 }]) {
+    f.readers.filesystem.lstatSync = target => ({ ...original(target),
+      ...(target === f.env.TMPDIR ? changed : {}) });
+    assert.throws(() => f.api.settings(f.env, f.readers), error =>
+      error.reason === 'browser_storage_observation_failed');
+  }
+});
+
 test('active launch refuses a missing native generation before storage queries', () => {
   const f = fixture(); delete f.env.BAMBOO_BROWSER_STORAGE_GENERATION;
   assert.throws(() => f.api.settings(f.env, f.readers), e => e.reason === 'browser_storage_launch_fence_invalid');

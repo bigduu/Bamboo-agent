@@ -602,6 +602,24 @@ async fn read_host_line<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+fn create_host_temporary_directory(
+    parent: Option<&std::path::Path>,
+) -> std::io::Result<tempfile::TempDir> {
+    let mut temporary = tempfile::Builder::new();
+    temporary.prefix("bamboo-browser-session-");
+    #[cfg(unix)]
+    if parent.is_some() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Set permissions at creation; never chmod an existing directory.
+        temporary.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    match parent {
+        Some(parent) => temporary.tempdir_in(parent),
+        None => temporary.tempdir(),
+    }
+}
+
 impl BrowserSession {
     async fn spawn(
         profile_lease: Option<profile::Lease>,
@@ -667,13 +685,8 @@ impl BrowserSession {
         if let Some(storage) = bounded {
             storage.configure(&mut command);
         }
-        let mut temporary = tempfile::Builder::new();
-        temporary.prefix("bamboo-browser-session-");
-        let temp_dir = match bounded {
-            Some(storage) => temporary.tempdir_in(&storage.temporary),
-            None => temporary.tempdir(),
-        }
-        .map_err(|_| {
+        let temporary_parent = bounded.map(|storage| storage.temporary.as_path());
+        let temp_dir = create_host_temporary_directory(temporary_parent).map_err(|_| {
             BrowserError::Unavailable("unable to create browser temporary directory".into())
         })?;
         command.env("TMPDIR", temp_dir.path());
@@ -1268,6 +1281,35 @@ impl BrowserSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_host_scratch_is_private_and_preserves_existing_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("existing-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let sentinel = parent.join("existing-sentinel");
+        std::fs::write(&sentinel, b"preserve synthetic existing data").unwrap();
+        let before = parent.metadata().unwrap().permissions().mode();
+
+        let scratch = create_host_temporary_directory(Some(&parent)).unwrap();
+        let scratch_path = scratch.path().to_path_buf();
+        assert_eq!(scratch.path().parent(), Some(parent.as_path()));
+        assert_eq!(
+            scratch.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(parent.metadata().unwrap().permissions().mode(), before);
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"preserve synthetic existing data"
+        );
+        drop(scratch);
+        assert!(!scratch_path.exists());
+        assert!(sentinel.is_file());
+    }
 
     #[test]
     fn only_known_read_actions_survive_caller_cancellation() {
