@@ -1930,3 +1930,6 @@ async fn role_neutral_root_creation_adapter_preserves_existing_host_scope_and_ca
         assert_eq!(f.count().await, before);
     }
 }
+
+#[path = "host_root_create_app_tests.rs"]
+mod host_app;
