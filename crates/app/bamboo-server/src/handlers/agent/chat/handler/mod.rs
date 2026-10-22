@@ -22,6 +22,7 @@ use legacy_selection::{
     WorkflowMetadataCheckpoint,
 };
 mod ingress;
+#[cfg(test)]
 pub(crate) use ingress::admit_for_execute;
 mod request;
 

@@ -276,6 +276,7 @@ impl ExecuteAdmissionCheck {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn admit_for_execute(
     state: &AppState,
     id: &str,
