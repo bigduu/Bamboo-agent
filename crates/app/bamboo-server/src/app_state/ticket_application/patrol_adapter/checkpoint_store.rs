@@ -33,9 +33,34 @@ mod physical {
 
     type PublicationFault = Box<dyn Fn(Boundary) -> std::io::Result<()> + Send + Sync>;
 
+    struct LockedDirectory(File);
+
+    impl LockedDirectory {
+        fn acquire(directory: File) -> Result<Self, PortError> {
+            FileExt::try_lock_exclusive(&directory).map_err(|_| PortError::Conflict)?;
+            Ok(Self(directory))
+        }
+    }
+
+    impl std::ops::Deref for LockedDirectory {
+        type Target = File;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for LockedDirectory {
+        fn drop(&mut self) {
+            // A duplicated or fork-inherited descriptor may outlive this owner.
+            // Closing our descriptor alone would leave its flock held.
+            let _ = FileExt::unlock(&self.0);
+        }
+    }
+
     pub struct PatrolCheckpointStore {
         root: PathBuf,
-        directory: File,
+        directory: LockedDirectory,
         writer: File,
         poisoned: bool,
         fault: Option<PublicationFault>,
@@ -49,6 +74,10 @@ mod physical {
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(root)
                 .map_err(|_| PortError::Unavailable)?;
+            // Retain the stable directory lock for this writer's entire lifetime.
+            // Named-lock removal/replacement/restoration cannot admit a peer.
+            // Root-namespace repair and mixed-version writers require quiescence.
+            let directory = LockedDirectory::acquire(directory)?;
             let writer = open_at(
                 &directory,
                 "patrol-writer.lock",
@@ -369,6 +398,117 @@ mod physical {
             ));
             drop(first);
             assert!(PatrolCheckpointStore::open(&path).is_ok());
+        }
+
+        fn assert_named_lock_change_cannot_admit_writer(replacement: bool) {
+            let root = root();
+            let path = canonical(&root);
+            let first = PatrolCheckpointStore::open(&path).unwrap();
+            let lock = path.join("patrol-writer.lock");
+            std::fs::remove_file(&lock).unwrap();
+            if replacement {
+                std::fs::write(&lock, b"").unwrap();
+            }
+            assert!(matches!(
+                PatrolCheckpointStore::open(&path),
+                Err(PortError::Conflict)
+            ));
+            drop(first);
+            assert!(PatrolCheckpointStore::open(&path).is_ok());
+        }
+
+        #[test]
+        fn lock_identity_deleted_name_does_not_admit_a_second_writer() {
+            assert_named_lock_change_cannot_admit_writer(false);
+        }
+
+        #[test]
+        fn lock_identity_replaced_name_does_not_admit_a_second_writer() {
+            assert_named_lock_change_cannot_admit_writer(true);
+        }
+
+        #[test]
+        fn lock_identity_dropped_store_unlocks_a_retained_directory_descriptor() {
+            let root = root();
+            let path = canonical(&root);
+            let first = PatrolCheckpointStore::open(&path).unwrap();
+            let retained = first.directory.try_clone().unwrap();
+            drop(first);
+            let second = PatrolCheckpointStore::open(&path).unwrap();
+            assert!(retained.metadata().unwrap().is_dir());
+            drop(second);
+            drop(retained);
+        }
+
+        #[test]
+        fn lock_identity_early_error_unlocks_a_retained_directory_descriptor() {
+            let root = root();
+            let path = canonical(&root);
+            let mut retained = None;
+            let attempt = (|| -> Result<(), PortError> {
+                let directory = LockedDirectory::acquire(File::open(&path).unwrap())?;
+                retained = Some(directory.try_clone().unwrap());
+                Err(PortError::Unavailable)
+            })();
+            assert_eq!(attempt, Err(PortError::Unavailable));
+            assert!(retained.as_ref().unwrap().metadata().unwrap().is_dir());
+            let second = PatrolCheckpointStore::open(&path).unwrap();
+            drop(second);
+            drop(retained);
+        }
+
+        #[test]
+        fn lock_identity_restored_inode_cannot_hide_a_competing_cas() {
+            let root = root();
+            let path = canonical(&root);
+            let mut first = PatrolCheckpointStore::open(&path).unwrap();
+            assert_eq!(first.save(None, &checkpoint()), Ok(1));
+            let blocked = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let observed = blocked.clone();
+            let fault_path = path.clone();
+            let mut competing = checkpoint();
+            competing.last_check_ms = 102;
+            competing.next_check_ms = 112;
+            first.fault = Some(Box::new(move |boundary| {
+                if boundary != Boundary::BeforeRename {
+                    return Ok(());
+                }
+                let named = fault_path.join("patrol-writer.lock");
+                let retained = fault_path.join("retained-patrol-writer.lock");
+                std::fs::rename(&named, &retained)?;
+                let prevented = match PatrolCheckpointStore::open(&fault_path) {
+                    Err(PortError::Conflict) => true,
+                    Err(error) => panic!("unexpected competing-open error: {error:?}"),
+                    Ok(mut second) => {
+                        // A real second store interleaves a CAS after the first
+                        // read/validation but before its final rename.
+                        assert_eq!(second.save(Some(1), &competing), Ok(2));
+                        false
+                    }
+                };
+                if named.exists() {
+                    std::fs::remove_file(&named)?;
+                }
+                std::fs::rename(&retained, &named)?;
+                *observed.lock().unwrap() = Some(prevented);
+                Ok(())
+            }));
+            let mut next = checkpoint();
+            next.last_check_ms = 101;
+            next.next_check_ms = 111;
+            assert_eq!(first.save(Some(1), &next), Ok(2));
+            assert_eq!(
+                *blocked.lock().unwrap(),
+                Some(true),
+                "restoring the named inode admitted two successful revision-2 CAS writes"
+            );
+            assert_eq!(
+                first.load(&scope()).unwrap().unwrap(),
+                StoredCheckpoint {
+                    version: 2,
+                    checkpoint: next
+                }
+            );
         }
 
         #[test]
