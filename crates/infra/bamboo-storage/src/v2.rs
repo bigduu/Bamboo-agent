@@ -6744,7 +6744,7 @@ impl Storage for SessionStoreV2 {
         &self,
         caller: &bamboo_domain::SessionCallerReference,
     ) -> io::Result<Option<bamboo_domain::HostSessionScopeToken>> {
-        Ok(self.host_scope_registry.lookup(caller).await)
+        self.host_scope_registry.lookup(caller).await
     }
 
     async fn list_host_scoped_targets(

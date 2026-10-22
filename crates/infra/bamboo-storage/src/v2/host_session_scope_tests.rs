@@ -144,11 +144,7 @@ async fn list_and_inspect_rights_remain_distinct_and_revocation_has_no_global_fa
         .revoke_host_session_scope(&caller.id, 1)
         .await
         .unwrap();
-    assert!(store
-        .find_host_session_scope(&observed)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(store.find_host_session_scope(&observed).await.is_err());
     assert!(store
         .list_host_scoped_targets(&token, &observed)
         .await

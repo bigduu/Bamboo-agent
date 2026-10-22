@@ -44,7 +44,7 @@ async fn default_registry_is_empty_and_copied_observations_cannot_mint_installed
     let registry = HostSessionScopeRegistry::default();
     let caller = Session::new("caller", "model");
     let observed = SessionCallerReference::from(&caller);
-    assert!(registry.lookup(&observed).await.is_none());
+    assert!(registry.lookup(&observed).await.unwrap().is_none());
     let token = install(&registry, &caller, 1).await;
     let copied = serde_json::from_value(serde_json::to_value(token.binding()).unwrap()).unwrap();
     let forged = HostSessionScopeIssuer::default().issue(copied).unwrap();
@@ -55,7 +55,7 @@ async fn default_registry_is_empty_and_copied_observations_cannot_mint_installed
     assert!(registry
         .lookup(&SessionCallerReference::from(&recreated))
         .await
-        .is_none());
+        .is_err());
     assert!(registry
         .retain(&token, &SessionCallerReference::from(&recreated))
         .await
@@ -80,7 +80,7 @@ async fn revoke_waits_for_retained_physical_authority_then_invalidates_old_token
     );
     drop(held);
     assert_eq!(revoke.await.unwrap(), 2);
-    assert!(registry.lookup(&observed).await.is_none());
+    assert!(registry.lookup(&observed).await.is_err());
     assert!(registry.retain(&token, &observed).await.is_err());
 }
 
@@ -111,6 +111,7 @@ async fn replacement_uses_one_publication_fence_and_never_reactivates_an_old_tok
         .lookup(&observed)
         .await
         .unwrap()
+        .unwrap()
         .same_installation(&new));
 }
 
@@ -120,7 +121,7 @@ async fn dropping_uncommitted_publication_or_wrong_caller_changes_no_scope() {
     let caller = Session::new("caller", "model");
     let observed = SessionCallerReference::from(&caller);
     drop(registry.begin_install(&caller.id, 0).await.unwrap());
-    assert!(registry.lookup(&observed).await.is_none());
+    assert!(registry.lookup(&observed).await.unwrap().is_none());
     let other = Session::new("other-caller", "model");
     assert!(registry
         .begin_install(&caller.id, 0)
@@ -128,10 +129,11 @@ async fn dropping_uncommitted_publication_or_wrong_caller_changes_no_scope() {
         .unwrap()
         .install(binding(&other, 1))
         .is_err());
-    assert!(registry.lookup(&observed).await.is_none());
+    assert!(registry.lookup(&observed).await.unwrap().is_none());
     assert!(registry
         .lookup(&SessionCallerReference::from(&other))
         .await
+        .unwrap()
         .is_none());
     let token = install(&registry, &caller, 1).await;
     assert!(registry.retain(&token, &observed).await.is_ok());
