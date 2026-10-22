@@ -642,7 +642,9 @@ async fn run_case(case: Case) {
             "stale_cursor_result_present":facts.responses.contains_key("handoff-old-cursor-on-fresh-returned-reader"),
         });
         (
-            current.next == provider.plan.len() && current.pending.is_none() && current.finished == 1,
+            current.next == provider.plan.len()
+                && current.pending.is_none()
+                && current.finished == 1,
             diagnostic,
         )
     };
@@ -1202,7 +1204,10 @@ impl LegacyAfterRead {
                     .await
                     .unwrap()
                     .unwrap();
-                assert_eq!(actual.workspace_path_meta().as_deref(), self.probe.b.to_str());
+                assert_eq!(
+                    actual.workspace_path_meta().as_deref(),
+                    self.probe.b.to_str()
+                );
                 assert_eq!(actual.project_id_meta(), before.project_id_meta());
                 assert_eq!(actual.created_at, before.created_at);
                 assert_eq!(actual.metadata_version, before.metadata_version + 1);
@@ -1211,9 +1216,9 @@ impl LegacyAfterRead {
             Err(error) => {
                 assert!(
                     self.probe.uncertain
-                        && error.to_string().contains(
-                            "Controlled loss of legacy Workspace commit confirmation"
-                        ),
+                        && error
+                            .to_string()
+                            .contains("Controlled loss of legacy Workspace commit confirmation"),
                     "only the deliberate post-save confirmation loss belongs to this case"
                 );
                 // No await after an unknown completion: the outer biased
@@ -1243,11 +1248,7 @@ impl ToolExecutor for LegacyAfterRead {
             }) as Arc<dyn ToolExecutor>
         })
     }
-    fn resolve_reference_for_session(
-        &self,
-        session: &Session,
-        reference: &str,
-    ) -> Option<String> {
+    fn resolve_reference_for_session(&self, session: &Session, reference: &str) -> Option<String> {
         self.inner.resolve_reference_for_session(session, reference)
     }
     async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
@@ -1292,7 +1293,9 @@ impl ToolExecutor for LegacyAfterRead {
         name: &str,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
-        self.inner.check_permissions_for_exact(call, name, ctx).await
+        self.inner
+            .check_permissions_for_exact(call, name, ctx)
+            .await
     }
     async fn check_permissions_for_resolved(
         &self,
@@ -1609,7 +1612,9 @@ async fn legacy_case(uncertain: bool) {
         .find(|message| message.tool_call_id.as_deref() == Some(LEGACY_READ))
         .unwrap();
     assert_eq!(primary_result.tool_success, Some(true));
-    assert!(primary_result.content.contains("LEGACY_COMPLETED_ONCE_IN_A"));
+    assert!(primary_result
+        .content
+        .contains("LEGACY_COMPLETED_ONCE_IN_A"));
     let cancelled = state
         .agent_runners
         .read()
