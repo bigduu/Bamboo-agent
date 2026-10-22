@@ -54,12 +54,13 @@ impl RootThinkingMode {
 /// Exact execution identities admitted for an orchestration-only Root.
 /// Unknown tools, external providers, and legacy aliases do not enter this
 /// list; callers first resolve a registered execution identity.
-pub const ROOT_ORCHESTRATION_TOOLS: [&str; 17] = [
+pub const ROOT_ORCHESTRATION_TOOLS: [&str; 18] = [
     "SubAgent",
     "spawn_session",
     "Plan",
     "Task",
     "session_history_current",
+    "session_history",
     "session_message",
     "Read",
     "Grep",
@@ -78,9 +79,10 @@ pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
     ROOT_ORCHESTRATION_TOOLS.contains(&execution_name)
 }
 
-/// Exact management tools with their own live Supervisor/target authority gate.
-/// The history executor restricts Supervisor reads to this scope too.
-pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 2] = ["session_control", "session_history"];
+/// Role-specific management retains its own live Supervisor authority gate.
+/// Common Session ports additionally require concrete Host instance proof at
+/// model catalog/dispatch/replay; these category names alone grant nothing.
+pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 1] = ["session_control"];
 
 pub fn orchestration_only_allows_execution_name_for_supervisor(
     execution_name: &str,
@@ -281,7 +283,7 @@ mod tests {
         assert!(ordinary.allows_model_tool_execution("Edit"));
         ordinary.set_root_orchestration_only(true).unwrap();
         assert!(!ordinary.allows_model_tool_execution("session_control"));
-        assert!(!ordinary.allows_model_tool_execution("session_history"));
+        assert!(ordinary.allows_model_tool_execution("session_history"));
     }
 
     #[test]
@@ -327,9 +329,8 @@ mod tests {
             let mut invalid = supervisor.clone();
             mutation(&mut invalid);
             invalid.metadata.insert("role".into(), "supervisor".into());
-            for name in ["session_control", "session_history"] {
-                assert!(!invalid.allows_model_tool_execution(name));
-            }
+            assert!(!invalid.allows_model_tool_execution("session_control"));
+            assert!(invalid.allows_model_tool_execution("session_history"));
         }
         for name in [
             "default::session_control",
@@ -344,9 +345,8 @@ mod tests {
         let mut ordinary = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
         ordinary.set_root_orchestration_only(true).unwrap();
         ordinary.metadata.insert("role".into(), "supervisor".into());
-        for name in ["session_control", "session_history"] {
-            assert!(!ordinary.allows_model_tool_execution(name));
-        }
+        assert!(!ordinary.allows_model_tool_execution("session_control"));
+        assert!(ordinary.allows_model_tool_execution("session_history"));
     }
 
     #[test]

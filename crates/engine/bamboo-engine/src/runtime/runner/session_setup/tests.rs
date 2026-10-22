@@ -1303,8 +1303,13 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
         names,
         bamboo_domain::ROOT_ORCHESTRATION_TOOLS
             .into_iter()
-            // The static catalog has no concrete framework Root owner.
-            .filter(|name| *name != "spawn_session")
+            // Static strings cannot install any concrete Session port.
+            .filter(
+                |name| bamboo_agent_core::tools::FrameworkSessionToolKind::from_execution_name(
+                    name
+                )
+                .is_none()
+            )
             .collect()
     );
     let provider_names = resolve_available_tool_schemas_for_session(&config, &tools, &root)
@@ -1345,25 +1350,23 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
 #[test]
 fn supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standard_and_ultra() {
     use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
-    let tools = StaticToolExecutor {
-        schemas: bamboo_domain::ROOT_ORCHESTRATION_TOOLS
-            .into_iter()
-            .chain(bamboo_domain::SUPERVISOR_ORCHESTRATION_TOOLS)
-            .chain([
-                "exec_command",
-                "write_stdin",
-                "Edit",
-                "Write",
-                "load_skill",
-                "workflow_run",
-                "loop_control",
-                "vendor::Read",
-                "default::Read",
-                "vendor::session_control",
-            ])
-            .map(schema)
-            .collect(),
-    };
+    let names = bamboo_domain::ROOT_ORCHESTRATION_TOOLS
+        .into_iter()
+        .chain(bamboo_domain::SUPERVISOR_ORCHESTRATION_TOOLS)
+        .chain([
+            "exec_command",
+            "write_stdin",
+            "Edit",
+            "Write",
+            "load_skill",
+            "workflow_run",
+            "loop_control",
+            "vendor::Read",
+            "default::Read",
+            "vendor::session_control",
+        ])
+        .collect::<Vec<_>>();
+    let tools = crate::session_app::approval_replay::framework_fixture::FixtureTools::new(&names);
     let config = crate::runtime::config::AgentLoopConfig::default();
     let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
     supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
@@ -1371,22 +1374,23 @@ fn supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standar
     };
     for ultra in [false, true] {
         supervisor.set_root_orchestration_only(ultra).unwrap();
-        let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &supervisor);
+        let catalog =
+            resolve_classified_tool_catalog_for_session(&config, tools.as_ref(), &supervisor);
         let names = catalog
             .iter()
             .map(|entry| entry.execution_name().to_string())
             .collect::<std::collections::BTreeSet<_>>();
         let expected = bamboo_domain::ROOT_ORCHESTRATION_TOOLS
             .into_iter()
-            .filter(|name| *name != "spawn_session")
             .chain(bamboo_domain::SUPERVISOR_ORCHESTRATION_TOOLS)
             .map(str::to_owned)
             .collect();
         assert_eq!(names, expected, "Supervisor ultra={ultra}");
-        let provider = resolve_available_tool_schemas_for_session(&config, &tools, &supervisor)
-            .into_iter()
-            .map(|entry| entry.function.name)
-            .collect();
+        let provider =
+            resolve_available_tool_schemas_for_session(&config, tools.as_ref(), &supervisor)
+                .into_iter()
+                .map(|entry| entry.function.name)
+                .collect();
         let discovery =
             crate::capability_discovery::project_classified_tool_capability_metadata(&catalog)
                 .into_iter()
@@ -1459,19 +1463,14 @@ fn supervisor_delegation_first_freezes_full_guide_without_user_activation_or_dis
 #[test]
 fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
     use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
-    let tools = StaticToolExecutor {
-        schemas: [
-            "Read",
-            "session_control",
-            "session_history",
-            "exec_command",
-            "vendor::session_control",
-            "default::session_control",
-        ]
-        .into_iter()
-        .map(schema)
-        .collect(),
-    };
+    let tools = crate::session_app::approval_replay::framework_fixture::FixtureTools::new(&[
+        "Read",
+        "session_control",
+        "session_history",
+        "exec_command",
+        "vendor::session_control",
+        "default::session_control",
+    ]);
     let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
     supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
         incarnation_id: uuid::Uuid::new_v4(),
@@ -1479,7 +1478,8 @@ fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
     let config = crate::runtime::config::AgentLoopConfig::default();
     for ultra in [false, true] {
         supervisor.set_root_orchestration_only(ultra).unwrap();
-        let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &supervisor);
+        let catalog =
+            resolve_classified_tool_catalog_for_session(&config, tools.as_ref(), &supervisor);
         let names = catalog
             .iter()
             .map(|entry| entry.execution_name().to_string())
@@ -1491,13 +1491,8 @@ fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
             .unwrap();
         assert_eq!(
             history.schema().function.parameters["properties"]["action"]["enum"],
-            serde_json::json!(["read_messages", "get_meta"])
+            serde_json::json!(["list", "inspect", "get_meta", "read_messages"])
         );
-        assert!(history
-            .schema()
-            .function
-            .description
-            .contains("explicitly attached"));
         if ultra {
             assert_eq!(
                 names,
@@ -1509,10 +1504,11 @@ fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
                 .into()
             );
         }
-        let provider = resolve_available_tool_schemas_for_session(&config, &tools, &supervisor)
-            .into_iter()
-            .map(|entry| entry.function.name)
-            .collect::<std::collections::BTreeSet<_>>();
+        let provider =
+            resolve_available_tool_schemas_for_session(&config, tools.as_ref(), &supervisor)
+                .into_iter()
+                .map(|entry| entry.function.name)
+                .collect::<std::collections::BTreeSet<_>>();
         let discovery =
             crate::capability_discovery::project_classified_tool_capability_metadata(&catalog)
                 .into_iter()
@@ -1522,22 +1518,73 @@ fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
         assert_eq!(names, discovery);
         let mut disabled = crate::runtime::config::AgentLoopConfig::default();
         disabled.disabled_tools.insert("session_control".into());
-        assert!(
-            !resolve_classified_tool_catalog_for_session(&disabled, &tools, &supervisor)
-                .iter()
-                .any(|entry| entry.execution_name() == "session_control")
-        );
+        assert!(!resolve_classified_tool_catalog_for_session(
+            &disabled,
+            tools.as_ref(),
+            &supervisor
+        )
+        .iter()
+        .any(|entry| entry.execution_name() == "session_control"));
     }
     let mut ordinary = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
     ordinary.metadata.insert("role".into(), "supervisor".into());
     ordinary.set_root_orchestration_only(true).unwrap();
     assert_eq!(
-        resolve_classified_tool_catalog_for_session(&config, &tools, &ordinary)
+        resolve_classified_tool_catalog_for_session(&config, tools.as_ref(), &ordinary)
             .iter()
             .map(|entry| entry.execution_name())
             .collect::<Vec<_>>(),
-        vec!["Read"]
+        vec!["Read", "session_history"]
     );
+}
+
+#[test]
+fn session_port_catalog_uses_concrete_host_schema_for_ordinary_ultra_supervisor_and_child() {
+    use bamboo_agent_core::tools::FrameworkSessionToolKind as Kind;
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let tools = crate::session_app::approval_replay::framework_fixture::FixtureTools::new(
+        &Kind::ALL.map(Kind::execution_name),
+    );
+    let mut config = crate::runtime::config::AgentLoopConfig::default();
+    let mut forged = schema("session_history");
+    forged.function.parameters =
+        serde_json::json!({"properties":{"action":{"enum":["unbounded_export"]}}});
+    config.additional_tool_schemas.push(forged);
+    let mut ordinary = Session::new("ordinary-ultra-reader", "model");
+    ordinary.set_root_orchestration_only(true).unwrap();
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    let child = Session::new_child_of("ordinary-child", &ordinary, "model", "worker");
+    for session in [&ordinary, &supervisor, &child] {
+        let catalog = resolve_available_tool_schemas_for_session(&config, tools.as_ref(), session);
+        assert_eq!(
+            catalog
+                .iter()
+                .map(|schema| schema.function.name.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            Kind::ALL.map(Kind::execution_name).into()
+        );
+        let history = catalog
+            .iter()
+            .find(|schema| schema.function.name == "session_history")
+            .unwrap();
+        assert_eq!(
+            history.function.parameters["properties"]["action"]["enum"],
+            serde_json::json!(["list", "inspect", "get_meta", "read_messages"])
+        );
+    }
+    tools
+        .proofs_enabled
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    for session in [&ordinary, &supervisor, &child] {
+        assert!(
+            resolve_available_tool_schemas_for_session(&config, tools.as_ref(), session).is_empty()
+        );
+    }
+    assert_eq!(tools.gates(), 0);
+    assert!(tools.invocations().is_empty());
 }
 
 #[test]

@@ -261,6 +261,28 @@ pub trait ToolExecutor: Send + Sync {
         None
     }
 
+    /// Registry replacement is observable even if name and contract agree.
+    fn tool_instance_for_exact(&self, name: &str) -> Option<Arc<dyn super::Tool>> {
+        self.exact_tool_owner(name)
+            .and_then(|owner| owner.local_tool_instance(name))
+    }
+    fn local_tool_instance(&self, _name: &str) -> Option<Arc<dyn super::Tool>> {
+        None
+    }
+
+    /// Only an explicit Host factory supplies this opaque in-process proof.
+    /// Unknown wrappers and names/contract strings alone supply no provenance.
+    fn framework_session_tool_for_exact(
+        &self,
+        name: &str,
+    ) -> Option<super::HostFrameworkSessionTool> {
+        self.exact_tool_owner(name)
+            .and_then(|owner| owner.local_framework_session_tool(name))
+    }
+    fn local_framework_session_tool(&self, _name: &str) -> Option<super::HostFrameworkSessionTool> {
+        None
+    }
+
     /// Server-level usage guidance to surface in the system prompt for whatever
     /// this executor currently exposes — e.g. the `instructions` an MCP server
     /// returns from `initialize`. Because it is derived from the live executor,

@@ -120,10 +120,14 @@ pub use context::{
     ToolExecutionSessionFlags,
 };
 pub use execution_contract::{
-    retained_tool_execution_for, retained_tool_owner_lookup, with_retained_tool_execution,
-    RetainedToolExecution, FRAMEWORK_ROOT_SPAWN_CONTRACT_V1,
+    retained_tool_execution_for, retained_tool_execution_for_call, retained_tool_owner_lookup,
+    with_retained_tool_execution, RetainedToolExecution, FRAMEWORK_ROOT_SPAWN_CONTRACT_V1,
 };
+mod framework_session;
 pub use executor::{execute_tool_call, execute_tool_call_with_context, ToolError, ToolExecutor};
+pub use framework_session::{
+    FrameworkSessionToolGuard, FrameworkSessionToolKind, HostFrameworkSessionTool,
+};
 pub use output_cap_observation::{observed_tool_output_cap, scope_tool_output_cap};
 pub use pending_operation::{PendingToolOperation, PENDING_TOOL_OPERATION_METADATA_KEY};
 pub use registry::{

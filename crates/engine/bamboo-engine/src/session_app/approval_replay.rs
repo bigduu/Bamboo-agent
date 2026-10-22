@@ -317,9 +317,14 @@ pub fn resolve_permission_replay_owner(
         let execution =
             restore_permission_replay_execution(session, target, operation.execution_name())?
                 .expect("retained operation provides execution selection");
-        return Ok(execution
-            .owner_is_available(executor)
-            .then(|| operation.execution_name().to_owned()));
+        return Ok((execution.owner_is_available(executor)
+            && replay_framework_instance_available(
+                session,
+                operation.execution_name(),
+                Some(&execution),
+                executor,
+            ))
+        .then(|| operation.execution_name().to_owned()));
     }
     let legacy_supervisor_binding = session.messages[target.result_message_index]
         .metadata
@@ -343,9 +348,14 @@ pub fn resolve_permission_replay_owner(
         .map_err(|error| AgentError::Tool(error.into()))?;
         let execution = restore_permission_replay_execution(session, target, &request.tool_name)?
             .expect("validated legacy binding provides execution selection");
-        return Ok(execution
-            .owner_is_available(executor)
-            .then_some(request.tool_name));
+        return Ok((execution.owner_is_available(executor)
+            && replay_framework_instance_available(
+                session,
+                &request.tool_name,
+                Some(&execution),
+                executor,
+            ))
+        .then_some(request.tool_name));
     }
     if bamboo_domain::independent_root_spawn_reference(&target.tool_call.function.name) {
         return Err(AgentError::Tool("retained spawn operation has no frozen owner/arguments; history and pending state are preserved. Resend the intended operation explicitly; no Root or Child was started".into()));
@@ -358,7 +368,38 @@ pub fn resolve_permission_replay_owner(
             ));
         }
     }
-    Ok(owner)
+    Ok(owner.filter(|name| replay_framework_instance_available(session, name, None, executor)))
+}
+
+fn replay_framework_instance_available(
+    session: &Session,
+    name: &str,
+    retained: Option<&RetainedToolExecution>,
+    executor: &dyn ToolExecutor,
+) -> bool {
+    let kind = bamboo_agent_core::tools::FrameworkSessionToolKind::from_execution_name(name);
+    let root_semantics = retained.and_then(RetainedToolExecution::execution_contract)
+        == Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1);
+    // A known retained custom/legacy owner remains that exact operation. A
+    // normal Child's own frozen ceiling still checks whether it is callable;
+    // do not reinterpret it as the newly installed framework Root instance.
+    let retained_ordinary_legacy_spawn = name == "spawn_session"
+        && !session.model_orchestration_only_enabled()
+        && retained.is_some_and(|retained| retained.contract_known() && !root_semantics);
+    if kind.is_none()
+        || retained_ordinary_legacy_spawn
+        || !(root_semantics
+            || session.model_orchestration_only_enabled()
+            || session.kind == bamboo_domain::SessionKind::Child)
+    {
+        return true;
+    }
+    match retained {
+        Some(retained) => retained.framework_instance_is_available(executor),
+        None => executor
+            .framework_session_tool_for_exact(name)
+            .is_some_and(|proof| Some(proof.kind()) == kind && proof.is_current()),
+    }
 }
 
 /// Locate the concrete approved invocation, newest-first and optionally bound
@@ -1034,6 +1075,9 @@ pub async fn refresh_retained_approval_replay_posture(
     }
     Ok(decision)
 }
+
+#[cfg(test)]
+pub(crate) mod framework_fixture;
 
 #[cfg(test)]
 mod tests {
@@ -1774,6 +1818,67 @@ mod tests {
     struct FrozenOwnerProbe {
         names: Vec<&'static str>,
         resolver_queries: std::sync::atomic::AtomicUsize,
+    }
+
+    #[test]
+    fn retained_framework_replay_needs_actual_instance_not_same_contract_and_keeps_original_bytes()
+    {
+        use framework_fixture::{park, FixtureTools};
+        for version in [None, Some(1), Some(2)] {
+            let mut session = Session::new("proof-replay", "model");
+            session.session_version = version;
+            let call = ToolCall {
+                id: "parked-root".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "default::spawnSession".into(),
+                    arguments: "{ \"message\":\"retained original bytes\" }".into(),
+                },
+            };
+            let host = FixtureTools::new(&["spawn_session"]);
+            let target = park(
+                &mut session,
+                &call,
+                "spawn_session",
+                true,
+                Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1),
+            );
+            let original = serde_json::to_value(&session).unwrap();
+            assert_eq!(
+                resolve_permission_replay_owner(&session, &target, host.as_ref())
+                    .unwrap()
+                    .as_deref(),
+                Some("spawn_session")
+            );
+            host.proofs_enabled
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                host.execution_contract_for_exact("spawn_session"),
+                Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+            );
+            assert!(
+                resolve_permission_replay_owner(&session, &target, host.as_ref())
+                    .unwrap()
+                    .is_none()
+            );
+            let shadow = FrozenOwnerProbe {
+                names: vec!["spawn_session"],
+                resolver_queries: Default::default(),
+            };
+            assert!(resolve_permission_replay_owner(&session, &target, &shadow)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                shadow
+                    .resolver_queries
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            assert_eq!(target.tool_call(), &call);
+            assert_eq!(serde_json::to_value(&session).unwrap(), original);
+            assert_eq!(host.gates(), 0);
+            assert!(host.invocations().is_empty());
+        }
     }
 
     #[async_trait::async_trait]

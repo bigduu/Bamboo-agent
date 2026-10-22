@@ -1,5 +1,7 @@
 use crate::runtime::config::AgentLoopConfig;
-use bamboo_agent_core::tools::{ToolExecutor, ToolSchema};
+use bamboo_agent_core::tools::{
+    FrameworkSessionToolKind as SessionToolKind, ToolExecutor, ToolSchema,
+};
 use bamboo_agent_core::Session;
 use bamboo_domain::{
     resolve_disabled_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
@@ -153,19 +155,25 @@ fn resolve_catalog_with_activation(
     }
 
     tool_schemas.extend(config.additional_tool_schemas.clone());
-    // Config registries may be shared by old and new Sessions. Only an actually
-    // installed Host owner contributes the fresh Root entry, in every version.
-    tool_schemas.retain(|schema| schema.function.name != "spawn_session");
-    let framework_root_installed = tools
-        .exact_tool_owner("spawn_session")
-        .and_then(|owner| owner.local_execution_contract("spawn_session"))
-        == Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1);
-    tool_schemas.extend(
-        tools
-            .list_tools()
-            .into_iter()
-            .filter(|schema| framework_root_installed && schema.function.name == "spawn_session"),
-    );
+    // Names, shared registries and contract strings cannot supply framework
+    // schemas. Use the concrete Host instance for every installed Session port.
+    let framework = SessionToolKind::ALL
+        .into_iter()
+        .filter_map(|kind| {
+            tools
+                .framework_session_tool_for_exact(kind.execution_name())
+                .filter(|proof| proof.kind() == kind && proof.is_current())
+                .map(|proof| (kind.execution_name(), proof))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    tool_schemas.retain(|schema| {
+        let name = schema.function.name.as_str();
+        !framework.contains_key(name)
+            && name != "spawn_session"
+            && !((session.model_orchestration_only_enabled() || session.kind == SessionKind::Child)
+                && SessionToolKind::from_execution_name(name).is_some())
+    });
+    tool_schemas.extend(framework.values().map(|proof| proof.schema()));
 
     tool_schemas.sort_by(|left, right| left.function.name.cmp(&right.function.name));
     tool_schemas.dedup_by(|left, right| left.function.name == right.function.name);
@@ -235,14 +243,6 @@ fn resolve_catalog_with_activation(
                 "Supervisor: delegate execution, including simple implementation tasks; retain only necessary dedicated read-only acquisition and orchestration here. If no suitable authorized worker is available, report the actual recoverable blocker instead of self-executing or repeatedly creating children. {}",
                 schema.function.description,
             );
-        }
-        for schema in tool_schemas
-            .iter_mut()
-            .filter(|schema| schema.function.name == "session_history")
-        {
-            schema.function.description = "Bounded history/metadata readback for this Supervisor or an explicitly attached independent Root in its current valid Project/lifetime scope. Use read_messages/get_meta. Global list/search is not available; use session_history_current for current-turn paging.".into();
-            schema.function.parameters["properties"]["action"]["enum"] =
-                serde_json::json!(["read_messages", "get_meta"]);
         }
     }
 
