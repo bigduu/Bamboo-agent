@@ -196,6 +196,24 @@ async fn current_permit_caller_and_reserved_target_are_rechecked_even_on_receipt
                 .revoke_host_session_scope(&caller.id, 1)
                 .await
                 .unwrap();
+        } else if change.ends_with("birth") {
+            let observed = if change.starts_with("caller-") {
+                &caller
+            } else {
+                &target
+            };
+            store.delete_session(&observed.id).await.unwrap();
+            store
+                .recreate_root_session(&observed.id, "new-model")
+                .await
+                .unwrap();
+            let mut recreated = store.load_session(&observed.id).await.unwrap().unwrap();
+            assert_ne!(recreated.created_at, observed.created_at);
+            recreated.set_project_id_meta(observed.project_id_meta().unwrap());
+            if let Some(workspace) = observed.workspace_path_meta() {
+                recreated.set_workspace_path_meta(workspace);
+            }
+            store.save_session(&recreated).await.unwrap();
         } else {
             let mut changed = if change.starts_with("caller-") {
                 caller.clone()
@@ -203,9 +221,6 @@ async fn current_permit_caller_and_reserved_target_are_rechecked_even_on_receipt
                 target.clone()
             };
             match change {
-                "caller-birth" | "target-birth" => {
-                    changed.created_at += chrono::Duration::seconds(1)
-                }
                 "caller-metadata" | "target-metadata" => changed.metadata_version += 1,
                 "target-project" => changed.set_project_id_meta("changed-project"),
                 "target-workspace" => changed.set_workspace_path_meta("/changed-workspace"),
@@ -220,7 +235,10 @@ async fn current_permit_caller_and_reserved_target_are_rechecked_even_on_receipt
                 .is_err(),
             "{change}"
         );
-        assert_eq!(inbox.inspect(&target.id).await.unwrap().generation, 1);
+        assert_eq!(
+            inbox.inspect(&target.id).await.unwrap().generation,
+            if change == "target-birth" { 0 } else { 1 }
+        );
     }
 }
 

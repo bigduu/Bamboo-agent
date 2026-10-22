@@ -2,7 +2,7 @@
 
 use super::*;
 use bamboo_domain::{host_session_create_identity, HostSessionScopeToken, SessionCallerReference};
-use bamboo_engine::SessionMessengerReceipt;
+use bamboo_engine::SessionPeerDeliveryReceipt;
 use bamboo_server_tools::session_control::root_creation::SessionRootCreatePort;
 
 /// A create-purpose Inbox adapter, distinct from target SendPeer or management.
@@ -18,7 +18,7 @@ pub(in crate::app_state) trait HostRootFirstInputPort: Send + Sync {
         operation_id: uuid::Uuid,
         reserved_root: &Session,
         message: &str,
-    ) -> Result<SessionMessengerReceipt, SessionMessengerError>;
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError>;
 }
 
 struct CanonicalHostRootFirstInput(Arc<SessionMessenger>);
@@ -32,7 +32,7 @@ impl HostRootFirstInputPort for CanonicalHostRootFirstInput {
         operation_id: uuid::Uuid,
         reserved_root: &Session,
         message: &str,
-    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         self.0
             .send_host_root_first_input(token, caller, operation_id, reserved_root, message)
             .await
@@ -320,9 +320,29 @@ impl CreationAuthority {
         creator: &SupervisedRootCreator,
     ) -> Result<ToolResult, ToolError> {
         match self {
-            Self::Supervisor { reference, .. } => {
+            Self::Supervisor {
+                reference,
+                original_caller,
+            } => {
                 self.current_revision(creator).await?;
-                SupervisedRootCreatePort::scope(creator, reference).await
+                let result = SupervisedRootCreatePort::scope(creator, reference).await?;
+                if let Some(caller) = original_caller {
+                    creator.check_original_caller(caller).await?;
+                    // Last await for this read: an installation or tombstone
+                    // cannot be reinterpreted as legacy Supervisor scope.
+                    if creator
+                        .store
+                        .find_host_session_scope(caller)
+                        .await
+                        .map_err(|error| {
+                            ToolError::Execution(format!("Host Root scope unavailable: {error}"))
+                        })?
+                        .is_some()
+                    {
+                        return Err(ToolError::Execution("Host Root scope was installed before the legacy observation completed; read current scope again".into()));
+                    }
+                }
+                Ok(result)
             }
             Self::Host { token, .. } => {
                 let revision = self.current_revision(creator).await?;
@@ -492,7 +512,7 @@ impl CreationAuthority {
         creator: &SupervisedRootCreator,
         request: &SupervisedRootCreateRequest,
         candidate: &Session,
-    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         match self {
             Self::Supervisor {
                 reference,
@@ -501,26 +521,25 @@ impl CreationAuthority {
                 Some(caller) => {
                     creator
                         .messenger
-                        .supervisor_followup_observed(
+                        .supervisor_root_first_input_observed(
                             caller,
                             reference,
-                            &candidate.id,
-                            &request.operation_id.to_string(),
+                            request.operation_id,
+                            candidate,
                             &request.message,
                         )
                         .await
                 }
-                None => {
-                    creator
-                        .messenger
-                        .supervisor_followup(
-                            reference,
-                            &candidate.id,
-                            &request.operation_id.to_string(),
-                            &request.message,
-                        )
-                        .await
-                }
+                None => creator
+                    .messenger
+                    .supervisor_followup(
+                        reference,
+                        &candidate.id,
+                        &request.operation_id.to_string(),
+                        &request.message,
+                    )
+                    .await
+                    .map(Into::into),
             },
             Self::Host {
                 caller,

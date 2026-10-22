@@ -1843,9 +1843,26 @@ pub trait SessionInboxPort: Send + Sync {
         _operation_id: uuid::Uuid,
         _reserved_root: &super::Session,
         _envelope: &SessionMessageEnvelope,
-    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
         Err(SessionInboxError::Storage(
             "Host create-purpose first-input admission is unsupported".into(),
+        ))
+    }
+
+    /// Generic-caller Root creation through the never-installed Supervisor
+    /// namespace. Retain its existing relationship authority and the original
+    /// full caller/reserved Root observations. Return actual pending state;
+    /// historical admission alone cannot request activation from a fresh router.
+    async fn deliver_unscoped_supervisor_root_first_input(
+        &self,
+        _caller: &crate::SessionCallerReference,
+        _supervisor: &crate::SupervisorReference,
+        _operation_id: uuid::Uuid,
+        _reserved_root: &super::Session,
+        _envelope: &SessionMessageEnvelope,
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "unscoped observed Supervisor Root first-input admission is unsupported".into(),
         ))
     }
 

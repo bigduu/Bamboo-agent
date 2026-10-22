@@ -17,7 +17,82 @@ fn denied(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message.into())
 }
 
+fn root_first_input_request(
+    caller: &SessionCallerReference,
+    operation_id: Uuid,
+    candidate: &Session,
+    envelope: &bamboo_domain::SessionMessageEnvelope,
+) -> io::Result<(bamboo_domain::ProjectId, String)> {
+    use bamboo_domain::{SessionMessageBody, SessionMessageKind, SessionMessageSource};
+    let project = super::supervisor_management::new_root_candidate_project(candidate)?;
+    let workspace = candidate
+        .workspace_path_meta()
+        .ok_or_else(|| denied("host_session_create_workspace_missing"))?;
+    let (id, thread) =
+        bamboo_domain::host_root_first_input_identity(caller, operation_id, candidate)
+            .map_err(denied)?;
+    envelope
+        .validate()
+        .map_err(|error| denied(error.to_string()))?;
+    let text = match &envelope.body {
+        SessionMessageBody::Content(content)
+            if content.parts.is_empty() && content.skill_request.is_none() =>
+        {
+            &content.text
+        }
+        _ => return Err(denied("host_root_first_input_requires_bounded_text")),
+    };
+    if envelope.source
+        != (SessionMessageSource::Session {
+            session_id: caller.session_id.clone(),
+        })
+        || envelope.target_session_id != candidate.id
+        || envelope.kind != SessionMessageKind::PeerMessage
+        || envelope.id != id
+        || envelope.thread_id != thread
+        || envelope.correlation_id.as_deref() != Some(operation_id.to_string().as_str())
+        || envelope.in_reply_to.is_some()
+        || envelope.attempt.is_some()
+        || text.trim().is_empty()
+        || text.contains('\0')
+        || text.len() > bamboo_domain::MAX_SESSION_PEER_MESSAGE_BYTES
+    {
+        return Err(denied("host_root_first_input_envelope_mismatch"));
+    }
+    Ok((project, workspace))
+}
+
 impl SessionStoreV2 {
+    // Caller must own the complete final target authority before this read.
+    async fn check_first_input_reserved_root(&self, candidate: &Session) -> io::Result<()> {
+        let current = self
+            .load_root_authority_unchecked(&candidate.id)
+            .await?
+            .ok_or_else(|| denied("host_root_first_input_reserved_root_missing"))?;
+        if !super::supervisor_management::reserved_root_matches(&current, candidate)
+            || !SessionCallerReference::from(candidate).matches_session(&current)
+        {
+            return Err(denied("host_root_first_input_reserved_root_changed"));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn lock_unscoped_supervisor_root_first_input(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &bamboo_domain::SupervisorReference,
+        operation_id: Uuid,
+        candidate: &Session,
+        envelope: &bamboo_domain::SessionMessageEnvelope,
+    ) -> io::Result<super::host_session_scope::LegacySessionDeliveryGuards> {
+        root_first_input_request(caller, operation_id, candidate, envelope)?;
+        let authority = self
+            .lock_unscoped_supervisor_delivery(caller, supervisor, &candidate.id)
+            .await?;
+        self.check_first_input_reserved_root(candidate).await?;
+        Ok(authority)
+    }
+
     pub(crate) async fn lock_host_root_first_input(
         &self,
         token: &HostSessionScopeToken,
@@ -26,42 +101,8 @@ impl SessionStoreV2 {
         candidate: &Session,
         envelope: &bamboo_domain::SessionMessageEnvelope,
     ) -> io::Result<HostCreatedRootDeliveryGuards> {
-        use bamboo_domain::{SessionMessageBody, SessionMessageKind, SessionMessageSource};
-        let project = super::supervisor_management::new_root_candidate_project(candidate)?;
-        let workspace = candidate
-            .workspace_path_meta()
-            .ok_or_else(|| denied("host_session_create_workspace_missing"))?;
-        let (id, thread) =
-            bamboo_domain::host_root_first_input_identity(caller, operation_id, candidate)
-                .map_err(denied)?;
-        envelope
-            .validate()
-            .map_err(|error| denied(error.to_string()))?;
-        let text = match &envelope.body {
-            SessionMessageBody::Content(content)
-                if content.parts.is_empty() && content.skill_request.is_none() =>
-            {
-                &content.text
-            }
-            _ => return Err(denied("host_root_first_input_requires_bounded_text")),
-        };
-        if envelope.source
-            != (SessionMessageSource::Session {
-                session_id: caller.session_id.clone(),
-            })
-            || envelope.target_session_id != candidate.id
-            || envelope.kind != SessionMessageKind::PeerMessage
-            || envelope.id != id
-            || envelope.thread_id != thread
-            || envelope.correlation_id.as_deref() != Some(operation_id.to_string().as_str())
-            || envelope.in_reply_to.is_some()
-            || envelope.attempt.is_some()
-            || text.trim().is_empty()
-            || text.contains('\0')
-            || text.len() > bamboo_domain::MAX_SESSION_PEER_MESSAGE_BYTES
-        {
-            return Err(denied("host_root_first_input_envelope_mismatch"));
-        }
+        let (project, workspace) =
+            root_first_input_request(caller, operation_id, candidate, envelope)?;
         let scope = self.host_scope_registry.retain(token, caller).await?;
         let binding = scope.token().binding();
         binding
@@ -79,13 +120,7 @@ impl SessionStoreV2 {
         if !caller.matches_session(&current) {
             return Err(denied("host_session_operation_caller_changed"));
         }
-        let current_target = self
-            .load_root_authority_unchecked(&candidate.id)
-            .await?
-            .ok_or_else(|| denied("host_root_first_input_reserved_root_missing"))?;
-        if !super::supervisor_management::reserved_root_matches(&current_target, candidate) {
-            return Err(denied("host_root_first_input_reserved_root_changed"));
-        }
+        self.check_first_input_reserved_root(candidate).await?;
         Ok(HostCreatedRootDeliveryGuards {
             inbox_dir: self
                 .abs_path_from_rel(&Self::root_rel_path(&candidate.id))

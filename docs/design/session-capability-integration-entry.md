@@ -15,6 +15,12 @@ Inbox jobs retain those guards after async cancellation or runtime shutdown.
 There is no second queue or receipt store and no SendPeer/inspect grant is
 inferred. Durable first input is not task completion.
 
+The create-purpose Inbox preserves its final-lock `pending` observation. An
+exact retry of ACKed, cancelled or terminal input returns the original receipt
+with `activation=delivery_not_pending` and `activation_requested=false`; it
+does not contact a fresh activation router or invent a coalesced run. Current
+creation/caller/target authorization is still required even for that receipt.
+
 Creation-only ordinary Root/Child permits use a birth-bound creation-input
 address. Genuine Supervisors preserve the old `supervisor_followup` address,
 thread and RespectSpecificWait wire across never-installed/Host route changes.

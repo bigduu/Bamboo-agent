@@ -333,9 +333,12 @@ impl SupervisedRootCreator {
             Ok(receipt) => (
                 receipt.delivery,
                 match receipt.activation {
-                    SessionActivationDisposition::ActiveNotified => "active_notified",
-                    SessionActivationDisposition::ActivationReserved => "activation_reserved",
-                    SessionActivationDisposition::ActivationCoalesced => "activation_coalesced",
+                    Some(SessionActivationDisposition::ActiveNotified) => "active_notified",
+                    Some(SessionActivationDisposition::ActivationReserved) => "activation_reserved",
+                    Some(SessionActivationDisposition::ActivationCoalesced) => {
+                        "activation_coalesced"
+                    }
+                    None => "delivery_not_pending",
                 },
             ),
             Err(SessionMessengerError::Activation { receipt, .. }) => {
@@ -479,7 +482,9 @@ fn completed(
         "code":if matches!(delivery.activation.as_str(), "activation_pending" | "activation_retry_required") {
             delivery.activation.as_str()
         } else {"admitted"},
-        "note":if linked == Some(true) {
+        "note":if delivery.activation == "delivery_not_pending" {
+            "The first input has a durable historical admission and is no longer pending. This admission attempt requested no activation. This does not prove consumption, successful execution or task completion. No target rights or management link are inferred."
+        } else if linked == Some(true) {
             "Creation, relationship and first input are durable, not task completion. A replay is historical admission, not a new run or current activation status. Retry exactly this request for uncertain activation. No Work/Ticket, isolated worktree, Supervisor context or additional permission is created. Recovery uses the existing 24-hour terminal receipt window."
         } else {
             "Creation and first input are durable, not task completion. No management link or target grant is created. A replay is historical admission, not a new run or current activation status. Retry only the unchanged request with its original operation UUID. The Host reservation remains retained across grant and conversation changes."
@@ -487,6 +492,9 @@ fn completed(
     });
     if linked.is_none() {
         response["management_link_changed"] = json!(false);
+    }
+    if delivery.activation == "delivery_not_pending" {
+        response["activation_requested"] = json!(false);
     }
     ToolResult::text(
         delivery.activation != "activation_retry_required",

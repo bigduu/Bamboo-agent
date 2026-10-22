@@ -2559,15 +2559,45 @@ impl SessionInboxPort for FileSessionInbox {
         operation_id: uuid::Uuid,
         reserved_root: &bamboo_domain::Session,
         envelope: &SessionMessageEnvelope,
-    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
         let authority = self
             .sessions
             .lock_host_root_first_input(token, caller, operation_id, reserved_root, envelope)
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
-        self.deliver_with_lifecycle_held(
+        self.deliver_with_lifecycle_held_state(
             envelope,
             InboxAuthority::HostCreation { _guard: authority },
+            None,
+            Some(SessionInboxActivationIntent::new(
+                SessionActivationPolicy::RespectSpecificWait,
+            )),
+        )
+        .await
+    }
+
+    async fn deliver_unscoped_supervisor_root_first_input(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        supervisor: &bamboo_domain::SupervisorReference,
+        operation_id: uuid::Uuid,
+        reserved_root: &bamboo_domain::Session,
+        envelope: &SessionMessageEnvelope,
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
+        let authority = self
+            .sessions
+            .lock_unscoped_supervisor_root_first_input(
+                caller,
+                supervisor,
+                operation_id,
+                reserved_root,
+                envelope,
+            )
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        self.deliver_with_lifecycle_held_state(
+            envelope,
+            InboxAuthority::Unscoped { _guard: authority },
             None,
             Some(SessionInboxActivationIntent::new(
                 SessionActivationPolicy::RespectSpecificWait,

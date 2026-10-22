@@ -462,21 +462,9 @@ impl SessionMessenger {
         operation_id: uuid::Uuid,
         reserved_root: &Session,
         message: &str,
-    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
-        let operation = operation_id.to_string();
-        Self::validate_peer_input(&operation, message)?;
-        let (id, thread) =
-            bamboo_domain::host_root_first_input_identity(caller, operation_id, reserved_root)
-                .map_err(|error| SessionMessengerError::InvalidEnvelope(error.into()))?;
-        let envelope = Self::peer_envelope_for_ids(
-            &caller.session_id,
-            &reserved_root.id,
-            &operation,
-            message,
-            id,
-            thread,
-            None,
-        );
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
+        let envelope =
+            Self::root_first_input_envelope(caller, operation_id, reserved_root, message)?;
         let started = Instant::now();
         let delivery = self
             .inbox
@@ -487,8 +475,72 @@ impl SessionMessenger {
                 self.record_rejection(&error);
                 error
             })?;
-        let admission = self.record_admission(envelope, delivery, started);
-        self.activate_prepared(&admission).await
+        self.finish_peer_delivery(
+            envelope,
+            delivery,
+            started,
+            Some(SessionMessageDeliveryIntent::TriggerTurn),
+        )
+        .await
+    }
+
+    /// Canonical generic-caller Supervisor creation keeps its old wire but
+    /// uses current pending state, unlike the independent legacy followup API.
+    pub async fn supervisor_root_first_input_observed(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &SupervisorReference,
+        operation_id: uuid::Uuid,
+        reserved_root: &Session,
+        message: &str,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
+        let envelope =
+            Self::root_first_input_envelope(caller, operation_id, reserved_root, message)?;
+        let started = Instant::now();
+        let delivery = self
+            .inbox
+            .deliver_unscoped_supervisor_root_first_input(
+                caller,
+                supervisor,
+                operation_id,
+                reserved_root,
+                &envelope,
+            )
+            .await
+            .map_err(|error| {
+                let error = SessionMessengerError::Inbox(error);
+                self.record_rejection(&error);
+                error
+            })?;
+        self.finish_peer_delivery(
+            envelope,
+            delivery,
+            started,
+            Some(SessionMessageDeliveryIntent::TriggerTurn),
+        )
+        .await
+    }
+
+    fn root_first_input_envelope(
+        caller: &SessionCallerReference,
+        operation_id: uuid::Uuid,
+        reserved_root: &Session,
+        message: &str,
+    ) -> Result<SessionMessageEnvelope, SessionMessengerError> {
+        let operation = operation_id.to_string();
+        Self::validate_peer_input(&operation, message)?;
+        let (id, thread) =
+            bamboo_domain::host_root_first_input_identity(caller, operation_id, reserved_root)
+                .map_err(|error| SessionMessengerError::InvalidEnvelope(error.into()))?;
+        Ok(Self::peer_envelope_for_ids(
+            &caller.session_id,
+            &reserved_root.id,
+            &operation,
+            message,
+            id,
+            thread,
+            None,
+        ))
     }
 
     /// Active-run-only peer input. The Inbox owns exact retry recovery and

@@ -8,7 +8,7 @@ use bamboo_domain::{
     HostSessionCreateScope, HostSessionRight, HostSessionScopeBinding, HostSessionScopeToken,
     SessionCallerReference, SessionMessageId, HOST_SESSION_SCOPE_VERSION,
 };
-use bamboo_engine::SessionMessengerReceipt;
+use bamboo_engine::{SessionMessengerReceipt, SessionPeerDeliveryReceipt};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
@@ -27,7 +27,7 @@ impl HostRootFirstInputPort for FirstInputMock {
         operation_id: uuid::Uuid,
         reserved_root: &Session,
         message: &str,
-    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         self.calls.lock().unwrap().push((
             caller.clone(),
             operation_id,
@@ -50,7 +50,7 @@ impl HostRootFirstInputPort for FirstInputMock {
                 generation: 1,
             },
             activation: SessionActivationDisposition::ActivationReserved,
-        })
+        }.into())
     }
 }
 
@@ -333,6 +333,83 @@ async fn canonical_create_input_keeps_known_receipt_when_activation_fails_then_r
     let retry = accepted(port.create(&original, request).await.unwrap());
     assert_eq!(retry["receipt_id"], first["receipt_id"]);
     assert_eq!(f.inbox.inspect(&id).await.unwrap().generation, 1);
+}
+
+#[tokio::test]
+async fn acknowledged_first_input_replay_does_not_activate_a_fresh_router() {
+    for use_host in [true, false] {
+        let f = Fixture::new().await;
+        let (source, ancestors) = caller(&f, if use_host { "root" } else { "supervisor" }).await;
+        let original = SessionCallerReference::from(&source);
+        let request = request(&f);
+        if use_host {
+            install(&f, &source, ancestors, &request, 1, BTreeSet::new()).await;
+        }
+        f.activation.fail.store(true, Ordering::SeqCst);
+        let first = accepted(
+            f.creator
+                .caller_port()
+                .create(&original, request.clone())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(first["code"], "activation_pending");
+        let id = first["target_session_id"].as_str().unwrap();
+        let claim = f.inbox.claim(id, 1).await.unwrap().remove(0);
+        let mut checkpoint = f.creator.store.load_session(id).await.unwrap().unwrap();
+        checkpoint.add_message(claim.envelope.to_provider_message().unwrap());
+        checkpoint
+            .session_inbox_admission_mut()
+            .record(claim.envelope.id.clone(), claim.generation);
+        f.creator.store.save_session(&checkpoint).await.unwrap();
+        f.inbox.ack(id, &claim).await.unwrap();
+        let fresh_activation = Arc::new(Activation::default());
+        let mut creator = f.creator.clone();
+        creator.messenger = Arc::new(SessionMessenger::new(
+            creator.store.clone(),
+            f.inbox.clone(),
+            fresh_activation.clone(),
+        ));
+        let replay = accepted(
+            creator
+                .caller_port()
+                .create(&original, request)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(replay["receipt_id"], first["receipt_id"]);
+        assert_eq!(replay["activation"], "delivery_not_pending");
+        assert_eq!(replay["activation_requested"], false);
+        assert_eq!(fresh_activation.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(f.inbox.inspect(id).await.unwrap().generation, 1);
+        assert_eq!(f.inbox.inspect(id).await.unwrap().pending, 0);
+    }
+}
+
+#[tokio::test]
+async fn captured_legacy_scope_cannot_return_after_host_namespace_installation() {
+    let f = Fixture::new().await;
+    let (source, ancestors) = caller(&f, "supervisor").await;
+    let legacy = CreationAuthority::Supervisor {
+        reference: f.supervisor.clone(),
+        original_caller: Some(SessionCallerReference::from(&source)),
+    };
+    let request = request(&f);
+    install(&f, &source, ancestors, &request, 1, BTreeSet::new()).await;
+    assert!(legacy.scope(&f.creator).await.is_err());
+    f.creator
+        .store
+        .revoke_host_session_scope(&source.id, 1)
+        .await
+        .unwrap();
+    assert!(legacy.scope(&f.creator).await.is_err());
+    assert!(
+        CreationAuthority::legacy_supervisor(f.supervisor.clone())
+            .scope(&f.creator)
+            .await
+            .unwrap()
+            .success
+    );
 }
 
 #[tokio::test]
