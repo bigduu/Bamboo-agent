@@ -327,7 +327,7 @@ fn erase_children(directory: &std::fs::File, device: u64, depth: usize) -> Resul
     impl Drop for Entries { fn drop(&mut self) { unsafe { libc::closedir(self.0); } } }
     // dup() would share the readdir offset with the pinned descriptor: a
     // partial failure could make a retry skip old entries. Open '.' afresh.
-    let duplicate = unsafe { libc::openat(directory.as_raw_fd(), b".\0".as_ptr().cast(),
+    let duplicate = unsafe { libc::openat(directory.as_raw_fd(), c".".as_ptr(),
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
     if duplicate < 0 { return Err(unavailable("browser_storage_reset_unavailable")); }
     let entries = unsafe { libc::fdopendir(duplicate) };
