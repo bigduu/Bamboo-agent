@@ -99,3 +99,75 @@ async fn ordinary_fulfilled_host_close_keeps_the_existing_cleanup_contract() {
     assert!(!scratch.exists());
     assert!(profile::acquire(&home.path().join("profiles"), "writer-domain-chat").is_ok());
 }
+
+#[tokio::test]
+async fn unknown_writer_marker_failure_still_fences_manager_admission() {
+    let home = tempfile::tempdir().unwrap();
+    let lifecycle = BrowserLifecycle::default();
+    let (session, profile, scratch) = fixture(home.path(), &lifecycle, "/bin/sleep");
+    let invalid_marker = profile.join(UNKNOWN_WRITERS);
+    std::fs::create_dir(&invalid_marker).unwrap();
+    session.signal_stop();
+    session.terminate("synthetic marker failure").await;
+    let blocked_before_io_recovery = lifecycle.unconfirmed_writers.load(Ordering::Acquire);
+    let lease_retained = profile_lock_is_held(&profile);
+    let scratch_retained = scratch.join("synthetic-sentinel").is_file();
+    let completion_was_not_published = !*session.cleanup.done.borrow();
+    // Repair only this synthetic obstruction before asserting, including RED.
+    // Otherwise Drop correctly waits forever for a durable-fence I/O recovery.
+    std::fs::remove_dir(invalid_marker).unwrap();
+    session.quarantine_resources();
+    assert!(blocked_before_io_recovery, "unknown writers must fence admission before marker I/O");
+    assert!(lease_retained && scratch_retained && completion_was_not_published);
+}
+
+#[test]
+fn queued_open_cannot_launch_after_unknown_writer_fence() {
+    const DATA: &str = "BAMBOO_BROWSER_WRITER_ADMISSION_FIXTURE";
+    if let Some(home) = std::env::var_os(DATA).map(PathBuf::from) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let browser = BrowserManager::with_profile_root(home.join("profiles"));
+            let gate = browser.session_gate("queued-chat");
+            let held_gate = gate.lock().await;
+            let mut opening = Box::pin(browser.open("queued-chat"));
+            // The first poll passes the initial admission check and then waits
+            // at the actual per-chat gate, before any host can be spawned.
+            assert!(futures::poll!(opening.as_mut()).is_pending());
+            let (session, _, _) = fixture(&home, &browser.lifecycle, "/bin/sleep");
+            session.signal_stop();
+            session.terminate("synthetic unknown writer").await;
+            drop(held_gate);
+            let result = opening.await;
+            let launched = profile::directory(&home.join("profiles"), "queued-chat")
+                .unwrap().join("synthetic-launched").exists();
+            // Drain the synthetic EOF host on RED before checking the result.
+            browser.shutdown().await;
+            assert!(matches!(result, Err(BrowserError::Unavailable(ref message))
+                if message == "browser writer exit unconfirmed"));
+            assert!(!launched, "a queued open must not launch a new child after the fence");
+        });
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let script = home.path().join("synthetic-host.py");
+    std::fs::write(&script, r#"import json, os, pathlib, sys
+profile = pathlib.Path(os.environ['BAMBOO_BROWSER_PROFILE_DIR'])
+(profile / 'synthetic-launched').write_text('synthetic only')
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({'id': request['id'], 'ok': True, 'result': {'tabs': []}}), flush=True)
+"#).unwrap();
+    let log_path = home.path().join("fixture.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["browser::writer_lifecycle_tests::queued_open_cannot_launch_after_unknown_writer_fence",
+            "--exact", "--test-threads=1"])
+        .env(DATA, home.path())
+        .env("BAMBOO_BROWSER_NODE", std::env::var_os("BAMBOO_BROWSER_TEST_PYTHON")
+            .unwrap_or_else(|| "/usr/bin/python3".into()))
+        .env("BAMBOO_BROWSER_HOST_SCRIPT", script)
+        .stdout(Stdio::from(log.try_clone().unwrap())).stderr(Stdio::from(log))
+        .status().unwrap();
+    assert!(status.success(), "{}", std::fs::read_to_string(log_path).unwrap());
+}
