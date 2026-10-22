@@ -296,6 +296,12 @@ impl ToolExecutor for OverlayToolExecutor {
         }
     }
 
+    fn local_execution_contract(&self, name: &str) -> Option<&'static str> {
+        (name == self.overlay.name())
+            .then(|| self.overlay.execution_contract())
+            .flatten()
+    }
+
     fn list_tools(&self) -> Vec<ToolSchema> {
         let mut tools = self.base.list_tools();
 

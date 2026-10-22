@@ -7,8 +7,9 @@
 
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{
-    plan_mode_allows_tool, ExecutingSupervisorObservation, PendingToolOperation, ToolCall,
-    ToolExecutionSessionFlags, ToolExecutor, ToolResult, PENDING_TOOL_OPERATION_METADATA_KEY,
+    plan_mode_allows_tool, ExecutingSupervisorObservation, PendingToolOperation,
+    RetainedToolExecution, ToolCall, ToolExecutionSessionFlags, ToolExecutor, ToolResult,
+    PENDING_TOOL_OPERATION_METADATA_KEY,
 };
 use bamboo_agent_core::{AgentError, PendingQuestionSource, Session};
 use bamboo_domain::{permission_request_generation, AgentRuntimeState, PermissionMode};
@@ -28,6 +29,8 @@ pub(crate) struct PermissionReplayOrigin {
     session_id: String,
     tool_call: ToolCall,
     execution_name: String,
+    execution_contract: Option<String>,
+    contract_known: bool,
 }
 
 impl PermissionReplayOrigin {
@@ -37,6 +40,8 @@ impl PermissionReplayOrigin {
         session_id: &str,
         tool_call: &ToolCall,
         execution_name: &str,
+        execution_contract: Option<&str>,
+        contract_known: bool,
     ) -> Self {
         Self {
             caller,
@@ -44,6 +49,8 @@ impl PermissionReplayOrigin {
             session_id: session_id.into(),
             tool_call: tool_call.clone(),
             execution_name: execution_name.into(),
+            execution_contract: execution_contract.map(str::to_owned),
+            contract_known,
         }
     }
 
@@ -77,14 +84,17 @@ impl PermissionReplayOrigin {
         }
         let mut metadata = serde_json::json!({"permission_request": request});
         if let Some(caller) = self.caller.as_ref() {
-            metadata[PENDING_TOOL_OPERATION_METADATA_KEY] = PendingToolOperation::capture(
-                caller.clone(),
-                &message.id,
-                &self.tool_call,
-                &self.execution_name,
-                &request.request_generation,
-            )
-            .metadata_value();
+            metadata[PENDING_TOOL_OPERATION_METADATA_KEY] =
+                PendingToolOperation::capture_with_contract(
+                    caller.clone(),
+                    &message.id,
+                    &self.tool_call,
+                    &self.execution_name,
+                    &request.request_generation,
+                    self.execution_contract.as_deref(),
+                    self.contract_known,
+                )
+                .metadata_value();
         }
         if let Some(observation) = self.observation {
             metadata[ExecutingSupervisorObservation::PERMISSION_REPLAY_METADATA_KEY] = observation
@@ -177,6 +187,66 @@ pub fn restore_permission_replay_caller(
         .map(|operation| operation.map(|operation| operation.caller().clone()))
 }
 
+/// Restore semantic selection only from retained Host evidence. Missing v1
+/// provenance cannot identify a canonical v2 spawn owner after a name collision.
+pub fn restore_permission_replay_execution(
+    session: &Session,
+    target: &PermissionReplayTarget,
+    execution_name: &str,
+) -> Result<Option<RetainedToolExecution>, AgentError> {
+    let operation = retained_operation(session, target)?;
+    let (known, contract) = if let Some(operation) = operation.as_ref() {
+        if operation.execution_name() != execution_name {
+            return Err(AgentError::Tool("retained execution owner changed".into()));
+        }
+        if operation.has_execution_contract_record() {
+            (
+                operation.execution_contract_known(),
+                operation.execution_contract(),
+            )
+        } else {
+            if execution_name == "spawn_session" && session.independent_root_spawn_contract() {
+                return Err(unknown_spawn_contract());
+            }
+            (execution_name == "spawn_session", None)
+        }
+    } else {
+        let legacy_binding = session.messages[target.result_message_index]
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| {
+                metadata
+                    .get(ExecutingSupervisorObservation::PERMISSION_REPLAY_METADATA_KEY)
+                    .is_some()
+            });
+        if !legacy_binding {
+            return Ok(None);
+        }
+        ExecutingSupervisorObservation::restore_permission_replay_record(
+            session,
+            target.result_message_index,
+            &target.tool_call,
+            execution_name,
+            target.request_generation(),
+        )
+        .map_err(|error| AgentError::Tool(error.into()))?;
+        if execution_name == "spawn_session" && session.independent_root_spawn_contract() {
+            return Err(unknown_spawn_contract());
+        }
+        (execution_name == "spawn_session", None)
+    };
+    if execution_name == "spawn_session" && !known {
+        return Err(unknown_spawn_contract());
+    }
+    RetainedToolExecution::new(&target.tool_call, execution_name, known, contract)
+        .map(Some)
+        .map_err(|error| AgentError::Tool(error.to_string()))
+}
+
+fn unknown_spawn_contract() -> AgentError {
+    AgentError::Tool("retained spawn operation lacks concrete execution-contract provenance; history and pending markers are preserved. Resend explicitly; no Root or Child was started".into())
+}
+
 fn retained_request(
     session: &Session,
     target: &PermissionReplayTarget,
@@ -244,8 +314,11 @@ pub fn resolve_permission_replay_owner(
                 "permission replay owner differs from its frozen operation".into(),
             ));
         }
-        return Ok(executor
-            .owns_exact_tool(operation.execution_name())
+        let execution =
+            restore_permission_replay_execution(session, target, operation.execution_name())?
+                .expect("retained operation provides execution selection");
+        return Ok(execution
+            .owner_is_available(executor)
             .then(|| operation.execution_name().to_owned()));
     }
     let legacy_supervisor_binding = session.messages[target.result_message_index]
@@ -268,8 +341,10 @@ pub fn resolve_permission_replay_owner(
             target.request_generation(),
         )
         .map_err(|error| AgentError::Tool(error.into()))?;
-        return Ok(executor
-            .owns_exact_tool(&request.tool_name)
+        let execution = restore_permission_replay_execution(session, target, &request.tool_name)?
+            .expect("validated legacy binding provides execution selection");
+        return Ok(execution
+            .owner_is_available(executor)
             .then_some(request.tool_name));
     }
     if bamboo_domain::independent_root_spawn_reference(&target.tool_call.function.name) {
@@ -937,6 +1012,29 @@ pub async fn refresh_approval_replay_posture(
     }
 }
 
+/// Refresh the live policy, then preserve the historical custom-owner mode
+/// boundary. The common spawn name is for the proven framework Root tool;
+/// joining that allowlist cannot promote a retained custom implementation.
+pub async fn refresh_retained_approval_replay_posture(
+    storage: &dyn Storage,
+    session: &mut Session,
+    configured_mode: PermissionMode,
+    execution_name: Option<&str>,
+    execution: Option<&RetainedToolExecution>,
+) -> Result<ApprovalReplayDecision, AgentError> {
+    let decision =
+        refresh_approval_replay_posture(storage, session, configured_mode, execution_name).await?;
+    if matches!(decision, ApprovalReplayDecision::Execute(_))
+        && execution_name == Some("spawn_session")
+        && session.model_orchestration_only_enabled()
+        && execution.and_then(RetainedToolExecution::execution_contract)
+            != Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+    {
+        return Ok(ApprovalReplayDecision::BlockedByRootToolAuthority);
+    }
+    Ok(decision)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1126,6 +1224,61 @@ mod tests {
             "2026-08-14T00:00:00Z".to_string(),
         );
         session
+    }
+
+    #[tokio::test]
+    async fn common_spawn_name_does_not_promote_retained_custom_after_live_ultra_selection() {
+        for version in [None, Some(1), Some(2)] {
+            for contract in [
+                None,
+                Some("custom.spawn.v1"),
+                Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1),
+            ] {
+                let mut owned =
+                    session_with_mode("replay-original-owner", SessionPermissionMode::Default);
+                owned.session_version = version;
+                owned.metadata.insert(
+                    "permission_reexecute_tool_call_id".into(),
+                    "retained-custom".into(),
+                );
+                owned.add_message(Message::user("keep the original work"));
+                let markers = owned.metadata.clone();
+                let messages = serde_json::to_value(&owned.messages).unwrap();
+                let mut latest = owned.clone();
+                latest.set_root_orchestration_only(true).unwrap();
+                let storage = ReplayStorage {
+                    session: RwLock::new(Some(latest)),
+                    fail_load: false,
+                };
+                let call = ToolCall {
+                    id: "retained-custom".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "spawn_session".into(),
+                        arguments: "{}".into(),
+                    },
+                };
+                let execution =
+                    RetainedToolExecution::new(&call, "spawn_session", true, contract).unwrap();
+                let decision = refresh_retained_approval_replay_posture(
+                    &storage,
+                    &mut owned,
+                    PermissionMode::Default,
+                    Some("spawn_session"),
+                    Some(&execution),
+                )
+                .await
+                .unwrap();
+                if contract == Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1) {
+                    assert!(matches!(decision, ApprovalReplayDecision::Execute(_)));
+                } else {
+                    assert_eq!(decision, ApprovalReplayDecision::BlockedByRootToolAuthority);
+                }
+                assert!(owned.root_orchestration_only_enabled());
+                assert_eq!(owned.metadata, markers);
+                assert_eq!(serde_json::to_value(&owned.messages).unwrap(), messages);
+            }
+        }
     }
 
     #[tokio::test]
@@ -1640,6 +1793,11 @@ mod tests {
             // exact custom registration. Retained replay must not consult it.
             Some("spawn_session".into())
         }
+        fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+            self.names
+                .contains(&name)
+                .then_some(self as &dyn ToolExecutor)
+        }
     }
 
     fn frozen_spawn_session(version: Option<u32>, owner: &str) -> Session {
@@ -1682,6 +1840,12 @@ mod tests {
                     names: vec!["SubAgent", "spawn_session", "spawnSession"],
                     resolver_queries: Default::default(),
                 };
+                if version == Some(2) && owner == "spawn_session" {
+                    let before = serde_json::to_value(&session).unwrap();
+                    assert!(resolve_permission_replay_owner(&session, &target, &probe).is_err());
+                    assert_eq!(serde_json::to_value(&session).unwrap(), before);
+                    continue;
+                }
                 assert_eq!(
                     resolve_permission_replay_owner(&session, &target, &probe)
                         .unwrap()
@@ -1837,6 +2001,8 @@ mod tests {
             &session.id,
             &call,
             "SubAgent",
+            None,
+            true,
         )
         .bind_waiting_message(&mut result);
         assert!(result

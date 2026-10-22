@@ -2,8 +2,8 @@
 //!
 //! A legacy record without a stamp uses the existing supported contract. This
 //! is neither a migration nor an authority grant. New tool semantics require a
-//! separately implemented version; an old tool spelling never changes meaning
-//! merely because this process is newer.
+//! retained operation contract. Fresh spawn calls use the current Root entry;
+//! historical operations keep their frozen owner and semantic provenance.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -14,8 +14,9 @@ use super::{
 
 pub const CURRENT_SESSION_VERSION: u32 = 2;
 
-/// Missing/v1 retain the original Child-spawn tool contract. v2 separates
-/// independent Root spawning; support does not make these two contracts equal.
+/// Missing/v1 retain the same historical operation contract. v2 originally
+/// introduced independent Root spawning; retained snapshots remain distinct
+/// even though fresh spawn routing now uses the Root entry for all three.
 pub fn same_session_tool_contract(left: Option<u32>, right: Option<u32>) -> bool {
     matches!(
         (left, right),
@@ -33,9 +34,10 @@ pub fn independent_root_spawn_reference(reference: &str) -> bool {
     name.eq_ignore_ascii_case("spawn_session") || name.eq_ignore_ascii_case("spawnSession")
 }
 
-/// Exact registrations still win. Only the new behavior contract gives the
-/// unshadowed historical spellings an independent-Root owner; no owner means
-/// unavailable, never a fallback to SubAgent.
+/// Fresh calls use an installed independent-Root entry for every supported
+/// Session version. Exact registrations still win; no Root owner means
+/// unavailable, never a fallback to SubAgent. Retained approval replay uses its
+/// frozen operation owner instead of this fresh-call resolver.
 pub fn resolve_session_tool_reference(
     version: Option<u32>,
     reference: &str,
@@ -44,7 +46,7 @@ pub fn resolve_session_tool_reference(
     if !supported(version) {
         return None;
     }
-    if version == Some(2) && independent_root_spawn_reference(reference) {
+    if independent_root_spawn_reference(reference) {
         let exact = reference.trim();
         if contains(exact) {
             return Some(exact.to_string());
@@ -107,6 +109,8 @@ fn supported(version: Option<u32>) -> bool {
 }
 
 impl Session {
+    /// Historical v2 stamp used to assess retained operation ambiguity and
+    /// snapshot compatibility. Fresh tool routing is independent of this flag.
     pub fn independent_root_spawn_contract(&self) -> bool {
         self.session_version == Some(2)
     }

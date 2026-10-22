@@ -169,7 +169,7 @@ pub(super) fn resolve_callable_for_session(
     callable: &EffectiveCallableSet,
     reference: &str,
 ) -> Option<String> {
-    if version == Some(2) && bamboo_domain::independent_root_spawn_reference(reference) {
+    if bamboo_domain::independent_root_spawn_reference(reference) {
         bamboo_domain::resolve_session_tool_reference(version, reference, |name| {
             callable.contains_execution_name(name)
         })
@@ -375,6 +375,12 @@ async fn execute_tool_call_only_with_execution_name_inner(
     execution_name: &str,
     mut ctx: ToolExecutionOnlyContext<'_>,
 ) -> Result<ToolExecutionOutcome, AgentError> {
+    let execution = bamboo_agent_core::tools::RetainedToolExecution::capture(
+        ctx.tool_call,
+        execution_name,
+        ctx.tools.as_ref(),
+    )
+    .map_err(|error| AgentError::Tool(error.to_string()))?;
     // Recheck the resolved exact executor identity even if the provider cites a
     // stale schema or the round's EffectiveCallableSet predates live tightening.
     // Reject before ToolStart, hooks, replay handling, and executor entry.
@@ -385,10 +391,10 @@ async fn execute_tool_call_only_with_execution_name_inner(
     // not turn its spelling into a compatibility alias for another owner.
     let reference = ctx.tool_call.function.name.trim();
     let exact_owner_shadowed = reference != execution_name && ctx.tools.owns_exact_tool(reference);
-    let independent_root_denied = ctx.session_behavior_version == Some(2)
-        && execution_name == "spawn_session"
-        && !executing_supervisor;
-    if independent_root_denied
+    let framework_root_unavailable = execution_name == "spawn_session"
+        && execution.execution_contract()
+            != Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1);
+    if framework_root_unavailable
         || ((ctx.root_orchestration_only || executing_supervisor)
             && (exact_owner_shadowed
                 || !bamboo_domain::orchestration_only_allows_execution_name_for_supervisor(
@@ -411,7 +417,9 @@ async fn execute_tool_call_only_with_execution_name_inner(
             portable_tool: None,
             post_tool_hook_eligible: false,
             managed_running_violation: false,
-            result: Err(if executing_supervisor {
+            result: Err(if framework_root_unavailable {
+                "session_root_port_unavailable: spawn_session requires a concrete framework Root owner; no Root or Child was started".into()
+            } else if executing_supervisor {
                 format!("supervisor_delegation_required: Tool '{}' is outside Supervisor orchestration authority. Delegate execution to an authorized worker. If unavailable or denied, report the actual recoverable blocker; do not self-execute or retry unchanged delegation indefinitely.", ctx.tool_call.function.name)
             } else {
                 format!(
@@ -807,6 +815,8 @@ async fn execute_tool_call_only_with_execution_name_inner(
                 ctx.session_id,
                 ctx.tool_call,
                 execution_name,
+                execution.execution_contract(),
+                execution.contract_known(),
             )
         }),
         result: result.map_err(|error| error.to_string()),
@@ -2152,6 +2162,7 @@ mod hook_tests {
     struct NameRecordingExecutor {
         entered: Mutex<Vec<String>>,
         schemas: Vec<ToolSchema>,
+        root_provenance: Option<bool>,
     }
 
     impl NameRecordingExecutor {
@@ -2159,6 +2170,7 @@ mod hook_tests {
             Self {
                 entered: Mutex::new(Vec::new()),
                 schemas: schema_names.iter().copied().map(tool_schema).collect(),
+                root_provenance: Some(true),
             }
         }
 
@@ -2182,6 +2194,17 @@ mod hook_tests {
 
         fn list_tools(&self) -> Vec<ToolSchema> {
             self.schemas.clone()
+        }
+        fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+            if name == "spawn_session" && self.root_provenance.is_none() {
+                return None;
+            }
+            self.owns_exact_tool(name)
+                .then_some(self as &dyn ToolExecutor)
+        }
+        fn local_execution_contract(&self, name: &str) -> Option<&'static str> {
+            (name == "spawn_session" && self.root_provenance == Some(true))
+                .then_some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
         }
     }
 
@@ -5001,7 +5024,43 @@ mod hook_tests {
         }
     }
     #[tokio::test]
-    async fn versioned_spawn_final_gate_matrix_has_no_child_fallback_or_ordinary_root_authority() {
+    async fn fresh_spawn_rejects_opaque_or_uncontracted_owner_before_toolstart() {
+        let callable = effective_callable_set(
+            &["spawn_session", "SubAgent"],
+            CapabilityLoadingMode::LegacyFullCatalog,
+            &[],
+        );
+        for provenance in [None, Some(false)] {
+            for ultra in [false, true] {
+                let mut probe = NameRecordingExecutor::new(&["spawn_session", "SubAgent"]);
+                probe.root_provenance = provenance;
+                let concrete = Arc::new(probe);
+                let tools: Arc<dyn ToolExecutor> = concrete.clone();
+                let call = probe_call("spawn_session");
+                let (tx, mut rx) = mpsc::channel(64);
+                let result =
+                    execute_without_hooks_with_root_authority(&callable, &tools, &call, &tx, ultra)
+                        .await;
+                assert!(result
+                    .result
+                    .unwrap_err()
+                    .contains("session_root_port_unavailable"));
+                assert!(concrete.entered().is_empty());
+                assert!(std::iter::from_fn(|| rx.try_recv().ok())
+                    .all(|event| !matches!(event, AgentEvent::ToolStart { .. })));
+                let child = probe_call("SubAgent");
+                let result = execute_without_hooks_with_root_authority(
+                    &callable, &tools, &child, &tx, ultra,
+                )
+                .await;
+                assert!(result.result.is_ok());
+                assert_eq!(concrete.entered(), vec!["SubAgent"]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_spawn_dispatch_is_role_neutral_and_never_uses_child_alias() {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
         for version in [None, Some(1), Some(2)] {
             for ultra in [false, true] {
@@ -5024,17 +5083,18 @@ mod hook_tests {
                         session = Session::new_child_of("child", &session, "model", "worker");
                         session.session_version = version;
                     }
-                    let names: &[&str] = if version == Some(2) {
-                        &["spawn_session", "SubAgent"]
-                    } else {
-                        &["SubAgent"]
-                    };
+                    let names: &[&str] = &["spawn_session", "SubAgent"];
                     let callable = effective_callable_set(
                         names,
                         CapabilityLoadingMode::LegacyFullCatalog,
                         &[],
                     );
-                    for name in ["spawn_session", "spawnSession", "default::spawn_session"] {
+                    for name in [
+                        "spawn_session",
+                        "spawnSession",
+                        "default::spawn_session",
+                        "SubAgent",
+                    ] {
                         let concrete = Arc::new(NameRecordingExecutor::new(names));
                         let tools: Arc<dyn ToolExecutor> = concrete.clone();
                         let call = probe_call(name);
@@ -5069,17 +5129,17 @@ mod hook_tests {
                         )
                         .await
                         .unwrap();
-                        let allowed = version != Some(2) || identity == "supervisor";
+                        let allowed = true;
                         assert_eq!(
                             outcome.result.is_ok(),
                             allowed,
                             "{version:?}/{ultra}/{identity}/{name}"
                         );
                         assert_eq!(call, original, "history keeps the caller spelling");
-                        let selected = if version == Some(2) {
-                            "spawn_session"
-                        } else {
+                        let selected = if name == "SubAgent" {
                             "SubAgent"
+                        } else {
+                            "spawn_session"
                         };
                         assert_eq!(
                             concrete.entered(),

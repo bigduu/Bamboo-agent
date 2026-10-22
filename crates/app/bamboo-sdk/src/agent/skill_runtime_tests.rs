@@ -1002,7 +1002,7 @@ async fn sdk_defaults_ultra_keeps_exact_registered_authority_intersection_and_de
         .iter()
         .map(|name| (*name).to_owned())
         .collect::<BTreeSet<_>>();
-    assert_eq!(canonical.len(), 16);
+    assert_eq!(canonical.len(), 17);
     let expected = agent
         .inner
         .default_tools()

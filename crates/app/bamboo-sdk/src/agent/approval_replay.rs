@@ -4,9 +4,10 @@ use super::{Agent, AgentError, AgentEvent, Message, Session};
 use bamboo_agent_core::tools::{ToolExecutor, ToolOutcome};
 use bamboo_agent_core::{PendingQuestion, PendingQuestionSource};
 use bamboo_engine::session_app::approval_replay::{
-    apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
-    repark_permission_replay, resolve_permission_replay_owner,
-    restore_permission_replay_authorization, restore_permission_replay_caller,
+    apply_permission_replay_result, find_permission_replay_target,
+    refresh_retained_approval_replay_posture, repark_permission_replay,
+    resolve_permission_replay_owner, restore_permission_replay_authorization,
+    restore_permission_replay_caller, restore_permission_replay_execution,
     validate_pending_permission_replay_authority, validate_permission_replay_authority,
     ApprovalReplayDecision, PermissionReplayTarget,
 };
@@ -236,11 +237,17 @@ impl Agent {
             replay_owner.as_deref().unwrap_or(tool_name),
         )?;
         let executing_caller = restore_permission_replay_caller(session, &target)?;
-        let decision = refresh_approval_replay_posture(
+        let retained_execution = restore_permission_replay_execution(
+            session,
+            &target,
+            replay_owner.as_deref().unwrap_or(tool_name),
+        )?;
+        let decision = refresh_retained_approval_replay_posture(
             self.storage().as_ref(),
             session,
             self.permission_mode,
             replay_owner.as_deref(),
+            retained_execution.as_ref(),
         )
         .await?;
         let flags = match decision {
@@ -297,14 +304,17 @@ impl Agent {
                 bash_completion_sink: None,
                 pre_parsed_args: None,
             };
-            let dispatch = bamboo_agent_core::tools::with_executing_session_caller(
-                executing_caller.map(std::sync::Arc::new),
-                async {
-                    executor
-                        .execute_exact_with_context_outcome(tool_call, &replay_owner, ctx)
-                        .await
-                        .map(ToolOutcome::into_tool_result)
-                },
+            let dispatch = bamboo_agent_core::tools::with_retained_tool_execution(
+                retained_execution,
+                bamboo_agent_core::tools::with_executing_session_caller(
+                    executing_caller.map(std::sync::Arc::new),
+                    async {
+                        executor
+                            .execute_exact_with_context_outcome(tool_call, &replay_owner, ctx)
+                            .await
+                            .map(ToolOutcome::into_tool_result)
+                    },
+                ),
             );
             let (result, execution_error) = match with_permission_replay_generation(
                 &session.id,

@@ -1180,6 +1180,15 @@ impl ToolExecutor for BuiltinToolExecutor {
             .then_some(self as &dyn ToolExecutor)
     }
 
+    fn local_execution_contract(&self, name: &str) -> Option<&'static str> {
+        if !self.owns_exact_tool(name) {
+            return None;
+        }
+        self.registry
+            .get(name)
+            .and_then(|tool| tool.execution_contract())
+    }
+
     fn tool_mutability(&self, tool_name: &str) -> crate::ToolMutability {
         let resolved = resolve_registered_tool_name(&self.registry, tool_name);
         if self.native_tool_ceiling.is_some()
