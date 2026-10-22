@@ -9,7 +9,11 @@ use std::{
     time::Duration,
 };
 
-pub struct Host(pub Child);
+// Port selection drops the probe socket before the real process can bind.
+// Coordinate that startup window, while leaving ready Hosts/tests concurrent.
+static HOST_STARTUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub struct Host(pub Child, u64);
 impl Drop for Host {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -26,6 +30,7 @@ pub fn start_with_fault(data: &Path, port: u16, fault: Option<(&str, &str)>) -> 
         .append(true)
         .open(data.join("host.log"))
         .unwrap();
+    let log_start = log.metadata().unwrap().len();
     let mut process = Command::new(env!("CARGO_BIN_EXE_bamboo"));
     process
         .args([
@@ -52,7 +57,7 @@ pub fn start_with_fault(data: &Path, port: u16, fault: Option<(&str, &str)>) -> 
     if let Ok(path) = std::env::var("BAMBOO_TICKET_FIXTURE_STATIC_DIR") {
         process.arg("--static-dir").arg(path);
     }
-    Host(process.spawn().unwrap())
+    Host(process.spawn().unwrap(), log_start)
 }
 
 pub async fn get(client: &reqwest::Client, base: &str, path: &str) -> Value {
@@ -94,11 +99,16 @@ pub async fn ready(client: &reqwest::Client, base: &str, host: &mut Host, data: 
                     std::fs::read_to_string(data.join("host.log")).unwrap()
                 );
             }
-            if client
-                .get(format!("{base}/health"))
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success())
+            // /health alone can belong to a peer when our child lost the bind
+            // race. Require this launch's own post-bind log before any probe;
+            // a previous launch's appended log is not current startup proof.
+            let log = std::fs::read(data.join("host.log")).unwrap();
+            if listener_started(&log, host.1, base)
+                && client
+                    .get(format!("{base}/health"))
+                    .send()
+                    .await
+                    .is_ok_and(|r| r.status().is_success())
             {
                 break;
             }
@@ -107,6 +117,39 @@ pub async fn ready(client: &reqwest::Client, base: &str, host: &mut Host, data: 
     })
     .await
     .expect("actual Host startup");
+}
+
+fn listener_started(log: &[u8], start: u64, base: &str) -> bool {
+    let Ok(start) = usize::try_from(start) else {
+        return false;
+    };
+    let Some(current) = log.get(start..) else {
+        return false;
+    };
+    let expected = format!(
+        "Unified server running on {}",
+        base.strip_suffix("/api/v1").expect("fixture API base")
+    );
+    String::from_utf8_lossy(current)
+        .lines()
+        .any(|line| line.ends_with(&expected))
+}
+
+#[test]
+fn startup_log_rejects_previous_launch_and_foreign_listener() {
+    let base = "http://127.0.0.1:46443/api/v1";
+    let old = b"Unified server running on http://127.0.0.1:46443\n";
+    assert!(!listener_started(old, old.len() as u64, base));
+    assert!(!listener_started(
+        b"Unified server running on http://127.0.0.1:46444\n",
+        0,
+        base
+    ));
+    assert!(!listener_started(b"Failed to bind listener\n", 0, base));
+    assert!(!listener_started(old, u64::MAX, base));
+    let mut appended = old.to_vec();
+    appended.extend_from_slice(b"INFO Unified server running on http://127.0.0.1:46443\n");
+    assert!(listener_started(&appended, old.len() as u64, base));
 }
 
 pub type ControlledResponse = fn(&Value, &Probe) -> Option<(Value, &'static str)>;
@@ -546,6 +589,7 @@ impl Fixture {
         Self::with_backend(fault, true).await
     }
     async fn with_backend(fault: Option<(&str, &str)>, legacy_worker: bool) -> Self {
+        let _startup = HOST_STARTUP.lock().await;
         let temp = tempfile::Builder::new()
             .prefix("bamboo-1481-ticket-lifecycle-")
             .tempdir_in("/tmp")
@@ -614,6 +658,7 @@ impl Fixture {
         }
     }
     pub async fn restart(&mut self) {
+        let _startup = HOST_STARTUP.lock().await;
         drop(self.host.take());
         let mut host = start(&self.data, self.port);
         ready(&self.client, &self.base, &mut host, &self.data).await;

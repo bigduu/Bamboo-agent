@@ -27,6 +27,8 @@ use crate::{
     CredentialStore, ProviderConfigs,
 };
 
+pub mod share_transaction;
+
 const MIGRATION_VERSION: u32 = 1;
 const SECTION_LAYOUT_COMPLETION_LEDGER_VERSION: u32 = 1;
 const MANIFEST_FILE: &str = "config-credential-migration.json";
@@ -365,6 +367,7 @@ enum MigrationScope {
     ProviderFacade,
     SectionSplit,
     FacadeCompound,
+    ConfigShare,
 }
 
 fn is_section_layout_scope(scope: Option<MigrationScope>) -> bool {
@@ -10291,6 +10294,9 @@ fn recover_committed_with_cluster_tracker(
     let mut manifest: MigrationManifest = serde_json::from_slice(&bytes)?;
     validate_manifest(&manifest)?;
     if manifest.state == MigrationState::Complete {
+        if manifest.migration_scope == Some(MigrationScope::ConfigShare) {
+            share_transaction::validate_completed(data_dir, &manifest)?;
+        }
         if is_section_layout_scope(manifest.migration_scope) {
             verify_section_split_completion(data_dir, &manifest)?;
             persist_section_layout_completion_ledger(data_dir, &manifest)?;
@@ -10299,6 +10305,13 @@ fn recover_committed_with_cluster_tracker(
         cleanup_transaction_dirs(data_dir, &manifest)?;
         remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
         return Ok(None);
+    }
+    if manifest.migration_scope == Some(MigrationScope::ConfigShare) {
+        share_transaction::recover_pending(data_dir, manifest)?;
+        return Ok(Some(CredentialMigrationOutcome {
+            migrated_credentials: 0,
+            resumed: true,
+        }));
     }
     if manifest.state == MigrationState::Pending
         && matching_cluster_abort_evidence(data_dir, &manifest)?
@@ -11447,7 +11460,11 @@ pub(crate) fn section_layout_completion_evidence_matches(
         {
             return Ok(false);
         }
-        manifest.migration_scope
+        // A later share commit has the same relationship to the immutable
+        // initial-layout provenance as an ordinary exact transaction.
+        manifest
+            .migration_scope
+            .filter(|scope| *scope != MigrationScope::ConfigShare)
     } else {
         None
     };
@@ -11587,7 +11604,9 @@ pub(crate) fn section_layout_allows_legacy_root_reconciliation(
         {
             return Ok(false);
         }
-        manifest.migration_scope
+        manifest
+            .migration_scope
+            .filter(|scope| *scope != MigrationScope::ConfigShare)
     } else {
         None
     };
@@ -11996,6 +12015,9 @@ fn install_pending(
     #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<()> {
     validate_manifest(manifest)?;
+    if manifest.migration_scope == Some(MigrationScope::ConfigShare) {
+        return share_transaction::install_pending(data_dir, manifest);
+    }
     if manifest.state != MigrationState::Pending {
         return Err(ConfigStoreError::Validation(
             "only a pending transaction may install staged members".to_string(),
@@ -13749,6 +13771,9 @@ fn rollback_section_split_credentials(
 }
 
 fn finish_transaction(data_dir: &Path, mut manifest: MigrationManifest) -> ConfigStoreResult<()> {
+    if manifest.migration_scope == Some(MigrationScope::ConfigShare) {
+        return share_transaction::finish(data_dir, manifest);
+    }
     if manifest.exact_scope == Some(ExactTransactionScope::ClusterFabric)
         && matching_cluster_abort_evidence(data_dir, &manifest)?
     {
@@ -14714,6 +14739,9 @@ fn facade_source_attestation_is_valid(manifest: &MigrationManifest) -> bool {
 }
 
 fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
+    if manifest.migration_scope == Some(MigrationScope::ConfigShare) {
+        return share_transaction::validate_manifest(manifest);
+    }
     let expected_stage = format!("{STAGE_PREFIX}{}", manifest.transaction_id);
     let unique = manifest
         .files
@@ -14778,7 +14806,7 @@ fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
                     InstallMode::Migration | InstallMode::Exact => true,
                 })
         }
-        (true, Some(_)) => false,
+        (true, Some(_)) | (false, Some(MigrationScope::ConfigShare)) => false,
     };
     let exact_scope_valid = match (exact_transaction, manifest.exact_scope) {
         (false, None) => true,

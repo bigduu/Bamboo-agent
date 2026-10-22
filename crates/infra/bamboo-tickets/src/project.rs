@@ -347,6 +347,9 @@ pub struct ProjectBoardRequest {
     pub include_archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sprint_filter: Option<SprintBoardFilter>,
+    /// Owner deadline filter evaluated at an explicit instant, never the Host clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overdue_as_of: Option<String>,
     pub limit: usize,
     pub cursor: Option<ReadCursor>,
     pub fixed_commit: Option<String>,
@@ -364,7 +367,20 @@ impl TicketService {
         if !(1..=100).contains(&request.limit) {
             return Err(invalid("board limit 1..100"));
         }
-        let hash = crate::sprint_query::board_query_hash(request)?;
+        let overdue_as_of = request
+            .overdue_as_of
+            .as_deref()
+            .map(crate::planning::overdue_instant)
+            .transpose()?;
+        let base_hash = crate::sprint_query::board_query_hash(request)?;
+        let hash = match request.overdue_as_of.as_deref() {
+            None => base_hash,
+            Some(as_of) => content_hash(&canonical_bytes(&(
+                "project-board-overdue-v1",
+                &base_hash,
+                as_of,
+            ))?),
+        };
         let (commit, snapshot) = self.query_snapshot(
             authority,
             &hash,
@@ -397,6 +413,13 @@ impl TicketService {
                     .as_ref()
                     .is_none_or(|ids| ids.contains(&t.id))
         }) {
+            let matches_deadline = match &overdue_as_of {
+                Some(as_of) => crate::planning::is_overdue_at(ticket, as_of)?,
+                None => true,
+            };
+            if !matches_deadline {
+                continue;
+            }
             counts.total += 1;
             if ticket.state == WorkState::Cancelled {
                 counts.cancelled += 1;
