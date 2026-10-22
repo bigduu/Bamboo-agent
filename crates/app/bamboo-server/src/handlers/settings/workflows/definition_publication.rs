@@ -399,7 +399,11 @@ fn create_file(
     Ok(after)
 }
 
-#[derive(Clone, Copy, Default)]
+#[cfg(test)]
+type PublicationHook = std::sync::Arc<dyn Fn(&CapDir, &CapDir) + Send + Sync>;
+
+#[cfg_attr(not(test), derive(Copy))]
+#[derive(Clone, Default)]
 enum PublicationFault {
     #[default]
     None,
@@ -407,6 +411,8 @@ enum PublicationFault {
     BeforeRename,
     #[cfg(test)]
     AfterRename,
+    #[cfg(test)]
+    BeforeRenameHook(PublicationHook),
 }
 
 #[cfg(test)]
@@ -630,6 +636,10 @@ fn update_definition_with_fault(
     #[cfg(test)]
     if matches!(_fault, PublicationFault::BeforeRename) {
         return Err(injected_failure());
+    }
+    #[cfg(test)]
+    if let PublicationFault::BeforeRenameHook(hook) = &_fault {
+        hook(&authority.transaction, &bundle);
     }
     // Handle-relative atomic replacement. Never truncate the visible file.
     if authority
@@ -1141,6 +1151,63 @@ mod tests {
             Err(DefinitionPublicationError::PublicationUncertain(_))
         ));
         assert_eq!(read_definition(root.path(), "another").unwrap().revision, 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn replacement_after_final_check_is_retained_and_reported_uncertain() {
+        let (root, original) = fixture();
+        let mut external_bytes = original.bytes.clone();
+        external_bytes.extend_from_slice(b"\n# Concurrent external editor version B\n");
+        let external_identity = Arc::new(std::sync::Mutex::new(None));
+        let captured_identity = external_identity.clone();
+        let replacement = external_bytes.clone();
+        let result = update_definition_with_fault(
+            root.path(),
+            ID,
+            &original.digest,
+            original.revision,
+            &original.skill_digest,
+            &definition(ID, 2),
+            PublicationFault::BeforeRenameHook(Arc::new(move |transaction, bundle| {
+                let name = format!("external-{}.yaml", uuid::Uuid::new_v4());
+                let metadata = create_file(transaction, &name, &replacement).unwrap();
+                *captured_identity.lock().unwrap() = Some(cap_node_identity(&metadata));
+                transaction.rename(&name, bundle, DEFINITION_FILE).unwrap();
+                sync_cap_directory(bundle).unwrap();
+                sync_cap_directory(transaction).unwrap();
+            })),
+        );
+        let external_identity = external_identity.lock().unwrap().unwrap();
+        let bundle = root.path().join("skills").join(ID);
+        let mut candidates = vec![bundle.join(DEFINITION_FILE)];
+        candidates.extend(
+            std::fs::read_dir(root.path().join(CLONE_TRANSACTION_DIRECTORY))
+                .unwrap()
+                .map(|entry| entry.unwrap().path()),
+        );
+        let preserved = candidates
+            .iter()
+            .filter(|path| {
+                let Ok(file) = std::fs::File::open(path) else {
+                    return false;
+                };
+                std_file_identity(&file) == Some(external_identity)
+                    && std::fs::read(path).unwrap() == external_bytes
+            })
+            .count();
+        assert_eq!(
+            preserved, 1,
+            "the concurrent editor's exact inode and bytes must survive; result: {result:?}"
+        );
+        assert!(matches!(
+            result,
+            Err(DefinitionPublicationError::PublicationUncertain(_))
+        ));
+        assert_eq!(
+            std::fs::read(bundle.join(SKILL_FILE)).unwrap(),
+            original.skill_bytes
+        );
     }
 
     #[test]
