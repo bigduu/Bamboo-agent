@@ -16,7 +16,7 @@ fn conflict() -> io::Error {
     denied("host_session_scope_revision_conflict")
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ScopePublication {
     revision: u64,
     token: Option<HostSessionScopeToken>,
@@ -24,7 +24,7 @@ struct ScopePublication {
 
 /// This instance is owned by one canonical SessionStore. Clones share the same
 /// issuer and fences. A newly constructed store has no installed grants.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct HostSessionScopeRegistry {
     issuer: HostSessionScopeIssuer,
     slots: Arc<RwLock<BTreeMap<String, Arc<RwLock<ScopePublication>>>>>,

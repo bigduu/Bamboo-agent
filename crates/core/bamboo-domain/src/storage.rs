@@ -436,6 +436,48 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// A candidate for an explicitly installed Host grant. This lookup is not
+    /// final authority; consumers must use the integrated reads/admission port.
+    async fn find_host_session_scope(
+        &self,
+        caller: &crate::SessionCallerReference,
+    ) -> std::io::Result<Option<crate::HostSessionScopeToken>> {
+        let _ = caller;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "host_session_scope_unsupported",
+        ))
+    }
+
+    /// Finite metadata-only observations under caller/target/lineage locks.
+    /// No global index or transcript is returned. Pagination is a tool concern.
+    async fn list_host_scoped_targets(
+        &self,
+        token: &crate::HostSessionScopeToken,
+        caller: &crate::SessionCallerReference,
+    ) -> std::io::Result<Vec<crate::HostSessionTargetScope>> {
+        let _ = (token, caller);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "host_session_scope_unsupported",
+        ))
+    }
+
+    /// Strict one-target snapshot for the installed bounded-inspection adapter.
+    /// A public lookup followed by load_session cannot replace this boundary.
+    async fn load_host_scoped_target(
+        &self,
+        token: &crate::HostSessionScopeToken,
+        caller: &crate::SessionCallerReference,
+        target_id: &str,
+    ) -> std::io::Result<Session> {
+        let _ = (token, caller, target_id);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "host_session_scope_unsupported",
+        ))
+    }
+
     /// Bounded trusted host scope observation, never a Session directory.
     async fn inspect_supervisor_scope(
         &self,

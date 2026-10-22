@@ -129,6 +129,7 @@ use default_actor_context::DefaultWriterGuards;
 pub(crate) use default_actor_context::DefaultWriterPhysicalGuards;
 #[cfg(test)]
 mod conversation_generation_tests;
+pub(crate) mod host_session_scope;
 mod root_context;
 #[cfg(test)]
 mod root_context_tests;
@@ -1456,6 +1457,8 @@ pub struct SessionStoreV2 {
     /// the dedicated fs2 file lock covers independent store instances and
     /// processes sharing this Bamboo home.
     runtime_task_transaction_gate: std::sync::Arc<RwLock<()>>,
+    /// Empty unless a trusted Host explicitly installs a finite caller scope.
+    host_scope_registry: crate::host_session_scope::HostSessionScopeRegistry,
     /// When true, ordinary control-plane access fails closed until the retained
     /// undo journal has restored both sides of an interrupted transaction.
     runtime_task_recovery_required: AtomicBool,
@@ -1790,6 +1793,7 @@ impl SessionStoreV2 {
             persistence_metrics,
             session_lifecycle_lock: std::sync::Arc::new(RwLock::new(())),
             runtime_task_transaction_gate: std::sync::Arc::new(RwLock::new(())),
+            host_scope_registry: crate::host_session_scope::HostSessionScopeRegistry::default(),
             runtime_task_recovery_required: AtomicBool::new(false),
             #[cfg(test)]
             runtime_task_faults: std::sync::Mutex::new(Vec::new()),
@@ -6736,6 +6740,31 @@ impl SessionStoreV2 {
 
 #[async_trait::async_trait]
 impl Storage for SessionStoreV2 {
+    async fn find_host_session_scope(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+    ) -> io::Result<Option<bamboo_domain::HostSessionScopeToken>> {
+        Ok(self.host_scope_registry.lookup(caller).await)
+    }
+
+    async fn list_host_scoped_targets(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &bamboo_domain::SessionCallerReference,
+    ) -> io::Result<Vec<bamboo_domain::HostSessionTargetScope>> {
+        self.list_host_scoped_targets_impl(token, caller).await
+    }
+
+    async fn load_host_scoped_target(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<Session> {
+        self.load_host_scoped_target_impl(token, caller, target_id)
+            .await
+    }
+
     async fn save_manual_title(&self, session: &Session) -> io::Result<()> {
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;

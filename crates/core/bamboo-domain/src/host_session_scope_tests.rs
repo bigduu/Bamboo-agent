@@ -380,7 +380,14 @@ fn valid_conversation_reset_preserves_scope_while_old_operation_generation_is_st
     let scope = observe(&caller);
     let first = reset_candidate(&caller);
     let second = reset_candidate(&first);
+    let original_call = SessionCallerReference::from(&caller);
+    assert!(serde_json::to_value(&original_call)
+        .unwrap()
+        .get("conversation_reset")
+        .is_none());
     for fresh in [&first, &second] {
+        assert!(!original_call.matches_session(fresh));
+        assert!(SessionCallerReference::from(fresh).matches_session(fresh));
         scope.check_session(fresh).unwrap();
         assert!(scope
             .identity
@@ -415,7 +422,7 @@ fn valid_conversation_reset_preserves_scope_while_old_operation_generation_is_st
         HostScopeSessionObservation::capture(&corrupt, Vec::new()),
         Err(HostSessionScopeError::Invalid)
     );
-    // This demonstrates the two data contracts. ToolCtx/replay/final writer
-    // generation propagation is a separate mandatory integration, not provided
-    // by a persistent scope observation or by this pure fixture.
+    // Scope intent is stable while the actual original caller now freezes
+    // the complete generation. Retained records and owned ToolCtx carry that
+    // reference; every final operation must compare it to canonical data.
 }
