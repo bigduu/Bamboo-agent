@@ -291,6 +291,10 @@ fn workspace(root: &Path, index: usize) -> ExecutionWorkspace {
 impl Fixture {
     async fn new(work_count: usize) -> Self {
         let root = tempfile::tempdir().unwrap();
+        // The named-profile reader opens the physical home without following
+        // symlinks. macOS TempDir may use /var; pass its canonical directory to
+        // every Host adapter, as the same-root lifecycle fixture already does.
+        let physical_root = root.path().canonicalize().unwrap();
         let (send, requests) = mpsc::unbounded_channel();
         let provider = Arc::new(ControlledProvider {
             requests: send,
@@ -309,10 +313,10 @@ impl Fixture {
             .get_or_insert_with(Default::default)
             .auto_dream_enabled = false;
         let state = AppState::new_with_provider_and_memory_store(
-            root.path().to_path_buf(),
+            physical_root.clone(),
             config,
             provider.clone(),
-            bamboo_memory::memory_store::MemoryStore::new(root.path().join("jiandu")),
+            bamboo_memory::memory_store::MemoryStore::new(physical_root.join("jiandu")),
         )
         .await
         .unwrap();
