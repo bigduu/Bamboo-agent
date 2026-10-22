@@ -156,13 +156,13 @@ function receipt(target, bytes) {
     cargoMessagesSha256: '6'.repeat(64), stampedDiffSha256: '7'.repeat(64), frontendBytes }
 }
 
-function inputs(t) {
+function inputs(t, { targets = release.TARGETS } = {}) {
   const root = temporary(t)
   const sourceRoot = path.join(root, 'source'), inputDirectory = path.join(root, 'inputs'), outputDirectory = path.join(root, 'output')
   for (const dir of [sourceRoot, inputDirectory, outputDirectory, path.join(sourceRoot, 'browser-runtime')]) fs.mkdirSync(dir)
   for (const file of release.HOST_FILES) fs.writeFileSync(path.join(sourceRoot, file), `fixture-only ${file}\n`)
   const receipts = [], expectedBuilds = {}
-  for (const target of release.TARGETS) {
+  for (const target of targets) {
     const dir = path.join(inputDirectory, target), bytes = header(target)
     fs.mkdirSync(dir)
     fs.writeFileSync(path.join(dir, release.artifactName(target)), bytes)
@@ -175,6 +175,30 @@ function inputs(t) {
   }
   return { root, sourceRoot, inputDirectory, outputDirectory, receipts, identity, frontendBytes, expectedBuilds, signingKey }
 }
+
+const repairTargets = Object.freeze(['aarch64-apple-darwin', 'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu'])
+
+test('repair publication produces a distinct v2 contract for exactly ARM macOS, Windows and Linux', (t) => {
+  const value = inputs(t, { targets: repairTargets })
+  const manifest = release.assembleRelease(value)
+  assert.equal(manifest.schemaVersion, 2)
+  assert.deepEqual(manifest.artifacts.map(item => item.target), repairTargets)
+  const bytes = fs.readFileSync(path.join(value.outputDirectory, 'bamboo-sidecars-v2.json'))
+  assert.deepEqual(JSON.parse(bytes), manifest)
+  const proof = JSON.parse(fs.readFileSync(path.join(value.outputDirectory, 'bamboo-executables-provenance-v2.json')))
+  assert.equal(proof.schemaVersion, 2)
+  assert.equal(proof.kind, 'bamboo-complete-executables/v2')
+  assert.deepEqual(proof.builds.map(item => item.target), repairTargets)
+  assert.equal(proof.manifestSha256, release.sha256(bytes))
+  assert.deepEqual(Buffer.from(proof.manifestBytesBase64, 'base64'), bytes)
+})
+
+test('repair publication rejects Intel and every missing required platform', (t) => {
+  for (const targets of [
+    [...repairTargets, 'x86_64-apple-darwin'],
+    ...repairTargets.map(missing => repairTargets.filter(target => target !== missing)),
+  ]) assert.throws(() => release.assembleRelease(inputs(t, { targets })))
+})
 
 test('actual producer writes a deterministic three-regular-file USTAR host and complete embedded manifest', (t) => {
   const value = inputs(t)
