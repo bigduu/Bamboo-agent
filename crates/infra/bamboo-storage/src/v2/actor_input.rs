@@ -19,6 +19,7 @@ const BOOKKEEPING_KEY: &str = "_bamboo_owned_input_checkpoint";
 pub struct ActorInputCheckpoint {
     pub fence: ActorActivationFence,
     pub expected_created_at: DateTime<Utc>,
+    pub expected_conversation_generation: bamboo_domain::ConversationGenerationObservation,
     pub claim: SessionInboxOwnedClaim,
     pub expected_messages: Vec<Message>,
     pub expected_provider_transcript:
@@ -33,6 +34,7 @@ pub struct ActorInputCheckpoint {
 pub struct ActorClaimContextSeed {
     pub fence: ActorActivationFence,
     pub expected_created_at: DateTime<Utc>,
+    pub expected_conversation_generation: bamboo_domain::ConversationGenerationObservation,
     pub expected_messages: Vec<Message>,
     pub expected_provider_transcript:
         bamboo_domain::session::provider_transcript::ProviderTranscriptState,
@@ -332,6 +334,7 @@ impl SessionStoreV2 {
             })())
         })
         .await??;
+        source.require_conversation_generation(&request.expected_conversation_generation)?;
         let lineage = self.validate_actor_lineage(&source.entry.actor).await?;
         actor_checkpoint_lineage::validate_recorded_observations(
             &source.entry.actor.ancestor_observations,
@@ -663,6 +666,7 @@ impl SessionStoreV2 {
             })())
         })
         .await??;
+        source.require_conversation_generation(&request.expected_conversation_generation)?;
         let lineage = self.validate_actor_lineage(&source.entry.actor).await?;
         actor_checkpoint_lineage::validate_recorded_observations(
             &source.entry.actor.ancestor_observations,

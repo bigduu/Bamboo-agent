@@ -179,3 +179,26 @@ fn default_checkpoint_rejects_before_merging_or_saving_a_stale_transcript() {
     assert_eq!(serde_json::to_value(&stale).unwrap(), before);
     assert_eq!(persister.saves.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn an_original_observation_cannot_refresh_itself_from_a_new_session_or_lease() {
+    let mut caller = Session::new("generation-observation", "model");
+    let observed = caller.conversation_generation_observation();
+    let canonical = at_revision(&caller, 1);
+    caller = canonical.clone();
+    assert_eq!(
+        observed.check_canonical(&caller),
+        Err(ConversationGenerationError::StaleGeneration)
+    );
+    assert!(canonical
+        .conversation_generation_observation()
+        .check_canonical(&canonical)
+        .is_ok());
+    let mut invalid = canonical;
+    invalid.conversation_reset.as_mut().unwrap().schema_version = 99;
+    let observed_invalid = invalid.conversation_generation_observation();
+    assert_eq!(
+        observed_invalid.check_canonical(&invalid),
+        Err(ConversationGenerationError::InvalidState)
+    );
+}

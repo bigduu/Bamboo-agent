@@ -77,6 +77,7 @@ impl Fixture {
         let owner = RootActorRuntimeWrite {
             fence: activation.fence(),
             created_at: base.created_at,
+            conversation_generation: base.conversation_generation_observation(),
         };
         let bound = a.bind_root_actor_inbox(&owner, raw.clone()).unwrap();
         Self {
@@ -648,6 +649,7 @@ async fn checkpoint_successor_once(
     let b_owner = RootActorRuntimeWrite {
         fence: activation.fence(),
         created_at: f.base.created_at,
+        conversation_generation: f.base.conversation_generation_observation(),
     };
     let raw_b = Arc::new(crate::FileSessionInbox::new(
         f.b.clone(),

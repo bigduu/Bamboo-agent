@@ -16,6 +16,8 @@ use crate::{
 pub struct RootActorRuntimeWrite {
     pub fence: crate::ActorActivationFence,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Immutable original-caller data, never replaced by a new activation.
+    pub conversation_generation: crate::ConversationGenerationObservation,
 }
 
 /// Target-only transport disposal, issued by the actual registered owner.
