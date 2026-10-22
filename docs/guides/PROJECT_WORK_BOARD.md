@@ -147,3 +147,25 @@ stop confirmation through the Ticket service; the original adopted version
 remains visible. Creating `shutdown_marker` stops the fixture; it also expires
 after 15 minutes. Dispatch is disabled before serving. All runtime records are
 synthetic test evidence, not a completed model run or real Worker acceptance.
+
+## Ready admission with a pending context candidate
+
+A generation-zero Ready Work is checked against its current context candidate
+before Start. Once the canonical Start commits, pending admission is bound to
+that Assignment's adopted context and immutable DispatchSpec instead. A legal
+metadata-only candidate for a later Start does not replace the current grant,
+Start receipt, workspace, contract, or dispatch key.
+
+The Ready policy must still be installed explicitly by the Host. For an
+existing pending intent in the same writer epoch, it checks the original grant
+against `assignment_contexts` and the original spec. It does not manufacture a
+second Start for the newer candidate. `ensure_fenced` rechecks the original
+spec against the live Project/resource/binding and Git identity, including the
+check after queue capacity is reserved. A newer candidate cannot make a stale
+original resource version eligible.
+
+Retry reservations, attempts, request identity, backoff and original deadline
+remain attached to the same Work and intent. A real writer epoch change still
+uses the existing quarantine and receipt reconciliation rules; neither pending
+metadata nor this policy restores a grant after restart. Submission and human
+acceptance continue to use the canonical Ticket authority.

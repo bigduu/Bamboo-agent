@@ -26,12 +26,20 @@ pub struct TicketApplication {
     adapter: OnceLock<Arc<ChildSessionAdapter>>,
     messenger: OnceLock<Arc<bamboo_engine::SessionMessenger>>,
     workspace: String,
+    ready_scheduler: Arc<bamboo_orchestration::ReadyWorkScheduler>,
 }
 
+mod admission;
 mod initialization;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
+mod patrol_adapter;
+pub use patrol_adapter::PatrolCheckpointStore;
+mod ready_retry_store;
 mod resolution;
+mod scheduling;
 mod sprints;
+pub use bamboo_orchestration::{ReadyBlockKind, ReadyReconcile, ReadyWorkGrant, ReadyWorkPolicy};
+pub use ready_retry_store::{FileReadyRetryStore, ReadyRetryFilePhase, ReadyRetryPublicationFault};
 #[cfg(test)]
 mod tests;
 
@@ -57,6 +65,10 @@ impl TicketApplication {
                 .join(DEFAULT_SUPERVISOR_SESSION_ID)
                 .to_string_lossy()
                 .into_owned(),
+            ready_scheduler: Arc::new(bamboo_orchestration::ReadyWorkScheduler::with_recovery(
+                Arc::new(FileReadyRetryStore::new(root)),
+                Arc::new(bamboo_orchestration::ready_recovery::SystemReadyRetryClock),
+            )),
         }
     }
 
@@ -273,6 +285,10 @@ impl TicketApplication {
         )?;
         expected.receipt = Some(receipt.clone());
         expected.receipt_created_at = Some(child.created_at);
+        let actual = ticket_runtime::read_dispatch(&child)?;
+        // The request ceiling is canonical Host metadata, additional to the
+        // unchanged immutable Ticket operation/spec identity.
+        expected.max_rounds = actual.as_ref().and_then(|binding| binding.max_rounds);
         if child.kind != bamboo_domain::SessionKind::Child
             || child.id != child_id
             || child.parent_session_id.as_deref()
@@ -282,7 +298,7 @@ impl TicketApplication {
                 .metadata
                 .get(bamboo_engine::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
                 != Some(&assignment.id)
-            || ticket_runtime::read_dispatch(&child)?.as_ref() != Some(&expected)
+            || actual.as_ref() != Some(&expected)
             || receipt.session_id != child.id
             || receipt.run_id.is_empty()
             || child.metadata.get("runtime.local_task.run_id") != Some(&receipt.run_id)
@@ -375,6 +391,7 @@ impl TicketApplication {
         let (service, authority) = self.authority(principal.clone()).await?;
         self.validate_project_operations(&service, command)?;
         let receipt = service.work_update(&authority, command)?;
+        self.wake_ready_work();
         self.cancel_after_commit(&service, command);
         if matches!(principal, Principal::User { .. })
             && command.operations.iter().any(|op| {
@@ -460,51 +477,20 @@ impl TicketApplication {
         Ok(())
     }
 
-    fn validate_project_context(
-        &self,
-        project_id: &bamboo_domain::ProjectId,
-        context: Option<&bamboo_tickets::ProjectContextSnapshot>,
-        adopting: bool,
-    ) -> Result<()> {
-        let store = bamboo_projects::ProjectStore::open(self.root.clone())
-            .map_err(|e| Error::AuthorityUnavailable(e.to_string()))?;
-        let manifest = store
-            .get(project_id)
-            .map_err(|e| Error::InvalidTransition(e.to_string()))?;
-        if manifest.status != bamboo_domain::ProjectStatus::Active {
-            return Err(Error::InvalidTransition("Project is archived".into()));
-        }
-        if let Some(context) = context {
-            if (adopting && context.project_revision != manifest.revision)
-                || context.resource_revision != manifest.resource_revision
-                || !manifest
-                    .workspace_roots()
-                    .any(|p| p == context.workspace_binding.path)
-            {
-                return Err(Error::RevisionConflict);
-            }
-            if let Some(binding) = manifest
-                .workspace_bindings
-                .iter()
-                .find(|b| b.path == context.workspace_binding.path)
-            {
-                if binding != &context.workspace_binding {
-                    return Err(Error::RevisionConflict);
-                }
-            } else if context.workspace_binding.git_common_dir.is_some()
-                || context.workspace_binding.label.is_some()
-            {
-                return Err(Error::InvalidTransition(
-                    "primary binding has no auxiliary metadata".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
     /// Commit before enqueue, return admission observations without waiting for
     /// the Worker. Errors after commit are reported alongside its receipt.
     pub async fn dispatch(&self, principal: Principal, command: &Command) -> Result<Value> {
+        self.dispatch_with_round_ceiling(principal, command, None, None)
+            .await
+    }
+
+    async fn dispatch_with_round_ceiling(
+        &self,
+        principal: Principal,
+        command: &Command,
+        max_rounds: Option<u32>,
+        fence: Option<&bamboo_orchestration::ReadyAdmissionFence>,
+    ) -> Result<Value> {
         let flags = self.config.read().await.features.clone();
         if !flags.ticket_mutation {
             return Err(Error::AuthorityUnavailable(
@@ -533,8 +519,12 @@ impl TicketApplication {
             .await?;
         }
         self.validate_project_operations(&service, command)?;
+        if let Some(fence) = fence {
+            fence.check()?;
+        }
         let receipt = service.work_dispatch(&authority, command)?;
-        self.enqueue_receipt(&service, command, receipt).await
+        self.enqueue_receipt_with_round_ceiling(&service, command, receipt, max_rounds, fence)
+            .await
     }
 
     /// Ticket stop proof is currently local-only. Git identity is read before
@@ -578,6 +568,18 @@ impl TicketApplication {
         command: &Command,
         receipt: OperationReceipt,
     ) -> Result<Value> {
+        self.enqueue_receipt_with_round_ceiling(service, command, receipt, None, None)
+            .await
+    }
+
+    async fn enqueue_receipt_with_round_ceiling(
+        &self,
+        service: &Arc<TicketService>,
+        command: &Command,
+        receipt: OperationReceipt,
+        max_rounds: Option<u32>,
+        fence: Option<&bamboo_orchestration::ReadyAdmissionFence>,
+    ) -> Result<Value> {
         self.cancel_after_commit(service, command);
         let snapshot = service.published()?.1;
         let mut runtime = Vec::new();
@@ -588,9 +590,18 @@ impl TicketApplication {
             .filter(|a| receipt.ids.values().any(|id| id == &a.id))
         {
             let intent = &snapshot.intents[&assignment.dispatch_key];
-            let observation = self
-                .ensure(&assignment.dispatch_key, &intent.immutable_spec)
-                .await;
+            let observation = if max_rounds.is_some() {
+                self.ensure_with_round_ceiling(
+                    &assignment.dispatch_key,
+                    &intent.immutable_spec,
+                    max_rounds,
+                    fence,
+                )
+                .await
+            } else {
+                self.ensure(&assignment.dispatch_key, &intent.immutable_spec)
+                    .await
+            };
             match observation {
                 Ok(observation) => runtime.push(json!({"dispatch_key":assignment.dispatch_key, "observation":observation})),
                 Err(error) => errors.push(json!({"dispatch_key":assignment.dispatch_key,"status_code":error.status_code(),"reason":error.to_string()})),
@@ -720,31 +731,20 @@ impl TicketApplication {
         }
     }
 
-    fn validate_dispatch_project_context(
-        &self,
-        snapshot: &bamboo_tickets::Snapshot,
-        spec: &DispatchSpec,
-    ) -> Result<()> {
-        if let Some(project_id) = snapshot.project.links.get(&spec.work_id) {
-            let context = spec
-                .project_context_hash
-                .as_ref()
-                .and_then(|hash| snapshot.project.contexts.get(hash))
-                .ok_or_else(|| {
-                    Error::InvalidTransition("adopted Project context missing".into())
-                })?;
-            if &context.project_id != project_id {
-                return Err(Error::InvalidTransition("adopted Project mismatch".into()));
-            }
-            self.validate_project_context(project_id, Some(context), false)?;
-        }
-        Ok(())
-    }
-
     async fn ensure(
         &self,
         key: &str,
         spec: &DispatchSpec,
+    ) -> Result<ticket_runtime::DispatchObservation> {
+        self.ensure_with_round_ceiling(key, spec, None, None).await
+    }
+
+    async fn ensure_with_round_ceiling(
+        &self,
+        key: &str,
+        spec: &DispatchSpec,
+        max_rounds: Option<u32>,
+        fence: Option<&bamboo_orchestration::ReadyAdmissionFence>,
     ) -> Result<ticket_runtime::DispatchObservation> {
         let service = self.service()?;
         let enabled = self.config.read().await.features.ticket_dispatch;
@@ -770,14 +770,21 @@ impl TicketApplication {
         })?;
         adapter
             .ensure_ticket_dispatch(
-                service,
+                service.clone(),
                 key,
                 spec,
                 &TicketDispatchPolicy {
                     enabled,
                     worker_role: "worker".into(),
                     workspace: self.workspace.clone(),
+                    max_rounds,
+                    admission_fence: fence.cloned(),
                 },
+                Box::pin(async {
+                    self.revalidate_ticket_dispatch_admission(&service, key, spec)
+                        .await
+                        .map_err(|error| error.to_string())
+                }),
             )
             .await
     }
