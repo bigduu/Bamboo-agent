@@ -109,6 +109,74 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 }
 
 impl ChildSessionAdapter {
+    /// Carry a live Host check through durable launch preparation and scheduler
+    /// capacity waits. The scheduler checks it inside the actual queue commit.
+    pub(crate) async fn admit_child_run_checked(
+        &self,
+        parent: &Session,
+        child: &Session,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+        admission_check: Option<&bamboo_engine::execution::spawn::QueueAdmissionCheck>,
+    ) -> Result<bamboo_domain::AdmissionCommit<()>, ChildSessionError> {
+        self.admit_child_run_revalidated(
+            parent,
+            child,
+            gate,
+            admission_check,
+            Box::pin(async { Ok(()) }),
+        )
+        .await
+    }
+
+    pub(crate) async fn admit_child_run_revalidated(
+        &self,
+        parent: &Session,
+        child: &Session,
+        gate: Option<&bamboo_domain::AdmissionGate>,
+        admission_check: Option<&bamboo_engine::execution::spawn::QueueAdmissionCheck>,
+        preflight: futures::future::BoxFuture<'_, Result<(), String>>,
+    ) -> Result<bamboo_domain::AdmissionCommit<()>, ChildSessionError> {
+        let child = self.ensure_child_launch_intent(child).await?;
+        let reservation = match self
+            .scheduler
+            .reserve_queue_capacity(gate)
+            .await
+            .map_err(ChildSessionError::Execution)?
+        {
+            bamboo_domain::AdmissionCommit::Committed(reservation) => reservation,
+            bamboo_domain::AdmissionCommit::AlreadyCommitted => {
+                return Ok(bamboo_domain::AdmissionCommit::AlreadyCommitted)
+            }
+            bamboo_domain::AdmissionCommit::Cancelled => {
+                return Ok(bamboo_domain::AdmissionCommit::Cancelled)
+            }
+        };
+        if let Some(terminal) = reservation.terminal_state() {
+            return Ok(terminal);
+        }
+        // A cancelled or dropped caller releases this permit without a queue
+        // entry. The preflight result is arbitrated inside the original gate
+        // so an AlreadyCommitted result cannot be overwritten by an I/O error.
+        let preflight = match gate {
+            Some(gate) => tokio::select! {
+                biased;
+                _ = gate.cancelled() => return Ok(bamboo_domain::AdmissionCommit::Cancelled),
+                result = preflight => result,
+            },
+            None => preflight.await,
+        };
+        reservation
+            .enqueue_announced_for_generation_revalidated(
+                Self::child_spawn_job(parent, &child)?,
+                Some(child.title.clone()),
+                Some(child.child_launch_generation()),
+                admission_check,
+                preflight,
+            )
+            .await
+            .map_err(ChildSessionError::Execution)
+    }
+
     fn validate_configured_child_model(
         config: &Config,
         child: &Session,
@@ -1859,16 +1927,8 @@ impl ChildSessionPort for ChildSessionAdapter {
         child: &Session,
         gate: Option<&bamboo_domain::AdmissionGate>,
     ) -> Result<bamboo_domain::AdmissionCommit<()>, ChildSessionError> {
-        let child = self.ensure_child_launch_intent(child).await?;
-        self.scheduler
-            .enqueue_announced_for_generation(
-                Self::child_spawn_job(parent, &child)?,
-                Some(child.title.clone()),
-                gate,
-                Some(child.child_launch_generation()),
-            )
+        self.admit_child_run_checked(parent, child, gate, None)
             .await
-            .map_err(ChildSessionError::Execution)
     }
 
     async fn cancel_child_run_and_wait(
