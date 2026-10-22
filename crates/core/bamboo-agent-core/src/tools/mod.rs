@@ -94,6 +94,7 @@ pub mod accumulator;
 pub mod agentic;
 pub mod bash_completion;
 pub mod context;
+pub mod execution_contract;
 pub mod executor;
 pub mod input_guard;
 mod output_cap_observation;
@@ -117,6 +118,10 @@ pub use bash_completion::{BashCompletionInfo, BashCompletionSink};
 pub use context::{
     with_executing_session_caller, ExecutingSupervisorObservation, ToolExecutionContext,
     ToolExecutionSessionFlags,
+};
+pub use execution_contract::{
+    retained_tool_execution_for, retained_tool_owner_lookup, with_retained_tool_execution,
+    RetainedToolExecution, FRAMEWORK_ROOT_SPAWN_CONTRACT_V1,
 };
 pub use executor::{execute_tool_call, execute_tool_call_with_context, ToolError, ToolExecutor};
 pub use output_cap_observation::{observed_tool_output_cap, scope_tool_output_cap};

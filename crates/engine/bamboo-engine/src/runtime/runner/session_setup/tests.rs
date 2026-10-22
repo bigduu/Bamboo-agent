@@ -1258,6 +1258,7 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
     let tools = StaticToolExecutor {
         schemas: [
             "SubAgent",
+            "spawn_session",
             "Plan",
             "Task",
             "session_history_current",
@@ -1302,6 +1303,8 @@ fn selected_root_catalog_exposes_only_exact_orchestration_and_evidence_tools() {
         names,
         bamboo_domain::ROOT_ORCHESTRATION_TOOLS
             .into_iter()
+            // The static catalog has no concrete framework Root owner.
+            .filter(|name| *name != "spawn_session")
             .collect()
     );
     let provider_names = resolve_available_tool_schemas_for_session(&config, &tools, &root)
@@ -1375,6 +1378,7 @@ fn supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standar
             .collect::<std::collections::BTreeSet<_>>();
         let expected = bamboo_domain::ROOT_ORCHESTRATION_TOOLS
             .into_iter()
+            .filter(|name| *name != "spawn_session")
             .chain(bamboo_domain::SUPERVISOR_ORCHESTRATION_TOOLS)
             .map(str::to_owned)
             .collect();
