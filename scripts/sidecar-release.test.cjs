@@ -377,7 +377,7 @@ test('substituting a binary and matching forged receipt cannot bypass the indepe
   fs.writeFileSync(path.join(value.inputDirectory, original.target, 'build-receipt.json'), JSON.stringify(original))
   assert.throws(() => release.assembleRelease(value), /independent build-job output/)
   const missing = clone(value.expectedBuilds); delete missing[release.targetOutputKey(release.TARGETS[0])]
-  assert.throws(() => release.expectedBuildBindings(missing), /four unique/)
+  assert.throws(() => release.expectedBuildBindings(missing), legacySuite ? /four unique/ : /three unique/)
   assert.throws(() => release.expectedBuildBindings(null), /independent build-job outputs/)
   const wrongAttempt = inputs(t)
   const key = release.targetOutputKey(release.TARGETS[0])
@@ -817,13 +817,18 @@ test(`frozen v${testContractVersion} recovery validation rejects foreign identit
 })
 
 if (!legacySuite) test('the complete original controller contract suite also passes for frozen four-platform v1', (t) => {
+  const env = { ...process.env, BAMBOO_TEST_EXECUTABLE_CONTRACT: '1' }
+  // A new CLI test runner must not inherit this runner's child-v8 protocol.
+  // Otherwise Node exits successfully without actually running the v1 files.
+  delete env.NODE_TEST_CONTEXT
   const child = spawnSync(process.execPath, ['--test', '--test-reporter=tap', __filename], {
-    encoding: 'utf8', env: { ...process.env, BAMBOO_TEST_EXECUTABLE_CONTRACT: '1' }, maxBuffer: 8 * 1024 * 1024,
+    encoding: 'utf8', env, maxBuffer: 8 * 1024 * 1024,
   })
   assert.equal(child.status, 0, child.stdout + child.stderr)
-  const counts = Object.fromEntries([...child.stdout.matchAll(/^# (tests|pass|fail|skipped|cancelled) (\d+)$/gm)]
+  const counts = Object.fromEntries([...child.stdout.matchAll(/^# (tests|pass|fail|skipped|cancelled|todo) (\d+)$/gm)]
     .map(([, key, value]) => [key, Number(value)]))
   assert.ok(counts.tests >= 27)
-  assert.equal(counts.fail, 0); assert.equal(counts.skipped, 0); assert.equal(counts.cancelled, 0)
+  assert.equal(counts.tests, counts.pass)
+  assert.equal(counts.fail, 0); assert.equal(counts.skipped, 0); assert.equal(counts.cancelled, 0); assert.equal(counts.todo, 0)
   t.diagnostic('Historical v1 suite: ' + JSON.stringify(counts))
 })

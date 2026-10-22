@@ -369,7 +369,7 @@ function expectedBuildBindings(outputs, contractVersion = 2) {
     delete outputs[intel]
   }
   assert.deepEqual(Object.keys(outputs).sort(), contract.targets.map(targetOutputKey).sort(),
-    'Require exactly the contract native build-job output bindings')
+    contractVersion === 1 ? 'Require four unique build-job output bindings' : 'Require three unique build-job output bindings')
   return new Map(contract.targets.map((target) => {
     assert.equal(typeof outputs[targetOutputKey(target)], 'string')
     const value = JSON.parse(outputs[targetOutputKey(target)])
