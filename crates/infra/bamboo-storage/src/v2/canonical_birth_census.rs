@@ -360,7 +360,9 @@ fn cleanup_location(home: &Path, id: &str) -> io::Result<Option<(PathBuf, String
     fn directory(path: &Path) -> io::Result<bool> {
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
-            Ok(_) => Err(other_io_error("canonical cleanup path is not a real directory")),
+            Ok(_) => Err(other_io_error(
+                "canonical cleanup path is not a real directory",
+            )),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
         }
@@ -382,7 +384,9 @@ fn cleanup_location(home: &Path, id: &str) -> io::Result<Option<(PathBuf, String
             continue;
         }
         if !metadata.file_type().is_dir() {
-            return Err(other_io_error("canonical cleanup Root is not a real directory"));
+            return Err(other_io_error(
+                "canonical cleanup Root is not a real directory",
+            ));
         }
         let name = entry.file_name();
         let root = name

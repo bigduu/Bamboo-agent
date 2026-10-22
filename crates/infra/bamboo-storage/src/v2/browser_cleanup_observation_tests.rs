@@ -101,10 +101,7 @@ async fn large_history_recursive_deletion_keeps_post_delete_observations_availab
         .await
         .unwrap());
     for live in [&survivor, &surviving_child] {
-        assert!(!store
-            .session_is_canonically_absent(&live.id)
-            .await
-            .unwrap());
+        assert!(!store.session_is_canonically_absent(&live.id).await.unwrap());
     }
     assert!(home.path().join("sessions").join(&survivor.id).exists());
     assert!(home
@@ -135,10 +132,7 @@ async fn cleanup_observations_reject_ambiguous_and_linked_placements() {
         .session_has_canonical_cleanup_evidence(&root.id)
         .await
         .is_err());
-    assert!(store
-        .session_is_canonically_absent(&root.id)
-        .await
-        .is_err());
+    assert!(store.session_is_canonically_absent(&root.id).await.is_err());
     std::fs::remove_dir(&duplicate).unwrap();
     #[cfg(unix)]
     {
@@ -151,10 +145,10 @@ async fn cleanup_observations_reject_ambiguous_and_linked_placements() {
             .session_has_canonical_cleanup_evidence(&root.id)
             .await
             .is_err());
-        assert!(store
-            .session_is_canonically_absent(&root.id)
-            .await
-            .is_err());
-        assert_eq!(std::fs::read(&marker).unwrap(), b"synthetic state must survive");
+        assert!(store.session_is_canonically_absent(&root.id).await.is_err());
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"synthetic state must survive"
+        );
     }
 }
