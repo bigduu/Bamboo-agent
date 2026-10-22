@@ -1308,8 +1308,7 @@ mod tests {
                 let Ok(file) = std::fs::File::open(path) else {
                     return false;
                 };
-                std_file_identity(&file) == Some(identity)
-                    && std::fs::read(path).unwrap() == bytes
+                std_file_identity(&file) == Some(identity) && std::fs::read(path).unwrap() == bytes
             })
             .count()
     }
@@ -1340,7 +1339,10 @@ mod tests {
             Err(DefinitionPublicationError::PublicationUncertain(_))
         ));
         let identity = identity.lock().unwrap().unwrap();
-        assert_eq!(retained_file_count(root.path(), identity, &original.bytes), 1);
+        assert_eq!(
+            retained_file_count(root.path(), identity, &original.bytes),
+            1
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1394,8 +1396,7 @@ mod tests {
     fn successful_updates_retain_each_displaced_version_outside_the_bundle() {
         let (root, original) = fixture();
         let path = root.path().join("skills").join(ID).join(DEFINITION_FILE);
-        let original_identity =
-            std_file_identity(&std::fs::File::open(&path).unwrap()).unwrap();
+        let original_identity = std_file_identity(&std::fs::File::open(&path).unwrap()).unwrap();
         let revised = update(root.path(), &original, &definition(ID, 2)).unwrap();
         let revised_identity = std_file_identity(&std::fs::File::open(&path).unwrap()).unwrap();
         let latest = update(root.path(), &revised, &definition(ID, 3)).unwrap();
@@ -1404,7 +1405,10 @@ mod tests {
             retained_file_count(root.path(), original_identity, &original.bytes),
             1
         );
-        assert_eq!(retained_file_count(root.path(), revised_identity, &revised.bytes), 1);
+        assert_eq!(
+            retained_file_count(root.path(), revised_identity, &revised.bytes),
+            1
+        );
         assert_eq!(
             std::fs::read(path.with_file_name(SKILL_FILE)).unwrap(),
             original.skill_bytes

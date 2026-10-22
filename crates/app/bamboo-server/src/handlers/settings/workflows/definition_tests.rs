@@ -128,8 +128,14 @@ async fn unsupported_update_is_501_while_create_and_read_stay_available() {
     assert_eq!(unchanged["content_digest"], first["content_digest"]);
     assert_eq!(unchanged["skill_digest"], first["skill_digest"]);
     assert_eq!(unchanged["definition"]["revision"], 1);
-    assert_eq!(std::fs::read(bundle.join("workflow.yaml")).unwrap(), original_definition);
-    assert_eq!(std::fs::read(bundle.join("SKILL.md")).unwrap(), original_skill);
+    assert_eq!(
+        std::fs::read(bundle.join("workflow.yaml")).unwrap(),
+        original_definition
+    );
+    assert_eq!(
+        std::fs::read(bundle.join("SKILL.md")).unwrap(),
+        original_skill
+    );
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
