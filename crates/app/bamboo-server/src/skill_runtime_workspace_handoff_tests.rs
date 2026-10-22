@@ -258,6 +258,7 @@ struct ProviderState {
     cursor: Option<String>,
     list_cursor: Option<String>,
     attempts: usize,
+    finished: usize,
 }
 struct HandoffProvider {
     probe: Arc<Probe>,
@@ -451,6 +452,7 @@ impl LLMProvider for HandoffProvider {
             }
         }
         if current.next == self.plan.len() {
+            current.finished += 1;
             return Ok(Box::pin(futures::stream::iter([
                 Ok(LLMChunk::Token(
                     "Controlled workspace handoff complete".into(),
@@ -531,7 +533,7 @@ async fn run_case(case: Case) {
         title_patch: Mutex::default(),
     });
     let provider = Arc::new(HandoffProvider::new(probe.clone()));
-    let state = state(&root, provider).await;
+    let state = state(&root, provider.clone()).await;
     // Actix services are local. Keep the real HTTP handler on this test's
     // local runtime; only Send channels cross the actual ToolExecutor future.
     let patch_worker = if case == Case::TitleAfterSet {
@@ -607,6 +609,43 @@ async fn run_case(case: Case) {
     .expect("actual terminal Root must release before fixture cleanup");
     let durable = state.storage.load_session(&id).await.unwrap().unwrap();
     let facts = probe.observed.lock().unwrap();
+    let (plan_consumed, diagnostic) = {
+        let current = provider.current.lock().unwrap();
+        let cwd_a = facts.responses.get(CWD_A);
+        let cwd_a_envelope =
+            cwd_a.and_then(|(_, result)| serde_json::from_str::<Value>(result).ok());
+        let durable_cwd_a = durable
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.tool_call_id.as_deref() == Some(CWD_A));
+        let safe = bamboo_server_tools::project_tools::workspace_diagnostics::safe_identifier;
+        let diagnostic = json!({
+            "plan_next":current.next,"plan_len":provider.plan.len(),
+            "pending_id":current.pending.as_ref().map(|(_, id)| safe(id)),
+            "final_replies":current.finished,"tool_requests":current.attempts,
+            "completion_reason":durable.metadata.get("runtime.completion_reason").map(|value| safe(value)),
+            "pending_question_present":durable.pending_question.is_some(),
+            "pending_approval_field_available":false,
+            "last_tool_result_id":durable.messages.iter().rev()
+                .find_map(|message| message.tool_call_id.as_deref()).map(safe),
+            "cwd_a_result_present":cwd_a.is_some(),
+            "cwd_a_success":cwd_a.map(|(success, _)| *success),
+            "cwd_a_status":cwd_a_envelope.as_ref().and_then(|value| value["status"].as_str()).map(safe),
+            "cwd_a_exit_code":cwd_a_envelope.as_ref().and_then(|value| value["exit_code"].as_i64()),
+            "cwd_a_durable_requested":durable.messages.iter().any(|message|
+                message.tool_calls.as_ref().is_some_and(|calls| calls.iter().any(|call| call.id == CWD_A))),
+            "cwd_a_durable_result_present":durable_cwd_a.is_some(),
+            "cwd_a_durable_success":durable_cwd_a.and_then(|message| message.tool_success),
+            "old_a_result_present":facts.responses.contains_key(OLD_A),
+            "returned_reader_result_present":facts.responses.contains_key("handoff-read-returned-a"),
+            "stale_cursor_result_present":facts.responses.contains_key("handoff-old-cursor-on-fresh-returned-reader"),
+        });
+        (
+            current.next == provider.plan.len() && current.pending.is_none() && current.finished == 1,
+            diagnostic,
+        )
+    };
     assert!(
         matches!(terminal, AgentStatus::Completed),
         "ordinary authorized handoff must complete: {terminal:?}; {facts:?}"
@@ -655,8 +694,12 @@ async fn run_case(case: Case) {
     );
     assert_eq!(facts.calls.get(CWD_B), Some(&1));
     if case == Case::RoundTrip {
-        assert_eq!(facts.calls.get(CWD_A), Some(&1));
+        assert_eq!(facts.calls.get(CWD_A), Some(&1), "{diagnostic}");
     }
+    assert!(
+        plan_consumed,
+        "the complete finite provider plan must be consumed: {diagnostic}"
+    );
     if case == Case::TitleAfterSet {
         assert_eq!(
             facts.title_patches.len(),
@@ -1035,6 +1078,7 @@ async fn native_workspace_handoff_idle_expired_actor_observes_both_switches_befo
 // Exercise the existing referenced HTTP Inbox adapter, not a fabricated
 // SkillsHost. Native Main above still never advertises provider Workspace.
 const LEGACY_READ: &str = "legacy-handoff-completed-read";
+const LEGACY_TRIGGER: &str = "legacy-handoff-second-read";
 const LEGACY_SET: &str = "legacy-handoff-workspace";
 const LEGACY_CWD: &str = "legacy-handoff-next-cwd";
 
@@ -1042,7 +1086,12 @@ const LEGACY_CWD: &str = "legacy-handoff-next-cwd";
 struct LegacyTrace {
     requests: usize,
     read_completed: usize,
+    read_consumed: usize,
+    trigger_completed: usize,
+    trigger_consumed: usize,
+    set_attempts: usize,
     set_completed: usize,
+    set_errors: usize,
     cwd_completed: usize,
     later_provider_requests: usize,
 }
@@ -1055,6 +1104,236 @@ struct LegacyProbe {
     trace: Mutex<LegacyTrace>,
 }
 struct LegacyProvider(Arc<LegacyProbe>);
+
+/// A test observation around the actual Root executor. Every registration,
+/// exact owner, permission and scheduling decision remains the inner owner's.
+/// The Host hook runs after a distinct second Read has completed, inside
+/// per_call's genuine Root capability scope. The first Read is already durable
+/// before any cancellation can occur; Workspace never becomes a model function.
+struct LegacyAfterRead {
+    inner: Arc<dyn ToolExecutor>,
+    probe: Arc<LegacyProbe>,
+}
+impl LegacyAfterRead {
+    async fn completed_read(
+        &self,
+        call: &ToolCall,
+        name: &str,
+        ctx: ToolExecutionContext<'_>,
+        outcome: Result<ToolOutcome, ToolError>,
+    ) -> Result<ToolOutcome, ToolError> {
+        if name != "Read" || !matches!(call.id.as_str(), LEGACY_READ | LEGACY_TRIGGER) {
+            return outcome;
+        }
+        assert!(
+            matches!(&outcome, Ok(ToolOutcome::Completed(result)) if result.success),
+            "the actual legacy Read must succeed before the Host setter"
+        );
+        if call.id == LEGACY_READ {
+            self.probe.trace.lock().unwrap().read_completed += 1;
+            return outcome;
+        }
+        let owner = bamboo_agent_core::tools::context::root_actor_tool_writer()
+            .flatten()
+            .expect("actual per_call Root writer remains scoped after the completed Read");
+        assert_eq!(owner.fence.actor_id, self.probe.id);
+        assert_eq!(ctx.session_id, Some(self.probe.id.as_str()));
+        assert!(!ctx.bypass_permissions && !ctx.auto_approve_permissions);
+        let state = self.probe.state.lock().unwrap().as_ref().unwrap().clone();
+        let before = state
+            .storage
+            .load_session(&self.probe.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.tool_call_id.as_deref() == Some(LEGACY_READ)
+                        && message.tool_success == Some(true)
+                })
+                .count(),
+            1,
+            "the original successful Read must be durable before the separate Host trigger"
+        );
+        {
+            let mut trace = self.probe.trace.lock().unwrap();
+            trace.trigger_completed += 1;
+            trace.set_attempts += 1;
+        }
+        let original_cancel = {
+            let runners = state.agent_runners.read().await;
+            let runner = runners.get(&self.probe.id).unwrap();
+            assert_eq!(runner.run_id, owner.fence.run_id);
+            assert!(!runner.cancel_token.is_cancelled());
+            runner.cancel_token.clone()
+        };
+        let host = ToolCall {
+            id: LEGACY_SET.into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "Workspace".into(),
+                arguments: json!({"path":self.probe.b}).to_string(),
+            },
+        };
+        let result = self
+            .inner
+            .execute_exact_with_context_outcome(
+                &host,
+                "Workspace",
+                ToolExecutionContext {
+                    tool_call_id: &host.id,
+                    pre_parsed_args: None,
+                    ..ctx
+                },
+            )
+            .await;
+        match result {
+            Ok(ToolOutcome::Completed(result)) => {
+                assert!(
+                    result.success && !self.probe.uncertain,
+                    "the controlled Host setter must confirm the actual commit"
+                );
+                let actual = state
+                    .storage
+                    .load_session(&self.probe.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(actual.workspace_path_meta().as_deref(), self.probe.b.to_str());
+                assert_eq!(actual.project_id_meta(), before.project_id_meta());
+                assert_eq!(actual.created_at, before.created_at);
+                assert_eq!(actual.metadata_version, before.metadata_version + 1);
+                self.probe.trace.lock().unwrap().set_completed += 1;
+            }
+            Err(error) => {
+                assert!(
+                    self.probe.uncertain
+                        && error.to_string().contains(
+                            "Controlled loss of legacy Workspace commit confirmation"
+                        ),
+                    "only the deliberate post-save confirmation loss belongs to this case"
+                );
+                // No await after an unknown completion: the outer biased
+                // cancel select may drop this future at its next suspension.
+                // Canonical B is checked after the real terminal boundary.
+                assert!(
+                    original_cancel.is_cancelled(),
+                    "the uncertain Host result must cancel its original genuine owner"
+                );
+                self.probe.trace.lock().unwrap().set_errors += 1;
+            }
+            _ => panic!("the real Host setter must have a completed or error outcome"),
+        }
+        // Preserve the actual trigger Read outcome verbatim. Unknown Host
+        // completion may cancel this batch before the trigger checkpoints;
+        // the original first Read was already durable in the prior round.
+        outcome
+    }
+}
+#[async_trait]
+impl ToolExecutor for LegacyAfterRead {
+    fn for_session(&self, session: &Session) -> Option<Arc<dyn ToolExecutor>> {
+        self.inner.for_session(session).map(|inner| {
+            Arc::new(Self {
+                inner,
+                probe: self.probe.clone(),
+            }) as Arc<dyn ToolExecutor>
+        })
+    }
+    fn resolve_reference_for_session(
+        &self,
+        session: &Session,
+        reference: &str,
+    ) -> Option<String> {
+        self.inner.resolve_reference_for_session(session, reference)
+    }
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        self.inner.execute(call).await
+    }
+    async fn execute_with_context(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.inner.execute_with_context(call, ctx).await
+    }
+    async fn execute_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        self.inner.execute_with_context_outcome(call, ctx).await
+    }
+    async fn execute_exact_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        name: &str,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        let outcome = self
+            .inner
+            .execute_exact_with_context_outcome(call, name, ctx)
+            .await;
+        self.completed_read(call, name, ctx, outcome).await
+    }
+    async fn check_permissions_for(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        self.inner.check_permissions_for(call, ctx).await
+    }
+    async fn check_permissions_for_exact(
+        &self,
+        call: &ToolCall,
+        name: &str,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        self.inner.check_permissions_for_exact(call, name, ctx).await
+    }
+    async fn check_permissions_for_resolved(
+        &self,
+        call: &ToolCall,
+        name: &str,
+        args: &Value,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        self.inner
+            .check_permissions_for_resolved(call, name, args, ctx)
+            .await
+    }
+    fn list_tools(&self) -> Vec<ToolSchema> {
+        self.inner.list_tools()
+    }
+    fn owns_exact_tool(&self, name: &str) -> bool {
+        self.inner.owns_exact_tool(name)
+    }
+    fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+        self.inner.exact_tool_owner(name)
+    }
+    fn tool_guidance(&self) -> Option<String> {
+        self.inner.tool_guidance()
+    }
+    fn tool_mutability(&self, name: &str) -> ToolMutability {
+        self.inner.tool_mutability(name)
+    }
+    fn call_mutability(&self, call: &ToolCall) -> ToolMutability {
+        self.inner.call_mutability(call)
+    }
+    fn tool_concurrency_safe(&self, name: &str) -> bool {
+        self.inner.tool_concurrency_safe(name)
+    }
+    fn call_concurrency_safe(&self, call: &ToolCall) -> bool {
+        self.inner.call_concurrency_safe(call)
+    }
+    fn call_parallel_classification(&self, call: &ToolCall) -> (ToolMutability, bool) {
+        self.inner.call_parallel_classification(call)
+    }
+}
+
 struct LegacyRegistration(Arc<LegacyProbe>);
 impl Drop for LegacyRegistration {
     fn drop(&mut self) {
@@ -1072,6 +1351,10 @@ impl LLMProvider for LegacyProvider {
         _: &str,
     ) -> Result<LLMStream, LLMError> {
         let probe = &self.0;
+        assert!(
+            !tools.iter().any(|tool| tool.function.name == "Workspace"),
+            "legacy Main must retain the same Host-only Workspace catalog boundary"
+        );
         let state = probe.state.lock().unwrap().as_ref().unwrap().clone();
         let actual = state
             .storage
@@ -1103,8 +1386,16 @@ impl LLMProvider for LegacyProvider {
                 let read = prior(LEGACY_READ);
                 assert_eq!(read.tool_success, Some(true), "{}", read.content);
                 assert!(read.content.contains("LEGACY_COMPLETED_ONCE_IN_A"));
-                trace.read_completed += 1;
-                (LEGACY_SET, "Workspace", json!({"path":probe.b}))
+                trace.read_consumed += 1;
+                // The next real tool-call handler checkpoints this prior
+                // result before dispatching the distinct trigger. Its Host
+                // hook below verifies canonical durable success before set;
+                // do not assume an asynchronous event writer won this race.
+                (
+                    LEGACY_TRIGGER,
+                    "Read",
+                    json!({"file_path":probe.a.join("handoff-trigger.txt")}),
+                )
             }
             _ if probe.uncertain => {
                 trace.later_provider_requests += 1;
@@ -1114,9 +1405,14 @@ impl LLMProvider for LegacyProvider {
                 ])));
             }
             2 => {
-                let set = prior(LEGACY_SET);
-                assert_eq!(set.tool_success, Some(true), "{}", set.content);
-                trace.set_completed += 1;
+                let trigger = prior(LEGACY_TRIGGER);
+                assert_eq!(trigger.tool_success, Some(true), "{}", trigger.content);
+                assert!(trigger.content.contains("LEGACY_HANDOFF_TRIGGER_IN_A"));
+                trace.trigger_consumed += 1;
+                assert_eq!(
+                    trace.set_completed, 1,
+                    "the actual Host hook must commit before this round"
+                );
                 assert_eq!(actual.workspace_path_meta().as_deref(), probe.b.to_str());
                 assert_eq!(
                     bamboo_agent_core::workspace_state::peek_workspace(&probe.id),
@@ -1197,6 +1493,7 @@ async fn legacy_case(uncertain: bool) {
     std::fs::create_dir(&a).unwrap();
     std::fs::create_dir(&b).unwrap();
     std::fs::write(a.join("completed-once.txt"), "LEGACY_COMPLETED_ONCE_IN_A").unwrap();
+    std::fs::write(a.join("handoff-trigger.txt"), "LEGACY_HANDOFF_TRIGGER_IN_A").unwrap();
     let id = format!("legacy-workspace-handoff-{}", uuid::Uuid::new_v4());
     let probe = Arc::new(LegacyProbe {
         id: id.clone(),
@@ -1227,6 +1524,15 @@ async fn legacy_case(uncertain: bool) {
     actual_state.provider_router = Arc::new(ProviderModelRouter::new(
         actual_state.provider_registry.clone(),
     ));
+    let root_tools = actual_state.tool_factory.get(ToolSurface::Root);
+    actual_state.tool_factory = crate::tools::ToolSurfaceFactory::new(
+        actual_state.tool_factory.get(ToolSurface::Base),
+        actual_state.tool_factory.get(ToolSurface::WithTask),
+        Arc::new(LegacyAfterRead {
+            inner: root_tools,
+            probe: probe.clone(),
+        }),
+    );
     let state = web::Data::new(actual_state);
     *probe.state.lock().unwrap() = Some(state.clone());
     let project = state
@@ -1297,6 +1603,13 @@ async fn legacy_case(uncertain: bool) {
         1,
         "the already successful read must never replay"
     );
+    let primary_result = durable
+        .messages
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some(LEGACY_READ))
+        .unwrap();
+    assert_eq!(primary_result.tool_success, Some(true));
+    assert!(primary_result.content.contains("LEGACY_COMPLETED_ONCE_IN_A"));
     let cancelled = state
         .agent_runners
         .read()
@@ -1307,6 +1620,12 @@ async fn legacy_case(uncertain: bool) {
         .is_cancelled();
     let trace = probe.trace.lock().unwrap();
     assert_eq!(trace.read_completed, 1);
+    assert_eq!(trace.read_consumed, 1);
+    assert_eq!(trace.trigger_completed, 1);
+    assert_eq!(
+        trace.set_attempts, 1,
+        "one Host setter after the separate real trigger Read"
+    );
     assert_eq!(trace.later_provider_requests, 0);
     if uncertain {
         assert!(!state.workspace_handoffs.legacy_commit_confirmation_pending(&id),
@@ -1319,13 +1638,30 @@ async fn legacy_case(uncertain: bool) {
             trace.requests, 2,
             "unknown completion cancels before a later provider round"
         );
+        assert_eq!(trace.trigger_consumed, 0);
+        assert_eq!(trace.set_errors, 1);
+        assert_eq!(trace.set_completed, 0);
         assert_eq!(trace.cwd_completed, 0);
         assert!(cancelled);
     } else {
         assert!(matches!(terminal, AgentStatus::Completed), "{terminal:?}");
         assert_eq!(trace.requests, 4);
+        assert_eq!(trace.trigger_consumed, 1);
         assert_eq!(trace.set_completed, 1);
+        assert_eq!(trace.set_errors, 0);
         assert_eq!(trace.cwd_completed, 1);
+        assert_eq!(
+            durable
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.tool_call_id.as_deref() == Some(LEGACY_TRIGGER)
+                        && message.tool_success == Some(true)
+                })
+                .count(),
+            1,
+            "the successful handoff must retain the separate real trigger Read exactly once"
+        );
     }
 }
 
@@ -1350,9 +1686,12 @@ async fn legacy_workspace_handoff_missing_or_wrong_dispatch_proof_has_zero_mutat
     );
     let reservation = reserve_owned_source(&state, &session).await;
     // Deliberately no Native bind: this is the real non-Native runner owner.
+    // Warm through the same legitimate repository reader as Workspace's
+    // session_project preflight. Filling an empty cache is not a state write;
+    // retain the complete immutable A snapshot for every rejected proof.
     let before = state
-        .storage
-        .load_session(&session.id)
+        .session_repo
+        .try_load(&session.id)
         .await
         .unwrap()
         .unwrap();
@@ -1361,6 +1700,10 @@ async fn legacy_workspace_handoff_missing_or_wrong_dispatch_proof_has_zero_mutat
         .cache()
         .get(&session.id)
         .map(|entry| entry.read().clone());
+    assert!(
+        cached.is_some(),
+        "legal repository warm must publish the baseline"
+    );
     let workspace = bamboo_agent_core::workspace_state::peek_workspace(&session.id);
     let mut wrong_run = reservation.root_actor_writer().unwrap();
     wrong_run.fence.run_id = "different-run".into();
