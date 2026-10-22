@@ -17,8 +17,13 @@ async function fixture(t) {
   fs.mkdirSync(profile, { mode: 0o700 }); fs.mkdirSync(home, { mode: 0o700 });
   const server = http.createServer((request, response) => {
     if (request.url === '/slow') { setTimeout(() => response.end('<title>Slow A</title>'), 350); return; }
+    if (request.url === '/download') {
+      response.setHeader('content-type', 'application/octet-stream');
+      response.setHeader('content-disposition', 'attachment; filename="synthetic.txt"');
+      setTimeout(() => response.end('synthetic shared download'), 150); return;
+    }
     response.setHeader('content-type', 'text/html');
-    response.end('<!doctype html><title>Synthetic shared</title><button onclick="alert(\'A only\')">Dialog</button>');
+    response.end('<!doctype html><title>Synthetic shared</title><button onclick="alert(\'A only\')">Dialog</button><a id="download" href="/download">Download</a>');
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const url = `http://127.0.0.1:${server.address().port}`;
@@ -41,13 +46,21 @@ async function fixture(t) {
     if (value.event) { events.push(value); return; }
     const waiter = pending.get(value.id); if (!waiter) return;
     pending.delete(value.id); clearTimeout(waiter.timer);
+    try {
+      assert.equal(value.version, 2);
+      if (generation) assert.equal(value.host_generation, generation);
+      if (waiter.owner) {
+        assert.equal(value.scope_id, waiter.owner.id);
+        assert.equal(value.scope_generation, waiter.owner.generation);
+      }
+    } catch (error) { waiter.reject(error); return; }
     if (value.ok) waiter.resolve(value.result);
     else waiter.reject(Object.assign(new Error(value.error), { code: value.code }));
   });
   const call = (action, args = {}, owner) => new Promise((resolve, reject) => {
     const id = next++;
     const timer = setTimeout(() => { pending.delete(id); reject(new Error(`${action} timeout: ${stderr}`)); }, 15000);
-    pending.set(id, { resolve, reject, timer });
+    pending.set(id, { resolve, reject, timer, owner });
     child.stdin.write(JSON.stringify({ version: 2, id, action, args,
       ...(generation ? { host_generation: generation } : {}),
       ...(owner ? { scope_id: owner.id, scope_generation: owner.generation } : {}),
@@ -122,4 +135,42 @@ test('parallel navigation and a chat dialog do not block another chat or revive 
   await assert.rejects(f.call('state', {}, a), error => error.code === 'browser_scope_closed');
   await assert.rejects(f.call('scope_open', { profile_mode: 'shared' }, a), error => error.code === 'browser_scope_closed');
   assert.equal((await b.state()).url, f.url + '/');
+});
+
+test('shared popups inherit their opener and a mode conflict cannot alter a live clean scope', async t => {
+  const f = await fixture(t); const a = await f.open(); const b = await f.open(); const clean = await f.open('clean');
+  await Promise.all([a.visit(), b.visit(), clean.visit()]);
+  const bTab = (await b.state()).active_tab_id;
+  await a.evaluate('window.open(location.origin + "/popup"); true').catch(error => {
+    if (error.code !== 'stale_epoch') throw error;
+  });
+  let state;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    state = await a.state(); if (state.tabs.length === 2) break;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.equal(state.tabs.length, 2);
+  assert.equal((await b.state()).tabs.length, 1);
+  assert.equal((await b.state()).active_tab_id, bTab);
+  await assert.rejects(f.call('scope_open', { profile_mode: 'shared' }, clean),
+    error => error.code === 'browser_profile_mode_conflict');
+  assert.equal((await f.call('scope_open', {}, clean)).profile_mode, 'clean');
+});
+
+test('shared download arbitration preserves per-chat page and byte ownership', async t => {
+  const f = await fixture(t); const a = await f.open(); const b = await f.open();
+  await Promise.all([a.visit(), b.visit()]);
+  const aState = await a.state(); const bState = await b.state();
+  const first = f.call('download', { selector: '#download', expected_epoch: aState.page_epoch }, a);
+  const second = f.call('download', { selector: '#download', expected_epoch: bState.page_epoch }, b);
+  const results = await Promise.allSettled([first, second]);
+  assert.equal(results[0].status, 'fulfilled', JSON.stringify(results.map(result =>
+    ({ status: result.status, code: result.reason?.code, message: result.reason?.message }))));
+  assert.equal(results[1].status, 'rejected');
+  assert.equal(results[1].reason.code, 'browser_download_busy');
+  assert.equal(Buffer.from(results[0].value.data_base64, 'base64').toString(), 'synthetic shared download');
+  assert.equal((await a.state()).active_tab_id, aState.active_tab_id);
+  assert.equal((await b.state()).active_tab_id, bState.active_tab_id);
+  const later = await f.call('download', { selector: '#download', expected_epoch: (await b.state()).page_epoch }, b);
+  assert.equal(Buffer.from(later.data_base64, 'base64').toString(), 'synthetic shared download');
 });

@@ -35,10 +35,11 @@ function fixture(options = {}) {
     browser: { close: async () => { counts.browser++; await options.browserClose?.(); } },
     process: { exit(code) { scope.forcedExit = code; } },
     shuttingDown: false, hostClose: undefined, browserClosed: false,
+    hostRuntime: null,
     captureGeneration: 0, desiredCapture: undefined, activeCapture: undefined,
     activeDownloadAttempt: undefined, profileTimer: undefined, profileInterval: undefined,
     downloadCdp: {}, downloadContextId: 'synthetic', downloadDir: scratch,
-    retireAfterReply: true, TEST_RETIRE_CLOSE_DELAY_MS: 0,
+    retireAfterReply: options.retire || false, TEST_RETIRE_CLOSE_DELAY_MS: 0,
   });
   vm.runInContext(source.slice(closeStart, closeEnd) +
     '\nasync function boundedRetiredClose() {\n' + source.slice(retiredStart, retiredEnd) + '\n}', scope);
@@ -47,7 +48,7 @@ function fixture(options = {}) {
 
 test('bounded retirement preserves scratch while the actual close promise is pending', async () => {
   const gate = deferred();
-  const f = fixture({ contextClose: () => gate.promise });
+  const f = fixture({ contextClose: () => gate.promise, retire: true });
   try {
     await f.scope.boundedRetiredClose();
     assert.equal(f.scope.forcedExit, 1);
@@ -91,4 +92,11 @@ test('checkpoint failure stays an error after both writer close calls fulfill', 
   assert.deepEqual(f.counts, { context: 1, browser: 1 });
   assert.equal(f.scope.browserClosed, true);
   assert.equal(fs.existsSync(f.marker), false);
+});
+
+test('abnormal retirement retains scratch even after the native close calls fulfill', async () => {
+  const f = fixture({ retire: true });
+  await f.scope.closeHost();
+  assert.equal(f.scope.browserClosed, true);
+  assert.equal(fs.existsSync(f.marker), true);
 });

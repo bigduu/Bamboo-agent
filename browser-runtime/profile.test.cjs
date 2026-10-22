@@ -195,7 +195,7 @@ test('repeated open and last-tab window reconstruction preserve durable data but
   assert.deepEqual(await browser.evaluate('window.probe()'), durable);
 });
 
-test('separate chat profiles never share site login or storage and keep their own restart state', async t => {
+test('explicitly separate standalone profile directories keep independent storage and restart state', async t => {
   const f = await fixture(t); const a = f.start(f.profile('chat-A'));
   await a.visit(); await a.evaluate('window.seed()');
   const b = f.start(f.profile('chat-B')); await b.visit();
