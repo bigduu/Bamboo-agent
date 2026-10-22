@@ -249,9 +249,16 @@ impl AppState {
     ) -> Result<Self, AppError> {
         let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
         Self::new_with_provider_and_facade(
-            bamboo_home_dir, config, provider, false, None,
-            Arc::new(NoopToolEventPublisher), memory_store, false,
-        ).await
+            bamboo_home_dir,
+            config,
+            provider,
+            false,
+            None,
+            Arc::new(NoopToolEventPublisher),
+            memory_store,
+            false,
+        )
+        .await
     }
 
     /// Inject both provider and memory explicitly for isolated Host embeddings.

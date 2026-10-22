@@ -17,11 +17,11 @@ where
         let _entered = span.enter();
         work()
     })
-        .await
-        .map_err(|error| {
-            super::workspace_diagnostics::record_current_error("filesystem_worker", &error);
-            ToolError::Execution(format!("Workspace filesystem worker failed: {error}"))
-        })
+    .await
+    .map_err(|error| {
+        super::workspace_diagnostics::record_current_error("filesystem_worker", &error);
+        ToolError::Execution(format!("Workspace filesystem worker failed: {error}"))
+    })
 }
 
 pub(super) enum DirectoryCheck {
@@ -63,7 +63,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1)).await;
         release_tx.send(()).unwrap();
         let (released, checked) = worker.await.unwrap().unwrap();
-        assert!(released, "the async owner must progress while a probe waits");
+        assert!(
+            released,
+            "the async owner must progress while a probe waits"
+        );
         match checked.unwrap() {
             DirectoryCheck::Resolved(path) => assert_eq!(path, expected),
             _ => panic!("expected the actual temporary directory"),

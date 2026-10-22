@@ -163,7 +163,8 @@ impl Fixture {
             panic!("expected the exact obsolete run's interruption frame");
         };
         let prefix = format!("{INTERRUPTION} [actor_authority_conflict; RPA-");
-        let number = message.strip_prefix(&prefix)
+        let number = message
+            .strip_prefix(&prefix)
             .and_then(|suffix| suffix.strip_suffix(']'))
             .expect("typed authority classification and diagnostic number");
         assert_eq!(number.len(), 32);

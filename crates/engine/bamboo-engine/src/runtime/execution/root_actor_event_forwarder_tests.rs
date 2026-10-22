@@ -178,7 +178,8 @@ fn assert_root_interruption(actual: &AgentEvent) {
         panic!("expected the exact obsolete run's interruption frame");
     };
     let prefix = format!("{ROOT_AUTHORITY_LOST} [actor_authority_conflict; RPA-");
-    let number = message.strip_prefix(&prefix)
+    let number = message
+        .strip_prefix(&prefix)
         .and_then(|suffix| suffix.strip_suffix(']'))
         .expect("typed authority classification and diagnostic number");
     assert_eq!(number.len(), 32);
@@ -317,9 +318,7 @@ async fn reclaimed_generic_root_rejects_critical_cache_and_history_ack_without_l
         .await
         .unwrap()
         .unwrap();
-    assert_root_interruption(
-        &session_event(&mut critical.session).await,
-    );
+    assert_root_interruption(&session_event(&mut critical.session).await);
     assert!(matches!(
         critical.session.try_recv(),
         Err(TryRecvError::Empty)
@@ -346,9 +345,7 @@ async fn reclaimed_generic_root_rejects_critical_cache_and_history_ack_without_l
         .await
         .unwrap()
         .unwrap();
-    assert_root_interruption(
-        &session_event(&mut history.session).await,
-    );
+    assert_root_interruption(&session_event(&mut history.session).await);
     assert!(matches!(
         history.session.try_recv(),
         Err(TryRecvError::Empty)
@@ -460,9 +457,7 @@ async fn lost_root_authority_interrupts_live_run_without_publishing_rejected_sta
         .send(clarification("rejected private content"))
         .await
         .unwrap();
-    assert_root_interruption(
-        &session_event(&mut forwarder.session).await,
-    );
+    assert_root_interruption(&session_event(&mut forwarder.session).await);
     tokio::time::timeout(WAIT, forwarder.task)
         .await
         .unwrap()
@@ -587,9 +582,7 @@ async fn lost_root_authority_before_account_receipt_still_interrupts_live_transp
         .await
         .unwrap();
     drop(claim);
-    assert_root_interruption(
-        &session_event(&mut forwarder.session).await,
-    );
+    assert_root_interruption(&session_event(&mut forwarder.session).await);
     tokio::time::timeout(WAIT, forwarder.task)
         .await
         .unwrap()
@@ -626,9 +619,7 @@ async fn lost_root_authority_before_started_still_closes_subscribed_transport() 
         .await
         .unwrap();
     let mut forwarder = Forwarder::new(&fixture, fixture.a.clone(), &binding, "not-started");
-    assert_root_interruption(
-        &session_event(&mut forwarder.session).await,
-    );
+    assert_root_interruption(&session_event(&mut forwarder.session).await);
     tokio::time::timeout(WAIT, forwarder.task)
         .await
         .unwrap()

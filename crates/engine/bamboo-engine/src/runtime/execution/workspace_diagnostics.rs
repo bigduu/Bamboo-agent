@@ -1,10 +1,10 @@
 //! Privacy-preserving execution/Workspace correlation; never authority.
 
-use std::error::Error;
-use std::sync::OnceLock;
 use bamboo_agent_core::{Session, ToolError};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::error::Error;
+use std::sync::OnceLock;
 
 /// The salt is process-local and never logged. These identifiers are for log
 /// correlation only; they are neither persistent scope pins nor capabilities.
@@ -18,8 +18,11 @@ fn opaque(value: &str) -> String {
 }
 
 pub fn safe_identifier(value: &str) -> String {
-    if !value.is_empty() && value.len() <= 128
-        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_:".contains(&byte))
+    if !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_:".contains(&byte))
     {
         value.to_owned()
     } else {
@@ -28,12 +31,16 @@ pub fn safe_identifier(value: &str) -> String {
 }
 
 pub fn scope_fingerprint(session: &Session) -> String {
-    let source = session.metadata.get(
-        crate::project_context::WORKSPACE_SOURCE_METADATA_KEY,
-    );
+    let source = session
+        .metadata
+        .get(crate::project_context::WORKSPACE_SOURCE_METADATA_KEY);
     // Only these three scope fields enter the digest; never the transcript or
     // the rest of Session metadata, even as a diagnostic serialization.
-    let identity = json!([session.project_id_meta(), session.workspace_path_meta(), source]);
+    let identity = json!([
+        session.project_id_meta(),
+        session.workspace_path_meta(),
+        source
+    ]);
     format!("scope-{}", opaque(&identity.to_string()))
 }
 
@@ -48,13 +55,21 @@ pub fn fence_fingerprint(fence: &bamboo_domain::ActorActivationFence) -> String 
 /// recognizable delimiter, so a best-effort path scanner cannot make it safe.
 /// The opaque fingerprint correlates the original detail without disclosing it.
 pub fn redacted(value: &str) -> String {
-    format!("{} <detail:{}>", reason_tags(value).join(","), opaque(value))
+    format!(
+        "{} <detail:{}>",
+        reason_tags(value).join(","),
+        opaque(value)
+    )
 }
 
 /// Display-derived hints are deliberately not an authority classification.
 /// Typed io_kind/os_error/authority_conflict remain separate fields below.
 fn reason_tags(value: &str) -> Vec<&'static str> {
-    let lower: String = value.chars().take(8192).flat_map(char::to_lowercase).collect();
+    let lower: String = value
+        .chars()
+        .take(8192)
+        .flat_map(char::to_lowercase)
+        .collect();
     let patterns = [
         ("publication", "publication_rejected"),
         ("fence", "fence_detail"),
@@ -70,9 +85,13 @@ fn reason_tags(value: &str) -> Vec<&'static str> {
         ("timed out", "timeout"),
         ("cancel", "cancelled"),
     ];
-    let mut tags: Vec<_> = patterns.into_iter().filter_map(|(needle, tag)|
-        lower.contains(needle).then_some(tag)).collect();
-    if tags.is_empty() { tags.push("unclassified_error"); }
+    let mut tags: Vec<_> = patterns
+        .into_iter()
+        .filter_map(|(needle, tag)| lower.contains(needle).then_some(tag))
+        .collect();
+    if tags.is_empty() {
+        tags.push("unclassified_error");
+    }
     tags
 }
 
@@ -80,7 +99,9 @@ pub fn error_chain(error: &(dyn Error + 'static)) -> Vec<Value> {
     let mut chain = Vec::new();
     let mut current = Some(error);
     for _ in 0..8 {
-        let Some(cause) = current else { break; };
+        let Some(cause) = current else {
+            break;
+        };
         let io = cause.downcast_ref::<std::io::Error>();
         chain.push(json!({
             "message": redacted(&cause.to_string()),
@@ -90,7 +111,8 @@ pub fn error_chain(error: &(dyn Error + 'static)) -> Vec<Value> {
             "os_error": io.and_then(std::io::Error::raw_os_error),
             "authority_conflict": cause.is::<bamboo_domain::SessionAuthorityConflict>(),
         }));
-        current = io.and_then(std::io::Error::get_ref)
+        current = io
+            .and_then(std::io::Error::get_ref)
             .map(|inner| inner as &(dyn Error + 'static))
             .or_else(|| cause.source());
     }
@@ -119,7 +141,9 @@ pub fn record_failure(
     phase: &'static str,
     error: &(dyn Error + 'static),
 ) -> String {
-    let id = context.diagnostic_id.map(safe_identifier)
+    let id = context
+        .diagnostic_id
+        .map(safe_identifier)
         .unwrap_or_else(|| format!("WSH-{}", uuid::Uuid::new_v4().simple()));
     tracing::warn!(target: "bamboo.workspace_handoff",
         diagnostic_id = %id,
@@ -134,8 +158,11 @@ pub fn record_failure(
 
 pub fn annotated_error(error: ToolError, diagnostic_id: &str) -> ToolError {
     let annotate = |message: String| {
-        if message.contains(diagnostic_id) { message }
-        else { format!("{message} [{diagnostic_id}]") }
+        if message.contains(diagnostic_id) {
+            message
+        } else {
+            format!("{message} [{diagnostic_id}]")
+        }
     };
     match error {
         ToolError::Execution(message) => ToolError::Execution(annotate(message)),
@@ -143,4 +170,3 @@ pub fn annotated_error(error: ToolError, diagnostic_id: &str) -> ToolError {
         ToolError::NotFound(message) => ToolError::NotFound(annotate(message)),
     }
 }
-

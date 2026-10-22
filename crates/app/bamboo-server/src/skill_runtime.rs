@@ -574,7 +574,10 @@ impl NativeRun {
         let caller = SkillCatalogCaller {
             // Source generation is independent of Q's per-round epoch. A
             // return to an earlier path must never revive an old page handle.
-            caller_id: format!("native-main:{}:{execution_id}:source:{generation}", self.reservation_id),
+            caller_id: format!(
+                "native-main:{}:{execution_id}:source:{generation}",
+                self.reservation_id
+            ),
             session_id: self.policy.session_id.clone(),
             input_id,
             ceiling: self.policy.ceiling.clone(),
@@ -618,14 +621,22 @@ struct NativeResolver {
 #[async_trait]
 impl SkillCatalogCallerResolver for NativeResolver {
     async fn resolve(&self, ctx: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
-        let run = self.run.upgrade().ok_or_else(|| denied("Native Source owner disappeared"))?;
+        let run = self
+            .run
+            .upgrade()
+            .ok_or_else(|| denied("Native Source owner disappeared"))?;
         run.source.check_generation(self.generation)?;
         run.check_owner().await?;
         let caller = run.caller(ctx)?;
         // Direct durable read, never cache/owner reentry. The Reader also
         // validates current canonical Source scope and Config for each page.
-        let session = run.policy.state.storage.load_session(&run.policy.session_id)
-            .await.map_err(|error| denied(&error.to_string()))?
+        let session = run
+            .policy
+            .state
+            .storage
+            .load_session(&run.policy.session_id)
+            .await
+            .map_err(|error| denied(&error.to_string()))?
             .ok_or_else(|| denied("Native Session disappeared"))?;
         workspace_handoff::check_session(self.policy.clone(), session).await?;
         run.check_owner().await?;
@@ -648,7 +659,10 @@ impl SkillExecutionHost for NativeHost {
         session: &mut Session,
         execution_id: &str,
     ) -> Result<(), AgentError> {
-        self.run.refresh_workspace_scope(session, execution_id).await.map_err(engine_error)
+        self.run
+            .refresh_workspace_scope(session, execution_id)
+            .await
+            .map_err(engine_error)
     }
     fn observe_current_inputs(
         &self,
@@ -732,7 +746,11 @@ impl SkillExecutionHost for NativeHost {
                     call_id: ctx.tool_call_id.clone(),
                 },
                 async {
-                    let render = self.run.source.binding().map_err(engine_error)?
+                    let render = self
+                        .run
+                        .source
+                        .binding()
+                        .map_err(engine_error)?
                         .catalog
                         .render_catalog(&ctx)
                         .await
@@ -844,14 +862,17 @@ impl NativeExecutor {
             return Err(denied("Native finite Skills use the scoped Reader"));
         }
         if name.eq_ignore_ascii_case("Workspace") {
-            return Err(denied("Native Workspace mutation requires the actual Host setter"));
+            return Err(denied(
+                "Native Workspace mutation requires the actual Host setter",
+            ));
         }
         let source = self.run.source.read().await;
         let binding = self.run.source.binding()?;
         if !matches!(name, "skills_list" | "skills_read") {
             self.run.check_owner().await?;
             self.run.check_durable_session().await?;
-            let outcome = binding.tools
+            let outcome = binding
+                .tools
                 .execute_exact_with_context_outcome(call, name, ctx)
                 .await;
             drop(source);
@@ -917,12 +938,19 @@ impl ToolExecutor for NativeExecutor {
             Some(name) => self.dispatch(call, &name, ctx).await,
             None => {
                 if call.function.name.eq_ignore_ascii_case("Workspace") {
-                    return Err(denied("Native Workspace mutation requires the actual Host setter"));
+                    return Err(denied(
+                        "Native Workspace mutation requires the actual Host setter",
+                    ));
                 }
                 let _source = self.run.source.read().await;
                 self.run.check_owner().await?;
                 self.run.check_durable_session().await?;
-                self.run.source.binding()?.tools.execute_with_context_outcome(call, ctx).await
+                self.run
+                    .source
+                    .binding()?
+                    .tools
+                    .execute_with_context_outcome(call, ctx)
+                    .await
             }
         }
     }

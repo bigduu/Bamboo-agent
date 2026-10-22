@@ -17,10 +17,10 @@ use bamboo_engine::SessionRepository;
 use bamboo_projects::{ProjectStore, ProjectStoreError};
 use serde_json::{json, Value};
 
-mod workspace_io;
 pub mod workspace_diagnostics;
-use workspace_diagnostics::WorkspaceDiagnostic;
+mod workspace_io;
 use tracing::Instrument;
+use workspace_diagnostics::WorkspaceDiagnostic;
 
 #[derive(Debug)]
 enum EffectiveProjectWorkspaceError {
@@ -144,8 +144,10 @@ pub trait WorkspaceScopeGuard: Send + Sync {
 #[async_trait]
 pub trait WorkspaceHandoffHook: Send + Sync {
     /// Acquire the Source write boundary before the caller's Session lock.
-    async fn prepare(&self, session_id: &str)
-        -> Result<Box<dyn PreparedWorkspaceHandoff>, ToolError>;
+    async fn prepare(
+        &self,
+        session_id: &str,
+    ) -> Result<Box<dyn PreparedWorkspaceHandoff>, ToolError>;
 }
 
 /// One non-cloneable, in-process Host transaction. No ToolResult can create it.
@@ -156,8 +158,11 @@ pub trait PreparedWorkspaceHandoff: Send {
 
     /// Validate the actual locked Session and candidate; observe the old Actor
     /// revision and revoke old Source access before a potentially uncertain save.
-    async fn before_write(&mut self, before: &Session, candidate: &Session)
-        -> Result<(), ToolError>;
+    async fn before_write(
+        &mut self,
+        before: &Session,
+        candidate: &Session,
+    ) -> Result<(), ToolError>;
 
     /// Verify the committed canonical revision and publish a fresh Source only
     /// after durable save, cache and directory publication have all completed.
@@ -212,7 +217,9 @@ impl ProjectWorkspaceTool {
         diagnostic: Option<&WorkspaceDiagnostic>,
     ) -> Result<(Option<Session>, Option<ProjectManifest>), ToolError> {
         let Some(session) = self.sessions.try_load(session_id).await.map_err(|error| {
-            if let Some(log) = diagnostic { log.failure(&error); }
+            if let Some(log) = diagnostic {
+                log.failure(&error);
+            }
             ToolError::Execution(format!("failed to load Workspace session: {error}"))
         })?
         else {
@@ -233,7 +240,9 @@ impl ProjectWorkspaceTool {
         match workspace_io::run(move || projects.get(&project_id)).await? {
             Ok(project) => Ok((Some(session), Some(project))),
             Err(error) => {
-                if let Some(log) = diagnostic { log.failure(&error); }
+                if let Some(log) = diagnostic {
+                    log.failure(&error);
+                }
                 Err(ToolError::Execution(format!(
                     "assigned Project is unavailable; Workspace change refused: {error}"
                 )))
@@ -241,13 +250,19 @@ impl ProjectWorkspaceTool {
         }
     }
 
-    async fn workspace_owner(&self, workspace: &str, diagnostic: Option<&WorkspaceDiagnostic>) -> Result<Option<ProjectManifest>, ToolError> {
+    async fn workspace_owner(
+        &self,
+        workspace: &str,
+        diagnostic: Option<&WorkspaceDiagnostic>,
+    ) -> Result<Option<ProjectManifest>, ToolError> {
         let projects = self.projects.clone();
         let workspace = workspace.to_string();
         workspace_io::run(move || projects.find_workspace_owner_for_path(&workspace))
             .await?
             .map_err(|error| {
-                if let Some(log) = diagnostic { log.failure(&error); }
+                if let Some(log) = diagnostic {
+                    log.failure(&error);
+                }
                 project_tool_error(error)
             })
     }
@@ -317,22 +332,31 @@ impl Tool for ProjectWorkspaceTool {
     }
 
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
-        let mutating = args.get("path").and_then(Value::as_str)
+        let mutating = args
+            .get("path")
+            .and_then(Value::as_str)
             .is_some_and(|path| !path.trim().is_empty());
-        if !mutating { return self.invoke_inner(args, ctx, None).await; }
+        if !mutating {
+            return self.invoke_inner(args, ctx, None).await;
+        }
         let diagnostic = WorkspaceDiagnostic::new(&ctx);
         let span = diagnostic.span();
-        async {
-            diagnostic.finish(self.invoke_inner(args, ctx, Some(&diagnostic)).await)
-        }.instrument(span).await
+        async { diagnostic.finish(self.invoke_inner(args, ctx, Some(&diagnostic)).await) }
+            .instrument(span)
+            .await
     }
 }
 
 impl ProjectWorkspaceTool {
     async fn invoke_inner(
-        &self, args: Value, ctx: ToolCtx, diagnostic: Option<&WorkspaceDiagnostic>,
+        &self,
+        args: Value,
+        ctx: ToolCtx,
+        diagnostic: Option<&WorkspaceDiagnostic>,
     ) -> Result<ToolOutcome, ToolError> {
-        if let Some(log) = diagnostic { log.stage("read_canonical_scope"); }
+        if let Some(log) = diagnostic {
+            log.stage("read_canonical_scope");
+        }
         let session_id = ctx.session_id();
         let (session, mut project) = match session_id {
             Some(id) => self.session_project(id, diagnostic).await?,
@@ -352,7 +376,9 @@ impl ProjectWorkspaceTool {
                     "Workspace(set) requires a session_id in tool context".to_string(),
                 )
             })?;
-            if let Some(log) = diagnostic { log.stage("probe_destination"); }
+            if let Some(log) = diagnostic {
+                log.stage("probe_destination");
+            }
             let requested = requested.to_string();
             let path_project = project.clone();
             let path_resolver = self.workspace_resolver.clone();
@@ -395,10 +421,13 @@ impl ProjectWorkspaceTool {
                 };
                 Ok(workspace_io::check_directory(requested_path))
             })
-            .await??.map_err(|error| {
-                    if let Some(log) = diagnostic { log.failure(&error); }
-                    ToolError::Execution(format!("failed to canonicalize workspace: {error}"))
-                })?;
+            .await??
+            .map_err(|error| {
+                if let Some(log) = diagnostic {
+                    log.failure(&error);
+                }
+                ToolError::Execution(format!("failed to canonicalize workspace: {error}"))
+            })?;
             let canonical = match checked {
                 workspace_io::DirectoryCheck::Missing(path) => {
                     return Ok(completed(
@@ -457,7 +486,9 @@ impl ProjectWorkspaceTool {
             // publish a workspace under a Project identity that has changed.
             // Native calls may acquire this Session lock while they hold a
             // Source read boundary. Never take the locks in the opposite order.
-            if let Some(log) = diagnostic { log.stage("prepare_source"); }
+            if let Some(log) = diagnostic {
+                log.stage("prepare_source");
+            }
             let mut handoff = match &self.handoff_hook {
                 Some(hook) => Some(hook.prepare(session_id).await?),
                 None => None,
@@ -465,7 +496,9 @@ impl ProjectWorkspaceTool {
             if let (Some(handoff), Some(log)) = (handoff.as_mut(), diagnostic) {
                 handoff.set_diagnostic_id(log.id());
             }
-            if let Some(log) = diagnostic { log.stage("lock_session"); }
+            if let Some(log) = diagnostic {
+                log.stage("lock_session");
+            }
             let persistence_guard = self.sessions.persistence().acquire_lock(session_id).await;
             if let Some(guard) = &self.scope_guard {
                 if guard.scope_change_is_blocked(session_id)? {
@@ -484,7 +517,9 @@ impl ProjectWorkspaceTool {
                 .load_session(session_id)
                 .await
                 .map_err(|error| {
-                    if let Some(log) = diagnostic { log.failure(&error); }
+                    if let Some(log) = diagnostic {
+                        log.failure(&error);
+                    }
                     ToolError::Execution(format!(
                         "failed to reload Workspace session authority: {error}"
                     ))
@@ -498,7 +533,9 @@ impl ProjectWorkspaceTool {
                             workspace_io::run(move || projects.get(&project_id))
                                 .await?
                                 .map_err(|error| {
-                                    if let Some(log) = diagnostic { log.failure(&error); }
+                                    if let Some(log) = diagnostic {
+                                        log.failure(&error);
+                                    }
                                     project_tool_error(error)
                                 })?,
                         )
@@ -539,14 +576,18 @@ impl ProjectWorkspaceTool {
             let before = authoritative.clone();
             let scope_changed = authoritative.workspace_path_meta().as_deref()
                 != Some(final_display.as_str())
-                || authoritative.metadata.get(WORKSPACE_SOURCE_METADATA_KEY)
-                    .map(String::as_str) != Some(WorkspaceSource::Explicit.as_str());
+                || authoritative
+                    .metadata
+                    .get(WORKSPACE_SOURCE_METADATA_KEY)
+                    .map(String::as_str)
+                    != Some(WorkspaceSource::Explicit.as_str());
             if scope_changed {
-                authoritative.metadata_version = authoritative.metadata_version
+                authoritative.metadata_version = authoritative
+                    .metadata_version
                     .checked_add(1)
-                    .ok_or_else(|| ToolError::Execution(
-                        "Session metadata revision cannot advance".to_string(),
-                    ))?;
+                    .ok_or_else(|| {
+                        ToolError::Execution("Session metadata revision cannot advance".to_string())
+                    })?;
                 authoritative.updated_at = chrono::Utc::now();
             }
             authoritative.set_workspace_path_meta(final_display);
@@ -563,34 +604,46 @@ impl ProjectWorkspaceTool {
             if let Some(handoff) = handoff.as_mut() {
                 handoff.before_write(&before, &authoritative).await?;
             }
-            if let Some(log) = diagnostic { log.stage("durable_save"); }
+            if let Some(log) = diagnostic {
+                log.stage("durable_save");
+            }
             self.sessions
                 .storage()
                 .save_session(&authoritative)
                 .await
                 .map_err(|error| {
-                    if let Some(log) = diagnostic { log.failure(&error); }
+                    if let Some(log) = diagnostic {
+                        log.failure(&error);
+                    }
                     ToolError::Execution(format!(
                         "failed to persist validated workspace before publication: {error}"
                     ))
                 })?;
-            if let Some(log) = diagnostic { log.stage("publish_cache"); }
+            if let Some(log) = diagnostic {
+                log.stage("publish_cache");
+            }
             self.sessions.cache().insert(
                 session_id.to_string(),
                 Arc::new(bamboo_engine::SessionSnapshot::new(authoritative.clone())),
             );
             project = authoritative_project;
-            if let Some(log) = diagnostic { log.stage("publish_workspace_directory"); }
+            if let Some(log) = diagnostic {
+                log.stage("publish_workspace_directory");
+            }
             let stored = self.workspace_resolver.publish_resolved_workspace(
                 session_id,
                 final_path.clone(),
                 bamboo_engine::project_context::WorkspaceSource::Explicit.as_str(),
             );
-            if let Some(log) = diagnostic { log.stage("publish_source"); }
+            if let Some(log) = diagnostic {
+                log.stage("publish_source");
+            }
             if let Some(handoff) = handoff.as_mut() {
                 handoff.committed(&authoritative).await?;
             }
-            if let Some(log) = diagnostic { log.stage("committed"); }
+            if let Some(log) = diagnostic {
+                log.stage("committed");
+            }
             // Publish under the same lock as the durable save. A later writer
             // or Workflow admission must not observe an older registry scope.
             drop(persistence_guard);
