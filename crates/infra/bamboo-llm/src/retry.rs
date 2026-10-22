@@ -34,6 +34,12 @@ use tokio::time::Instant;
 
 use crate::provider::LLMError;
 
+mod diagnostics;
+pub use diagnostics::{
+    recent_initial_request_diagnostics, InitialRequestDiagnostic, RequestStopReason,
+};
+use diagnostics::{AttemptObservation, CancellationObservation};
+
 /// Secret-free evidence from the most recent retryable HTTP response while
 /// establishing one provider stream. A fresh observer is scoped to each
 /// bootstrap request so concurrent sessions cannot exchange diagnostics.
@@ -253,28 +259,36 @@ pub async fn send_with_retry<F>(
 where
     F: Fn() -> RequestBuilder,
 {
-    retry_initial_request(config, provider, || async {
-        match build().send().await {
-            Ok(response) => {
-                let status = response.status();
-                let retry_after = parse_retry_after(&response).map(|d| d.min(RETRY_AFTER_CEILING));
-                RetryAttempt {
-                    retry: is_retryable_status(status),
-                    status: Some(status),
-                    retry_after,
-                    deadline: None,
-                    result: Ok(response),
+    retry_initial_request(
+        config,
+        provider,
+        || async {
+            match build().send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    let retry_after =
+                        parse_retry_after(&response).map(|d| d.min(RETRY_AFTER_CEILING));
+                    RetryAttempt {
+                        retry: is_retryable_status(status),
+                        status: Some(status),
+                        retry_after,
+                        deadline: None,
+                        observation: None,
+                        result: Ok(response),
+                    }
                 }
+                Err(error) => RetryAttempt {
+                    retry: is_retryable_reqwest_error(&error),
+                    status: None,
+                    retry_after: None,
+                    deadline: None,
+                    observation: None,
+                    result: Err(error),
+                },
             }
-            Err(error) => RetryAttempt {
-                retry: is_retryable_reqwest_error(&error),
-                status: None,
-                retry_after: None,
-                deadline: None,
-                result: Err(error),
-            },
-        }
-    })
+        },
+        |_, _| {},
+    )
     .await
 }
 
@@ -284,6 +298,7 @@ struct RetryAttempt<T> {
     status: Option<StatusCode>,
     retry_after: Option<Duration>,
     deadline: Option<Instant>,
+    observation: Option<AttemptObservation>,
 }
 
 impl<T> RetryAttempt<T> {
@@ -294,39 +309,67 @@ impl<T> RetryAttempt<T> {
             status: None,
             retry_after: None,
             deadline: None,
+            observation: None,
         }
     }
 }
 
+#[derive(Clone, Copy)]
+enum RetryDecision {
+    Return,
+    Retry(Duration),
+    AttemptsExhausted,
+    BudgetExhausted,
+    DelayExceedsBudget,
+}
+
 // One inline retry driver: legacy callers keep their unread Response contract;
 // the Anthropic policy below supplies only its classification and shared budget.
-async fn retry_initial_request<T, F, Fut>(config: &RetryConfig, provider: &str, attempt: F) -> T
+async fn retry_initial_request<T, F, Fut, D>(
+    config: &RetryConfig,
+    provider: &str,
+    attempt: F,
+    decide: D,
+) -> T
 where
     F: Fn() -> Fut,
     Fut: Future<Output = RetryAttempt<T>>,
+    D: Fn(&mut RetryAttempt<T>, RetryDecision),
 {
     let max_attempts = config.max_attempts.max(1);
     let mut index = 0;
     loop {
-        let outcome = attempt().await;
-        if !outcome.retry || index + 1 >= max_attempts {
+        let mut outcome = attempt().await;
+        let decision = if !outcome.retry {
+            RetryDecision::Return
+        } else if outcome
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            RetryDecision::BudgetExhausted
+        } else if index + 1 >= max_attempts {
+            RetryDecision::AttemptsExhausted
+        } else {
+            let delay = outcome
+                .retry_after
+                .unwrap_or_else(|| backoff_delay(config, index));
+            if outcome.deadline.is_some_and(|deadline| {
+                Instant::now()
+                    .checked_add(delay)
+                    .is_none_or(|next| next >= deadline)
+            }) {
+                // Never shorten a server hint to squeeze another request into a budget.
+                RetryDecision::DelayExceedsBudget
+            } else {
+                RetryDecision::Retry(delay)
+            }
+        };
+        decide(&mut outcome, decision);
+        let RetryDecision::Retry(delay) = decision else {
             return outcome.result;
-        }
-        let delay = outcome
-            .retry_after
-            .unwrap_or_else(|| backoff_delay(config, index));
-        if outcome.deadline.is_some_and(|deadline| {
-            Instant::now()
-                .checked_add(delay)
-                .is_none_or(|next| next >= deadline)
-        }) {
-            // Never shorten a server hint to squeeze another request into a budget.
-            return outcome.result;
-        }
+        };
         if let Some(status) = outcome.status {
             let _ = INITIAL_HTTP_RETRY_OBSERVER.try_with(|observer| observer.record(status, delay));
-        }
-        if let Some(status) = outcome.status {
             tracing::warn!(
                 "[{provider}] transient HTTP {} on attempt {}/{}; retrying in {}ms",
                 status.as_u16(),
@@ -351,32 +394,68 @@ where
 const CONNECTOR_BODY_LIMIT: usize = 16 * 1024;
 const ANTHROPIC_MAX_ATTEMPTS: u32 = 4;
 const ANTHROPIC_REQUEST_BUDGET: Duration = Duration::from_secs(60);
+// A stalled route must leave time for another initial request. This cap applies
+// only until headers arrive: successful SSE consumption is never reissued.
+const ANTHROPIC_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One Anthropic call, including reasoning/tool-choice compatibility fallbacks.
 /// Atomic counting keeps borrowed policy futures Send without spawning work.
 pub(crate) struct InitialRequestBudget {
     attempts: AtomicU32,
     max_attempts: u32,
+    started: Instant,
     deadline: Instant,
+    attempt_timeout: Duration,
+    diagnostic_id: uuid::Uuid,
+    session_hash: Option<String>,
+    latest: Mutex<Option<AttemptObservation>>,
 }
 
 impl InitialRequestBudget {
     pub(crate) fn new(config: &RetryConfig) -> Self {
+        let started = Instant::now();
         Self {
             attempts: AtomicU32::new(0),
             max_attempts: config.max_attempts.clamp(1, ANTHROPIC_MAX_ATTEMPTS),
-            deadline: Instant::now() + ANTHROPIC_REQUEST_BUDGET,
+            started,
+            deadline: started + ANTHROPIC_REQUEST_BUDGET,
+            attempt_timeout: ANTHROPIC_ATTEMPT_TIMEOUT,
+            diagnostic_id: uuid::Uuid::new_v4(),
+            session_hash: None,
+            latest: Mutex::new(None),
         }
     }
 
-    fn terminal(&self, status: Option<StatusCode>, reason: &str) -> LLMError {
-        let status = status
-            .map(|s| format!("HTTP {}", s.as_u16()))
-            .unwrap_or_else(|| "no HTTP response".to_string());
-        LLMError::RequestFailed(format!(
-            "Anthropic upstream request failed ({status}): {reason}. Automatic retry limit reached after {} request(s). Try again later or contact the upstream gateway administrator.",
-            self.attempts.load(Ordering::Relaxed)
-        ))
+    fn failure(
+        &self,
+        observation: AttemptObservation,
+        stop: Option<RequestStopReason>,
+        retry_after: Option<Duration>,
+    ) -> RetryAttempt<Result<InitialResponse, LLMError>> {
+        let mut observation = observation;
+        let stop = stop.or_else(|| {
+            if Instant::now() >= self.deadline {
+                Some(RequestStopReason::TimeBudgetExhausted)
+            } else if self.attempts.load(Ordering::Relaxed) >= self.max_attempts {
+                Some(RequestStopReason::AttemptsExhausted)
+            } else {
+                None
+            }
+        });
+        observation.diagnostic.stop_reason = stop;
+        // The shared driver resolves the actual stopping condition before this
+        // placeholder can escape; scheduled retries never report exhaustion.
+        RetryAttempt {
+            result: Err(LLMError::RequestFailed(String::new())),
+            retry: stop.is_none(),
+            status: observation
+                .diagnostic
+                .status
+                .and_then(|s| StatusCode::from_u16(s).ok()),
+            retry_after,
+            deadline: Some(self.deadline),
+            observation: Some(observation),
+        }
     }
 }
 
@@ -480,82 +559,153 @@ where
 {
     let _ = INITIAL_HTTP_RETRY_OBSERVER
         .try_with(|observer| observer.budget_managed.store(true, Ordering::Relaxed));
-    retry_initial_request(config, "Anthropic", || async {
-        if Instant::now() >= budget.deadline
-            || budget
+    let mut cancellation = CancellationObservation {
+        budget,
+        completed: false,
+    };
+    let result = retry_initial_request(
+        config,
+        "Anthropic",
+        || async {
+            let attempt_started = Instant::now();
+            if attempt_started >= budget.deadline {
+                return budget.failure(
+                    budget.observation(
+                        attempt_started,
+                        "send_headers",
+                        "request deadline exceeded",
+                        None,
+                    ),
+                    Some(RequestStopReason::TimeBudgetExhausted),
+                    None,
+                );
+            }
+            if budget
                 .attempts
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |attempts| {
                     (attempts < budget.max_attempts).then_some(attempts + 1)
                 })
                 .is_err()
-        {
-            return RetryAttempt::final_result(Err(
-                budget.terminal(None, "request budget exhausted")
-            ));
-        }
-        let sent = tokio::time::timeout_at(budget.deadline, build().send()).await;
-        let mut response = match sent {
-            Err(_) => {
-                return RetryAttempt::final_result(Err(
-                    budget.terminal(None, "request deadline exceeded")
-                ))
-            }
-            Ok(Err(error)) => {
-                let retry = is_retryable_reqwest_error(&error);
-                let result = if retry {
-                    budget.terminal(None, "temporary transport failure")
-                } else {
-                    LLMError::Http(error)
-                };
-                return RetryAttempt {
-                    result: Err(result),
-                    retry: retry && budget.attempts.load(Ordering::Relaxed) < budget.max_attempts,
-                    status: None,
-                    retry_after: None,
-                    deadline: Some(budget.deadline),
-                };
-            }
-            Ok(Ok(response)) => response,
-        };
-        let status = response.status();
-        let retry_after = parse_retry_after_with_date(&response);
-        let error_body = if !status.is_success() && !is_retryable_status(status) {
-            match tokio::time::timeout_at(budget.deadline, read_connector_body(&mut response)).await
             {
-                Ok(Ok(body)) => Some(body),
-                _ => {
-                    return RetryAttempt::final_result(Err(budget
-                        .terminal(Some(status), "upstream error body could not be classified")))
-                }
+                return budget.failure(
+                    budget.observation(
+                        attempt_started,
+                        "send_headers",
+                        "request attempt limit reached",
+                        None,
+                    ),
+                    Some(RequestStopReason::AttemptsExhausted),
+                    None,
+                );
             }
-        } else {
-            None
-        };
-        let connector_recovery = error_body
-            .as_deref()
-            .is_some_and(|body| is_connector_recovery(status, body));
-        if connector_recovery || is_retryable_status(status) {
-            return RetryAttempt {
-                result: Err(budget.terminal(
-                    Some(status),
-                    if connector_recovery {
-                        "connector database is temporarily recovering"
-                    } else {
-                        "temporary upstream failure"
-                    },
-                )),
-                retry: budget.attempts.load(Ordering::Relaxed) < budget.max_attempts,
-                status: Some(status),
-                retry_after,
-                deadline: Some(budget.deadline),
+            budget.record(budget.observation(attempt_started, "send_headers", "none", None));
+            let attempt_deadline = budget
+                .deadline
+                .min(attempt_started + budget.attempt_timeout);
+            let sent = tokio::time::timeout_at(attempt_deadline, build().send()).await;
+            let mut response = match sent {
+                Err(_) => {
+                    return budget.failure(
+                        budget.observation(
+                            attempt_started,
+                            "send_headers",
+                            "initial response headers timed out",
+                            None,
+                        ),
+                        None,
+                        None,
+                    );
+                }
+                Ok(Err(error)) => {
+                    let retry = is_retryable_reqwest_error(&error);
+                    let kind = crate::providers::common::http_error_kind(&error);
+                    let mut outcome = budget.failure(
+                        budget.observation(attempt_started, "send_headers", kind, None),
+                        (!retry).then_some(RequestStopReason::NonRetryableTransport),
+                        None,
+                    );
+                    if !retry {
+                        outcome.result = Err(LLMError::Http(error));
+                    }
+                    return outcome;
+                }
+                Ok(Ok(response)) => response,
             };
-        }
-        RetryAttempt::final_result(Ok(InitialResponse {
-            response,
-            error_body,
-        }))
-    })
-    .await
+            let status = response.status();
+            let retry_after = parse_retry_after_with_date(&response);
+            let error_body = if !status.is_success() && !is_retryable_status(status) {
+                let mut observation =
+                    budget.observation(attempt_started, "error_body", "none", Some(status));
+                observation.diagnostic.event = "classify_error_body";
+                budget.record(observation);
+                match tokio::time::timeout_at(budget.deadline, read_connector_body(&mut response))
+                    .await
+                {
+                    Ok(Ok(body)) => Some(body),
+                    result => {
+                        let (failure, stop) = if result.is_err() {
+                            (
+                                "upstream error body deadline exceeded",
+                                RequestStopReason::TimeBudgetExhausted,
+                            )
+                        } else {
+                            (
+                                "upstream error body read failed",
+                                RequestStopReason::UnclassifiedErrorBody,
+                            )
+                        };
+                        return budget.failure(
+                            budget.observation(
+                                attempt_started,
+                                "error_body",
+                                failure,
+                                Some(status),
+                            ),
+                            Some(stop),
+                            None,
+                        );
+                    }
+                }
+            } else {
+                None
+            };
+            let connector_recovery = error_body
+                .as_deref()
+                .is_some_and(|body| is_connector_recovery(status, body));
+            if connector_recovery || is_retryable_status(status) {
+                return budget.failure(
+                    budget.observation(
+                        attempt_started,
+                        "response_status",
+                        if connector_recovery {
+                            "connector database is temporarily recovering"
+                        } else {
+                            "temporary upstream failure"
+                        },
+                        Some(status),
+                    ),
+                    // Fallback invocations share this absolute attempt count.
+                    (budget.attempts.load(Ordering::Relaxed) >= budget.max_attempts)
+                        .then_some(RequestStopReason::AttemptsExhausted),
+                    retry_after,
+                );
+            }
+            let mut observation =
+                budget.observation(attempt_started, "response_status", "none", Some(status));
+            observation.diagnostic.event = "response_returned";
+            observation.diagnostic.upstream_outcome = "response_received";
+            let mut outcome = RetryAttempt::final_result(Ok(InitialResponse {
+                response,
+                error_body,
+            }));
+            outcome.observation = Some(observation);
+            outcome
+        },
+        |outcome, decision| budget.decide(outcome, decision),
+    )
+    .await;
+    cancellation.completed = true;
+    result
 }
 
 #[cfg(test)]
