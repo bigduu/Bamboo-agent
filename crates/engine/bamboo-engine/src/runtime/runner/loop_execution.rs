@@ -138,12 +138,18 @@ async fn run_agent_loop_with_config_inner(
             }
         }
         if let Some(inputs) = config.initial_untrusted_inputs.as_ref() {
-            // Observation failure denies the optional Skill caller while
-            // retaining the ordinary SDK append and execution semantics.
+            // Optional Skill observation failure retains ordinary execution.
+            // A changed conversation is an execution refusal: a custom Host
+            // may already have replaced the mutable caller during checkpoint.
             if let Err(error) = inputs
                 .seal_sdk_input(session, config.persistence.as_ref())
                 .await
             {
+                if matches!(&error, bamboo_agent_core::AgentError::Tool(message)
+                    if message.starts_with("session_conversation_changed:"))
+                {
+                    return Err(error);
+                }
                 tracing::warn!(session_id = %session.id, %error, "SDK input remains unsealed");
             }
         }

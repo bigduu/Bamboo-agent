@@ -638,3 +638,364 @@ async fn retained_actor_projection_keeps_the_nonzero_ledger_in_its_checked_pair(
     drop(retained);
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn task_single_and_paired_cas_cannot_reinterpret_an_old_conversation_snapshot() {
+    let fixture = Fixture::new().await;
+    let peer = Session::new("zz-task-peer", "model");
+    fixture.store.save_session(&peer).await.unwrap();
+    let stale = runtime_sidecar_snapshot(&fixture.original);
+    let mut stale_updated = stale.clone();
+    let evaluated = super::tests::transaction_task_list(&fixture.original.id, "new Task state");
+    stale_updated.set_task_list(evaluated.clone());
+    stale_updated.set_task_list_version_meta("1");
+    let peer_original = fixture
+        .store
+        .load_runtime_control_plane(&peer.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut peer_updated = peer_original.clone();
+    peer_updated.set_task_list(evaluated);
+    peer_updated.set_task_list_version_meta("1");
+    let before = fixture.files().await;
+    assert_conflict(
+        fixture
+            .store
+            .save_task_control_plane_if_matches(&stale, &stale_updated)
+            .await
+            .unwrap_err(),
+    );
+    assert_conflict(
+        fixture
+            .store
+            .save_task_control_planes_atomically(
+                &stale,
+                &stale_updated,
+                &peer_original,
+                &peer_updated,
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(fixture.files().await, before);
+    assert!(fixture
+        .store
+        .runtime_task_journal_paths()
+        .await
+        .unwrap()
+        .is_empty());
+    let current = fixture
+        .store
+        .load_runtime_control_plane(&fixture.canonical.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut updated = current.clone();
+    updated.set_task_list(stale_updated.task_list.unwrap());
+    updated.set_task_list_version_meta("1");
+    assert!(fixture
+        .store
+        .save_task_control_plane_if_matches(&current, &updated)
+        .await
+        .unwrap());
+    let confirmed = fixture
+        .store
+        .load_session(&fixture.canonical.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        confirmed.conversation_reset,
+        fixture.canonical.conversation_reset
+    );
+    assert_eq!(confirmed.messages.len(), fixture.canonical.messages.len());
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn task_recovery_preflights_both_original_targets_and_legacy_cannot_cross_reset() {
+    let fixture = Fixture::new().await;
+    let peer = Session::new("zz-undo-peer", "model");
+    fixture.store.save_session(&peer).await.unwrap();
+    let mut wrong_birth = peer.clone();
+    wrong_birth.created_at += chrono::Duration::seconds(1);
+    let mut journal = RuntimeTaskTransactionJournal {
+        version: RUNTIME_TASK_TRANSACTION_VERSION,
+        transaction_id: Uuid::new_v4().to_string(),
+        first: TaskControlPlaneUndo {
+            session_id: fixture.canonical.id.clone(),
+            task_list: Some(super::tests::transaction_task_list(
+                &fixture.canonical.id,
+                "must not be written",
+            )),
+            task_list_version: "unexpected-undo".into(),
+            conversation_witness: Some(
+                TaskConversationWitness::capture(&fixture.canonical).unwrap(),
+            ),
+        },
+        second: TaskControlPlaneUndo {
+            session_id: peer.id.clone(),
+            task_list: None,
+            task_list_version: "unexpected-undo".into(),
+            conversation_witness: Some(TaskConversationWitness::capture(&wrong_birth).unwrap()),
+        },
+    };
+    let path = fixture
+        .store
+        .runtime_task_transaction_dir()
+        .join(format!("{}.json", journal.transaction_id));
+    SessionStoreV2::validate_runtime_task_journal(&path, &journal).unwrap();
+    let before = fixture.files().await;
+    let guard = fixture
+        .store
+        .lock_runtime_task_transaction_exclusive()
+        .await
+        .unwrap();
+    assert_conflict(
+        fixture
+            .store
+            .rollback_runtime_task_journal(&journal, &guard)
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(
+        fixture.files().await,
+        before,
+        "first target was written before the second preflight rejected"
+    );
+    journal.version = 1;
+    journal.first.conversation_witness = None;
+    journal.second.conversation_witness = None;
+    SessionStoreV2::validate_runtime_task_journal(&path, &journal).unwrap();
+    assert_conflict(
+        fixture
+            .store
+            .rollback_runtime_task_journal(&journal, &guard)
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(fixture.files().await, before);
+    journal.version = RUNTIME_TASK_TRANSACTION_VERSION;
+    assert!(
+        SessionStoreV2::validate_runtime_task_journal(&path, &journal).is_err(),
+        "v2 cannot omit original source evidence"
+    );
+    drop(guard);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn a_retained_copy_rollback_marker_cannot_remove_a_reset_root() {
+    let fixture = Fixture::new().await;
+    let journal = SessionCopyTransactionJournal {
+        version: SESSION_COPY_TRANSACTION_VERSION,
+        transaction_id: Uuid::new_v4().to_string(),
+        source_id: "old-copy-source".into(),
+        target_id: fixture.canonical.id.clone(),
+    };
+    let before = fixture.files().await;
+    assert_conflict(
+        fixture
+            .store
+            .rollback_session_copy_transaction(&journal)
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(fixture.files().await, before);
+    assert!(fixture
+        .store
+        .sessions_root_dir()
+        .join(&fixture.canonical.id)
+        .is_dir());
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn startup_cannot_reconstruct_missing_nonzero_supervisor_identity_proof() {
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    store
+        .get_or_create_default_supervisor("model")
+        .await
+        .unwrap();
+    let supervisor = store
+        .load_session(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    let candidate = proposed(&supervisor);
+    let directory = store
+        .sessions_root_dir()
+        .join(DEFAULT_SUPERVISOR_SESSION_ID);
+    let main = compact_main::serialize_main(&candidate).unwrap();
+    let runtime = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(&candidate)).unwrap();
+    fs::write(directory.join("session.json"), &main)
+        .await
+        .unwrap();
+    fs::write(directory.join(RUNTIME_SIDECAR_FILE), &runtime)
+        .await
+        .unwrap();
+    SessionStoreV2::write_staged_root_tool_proof(&directory, &candidate)
+        .await
+        .unwrap();
+    fs::remove_file(directory.join(supervisor_proof::SUPERVISOR_PROOF_FILE))
+        .await
+        .unwrap();
+    fs::remove_file(
+        home.path()
+            .join(supervisor_proof::SUPERVISOR_PROOF_MIGRATION_MARKER),
+    )
+    .await
+    .unwrap();
+    let reopened = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert!(!directory
+        .join(supervisor_proof::SUPERVISOR_PROOF_FILE)
+        .exists());
+    assert!(reopened
+        .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .is_err());
+    assert_eq!(
+        fs::read(directory.join("session.json")).await.unwrap(),
+        main
+    );
+    assert_eq!(
+        fs::read(directory.join(RUNTIME_SIDECAR_FILE))
+            .await
+            .unwrap(),
+        runtime
+    );
+    reopened.flush_search_index().await;
+    store.flush_search_index().await;
+    drop(reopened);
+    drop(store);
+    home.close().unwrap();
+}
+
+#[tokio::test]
+async fn legacy_v1_task_recovery_preserves_its_existing_zero_generation_behavior() {
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let (first, first_updated, second, second_updated) =
+        super::tests::seed_runtime_task_transaction_pair(&store)
+            .await
+            .unwrap();
+    let journal = RuntimeTaskTransactionJournal {
+        version: 1,
+        transaction_id: Uuid::new_v4().to_string(),
+        first: TaskControlPlaneUndo {
+            session_id: first.id.clone(),
+            task_list: first.task_list.clone(),
+            task_list_version: first.task_list_version_meta().unwrap(),
+            conversation_witness: None,
+        },
+        second: TaskControlPlaneUndo {
+            session_id: second.id.clone(),
+            task_list: second.task_list.clone(),
+            task_list_version: second.task_list_version_meta().unwrap(),
+            conversation_witness: None,
+        },
+    };
+    let guard = store
+        .lock_runtime_task_transaction_exclusive()
+        .await
+        .unwrap();
+    store
+        .write_existing_runtime_sidecar_durable_unchecked(
+            &first_updated,
+            RuntimeTaskDurabilityEvent::FirstUpdatedSidecarPublished,
+            &guard,
+        )
+        .await
+        .unwrap();
+    store
+        .write_existing_runtime_sidecar_durable_unchecked(
+            &second_updated,
+            RuntimeTaskDurabilityEvent::SecondUpdatedSidecarPublished,
+            &guard,
+        )
+        .await
+        .unwrap();
+    let path = store.write_runtime_task_journal(&journal).await.unwrap();
+    assert_eq!(
+        store
+            .read_runtime_task_journal(&path)
+            .await
+            .unwrap()
+            .version,
+        1
+    );
+    store
+        .recover_all_runtime_task_transactions_locked(&guard)
+        .await
+        .unwrap();
+    assert!(!path.exists());
+    drop(guard);
+    for expected in [&first, &second] {
+        let recovered = store.load_session(&expected.id).await.unwrap().unwrap();
+        assert!(recovered.conversation_reset.is_none());
+        assert_eq!(
+            recovered.task_list_version_meta(),
+            expected.task_list_version_meta()
+        );
+        assert_eq!(
+            serde_json::to_value(recovered.task_list).unwrap(),
+            serde_json::to_value(&expected.task_list).unwrap()
+        );
+    }
+    store.flush_search_index().await;
+    drop(store);
+    home.close().unwrap();
+}
+
+#[tokio::test]
+async fn child_wait_cannot_adopt_or_append_from_a_previous_conversation() {
+    let fixture = Fixture::new().await;
+    let before = fixture.files().await;
+    let mut updated = fixture.original.clone();
+    updated.add_message(Message::user("old conversation child wait outcome"));
+    let before_updated = serde_json::to_value(&updated).unwrap();
+    let published = Arc::new(AtomicBool::new(false));
+    let published_from_register = published.clone();
+    assert_conflict(
+        fixture
+            .store
+            .register_child_wait(
+                &fixture.original,
+                &[],
+                bamboo_domain::ChildWaitPolicy::All,
+                false,
+                Arc::new(move |_| {
+                    published_from_register.store(true, Ordering::SeqCst);
+                }),
+            )
+            .await
+            .unwrap_err(),
+    );
+    let published_from_cas = published.clone();
+    assert_conflict(
+        fixture
+            .store
+            .compare_exchange_child_wait(
+                &fixture.original,
+                &mut updated,
+                false,
+                Arc::new(move |_| {
+                    published_from_cas.store(true, Ordering::SeqCst);
+                }),
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(fixture.files().await, before);
+    assert_eq!(serde_json::to_value(&updated).unwrap(), before_updated);
+    assert!(!published.load(Ordering::SeqCst));
+    fixture.finish().await;
+}

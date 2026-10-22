@@ -16,6 +16,10 @@ pub const MAX_LOOP_ROUNDS: u32 = 1_000;
 pub const MAX_LOOP_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_STATE_BYTES: usize = MAX_LOOP_PROMPT_BYTES * 8;
 
+#[cfg(test)]
+#[path = "conversation_admission_tests.rs"]
+mod conversation_admission_tests;
+
 /// Host-supplied bounds for one live generation. There is no implicit default.
 /// Clones share the stop signal. Stop drains an already admitted iteration's
 /// current round/tool batch; it admits no subsequent round or iteration.
@@ -336,6 +340,7 @@ pub(crate) async fn reject_ambiguous_reentry(
             .check_execution_compatibility()
             .map_err(|error| AgentError::Tool(error.to_string()))?;
     }
+    super::runner::state_bridge::check_conversation_readback(session, durable.as_ref())?;
     reject_recovery(session)?;
     let Some(state) = read_loop_state(session)? else {
         return Ok(());
@@ -419,6 +424,7 @@ pub(crate) async fn admit_registered(
             .check_execution_compatibility()
             .map_err(|error| AgentError::Tool(error.to_string()))?;
     }
+    super::runner::state_bridge::check_conversation_readback(session, durable.as_ref())?;
     let stored = durable.as_ref().map(read_loop_state).transpose()?.flatten();
     if presented != stored
         || (stored.is_some()

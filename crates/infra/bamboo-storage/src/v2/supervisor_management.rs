@@ -432,7 +432,8 @@ impl SessionStoreV2 {
             )
             .await?
             .ok_or_else(|| denied("Supervisor disappeared before management publication"))?;
-        reject_incompatible_session_write(&canonical)
+        reject_incompatible_session_write(&canonical)?;
+        reject_conversation_generation_change(current, &canonical)
     }
 
     async fn publish_management_state(

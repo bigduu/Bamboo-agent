@@ -125,6 +125,8 @@ fn read_committed(directory: &Path) -> io::Result<Session> {
     )
     .map_err(conflict)?;
     supervisor::validate_overlay(&main, Some(&side))?;
+    main.check_conversation_generation(&side)
+        .map_err(conflict)?;
     if main.id != side.id
         || main.created_at != side.created_at
         || main.kind != SessionKind::Root
@@ -137,6 +139,42 @@ fn read_committed(directory: &Path) -> io::Result<Session> {
         ));
     }
     Ok(overlay_runtime_sidecar(main, Some(side)))
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_loop_cannot_overlay_runtime_from_another_conversation() {
+        let home = tempfile::tempdir().unwrap();
+        let main = Session::new("scoped-loop-conversation", "model");
+        let mut side = runtime_sidecar_snapshot(&main);
+        side.conversation_reset = Some(bamboo_domain::ConversationResetState {
+            schema_version: 1,
+            conversation_revision: 1,
+            receipts: vec![bamboo_domain::ConversationResetReceipt {
+                operation_id: format!("0:{}", Uuid::new_v4()),
+                birth_token: main.root_mode_birth_token(),
+                expected_snapshot_sha256: "a".repeat(64),
+                previous_revision: 0,
+                conversation_revision: 1,
+                retained_system_messages: 0,
+                reset_at: main.updated_at,
+            }],
+        });
+        std::fs::write(
+            home.path().join("session.json"),
+            compact_main::serialize_main(&main).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join(RUNTIME_SIDECAR_FILE),
+            serde_json::to_vec(&side).unwrap(),
+        )
+        .unwrap();
+        assert!(read_committed(home.path()).is_err());
+    }
 }
 
 impl SessionStoreV2 {

@@ -29,6 +29,7 @@ pub(crate) fn write_runtime(session: &mut Session, state: AgentRuntimeState) -> 
 }
 
 pub(crate) fn validate_incarnation(expected: &Session, latest: &Session) -> io::Result<()> {
+    reject_conversation_generation_change(expected, latest)?;
     if expected.id != latest.id
         || expected.created_at != latest.created_at
         || expected.kind != latest.kind

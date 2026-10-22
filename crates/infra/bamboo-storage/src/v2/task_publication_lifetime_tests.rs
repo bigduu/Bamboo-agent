@@ -352,11 +352,13 @@ async fn seed_pending(store: &SessionStoreV2, pair: &Pair) -> io::Result<()> {
         transaction_id: Uuid::new_v4().to_string(),
         first: TaskControlPlaneUndo {
             session_id: CHILD.into(),
+            conversation_witness: Some(TaskConversationWitness::capture(&pair.0)?),
             task_list: pair.0.task_list.clone(),
             task_list_version: "1".into(),
         },
         second: TaskControlPlaneUndo {
             session_id: ROOT.into(),
+            conversation_witness: Some(TaskConversationWitness::capture(&pair.2)?),
             task_list: pair.2.task_list.clone(),
             task_list_version: "1".into(),
         },
