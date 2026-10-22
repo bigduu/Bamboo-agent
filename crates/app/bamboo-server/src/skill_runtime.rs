@@ -880,6 +880,11 @@ impl NativeExecutor {
             // must remain outside any future Source read/admission guard.
             #[cfg(all(test, unix))]
             let completed = match &outcome {
+                Ok(ToolOutcome::Completed(result))
+                    if result.display_preference.as_deref() == Some("request_permissions") =>
+                {
+                    None
+                }
                 Ok(ToolOutcome::Completed(result)) => Some(result.success),
                 _ => None,
             };

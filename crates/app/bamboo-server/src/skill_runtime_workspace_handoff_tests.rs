@@ -17,6 +17,40 @@ const CWD_A: &str = "handoff-returned-cwd";
 const OLD_B: &str = "handoff-retained-reader-after-b";
 const OLD_A: &str = "handoff-retained-reader-after-a";
 
+fn authorize_fixture_pwd(state: &AppState, id: &str) {
+    // This disposable Session authorizes only the fixture's harmless cwd
+    // observation. Keep the ordinary permission gate and Native policy intact.
+    let permissions = state.permission_checker.permission_config().unwrap();
+    assert!(permissions.is_enabled());
+    assert_eq!(
+        permissions.mode(),
+        bamboo_tools::permission::PermissionMode::Default
+    );
+    permissions
+        .grant_typed_scoped_session_permission(
+            id,
+            bamboo_tools::permission::PermissionType::ExecuteCommand,
+            bamboo_tools::permission::PermissionMatcher {
+                id: "native-handoff-exact-pwd".into(),
+                kind: bamboo_tools::permission::PermissionMatcherKind::ExactResource,
+                value: "pwd".into(),
+            },
+        )
+        .unwrap();
+    assert!(permissions.is_scoped_session_granted(
+        id,
+        bamboo_tools::permission::PermissionType::ExecuteCommand,
+        "pwd"
+    ));
+    for command in ["pwd -P", "pwd; pwd"] {
+        assert!(!permissions.is_scoped_session_granted(
+            id,
+            bamboo_tools::permission::PermissionType::ExecuteCommand,
+            command
+        ));
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Case {
     Switch,
@@ -583,6 +617,7 @@ async fn run_case(case: Case) {
         "explicit".into(),
     );
     state.storage.save_session(&session).await.unwrap();
+    authorize_fixture_pwd(&state, &id);
     state
         .workspace_resolver
         .publish_resolved_workspace(&id, a.clone(), "test_initial");
@@ -1096,6 +1131,7 @@ struct LegacyTrace {
     set_errors: usize,
     cwd_completed: usize,
     later_provider_requests: usize,
+    successor_requests: usize,
 }
 struct LegacyProbe {
     id: String,
@@ -1104,6 +1140,8 @@ struct LegacyProbe {
     uncertain: bool,
     state: Mutex<Option<web::Data<AppState>>>,
     trace: Mutex<LegacyTrace>,
+    successor: AtomicBool,
+    retained_host: Mutex<Option<Arc<dyn bamboo_engine::config::WorkspaceExecutionHost>>>,
 }
 struct LegacyProvider(Arc<LegacyProbe>);
 
@@ -1142,6 +1180,9 @@ impl LegacyAfterRead {
         assert_eq!(ctx.session_id, Some(self.probe.id.as_str()));
         assert!(!ctx.bypass_permissions && !ctx.auto_approve_permissions);
         let state = self.probe.state.lock().unwrap().as_ref().unwrap().clone();
+        *self.probe.retained_host.lock().unwrap() = Some(
+            state.workspace_handoffs.retain_legacy_execution(&self.probe.id)
+        );
         let before = state
             .storage
             .load_session(&self.probe.id)
@@ -1341,6 +1382,7 @@ struct LegacyRegistration(Arc<LegacyProbe>);
 impl Drop for LegacyRegistration {
     fn drop(&mut self) {
         self.0.state.lock().unwrap().take();
+        self.0.retained_host.lock().unwrap().take();
     }
 }
 
@@ -1370,6 +1412,15 @@ impl LLMProvider for LegacyProvider {
             "a provider callback has no actual per_call Root proof"
         );
         let mut trace = probe.trace.lock().unwrap();
+        if probe.successor.load(Ordering::Acquire) {
+            assert_eq!(actual.workspace_path_meta().as_deref(), probe.b.to_str());
+            trace.requests += 1;
+            trace.successor_requests += 1;
+            return Ok(Box::pin(futures::stream::iter([
+                Ok(LLMChunk::Token("Controlled successor observes B".into())),
+                Ok(LLMChunk::Done),
+            ])));
+        }
         let round = trace.requests;
         trace.requests += 1;
         let prior = |id: &str| {
@@ -1505,6 +1556,8 @@ async fn legacy_case(uncertain: bool) {
         uncertain,
         state: Mutex::default(),
         trace: Mutex::default(),
+        successor: AtomicBool::new(false),
+        retained_host: Mutex::default(),
     });
     let _registration = LegacyRegistration(probe.clone());
     let provider = Arc::new(LegacyProvider(probe.clone()));
@@ -1560,6 +1613,7 @@ async fn legacy_case(uncertain: bool) {
         "explicit".into(),
     );
     state.storage.save_session(&session).await.unwrap();
+    authorize_fixture_pwd(&state, &id);
     state
         .workspace_resolver
         .publish_resolved_workspace(&id, a, "controlled_legacy_initial");
@@ -1667,6 +1721,35 @@ async fn legacy_case(uncertain: bool) {
             1,
             "the successful handoff must retain the separate real trigger Read exactly once"
         );
+    }
+    drop(trace);
+    if !uncertain {
+        // Retaining the completed bridge must not block the real successor:
+        // execution end closes it before router finalization, not at Arc Drop.
+        assert!(probe.retained_host.lock().unwrap().is_some());
+        probe.successor.store(true, Ordering::Release);
+        let (status, response) = http(&state, "/api/v1/chat", json!({
+            "session_id":id,"message":"Observe the committed workspace in a new turn",
+            "message_id":format!("legacy-successor-{}",uuid::Uuid::new_v4())
+        })).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        let (status, response) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+        assert!(matches!(done(&state, &id).await, AgentStatus::Completed));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while router.current_run_id(&id).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("successor Root must release before fixture cleanup");
+        assert!(probe.retained_host.lock().unwrap().is_some(), "hold the old Arc through successor");
+        assert_eq!(probe.trace.lock().unwrap().successor_requests, 1);
+        let current = state.storage.load_session(&id).await.unwrap().unwrap();
+        assert_eq!(current.workspace_path_meta().as_deref(), b.to_str());
+        for call_id in [LEGACY_READ, LEGACY_TRIGGER, LEGACY_CWD] {
+            assert_eq!(current.messages.iter().filter(|message|
+                message.tool_call_id.as_deref() == Some(call_id)
+            ).count(), 1, "completed tools never replay in the successor");
+        }
     }
 }
 

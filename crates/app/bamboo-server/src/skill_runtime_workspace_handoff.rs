@@ -19,6 +19,7 @@ type Runners = Arc<RwLock<HashMap<String, crate::AgentRunner>>>;
 #[derive(Default)]
 struct RegistryEntry {
     run: Weak<NativeRun>,
+    legacy_run: Weak<LegacyWorkspaceRun>,
     pending: bool,
 }
 
@@ -61,6 +62,10 @@ impl WorkspaceHandoffs {
     }
 
     pub(super) fn register(&self, run: &Arc<NativeRun>) -> Result<(), ToolError> {
+        // Keep upgraded owners alive until after the registry guard is gone:
+        // the last Legacy Arc's Drop may remove its own Weak entry.
+        let previous_native;
+        let previous_legacy;
         let mut entries = self
             .registry
             .entries
@@ -70,12 +75,14 @@ impl WorkspaceHandoffs {
         if entry.pending {
             return Err(denied("Native Source has a pending Workspace transaction"));
         }
-        if entry
-            .run
-            .upgrade()
-            .is_some_and(|old| old.check_live().is_ok())
+        previous_native = entry.run.upgrade();
+        previous_legacy = entry.legacy_run.upgrade();
+        if previous_native.as_ref().is_some_and(|old| old.check_live().is_ok())
         {
             return Err(denied("Native Source already has an active owner"));
+        }
+        if previous_legacy.as_ref().is_some_and(|old| old.is_live()) {
+            return Err(denied("Workspace already has an active Legacy owner"));
         }
         entry.run = Arc::downgrade(run);
         Ok(())
@@ -86,12 +93,69 @@ impl WorkspaceHandoffs {
             if let Some(entry) = entries.get_mut(&run.policy.session_id) {
                 if std::ptr::eq(entry.run.as_ptr(), run) {
                     entry.run = Weak::new();
-                    if !entry.pending {
+                    if !entry.pending && entry.legacy_run.strong_count() == 0 {
                         entries.remove(&run.policy.session_id);
                     }
                 }
             }
         }
+    }
+
+    pub(crate) fn bind_legacy_execution(
+        &self,
+        agent: &Arc<bamboo_engine::Agent>,
+        session: &Session,
+        reservation: &SessionExecutionReservation,
+    ) -> Result<Arc<bamboo_engine::Agent>, ToolError> {
+        if !ordinary_main(session) {
+            return Ok(agent.clone());
+        }
+        let owner = reservation.root_actor_writer().ok_or_else(|| {
+            denied("Legacy Workspace binding has no original Root writer")
+        })?;
+        let persistence = reservation.execution_persistence().ok_or_else(|| {
+            denied("Legacy Workspace binding has no original execution persistence")
+        })?;
+        if reservation.session_id() != session.id
+            || owner.created_at != session.created_at
+            || owner.fence.actor_id != session.id
+            || owner.fence.run_id != reservation.run_id()
+            || reservation.cancel_token().is_cancelled()
+            || persistence.root_actor_writer().as_ref().is_none_or(|actual| {
+                actual.fence != owner.fence || actual.created_at != owner.created_at
+            })
+        {
+            return Err(denied("Legacy Workspace binding has a different Root execution"));
+        }
+        let run = Arc::new(LegacyWorkspaceRun {
+            registry: self.registry.clone(),
+            owner: LegacyOwner { owner, cancel: reservation.cancel_token().clone() },
+            persistence,
+            live: AtomicBool::new(true),
+            gate: Arc::new(RwLock::new(())),
+            scope: SyncRwLock::new(LegacyScopeState {
+                adopted: WorkspaceScope::of(session),
+                receipt: None,
+                execution_id: None,
+            }),
+        });
+        let previous_native;
+        let previous_legacy;
+        {
+            let mut entries = self.registry.entries.lock()
+                .map_err(|_| denied("Workspace registry is unavailable"))?;
+            let entry = entries.entry(session.id.clone()).or_default();
+            previous_native = entry.run.upgrade();
+            previous_legacy = entry.legacy_run.upgrade();
+            if entry.pending
+                || previous_native.as_ref().is_some_and(|old| old.check_live().is_ok())
+                || previous_legacy.as_ref().is_some_and(|old| old.is_live())
+            {
+                return Err(denied("Workspace already has an admitted owner or transaction"));
+            }
+            entry.legacy_run = Arc::downgrade(&run);
+        }
+        Ok(Arc::new(agent.with_workspace_execution_host(run)))
     }
 
     #[cfg(test)]
@@ -111,6 +175,15 @@ impl WorkspaceHandoffs {
             .unwrap()
             .contains(session_id)
     }
+
+    #[cfg(test)]
+    pub(super) fn retain_legacy_execution(
+        &self,
+        session_id: &str,
+    ) -> Arc<dyn bamboo_engine::config::WorkspaceExecutionHost> {
+        self.registry.entries.lock().unwrap().get(session_id).unwrap()
+            .legacy_run.upgrade().expect("actual reserved Legacy bridge")
+    }
 }
 
 /// The marker is installed synchronously before observing runners or awaiting
@@ -124,7 +197,7 @@ impl Drop for Pending {
         if let Ok(mut entries) = self.registry.entries.lock() {
             if let Some(entry) = entries.get_mut(&self.session_id) {
                 entry.pending = false;
-                if entry.run.strong_count() == 0 {
+                if entry.run.strong_count() == 0 && entry.legacy_run.strong_count() == 0 {
                     entries.remove(&self.session_id);
                 }
             }
@@ -138,7 +211,7 @@ impl WorkspaceHandoffHook for WorkspaceHandoffs {
         &self,
         session_id: &str,
     ) -> Result<Box<dyn PreparedWorkspaceHandoff>, ToolError> {
-        let run = {
+        let (run, legacy_run) = {
             let mut entries = self
                 .registry
                 .entries
@@ -149,7 +222,7 @@ impl WorkspaceHandoffHook for WorkspaceHandoffs {
                 return Err(denied("Native Source has a pending Workspace transaction"));
             }
             entry.pending = true;
-            entry.run.upgrade()
+            (entry.run.upgrade(), entry.legacy_run.upgrade())
         };
         let pending = Pending {
             registry: self.registry.clone(),
@@ -176,6 +249,16 @@ impl WorkspaceHandoffHook for WorkspaceHandoffs {
                                 && owner.fence.run_id == runner.run_id
                                 && !runner.cancel_token.is_cancelled() =>
                         {
+                            let binding = legacy_run.as_ref().ok_or_else(|| {
+                                denied("Legacy Workspace has no original runtime handoff binding")
+                            })?;
+                            if binding.owner.owner.fence != owner.fence
+                                || binding.owner.owner.created_at != owner.created_at
+                                || binding.owner.cancel != runner.cancel_token
+                                || !binding.is_live()
+                            {
+                                return Err(denied("Legacy Workspace handoff has a different owner"));
+                            }
                             Some(LegacyOwner {
                                 owner,
                                 cancel: runner.cancel_token.clone(),
@@ -189,7 +272,10 @@ impl WorkspaceHandoffHook for WorkspaceHandoffs {
                         (None, _) => None,
                     }
                 };
-                None
+                match &legacy_run {
+                    Some(run) => Some(run.gate.clone().write_owned().await),
+                    None => None,
+                }
             }
         };
         Ok(Box::new(Prepared {
@@ -203,6 +289,7 @@ impl WorkspaceHandoffHook for WorkspaceHandoffs {
             earlier_scopes: Vec::new(),
             idle_activation: None,
             legacy,
+            legacy_run,
             cancel_uncertain_legacy: false,
             diagnostic_id: None,
         }))
@@ -590,6 +677,7 @@ async fn observe_exact_root(
 
 /// Captured only from the actual per_call task-local Root capability and its
 /// current runner. This observes an existing owner; it never claims a lease.
+#[derive(Clone)]
 struct LegacyOwner {
     owner: bamboo_domain::RootActorRuntimeWrite,
     cancel: CancellationToken,
@@ -604,6 +692,10 @@ impl LegacyOwner {
                 "Legacy Workspace dispatch changed its original Root writer",
             ));
         }
+        self.check_active_runner(registry, session_id).await
+    }
+
+    async fn check_active_runner(&self, registry: &Registry, session_id: &str) -> Result<(), ToolError> {
         let runners = registry.runners.read().await;
         if self.cancel.is_cancelled()
             || !runners.get(session_id).is_some_and(|runner| {
@@ -636,6 +728,185 @@ impl LegacyOwner {
         self.check_runner(registry, &session.id).await?;
         observe_exact_root(registry, &self.owner, session, diagnostic_id).await?;
         self.check_runner(registry, &session.id).await
+    }
+}
+
+struct LegacyScopeState {
+    adopted: WorkspaceScope,
+    receipt: Option<CommittedScope>,
+    execution_id: Option<String>,
+}
+
+/// One reserved Legacy execution. The registry retains only its Weak pointer;
+/// the execution-local runtime, not a Session cache, owns its lifetime.
+struct LegacyWorkspaceRun {
+    registry: Arc<Registry>,
+    owner: LegacyOwner,
+    persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence>,
+    live: AtomicBool,
+    gate: Arc<RwLock<()>>,
+    scope: SyncRwLock<LegacyScopeState>,
+}
+
+impl LegacyWorkspaceRun {
+    fn is_live(&self) -> bool {
+        self.live.load(Ordering::Acquire) && !self.owner.cancel.is_cancelled()
+    }
+
+    fn check_identity(&self, session: &Session) -> Result<(), ToolError> {
+        let state = self.scope.read()
+            .map_err(|_| denied("Legacy Workspace scope is unavailable"))?;
+        if !self.is_live()
+            || !ordinary_main(session)
+            || session.id != state.adopted.session_id
+            || session.created_at != state.adopted.created_at
+            || session.project_id_meta() != state.adopted.project
+            || self.owner.owner.fence.actor_id != session.id
+            || self.owner.owner.created_at != session.created_at
+        {
+            return Err(denied("Legacy Workspace execution identity changed"));
+        }
+        Ok(())
+    }
+
+    fn close(&self) {
+        self.live.store(false, Ordering::Release);
+        if let Ok(mut entries) = self.registry.entries.lock() {
+            if let Some(entry) = entries.get_mut(&self.owner.owner.fence.actor_id) {
+                if std::ptr::eq(entry.legacy_run.as_ptr(), self) {
+                    entry.legacy_run = Weak::new();
+                    if !entry.pending && entry.run.strong_count() == 0 {
+                        entries.remove(&self.owner.owner.fence.actor_id);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn refresh(
+        &self,
+        session: &mut Session,
+        execution_id: &str,
+        persistence: &Arc<dyn bamboo_domain::RuntimeSessionPersistence>,
+    ) -> Result<(), ToolError> {
+        // The Host setter holds W before Session. Keep the same order while
+        // checkpointing, so a new transaction cannot race this adoption.
+        let _scope_gate = self.gate.read().await;
+        self.check_identity(session)?;
+        self.owner.check_active_runner(&self.registry, &session.id).await?;
+        if execution_id.is_empty()
+            || !Arc::ptr_eq(persistence, &self.persistence)
+            || persistence.root_actor_writer().as_ref().is_none_or(|actual| {
+                actual.fence != self.owner.owner.fence
+                    || actual.created_at != self.owner.owner.created_at
+            })
+        {
+            return Err(denied("Legacy Workspace adoption has a different execution persistence"));
+        }
+        let (receipt, adopted) = {
+            let mut state = self.scope.write()
+                .map_err(|_| denied("Legacy Workspace scope is unavailable"))?;
+            if state.execution_id.as_deref().is_some_and(|id| id != execution_id) {
+                return Err(denied("Legacy Workspace adoption has a different execution"));
+            }
+            state.execution_id = Some(execution_id.to_owned());
+            (state.receipt.clone(), state.adopted.clone())
+        };
+        let Some(receipt) = receipt else {
+            // A later canonical path alone is never a Host handoff receipt.
+            return Ok(());
+        };
+        if !adopted.matches(session)
+            && !receipt.before.matches(session)
+            && !receipt.after.matches_or_title_successor(session)
+            && !receipt.earlier.iter().any(|scope| scope.matches(session))
+        {
+            return Err(denied("Legacy live scope does not match its committed handoff"));
+        }
+        let actual = self.registry.storage.load_session(&session.id).await
+            .map_err(|error| observed_error(&session.id, Some(&self.owner.owner.fence.run_id),
+                receipt.diagnostic_id.as_deref(), "load_legacy_committed_scope", &error))?
+            .ok_or_else(|| denied("Legacy Workspace Session disappeared"))?;
+        self.check_identity(&actual)?;
+        if !receipt.after.matches_or_title_successor(&actual) {
+            return Err(denied("Legacy canonical scope changed after its Host handoff"));
+        }
+        if receipt.after.title_successor(&actual) {
+            self.registry.storage.validate_title_observations(&actual).await
+                .map_err(|error| observed_error(&session.id, Some(&self.owner.owner.fence.run_id),
+                    receipt.diagnostic_id.as_deref(), "validate_legacy_title_suffix", &error))?;
+        }
+        observe_exact_root(&self.registry, &self.owner.owner, &actual,
+            receipt.diagnostic_id.as_deref()).await?;
+        let target = WorkspaceScope::of(&actual);
+        if session.metadata_version >= target.metadata_version && !target.matches(session) {
+            return Err(denied("Legacy live scope conflicts with its committed revision"));
+        }
+        if session.metadata_version < target.metadata_version {
+            // Reuse the original append-safe checkpoint to adopt the complete
+            // canonical metadata group. Never stamp N+1 onto a stale path.
+            persistence.checkpoint_runtime_session(session).await
+                .map_err(|error| observed_error(&session.id, Some(&self.owner.owner.fence.run_id),
+                    receipt.diagnostic_id.as_deref(), "checkpoint_legacy_committed_scope", &error))?;
+        }
+        if !receipt.after.matches_or_title_successor(session) {
+            return Err(denied("Legacy checkpoint did not adopt its exact Host scope"));
+        }
+        let canonical = self.registry.storage.load_session(&session.id).await
+            .map_err(|error| observed_error(&session.id, Some(&self.owner.owner.fence.run_id),
+                receipt.diagnostic_id.as_deref(), "reload_legacy_adopted_scope", &error))?
+            .ok_or_else(|| denied("Legacy adopted Session disappeared"))?;
+        if !WorkspaceScope::of(session).matches(&canonical) {
+            return Err(denied("Legacy checkpoint canonical revision changed"));
+        }
+        if receipt.after.title_successor(&canonical) {
+            self.registry.storage.validate_title_observations(&canonical).await
+                .map_err(|error| observed_error(&session.id, Some(&self.owner.owner.fence.run_id),
+                    receipt.diagnostic_id.as_deref(), "validate_legacy_adopted_title", &error))?;
+        }
+        self.owner.check_active_runner(&self.registry, &session.id).await?;
+        observe_exact_root(&self.registry, &self.owner.owner, &canonical,
+            receipt.diagnostic_id.as_deref()).await?;
+        let mut state = self.scope.write()
+            .map_err(|_| denied("Legacy Workspace scope is unavailable"))?;
+        state.adopted = WorkspaceScope::of(session);
+        state.receipt = None;
+        tracing::info!(target: "bamboo.workspace_handoff",
+            diagnostic_id = ?receipt.diagnostic_id,
+            session_id = %safe_identifier(&session.id),
+            run_id = %safe_identifier(&self.owner.owner.fence.run_id),
+            fence = %fence_fingerprint(&self.owner.owner.fence),
+            lease_epoch = self.owner.owner.fence.lease_epoch,
+            scope = %scope_fingerprint(session), metadata_version = session.metadata_version,
+            phase = "legacy_runtime_scope_adopted", "Live Legacy scope adopted committed Host metadata");
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl bamboo_engine::config::WorkspaceExecutionHost for LegacyWorkspaceRun {
+    async fn refresh_runtime_scope(
+        &self,
+        session: &mut Session,
+        execution_id: &str,
+        persistence: &Arc<dyn bamboo_domain::RuntimeSessionPersistence>,
+    ) -> Result<(), AgentError> {
+        let result = self.refresh(session, execution_id, persistence).await;
+        if result.is_err() {
+            // Only the original reservation's token; never cancel a successor.
+            self.owner.cancel.cancel();
+        }
+        result.map_err(engine_error)
+    }
+
+    fn finish(&self) {
+        self.close();
+    }
+}
+
+impl Drop for LegacyWorkspaceRun {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -707,6 +978,7 @@ struct Prepared {
     earlier_scopes: Vec<WorkspaceScope>,
     idle_activation: Option<Option<bamboo_domain::ActorActivationFence>>,
     legacy: Option<LegacyOwner>,
+    legacy_run: Option<Arc<LegacyWorkspaceRun>>,
     cancel_uncertain_legacy: bool,
     diagnostic_id: Option<String>,
 }
@@ -850,6 +1122,19 @@ impl PreparedWorkspaceHandoff for Prepared {
             legacy
                 .observe(registry, before, self.diagnostic_id.as_deref())
                 .await?;
+            let run = self.legacy_run.as_ref()
+                .ok_or_else(|| denied("Legacy Workspace runtime binding disappeared"))?;
+            run.check_identity(before)?;
+            let mut scope = run.scope.write()
+                .map_err(|_| denied("Legacy Workspace scope is unavailable"))?;
+            if let Some(receipt) = scope.receipt.take() {
+                self.earlier_scopes = receipt.earlier;
+                for previous in [receipt.before, receipt.after] {
+                    if !self.earlier_scopes.contains(&previous) {
+                        self.earlier_scopes.push(previous);
+                    }
+                }
+            }
             // All validation precedes arming. Any cancellation or error from
             // this point through committed() must stop only this exact run.
             self.cancel_uncertain_legacy = true;
@@ -950,6 +1235,18 @@ impl PreparedWorkspaceHandoff for Prepared {
             legacy
                 .observe(registry, &actual, self.diagnostic_id.as_deref())
                 .await?;
+            let run = self.legacy_run.as_ref()
+                .ok_or_else(|| denied("Legacy Workspace runtime binding disappeared"))?;
+            run.check_identity(&actual)?;
+            run.scope.write()
+                .map_err(|_| denied("Legacy Workspace scope is unavailable"))?
+                .receipt = Some(CommittedScope {
+                    before: self.before_scope.clone()
+                        .ok_or_else(|| denied("Legacy Workspace preparation disappeared"))?,
+                    after: WorkspaceScope::of(&actual),
+                    earlier: std::mem::take(&mut self.earlier_scopes),
+                    diagnostic_id: self.diagnostic_id.clone(),
+                });
             self.cancel_uncertain_legacy = false;
         } else if let Some(expected) = &self.idle_activation {
             if observe_idle_root(registry, &actual, self.diagnostic_id.as_deref())
