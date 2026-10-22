@@ -29,7 +29,11 @@ fn handle() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..24].to_owned()
 }
 
-pub(super) fn valid_handshake(value: &Value, generation: Option<&str>, bounded_storage: bool) -> bool {
+pub(super) fn valid_handshake(
+    value: &Value,
+    generation: Option<&str>,
+    bounded_storage: bool,
+) -> bool {
     value.get("protocol_version").and_then(Value::as_u64) == Some(2)
         && generation.is_some_and(valid_handle)
         && value.get("host_generation").and_then(Value::as_str) == generation
@@ -39,11 +43,13 @@ pub(super) fn valid_handshake(value: &Value, generation: Option<&str>, bounded_s
             .is_some_and(valid_handle)
         && value.get("scope_count").and_then(Value::as_u64) == Some(0)
         && value.get("profile_modes") == Some(&json!(["shared", "clean"]))
-        && (!bounded_storage || value.get("storage_boundary") == Some(&json!({
-            "provider": "mac_apfs_fixed_v1", "image_bytes": 536_870_912,
-            "quota_bytes": 402_653_184, "native_root_tracking": 1,
-            "native_group": "host_inherited_v1"
-        })))
+        && (!bounded_storage
+            || value.get("storage_boundary")
+                == Some(&json!({
+                    "provider": "mac_apfs_fixed_v1", "image_bytes": 536_870_912,
+                    "quota_bytes": 402_653_184, "native_root_tracking": 1,
+                    "native_group": "host_inherited_v1"
+                })))
 }
 
 #[cfg(test)]

@@ -89,9 +89,13 @@ impl Lease {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
-        let mut marker = options.open(self.path.join(LAUNCH_ACTIVE)).map_err(|_| unavailable())?;
-        marker.write_all(format!("{LAUNCH_MAGIC}{generation}\n").as_bytes())
-            .and_then(|()| marker.sync_all()).map_err(|_| unavailable())?;
+        let mut marker = options
+            .open(self.path.join(LAUNCH_ACTIVE))
+            .map_err(|_| unavailable())?;
+        marker
+            .write_all(format!("{LAUNCH_MAGIC}{generation}\n").as_bytes())
+            .and_then(|()| marker.sync_all())
+            .map_err(|_| unavailable())?;
         sync_directory(&self.path)?;
         self.launch_generation = Some(generation);
         Ok(self.launch_generation.as_deref().unwrap())
@@ -175,14 +179,16 @@ impl Lease {
             Ok(metadata) => {
                 use std::io::Read;
                 let generation = self.launch_generation.as_ref().ok_or_else(unavailable)?;
-                if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 128 {
+                if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 128
+                {
                     return Err(unavailable());
                 }
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::{MetadataExt, PermissionsExt};
                     if metadata.uid() != unsafe { libc::geteuid() }
-                        || metadata.permissions().mode() & 0o777 != 0o600 {
+                        || metadata.permissions().mode() & 0o777 != 0o600
+                    {
                         return Err(unavailable());
                     }
                 }
@@ -194,8 +200,12 @@ impl Lease {
                     options.custom_flags(libc::O_NOFOLLOW);
                 }
                 let mut bytes = Vec::new();
-                options.open(self.path.join(LAUNCH_ACTIVE)).map_err(|_| unavailable())?
-                    .take(129).read_to_end(&mut bytes).map_err(|_| unavailable())?;
+                options
+                    .open(self.path.join(LAUNCH_ACTIVE))
+                    .map_err(|_| unavailable())?
+                    .take(129)
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| unavailable())?;
                 if bytes != format!("{LAUNCH_MAGIC}{generation}\n").as_bytes() {
                     return Err(unavailable());
                 }
@@ -385,13 +395,20 @@ pub(super) fn begin_reset(root: &Path) -> Result<ResetGate, BrowserError> {
         reject_unconfirmed_writers(&entry.path())?;
     }
     let storage = super::storage::reset::Owner::prepare(&root)?;
-    Ok(ResetGate { _file: gate, storage: std::sync::Mutex::new(storage) })
+    Ok(ResetGate {
+        _file: gate,
+        storage: std::sync::Mutex::new(storage),
+    })
 }
 
 fn reject_unconfirmed_writers(path: &Path) -> Result<(), BrowserError> {
     match std::fs::symlink_metadata(path.join(LAUNCH_ACTIVE)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        _ => return Err(BrowserError::Unavailable("browser writer exit unconfirmed".into())),
+        _ => {
+            return Err(BrowserError::Unavailable(
+                "browser writer exit unconfirmed".into(),
+            ))
+        }
     }
     match std::fs::symlink_metadata(path.join(WRITER_EXIT_UNCONFIRMED)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -628,8 +645,10 @@ mod tests {
         let mut lease = acquire_shared(&root).unwrap();
         let generation = lease.begin_launch().unwrap().to_owned();
         let path = lease.path.clone();
-        assert_eq!(std::fs::read_to_string(path.join(LAUNCH_ACTIVE)).unwrap(),
-            format!("{LAUNCH_MAGIC}{generation}\n"));
+        assert_eq!(
+            std::fs::read_to_string(path.join(LAUNCH_ACTIVE)).unwrap(),
+            format!("{LAUNCH_MAGIC}{generation}\n")
+        );
         drop(lease); // Models process-local lock loss, not a clean writer exit.
         assert!(acquire_shared(&root).is_err());
         assert!(remove_key_notifying(&root, &shared_key(), || panic!("not retired")).is_err());

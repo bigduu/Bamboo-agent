@@ -379,8 +379,14 @@ impl BrowserReaper {
         let mut killed = false;
         let clean = loop {
             if let Ok(Some(status)) = self.child.lock().unwrap().try_wait() {
-                break self.clean_host_exit || (self.graceful && !killed && status.success()
-                    && managed_group_exit_confirmed(self.group_exit_required, self.process_group));
+                break self.clean_host_exit
+                    || (self.graceful
+                        && !killed
+                        && status.success()
+                        && managed_group_exit_confirmed(
+                            self.group_exit_required,
+                            self.process_group,
+                        ));
             }
             if !killed && Instant::now() >= deadline {
                 self.cleanup.fence_writers();
@@ -644,12 +650,20 @@ impl BrowserSession {
             // The actual native account/reset locks move into the worker.
             // Cancellation drops the waiter, not a still-running preparation
             // owner or its pending create/attach journal.
-            profile_lease = Some(tokio::task::spawn_blocking(move || {
-                lease.storage = Some(Arc::new(storage::Launch::prepare(&lease.path)?));
-                Ok::<_, BrowserError>(lease)
-            }).await.map_err(|_| BrowserError::Unavailable("browser_storage_preparation_interrupted".into()))??);
+            profile_lease = Some(
+                tokio::task::spawn_blocking(move || {
+                    lease.storage = Some(Arc::new(storage::Launch::prepare(&lease.path)?));
+                    Ok::<_, BrowserError>(lease)
+                })
+                .await
+                .map_err(|_| {
+                    BrowserError::Unavailable("browser_storage_preparation_interrupted".into())
+                })??,
+            );
         }
-        let bounded = profile_lease.as_ref().and_then(|lease| lease.storage.as_ref());
+        let bounded = profile_lease
+            .as_ref()
+            .and_then(|lease| lease.storage.as_ref());
         if let Some(storage) = bounded {
             storage.configure(&mut command);
         }
@@ -708,7 +722,11 @@ impl BrowserSession {
         let readiness = readiness?;
         let generation = session.handshake_generation.lock().unwrap().clone();
         if shared
-            && !shared::valid_handshake(&readiness, generation.as_deref(), lifecycle.bounded_storage)
+            && !shared::valid_handshake(
+                &readiness,
+                generation.as_deref(),
+                lifecycle.bounded_storage,
+            )
         {
             let _ = session.begin_retirement("incompatible shared browser host");
             session.terminate("incompatible shared browser host").await;
@@ -1090,7 +1108,8 @@ impl BrowserSession {
                 None
             };
             if let Some(clean) = graceful {
-                let clean = clean && !self.kill_issued.load(Ordering::Acquire)
+                let clean = clean
+                    && !self.kill_issued.load(Ordering::Acquire)
                     && managed_group_exit_confirmed(self.group_exit_required, self.process_group);
                 self.reaped.store(true, Ordering::Release);
                 self.clean_host_exit.store(clean, Ordering::Release);
@@ -2436,11 +2455,11 @@ impl BrowserManager {
             let root = root.clone();
             // Own hosts released their shared gate. Foreign active owners
             // make reset fail before storage is deleted. Hold X through wipe.
-            guard._profile_gate = Some(
-                Arc::new(tokio::task::spawn_blocking(move || profile::begin_reset(&root))
+            guard._profile_gate = Some(Arc::new(
+                tokio::task::spawn_blocking(move || profile::begin_reset(&root))
                     .await
-                    .map_err(|_| BrowserError::Unavailable("browser reset interrupted".into()))??),
-            );
+                    .map_err(|_| BrowserError::Unavailable("browser reset interrupted".into()))??,
+            ));
         }
         Ok(guard)
     }

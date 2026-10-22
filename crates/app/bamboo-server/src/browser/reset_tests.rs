@@ -117,7 +117,8 @@ async fn unqualified_bounded_storage_refuses_reset_before_canonical_history_dele
             .await
             .unwrap(),
     );
-    state.session_store
+    state
+        .session_store
         .save_session(&Session::new("bounded-reset-preserve", "synthetic-model"))
         .await
         .unwrap();
@@ -127,9 +128,16 @@ async fn unqualified_bounded_storage_refuses_reset_before_canonical_history_dele
     std::fs::write(&sentinel, b"preserve synthetic backing").unwrap();
     let outcome = crate::handlers::agent::dev::reset(state.clone()).await;
     assert!(outcome.is_err());
-    assert!(state.session_store.load_session("bounded-reset-preserve")
-        .await.unwrap().is_some());
-    assert_eq!(std::fs::read(sentinel).unwrap(), b"preserve synthetic backing");
+    assert!(state
+        .session_store
+        .load_session("bounded-reset-preserve")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        std::fs::read(sentinel).unwrap(),
+        b"preserve synthetic backing"
+    );
     state.shutdown().await;
 }
 
