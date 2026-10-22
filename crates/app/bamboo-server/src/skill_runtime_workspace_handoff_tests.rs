@@ -1214,7 +1214,9 @@ fn assert_legacy_prompt_workspace_b(
         messages
             .iter()
             .filter(|message| message.role == Role::System)
-            .all(|message| !message.content.contains("<!-- BAMBOO_WORKSPACE_CONTEXT_START -->")),
+            .all(|message| !message
+                .content
+                .contains("<!-- BAMBOO_WORKSPACE_CONTEXT_START -->")),
         "mutable Workspace context must not rewrite the invariant System prefix"
     );
     index
