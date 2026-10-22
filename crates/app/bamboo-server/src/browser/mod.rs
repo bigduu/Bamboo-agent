@@ -5,6 +5,7 @@
 mod concurrent_drain_tests;
 #[cfg(test)]
 mod persistence_tests;
+mod launch_admission;
 mod profile;
 mod shared;
 mod storage;
@@ -231,6 +232,20 @@ struct BrowserQuarantine {
 }
 
 impl BrowserCleanup {
+    fn register(lifecycle: &BrowserLifecycle) -> Arc<Self> {
+        let cleanup = Arc::new(Self {
+            session: Mutex::new(Weak::new()),
+            done: watch::channel(false).0,
+            quarantined: Mutex::new(Vec::new()),
+            unconfirmed_writers: lifecycle.unconfirmed_writers.clone(),
+            writer_admission: lifecycle.writer_admission.clone(),
+        });
+        let mut owners = lifecycle.owners.lock().unwrap();
+        owners.retain(|owner| !*owner.done.borrow() || owner.is_quarantined());
+        owners.push(cleanup.clone());
+        cleanup
+    }
+
     fn finish(&self) {
         self.done.send_replace(true);
     }
@@ -326,6 +341,7 @@ impl Drop for BrowserSession {
             graceful,
             marked,
             clean_host_exit: self.clean_host_exit.load(Ordering::Acquire),
+            native_launch_unadmitted: false,
         };
         if !can_detach {
             // With no durable fence, Drop cannot safely return and let process
@@ -334,7 +350,13 @@ impl Drop for BrowserSession {
             resources.reap();
             return;
         }
-        let resources = Arc::new(Mutex::new(Some(resources)));
+        resources.spawn();
+    }
+}
+
+impl BrowserReaper {
+    fn spawn(self) {
+        let resources = Arc::new(Mutex::new(Some(self)));
         let worker = resources.clone();
         if std::thread::Builder::new()
             .name("browser-host-reaper".into())
@@ -364,6 +386,9 @@ struct BrowserReaper {
     graceful: bool,
     marked: bool,
     clean_host_exit: bool,
+    // Only the owned prelaunch guard sets this before ANY grant attempt.
+    // It is not an exit-code/PID inference about an admitted native writer.
+    native_launch_unadmitted: bool,
 }
 
 impl BrowserReaper {
@@ -379,17 +404,21 @@ impl BrowserReaper {
         let mut killed = false;
         let clean = loop {
             if let Ok(Some(status)) = self.child.lock().unwrap().try_wait() {
+                let group_gone = managed_group_exit_confirmed(
+                    self.group_exit_required,
+                    self.process_group,
+                );
                 break self.clean_host_exit
+                    || (self.native_launch_unadmitted && group_gone)
                     || (self.graceful
                         && !killed
                         && status.success()
-                        && managed_group_exit_confirmed(
-                            self.group_exit_required,
-                            self.process_group,
-                        ));
+                        && group_gone);
             }
             if !killed && Instant::now() >= deadline {
-                self.cleanup.fence_writers();
+                if !self.native_launch_unadmitted {
+                    self.cleanup.fence_writers();
+                }
                 #[cfg(unix)]
                 if let Some(group) = self.process_group {
                     kill_browser_process_group(group);
@@ -405,14 +434,14 @@ impl BrowserReaper {
             self.cleanup.fence_writers();
         }
         if let Some(lease) = &self.lease {
-            if clean {
+            if clean && !self.native_launch_unadmitted {
                 // Unlink may succeed before its directory barrier fails. Keep
                 // the lease until that barrier is confirmed, even if a retry
                 // finds the marker already absent.
                 while lease.finish_close().is_err() {
                     std::thread::sleep(Duration::from_millis(250));
                 }
-            } else {
+            } else if !clean {
                 // If disk I/O prevented the marker, retaining the lease is the
                 // replay fence. Do not release an unmarked, unconfirmed profile.
                 while !marked {
@@ -634,6 +663,13 @@ impl BrowserSession {
         shared: bool,
     ) -> Result<Arc<Self>, BrowserError> {
         let script = host_script();
+        // Compatibility guard, not authentication. An older host must not
+        // ignore the new permit and launch a writer before native admission.
+        let verified_admission_host = if lifecycle.bounded_storage {
+            Some(launch_admission::verify_host(&script)?)
+        } else {
+            None
+        };
         #[cfg(test)]
         let script = if shared
             && !lifecycle.bounded_storage
@@ -703,30 +739,49 @@ impl BrowserSession {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        if lifecycle.bounded_storage {
-            let generation = profile_lease.as_mut().unwrap().begin_launch()?;
-            command.env("BAMBOO_BROWSER_STORAGE_GENERATION", generation);
+        let attempt = verified_admission_host.as_ref().map(|_| uuid::Uuid::new_v4());
+        if let Some(attempt) = attempt {
+            command.env("BAMBOO_BROWSER_LAUNCH_ATTEMPT", attempt.to_string());
         }
+        let startup_deadline = Instant::now() + BROWSER_COMMAND_DEADLINE;
         let child = match lifecycle.spawn_child(&mut command) {
             Ok(child) => child,
             Err(error) => {
-                // spawn() failed before yielding a child. No writer was
-                // admitted; clear only this launch's exact marker. On a failed
-                // directory barrier the on-disk fence remains fail-closed.
-                if let Some(lease) = profile_lease.as_ref() {
-                    let _ = lease.finish_close();
-                }
+                // No child or launch permission exists and no new marker was
+                // created. Never clear a pre-existing launch generation here.
                 return Err(error);
             }
         };
-        let session = Self::from_child_tracked(child, Some(temp_dir), lifecycle)?;
-        *session.profile_lease.lock().unwrap() = profile_lease;
+        let session = if let Some(attempt) = attempt {
+            let admitted = launch_admission::admit(
+                child,
+                profile_lease.take().unwrap(),
+                temp_dir,
+                lifecycle,
+                attempt,
+                startup_deadline,
+            )
+            .await?;
+            Self::from_child_owned(
+                admitted.child,
+                Some(admitted.scratch),
+                lifecycle,
+                Some(admitted.lease),
+                Some(admitted.cleanup),
+            )?
+        } else {
+            Self::from_child_owned(child, Some(temp_dir), lifecycle, profile_lease, None)?
+        };
         session.protocol_v2.store(shared, Ordering::Release);
         let mut abort_guard = BrowserCallAbortGuard::new(session.clone(), None);
         // The first state request doubles as a readiness probe. A missing
         // Playwright package or Chromium binary fails here, not on first click.
         let readiness = session
-            .call(if shared { "runtime_state" } else { "state" }, json!({}))
+            .call_with_deadline(
+                if shared { "runtime_state" } else { "state" },
+                json!({}),
+                startup_deadline.saturating_duration_since(Instant::now()),
+            )
             .await;
         if readiness.is_err() {
             session.terminate("browser host unavailable").await;
@@ -758,10 +813,21 @@ impl BrowserSession {
         Self::from_child_tracked(child, temp_dir, &BrowserLifecycle::default())
     }
 
+    #[cfg(test)]
     fn from_child_tracked(
+        child: Child,
+        temp_dir: Option<tempfile::TempDir>,
+        lifecycle: &BrowserLifecycle,
+    ) -> Result<Arc<Self>, BrowserError> {
+        Self::from_child_owned(child, temp_dir, lifecycle, None, None)
+    }
+
+    fn from_child_owned(
         mut child: Child,
         temp_dir: Option<tempfile::TempDir>,
         lifecycle: &BrowserLifecycle,
+        profile_lease: Option<profile::Lease>,
+        cleanup: Option<Arc<BrowserCleanup>>,
     ) -> Result<Arc<Self>, BrowserError> {
         let process_group = child.id().and_then(|id| i32::try_from(id).ok());
         let stdin = child
@@ -774,20 +840,14 @@ impl BrowserSession {
             .ok_or_else(|| BrowserError::Unavailable("browser host stdout not available".into()))?;
         let (frames, _) = watch::channel(None);
         let (shutdown, _) = watch::channel(false);
-        let cleanup = Arc::new(BrowserCleanup {
-            session: Mutex::new(Weak::new()),
-            done: watch::channel(false).0,
-            quarantined: Mutex::new(Vec::new()),
-            unconfirmed_writers: lifecycle.unconfirmed_writers.clone(),
-            writer_admission: lifecycle.writer_admission.clone(),
-        });
+        let cleanup = cleanup.unwrap_or_else(|| BrowserCleanup::register(lifecycle));
         let session = Arc::new(Self {
             cleanup: cleanup.clone(),
             protocol_v2: AtomicBool::new(false),
             shared_router: Mutex::new(Weak::new()),
             handshake_generation: Mutex::new(None),
             child: Arc::new(Mutex::new(child)),
-            profile_lease: Mutex::new(None),
+            profile_lease: Mutex::new(profile_lease),
             temp_dir: Mutex::new(temp_dir),
             process_group,
             group_exit_required: lifecycle.bounded_storage,
@@ -808,11 +868,6 @@ impl BrowserSession {
             last_used: Mutex::new(Instant::now()),
         });
         *cleanup.session.lock().unwrap() = Arc::downgrade(&session);
-        {
-            let mut owners = lifecycle.owners.lock().unwrap();
-            owners.retain(|owner| !*owner.done.borrow() || owner.is_quarantined());
-            owners.push(cleanup);
-        }
         let weak = Arc::downgrade(&session);
         tokio::spawn(async move { Self::read_messages(weak, stdout).await });
         Ok(session)

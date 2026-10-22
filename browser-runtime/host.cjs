@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // BAMBOO_BROWSER_STORAGE_INSPECTION_V1
+// BAMBOO_BROWSER_LAUNCH_ADMISSION_V1
 // One host owns the account browser; chats own pages and optional clean contexts.
 // Bamboo is the only client: newline-delimited JSON over stdio never exposes a CDP port.
 // Load Playwright only inside main, after installing native child tracking.
@@ -307,7 +308,7 @@ function storageOperationError(cause, origin) {
   return storageUnavailable(reason, cause);
 }
 
-function productionStorageSettings(environment = process.env, readers = {}) {
+function productionStorageSettings(environment = process.env, readers = {}, prelaunch = false) {
   if (environment.BAMBOO_BROWSER_HOST_PROTOCOL !== '2' &&
       !environment.BAMBOO_BROWSER_STORAGE_DATA_ROOT) return null;
   if ((readers.platform || process.platform) !== 'darwin') {
@@ -337,28 +338,30 @@ function productionStorageSettings(environment = process.env, readers = {}) {
     // cookie/database; its presence requires a separately approved migration.
     const entries = filesystem.readdirSync(control);
     if (entries.some(name => name !== '.bamboo-profile.lock' &&
-        name !== '.bamboo-profile-launch-active-v1')) {
+        (prelaunch || name !== '.bamboo-profile-launch-active-v1'))) {
       throw storageUnavailable('browser_storage_migration_required');
     }
     // Correlate this owned launch with the native durable fence. This UUID is
     // not authentication or proof of all-writer exit. A fresh owner must never
     // adopt a previous launch simply because its process-local locks vanished.
-    let descriptor;
-    try {
-      const generation = environment.BAMBOO_BROWSER_STORAGE_GENERATION;
-      assert.match(generation, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-      descriptor = filesystem.openSync(path.join(control, '.bamboo-profile-launch-active-v1'),
-        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-      const metadata = filesystem.fstatSync(descriptor);
-      assert.ok(metadata.isFile() && metadata.uid === owner &&
-        (metadata.mode & 0o777) === 0o600 && metadata.size <= 128);
-      const bytes = Buffer.alloc(129);
-      const length = filesystem.readSync(descriptor, bytes, 0, bytes.length, 0);
-      assert.equal(bytes.subarray(0, length).toString('utf8'), `BAMBOO_BROWSER_LAUNCH_V1\n${generation}\n`);
-    } catch (error) {
-      throw storageUnavailable('browser_storage_launch_fence_invalid', error);
-    } finally {
-      if (descriptor !== undefined) filesystem.closeSync(descriptor);
+    if (!prelaunch) {
+      let descriptor;
+      try {
+        const generation = environment.BAMBOO_BROWSER_STORAGE_GENERATION;
+        assert.match(generation, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+        descriptor = filesystem.openSync(path.join(control, '.bamboo-profile-launch-active-v1'),
+          fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+        const metadata = filesystem.fstatSync(descriptor);
+        assert.ok(metadata.isFile() && metadata.uid === owner &&
+          (metadata.mode & 0o777) === 0o600 && metadata.size <= 128);
+        const bytes = Buffer.alloc(129);
+        const length = filesystem.readSync(descriptor, bytes, 0, bytes.length, 0);
+        assert.equal(bytes.subarray(0, length).toString('utf8'), `BAMBOO_BROWSER_LAUNCH_V1\n${generation}\n`);
+      } catch (error) {
+        throw storageUnavailable('browser_storage_launch_fence_invalid', error);
+      } finally {
+        if (descriptor !== undefined) filesystem.closeSync(descriptor);
+      }
     }
     assert.equal(environment.BAMBOO_BROWSER_PROFILE_DIR, plan.paths.profile);
     for (const [name, role] of Object.entries({ HOME: 'home', XDG_CACHE_HOME: 'cache',
@@ -383,6 +386,63 @@ function productionStorageSettings(environment = process.env, readers = {}) {
   } catch (error) {
     if (error.code === 'browser_storage_unavailable') throw error;
     throw storageUnavailable('browser_storage_observation_failed', error);
+  }
+}
+
+// This is a lifecycle permit from the owned native parent, not an HTTP/model
+// authorization proof. Preflight is read-only; no native roots or profile
+// writers may be constructed before the parent's durable-fence grant.
+async function prepareNativeLaunch(environment = process.env, input = process.stdin, output = process.stdout) {
+  if (environment.BAMBOO_BROWSER_HOST_PROTOCOL !== '2' &&
+      !environment.BAMBOO_BROWSER_STORAGE_DATA_ROOT) return null;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  const attempt = environment.BAMBOO_BROWSER_LAUNCH_ATTEMPT;
+  if (environment.BAMBOO_BROWSER_HOST_PROTOCOL !== '2' || !uuid.test(attempt || '')) {
+    throw Object.assign(new Error('browser launch admission required'), { code: 'browser_launch_admission_required' });
+  }
+  productionStorageSettings(environment, {}, true);
+  const prefix = 'BAMBOO_BROWSER_LAUNCH_V1 ';
+  const lines = readline.createInterface({ input, crlfDelay: Infinity });
+  // Keep this SAME iterator through normal RPC, including a first request
+  // delivered in the same pipe chunk as the grant. Never discard prefetched data.
+  const requests = lines[Symbol.asyncIterator]();
+  let rejectOversize;
+  const oversized = new Promise((_, reject) => { rejectOversize = reject; });
+  let frameBytes = 0; let firstLineSeen = false;
+  const limit = chunk => {
+    if (firstLineSeen) return;
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    const end = bytes.indexOf(10);
+    frameBytes += end < 0 ? bytes.length : end + 1;
+    firstLineSeen = end >= 0;
+    if (frameBytes > 16_384) {
+      lines.close(); input.pause();
+      rejectOversize(new Error('browser launch frame too large'));
+    }
+  };
+  input.on('data', limit);
+  try {
+    output.write(prefix + JSON.stringify({ kind: 'bamboo_browser_launch_ready', version: 1,
+      attempt_id: attempt }) + '\n');
+    const first = await Promise.race([requests.next(), oversized]);
+    assert.ok(!first.done && Buffer.byteLength(first.value) <= 16_384);
+    assert.ok(first.value.startsWith(prefix));
+    const grant = JSON.parse(first.value.slice(prefix.length));
+    assert.equal(first.value, prefix + JSON.stringify(grant), 'Noncanonical/duplicate grant fields');
+    assert.deepEqual(Object.keys(grant).sort(), ['attempt_id', 'kind', 'launch_generation', 'version']);
+    assert.equal(grant.kind, 'bamboo_browser_launch_grant');
+    assert.equal(grant.version, 1);
+    assert.equal(grant.attempt_id, attempt);
+    assert.match(grant.launch_generation, uuid);
+    return { lines, requests,
+      environment: { ...environment, BAMBOO_BROWSER_STORAGE_GENERATION: grant.launch_generation } };
+  } catch (cause) {
+    lines.close(); input.pause();
+    throw Object.assign(new Error('browser launch admission invalid', { cause }), {
+      code: 'browser_launch_admission_invalid',
+    });
+  } finally {
+    input.removeListener('data', limit);
   }
 }
 
@@ -4032,7 +4092,8 @@ async function finishCloseHost() {
 }
 
 async function main() {
-  hostStorageSettings = productionStorageSettings();
+  const admission = await prepareNativeLaunch();
+  hostStorageSettings = productionStorageSettings(admission?.environment || process.env);
   if (hostStorageSettings) process.chdir(hostStorageSettings.scratch);
   const downloadRoot = process.env.BAMBOO_BROWSER_DOWNLOAD_ROOT || os.tmpdir();
   downloadDir = await fs.mkdtemp(path.join(downloadRoot, 'bamboo-browser-download-'));
@@ -4075,7 +4136,8 @@ async function main() {
   const v2 = process.env.BAMBOO_BROWSER_HOST_PROTOCOL === '2';
   const legacy = { scope_id: '0'.repeat(24), scope_generation: '0'.repeat(24), host_generation: hostRuntime.generation, version: 2 };
   if (!v2) await hostRuntime.handle({ ...legacy, action: 'scope_open', args: {} });
-  const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  const lines = admission?.lines || readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  const requests = admission?.requests || lines[Symbol.asyncIterator]();
   const pending = new Set();
   const budget = createRequestBudget();
   let lastRequestId = 0;
@@ -4097,7 +4159,7 @@ async function main() {
         error: String(error.message || error) }, v2, hostRuntime.generation));
     }
   }
-  for await (const line of lines) {
+  for await (const line of requests) {
     if (shuttingDown) break;
     let request;
     let envelopeValid = false;

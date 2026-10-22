@@ -11,6 +11,7 @@ const sandbox = { require, module: { exports: {} }, process, Buffer, URL,
   setTimeout, clearTimeout, setInterval, clearInterval };
 vm.runInNewContext(fs.readFileSync(host, 'utf8') + `
   productionStorageSettings = () => null;
+  prepareNativeLaunch = async () => null;
   main().catch(async error => {
     process.stderr.write('synthetic host fixture failed: ' + error.message + '\\n');
     process.exitCode = 1;

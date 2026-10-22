@@ -16,6 +16,7 @@ function fixture() {
   new vm.Script(fs.readFileSync(path.join(__dirname, 'host.cjs'), 'utf8')).runInContext(scope);
   const api = vm.runInContext(`({
     settings: (...args) => productionStorageSettings(...args),
+    preflight: (...args) => productionStorageSettings(...args, true),
     error: (...args) => storageOperationError(...args),
     plan: (...args) => macSharedStoragePlan(...args),
   })`, scope);
@@ -91,6 +92,32 @@ test('bounded scratch admits exact 0700 but refuses group access and a wrong dev
       ...(target === f.env.TMPDIR ? changed : {}) });
     assert.throws(() => f.api.settings(f.env, f.readers), error =>
       error.reason === 'browser_storage_observation_failed');
+  }
+});
+
+test('actual preflight validates private storage without opening or adopting a launch fence', () => {
+  const f = fixture(); delete f.env.BAMBOO_BROWSER_STORAGE_GENERATION;
+  f.readers.filesystem.readdirSync = () => ['.bamboo-profile.lock'];
+  f.readers.filesystem.openSync = () => { throw new Error('preflight must not open a launch fence'); };
+  assert.equal(f.api.preflight(f.env, f.readers).scratch, f.env.TMPDIR);
+  assert.equal(f.calls.length, 1);
+});
+
+test('actual preflight still refuses 0755 scratch before any native permission', () => {
+  const f = fixture(); f.readers.filesystem.readdirSync = () => ['.bamboo-profile.lock'];
+  const original = f.readers.filesystem.lstatSync;
+  f.readers.filesystem.lstatSync = target => ({ ...original(target),
+    ...(target === f.env.TMPDIR ? { mode: 0o40755 } : {}) });
+  assert.throws(() => f.api.preflight(f.env, f.readers), error =>
+    error.reason === 'browser_storage_observation_failed');
+});
+
+test('actual preflight refuses old active or unknown markers rather than clearing them', () => {
+  for (const marker of ['.bamboo-profile-launch-active-v1', '.bamboo-profile-writer-exit-unconfirmed']) {
+    const f = fixture(); f.readers.filesystem.readdirSync = () => ['.bamboo-profile.lock', marker];
+    assert.throws(() => f.api.preflight(f.env, f.readers), error =>
+      error.reason === 'browser_storage_migration_required');
+    assert.equal(f.calls.length, 0);
   }
 });
 

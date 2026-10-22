@@ -29,6 +29,7 @@ async fn clean_reaper_holds_lease_until_close_directory_barrier_recovers() {
     let process_group = child.id().and_then(|id| i32::try_from(id).ok());
     let stdin = child.stdin.take();
     let reaper = BrowserReaper {
+        native_launch_unadmitted: false,
         cleanup: Arc::new(BrowserCleanup {
             session: Mutex::new(Weak::new()),
             done: watch::channel(false).0,

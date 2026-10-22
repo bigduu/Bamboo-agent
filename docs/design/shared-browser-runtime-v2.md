@@ -96,3 +96,21 @@ recorded separately with their exact source hashes. New Rust manager, parser,
 namespace, shutdown and reset tests are source preparation until their actual
 commands complete in the coordinated Rust window. A Node component pass does
 not establish HTTP/Lotus integration, cross-platform acceptance or publication.
+
+## Native startup permission
+
+The bounded production owner requires a host with the launch-admission v1
+compatibility marker. Before importing Playwright or creating a native browser,
+the host performs read-only storage preflight and waits on its owned pipe. The
+parent validates the attempt-bound ready frame, persists its launch fence, then
+sends the exact generation-bound grant. Both bootstrap frames use the
+`BAMBOO_BROWSER_LAUNCH_V1 ` prefix and are limited to 16384 bytes. Normal RPC keeps
+its original iterator and request IDs. The existing startup deadline covers both
+bootstrap and normal readiness.
+
+A confirmed pre-permission failure reaps the Node child and managed group before
+releasing its original lease and scratch; it neither creates nor removes a
+launch fence. Any possibly attempted grant, invalid bootstrap contract, or
+unconfirmed reap remains eligible for the existing unknown-writer quarantine.
+This is internal lifecycle admission, not an owner-authentication proof. It does
+not recover a previous generation, clear an old fence, or change HTTP access.

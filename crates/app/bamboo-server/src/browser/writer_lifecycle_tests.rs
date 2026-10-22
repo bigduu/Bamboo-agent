@@ -55,6 +55,7 @@ async fn clean_node_exit_with_a_remaining_group_member_retains_active_fence_and_
         writer_admission: Arc::new(Mutex::new(())),
     });
     BrowserReaper {
+        native_launch_unadmitted: false,
         child: Arc::new(Mutex::new(child)),
         cleanup: cleanup.clone(),
         lease: Some(lease),
