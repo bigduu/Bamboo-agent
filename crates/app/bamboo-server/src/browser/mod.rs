@@ -638,10 +638,16 @@ impl BrowserSession {
             command.env("BAMBOO_BROWSER_PROFILE_DIR", &lease.path);
         }
         if lifecycle.bounded_storage {
-            let lease = profile_lease.as_mut().ok_or_else(|| {
+            let mut lease = profile_lease.take().ok_or_else(|| {
                 BrowserError::Unavailable("browser_storage_control_invalid".into())
             })?;
-            lease.storage = Some(Arc::new(storage::Launch::admit(&lease.path)?));
+            // The actual native account/reset locks move into the worker.
+            // Cancellation drops the waiter, not a still-running preparation
+            // owner or its pending create/attach journal.
+            profile_lease = Some(tokio::task::spawn_blocking(move || {
+                lease.storage = Some(Arc::new(storage::Launch::prepare(&lease.path)?));
+                Ok::<_, BrowserError>(lease)
+            }).await.map_err(|_| BrowserError::Unavailable("browser_storage_preparation_interrupted".into()))??);
         }
         let bounded = profile_lease.as_ref().and_then(|lease| lease.storage.as_ref());
         if let Some(storage) = bounded {

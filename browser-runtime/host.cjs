@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// BAMBOO_BROWSER_STORAGE_INSPECTION_V1
 // One host owns the account browser; chats own pages and optional clean contexts.
 // Bamboo is the only client: newline-delimited JSON over stdio never exposes a CDP port.
 // Load Playwright only inside main, after installing native child tracking.
@@ -96,7 +97,13 @@ function validateMacStorageResetObservation(plan, value) {
   return validateMacStorageIdentity(plan, value, true);
 }
 
-function validateMacStorageIdentity(plan, value, resetting) {
+// A freshly formatted volume has not yet acquired its private role folders.
+// This read-only result permits native preparation checks, never launch.
+function validateMacStoragePreparationObservation(plan, value) {
+  return validateMacStorageIdentity(plan, value, false, true);
+}
+
+function validateMacStorageIdentity(plan, value, resetting, preparing = false) {
   assert.ok(isDeepStrictEqual(plan, macSharedStoragePlan(plan.dataRoot)), 'Storage plan changed');
   keys(value, ['ownerUid', 'image', 'attachment', 'volume', 'mount', 'paths']);
   assert.ok(Number.isSafeInteger(value.ownerUid) && value.ownerUid >= 0);
@@ -120,7 +127,7 @@ function validateMacStorageIdentity(plan, value, resetting) {
   assert.match(volume.deviceIdentifier, /^disk[0-9]+s[0-9]+$/);
   assert.equal(volume.quotaBytes, QUOTA_BYTES);
   assert.ok(Number.isSafeInteger(volume.usedBytes) && volume.usedBytes >= 0 &&
-    (resetting ? volume.usedBytes <= IMAGE_BYTES : volume.usedBytes < QUOTA_BYTES),
+    (resetting || preparing ? volume.usedBytes <= IMAGE_BYTES : volume.usedBytes < QUOTA_BYTES),
   'Full or unconfirmed storage refuses admission');
   assert.equal(volume.filesystem, 'apfs');
   assert.equal(volume.writable, true);
@@ -133,12 +140,22 @@ function validateMacStorageIdentity(plan, value, resetting) {
   assert.ok(Number.isSafeInteger(mount.device) && mount.device > 0);
   assert.ok(Number.isSafeInteger(image.device) && image.device > 0);
   assert.notEqual(mount.device, image.device, 'An ordinary folder is not a mounted image');
-  privateDirectory(mount, plan.mount, mount.device, value.ownerUid);
+  if (preparing) {
+    keys(mount, ['path', 'realPath', 'directory', 'symlink', 'device', 'uid', 'mode']);
+    assert.equal(mount.path, plan.mount); assert.equal(mount.realPath, plan.mount);
+    assert.equal(mount.directory, true); assert.equal(mount.symlink, false);
+    assert.equal(mount.uid, value.ownerUid);
+    assert.ok(Number.isSafeInteger(mount.mode) && mount.mode >= 0 && mount.mode <= 0xffff &&
+      [0o700, 0o755].includes(mount.mode & 0o777));
+  } else privateDirectory(mount, plan.mount, mount.device, value.ownerUid);
   keys(value.paths, Object.keys(plan.paths));
   for (const [role, target] of Object.entries(plan.paths)) {
-    privateDirectory(value.paths[role], target, mount.device, value.ownerUid);
+    if (!(preparing && value.paths[role] === null)) {
+      privateDirectory(value.paths[role], target, mount.device, value.ownerUid);
+    }
   }
-  return { kind: resetting ? 'validated_mac_storage_reset_observation_v1' :
+  return { kind: preparing ? 'validated_mac_storage_preparation_observation_v1' :
+    resetting ? 'validated_mac_storage_reset_observation_v1' :
     'validated_mac_storage_observation_v1', image: plan.image,
     volumeUuid: volume.uuid, imageBytes: IMAGE_BYTES, quotaBytes: QUOTA_BYTES,
     launchAuthorized: false, writerExitProven: false, detachAuthorized: false };
@@ -165,7 +182,42 @@ function inspectMacStorageForReset(plan, readers = {}) {
   return inspectMacStorageIdentity(plan, readers, true);
 }
 
-function inspectMacStorageIdentity(plan, readers, resetting) {
+function inspectMacStorageForPreparation(plan, readers = {}) {
+  return inspectMacStorageIdentity(plan, readers, false, true);
+}
+
+// Before a reattach, bind the registered inode to one non-sparse backing and
+// reject an attachment anywhere else. No create/attach or quota mutation here.
+function inspectMacStorageBacking(plan, readers = {}) {
+  assert.ok(isDeepStrictEqual(plan, macSharedStoragePlan(plan.dataRoot)), 'Storage plan changed');
+  const filesystem = readers.filesystem || nativeFs;
+  const read = readers.readPlist || readMacPlist;
+  const uid = readers.uid ?? process.getuid?.();
+  const stat = filesystem.lstatSync(plan.image);
+  assert.equal(filesystem.realpathSync(plan.dataRoot), plan.dataRoot);
+  assert.equal(filesystem.realpathSync(plan.image), plan.image);
+  assert.ok(stat.isFile() && !stat.isSymbolicLink());
+  assert.equal(stat.uid, uid); assert.equal(stat.mode & 0o777, 0o600);
+  assert.equal(stat.size, IMAGE_BYTES); assert.equal(stat.nlink, 1);
+  assert.ok(Number.isSafeInteger(stat.ino) && stat.ino > 0);
+  const info = read('/usr/bin/hdiutil', ['imageinfo', '-plist', plan.image]);
+  assert.equal(info.Format, 'UDRW'); assert.deepEqual(info.Segments, [plan.image]);
+  assert.equal(info['Size Information']?.['Total Bytes'], IMAGE_BYTES);
+  const images = read('/usr/bin/hdiutil', ['info', '-plist']).images;
+  assert.ok(Array.isArray(images));
+  const matching = images.filter(item => item['image-path'] === plan.image);
+  assert.ok(matching.length <= 1, 'Duplicate image attachments');
+  if (matching.length) {
+    const mounted = matching[0]['system-entities']?.filter(item => item['mount-point']);
+    assert.equal(mounted?.length, 1, 'Image has no unique mounted volume');
+    assert.equal(mounted[0]['mount-point'], plan.mount);
+    assert.match(mounted[0]['dev-entry'], /^\/dev\/disk[0-9]+s[0-9]+$/);
+  }
+  return { kind: 'validated_mac_storage_backing_observation_v1', imageBytes: IMAGE_BYTES,
+    imageInode: stat.ino, imageDevice: stat.dev, attached: matching.length === 1 };
+}
+
+function inspectMacStorageIdentity(plan, readers, resetting, preparing = false) {
   assert.ok(isDeepStrictEqual(plan, macSharedStoragePlan(plan.dataRoot)), 'Storage plan changed');
   const filesystem = readers.filesystem || nativeFs;
   const read = readers.readPlist || readMacPlist;
@@ -189,8 +241,13 @@ function inspectMacStorageIdentity(plan, readers, resetting) {
       device: metadata.dev, uid: metadata.uid, mode: metadata.mode };
   }
   const mount = directory(plan.mount);
-  const paths = Object.fromEntries(Object.entries(plan.paths)
-    .map(([role, target]) => [role, directory(target)]));
+  const paths = Object.fromEntries(Object.entries(plan.paths).map(([role, target]) => {
+    try { return [role, directory(target)]; }
+    catch (error) {
+      if (preparing && error.code === 'ENOENT') return [role, null];
+      throw error;
+    }
+  }));
   const imageInfo = read('/usr/bin/hdiutil', ['imageinfo', '-plist', plan.image]);
   image.virtualBytes = imageInfo['Size Information']?.['Total Bytes'];
   image.format = imageInfo.Format;
@@ -203,6 +260,7 @@ function inspectMacStorageIdentity(plan, readers, resetting) {
     item.ContainerReference === info.APFSContainerReference);
   assert.equal(containers?.length, 1, 'Ambiguous or missing APFS container');
   const volumes = containers[0].Volumes?.filter(item => item.DeviceIdentifier === info.DeviceIdentifier);
+  assert.equal(containers[0].Volumes?.length, 1, 'Expected one bounded APFS volume');
   assert.equal(volumes?.length, 1, 'Ambiguous or missing APFS volume');
   const nativeVolume = volumes[0];
   assert.equal(nativeVolume.APFSVolumeUUID, info.VolumeUUID);
@@ -219,7 +277,8 @@ function inspectMacStorageIdentity(plan, readers, resetting) {
     attachment: { imagePath: images[0]['image-path'], volumeDevice: info.DeviceIdentifier,
       volumeUuid: info.VolumeUUID, mountPoint: info.MountPoint },
   };
-  return { observation, validation: resetting ? validateMacStorageResetObservation(plan, observation) :
+  return { observation, validation: preparing ? validateMacStoragePreparationObservation(plan, observation) :
+    resetting ? validateMacStorageResetObservation(plan, observation) :
     validateMacStorageObservation(plan, observation) };
 }
 
@@ -4095,14 +4154,26 @@ if (require.main === module) {
     // is not an erasure grant; the native owner still holds and verifies paths.
     try {
       assert.equal(arguments_.length, 2);
-      assert.ok(['--storage-inspect-v1', '--storage-reset-inspect-v1'].includes(arguments_[0]));
+      assert.ok(['--storage-inspect-v1', '--storage-reset-inspect-v1', '--storage-prepare-inspect-v1',
+        '--storage-backing-inspect-v1'].includes(arguments_[0]));
       assert.equal(process.platform, 'darwin');
       const plan = macSharedStoragePlan(arguments_[1]);
-      const result = arguments_[0] === '--storage-reset-inspect-v1' ?
+      if (arguments_[0] === '--storage-backing-inspect-v1') {
+        process.stdout.write(JSON.stringify(inspectMacStorageBacking(plan)) + '\n');
+      } else {
+      const result = arguments_[0] === '--storage-prepare-inspect-v1' ? inspectMacStorageForPreparation(plan) :
+        arguments_[0] === '--storage-reset-inspect-v1' ?
         inspectMacStorageForReset(plan) : inspectMacSharedStorage(plan);
-      process.stdout.write(JSON.stringify({ kind: result.validation.kind,
+      const receipt = { kind: result.validation.kind,
         volumeUuid: result.validation.volumeUuid, imageBytes: IMAGE_BYTES, quotaBytes: QUOTA_BYTES,
-        mountDevice: result.observation.mount.device, imageDevice: result.observation.image.device }) + '\n');
+        mountDevice: result.observation.mount.device, imageDevice: result.observation.image.device };
+      if (arguments_[0] === '--storage-prepare-inspect-v1') {
+        receipt.mountMode = result.observation.mount.mode & 0o777;
+        receipt.pathsComplete = Object.values(result.observation.paths).every(value => value !== null);
+        receipt.pathsAbsent = Object.values(result.observation.paths).every(value => value === null);
+      }
+      process.stdout.write(JSON.stringify(receipt) + '\n');
+      }
     } catch {
       process.stderr.write('browser storage inspection unavailable\n');
       process.exitCode = 2;
@@ -4116,5 +4187,6 @@ if (require.main === module) {
   module.exports = { installScriptBlobCapture, installDownloadLinkInspector,
     IMAGE_BYTES, QUOTA_BYTES, ACCOUNT_KEY, macSharedStoragePlan,
     validateMacStorageObservation, inspectMacSharedStorage,
-    validateMacStorageResetObservation, inspectMacStorageForReset };
+    validateMacStorageResetObservation, inspectMacStorageForReset,
+    validateMacStoragePreparationObservation, inspectMacStorageForPreparation, inspectMacStorageBacking };
 }

@@ -42,7 +42,11 @@ impl Owner {
         {
             let control = profile_root.join(super::profile::shared_key());
             let launch = super::Launch::pin_existing(&control, false)?;
+            super::prepare::guard_reset(&root)?;
             let receipt = inspect(&launch)?;
+            if super::prepare::registered_uuid(&launch.data_root)?.is_some_and(|uuid| uuid != receipt.volume_uuid) {
+                return Err(unavailable("browser_storage_reset_identity_changed"));
+            }
             validate_root_names(&launch)?;
             if let Some(previous) = read_journal(&root)? {
                 if previous.volume_uuid != receipt.volume_uuid {
@@ -106,10 +110,20 @@ pub(super) fn launch_volume_uuid(data_root: &Path) -> Result<Option<String>, Bro
 
 #[cfg(target_os = "macos")]
 fn read_journal(root: &Path) -> Result<Option<Journal>, BrowserError> {
+    let Some(journal) = read_control_record::<Journal>(root, JOURNAL)? else { return Ok(None); };
+    if journal.version != 1 || journal.generation.is_nil() || journal.volume_uuid.is_nil()
+        || journal.image_bytes != super::IMAGE_BYTES || journal.quota_bytes != 402_653_184 {
+        return Err(unavailable("browser_storage_reset_journal_invalid"));
+    }
+    Ok(Some(journal))
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn read_control_record<T: serde::de::DeserializeOwned>(root: &Path, name: &str) -> Result<Option<T>, BrowserError> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let file = match std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW)
-        .open(root.join(JOURNAL)) {
+        .open(root.join(name)) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(unavailable("browser_storage_reset_journal_invalid")),
@@ -121,53 +135,98 @@ fn read_journal(root: &Path) -> Result<Option<Journal>, BrowserError> {
     }
     let mut bytes = Vec::new();
     file.take(1025).read_to_end(&mut bytes).map_err(|_| unavailable("browser_storage_reset_journal_invalid"))?;
-    let journal: Journal = serde_json::from_slice(&bytes).map_err(|_| unavailable("browser_storage_reset_journal_invalid"))?;
-    if journal.version != 1 || journal.generation.is_nil() || journal.volume_uuid.is_nil()
-        || journal.image_bytes != super::IMAGE_BYTES || journal.quota_bytes != 402_653_184 {
-        return Err(unavailable("browser_storage_reset_journal_invalid"));
-    }
+    let journal = serde_json::from_slice(&bytes).map_err(|_| unavailable("browser_storage_reset_journal_invalid"))?;
     Ok(Some(journal))
 }
 
 #[cfg(target_os = "macos")]
 fn write_journal(root: &Path, journal: &Journal) -> Result<(), BrowserError> {
+    write_control_record(root, JOURNAL, journal)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn write_control_record<T: serde::Serialize>(root: &Path, name: &str, journal: &T) -> Result<(), BrowserError> {
     use std::io::Write;
     let bytes = serde_json::to_vec(journal).map_err(|_| unavailable("browser_storage_reset_journal_invalid"))?;
     if bytes.len() > 1024 { return Err(unavailable("browser_storage_reset_journal_invalid")); }
     let mut next = tempfile::NamedTempFile::new_in(root).map_err(|_| unavailable("browser_storage_reset_unavailable"))?;
     next.write_all(&bytes).and_then(|()| next.as_file().sync_all())
         .map_err(|_| unavailable("browser_storage_reset_unavailable"))?;
-    next.persist(root.join(JOURNAL)).map_err(|_| unavailable("browser_storage_reset_unavailable"))?;
+    next.persist(root.join(name)).map_err(|_| unavailable("browser_storage_reset_unavailable"))?;
     super::profile::sync_directory(root)
 }
 
 #[cfg(target_os = "macos")]
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Inspection {
+pub(super) struct Inspection {
     kind: String,
-    volume_uuid: uuid::Uuid,
+    pub(super) volume_uuid: uuid::Uuid,
     image_bytes: u64,
     quota_bytes: u64,
-    mount_device: u64,
+    pub(super) mount_device: u64,
     image_device: u64,
+    pub(super) mount_mode: Option<u32>,
+    pub(super) paths_complete: Option<bool>,
+    pub(super) paths_absent: Option<bool>,
 }
 
 #[cfg(target_os = "macos")]
 fn inspect(launch: &super::Launch) -> Result<Inspection, BrowserError> {
+    inspect_pinned(launch, "reset")
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn inspect_for_launch(launch: &super::Launch) -> Result<Inspection, BrowserError> {
+    inspect_pinned(launch, "launch")
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_pinned(launch: &super::Launch, purpose: &str) -> Result<Inspection, BrowserError> {
+    use std::os::unix::fs::MetadataExt;
+    let device = launch._directories[2].1.metadata().map_err(|_| unavailable("browser_storage_path_invalid"))?.dev();
+    inspect_native(&launch.data_root, device, purpose)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn inspect_for_preparation(data_root: &Path, mount_device: u64) -> Result<Inspection, BrowserError> {
+    inspect_native(data_root, mount_device, "preparation")
+}
+
+#[cfg(target_os = "macos")]
+fn inspect_native(data_root: &Path, mount_device: u64, purpose: &str) -> Result<Inspection, BrowserError> {
+    let (argument, expected_kind) = match purpose {
+        "reset" => ("--storage-reset-inspect-v1", "validated_mac_storage_reset_observation_v1"),
+        "launch" => ("--storage-inspect-v1", "validated_mac_storage_observation_v1"),
+        "preparation" => ("--storage-prepare-inspect-v1", "validated_mac_storage_preparation_observation_v1"),
+        _ => return Err(unavailable("browser_storage_inspection_failed")),
+    };
+    let receipt: Inspection = read_native_receipt(data_root, argument)?;
+    if receipt.kind != expected_kind || receipt.volume_uuid.is_nil()
+        || receipt.image_bytes != super::IMAGE_BYTES || receipt.quota_bytes != 402_653_184
+        || receipt.mount_device == receipt.image_device || mount_device != receipt.mount_device
+        || (purpose == "preparation" && (receipt.mount_mode.is_none() || receipt.paths_complete.is_none() || receipt.paths_absent.is_none()))
+        || (purpose != "preparation" && (receipt.mount_mode.is_some() || receipt.paths_complete.is_some() || receipt.paths_absent.is_some())) {
+        return Err(unavailable("browser_storage_inspection_failed"));
+    }
+    Ok(receipt)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn read_native_receipt<T: serde::de::DeserializeOwned>(data_root: &Path, argument: &str) -> Result<T, BrowserError> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::MetadataExt;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
     let script = super::super::host_script();
+    let _verified_script = verify_inspector_script(&script)?;
     let node = std::env::var_os("BAMBOO_BROWSER_NODE").unwrap_or_else(|| "node".into());
     let mut command = Command::new(node);
     command.env_clear();
     for name in ["PATH", "LANG", "LC_ALL"] {
         if let Some(value) = std::env::var_os(name) { command.env(name, value); }
     }
-    let mut child = command.arg(script).arg("--storage-reset-inspect-v1").arg(&launch.data_root)
+    let mut child = command.arg(script).arg(argument).arg(data_root)
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
         .spawn().map_err(|_| unavailable("browser_storage_inspection_failed"))?;
     let mut output = child.stdout.take().unwrap();
@@ -202,14 +261,27 @@ fn inspect(launch: &super::Launch) -> Result<Inspection, BrowserError> {
         let _ = child.kill(); let _ = child.wait();
         return Err(unavailable("browser_storage_inspection_failed"));
     }
-    let receipt: Inspection = serde_json::from_slice(&bytes).map_err(|_| unavailable("browser_storage_inspection_failed"))?;
-    if receipt.kind != "validated_mac_storage_reset_observation_v1" || receipt.volume_uuid.is_nil()
-        || receipt.image_bytes != super::IMAGE_BYTES || receipt.quota_bytes != 402_653_184
-        || receipt.mount_device == receipt.image_device
-        || launch._directories[2].1.metadata().map_err(|_| unavailable("browser_storage_path_invalid"))?.dev() != receipt.mount_device {
-        return Err(unavailable("browser_storage_inspection_failed"));
+    serde_json::from_slice(&bytes).map_err(|_| unavailable("browser_storage_inspection_failed"))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_inspector_script(path: &Path) -> Result<std::fs::File, BrowserError> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    const PREFIX: &[u8] = b"#!/usr/bin/env node\n// BAMBOO_BROWSER_STORAGE_INSPECTION_V1\n";
+    let mut file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)
+        .map_err(|_| unavailable("browser_storage_host_incompatible"))?;
+    let metadata = file.metadata().map_err(|_| unavailable("browser_storage_host_incompatible"))?;
+    if !metadata.is_file() || metadata.len() > 8 * 1024 * 1024 {
+        return Err(unavailable("browser_storage_host_incompatible"));
     }
-    Ok(receipt)
+    let mut prefix = vec![0; PREFIX.len()];
+    file.read_exact(&mut prefix).map_err(|_| unavailable("browser_storage_host_incompatible"))?;
+    if prefix != PREFIX { return Err(unavailable("browser_storage_host_incompatible")); }
+    // Compatibility only, never authentication of arbitrary user-configured
+    // code. In particular, an older host may ignore inspection arguments and
+    // start Chromium, so reject that cohort before executing Node at all.
+    Ok(file)
 }
 
 #[cfg(target_os = "macos")]
@@ -321,6 +393,19 @@ mod tests {
     fn journal(complete: bool) -> Journal {
         Journal { version: 1, generation: uuid::Uuid::new_v4(), volume_uuid: uuid::Uuid::new_v4(),
             image_bytes: super::super::IMAGE_BYTES, quota_bytes: 402_653_184, complete }
+    }
+
+    #[test]
+    fn an_old_or_linked_host_is_rejected_before_an_inspection_process_can_start() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old-host.cjs");
+        std::fs::write(&old, b"#!/usr/bin/env node\n// old main ignores arguments\n").unwrap();
+        assert!(verify_inspector_script(&old).is_err());
+        let current = root.path().join("current-host.cjs");
+        std::fs::write(&current, b"#!/usr/bin/env node\n// BAMBOO_BROWSER_STORAGE_INSPECTION_V1\n").unwrap();
+        assert!(verify_inspector_script(&current).is_ok());
+        let linked = root.path().join("linked.cjs"); symlink(current, &linked).unwrap();
+        assert!(verify_inspector_script(&linked).is_err());
     }
 
     #[test]

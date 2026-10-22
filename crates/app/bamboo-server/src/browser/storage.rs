@@ -1,4 +1,4 @@
-//! Admission to existing bounded storage; never provision, mount or migrate.
+//! Native bounded storage preparation/admission; never migrate or evict data.
 //! The packaged host performs the live native quota/backing inspection before
 //! loading Playwright. These pinned paths do not replace that OS inspection.
 
@@ -9,6 +9,8 @@ use super::BrowserError;
 use super::profile;
 
 pub(super) mod reset;
+#[cfg(target_os = "macos")]
+mod prepare;
 
 #[cfg(target_os = "macos")]
 const IMAGE_BYTES: u64 = 536_870_912;
@@ -25,6 +27,7 @@ pub(super) struct Launch {
     // Keep the actually opened mount/path descriptors with the account lease,
     // including quarantine. No Drop implementation detaches or removes them.
     _directories: Vec<(PathBuf, std::fs::File)>,
+    _image: Option<std::fs::File>,
     reset_volume_uuid: Option<String>,
 }
 
@@ -55,11 +58,22 @@ fn layout(control: &Path) -> Result<Launch, BrowserError> {
         data: mount.join("data"),
         temporary: mount.join("tmp"),
         _directories: Vec::new(),
+        _image: None,
         reset_volume_uuid: None,
     })
 }
 
 impl Launch {
+    #[cfg(target_os = "macos")]
+    pub(super) fn prepare(control: &Path) -> Result<Self, BrowserError> {
+        prepare::prepare(control)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn prepare(control: &Path) -> Result<Self, BrowserError> {
+        Self::admit(control)
+    }
+
     #[cfg(not(target_os = "macos"))]
     pub(super) fn admit(_control: &Path) -> Result<Self, BrowserError> {
         Err(unavailable("browser_storage_provider_unsupported"))
@@ -68,7 +82,14 @@ impl Launch {
     #[cfg(target_os = "macos")]
     pub(super) fn admit(control: &Path) -> Result<Self, BrowserError> {
         let mut launch = Self::pin_existing(control, true)?;
-        launch.reset_volume_uuid = reset::launch_volume_uuid(&launch.data_root)?;
+        let registered = prepare::registered_uuid(&launch.data_root)?;
+        let reset = reset::launch_volume_uuid(&launch.data_root)?;
+        let actual = reset::inspect_for_launch(&launch)?.volume_uuid;
+        if registered.is_some_and(|uuid| uuid != actual)
+            || reset.is_some_and(|uuid| uuid != actual.to_string()) {
+            return Err(unavailable("browser_storage_backing_identity_changed"));
+        }
+        launch.reset_volume_uuid = Some(actual.to_string());
         Ok(launch)
     }
 
@@ -90,11 +111,13 @@ impl Launch {
         }
         let root = launch.data_root.join("browser-storage-v1");
         let image = root.join("account.dmg");
-        let image_metadata = std::fs::symlink_metadata(&image)
+        let image_file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&image)
             .map_err(|_| unavailable("browser_storage_provider_not_ready"))?;
+        let image_metadata = image_file.metadata().map_err(|_| unavailable("browser_storage_backing_invalid"))?;
         if !image_metadata.is_file()
             || image_metadata.file_type().is_symlink()
             || image_metadata.len() != IMAGE_BYTES
+            || image_metadata.nlink() != 1
             || image_metadata.uid() != unsafe { libc::geteuid() }
             || image_metadata.permissions().mode() & 0o777 != 0o600
             || std::fs::canonicalize(&image).ok().as_deref() != Some(image.as_path())
@@ -137,7 +160,10 @@ impl Launch {
                 .metadata()
                 .map_err(|_| unavailable("browser_storage_path_invalid"))?;
             if metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.permissions().mode() & 0o777 != 0o700
+                || (if path == &launch.data_root {
+                    let mode = metadata.permissions().mode() & 0o777;
+                    mode & 0o700 != 0o700 || mode & 0o022 != 0
+                } else { metadata.permissions().mode() & 0o777 != 0o700 })
                 || std::fs::canonicalize(path).ok().as_deref() != Some(path.as_path())
                 || (path.starts_with(&mount) && metadata.dev() != mount_metadata.dev())
             {
@@ -145,6 +171,7 @@ impl Launch {
             }
             launch._directories.push((path.to_path_buf(), directory));
         }
+        launch._image = Some(image_file);
         Ok(launch)
     }
 
@@ -189,15 +216,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_manager_refuses_missing_provider_without_spawning_node() {
+    async fn production_manager_refuses_unsafe_storage_before_native_commands_or_node() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path().canonicalize().unwrap();
         let manager = super::super::BrowserManager::with_profile_root(home.join("browser-profiles"));
+        // A regular sentinel cannot be a storage root. This regression must
+        // never create/attach an image when ordinary unit tests are selected.
+        std::fs::write(home.join("browser-storage-v1"), b"synthetic preserve").unwrap();
         let outcome = manager.open("new-production-storage-admission").await;
         assert!(matches!(outcome, Err(BrowserError::Unavailable(reason))
             if reason.starts_with("browser_storage_")));
         assert!(manager.lifecycle.owners.lock().unwrap().is_empty());
-        assert!(!home.join("browser-storage-v1").exists());
+        assert_eq!(std::fs::read(home.join("browser-storage-v1")).unwrap(), b"synthetic preserve");
         manager.shutdown().await;
     }
 

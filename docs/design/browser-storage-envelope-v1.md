@@ -54,8 +54,9 @@ execution operation. Its proposed command arrays are review material only.
 ## Local production-admission candidate
 
 The production `BrowserManager::with_profile_root` selects bounded storage.
-`browser/storage.rs` admits only an existing private fixed backing and mounted
-path set; it never creates or attaches an image. It pins the opened directories
+`browser/storage.rs` prepares and admits only a private fixed backing and mounted
+path set. `browser/storage/prepare.rs` is the Mac native preparation owner.
+It pins the backing file and opened directories
 with the existing stable account lease. The old derived account directory holds
 only control locks/fences, outside the quota filesystem. An old cookie/database
 entry causes `browser_storage_migration_required`, without reading or moving it.
@@ -68,12 +69,42 @@ control or scratch paths. Readiness must advertise the exact fixed-storage
 capability, so an older v2 host cannot silently ignore the boundary. A missing
 Mac provider returns `browser_storage_provider_not_ready`; unqualified Windows
 or Linux implementations return `browser_storage_provider_unsupported`.
-No fresh-storage provisioning executor is implemented by this source change.
-Missing or unmounted storage refuses browser admission. That is a functional
-gap in first-use/reboot recovery, not a request to deploy on real user data.
-Existing mounted storage can be qualified using the approved isolated fixture.
-The source-only reset candidate described below has not passed Rust or native
-acceptance; the earlier blanket refusal is not counted as working erasure.
+The default Mac shared path now includes first-use creation and clean-reboot
+reattachment in source. It no longer depends on a manually prepared mount.
+Preparation runs in a blocking worker that owns the actual account/reset lease,
+so cancelling an HTTP waiter does not release locks under a running disk step.
+An absent/empty unregistered root may create one 536870912-byte UDIF/UDRW image,
+with a single 402653184-byte quota set at initial APFS format. No overwrite flag,
+sudo, existing-volume resize or default data migration is available.
+
+A private bounded pending record is synced before create or attach. A command
+failure, timeout or uncertain result keeps that fence: a new opener and reset
+cannot blindly replay the operation. A ready record binds the backing inode and
+volume UUID. After a normal reboot, only that same registered file may be
+reattached; a missing/replaced file is never recreated as an empty account.
+An existing unregistered image is refused rather than silently adopted. A
+crash with an unfinished launch or disk mutation retains its fence; this is
+clean-restart recovery, not an automatic repair of an unconfirmed old writer.
+Read-only OS inspection rejects an image attached elsewhere, duplicate
+attachments, additional APFS volumes, sparse/segmented backing and wrong quota.
+Existing role directories are validated, not repaired or replaced. Only a
+newly formatted, native-verified empty volume receives new private role folders.
+Privacy tightening applies only to that new volume/new image, never to an old
+user directory. A non-writable-by-others owned data-root mode of 0755 is accepted
+without changing it; storage and control directories remain private 0700.
+
+Preparation readiness is distinct from writer admission. A full reattached
+volume can become ready for explicit reset, while live launch inspection still
+refuses before the active launch fence, Node or Chromium starts. The free-space
+floor is a pressure check, not a quota claim. The kernel volume quota and fixed
+backing supply the candidate hard bound. The Node inspector is still read-only;
+all create/attach execution stays with the native leased owner.
+
+These are uncompiled source changes, not a tested storage provider. Ordinary
+Rust unit fixtures cannot run image mutations: their compile-time-only runner
+records an attempted step and refuses it. Real source-matched CLI preparation
+is qualified separately against explicitly approved isolated targets. No test
+needs production deployment. The reset candidate below also remains unverified.
 
 Before spawning a native writer, the account owner now writes and syncs a
 bounded launch UUID fence outside quota. A new process refuses any old active
@@ -164,18 +195,15 @@ Those real-Chromium page tests still do not establish native quota acceptance.
    unsupported/fail-closed behavior. This Mac proposal cannot certify their
    native runtime. No driver, privilege grant, system quota or mount setup on
    those platforms is authorized by this preparation.
-7. Decide the supported first-use/platform boundary before enabling this change
-   broadly. Existing-envelope admission is implemented; automatic fresh backing
-   preparation and post-reboot reattachment are not. A minimal future executor
-   would hold the native account/reset lease, create only a nonexistent private
-   536870912-byte backing, set the 402653184-byte quota at first format, and
-   verify actual OS identity before a writer starts. Its bounded pending journal
-   must preserve uncertain create/attach outcomes without overwrite, retry,
-   forced detach, migration or permission escalation. This is source work, not
-   a requirement to perform a production operation for code merge. Current
-   Windows/Linux refusal preserves files but disables the new browser path;
-   it is not claimed as nonbreaking cross-platform support. A Mac-only scope
-   must be accepted explicitly if the original four-platform promise changes.
+7. Qualify the implemented Mac first-use/reboot path and its cancellation/failure
+   boundary before enabling it. This is a runtime proof requirement, not a
+   requirement to perform a production operation for code merge. Windows/Linux
+   still have no storage provider: refusal preserves their files but disables
+   the new browser path, and is not nonbreaking cross-platform support. The
+   minimal current delivery is Mac shared/clean persistence with its required
+   bound; no Windows/Linux driver, quota provider or platform rollout is added.
+   Do not call a deliberate unsupported boundary a completed implementation for
+   those systems, or silently revert shared mode to disposable storage.
 
 ## Approved actual Chromium experiment
 

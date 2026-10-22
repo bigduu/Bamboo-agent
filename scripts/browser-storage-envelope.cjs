@@ -4,8 +4,12 @@
 // Requiring it does not load Playwright or start any native process.
 const { IMAGE_BYTES, QUOTA_BYTES, ACCOUNT_KEY, macSharedStoragePlan,
   validateMacStorageObservation, inspectMacSharedStorage,
-  validateMacStorageResetObservation, inspectMacStorageForReset } = require('../browser-runtime/host.cjs');
+  validateMacStorageResetObservation, inspectMacStorageForReset,
+  validateMacStoragePreparationObservation, inspectMacStorageForPreparation,
+  inspectMacStorageBacking } = require('../browser-runtime/host.cjs');
 
 module.exports = { IMAGE_BYTES, QUOTA_BYTES, ACCOUNT_KEY, macSharedStoragePlan,
   validateMacStorageObservation, inspectMacSharedStorage,
-  validateMacStorageResetObservation, inspectMacStorageForReset };
+  validateMacStorageResetObservation, inspectMacStorageForReset,
+  validateMacStoragePreparationObservation, inspectMacStorageForPreparation,
+  inspectMacStorageBacking };
