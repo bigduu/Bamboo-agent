@@ -27,7 +27,9 @@ async function fixture(t) {
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const url = `http://127.0.0.1:${server.address().port}`;
-  const child = spawn(process.execPath, [path.join(__dirname, 'host.cjs')], {
+  // These are actual Chromium page/routing component tests with mocked native
+  // storage admission, not quota or production-provider acceptance.
+  const child = spawn(process.execPath, [path.join(__dirname, 'test-host-fixture.cjs')], {
     env: { PATH: process.env.PATH, NODE_PATH: process.env.NODE_PATH || '', HOME: home,
       TMPDIR: root, TEMP: root, TMP: root, BAMBOO_BROWSER_DOWNLOAD_ROOT: root,
       BAMBOO_BROWSER_PROFILE_DIR: profile, BAMBOO_BROWSER_HOST_PROTOCOL: '2',

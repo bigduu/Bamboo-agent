@@ -1,10 +1,11 @@
 # Shared browser storage boundary preparation
 
-This is a proposed adapter contract, not an enabled production backend. The
-current shared browser still has no hard storage bound. The open capacity
-finding on PR #2102 continues to block merge. No image creation, attachment,
-quota mutation, production migration or native writer acceptance follows from
-the Node tests in this change.
+Remote PR head `d9154725` is unpublished and still has no hard storage bound. The
+local candidate adds admission to existing bounded storage and explicit native
+root waiting, but its Rust integration is uncompiled and no production storage
+has been prepared. The open capacity finding on PR #2102 continues to block
+merge. No image creation, attachment, quota mutation, production migration or
+all-writer containment acceptance follows from the Node tests in this change.
 
 ## What changed with shared mode
 
@@ -23,8 +24,9 @@ and are not silently imported, evicted or counted as newly bounded data.
 
 ## Prepared component
 
-`scripts/browser-storage-envelope.cjs` supplies an inert Mac plan and a read-only
-inspector. The proposed backing is 536870912 bytes, with a single APFS volume
+`scripts/browser-storage-envelope.cjs` re-exports the canonical plan and read-only
+inspector included in `browser-runtime/host.cjs`; requiring either does not load
+Playwright or launch a native process. The proposed backing is 536870912 bytes, with a single APFS volume
 quota of 402653184 bytes. The one shared account profile and all temporary clean
 context data share that envelope, so each is bounded by the same aggregate
 ceiling. This is a candidate based on the small synthetic experiment, not an
@@ -49,23 +51,68 @@ launch or become a replacement for the trusted adapter's live, leased OS
 inspection. The script has no provision, attach, detach, quota-setting or sudo
 execution operation. Its proposed command arrays are review material only.
 
+## Local production-admission candidate
+
+The production `BrowserManager::with_profile_root` selects bounded storage.
+`browser/storage.rs` admits only an existing private fixed backing and mounted
+path set; it never creates or attaches an image. It pins the opened directories
+with the existing stable account lease. The old derived account directory holds
+only control locks/fences, outside the quota filesystem. An old cookie/database
+entry causes `browser_storage_migration_required`, without reading or moving it.
+All profile, HOME/XDG, temporary and download paths are passed to the host inside
+the envelope; no production ordinary-directory fallback exists.
+
+Before loading Playwright, the host independently reads native backing/quota
+identity through the canonical inspector and rejects inconsistent environment,
+control or scratch paths. Readiness must advertise the exact fixed-storage
+capability, so an older v2 host cannot silently ignore the boundary. A missing
+Mac provider returns `browser_storage_provider_not_ready`; unqualified Windows
+or Linux implementations return `browser_storage_provider_unsupported`.
+No production provisioning policy is selected by this source change. Until
+qualified reset cleanup exists, an existing storage envelope blocks canonical
+reset before history/control deletion instead of falsely claiming erasure.
+
+Pinned Playwright is loaded only after a scoped spawn hook is installed. The
+hook captures the actual native ChildProcess returned for the one expected
+profile; another profile or a second physical root is refused. Normal cleanup
+waits that root's close event and zero status after Playwright close fulfills.
+Production also reads its actual PID/PGID and requires a dedicated host group
+before overriding Playwright's detached root launch with group inheritance.
+This targets the preserved Node-group counterexample; it does not use
+`--single-process` or merge renderer/GPU processes. Unconfirmed cleanup requests
+a stop through the captured ChildProcess handle, never a stale numeric PID.
+Playwright's own detached-group force-kill assumption is no longer sufficient;
+the captured-handle path and native owner's existing deadline/group fallback
+therefore remain required. No close deadline is increased by this candidate.
+Missing capture, abnormal close or a missing close event preserves scratch and
+an unconfirmed outcome. This is a stronger root-wait boundary; it **does not**
+prove arbitrary detached descendants exited. Forced paths retain the existing
+durable quarantine and cannot use root exit as a permission to detach an image.
+
+Trusted filesystem `ENOSPC`/`EDQUOT` errors are capacity refusals; `EIO` and the
+observed Chromium `DataError: Failed to write blobs (IOError)` remain unconfirmed
+I/O. An origin `QuotaExceededError` is a separate origin limit, and page text is
+never promoted to native ENOSPC. Checkpoint failures preserve the old in-memory
+receipt, retire the shared writer and do not automatically retry the write.
+
+Existing synthetic page/EOF component fixtures now select explicit test-only
+storage admission. The Rust fixture constructor is absent from production
+builds; `test-host-fixture.cjs` is excluded from the three-file published host.
+Those real-Chromium page tests still do not establish native quota acceptance.
+
 ## Remaining production work
 
-1. A native owner must hold a stable process-shared storage lease outside the
-   mount, create/open the one backing under an explicitly approved policy, and
-   bind current OS identity to opened paths before browser readiness. Existing
-   unbounded data must cause an explicit migration-required refusal, not an
-   automatic copy, truncation, reinitialization or second backing allocation.
-2. `BrowserSession::spawn_protocol` currently allocates its scratch under the
-   ordinary host temporary directory and inherits HOME. It must use the verified
-   envelope for every owned writable path. Profile data may move only through
-   the approved adapter; stable lifecycle/reset lock inodes stay outside the
-   mount. The three-file published host format must remain coordinated.
-3. Unknown-writer/close-pending metadata must remain durably writable **outside**
-   the potentially full profile filesystem. Otherwise ENOSPC can prevent the
-   fence itself. Metadata remains a small fixed per-account record, with no page
-   payload, rather than an unbounded journal. Existing marker/lease recovery and
-   reset ordering must be retained and revalidated for the new paths.
+1. Qualify the native admission/held-descriptor and all-write-path wiring with
+   the coordinated Rust checks and an actual product fixture. No new Rust source
+   is represented as compiled by the Node results. Storage creation/attachment
+   and any old-data migration remain outside the existing experiment grant.
+2. Finish a qualified reset/recovery provider that preserves account data on
+   failure and checks writer exit before erasure. The current explicit refusal
+   is a feature boundary, not a completed reset implementation. Keep the
+   three-file published host format and existing locks/epochs.
+3. Revalidate the outside-quota control fence and stable account lock through
+   full-volume errors, restart and unknown writer recovery. Keep metadata
+   bounded; do not turn it into a page-data journal or clear it on uncertainty.
 4. Quota/full/I/O errors must preserve existing data and report an unconfirmed
    operation. No automatic eviction, changed timeout, retry or unbounded
    directory fallback is acceptable. APFS-full recovery and checkpoint failure

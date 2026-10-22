@@ -7,6 +7,7 @@ mod concurrent_drain_tests;
 mod persistence_tests;
 mod profile;
 mod shared;
+mod storage;
 pub use shared::BrowserProfileMode;
 #[cfg(test)]
 mod reset_tests;
@@ -140,6 +141,7 @@ pub struct BrowserManager {
 /// A cleanup record survives the final session Arc and its detached reaper.
 #[derive(Default)]
 struct BrowserLifecycle {
+    bounded_storage: bool,
     stopping: AtomicBool,
     reset_epoch: AtomicU64,
     opens: tokio::sync::RwLock<()>,
@@ -580,11 +582,23 @@ impl BrowserSession {
     }
 
     async fn spawn_protocol(
-        profile_lease: Option<profile::Lease>,
+        mut profile_lease: Option<profile::Lease>,
         lifecycle: &BrowserLifecycle,
         shared: bool,
     ) -> Result<Arc<Self>, BrowserError> {
         let script = host_script();
+        #[cfg(test)]
+        let script = if shared
+            && !lifecycle.bounded_storage
+            && std::env::var_os("BAMBOO_BROWSER_HOST_SCRIPT").is_none()
+        {
+            // Explicit component fixture: real pages/EOF, mocked quota only.
+            // This path and constructor do not exist in production builds.
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../browser-runtime/test-host-fixture.cjs")
+        } else {
+            script
+        };
         if !script.is_file() {
             return Err(BrowserError::Unavailable(format!(
                 "host script not found at {} (set BAMBOO_BROWSER_HOST_SCRIPT)",
@@ -600,12 +614,25 @@ impl BrowserSession {
         if let Some(lease) = &profile_lease {
             command.env("BAMBOO_BROWSER_PROFILE_DIR", &lease.path);
         }
-        let temp_dir = tempfile::Builder::new()
-            .prefix("bamboo-browser-session-")
-            .tempdir()
-            .map_err(|_| {
-                BrowserError::Unavailable("unable to create browser temporary directory".into())
+        if lifecycle.bounded_storage {
+            let lease = profile_lease.as_mut().ok_or_else(|| {
+                BrowserError::Unavailable("browser_storage_control_invalid".into())
             })?;
+            lease.storage = Some(Arc::new(storage::Launch::admit(&lease.path)?));
+        }
+        let bounded = profile_lease.as_ref().and_then(|lease| lease.storage.as_ref());
+        if let Some(storage) = bounded {
+            storage.configure(&mut command);
+        }
+        let mut temporary = tempfile::Builder::new();
+        temporary.prefix("bamboo-browser-session-");
+        let temp_dir = match bounded {
+            Some(storage) => temporary.tempdir_in(&storage.temporary),
+            None => temporary.tempdir(),
+        }
+        .map_err(|_| {
+            BrowserError::Unavailable("unable to create browser temporary directory".into())
+        })?;
         command.env("TMPDIR", temp_dir.path());
         // Node's os.tmpdir() uses TEMP/TMP on Windows. The host also receives
         // this owned path explicitly for its download directory.
@@ -636,7 +663,9 @@ impl BrowserSession {
         abort_guard.disarm();
         let readiness = readiness?;
         let generation = session.handshake_generation.lock().unwrap().clone();
-        if shared && !shared::valid_handshake(&readiness, generation.as_deref()) {
+        if shared
+            && !shared::valid_handshake(&readiness, generation.as_deref(), lifecycle.bounded_storage)
+        {
             let _ = session.begin_retirement("incompatible shared browser host");
             session.terminate("incompatible shared browser host").await;
             return Err(BrowserError::Unavailable(
@@ -794,6 +823,9 @@ impl BrowserSession {
                         Some("dialog_pending") => BrowserError::DialogPending,
                         Some("invalid_url" | "invalid_request") => {
                             BrowserError::Invalid(error.to_string())
+                        }
+                        Some("browser_storage_unavailable") => {
+                            BrowserError::Unavailable(error.to_string())
                         }
                         _ => BrowserError::Failed(error.to_string()),
                     })
@@ -2047,7 +2079,7 @@ mod tests {
     async fn closing_a_chat_releases_its_profile_after_reaping_with_old_references_alive() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("browser-profiles");
-        let browser = BrowserManager::with_profile_root(root.clone());
+        let browser = BrowserManager::with_fixture_profile_root(root.clone());
         let session = fake_host("cat >/dev/null", &[]);
         *session.profile_lease.lock().unwrap() = Some(profile::acquire(&root, "chat-a").unwrap());
         browser
@@ -2073,7 +2105,7 @@ mod tests {
     async fn idle_reclamation_releases_the_profile_without_deleting_durable_state() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("browser-profiles");
-        let browser = BrowserManager::with_profile_root(root.clone());
+        let browser = BrowserManager::with_fixture_profile_root(root.clone());
         let lease = profile::acquire(&root, "idle-chat").unwrap();
         let path = lease.path.clone();
         let sentinel = path.join("synthetic-site-data");
@@ -2125,7 +2157,7 @@ mod tests {
         });
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("browser-profiles");
-        let browser = BrowserManager::with_profile_root(root.clone());
+        let browser = BrowserManager::with_fixture_profile_root(root.clone());
         let opened = browser.open("chat-a").await.unwrap();
         assert_eq!(opened["profile_mode"], "shared");
         assert_eq!(
@@ -2207,7 +2239,7 @@ mod tests {
         browser.close("chat-a").await.unwrap();
         assert!(profile::acquire_shared(&root).is_ok());
 
-        let restarted = BrowserManager::with_profile_root(root);
+        let restarted = BrowserManager::with_fixture_profile_root(root);
         let opened = restarted.open("chat-a").await.unwrap();
         let page = restarted
             .command(
@@ -2273,6 +2305,21 @@ impl BrowserManager {
     /// Production supplies a data-directory-owned root. Default managers used
     /// by isolated protocol tests retain their explicitly ephemeral behavior.
     pub fn with_profile_root(root: PathBuf) -> Self {
+        Self {
+            profile_root: Some(Arc::new(root)),
+            lifecycle: Arc::new(BrowserLifecycle {
+                bounded_storage: true,
+                ..BrowserLifecycle::default()
+            }),
+            ..Self::default()
+        }
+    }
+
+    // Existing protocol/EOF fixtures have no real browser or kernel storage
+    // provider. Their explicit constructor is absent from production builds.
+    // New storage-admission tests always exercise with_profile_root instead.
+    #[cfg(test)]
+    fn with_fixture_profile_root(root: PathBuf) -> Self {
         Self {
             profile_root: Some(Arc::new(root)),
             ..Self::default()

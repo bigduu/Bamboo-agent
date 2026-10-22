@@ -9,7 +9,7 @@ async fn durable_retirement_releases_memory_and_blocks_a_restarted_manager() {
     let owner = profile::acquire(&root, "deleted").unwrap();
     let path = owner.path.clone();
     drop(owner);
-    let browser = BrowserManager::with_profile_root(root.clone());
+    let browser = BrowserManager::with_fixture_profile_root(root.clone());
     browser.retire("deleted").await.unwrap();
     assert!(!path.exists());
     assert!(
@@ -21,7 +21,7 @@ async fn durable_retirement_releases_memory_and_blocks_a_restarted_manager() {
         Err(BrowserError::NotOpen)
     ));
     assert!(matches!(
-        BrowserManager::with_profile_root(root)
+        BrowserManager::with_fixture_profile_root(root)
             .open("deleted")
             .await,
         Err(BrowserError::NotOpen)
@@ -40,7 +40,7 @@ async fn retirement_marker_barrier_failure_keeps_the_memory_fence_until_retry() 
     let root = home.path().join("profiles");
     let owner = profile::acquire(&root, "deleted").unwrap();
     drop(owner);
-    let browser = BrowserManager::with_profile_root(root.clone());
+    let browser = BrowserManager::with_fixture_profile_root(root.clone());
     let leases = root.join(".bamboo-profile-leases");
     std::fs::set_permissions(&leases, std::fs::Permissions::from_mode(0o300)).unwrap();
     let result = browser.retire("deleted").await;
@@ -59,7 +59,7 @@ async fn retirement_marker_barrier_failure_keeps_the_memory_fence_until_retry() 
     );
     assert!(browser.retired.lock().unwrap().is_empty());
     assert!(matches!(
-        BrowserManager::with_profile_root(root)
+        BrowserManager::with_fixture_profile_root(root)
             .open("deleted")
             .await,
         Err(BrowserError::NotOpen)
@@ -78,7 +78,7 @@ async fn retiring_a_closed_chat_purges_only_its_persisted_profile() {
     let other_cookie = other.path.join("Cookies");
     std::fs::write(&other_cookie, b"other synthetic state").unwrap();
     drop(deleted);
-    let browser = BrowserManager::with_profile_root(root);
+    let browser = BrowserManager::with_fixture_profile_root(root);
 
     browser.retire("deleted").await.unwrap();
     assert!(!path.exists(), "deleted chat retained its site data");
@@ -97,7 +97,7 @@ async fn retiring_a_closed_chat_purges_only_its_persisted_profile() {
 async fn retiring_a_missing_chat_does_not_create_profile_directories() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("profiles");
-    BrowserManager::with_profile_root(root.clone())
+    BrowserManager::with_fixture_profile_root(root.clone())
         .retire("absent")
         .await
         .unwrap();
@@ -111,7 +111,7 @@ async fn retiring_a_chat_refuses_to_remove_another_live_owners_profile() {
     let owner = profile::acquire(&root, "deleted").unwrap();
     let path = owner.path.clone();
     std::fs::write(path.join("Cookies"), b"synthetic state").unwrap();
-    let browser = BrowserManager::with_profile_root(root);
+    let browser = BrowserManager::with_fixture_profile_root(root);
 
     assert!(browser.retire("deleted").await.is_err());
     assert_eq!(
@@ -138,7 +138,7 @@ async fn retiring_an_unconfirmed_closed_profile_purges_its_checkpoint() {
     drop(owner);
     assert!(profile::acquire(&root, "deleted").is_err());
 
-    BrowserManager::with_profile_root(root)
+    BrowserManager::with_fixture_profile_root(root)
         .retire("deleted")
         .await
         .unwrap();
@@ -169,7 +169,7 @@ async fn retiring_a_live_chat_reaps_its_host_before_purging_with_old_arcs_alive(
     let root = temporary.path().join("profiles");
     let marker = temporary.path().join("profile-existed-at-eof");
     let (session, path) = closing_host(&root, &marker, 0);
-    let browser = BrowserManager::with_profile_root(root);
+    let browser = BrowserManager::with_fixture_profile_root(root);
     browser
         .sessions
         .lock()
@@ -198,7 +198,7 @@ async fn retiring_a_nonzero_host_exit_still_purges_after_reaping() {
     let root = temporary.path().join("profiles");
     let marker = temporary.path().join("profile-existed-at-eof");
     let (session, path) = closing_host(&root, &marker, 23);
-    let browser = BrowserManager::with_profile_root(root);
+    let browser = BrowserManager::with_fixture_profile_root(root);
     browser
         .sessions
         .lock()
@@ -226,7 +226,7 @@ async fn cancelled_retirement_waiter_does_not_abandon_profile_deletion() {
     let root = temporary.path().join("profiles");
     let marker = temporary.path().join("profile-existed-at-eof");
     let (session, path) = closing_host(&root, &marker, 0);
-    let browser = BrowserManager::with_profile_root(root);
+    let browser = BrowserManager::with_fixture_profile_root(root);
     browser
         .sessions
         .lock()
@@ -266,7 +266,7 @@ async fn retirement_rejects_profile_symlinks_and_does_not_follow_internal_links(
     let sentinel = outside.join("Cookies");
     std::fs::write(&sentinel, b"outside synthetic state").unwrap();
     std::os::unix::fs::symlink(&outside, &path).unwrap();
-    let browser = BrowserManager::with_profile_root(root.clone());
+    let browser = BrowserManager::with_fixture_profile_root(root.clone());
     assert!(browser.retire("deleted").await.is_err());
     assert_eq!(
         std::fs::read(&sentinel).unwrap(),
@@ -301,7 +301,7 @@ async fn retirement_cannot_pass_an_opener_that_has_not_created_its_directory() {
         )))
         .unwrap();
     fs2::FileExt::try_lock_exclusive(&lock).unwrap();
-    let browser = BrowserManager::with_profile_root(root);
+    let browser = BrowserManager::with_fixture_profile_root(root);
     assert!(browser.retire("deleted").await.is_err());
     assert!(!path.exists());
     drop(lock);
@@ -328,7 +328,7 @@ async fn retirement_keeps_the_stable_lock_inode_and_preopened_descriptors_exclus
         .unwrap();
     let before = competing.metadata().unwrap();
     drop(owner);
-    BrowserManager::with_profile_root(root.clone())
+    BrowserManager::with_fixture_profile_root(root.clone())
         .retire("deleted")
         .await
         .unwrap();
@@ -362,7 +362,7 @@ async fn retirement_io_failure_is_reported_and_can_be_retried() {
     let path = owner.path.clone();
     std::fs::write(path.join("Cookies"), b"synthetic state").unwrap();
     drop(owner);
-    let browser = BrowserManager::with_profile_root(root);
+    let browser = BrowserManager::with_fixture_profile_root(root);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
     let result = browser.retire("deleted").await;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();

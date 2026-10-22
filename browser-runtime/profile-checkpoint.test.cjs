@@ -15,7 +15,7 @@ function deferred() {
 
 // Execute the actual host checkpoint function with real private files. Only
 // directory sync is gated/faulted; no Chromium, account or user profile enters.
-async function fixture(t, { failSync = false, platform = process.platform } = {}) {
+async function fixture(t, { failSync = false, syncCode = 'EIO', platform = process.platform } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'bamboo-checkpoint-barrier-'));
   const profileKey = 'a'.repeat(64);
   const directory = path.join(root, profileKey);
@@ -44,7 +44,7 @@ async function fixture(t, { failSync = false, platform = process.platform } = {}
         async sync() {
           events.push('directory-sync-entered');
           entered.resolve();
-          if (failSync) throw Object.assign(new Error('synthetic directory sync failure'), { code: 'EIO' });
+          if (failSync) throw Object.assign(new Error('synthetic directory sync failure'), { code: syncCode });
           await release.promise;
           await handle.sync();
           events.push('directory-synced');
@@ -114,13 +114,14 @@ test('cookie checkpoint directory-sync failure fails closed without advancing it
   skip: process.platform === 'win32',
 }, async t => {
   const f = await fixture(t, { failSync: true });
-  await assert.rejects(f.api.checkpoint(), error => error.code === 'browser_profile_unavailable');
+  await assert.rejects(f.api.checkpoint(), error => error.code === 'browser_storage_unavailable' &&
+    error.reason === 'browser_storage_io_unconfirmed' && error.cause.code === 'EIO');
   assert.equal(f.api.state().bytes, f.oldBytes);
   assert.equal(f.api.state().failed, true);
   assert.equal(f.api.state().retire, true);
   assert.deepEqual(f.events, ['renamed', 'directory-sync-entered', 'directory-closed']);
   assert.deepEqual(JSON.parse(await fs.readFile(f.target, 'utf8')).cookies, []);
-  await assert.rejects(f.api.checkpoint(), error => error.code === 'browser_profile_unavailable');
+  await assert.rejects(f.api.checkpoint(), error => error.code === 'browser_storage_unavailable');
   assert.equal(f.events.filter(event => event === 'renamed').length, 1);
 });
 
@@ -129,4 +130,17 @@ test('cookie checkpoint keeps the existing Windows path without a directory fsyn
   await f.api.checkpoint();
   assert.deepEqual(f.events, ['renamed']);
   assert.deepEqual(JSON.parse(f.api.state().bytes).cookies, []);
+});
+
+for (const syncCode of ['ENOSPC', 'EDQUOT']) test(`checkpoint ${syncCode} preserves unconfirmed state and retires the account writer`, {
+  skip: process.platform === 'win32',
+}, async t => {
+  const f = await fixture(t, { failSync: true, syncCode });
+  await assert.rejects(f.api.checkpoint(), error => error.code === 'browser_storage_unavailable' &&
+    error.reason === 'browser_storage_full' && error.cause.code === syncCode);
+  assert.equal(f.api.state().bytes, f.oldBytes);
+  assert.equal(f.api.state().failed, true);
+  assert.equal(f.api.state().retire, true);
+  await assert.rejects(f.api.checkpoint(), error => error.reason === 'browser_storage_full');
+  assert.equal(f.events.filter(event => event === 'renamed').length, 1, 'no automatic write replay');
 });

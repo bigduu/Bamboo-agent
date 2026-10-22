@@ -29,7 +29,7 @@ fn handle() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..24].to_owned()
 }
 
-pub(super) fn valid_handshake(value: &Value, generation: Option<&str>) -> bool {
+pub(super) fn valid_handshake(value: &Value, generation: Option<&str>, bounded_storage: bool) -> bool {
     value.get("protocol_version").and_then(Value::as_u64) == Some(2)
         && generation.is_some_and(valid_handle)
         && value.get("host_generation").and_then(Value::as_str) == generation
@@ -39,6 +39,30 @@ pub(super) fn valid_handshake(value: &Value, generation: Option<&str>) -> bool {
             .is_some_and(valid_handle)
         && value.get("scope_count").and_then(Value::as_u64) == Some(0)
         && value.get("profile_modes") == Some(&json!(["shared", "clean"]))
+        && (!bounded_storage || value.get("storage_boundary") == Some(&json!({
+            "provider": "mac_apfs_fixed_v1", "image_bytes": 536_870_912,
+            "quota_bytes": 402_653_184, "native_root_tracking": 1,
+            "native_group": "host_inherited_v1"
+        })))
+}
+
+#[cfg(test)]
+#[test]
+fn production_readiness_requires_exact_bounded_storage_capability() {
+    let generation = "a".repeat(24);
+    let mut value = json!({"protocol_version":2,"host_generation":generation,
+        "browser_instance_id":"b".repeat(24),"scope_count":0,"profile_modes":["shared","clean"]});
+    assert!(valid_handshake(&value, Some(&generation), false));
+    assert!(!valid_handshake(&value, Some(&generation), true));
+    value["storage_boundary"] = json!({"provider":"mac_apfs_fixed_v1",
+        "image_bytes":536_870_912,"quota_bytes":402_653_184,"native_root_tracking":1,
+        "native_group":"host_inherited_v1"});
+    assert!(valid_handshake(&value, Some(&generation), true));
+    value["storage_boundary"]["quota_bytes"] = json!(402_653_185);
+    assert!(!valid_handshake(&value, Some(&generation), true));
+    value["storage_boundary"]["quota_bytes"] = json!(402_653_184);
+    value["storage_boundary"]["all_descendants_proven"] = json!(true);
+    assert!(!valid_handshake(&value, Some(&generation), true));
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -219,7 +243,7 @@ impl SharedRuntime {
                 Some("dialog_pending") => BrowserError::DialogPending,
                 Some("browser_busy") => BrowserError::Busy,
                 Some("invalid_url" | "invalid_request") => BrowserError::Invalid(error.into()),
-                Some("browser_unavailable") => {
+                Some("browser_unavailable" | "browser_storage_unavailable") => {
                     self.core.mark_dead("shared browser runtime unavailable");
                     BrowserError::Unavailable(error.into())
                 }

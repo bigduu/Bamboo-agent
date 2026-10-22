@@ -33,6 +33,7 @@ function fixture(options = {}) {
     checkpointProfile: options.checkpoint || (async () => {}),
     context: { pages: () => [], close: async () => { counts.context++; await options.contextClose?.(); } },
     browser: { close: async () => { counts.browser++; await options.browserClose?.(); } },
+    nativeRoots: options.nativeRoots,
     process: { exit(code) { scope.forcedExit = code; } },
     shuttingDown: false, hostClose: undefined, browserClosed: false,
     hostRuntime: null,
@@ -99,4 +100,30 @@ test('abnormal retirement retains scratch even after the native close calls fulf
   await f.scope.closeHost();
   assert.equal(f.scope.browserClosed, true);
   assert.equal(fs.existsSync(f.marker), true);
+});
+
+test('normal cleanup waits for the captured native root close after Playwright fulfills', async () => {
+  const gate = deferred();
+  const f = fixture({ nativeRoots: { waitClosed: () => gate.promise } });
+  const close = f.scope.closeHost();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(f.counts, { context: 1, browser: 1 });
+  const before = { closed: f.scope.browserClosed, scratch: fs.existsSync(f.marker) };
+  gate.resolve(); await close;
+  assert.equal(before.closed, false);
+  assert.equal(before.scratch, true);
+  assert.equal(f.scope.browserClosed, true);
+  assert.equal(fs.existsSync(f.marker), false);
+});
+
+test('native root wait refusal retains scratch even when both Playwright closes fulfill', async () => {
+  let stops = 0;
+  const f = fixture({ nativeRoots: { waitClosed: async () => {
+    throw Object.assign(new Error('synthetic native root unconfirmed'), { code: 'browser_writer_exit_unconfirmed' });
+  }, stopCapturedRoots() { stops++; } } });
+  await assert.rejects(f.scope.closeHost(), e => e.code === 'browser_writer_exit_unconfirmed');
+  assert.deepEqual(f.counts, { context: 1, browser: 1 });
+  assert.equal(f.scope.browserClosed, false);
+  assert.equal(fs.existsSync(f.marker), true);
+  assert.equal(stops, 1, 'request a stop only through the captured native handles');
 });

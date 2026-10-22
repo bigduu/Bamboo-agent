@@ -142,11 +142,13 @@ fn concurrent_drain_process_fixture() {
         .build()
         .unwrap()
         .block_on(async {
-            let state = actix_web::web::Data::new(
-                crate::app_state::AppState::new(fixture.join("data"))
-                    .await
-                    .unwrap(),
-            );
+            let mut state = crate::app_state::AppState::new(fixture.join("data"))
+                .await
+                .unwrap();
+            state.browser = Arc::new(BrowserManager::with_fixture_profile_root(
+                fixture.join("data").join("browser-profiles"),
+            ));
+            let state = actix_web::web::Data::new(state);
             let root = Session::new("concurrent-drain-root", "synthetic-model");
             let deleting = matches!(mode.as_str(), "delete" | "bulk");
             if deleting {

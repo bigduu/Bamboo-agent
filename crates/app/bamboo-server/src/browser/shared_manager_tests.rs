@@ -59,7 +59,7 @@ fn two_chats_share_one_process_and_deleting_one_preserves_its_sibling_and_accoun
                 .unwrap()
                 .block_on(async {
                     let root = home.join("profiles");
-                    let manager = BrowserManager::with_profile_root(root.clone());
+                    let manager = BrowserManager::with_fixture_profile_root(root.clone());
                     let (a, b) = tokio::join!(
                         manager.open("canonical-chat-a"),
                         manager.open("canonical-chat-b")
@@ -94,7 +94,7 @@ fn two_chats_share_one_process_and_deleting_one_preserves_its_sibling_and_accoun
                     ));
                     manager.shutdown().await;
 
-                    let restarted = BrowserManager::with_profile_root(root);
+                    let restarted = BrowserManager::with_fixture_profile_root(root);
                     assert!(restarted.open("canonical-chat-a").await.is_err());
                     assert_eq!(
                         restarted.open("canonical-chat-c").await.unwrap()["profile_mode"],
@@ -122,7 +122,7 @@ fn active_clean_mode_is_preserved_until_explicit_close_and_reopen() {
                 .build()
                 .unwrap()
                 .block_on(async {
-                    let manager = BrowserManager::with_profile_root(home.join("profiles"));
+                    let manager = BrowserManager::with_fixture_profile_root(home.join("profiles"));
                     let clean = manager
                         .open_with_mode("canonical-clean", Some(BrowserProfileMode::Clean))
                         .await
@@ -172,7 +172,7 @@ fn cancelling_a_chat_mutation_closes_its_scope_without_killing_the_sibling_host(
                 .build()
                 .unwrap()
                 .block_on(async {
-                    let manager = BrowserManager::with_profile_root(home.join("profiles"));
+                    let manager = BrowserManager::with_fixture_profile_root(home.join("profiles"));
                     manager.open("canonical-chat-a").await.unwrap();
                     manager.open("canonical-chat-b").await.unwrap();
                     let owned = manager.clone();
@@ -232,7 +232,7 @@ fn reset_reuses_the_account_key_but_preserves_deleted_chat_fences() {
                 .unwrap()
                 .block_on(async {
                     let root = home.join("profiles");
-                    let manager = BrowserManager::with_profile_root(root.clone());
+                    let manager = BrowserManager::with_fixture_profile_root(root.clone());
                     manager.open("old-canonical-chat").await.unwrap();
                     manager
                         .retire_deleted_session("old-canonical-chat")
@@ -274,7 +274,7 @@ fn wrong_reply_owner_fences_the_runtime_and_retains_unknown_writer_state() {
                 .unwrap()
                 .block_on(async {
                     let root = home.join("profiles");
-                    let manager = BrowserManager::with_profile_root(root);
+                    let manager = BrowserManager::with_fixture_profile_root(root);
                     manager.open("canonical-chat-a").await.unwrap();
                     manager.open("canonical-chat-b").await.unwrap();
                     assert!(manager
@@ -311,7 +311,7 @@ fn cancelled_startup_is_owned_and_shutdown_cannot_admit_another_writer() {
                 .block_on(async {
                     std::fs::write(home.join("delay-handshake"), b"synthetic startup gate")
                         .unwrap();
-                    let manager = BrowserManager::with_profile_root(home.join("profiles"));
+                    let manager = BrowserManager::with_fixture_profile_root(home.join("profiles"));
                     let owned = manager.clone();
                     let opening =
                         tokio::spawn(async move { owned.open("canonical-startup-chat").await });
@@ -366,7 +366,7 @@ fn pending_scope_close_joins_a_global_drain_without_killing_the_checkpoint() {
                 .unwrap()
                 .block_on(async {
                     let root = home.join("profiles");
-                    let manager = BrowserManager::with_profile_root(root);
+                    let manager = BrowserManager::with_fixture_profile_root(root);
                     manager.open("canonical-chat").await.unwrap();
                     let core = manager.shared.test_core().await.unwrap();
                     std::fs::write(home.join("delay-scope-close"), b"synthetic close gate")
@@ -419,7 +419,7 @@ fn a_scoped_mutation_waiting_for_stdin_cannot_run_after_its_chat_is_retired() {
                 .build()
                 .unwrap()
                 .block_on(async {
-                    let manager = BrowserManager::with_profile_root(home.join("profiles"));
+                    let manager = BrowserManager::with_fixture_profile_root(home.join("profiles"));
                     manager.open("canonical-chat-a").await.unwrap();
                     manager.open("canonical-chat-b").await.unwrap();
                     let core = manager.shared.test_core().await.unwrap();
@@ -481,7 +481,7 @@ fn ordinary_backpressure_is_nonfatal_and_scope_cleanup_keeps_reserved_admission(
         "ordinary_backpressure_is_nonfatal_and_scope_cleanup_keeps_reserved_admission",
         |home| {
             tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let manager = BrowserManager::with_profile_root(home.join("profiles"));
+            let manager = BrowserManager::with_fixture_profile_root(home.join("profiles"));
             manager.open("canonical-chat-a").await.unwrap();
             manager.open("canonical-chat-b").await.unwrap();
             let core = manager.shared.test_core().await.unwrap();

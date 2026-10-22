@@ -98,7 +98,7 @@ async fn marker_io_failure_keeps_the_live_owner_until_close_can_be_fenced() {
     command.process_group(0);
     let session = BrowserSession::from_child(command.spawn().unwrap(), None).unwrap();
     *session.profile_lease.lock().unwrap() = Some(lease);
-    let manager = BrowserManager::with_profile_root(root.clone());
+    let manager = BrowserManager::with_fixture_profile_root(root.clone());
     manager
         .sessions
         .lock()
@@ -144,7 +144,7 @@ async fn marker_io_failure_keeps_drop_and_the_lease_until_a_durable_fence_exists
     let session = BrowserSession::from_child(child, None).unwrap();
     *session.profile_lease.lock().unwrap() = Some(lease);
     session.kill_issued.store(true, Ordering::Release);
-    let manager = BrowserManager::with_profile_root(root.clone());
+    let manager = BrowserManager::with_fixture_profile_root(root.clone());
     manager.sessions.lock().await.insert("chat".into(), session);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
     let (finished, receiver) = std::sync::mpsc::channel();
@@ -199,7 +199,7 @@ fn profile_reaper_can_finish_after_the_async_runtime_has_stopped() {
         let scratch_path = scratch.path().to_path_buf();
         let session = BrowserSession::from_child(child, Some(scratch)).unwrap();
         *session.profile_lease.lock().unwrap() = Some(profile::acquire(&root, "chat").unwrap());
-        let manager = BrowserManager::with_profile_root(root.clone());
+        let manager = BrowserManager::with_fixture_profile_root(root.clone());
         manager.sessions.lock().await.insert("chat".into(), session);
         (manager, pid, scratch_path)
     });
@@ -245,7 +245,7 @@ async fn unconfirmed_profile_close_blocks_replay_and_discards_queued_writes() {
     let checkpoint = lease.path.join(".bamboo-session-cookies-v1.json");
     std::fs::write(&checkpoint, b"synthetic previous checkpoint").unwrap();
     *session.profile_lease.lock().unwrap() = Some(lease);
-    let manager = BrowserManager::with_profile_root(root.clone());
+    let manager = BrowserManager::with_fixture_profile_root(root.clone());
     manager
         .sessions
         .lock()
@@ -301,7 +301,7 @@ async fn nonzero_host_exit_cannot_claim_a_confirmed_profile_close() {
     command.process_group(0);
     let session = BrowserSession::from_child(command.spawn().unwrap(), None).unwrap();
     *session.profile_lease.lock().unwrap() = Some(profile::acquire(&root, "chat").unwrap());
-    let manager = BrowserManager::with_profile_root(root.clone());
+    let manager = BrowserManager::with_fixture_profile_root(root.clone());
     manager
         .sessions
         .lock()
@@ -334,7 +334,7 @@ async fn dropping_manager_keeps_lease_until_a_previously_signalled_child_is_reap
     // Model a stop that has been issued but whose exit has not been observed.
     // A signal flag alone is never evidence that releasing the lease is safe.
     session.kill_issued.store(true, Ordering::Release);
-    let manager = BrowserManager::with_profile_root(root);
+    let manager = BrowserManager::with_fixture_profile_root(root);
     manager
         .sessions
         .lock()
@@ -468,7 +468,7 @@ async fn prepare_immediate_logout() -> (
     let site = LogoutSite::start().await;
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("profiles");
-    let manager = BrowserManager::with_profile_root(root.clone());
+    let manager = BrowserManager::with_fixture_profile_root(root.clone());
     let initial = manager.open("logout-chat").await.unwrap();
     let page = manager
         .command(
@@ -524,7 +524,7 @@ async fn immediate_logout_then_retire(mode: &str) {
         _ => panic!("unknown fixture mode"),
     }
     drop(manager);
-    let reopened = BrowserManager::with_profile_root(root.clone());
+    let reopened = BrowserManager::with_fixture_profile_root(root.clone());
     let initial = tokio::time::timeout(BROWSER_CLOSE_DEADLINE + Duration::from_secs(5), async {
         loop {
             match reopened.open("logout-chat").await {

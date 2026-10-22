@@ -156,7 +156,7 @@ fn queued_open_cannot_launch_after_unknown_writer_fence() {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let browser = BrowserManager::with_profile_root(home.join("profiles"));
+            let browser = BrowserManager::with_fixture_profile_root(home.join("profiles"));
             let gate = browser.session_gate("queued-chat");
             let held_gate = gate.lock().await;
             let mut opening = Box::pin(browser.open("queued-chat"));

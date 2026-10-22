@@ -134,7 +134,10 @@ fn browser_shutdown_process_fixture() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let state = crate::app_state::AppState::new(data.clone()).await.unwrap();
+        let mut state = crate::app_state::AppState::new(data.clone()).await.unwrap();
+        state.browser = Arc::new(BrowserManager::with_fixture_profile_root(
+            data.join("browser-profiles"),
+        ));
         if mode == "startup" {
             let browser = state.browser.clone();
             let opening = tokio::spawn(async move { browser.open("shutdown-chat").await });

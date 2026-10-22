@@ -23,6 +23,9 @@ thread_local! {
 
 pub(super) struct Lease {
     pub(super) path: PathBuf,
+    // Control fences/locks above remain outside quota. The actual browser
+    // profile and scratch are selected by this native bounded-storage owner.
+    pub(super) storage: Option<std::sync::Arc<super::storage::Launch>>,
     _lock: std::fs::File,
     // Never unlink this lock with the profile: queued openers may already hold
     // a descriptor to its inode. Open and deletion use the same stable lock.
@@ -55,7 +58,11 @@ pub(super) fn acquire_chat(root: &Path, session_id: &str) -> Result<ChatLease, B
 }
 
 pub(super) fn acquire_shared(root: &Path) -> Result<Lease, BrowserError> {
-    acquire_key(root, &key(SHARED_ACCOUNT))
+    acquire_key(root, &shared_key())
+}
+
+pub(super) fn shared_key() -> String {
+    key(SHARED_ACCOUNT)
 }
 
 #[cfg(test)]
@@ -283,6 +290,7 @@ fn admission_gate(root: &Path, exclusive: bool) -> Result<std::fs::File, Browser
 pub(super) fn begin_reset(root: &Path) -> Result<std::fs::File, BrowserError> {
     let root = root_directory(root, true)?.ok_or_else(unavailable)?;
     let gate = admission_gate(&root, true)?;
+    super::storage::guard_reset(&root)?;
     // Refuse before any canonical wipe, including a restart that lost the old
     // process's locks. This never clears an unknown writer's durable fence.
     for entry in std::fs::read_dir(&root).map_err(|_| unavailable())? {
@@ -386,6 +394,7 @@ fn acquire_key(root: &Path, profile_key: &str) -> Result<Lease, BrowserError> {
     }
     Ok(Lease {
         path,
+        storage: None,
         _lock: lock,
         _lifecycle_lock: lifecycle_lock,
         _reset_gate: reset_gate,
@@ -595,7 +604,7 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
             .process_group(0);
-        let manager = super::super::BrowserManager::with_profile_root(root.clone());
+        let manager = super::super::BrowserManager::with_fixture_profile_root(root.clone());
         let session = super::super::BrowserSession::from_child_tracked(
             command.spawn().unwrap(),
             None,

@@ -109,6 +109,30 @@ fn dev_reset_reaps_active_host_fences_old_arcs_and_allows_new_chats() {
     check_owned_host_entry("reset");
 }
 
+#[tokio::test]
+async fn unqualified_bounded_storage_refuses_reset_before_canonical_history_deletion() {
+    let data = tempfile::tempdir().unwrap();
+    let state = web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    state.session_store
+        .save_session(&Session::new("bounded-reset-preserve", "synthetic-model"))
+        .await
+        .unwrap();
+    let storage = data.path().join("browser-storage-v1");
+    std::fs::create_dir(&storage).unwrap();
+    let sentinel = storage.join("synthetic-only-not-an-image");
+    std::fs::write(&sentinel, b"preserve synthetic backing").unwrap();
+    let outcome = crate::handlers::agent::dev::reset(state.clone()).await;
+    assert!(outcome.is_err());
+    assert!(state.session_store.load_session("bounded-reset-preserve")
+        .await.unwrap().is_some());
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"preserve synthetic backing");
+    state.shutdown().await;
+}
+
 #[cfg(unix)]
 pub(super) fn check_owned_host_entry(mode: &str) {
     let temporary = tempfile::tempdir().unwrap();
@@ -189,12 +213,15 @@ fn dev_reset_active_host_fixture() {
         .build()
         .unwrap()
         .block_on(async {
-            let state =
-                web::Data::new(crate::app_state::AppState::new(data.clone()).await.unwrap());
+            let mut state = crate::app_state::AppState::new(data.clone()).await.unwrap();
+            state.browser = Arc::new(BrowserManager::with_fixture_profile_root(
+                data.join("browser-profiles"),
+            ));
+            let state = web::Data::new(state);
             let entry = std::env::var("BAMBOO_BROWSER_RESET_ENTRY").unwrap();
             if entry == "gate" {
                 let root = data.join("browser-profiles");
-                let foreign = BrowserManager::with_profile_root(root.clone());
+                let foreign = BrowserManager::with_fixture_profile_root(root.clone());
                 let reset = state.browser.reset_profiles().await.unwrap();
                 // A distinct manager has its own in-memory open gate/epoch.
                 // Only the shared stable file gate can block this new key.

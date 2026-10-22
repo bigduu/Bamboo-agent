@@ -1,13 +1,382 @@
 #!/usr/bin/env node
 // One host owns the account browser; chats own pages and optional clean contexts.
 // Bamboo is the only client: newline-delimited JSON over stdio never exposes a CDP port.
-const { chromium } = require('playwright-core');
+// Load Playwright only inside main, after installing native child tracking.
 const { createHash, randomBytes } = require('node:crypto');
 const { constants: fsConstants } = require('node:fs');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const readline = require('node:readline');
+const assert = require('node:assert/strict');
+const nativeFs = require('node:fs');
+const { isDeepStrictEqual } = require('node:util');
+const { execFileSync } = require('node:child_process');
+
+// Shared by the production host and the read-only inspection CLI. No method
+// here creates, mounts, detaches or deletes a backing image.
+const IMAGE_BYTES = 536_870_912;
+const QUOTA_BYTES = 402_653_184;
+const ACCOUNT_KEY = createHash('sha256')
+  .update('bamboo-browser-shared-account-v1\0').digest('hex');
+
+function absolute(value) {
+  assert.ok(typeof value === 'string' && value.length > 1 && !value.includes('\0') &&
+    path.posix.isAbsolute(value) && path.posix.normalize(value) === value && !value.endsWith('/'),
+  'Expected a canonical absolute path');
+  return value;
+}
+
+function macSharedStoragePlan(dataRoot) {
+  absolute(dataRoot);
+  const root = path.posix.join(dataRoot, 'browser-storage-v1');
+  const image = path.posix.join(root, 'account.dmg');
+  const mount = path.posix.join(root, 'mounted');
+  const volumeName = `BambooBrowser_${createHash('sha256').update(dataRoot).digest('hex').slice(0, 12)}`;
+  const paths = {
+    profile: path.posix.join(mount, 'profiles', ACCOUNT_KEY),
+    home: path.posix.join(mount, 'home'),
+    cache: path.posix.join(mount, 'cache'),
+    config: path.posix.join(mount, 'config'),
+    data: path.posix.join(mount, 'data'),
+    temporary: path.posix.join(mount, 'tmp'),
+    downloads: path.posix.join(mount, 'downloads'),
+  };
+  return {
+    kind: 'mac_shared_browser_storage_plan_v1', dataRoot, root, image, mount,
+    imageBytes: IMAGE_BYTES, quotaBytes: QUOTA_BYTES, accountKey: ACCOUNT_KEY, paths,
+    // Preview only. Creation/mounting requires a separate concrete grant and
+    // an adapter that checks exclusive ownership and actual OS readback.
+    proposedCommands: [
+      { executable: '/usr/bin/hdiutil', arguments: ['create', '-size', '512m',
+        '-type', 'UDIF', '-fs', 'APFS', '-fsargs', `-q ${QUOTA_BYTES}`,
+        '-volname', volumeName, image] },
+      { executable: '/usr/bin/hdiutil', arguments: ['attach', '-plist', '-nobrowse',
+        '-mountpoint', mount, image] },
+    ],
+    launchPaths: {
+      userDataDir: paths.profile, downloadsPath: paths.downloads,
+      environment: { HOME: paths.home, XDG_CACHE_HOME: paths.cache,
+        XDG_CONFIG_HOME: paths.config, XDG_DATA_HOME: paths.data,
+        TMPDIR: paths.temporary, TEMP: paths.temporary, TMP: paths.temporary,
+        BAMBOO_BROWSER_PROFILE_DIR: paths.profile,
+        BAMBOO_BROWSER_DOWNLOAD_ROOT: paths.downloads },
+    },
+  };
+}
+
+function keys(value, expected) {
+  assert.ok(value && typeof value === 'object' && !Array.isArray(value));
+  assert.deepEqual(Object.keys(value).sort(), [...expected].sort());
+}
+
+function privateDirectory(value, expectedPath, device, owner) {
+  keys(value, ['path', 'realPath', 'directory', 'symlink', 'device', 'uid', 'mode']);
+  assert.equal(value.path, expectedPath);
+  assert.equal(value.realPath, expectedPath);
+  assert.equal(value.directory, true);
+  assert.equal(value.symlink, false);
+  assert.equal(value.device, device);
+  assert.equal(value.uid, owner);
+  assert.ok(Number.isSafeInteger(value.mode) && value.mode >= 0 && value.mode <= 0xffff &&
+    (value.mode & 0o777) === 0o700, 'Storage directories must be private');
+}
+
+// An OS adapter must collect these observations itself, with its stable lease
+// held, binding hdiutil backing identity to diskutil volume/quota and opened
+// path descriptors. Caller JSON, an old receipt or a mount path alone is not
+// evidence. Passing this structural check never authorizes launch or detach.
+function validateMacStorageObservation(plan, value) {
+  assert.ok(isDeepStrictEqual(plan, macSharedStoragePlan(plan.dataRoot)), 'Storage plan changed');
+  keys(value, ['ownerUid', 'image', 'attachment', 'volume', 'mount', 'paths']);
+  assert.ok(Number.isSafeInteger(value.ownerUid) && value.ownerUid >= 0);
+  const image = value.image;
+  keys(image, ['path', 'realPath', 'regular', 'symlink', 'uid', 'mode', 'device',
+    'sizeBytes', 'virtualBytes', 'format', 'segments']);
+  assert.equal(image.path, plan.image);
+  assert.equal(image.realPath, plan.image);
+  assert.equal(image.regular, true);
+  assert.equal(image.symlink, false);
+  assert.equal(image.uid, value.ownerUid);
+  assert.ok(Number.isSafeInteger(image.mode) && image.mode >= 0 && image.mode <= 0xffff);
+  assert.equal(image.mode & 0o777, 0o600);
+  assert.equal(image.sizeBytes, IMAGE_BYTES);
+  assert.equal(image.virtualBytes, IMAGE_BYTES);
+  assert.equal(image.format, 'UDRW');
+  assert.deepEqual(image.segments, [plan.image]);
+  const volume = value.volume;
+  keys(volume, ['uuid', 'deviceIdentifier', 'quotaBytes', 'usedBytes', 'filesystem', 'writable']);
+  assert.match(volume.uuid, /^[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}$/i);
+  assert.match(volume.deviceIdentifier, /^disk[0-9]+s[0-9]+$/);
+  assert.equal(volume.quotaBytes, QUOTA_BYTES);
+  assert.ok(Number.isSafeInteger(volume.usedBytes) && volume.usedBytes >= 0 &&
+    volume.usedBytes < QUOTA_BYTES, 'Full or unconfirmed storage refuses admission');
+  assert.equal(volume.filesystem, 'apfs');
+  assert.equal(volume.writable, true);
+  keys(value.attachment, ['imagePath', 'volumeDevice', 'volumeUuid', 'mountPoint']);
+  assert.equal(value.attachment.imagePath, plan.image);
+  assert.equal(value.attachment.volumeDevice, volume.deviceIdentifier);
+  assert.equal(value.attachment.volumeUuid, volume.uuid);
+  assert.equal(value.attachment.mountPoint, plan.mount);
+  const mount = value.mount;
+  assert.ok(Number.isSafeInteger(mount.device) && mount.device > 0);
+  assert.ok(Number.isSafeInteger(image.device) && image.device > 0);
+  assert.notEqual(mount.device, image.device, 'An ordinary folder is not a mounted image');
+  privateDirectory(mount, plan.mount, mount.device, value.ownerUid);
+  keys(value.paths, Object.keys(plan.paths));
+  for (const [role, target] of Object.entries(plan.paths)) {
+    privateDirectory(value.paths[role], target, mount.device, value.ownerUid);
+  }
+  return { kind: 'validated_mac_storage_observation_v1', image: plan.image,
+    volumeUuid: volume.uuid, imageBytes: IMAGE_BYTES, quotaBytes: QUOTA_BYTES,
+    launchAuthorized: false, writerExitProven: false, detachAuthorized: false };
+}
+
+// These are the only OS subprocesses used by inspection. Creation, attachment,
+// detachment, quota mutation and privilege escalation are intentionally absent.
+function readMacPlist(executable, arguments_) {
+  const environment = { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', LC_ALL: 'C' };
+  const bytes = execFileSync(executable, arguments_, { timeout: 10_000,
+    maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], env: environment });
+  const json = execFileSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', '-'], {
+    input: bytes, encoding: 'utf8', timeout: 10_000, maxBuffer: 4 * 1024 * 1024,
+    stdio: ['pipe', 'pipe', 'pipe'], env: environment,
+  });
+  return JSON.parse(json);
+}
+
+function inspectMacSharedStorage(plan, readers = {}) {
+  assert.ok(isDeepStrictEqual(plan, macSharedStoragePlan(plan.dataRoot)), 'Storage plan changed');
+  const filesystem = readers.filesystem || nativeFs;
+  const read = readers.readPlist || readMacPlist;
+  const uid = readers.uid ?? process.getuid?.();
+  assert.ok(Number.isSafeInteger(uid) && uid >= 0, 'Native owner identity unavailable');
+  assert.equal(filesystem.realpathSync(plan.dataRoot), plan.dataRoot);
+  const stat = filesystem.lstatSync(plan.image);
+  const image = { path: plan.image, realPath: filesystem.realpathSync(plan.image),
+    regular: stat.isFile(), symlink: stat.isSymbolicLink(), uid: stat.uid,
+    mode: stat.mode, device: stat.dev, sizeBytes: stat.size };
+  // Fail before subprocesses when the known owned backing is absent or unsafe.
+  assert.equal(image.realPath, plan.image);
+  assert.equal(image.regular, true);
+  assert.equal(image.symlink, false);
+  assert.equal(image.uid, uid);
+  assert.equal(image.sizeBytes, IMAGE_BYTES);
+  function directory(target) {
+    const metadata = filesystem.lstatSync(target);
+    return { path: target, realPath: filesystem.realpathSync(target),
+      directory: metadata.isDirectory(), symlink: metadata.isSymbolicLink(),
+      device: metadata.dev, uid: metadata.uid, mode: metadata.mode };
+  }
+  const mount = directory(plan.mount);
+  const paths = Object.fromEntries(Object.entries(plan.paths)
+    .map(([role, target]) => [role, directory(target)]));
+  const imageInfo = read('/usr/bin/hdiutil', ['imageinfo', '-plist', plan.image]);
+  image.virtualBytes = imageInfo['Size Information']?.['Total Bytes'];
+  image.format = imageInfo.Format;
+  image.segments = imageInfo.Segments;
+  const info = read('/usr/sbin/diskutil', ['info', '-plist', plan.mount]);
+  assert.equal(info.MountPoint, plan.mount);
+  assert.equal(info.APFSSnapshot, false);
+  const apfs = read('/usr/sbin/diskutil', ['apfs', 'list', '-plist']);
+  const containers = apfs.Containers?.filter(item =>
+    item.ContainerReference === info.APFSContainerReference);
+  assert.equal(containers?.length, 1, 'Ambiguous or missing APFS container');
+  const volumes = containers[0].Volumes?.filter(item => item.DeviceIdentifier === info.DeviceIdentifier);
+  assert.equal(volumes?.length, 1, 'Ambiguous or missing APFS volume');
+  const nativeVolume = volumes[0];
+  assert.equal(nativeVolume.APFSVolumeUUID, info.VolumeUUID);
+  const images = read('/usr/bin/hdiutil', ['info', '-plist']).images
+    ?.filter(item => item['image-path'] === plan.image);
+  assert.equal(images?.length, 1, 'Backing image not attached exactly once');
+  const entities = images[0]['system-entities']?.filter(item =>
+    item['dev-entry'] === `/dev/${info.DeviceIdentifier}` && item['mount-point'] === plan.mount);
+  assert.equal(entities?.length, 1, 'Mount is not owned by the expected backing image');
+  const observation = { ownerUid: uid, image, mount, paths,
+    volume: { uuid: nativeVolume.APFSVolumeUUID, deviceIdentifier: nativeVolume.DeviceIdentifier,
+      quotaBytes: nativeVolume.CapacityQuota, usedBytes: nativeVolume.CapacityInUse,
+      filesystem: info.FilesystemType, writable: info.WritableVolume },
+    attachment: { imagePath: images[0]['image-path'], volumeDevice: info.DeviceIdentifier,
+      volumeUuid: info.VolumeUUID, mountPoint: info.MountPoint },
+  };
+  return { observation, validation: validateMacStorageObservation(plan, observation) };
+}
+
+
+function storageUnavailable(reason, cause) {
+  const error = new Error(reason.replaceAll('_', ' '), { cause });
+  error.code = 'browser_storage_unavailable';
+  error.reason = reason;
+  return error;
+}
+
+// Error domains remain distinct. A DOM origin quota is not the native image
+// quota, and Chromium's observed DataError/IOError is not QuotaExceededError.
+// Page-controlled text never becomes evidence of native ENOSPC.
+function storageOperationError(cause, origin) {
+  let reason = 'browser_storage_outcome_unconfirmed';
+  if (origin === 'native_fs') {
+    if (cause?.code === 'ENOSPC' || cause?.code === 'EDQUOT') reason = 'browser_storage_full';
+    else if (cause?.code === 'EIO') reason = 'browser_storage_io_unconfirmed';
+  } else if (origin === 'chromium_storage') {
+    if (cause?.name === 'QuotaExceededError') reason = 'browser_origin_quota_exceeded';
+    else if (cause?.name === 'DataError' && cause?.message === 'Failed to write blobs (IOError)') {
+      reason = 'browser_storage_io_unconfirmed';
+    }
+  }
+  return storageUnavailable(reason, cause);
+}
+
+function productionStorageSettings(environment = process.env, readers = {}) {
+  if (environment.BAMBOO_BROWSER_HOST_PROTOCOL !== '2' &&
+      !environment.BAMBOO_BROWSER_STORAGE_DATA_ROOT) return null;
+  if ((readers.platform || process.platform) !== 'darwin') {
+    throw storageUnavailable('browser_storage_provider_unsupported');
+  }
+  try {
+    const plan = macSharedStoragePlan(environment.BAMBOO_BROWSER_STORAGE_DATA_ROOT);
+    const filesystem = readers.filesystem || nativeFs;
+    const owner = readers.uid ?? process.getuid?.();
+    const control = environment.BAMBOO_BROWSER_PROFILE_CONTROL_DIR;
+    absolute(control);
+    assert.equal(path.basename(control), ACCOUNT_KEY);
+    assert.equal(path.dirname(path.dirname(control)), plan.dataRoot);
+    assert.notEqual(path.dirname(control), plan.root);
+    function privatePath(target, device) {
+      absolute(target);
+      const stat = filesystem.lstatSync(target);
+      assert.equal(filesystem.realpathSync(target), target);
+      assert.ok(stat.isDirectory() && !stat.isSymbolicLink());
+      assert.equal(stat.uid, owner);
+      assert.equal(stat.mode & 0o777, 0o700);
+      if (device !== undefined) assert.equal(stat.dev, device);
+      return stat;
+    }
+    const controlStat = privatePath(control);
+    // Only metadata names are inspected. Never copy, parse or remove an old
+    // cookie/database; its presence requires a separately approved migration.
+    const entries = filesystem.readdirSync(control);
+    if (entries.some(name => name !== '.bamboo-profile.lock')) {
+      throw storageUnavailable('browser_storage_migration_required');
+    }
+    assert.equal(environment.BAMBOO_BROWSER_PROFILE_DIR, plan.paths.profile);
+    for (const [name, role] of Object.entries({ HOME: 'home', XDG_CACHE_HOME: 'cache',
+      XDG_CONFIG_HOME: 'config', XDG_DATA_HOME: 'data' })) {
+      assert.equal(environment[name], plan.paths[role]);
+    }
+    const scratch = environment.TMPDIR;
+    absolute(scratch);
+    assert.equal(path.dirname(scratch), plan.paths.temporary);
+    for (const name of ['TEMP', 'TMP', 'BAMBOO_BROWSER_DOWNLOAD_ROOT']) {
+      assert.equal(environment[name], scratch);
+    }
+    const inspected = (readers.inspect || inspectMacSharedStorage)(plan, readers);
+    const device = inspected.observation.mount.device;
+    assert.notEqual(controlStat.dev, device, 'Control fences must remain outside full storage');
+    privatePath(scratch, device);
+    return { plan, profile: plan.paths.profile, scratch, control };
+  } catch (error) {
+    if (error.code === 'browser_storage_unavailable') throw error;
+    throw storageUnavailable('browser_storage_observation_failed', error);
+  }
+}
+
+// Capture actual ChildProcess handles before pinned Playwright loads its spawn
+// module. A JS Browser.close() promise or Node exit does not wait those handles.
+// This proves only the captured roots; arbitrary detached descendants remain a
+// separate native containment requirement, never inferred from a PID or PGID.
+function verifyOwnedHostGroup(read = execFileSync, currentPid = process.pid) {
+  try {
+    assert.ok(Number.isSafeInteger(currentPid) && currentPid > 0);
+    const group = read('/bin/ps', ['-o', 'pgid=', '-p', String(currentPid)], {
+      encoding: 'utf8', timeout: 1000, maxBuffer: 1024,
+      stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' },
+    });
+    assert.equal(String(group).trim(), String(currentPid));
+    return true;
+  } catch (cause) {
+    const error = new Error('browser native owner process group unavailable', { cause });
+    error.code = 'browser_writer_exit_unconfirmed';
+    throw error;
+  }
+}
+
+function createNativeRootTracker(spawns, expectedProfile, policy = {}) {
+  const original = spawns.spawn;
+  const roots = [];
+  let launched = false;
+  function unconfirmed(cause) {
+    const error = new Error('browser native writer exit unconfirmed', { cause });
+    error.code = 'browser_writer_exit_unconfirmed';
+    return error;
+  }
+  return {
+    async launch(operation) {
+      if (launched) throw unconfirmed();
+      launched = true;
+      const capture = function(executable, args, options) {
+        const profiles = Array.isArray(args) ? args.filter(arg =>
+          typeof arg === 'string' && arg.startsWith('--user-data-dir=')) : [];
+        if (!profiles.length) return Reflect.apply(original, spawns, [executable, args, options]);
+        const actual = profiles[0].slice('--user-data-dir='.length);
+        if (profiles.length !== 1 || roots.length || !path.isAbsolute(actual) ||
+            expectedProfile && actual !== expectedProfile) throw unconfirmed();
+        // Pinned Playwright normally detaches Chromium into a second group.
+        // The production owner has first checked its own dedicated group;
+        // inherit it so native deadline cancellation includes this root.
+        const nativeOptions = policy.managedGroup ? { ...options, detached: false } : options;
+        const child = Reflect.apply(original, spawns, [executable, args, nativeOptions]);
+        if (!Number.isSafeInteger(child.pid) || child.pid < 1 || typeof child.once !== 'function') {
+          throw unconfirmed();
+        }
+        const record = { pid: child.pid, child, result: null, stopRequested: false };
+        record.closed = new Promise(resolve => {
+          child.once('close', (code, signal) => { record.result = { code, signal }; resolve(); });
+        });
+        roots.push(record);
+        return child;
+      };
+      spawns.spawn = capture;
+      let result;
+      try { result = await operation(); }
+      finally {
+        if (spawns.spawn === capture) spawns.spawn = original;
+      }
+      if (spawns.spawn !== original || roots.length !== 1) throw unconfirmed();
+      return result;
+    },
+    snapshot() {
+      return { roots: roots.map(root => ({ pid: root.pid, ...root.result })),
+        allDescendantsProven: false };
+    },
+    stopCapturedRoots() {
+      let rootSignalsAttempted = 0;
+      for (const root of roots) {
+        if (root.result || root.stopRequested) continue;
+        root.stopRequested = true;
+        rootSignalsAttempted++;
+        // Use the owned ChildProcess handle, never process.kill(numericPid).
+        // This requests a root stop only; its descendants remain unconfirmed.
+        try { root.child.kill('SIGKILL'); } catch { /* retain unknown outcome */ }
+      }
+      return { rootSignalsAttempted, allDescendantsProven: false };
+    },
+    async waitClosed() {
+      if (roots.length !== 1) throw unconfirmed();
+      let timer;
+      try {
+        await Promise.race([
+          Promise.all(roots.map(root => root.closed)),
+          new Promise((resolve, reject) => { timer = setTimeout(() => reject(unconfirmed()), 2000); }),
+        ]);
+      } finally { clearTimeout(timer); }
+      if (roots.some(root => !root.result || root.result.code !== 0 || root.result.signal !== null)) {
+        throw unconfirmed();
+      }
+      return this.snapshot();
+    },
+  };
+}
 
 const MAX_SNAPSHOT_CHARS = 80_000;
 const MAX_HTML_CHARS = 100_000;
@@ -80,6 +449,8 @@ let profileCheckpoint = Promise.resolve();
 let profileFailure;
 let profileTimer;
 let profileInterval;
+let nativeRoots;
+let hostStorageSettings;
 
 function profileError() {
   const error = new Error('browser profile persistence unavailable');
@@ -121,7 +492,10 @@ async function readProfile() {
     }
     profileCookieState = bytes;
     return state.cookies;
-  } catch {
+  } catch (error) {
+    if (['ENOSPC', 'EDQUOT', 'EIO'].includes(error?.code)) {
+      throw storageOperationError(error, 'native_fs');
+    }
     throw profileError();
   }
 }
@@ -159,8 +533,9 @@ function checkpointProfile() {
     } finally {
       await fs.rm(temporary, { force: true }).catch(() => {});
     }
-  }).catch(() => {
-    profileFailure = profileError();
+  }).catch(error => {
+    profileFailure = ['ENOSPC', 'EDQUOT', 'EIO'].includes(error?.code)
+      ? storageOperationError(error, 'native_fs') : profileError();
     retireAfterReply = true;
     throw profileFailure;
   });
@@ -3430,7 +3805,9 @@ function createHostRuntime({ browser, sharedContext, downloadCdp, contextOptions
   }
   async function handle(request) {
     if (request.action === 'runtime_state') return { protocol_version: 2, host_generation: hostGeneration,
-      browser_instance_id: instanceId, scope_count: entries.size, profile_modes: ['shared', 'clean'] };
+      browser_instance_id: instanceId, scope_count: entries.size, profile_modes: ['shared', 'clean'],
+      storage_boundary: hostStorageSettings ? { provider: 'mac_apfs_fixed_v1', image_bytes: IMAGE_BYTES,
+        quota_bytes: QUOTA_BYTES, native_root_tracking: 1, native_group: 'host_inherited_v1' } : null };
     if (stopping) throw error('browser_unavailable', 'browser runtime stopping');
     if (request.version !== 2 || request.host_generation !== hostGeneration ||
         !validHandle(request.scope_id) || !validHandle(request.scope_generation)) {
@@ -3528,10 +3905,14 @@ async function finishCloseHost() {
   let writerCloseError;
   try { await context?.close(); } catch (error) { writerCloseError = error; }
   try { await browser?.close(); } catch (error) { writerCloseError ||= error; }
+  try { await nativeRoots?.waitClosed(); } catch (error) { writerCloseError ||= error; }
   // A rejected close is not evidence that the writer stopped. Preserve the
   // scratch and do not publish browserClosed; the native owner must retain its
   // resources until the independent writer domain is actually confirmed.
-  if (writerCloseError) throw writerCloseError;
+  if (writerCloseError) {
+    nativeRoots?.stopCapturedRoots?.();
+    throw writerCloseError;
+  }
   browserClosed = true;
   downloadCdp = undefined;
   downloadContextId = undefined;
@@ -3546,6 +3927,7 @@ async function finishCloseHost() {
 }
 
 async function main() {
+  hostStorageSettings = productionStorageSettings();
   const downloadRoot = process.env.BAMBOO_BROWSER_DOWNLOAD_ROOT || os.tmpdir();
   downloadDir = await fs.mkdtemp(path.join(downloadRoot, 'bamboo-browser-download-'));
   const sessionCookies = await readProfile();
@@ -3553,8 +3935,13 @@ async function main() {
     ...(process.env.BAMBOO_BROWSER_EXECUTABLE ? { executablePath: process.env.BAMBOO_BROWSER_EXECUTABLE } : {}) };
   const contextOptions = { viewport: { width: 1000, height: 720 }, deviceScaleFactor: 1,
     acceptDownloads: true, serviceWorkers: 'block' };
+  const managedGroup = hostStorageSettings ? verifyOwnedHostGroup() : false;
+  nativeRoots = createNativeRootTracker(require('node:child_process'), profileDirectory, { managedGroup });
   if (profileDirectory) {
-    context = await chromium.launchPersistentContext(profileDirectory, { ...launchOptions, ...contextOptions });
+    context = await nativeRoots.launch(() => {
+      const { chromium } = require('playwright-core');
+      return chromium.launchPersistentContext(profileDirectory, { ...launchOptions, ...contextOptions });
+    });
     browser = context.browser();
     if (!browser) throw profileError();
     if (sessionCookies.length) await context.addCookies(sessionCookies);
@@ -3565,7 +3952,10 @@ async function main() {
   } else {
     // Explicit standalone/test hosts may omit persistence; production's shared
     // account runtime always receives its one stable leased profile directory.
-    browser = await chromium.launch(launchOptions);
+    browser = await nativeRoots.launch(() => {
+      const { chromium } = require('playwright-core');
+      return chromium.launch(launchOptions);
+    });
     context = await browser.newContext(contextOptions);
   }
   await configureContext(context);
@@ -3658,5 +4048,7 @@ if (require.main === module) {
     await closeHost().catch(() => {});
   });
 } else {
-  module.exports = { installScriptBlobCapture, installDownloadLinkInspector };
+  module.exports = { installScriptBlobCapture, installDownloadLinkInspector,
+    IMAGE_BYTES, QUOTA_BYTES, ACCOUNT_KEY, macSharedStoragePlan,
+    validateMacStorageObservation, inspectMacSharedStorage };
 }
