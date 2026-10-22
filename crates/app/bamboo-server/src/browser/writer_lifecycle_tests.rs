@@ -11,14 +11,20 @@ fn fixture(
     let root = home.join("profiles");
     let lease = profile::acquire(&root, "writer-domain-chat").unwrap();
     let profile_path = lease.path.clone();
-    let scratch = tempfile::Builder::new().prefix("scratch-").tempdir_in(home).unwrap();
+    let scratch = tempfile::Builder::new()
+        .prefix("scratch-")
+        .tempdir_in(home)
+        .unwrap();
     let scratch_path = scratch.path().to_path_buf();
     std::fs::write(scratch_path.join("synthetic-sentinel"), b"owned test data").unwrap();
     let mut command = Command::new(executable);
     if executable == "/bin/sleep" {
         command.arg("5");
     }
-    command.stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true);
     command.process_group(0);
     let child = command.spawn().unwrap();
     // Deliberately use the production constructor. This fixture supplies no
@@ -29,8 +35,11 @@ fn fixture(
 }
 
 fn profile_lock_is_held(profile: &std::path::Path) -> bool {
-    let file = std::fs::OpenOptions::new().read(true).write(true)
-        .open(profile.join(".bamboo-profile.lock")).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(profile.join(".bamboo-profile.lock"))
+        .unwrap();
     fs2::FileExt::try_lock_exclusive(&file).is_err()
 }
 
@@ -42,8 +51,14 @@ async fn forced_host_exit_preserves_the_unknown_writer_lease_and_scratch() {
     session.signal_stop();
     session.terminate("synthetic forced host exit").await;
     assert!(session.child.lock().unwrap().try_wait().unwrap().is_some());
-    assert!(profile_lock_is_held(&profile), "Node reaping must not release a native-writer lease");
-    assert!(scratch.join("synthetic-sentinel").is_file(), "unknown writers may still own scratch");
+    assert!(
+        profile_lock_is_held(&profile),
+        "Node reaping must not release a native-writer lease"
+    );
+    assert!(
+        scratch.join("synthetic-sentinel").is_file(),
+        "unknown writers may still own scratch"
+    );
     assert!(profile.join(UNKNOWN_WRITERS).is_file());
 }
 
@@ -58,7 +73,9 @@ async fn drop_reaper_preserves_unknown_writer_resources_after_reaping_node() {
     // until the actual Drop reaper takes ownership, avoiding an EOF/Arc race.
     session.kill_issued.store(true, Ordering::Release);
     drop(session);
-    tokio::time::timeout(Duration::from_secs(4), cleanup.wait()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(4), cleanup.wait())
+        .await
+        .unwrap();
     assert!(child.lock().unwrap().try_wait().unwrap().is_some());
     assert!(profile_lock_is_held(&profile));
     assert!(scratch.join("synthetic-sentinel").is_file());
@@ -71,7 +88,11 @@ async fn durable_unknown_writer_fence_blocks_reopen_delete_and_reset() {
     let root = home.path().join("profiles");
     let owner = profile::acquire(&root, "writer-domain-chat").unwrap();
     let path = owner.path.clone();
-    std::fs::write(path.join(UNKNOWN_WRITERS), b"synthetic unknown writer generation\n").unwrap();
+    std::fs::write(
+        path.join(UNKNOWN_WRITERS),
+        b"synthetic unknown writer generation\n",
+    )
+    .unwrap();
     let marker = path.join("synthetic-sentinel");
     std::fs::write(&marker, b"preserve this state").unwrap();
     drop(owner); // Simulates loss of process-local file descriptors on restart.
@@ -82,8 +103,10 @@ async fn durable_unknown_writer_fence_blocks_reopen_delete_and_reset() {
     let reset_allowed = reset.is_ok();
     drop(reset);
     let deletion_allowed = profile::remove(&root, "writer-domain-chat").is_ok();
-    assert!(!reopened_allowed && !reset_allowed && !deletion_allowed,
-        "a durable unknown-writer fence must survive the old owner process");
+    assert!(
+        !reopened_allowed && !reset_allowed && !deletion_allowed,
+        "a durable unknown-writer fence must survive the old owner process"
+    );
     assert_eq!(std::fs::read(marker).unwrap(), b"preserve this state");
 }
 
@@ -117,7 +140,10 @@ async fn unknown_writer_marker_failure_still_fences_manager_admission() {
     // Otherwise Drop correctly waits forever for a durable-fence I/O recovery.
     std::fs::remove_dir(invalid_marker).unwrap();
     session.quarantine_resources();
-    assert!(blocked_before_io_recovery, "unknown writers must fence admission before marker I/O");
+    assert!(
+        blocked_before_io_recovery,
+        "unknown writers must fence admission before marker I/O"
+    );
     assert!(lease_retained && scratch_retained && completion_was_not_published);
 }
 
@@ -125,7 +151,10 @@ async fn unknown_writer_marker_failure_still_fences_manager_admission() {
 fn queued_open_cannot_launch_after_unknown_writer_fence() {
     const DATA: &str = "BAMBOO_BROWSER_WRITER_ADMISSION_FIXTURE";
     if let Some(home) = std::env::var_os(DATA).map(PathBuf::from) {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         runtime.block_on(async {
             let browser = BrowserManager::with_profile_root(home.join("profiles"));
             let gate = browser.session_gate("queued-chat");
@@ -139,35 +168,65 @@ fn queued_open_cannot_launch_after_unknown_writer_fence() {
             session.terminate("synthetic unknown writer").await;
             drop(held_gate);
             let result = opening.await;
-            let launched = profile::directory(&home.join("profiles"), "queued-chat")
-                .unwrap().join("synthetic-launched").exists();
+            // Observe this fixture's actual account profile as well as a
+            // legacy profile; the shared runtime no longer uses a chat key.
+            let launched = std::fs::read_dir(home.join("profiles"))
+                .unwrap()
+                .any(|entry| {
+                    let entry = entry.unwrap();
+                    entry.file_type().unwrap().is_dir()
+                        && entry
+                            .path()
+                            .join("synthetic-launched")
+                            .try_exists()
+                            .unwrap()
+                });
             // Drain the synthetic EOF host on RED before checking the result.
             browser.shutdown().await;
             assert!(matches!(result, Err(BrowserError::Unavailable(ref message))
                 if message == "browser writer exit unconfirmed"));
-            assert!(!launched, "a queued open must not launch a new child after the fence");
+            assert!(
+                !launched,
+                "a queued open must not launch a new child after the fence"
+            );
         });
         return;
     }
     let home = tempfile::tempdir().unwrap();
     let script = home.path().join("synthetic-host.py");
-    std::fs::write(&script, r#"import json, os, pathlib, sys
+    std::fs::write(
+        &script,
+        r#"import json, os, pathlib, sys
 profile = pathlib.Path(os.environ['BAMBOO_BROWSER_PROFILE_DIR'])
 (profile / 'synthetic-launched').write_text('synthetic only')
 for line in sys.stdin:
     request = json.loads(line)
     print(json.dumps({'id': request['id'], 'ok': True, 'result': {'tabs': []}}), flush=True)
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let log_path = home.path().join("fixture.log");
     let log = std::fs::File::create(&log_path).unwrap();
     let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["browser::writer_lifecycle_tests::queued_open_cannot_launch_after_unknown_writer_fence",
-            "--exact", "--test-threads=1"])
+        .args([
+            "browser::writer_lifecycle_tests::queued_open_cannot_launch_after_unknown_writer_fence",
+            "--exact",
+            "--test-threads=1",
+        ])
         .env(DATA, home.path())
-        .env("BAMBOO_BROWSER_NODE", std::env::var_os("BAMBOO_BROWSER_TEST_PYTHON")
-            .unwrap_or_else(|| "/usr/bin/python3".into()))
+        .env(
+            "BAMBOO_BROWSER_NODE",
+            std::env::var_os("BAMBOO_BROWSER_TEST_PYTHON")
+                .unwrap_or_else(|| "/usr/bin/python3".into()),
+        )
         .env("BAMBOO_BROWSER_HOST_SCRIPT", script)
-        .stdout(Stdio::from(log.try_clone().unwrap())).stderr(Stdio::from(log))
-        .status().unwrap();
-    assert!(status.success(), "{}", std::fs::read_to_string(log_path).unwrap());
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log))
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "{}",
+        std::fs::read_to_string(log_path).unwrap()
+    );
 }
