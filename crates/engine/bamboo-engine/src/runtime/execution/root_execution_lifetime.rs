@@ -404,11 +404,12 @@ impl RootOuterTask {
     #[cfg(test)]
     pub(super) async fn pause_before_actor_finish(&self) {
         let pause = self.lifetime.upgrade().and_then(|lifetime| {
-            lifetime
+            let pause = lifetime
                 .before_actor_finish
                 .lock()
                 .ok()
-                .and_then(|pause| pause.clone())
+                .and_then(|pause| pause.clone());
+            pause
         });
         if let Some(pause) = pause {
             pause.entered.notify_one();
@@ -427,12 +428,14 @@ impl RootOuterTask {
         self.update(|task| task.tail_completed = true);
     }
     fn update(&self, update: impl FnOnce(&mut OuterTask)) {
-        if let Some(lifetime) = self.lifetime.upgrade() {
-            if let Ok(mut state) = lifetime.state.lock() {
-                if let Some(task) = state.tasks.get_mut(&self.epoch) {
-                    update(task);
-                }
-            }
+        let Some(lifetime) = self.lifetime.upgrade() else {
+            return;
+        };
+        let Ok(mut state) = lifetime.state.lock() else {
+            return;
+        };
+        if let Some(task) = state.tasks.get_mut(&self.epoch) {
+            update(task);
         }
     }
 

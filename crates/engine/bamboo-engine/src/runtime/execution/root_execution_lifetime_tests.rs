@@ -316,7 +316,7 @@ async fn actual_root_spawn_terminal_badge_precedes_real_join_and_actor_finish() 
     );
     let session = session();
     store.save_session(&session).await.unwrap();
-    let cache = Arc::default();
+    let cache: crate::SessionCache = Arc::default();
     let repository = crate::SessionRepository::new(
         cache.clone(),
         store.clone(),
