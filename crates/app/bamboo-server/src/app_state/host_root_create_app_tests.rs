@@ -1,6 +1,6 @@
 //! Synthetic App orchestration only. No provider, real account or real grant.
-//! The injected first-input port is a typed mock; its receipt is not evidence
-//! that the not-yet-installed canonical create-purpose Inbox has been tested.
+//! Injected-port cases test orchestration. Canonical-port cases below exercise
+//! the existing real FileSessionInbox over synthetic TempDir data only.
 
 use super::*;
 use bamboo_domain::{
@@ -225,7 +225,7 @@ async fn absent_create_input_port_blocks_before_reservation_even_for_explicit_ho
     let original = SessionCallerReference::from(&source);
     let request = request(&f);
     install(&f, &source, ancestors, &request, 1, BTreeSet::new()).await;
-    let port = f.creator.caller_port();
+    let port = f.creator.unconfigured_caller_port();
     let scope = port.scope(&original).await.unwrap();
     assert!(!scope.success);
     assert_eq!(value(scope)["code"], "host_root_first_input_unavailable");
@@ -259,6 +259,112 @@ async fn only_never_installed_supervisor_has_the_legacy_fallback() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("session_root_scope_unavailable"));
+}
+
+#[tokio::test]
+async fn default_caller_port_uses_real_create_purpose_inbox_without_a_send_grant() {
+    for role in ["root", "child", "supervisor"] {
+        let f = Fixture::new().await;
+        let (source, ancestors) = caller(&f, role).await;
+        let original = SessionCallerReference::from(&source);
+        let request = request(&f);
+        let token = install(&f, &source, ancestors, &request, 1, BTreeSet::new()).await;
+        let port = f.creator.caller_port();
+        assert!(port.scope(&original).await.unwrap().success);
+        let one = accepted(port.create(&original, request.clone()).await.unwrap());
+        let two = accepted(port.create(&original, request.clone()).await.unwrap());
+        let (_, id) = host_session_create_identity(&original, request.operation_id).unwrap();
+        assert_eq!(one["target_session_id"], id);
+        assert_eq!(two["target_session_id"], id);
+        assert_eq!(one["receipt_id"], two["receipt_id"]);
+        assert_eq!(one["linked"], Value::Null);
+        let backlog = f.inbox.inspect(&id).await.unwrap();
+        assert_eq!(backlog.generation, 1);
+        assert_eq!(backlog.pending, 1);
+        assert!(f
+            .creator
+            .store
+            .list_host_scoped_targets(&token, &original)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(f
+            .creator
+            .store
+            .load_host_scoped_target(&token, &original, &id)
+            .await
+            .is_err());
+        let message = f.inbox.claim(&id, 1).await.unwrap().remove(0).envelope;
+        assert_eq!(
+            message.source,
+            bamboo_domain::SessionMessageSource::Session {
+                session_id: source.id
+            }
+        );
+        assert_eq!(
+            message.correlation_id.as_deref(),
+            Some(request.operation_id.to_string().as_str())
+        );
+        assert_eq!(
+            message.body,
+            bamboo_domain::SessionMessageBody::Content(bamboo_domain::SessionMessageContent::text(
+                &request.message
+            ))
+        );
+        assert_eq!(f.activation.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn canonical_create_input_keeps_known_receipt_when_activation_fails_then_retries() {
+    let f = Fixture::new().await;
+    let (source, ancestors) = caller(&f, "root").await;
+    let original = SessionCallerReference::from(&source);
+    let request = request(&f);
+    install(&f, &source, ancestors, &request, 1, BTreeSet::new()).await;
+    let port = f.creator.caller_port();
+    f.activation.fail.store(true, Ordering::SeqCst);
+    let first = value(port.create(&original, request.clone()).await.unwrap());
+    assert_eq!(first["admitted"], true);
+    assert_eq!(first["code"], "activation_pending");
+    let (_, id) = host_session_create_identity(&original, request.operation_id).unwrap();
+    assert_eq!(f.inbox.inspect(&id).await.unwrap().generation, 1);
+    f.activation.fail.store(false, Ordering::SeqCst);
+    let retry = accepted(port.create(&original, request).await.unwrap());
+    assert_eq!(retry["receipt_id"], first["receipt_id"]);
+    assert_eq!(f.inbox.inspect(&id).await.unwrap().generation, 1);
+}
+
+#[tokio::test]
+async fn pending_legacy_supervisor_creation_resumes_through_host_with_one_real_inbox_address() {
+    let f = Fixture::new().await;
+    let request = request(&f);
+    f.activation.fail.store(true, Ordering::SeqCst);
+    let first = accepted(
+        f.creator
+            .create(&f.supervisor, request.clone())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(first["code"], "activation_pending");
+    let (source, ancestors) = caller(&f, "supervisor").await;
+    install(&f, &source, ancestors, &request, 1, BTreeSet::new()).await;
+    f.activation.fail.store(false, Ordering::SeqCst);
+    let retry = accepted(
+        f.creator
+            .caller_port()
+            .create(&SessionCallerReference::from(&source), request.clone())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(retry["target_session_id"], first["target_session_id"]);
+    assert_eq!(retry["receipt_id"], first["receipt_id"]);
+    assert_eq!(retry["linked"], Value::Null);
+    let (_, id) =
+        host_session_create_identity(&SessionCallerReference::from(&source), request.operation_id)
+            .unwrap();
+    assert_eq!(f.inbox.inspect(&id).await.unwrap().generation, 1);
+    assert_eq!(f.inbox.inspect(&id).await.unwrap().pending, 1);
 }
 
 #[tokio::test]

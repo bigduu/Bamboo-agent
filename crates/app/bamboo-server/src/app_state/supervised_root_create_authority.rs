@@ -21,6 +21,24 @@ pub(in crate::app_state) trait HostRootFirstInputPort: Send + Sync {
     ) -> Result<SessionMessengerReceipt, SessionMessengerError>;
 }
 
+struct CanonicalHostRootFirstInput(Arc<SessionMessenger>);
+
+#[async_trait]
+impl HostRootFirstInputPort for CanonicalHostRootFirstInput {
+    async fn deliver(
+        &self,
+        token: &HostSessionScopeToken,
+        caller: &SessionCallerReference,
+        operation_id: uuid::Uuid,
+        reserved_root: &Session,
+        message: &str,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        self.0
+            .send_host_root_first_input(token, caller, operation_id, reserved_root, message)
+            .await
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct CallerRootCreator {
     creator: SupervisedRootCreator,
@@ -67,9 +85,16 @@ impl CreationAuthorizationError {
 }
 
 impl SupervisedRootCreator {
-    /// The absent first-input adapter is an explicit blocker for installed Host
-    /// creation grants. Never-installed genuine Supervisors keep their old path.
+    /// All framework assemblies share the same canonical create-purpose Inbox.
+    /// Missing backend support fails closed at its final admission boundary.
     pub(in crate::app_state) fn caller_port(&self) -> Arc<dyn SessionRootCreatePort> {
+        self.with_host_first_input(Arc::new(CanonicalHostRootFirstInput(
+            self.messenger.clone(),
+        )))
+    }
+
+    #[cfg(test)]
+    pub(in crate::app_state) fn unconfigured_caller_port(&self) -> Arc<dyn SessionRootCreatePort> {
         Arc::new(CallerRootCreator {
             creator: self.clone(),
             first_input: None,
@@ -409,19 +434,39 @@ impl CreationAuthority {
         replayed: bool,
     ) -> std::io::Result<CreationPublication> {
         match self {
-            Self::Supervisor { reference, .. } => creator
-                .store
-                .create_and_attach_supervised_root(
-                    reference,
-                    request.expected_state_revision,
-                    candidate,
-                )
-                .await
-                .map(|relation| CreationPublication {
+            Self::Supervisor {
+                reference,
+                original_caller,
+            } => {
+                let relation = match original_caller {
+                    Some(caller) => {
+                        creator
+                            .store
+                            .create_and_attach_supervised_root_observed(
+                                caller,
+                                reference,
+                                request.expected_state_revision,
+                                candidate,
+                            )
+                            .await
+                    }
+                    None => {
+                        creator
+                            .store
+                            .create_and_attach_supervised_root(
+                                reference,
+                                request.expected_state_revision,
+                                candidate,
+                            )
+                            .await
+                    }
+                }?;
+                Ok(CreationPublication {
                     state_revision: relation.state_revision,
                     link_revision: relation.link_revision,
                     linked: Some(true),
-                }),
+                })
+            }
             Self::Host { caller, token, .. } => {
                 creator
                     .store
@@ -449,17 +494,34 @@ impl CreationAuthority {
         candidate: &Session,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
         match self {
-            Self::Supervisor { reference, .. } => {
-                creator
-                    .messenger
-                    .supervisor_followup(
-                        reference,
-                        &candidate.id,
-                        &request.operation_id.to_string(),
-                        &request.message,
-                    )
-                    .await
-            }
+            Self::Supervisor {
+                reference,
+                original_caller,
+            } => match original_caller {
+                Some(caller) => {
+                    creator
+                        .messenger
+                        .supervisor_followup_observed(
+                            caller,
+                            reference,
+                            &candidate.id,
+                            &request.operation_id.to_string(),
+                            &request.message,
+                        )
+                        .await
+                }
+                None => {
+                    creator
+                        .messenger
+                        .supervisor_followup(
+                            reference,
+                            &candidate.id,
+                            &request.operation_id.to_string(),
+                            &request.message,
+                        )
+                        .await
+                }
+            },
             Self::Host {
                 caller,
                 token,

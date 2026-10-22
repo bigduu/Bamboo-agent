@@ -5,6 +5,47 @@ use uuid::Uuid;
 
 use crate::{SessionAuthorityIdentity, SessionCallerReference, DEFAULT_SUPERVISOR_SESSION_ID};
 
+/// Pure first-input address, never a creation or target grant. Scope changes
+/// cannot allocate a second message for the same reserved Root operation.
+pub fn host_root_first_input_identity(
+    caller: &SessionCallerReference,
+    operation_id: Uuid,
+    reserved_root: &crate::Session,
+) -> Result<(crate::SessionMessageId, Option<String>), &'static str> {
+    let (_, reserved_id) = host_session_create_identity(caller, operation_id)?;
+    if reserved_root.id != reserved_id {
+        return Err("host_session_create_reservation_changed");
+    }
+    let id = match &caller.authority_identity {
+        SessionAuthorityIdentity::Supervisor { incarnation_id } => {
+            let reference = crate::SupervisorReference {
+                session_id: caller.session_id.clone(),
+                incarnation_id: *incarnation_id,
+            };
+            return Ok((
+                crate::supervisor_followup_message_id(
+                    &reference,
+                    &reserved_id,
+                    &operation_id.to_string(),
+                ),
+                None,
+            ));
+        }
+        SessionAuthorityIdentity::Ordinary => crate::SessionMessageId::stable(
+            "host-root-first-input:v1",
+            &serde_json::json!({
+                "caller_session_id": caller.session_id,
+                "caller_created_at": caller.created_at,
+                "target_session_id": reserved_id,
+                "target_created_at": reserved_root.created_at,
+                "operation_id": operation_id,
+            }),
+        ),
+    };
+    let thread = Some(id.to_string());
+    Ok((id, thread))
+}
+
 /// Creation identity survives scope replacement and conversation reset. Only
 /// the caller's immutable lifetime and the operation UUID select a reservation.
 /// A current exact creation permit is still required at every final write.
@@ -116,5 +157,50 @@ mod tests {
         );
         changed.session_id = "not-the-canonical-supervisor".into();
         assert!(host_session_create_identity(&changed, operation).is_err());
+    }
+
+    #[test]
+    fn first_input_address_is_birth_bound_and_keeps_supervisor_legacy_wire() {
+        let source = Session::new("caller", "model");
+        let caller = SessionCallerReference::from(&source);
+        let operation = Uuid::new_v4();
+        let (_, id) = host_session_create_identity(&caller, operation).unwrap();
+        let mut target = Session::new(id, "model");
+        let identity = host_root_first_input_identity(&caller, operation, &target).unwrap();
+        assert_eq!(identity.1.as_deref(), Some(identity.0.to_string().as_str()));
+        let mut changed_caller = caller.clone();
+        changed_caller.root_tool_authority_revision += 1;
+        assert_eq!(
+            host_root_first_input_identity(&changed_caller, operation, &target).unwrap(),
+            identity
+        );
+        target.created_at += chrono::Duration::seconds(1);
+        assert_ne!(
+            host_root_first_input_identity(&caller, operation, &target).unwrap(),
+            identity
+        );
+        target.id = "unrelated-root".into();
+        assert!(host_root_first_input_identity(&caller, operation, &target).is_err());
+
+        let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        let incarnation_id = Uuid::new_v4();
+        supervisor.authority_identity = SessionAuthorityIdentity::Supervisor { incarnation_id };
+        let caller = SessionCallerReference::from(&supervisor);
+        let (_, id) = host_session_create_identity(&caller, operation).unwrap();
+        let target = Session::new(id, "model");
+        let (message_id, thread) =
+            host_root_first_input_identity(&caller, operation, &target).unwrap();
+        assert!(thread.is_none());
+        assert_eq!(
+            message_id,
+            crate::supervisor_followup_message_id(
+                &crate::SupervisorReference {
+                    session_id: supervisor.id,
+                    incarnation_id,
+                },
+                &target.id,
+                &operation.to_string()
+            )
+        );
     }
 }

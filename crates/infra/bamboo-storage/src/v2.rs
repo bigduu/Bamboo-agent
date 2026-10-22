@@ -131,7 +131,7 @@ use default_actor_context::DefaultWriterGuards;
 pub(crate) use default_actor_context::DefaultWriterPhysicalGuards;
 #[cfg(test)]
 mod conversation_generation_tests;
-mod host_root_create;
+pub(crate) mod host_root_create;
 pub(crate) mod host_session_scope;
 mod root_context;
 #[cfg(test)]

@@ -136,6 +136,7 @@ pub(super) struct SupervisorManagementGuards {
     sessions: Vec<SessionWriteGuard>,
     _task: RuntimeTaskTransactionReadGuard,
     _lifecycle: SessionLifecycleReadGuard,
+    _host_namespace: Option<crate::host_session_scope::HostSessionScopeAbsence>,
 }
 
 impl Drop for SupervisorManagementGuards {
@@ -349,6 +350,7 @@ impl SessionStoreV2 {
             sessions,
             _task: task,
             _lifecycle: lifecycle,
+            _host_namespace: None,
         });
         // The physical job owns the guards through every file publication,
         // including if the originating HTTP future or runtime disappears.
@@ -481,9 +483,54 @@ impl SessionStoreV2 {
         expected_state_revision: u64,
         candidate: &Session,
     ) -> io::Result<SupervisorManagementReceipt> {
+        self.create_and_attach_supervised_root_inner(
+            supervisor,
+            expected_state_revision,
+            candidate,
+            None,
+        )
+        .await
+    }
+
+    /// Generic-caller compatibility only. Retain a real never-installed Host
+    /// namespace through all physical Root/link jobs, and compare the original
+    /// caller under the existing canonical Supervisor locks. The old explicit
+    /// Supervisor API retains its independent authorization contract above.
+    pub async fn create_and_attach_supervised_root_observed(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        supervisor: &SupervisorReference,
+        expected_state_revision: u64,
+        candidate: &Session,
+    ) -> io::Result<SupervisorManagementReceipt> {
+        self.create_and_attach_supervised_root_inner(
+            supervisor,
+            expected_state_revision,
+            candidate,
+            Some(caller),
+        )
+        .await
+    }
+
+    async fn create_and_attach_supervised_root_inner(
+        &self,
+        supervisor: &SupervisorReference,
+        expected_state_revision: u64,
+        candidate: &Session,
+        original_caller: Option<&bamboo_domain::SessionCallerReference>,
+    ) -> io::Result<SupervisorManagementReceipt> {
         reference_is_valid(supervisor)?;
         target_id_is_valid(&candidate.id)?;
         let project = new_root_candidate_project(candidate)?;
+        let host_namespace = match original_caller {
+            Some(caller) if caller.session_id == supervisor.session_id => Some(
+                self.host_scope_registry
+                    .retain_never_installed(&caller.session_id)
+                    .await?,
+            ),
+            Some(_) => return Err(denied("host_session_legacy_caller_mismatch")),
+            None => None,
+        };
         let lifecycle = self.lock_default_writer_lifecycle().await?;
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let sessions = self.management_session_locks(Some(&candidate.id)).await?;
@@ -491,8 +538,12 @@ impl SessionStoreV2 {
             sessions,
             _task: task,
             _lifecycle: lifecycle,
+            _host_namespace: host_namespace,
         });
         let mut current = self.management_supervisor_locked(supervisor).await?;
+        if original_caller.is_some_and(|caller| !caller.matches_session(&current)) {
+            return Err(denied("host_session_operation_caller_changed"));
+        }
         self.check_management_session_compatibility(&current)
             .await?;
         let mut state = current
@@ -608,6 +659,7 @@ impl SessionStoreV2 {
             sessions,
             _task: task,
             _lifecycle: lifecycle,
+            _host_namespace: None,
         });
         let mut current = self
             .management_supervisor_locked(&request.supervisor)

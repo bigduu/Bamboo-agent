@@ -452,6 +452,45 @@ impl SessionMessenger {
             .await
     }
 
+    /// Admit the first input for one explicitly authorized Root creation. This
+    /// is not the SendPeer port: no target grant or relationship is inferred.
+    /// A known durable receipt survives a later activation failure unchanged.
+    pub async fn send_host_root_first_input(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &SessionCallerReference,
+        operation_id: uuid::Uuid,
+        reserved_root: &Session,
+        message: &str,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        let operation = operation_id.to_string();
+        Self::validate_peer_input(&operation, message)?;
+        let (id, thread) =
+            bamboo_domain::host_root_first_input_identity(caller, operation_id, reserved_root)
+                .map_err(|error| SessionMessengerError::InvalidEnvelope(error.into()))?;
+        let envelope = Self::peer_envelope_for_ids(
+            &caller.session_id,
+            &reserved_root.id,
+            &operation,
+            message,
+            id,
+            thread,
+            None,
+        );
+        let started = Instant::now();
+        let delivery = self
+            .inbox
+            .deliver_host_root_first_input(token, caller, operation_id, reserved_root, &envelope)
+            .await
+            .map_err(|error| {
+                let error = SessionMessengerError::Inbox(error);
+                self.record_rejection(&error);
+                error
+            })?;
+        let admission = self.record_admission(envelope, delivery, started);
+        self.activate_prepared(&admission).await
+    }
+
     /// Active-run-only peer input. The Inbox owns exact retry recovery and
     /// retains its original authority through the runtime's publication CAS.
     /// This never cancels a run, requests activation or reconstructs an owner.

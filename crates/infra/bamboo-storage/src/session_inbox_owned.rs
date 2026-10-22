@@ -151,6 +151,9 @@ pub(crate) enum InboxAuthority {
     HostScoped {
         _guard: crate::v2::host_session_scope::HostScopedDeliveryGuards,
     },
+    HostCreation {
+        _guard: crate::v2::host_root_create::HostCreatedRootDeliveryGuards,
+    },
     Unscoped {
         _guard: crate::v2::host_session_scope::LegacySessionDeliveryGuards,
     },
@@ -618,6 +621,7 @@ impl FileSessionInbox {
         match authority {
             InboxAuthority::Peer { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::HostScoped { _guard } => Ok(_guard.inbox_dir.clone()),
+            InboxAuthority::HostCreation { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::Unscoped { _guard } => Ok(_guard.inbox_dir.clone()),
             _ => self.inbox_dir(target).await,
         }

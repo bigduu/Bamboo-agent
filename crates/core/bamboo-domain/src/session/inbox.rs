@@ -1831,6 +1831,24 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// First input for one exact creation permit and reserved independent Root.
+    /// This never borrows SendPeer, inspect or Supervisor management authority.
+    /// The concrete writer must retain the current scope, original caller and
+    /// exact reserved Root through the physical receipt job. All first inputs
+    /// use the existing RespectSpecificWait intent; unsupported fails closed.
+    async fn deliver_host_root_first_input(
+        &self,
+        _token: &crate::HostSessionScopeToken,
+        _caller: &crate::SessionCallerReference,
+        _operation_id: uuid::Uuid,
+        _reserved_root: &super::Session,
+        _envelope: &SessionMessageEnvelope,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "Host create-purpose first-input admission is unsupported".into(),
+        ))
+    }
+
     /// Canonical adapter compatibility only. The concrete writer must retain
     /// proof that the caller's Host namespace is still never-installed through
     /// physical admission, along with its original caller and existing peer

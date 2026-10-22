@@ -1,13 +1,99 @@
 //! A creation permit is distinct from target SendPeer or management authority.
 
 use super::*;
-use bamboo_domain::{host_session_create_identity, HostSessionScopeToken, SessionCallerReference};
+use bamboo_domain::{
+    host_session_create_identity, HostScopeSessionObservation, HostSessionScopeToken,
+    SessionCallerReference,
+};
+
+/// Constructed only after a current creation permit and both original Session
+/// observations have been checked under the complete physical authority set.
+pub(crate) struct HostCreatedRootDeliveryGuards {
+    pub(crate) inbox_dir: PathBuf,
+    _authority: super::host_session_scope::HostScopedSessionGuards,
+}
 
 fn denied(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message.into())
 }
 
 impl SessionStoreV2 {
+    pub(crate) async fn lock_host_root_first_input(
+        &self,
+        token: &HostSessionScopeToken,
+        caller: &SessionCallerReference,
+        operation_id: Uuid,
+        candidate: &Session,
+        envelope: &bamboo_domain::SessionMessageEnvelope,
+    ) -> io::Result<HostCreatedRootDeliveryGuards> {
+        use bamboo_domain::{SessionMessageBody, SessionMessageKind, SessionMessageSource};
+        let project = super::supervisor_management::new_root_candidate_project(candidate)?;
+        let workspace = candidate
+            .workspace_path_meta()
+            .ok_or_else(|| denied("host_session_create_workspace_missing"))?;
+        let (id, thread) =
+            bamboo_domain::host_root_first_input_identity(caller, operation_id, candidate)
+                .map_err(denied)?;
+        envelope
+            .validate()
+            .map_err(|error| denied(error.to_string()))?;
+        let text = match &envelope.body {
+            SessionMessageBody::Content(content)
+                if content.parts.is_empty() && content.skill_request.is_none() =>
+            {
+                &content.text
+            }
+            _ => return Err(denied("host_root_first_input_requires_bounded_text")),
+        };
+        if envelope.source
+            != (SessionMessageSource::Session {
+                session_id: caller.session_id.clone(),
+            })
+            || envelope.target_session_id != candidate.id
+            || envelope.kind != SessionMessageKind::PeerMessage
+            || envelope.id != id
+            || envelope.thread_id != thread
+            || envelope.correlation_id.as_deref() != Some(operation_id.to_string().as_str())
+            || envelope.in_reply_to.is_some()
+            || envelope.attempt.is_some()
+            || text.trim().is_empty()
+            || text.contains('\0')
+            || text.len() > bamboo_domain::MAX_SESSION_PEER_MESSAGE_BYTES
+        {
+            return Err(denied("host_root_first_input_envelope_mismatch"));
+        }
+        let scope = self.host_scope_registry.retain(token, caller).await?;
+        let binding = scope.token().binding();
+        binding
+            .create(operation_id, &project, &workspace)
+            .map_err(|error| denied(error.to_string()))?;
+        let target = HostScopeSessionObservation::capture(candidate, vec![])
+            .map_err(|error| denied(error.to_string()))?;
+        let observations = [binding.caller.clone(), target];
+        let authority = self
+            .lock_host_scope_observations(&observations, Some(scope), &[])
+            .await?;
+        let current = self
+            .peer_delivery_session(&caller.session_id, &caller.root_session_id)
+            .await?;
+        if !caller.matches_session(&current) {
+            return Err(denied("host_session_operation_caller_changed"));
+        }
+        let current_target = self
+            .load_root_authority_unchecked(&candidate.id)
+            .await?
+            .ok_or_else(|| denied("host_root_first_input_reserved_root_missing"))?;
+        if !super::supervisor_management::reserved_root_matches(&current_target, candidate) {
+            return Err(denied("host_root_first_input_reserved_root_changed"));
+        }
+        Ok(HostCreatedRootDeliveryGuards {
+            inbox_dir: self
+                .abs_path_from_rel(&Self::root_rel_path(&candidate.id))
+                .join("inbox"),
+            _authority: authority,
+        })
+    }
+
     /// Trusted Host-only final writer. `expected_revision` is required for a new
     /// operation. Only the existing durable, claimed creation reservation may
     /// omit it on an exact retry; the current exact permit is still mandatory.

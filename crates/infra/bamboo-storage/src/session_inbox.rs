@@ -2552,6 +2552,30 @@ impl SessionInboxPort for FileSessionInbox {
         .await
     }
 
+    async fn deliver_host_root_first_input(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &bamboo_domain::SessionCallerReference,
+        operation_id: uuid::Uuid,
+        reserved_root: &bamboo_domain::Session,
+        envelope: &SessionMessageEnvelope,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        let authority = self
+            .sessions
+            .lock_host_root_first_input(token, caller, operation_id, reserved_root, envelope)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        self.deliver_with_lifecycle_held(
+            envelope,
+            InboxAuthority::HostCreation { _guard: authority },
+            None,
+            Some(SessionInboxActivationIntent::new(
+                SessionActivationPolicy::RespectSpecificWait,
+            )),
+        )
+        .await
+    }
+
     async fn deliver_unscoped_peer_message(
         &self,
         caller: &bamboo_domain::SessionCallerReference,
@@ -2905,6 +2929,10 @@ mod receipt_tests;
 #[cfg(test)]
 #[path = "session_inbox_host_scope_tests.rs"]
 mod host_scope_tests;
+
+#[cfg(test)]
+#[path = "session_inbox_host_create_tests.rs"]
+mod host_create_tests;
 
 #[cfg(test)]
 mod tests {

@@ -389,6 +389,185 @@ async fn a_different_valid_generation_cannot_use_the_same_stable_creation_scope(
     assert!(store.load_session(&candidate.id).await.unwrap().is_none());
 }
 
+#[tokio::test]
+async fn observed_supervisor_creation_never_falls_back_after_host_installation() {
+    let (home, store, _ordinary) = fixture().await;
+    let supervisor = store
+        .get_or_create_default_supervisor("model")
+        .await
+        .unwrap();
+    let reference = bamboo_domain::SupervisorReference::from(&supervisor);
+    store
+        .mutate_supervisor_management(&bamboo_domain::SupervisorManagementRequest {
+            supervisor: reference.clone(),
+            expected_state_revision: 0,
+            mutation: bamboo_domain::SupervisorManagementMutation::ConfigureProjectScope {
+                allowed_projects: ["explicit-project".parse().unwrap()].into(),
+            },
+        })
+        .await
+        .unwrap();
+    let supervisor = store
+        .load_session(&reference.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let original = SessionCallerReference::from(&supervisor);
+    let operation = Uuid::new_v4();
+    let candidate = request_candidate(&supervisor, operation, &home.path().join("workspace"));
+    let token = install(
+        &store,
+        &supervisor,
+        vec![],
+        operation,
+        &candidate,
+        0,
+        BTreeSet::new(),
+    )
+    .await;
+    assert!(store
+        .create_and_attach_supervised_root_observed(&original, &reference, 1, &candidate)
+        .await
+        .is_err());
+    assert!(store.load_session(&candidate.id).await.unwrap().is_none());
+    store
+        .revoke_host_session_scope(&supervisor.id, token.binding().revision)
+        .await
+        .unwrap();
+    assert!(store
+        .create_and_attach_supervised_root_observed(&original, &reference, 1, &candidate)
+        .await
+        .is_err());
+    assert!(store.load_session(&candidate.id).await.unwrap().is_none());
+    // The explicit legacy Supervisor API has its independent contract. A
+    // generic caller cannot reach it by dropping a failed Host lookup.
+    store
+        .create_and_attach_supervised_root(&reference, 1, &candidate)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_supervisor_creation_retains_absence_and_rejects_another_generation() {
+    let (home, store, _ordinary) = fixture().await;
+    let store = Arc::new(store);
+    let supervisor = store
+        .get_or_create_default_supervisor("model")
+        .await
+        .unwrap();
+    let reference = bamboo_domain::SupervisorReference::from(&supervisor);
+    store
+        .mutate_supervisor_management(&bamboo_domain::SupervisorManagementRequest {
+            supervisor: reference.clone(),
+            expected_state_revision: 0,
+            mutation: bamboo_domain::SupervisorManagementMutation::ConfigureProjectScope {
+                allowed_projects: ["explicit-project".parse().unwrap()].into(),
+            },
+        })
+        .await
+        .unwrap();
+    let supervisor = store
+        .load_session(&reference.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let operation = Uuid::new_v4();
+    let candidate = request_candidate(&supervisor, operation, &home.path().join("workspace"));
+    let original = SessionCallerReference::from(&supervisor);
+    let bamboo_domain::ConversationResetPreparation::Prepared(prepared) =
+        bamboo_domain::prepare_conversation_reset(
+            &supervisor,
+            &supervisor.conversation_reset.clone().unwrap_or_default(),
+            &bamboo_domain::ConversationResetRequest {
+                session_id: supervisor.id.clone(),
+                operation_id: format!("0:{}", Uuid::new_v4()),
+                expected_birth_token: supervisor.root_mode_birth_token(),
+                expected_conversation_revision: 0,
+                expected_snapshot_sha256: bamboo_domain::conversation_reset_snapshot_sha256(
+                    &supervisor,
+                )
+                .unwrap(),
+            },
+            bamboo_domain::ConversationResetReadSafety::IdleObserved,
+            supervisor.updated_at + chrono::Duration::seconds(1),
+        )
+        .unwrap()
+    else {
+        panic!("pure reset preparation")
+    };
+    let mut other_generation = prepared.proposed_session;
+    other_generation.conversation_reset = Some(prepared.proposed_state);
+    let stale = store
+        .create_and_attach_supervised_root_observed(
+            &SessionCallerReference::from(&other_generation),
+            &reference,
+            1,
+            &candidate,
+        )
+        .await
+        .unwrap_err();
+    assert!(stale.to_string().contains("operation_caller_changed"));
+    assert!(store.load_session(&candidate.id).await.unwrap().is_none());
+    let hook = DefaultWriteHook::install(
+        &store,
+        ACTOR_TREE_REVISION_FILE,
+        DurableWritePhase::BeforeReplace,
+        false,
+    );
+    let _release = ReleaseHook(hook.clone());
+    let worker = {
+        let store = store.clone();
+        let reference = reference.clone();
+        let candidate = candidate.clone();
+        tokio::spawn(async move {
+            store
+                .create_and_attach_supervised_root_observed(&original, &reference, 1, &candidate)
+                .await
+        })
+    };
+    hook.wait();
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    let installing = Arc::new(tokio::sync::Notify::new());
+    let installer = {
+        let store = store.clone();
+        let supervisor = supervisor.clone();
+        let candidate = candidate.clone();
+        let installing = installing.clone();
+        tokio::spawn(async move {
+            installing.notify_one();
+            install(
+                &store,
+                &supervisor,
+                vec![],
+                operation,
+                &candidate,
+                0,
+                BTreeSet::new(),
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), installing.notified())
+        .await
+        .unwrap();
+    assert!(
+        !installer.is_finished(),
+        "scope publication passed the original physical job"
+    );
+    hook.release();
+    tokio::time::timeout(Duration::from_secs(10), installer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!home
+        .path()
+        .join("sessions")
+        .join(&candidate.id)
+        .join("session.json")
+        .exists());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aborted_creation_keeps_tree_publication_and_scope_locked_until_physical_completion() {
     let (home, store, caller) = fixture().await;
