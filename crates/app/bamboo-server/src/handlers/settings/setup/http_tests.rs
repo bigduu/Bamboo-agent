@@ -68,7 +68,8 @@ async fn complete_and_reset_through_http(state: web::Data<AppState>) {
         ("/api/v1/bamboo/setup/complete", true),
         ("/api/v1/bamboo/setup/incomplete", false),
     ] {
-        let response = test::call_service(&app, test::TestRequest::post().uri(uri).to_request()).await;
+        let response =
+            test::call_service(&app, test::TestRequest::post().uri(uri).to_request()).await;
         assert_eq!(response.status(), StatusCode::OK, "{uri}");
         let result: Value = test::read_body_json(response).await;
         assert_eq!(result, json!({"success": true}));
@@ -229,10 +230,7 @@ async fn setup_preserves_exact_core_winner_when_process_snapshot_is_stale() {
     let dir = tempfile::tempdir().unwrap();
     let state = web::Data::new(isolated_state(dir.path()).await);
     let external = ConfigFacade::open(dir.path()).unwrap();
-    let original = external
-        .registry()
-        .envelope_value(SectionId::Core)
-        .unwrap();
+    let original = external.registry().envelope_value(SectionId::Core).unwrap();
     let mut winner = original.data;
     winner["external_marker"] = json!({"keep": true});
     winner["setup"] = json!({"custom": "preserved"});
@@ -269,10 +267,7 @@ async fn setup_core_revision_race_returns_conflict_without_overwriting_winner() 
     let dir = tempfile::tempdir().unwrap();
     let state = isolated_state(dir.path()).await;
     let external = ConfigFacade::open(dir.path()).unwrap();
-    let original = external
-        .registry()
-        .envelope_value(SectionId::Core)
-        .unwrap();
+    let original = external.registry().envelope_value(SectionId::Core).unwrap();
     let mut winner = original.data;
     winner["external_marker"] = json!("wins");
     let before_others = other_section_bytes(dir.path());
@@ -289,8 +284,10 @@ async fn setup_core_revision_race_returns_conflict_without_overwriting_winner() 
     .await
     .unwrap_err();
 
-    assert!(matches!(error, AppError::ConfigConflict { expected, actual }
-        if expected == original.revision && actual == original.revision + 1));
+    assert!(
+        matches!(error, AppError::ConfigConflict { expected, actual }
+        if expected == original.revision && actual == original.revision + 1)
+    );
     assert_eq!(
         std::fs::read(dir.path().join("core.json")).unwrap(),
         winner_bytes
@@ -306,10 +303,7 @@ async fn invalid_setup_shape_still_returns_400_without_any_section_write() {
     let dir = tempfile::tempdir().unwrap();
     let state = web::Data::new(isolated_state(dir.path()).await);
     let external = ConfigFacade::open(dir.path()).unwrap();
-    let original = external
-        .registry()
-        .envelope_value(SectionId::Core)
-        .unwrap();
+    let original = external.registry().envelope_value(SectionId::Core).unwrap();
     let mut invalid = original.data;
     invalid["setup"] = json!("invalid");
     external
