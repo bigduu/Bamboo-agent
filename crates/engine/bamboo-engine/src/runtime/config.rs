@@ -535,6 +535,10 @@ impl UntrustedExecutionInputs {
         let final_digest = sdk_message_digest(message);
         let created_at = message.created_at;
         let persistence = persistence.ok_or_else(invalid)?;
+        session
+            .validate_conversation_state()
+            .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
+        let original_generation = session.conversation_generation_observation();
         persistence
             .checkpoint_runtime_session(session)
             .await
@@ -550,6 +554,20 @@ impl UntrustedExecutionInputs {
                 ))
             })?
             .ok_or_else(invalid)?;
+        original_generation
+            .check_canonical(session)
+            .map_err(|error| {
+                bamboo_agent_core::AgentError::Tool(format!(
+                    "session_conversation_changed: {error}"
+                ))
+            })?;
+        original_generation
+            .check_canonical(&accepted)
+            .map_err(|error| {
+                bamboo_agent_core::AgentError::Tool(format!(
+                    "session_conversation_changed: {error}"
+                ))
+            })?;
         let mut matching = accepted
             .messages
             .iter()
@@ -1331,6 +1349,78 @@ mod sdk_acceptance_tests {
             reject,
             corrupt,
         })
+    }
+
+    fn nonzero_conversation(session: &mut Session) {
+        session.conversation_reset = Some(bamboo_domain::ConversationResetState {
+            schema_version: 1,
+            conversation_revision: 1,
+            receipts: vec![bamboo_domain::ConversationResetReceipt {
+                operation_id: format!("0:{}", uuid::Uuid::new_v4()),
+                birth_token: session.root_mode_birth_token(),
+                expected_snapshot_sha256: "a".repeat(64),
+                previous_revision: 0,
+                conversation_revision: 1,
+                retained_system_messages: 0,
+                reset_at: session.updated_at,
+            }],
+        });
+    }
+
+    struct ConversationChangingRepository {
+        stored: std::sync::Mutex<Option<Session>>,
+        mutate_caller: bool,
+    }
+    #[async_trait::async_trait]
+    impl RuntimeSessionPersistence for ConversationChangingRepository {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            let mut accepted = session.clone();
+            if let Some(state) = accepted.conversation_reset.as_mut() {
+                state.receipts[0].expected_snapshot_sha256 = "b".repeat(64);
+            } else {
+                nonzero_conversation(&mut accepted);
+            }
+            if self.mutate_caller {
+                *session = accepted.clone();
+            }
+            *self.stored.lock().unwrap() = Some(accepted);
+            Ok(())
+        }
+        async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            self.save_runtime_session(session).await
+        }
+        async fn load_runtime_session(&self, _: &str) -> std::io::Result<Option<Session>> {
+            Ok(self.stored.lock().unwrap().clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_input_seal_freezes_generation_before_a_custom_checkpoint_and_readback() {
+        for mutate_caller in [false, true] {
+            for same_revision in [false, true] {
+                let mut session = Session::new("sdk-generation-seal", "model");
+                if same_revision {
+                    nonzero_conversation(&mut session);
+                }
+                let user = Message::user("exact id and digest still cannot cross conversation");
+                let inputs = producer(&session, &user, true);
+                session.add_message(user);
+                let persistence: Arc<dyn RuntimeSessionPersistence> =
+                    Arc::new(ConversationChangingRepository {
+                        stored: Default::default(),
+                        mutate_caller,
+                    });
+                let error = inputs
+                    .seal_sdk_input(&mut session, Some(&persistence))
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("session_conversation_changed:"));
+                assert!(
+                    current(&inputs, &session).is_none(),
+                    "cannot publish New input from a different conversation"
+                );
+            }
+        }
     }
     fn producer(session: &Session, user: &Message, typed: bool) -> UntrustedExecutionInputs {
         UntrustedExecutionInputs::new(vec![UntrustedInputObservation::new(&user.id, None).unwrap()])
