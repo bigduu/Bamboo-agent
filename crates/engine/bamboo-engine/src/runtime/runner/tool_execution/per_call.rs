@@ -391,10 +391,18 @@ async fn execute_tool_call_only_with_execution_name_inner(
     // not turn its spelling into a compatibility alias for another owner.
     let reference = ctx.tool_call.function.name.trim();
     let exact_owner_shadowed = reference != execution_name && ctx.tools.owns_exact_tool(reference);
-    let framework_root_unavailable = execution_name == "spawn_session"
-        && execution.execution_contract()
-            != Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1);
-    if framework_root_unavailable
+    let session_kind =
+        bamboo_agent_core::tools::FrameworkSessionToolKind::from_execution_name(execution_name);
+    let framework_unavailable = (execution_name == "spawn_session"
+        || ((ctx.root_orchestration_only
+            || executing_supervisor
+            || ctx.root_session_id != ctx.session_id)
+            && session_kind.is_some()))
+        && !ctx
+            .tools
+            .framework_session_tool_for_exact(execution_name)
+            .is_some_and(|proof| Some(proof.kind()) == session_kind && proof.is_current());
+    if framework_unavailable
         || ((ctx.root_orchestration_only || executing_supervisor)
             && (exact_owner_shadowed
                 || !bamboo_domain::orchestration_only_allows_execution_name_for_supervisor(
@@ -417,8 +425,13 @@ async fn execute_tool_call_only_with_execution_name_inner(
             portable_tool: None,
             post_tool_hook_eligible: false,
             managed_running_violation: false,
-            result: Err(if framework_root_unavailable {
-                "session_root_port_unavailable: spawn_session requires a concrete framework Root owner; no Root or Child was started".into()
+            result: Err(if framework_unavailable {
+                let code = if execution_name == "spawn_session" {
+                    "session_root_port_unavailable"
+                } else {
+                    "session_framework_port_unavailable"
+                };
+                format!("{code}: {execution_name} requires an installed concrete Host instance; names/contracts grant no capability and no operation was started")
             } else if executing_supervisor {
                 format!("supervisor_delegation_required: Tool '{}' is outside Supervisor orchestration authority. Delegate execution to an authorized worker. If unavailable or denied, report the actual recoverable blocker; do not self-execute or retry unchanged delegation indefinitely.", ctx.tool_call.function.name)
             } else {

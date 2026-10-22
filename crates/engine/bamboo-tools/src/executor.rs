@@ -1222,6 +1222,15 @@ impl ToolExecutor for BuiltinToolExecutor {
             .and_then(|tool| tool.execution_contract())
     }
 
+    fn local_tool_instance(
+        &self,
+        name: &str,
+    ) -> Option<std::sync::Arc<dyn bamboo_agent_core::tools::Tool>> {
+        self.owns_exact_tool(name)
+            .then(|| self.registry.get(name))
+            .flatten()
+    }
+
     fn tool_mutability(&self, tool_name: &str) -> crate::ToolMutability {
         let resolved = resolve_registered_tool_name(&self.registry, tool_name);
         if self.native_tool_ceiling.is_some()

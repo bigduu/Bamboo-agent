@@ -68,6 +68,20 @@ impl RetainedToolExecution {
         self.execution_contract.as_deref()
     }
 
+    pub fn execution_name(&self) -> &str {
+        &self.execution_name
+    }
+
+    /// Apply the historical exact selector while checking an installed Host
+    /// instance. A current same-name Root must not attest a retained custom tool.
+    pub fn framework_instance_is_available(&self, executor: &dyn ToolExecutor) -> bool {
+        RETAINED_TOOL_OWNER_LOOKUP.sync_scope(self.clone(), || {
+            executor
+                .framework_session_tool_for_exact(&self.execution_name)
+                .is_some_and(|proof| proof.is_current())
+        })
+    }
+
     /// Use the same retained selector for existence and semantic provenance.
     /// The owner pointer is diagnostic only; execution stays in the full chain.
     pub fn owner_is_available(&self, executor: &dyn ToolExecutor) -> bool {
@@ -100,13 +114,30 @@ pub fn retained_tool_execution_for(
     call: &ToolCall,
     execution_name: &str,
 ) -> Result<Option<RetainedToolExecution>, ToolError> {
+    let retained = retained_tool_execution_for_call(call)?;
+    if retained
+        .as_ref()
+        .is_some_and(|retained| retained.execution_name != execution_name)
+    {
+        return Err(ToolError::Execution(
+            "retained tool call or exact owner changed before dispatch".into(),
+        ));
+    }
+    Ok(retained)
+}
+
+/// Resolve the already-bound complete call before looking at its historical
+/// owner. A new nested call inherits no selector; changed same-ID calls reject.
+pub fn retained_tool_execution_for_call(
+    call: &ToolCall,
+) -> Result<Option<RetainedToolExecution>, ToolError> {
     let retained = RETAINED_TOOL_EXECUTION
         .try_with(Clone::clone)
         .ok()
         .flatten();
     match retained {
         Some(retained) if retained.tool_call.id == call.id => {
-            if retained.tool_call != *call || retained.execution_name != execution_name {
+            if retained.tool_call != *call {
                 return Err(ToolError::Execution(
                     "retained tool call or exact owner changed before dispatch".into(),
                 ));

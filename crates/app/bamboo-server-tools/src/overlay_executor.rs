@@ -318,6 +318,13 @@ impl ToolExecutor for OverlayToolExecutor {
             .flatten()
     }
 
+    fn local_tool_instance(
+        &self,
+        name: &str,
+    ) -> Option<std::sync::Arc<dyn bamboo_agent_core::tools::Tool>> {
+        (name == self.overlay.name()).then(|| self.overlay.clone())
+    }
+
     fn list_tools(&self) -> Vec<ToolSchema> {
         let mut tools = self.base.list_tools();
 

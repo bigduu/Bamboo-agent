@@ -317,9 +317,14 @@ pub fn resolve_permission_replay_owner(
         let execution =
             restore_permission_replay_execution(session, target, operation.execution_name())?
                 .expect("retained operation provides execution selection");
-        return Ok(execution
-            .owner_is_available(executor)
-            .then(|| operation.execution_name().to_owned()));
+        return Ok((execution.owner_is_available(executor)
+            && replay_framework_instance_available(
+                session,
+                operation.execution_name(),
+                Some(&execution),
+                executor,
+            ))
+        .then(|| operation.execution_name().to_owned()));
     }
     let legacy_supervisor_binding = session.messages[target.result_message_index]
         .metadata
@@ -343,9 +348,14 @@ pub fn resolve_permission_replay_owner(
         .map_err(|error| AgentError::Tool(error.into()))?;
         let execution = restore_permission_replay_execution(session, target, &request.tool_name)?
             .expect("validated legacy binding provides execution selection");
-        return Ok(execution
-            .owner_is_available(executor)
-            .then_some(request.tool_name));
+        return Ok((execution.owner_is_available(executor)
+            && replay_framework_instance_available(
+                session,
+                &request.tool_name,
+                Some(&execution),
+                executor,
+            ))
+        .then_some(request.tool_name));
     }
     if bamboo_domain::independent_root_spawn_reference(&target.tool_call.function.name) {
         return Err(AgentError::Tool("retained spawn operation has no frozen owner/arguments; history and pending state are preserved. Resend the intended operation explicitly; no Root or Child was started".into()));
@@ -358,7 +368,31 @@ pub fn resolve_permission_replay_owner(
             ));
         }
     }
-    Ok(owner)
+    Ok(owner.filter(|name| replay_framework_instance_available(session, name, None, executor)))
+}
+
+fn replay_framework_instance_available(
+    session: &Session,
+    name: &str,
+    retained: Option<&RetainedToolExecution>,
+    executor: &dyn ToolExecutor,
+) -> bool {
+    let kind = bamboo_agent_core::tools::FrameworkSessionToolKind::from_execution_name(name);
+    let root_semantics = retained.and_then(RetainedToolExecution::execution_contract)
+        == Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1);
+    if kind.is_none()
+        || !(root_semantics
+            || session.model_orchestration_only_enabled()
+            || session.kind == bamboo_domain::SessionKind::Child)
+    {
+        return true;
+    }
+    match retained {
+        Some(retained) => retained.framework_instance_is_available(executor),
+        None => executor
+            .framework_session_tool_for_exact(name)
+            .is_some_and(|proof| Some(proof.kind()) == kind && proof.is_current()),
+    }
 }
 
 /// Locate the concrete approved invocation, newest-first and optionally bound

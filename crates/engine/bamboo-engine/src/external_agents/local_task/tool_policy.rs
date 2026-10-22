@@ -2,14 +2,19 @@
 use super::*;
 use bamboo_agent_core::tools::{
     input_guard::{check_parsed_tool_input, check_raw_tool_input},
-    parse_tool_args_best_effort, Tool, ToolCall, ToolError, ToolExecutionContext, ToolOutcome,
-    ToolResult, ToolSchema,
+    parse_tool_args_best_effort, retained_tool_execution_for, retained_tool_execution_for_call,
+    retained_tool_owner_lookup, FrameworkSessionToolKind as SessionToolKind,
+    HostFrameworkSessionTool, RetainedToolExecution, Tool, ToolCall, ToolError,
+    ToolExecutionContext, ToolOutcome, ToolResult, ToolSchema,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct LocalChildTools {
     inner: Arc<dyn ToolExecutor>,
     allowed: BTreeSet<String>,
+    legacy_allowed: BTreeSet<String>,
+    framework: BTreeMap<String, HostFrameworkSessionTool>,
+    session_version: Option<u32>,
     child_id: String,
     read_only: bool,
     nested_allowed: bool,
@@ -40,15 +45,17 @@ impl LocalChildTools {
                 .unwrap_or_default(),
         );
         let mut subagent_denied = false;
+        let mut disabled_names = BTreeSet::new();
         for denied in denied {
             // Resolve against all exact identities before applying restrictions:
             // an unavailable exact foreign::Read must never fall through to Read.
-            if let Some(name) =
-                bamboo_domain::resolve_disabled_tool_reference_name(&denied, |name| {
-                    name == "SubAgent" || inner.owns_exact_tool(name)
-                })
-            {
+            if let Some(name) = bamboo_domain::resolve_session_tool_reference(
+                session.session_version,
+                &denied,
+                |name| name == "SubAgent" || inner.owns_exact_tool(name),
+            ) {
                 subagent_denied |= name == "SubAgent";
+                disabled_names.insert(name.clone());
                 allowed.remove(&name);
                 if let Some(replacement) = bamboo_domain::legacy_shell_replacement(&name) {
                     allowed.remove(replacement);
@@ -73,11 +80,36 @@ impl LocalChildTools {
             // exact ownership, dispatch and permission gates on that same set.
             allowed.retain(|name| !skill_host::skill_interface(name));
         }
+        // Catalog-derived strings never install a framework capability. Retain
+        // the previous non-strict set only for a proven frozen custom replay.
+        let mut legacy_allowed = allowed.clone();
+        if strict {
+            legacy_allowed.retain(|name| SessionToolKind::from_execution_name(name).is_none());
+        }
+        allowed.retain(|name| SessionToolKind::from_execution_name(name).is_none());
+        let framework = if strict {
+            BTreeMap::new()
+        } else {
+            SessionToolKind::ALL
+                .into_iter()
+                .filter(|kind| !read_only || kind.is_reader())
+                .filter(|kind| !disabled_names.contains(kind.execution_name()))
+                .filter_map(|kind| {
+                    inner
+                        .framework_session_tool_for_exact(kind.execution_name())
+                        .filter(|proof| proof.kind() == kind && proof.is_current())
+                        .map(|proof| (kind.execution_name().to_owned(), proof))
+                })
+                .collect()
+        };
         Ok(Self {
             store,
             owner,
             inner,
             allowed,
+            legacy_allowed,
+            framework,
+            session_version: session.session_version,
             child_id: session.id.clone(),
             read_only,
             nested_allowed: !strict && !read_only && !subagent_denied,
@@ -98,6 +130,12 @@ impl LocalChildTools {
     }
 
     fn registered(&self, name: &str) -> bool {
+        if SessionToolKind::from_execution_name(name).is_some() {
+            return self
+                .framework
+                .get(name)
+                .is_some_and(HostFrameworkSessionTool::is_current);
+        }
         self.subagent
             .as_ref()
             .is_some_and(|tool| name == tool.name())
@@ -105,16 +143,75 @@ impl LocalChildTools {
     }
 
     fn check(&self, call: &ToolCall, ctx: &ToolExecutionContext<'_>) -> Result<String, ToolError> {
+        self.check_context(call, ctx)?;
+        if let Some(retained) = retained_tool_execution_for_call(call)? {
+            let name = retained.execution_name().to_owned();
+            self.check_retained(&retained)?;
+            return Ok(name);
+        }
+        self.fresh_name(&call.function.name)
+            .ok_or_else(|| ToolError::NotFound(call.function.name.clone()))
+    }
+
+    fn check_context(
+        &self,
+        call: &ToolCall,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<(), ToolError> {
         if ctx.session_id != Some(self.child_id.as_str()) || ctx.tool_call_id != call.id {
             return Err(ToolError::Execution(
                 "local Child tool owner changed".into(),
             ));
         }
-        bamboo_domain::resolve_tool_reference_name(&call.function.name, |name| {
+        Ok(())
+    }
+    fn fresh_name(&self, reference: &str) -> Option<String> {
+        bamboo_domain::resolve_session_tool_reference(self.session_version, reference, |name| {
             self.registered(name)
         })
-        .filter(|name| self.allowed.contains(name))
-        .ok_or_else(|| ToolError::NotFound(call.function.name.clone()))
+        .filter(|name| self.allowed.contains(name) || self.framework.contains_key(name))
+    }
+    fn check_retained(&self, retained: &RetainedToolExecution) -> Result<(), ToolError> {
+        if retained.execution_name() == "spawn_session" && !retained.contract_known() {
+            return Err(ToolError::Execution(
+                "retained Child spawn owner has unknown provenance; resend explicitly".into(),
+            ));
+        }
+        if !retained.owner_is_available(self) {
+            return Err(ToolError::Execution(
+                "retained Child exact owner/instance is unavailable; resend explicitly".into(),
+            ));
+        }
+        if SessionToolKind::from_execution_name(retained.execution_name()).is_some()
+            && !retained.framework_instance_is_available(self)
+            && !(retained.execution_name() == "spawn_session"
+                && retained.contract_known()
+                && retained.execution_contract()
+                    != Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+                && self.legacy_allowed.contains("spawn_session"))
+        {
+            return Err(ToolError::Execution(
+                "retained Child framework instance is unavailable; resend explicitly".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn framework_for_call(
+        &self,
+        call: &ToolCall,
+        name: &str,
+    ) -> Result<Option<&HostFrameworkSessionTool>, ToolError> {
+        let proof = self.framework.get(name).filter(|proof| proof.is_current());
+        if let Some(retained) = retained_tool_execution_for(call, name)? {
+            if retained.contract_known()
+                && proof.is_some_and(|proof| {
+                    proof.execution_contract() != retained.execution_contract()
+                })
+            {
+                return Ok(None);
+            }
+        }
+        Ok(proof)
     }
 
     fn check_exact(
@@ -123,7 +220,11 @@ impl LocalChildTools {
         name: &str,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<(), ToolError> {
-        if self.check(call, ctx)? != name {
+        self.check_context(call, ctx)?;
+        if let Some(retained) = retained_tool_execution_for(call, name)? {
+            return self.check_retained(&retained);
+        }
+        if self.fresh_name(&call.function.name).as_deref() != Some(name) {
             return Err(ToolError::NotFound(call.function.name.clone()));
         }
         Ok(())
@@ -148,7 +249,24 @@ impl LocalChildTools {
         self.check_live().await?;
         ctx.plan_read_only |= self.read_only;
         let invoke = async {
-            if let Some(subagent) = self.subagent.as_ref().filter(|tool| tool.name() == name) {
+            if let Some(proof) = self.framework_for_call(call, name)? {
+                check_raw_tool_input(name, &call.function.arguments)?;
+                let args = ctx
+                    .pre_parsed_args
+                    .cloned()
+                    .unwrap_or_else(|| parse_tool_args_best_effort(&call.function.arguments).0);
+                check_parsed_tool_input(name, &args)?;
+                if let Some(outcome) = proof.check_permissions(call, &args, &ctx).await? {
+                    return Ok(outcome);
+                }
+                proof
+                    .check_restrictions(call, &args, &ctx.to_tool_ctx())
+                    .await?;
+                self.check_exact(call, name, &ctx)?;
+                self.check_live().await?;
+                proof.invoke_after_checks(args, ctx.to_tool_ctx()).await
+            } else if let Some(subagent) = self.subagent.as_ref().filter(|tool| tool.name() == name)
+            {
                 check_raw_tool_input(name, &call.function.arguments)?;
                 let args = ctx
                     .pre_parsed_args
@@ -229,6 +347,13 @@ impl ToolExecutor for LocalChildTools {
         self.check_live().await?;
         let mut ctx = *ctx;
         ctx.plan_read_only |= self.read_only;
+        if let Some(proof) = self.framework_for_call(call, name)? {
+            let args = ctx
+                .pre_parsed_args
+                .cloned()
+                .unwrap_or_else(|| parse_tool_args_best_effort(&call.function.arguments).0);
+            return proof.check_permissions(call, &args, &ctx).await;
+        }
         if self
             .subagent
             .as_ref()
@@ -258,6 +383,9 @@ impl ToolExecutor for LocalChildTools {
         self.check_live().await?;
         let mut ctx = *ctx;
         ctx.plan_read_only |= self.read_only;
+        if let Some(proof) = self.framework_for_call(call, name)? {
+            return proof.check_permissions(call, args, &ctx).await;
+        }
         self.inner
             .check_permissions_for_resolved(call, name, args, &ctx)
             .await
@@ -278,14 +406,38 @@ impl ToolExecutor for LocalChildTools {
         if let Some(subagent) = &self.subagent {
             schemas.push(subagent.to_schema());
         }
+        schemas.extend(
+            self.framework
+                .values()
+                .filter(|proof| proof.is_current())
+                .map(HostFrameworkSessionTool::schema),
+        );
         schemas
     }
     fn owns_exact_tool(&self, name: &str) -> bool {
-        self.allowed.contains(name) && self.registered(name)
+        if let Some(retained) = retained_tool_owner_lookup(name) {
+            if name == "spawn_session" && !retained.contract_known() {
+                return false;
+            }
+            return (self.allowed.contains(name) && self.registered(name))
+                || self
+                    .framework
+                    .get(name)
+                    .is_some_and(HostFrameworkSessionTool::is_current)
+                || (self.legacy_allowed.contains(name) && self.inner.owns_exact_tool(name));
+        }
+        (self.allowed.contains(name) || self.framework.contains_key(name)) && self.registered(name)
     }
     fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
-        if !self.allowed.contains(name) {
+        if !self.owns_exact_tool(name) {
             return None;
+        }
+        if self
+            .framework
+            .get(name)
+            .is_some_and(HostFrameworkSessionTool::is_current)
+        {
+            return Some(self);
         }
         if self
             .subagent
@@ -296,6 +448,49 @@ impl ToolExecutor for LocalChildTools {
         } else {
             self.inner.exact_tool_owner(name)
         }
+    }
+    fn local_execution_contract(&self, name: &str) -> Option<&'static str> {
+        self.framework
+            .get(name)
+            .filter(|proof| proof.is_current())
+            .and_then(HostFrameworkSessionTool::execution_contract)
+            .or_else(|| {
+                self.subagent
+                    .as_ref()
+                    .filter(|tool| tool.name() == name)
+                    .and_then(|tool| tool.execution_contract())
+            })
+    }
+    fn local_tool_instance(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.framework
+            .get(name)
+            .filter(|proof| proof.is_current())
+            .map(HostFrameworkSessionTool::instance)
+            .or_else(|| {
+                self.subagent
+                    .as_ref()
+                    .filter(|tool| tool.name() == name)
+                    .cloned()
+            })
+    }
+    fn local_framework_session_tool(&self, name: &str) -> Option<HostFrameworkSessionTool> {
+        self.framework
+            .get(name)
+            .filter(|proof| proof.is_current())
+            .cloned()
+    }
+    fn call_parallel_classification(
+        &self,
+        call: &ToolCall,
+    ) -> (bamboo_agent_core::ToolMutability, bool) {
+        if let Some(proof) = self
+            .fresh_name(&call.function.name)
+            .and_then(|name| self.framework.get(&name))
+        {
+            let class = proof.classify(&parse_tool_args_best_effort(&call.function.arguments).0);
+            return (class.mutability, class.parallel_safe);
+        }
+        self.inner.call_parallel_classification(call)
     }
 }
 

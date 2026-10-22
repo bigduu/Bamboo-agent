@@ -132,12 +132,13 @@ pub(super) fn build_base_tools(
             session_messenger.clone(),
         ),
     );
+    let session_message_tool = Arc::new(
+        bamboo_server_tools::SessionMessageTool::new(session_messenger)
+            .with_scoped_sender(scoped_sender),
+    );
     let with_messages: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_memory,
-        Arc::new(
-            bamboo_server_tools::SessionMessageTool::new(session_messenger)
-                .with_scoped_sender(scoped_sender),
-        ),
+        session_message_tool.clone(),
     ));
 
     // `ledger` sits in the base layer (not root-only) so headless reminder
@@ -204,14 +205,16 @@ pub(super) fn build_base_tools(
     // One real assembly serves Agent defaults, schedules and the Base supplied
     // to Child execution. LocalChildTools still applies its own immutable
     // native ceiling; registration here does not widen that separate boundary.
-    let base = bamboo_server_tools::framework_session_tools::assemble_framework_session_tools(
-        base,
-        builtin_executor.clone(),
-        session_store,
-        storage,
-        config,
-        root_creator,
-    );
+    let base =
+        bamboo_server_tools::framework_session_tools::assemble_framework_session_tools_with_message(
+            base,
+            builtin_executor.clone(),
+            session_store,
+            storage,
+            config,
+            root_creator,
+            Some(session_message_tool),
+        );
     let ceiling = Arc::new(HostNativeToolCeiling {
         builtin: builtin_executor.clone(),
         base: base.clone(),
