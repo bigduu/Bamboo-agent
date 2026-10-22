@@ -90,6 +90,49 @@ fn authored_skill_metadata_is_bounded_and_not_a_frontmatter_injection() {
     assert!(verify_authored_skill("authored-flow", &edited).is_err());
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[actix_web::test]
+async fn unsupported_update_is_501_while_create_and_read_stay_available() {
+    let data = tempfile::tempdir().unwrap();
+    let state = web::Data::new(AppState::new(data.path().to_path_buf()).await.unwrap());
+    let app = webtest::init_service(App::new().app_data(state).service(routes())).await;
+    let response = webtest::call_service(
+        &app,
+        webtest::TestRequest::post()
+            .uri("/definitions")
+            .set_json(json!({"target":"user","description":"Read unchanged", "definition":definition("authored-flow",1)}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let first: Value = webtest::read_body_json(response).await;
+    let bundle = data.path().join("skills/authored-flow");
+    let original_definition = std::fs::read(bundle.join("workflow.yaml")).unwrap();
+    let original_skill = std::fs::read(bundle.join("SKILL.md")).unwrap();
+    let response = webtest::call_service(
+        &app,
+        webtest::TestRequest::put()
+            .uri("/definitions/authored-flow")
+            .set_json(json!({"target":"user","expected_revision":1,"expected_digest":first["content_digest"],"expected_skill_digest":first["skill_digest"],"definition":definition("authored-flow",2)}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let unchanged: Value = webtest::call_and_read_body_json(
+        &app,
+        webtest::TestRequest::get()
+            .uri("/definitions/authored-flow?target=user")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(unchanged["content_digest"], first["content_digest"]);
+    assert_eq!(unchanged["skill_digest"], first["skill_digest"]);
+    assert_eq!(unchanged["definition"]["revision"], 1);
+    assert_eq!(std::fs::read(bundle.join("workflow.yaml")).unwrap(), original_definition);
+    assert_eq!(std::fs::read(bundle.join("SKILL.md")).unwrap(), original_skill);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[actix_web::test]
 async fn authoring_create_read_update_conflicts_and_pinned_revisions() {
     let data = tempfile::tempdir().unwrap();
@@ -683,6 +726,7 @@ async fn unassigned_legacy_session_keeps_its_durable_workspace() {
         .contains("legacy-marker.txt"));
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[actix_web::test]
 async fn nested_definitions_require_available_pins_and_cannot_cycle_through_replaced_root() {
     let data = tempfile::tempdir().unwrap();

@@ -4,6 +4,9 @@
 //! Clone and authoring writes share one descriptor-bound transaction lock.
 //! Failed stages are deliberately retained, never adopted or recursively
 //! removed: without a durable ownership journal, their ownership is uncertain.
+//! Updates also retain the displaced file outside catalog discovery. An
+//! exchange detects concurrent replacement without destroying its bytes; it
+//! does not provide an expected-inode CAS against uncooperative editors.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -30,6 +33,7 @@ const SKILL_FILE: &str = "SKILL.md";
 pub(super) enum DefinitionPublicationError {
     Invalid(&'static str),
     Conflict(&'static str),
+    Unsupported(&'static str),
     Io(std::io::Error),
     Internal(&'static str),
     /// Rename may have committed. The client must reload before retrying; an
@@ -399,7 +403,7 @@ fn create_file(
     Ok(after)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 type PublicationHook = std::sync::Arc<dyn Fn(&CapDir, &CapDir) + Send + Sync>;
 
 #[cfg_attr(not(test), derive(Copy))]
@@ -411,8 +415,10 @@ enum PublicationFault {
     BeforeRename,
     #[cfg(test)]
     AfterRename,
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     BeforeRenameHook(PublicationHook),
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    AfterRenameHook(PublicationHook),
 }
 
 #[cfg(test)]
@@ -569,6 +575,44 @@ pub(super) fn update_definition(
     )
 }
 
+pub(super) fn require_update_support() -> Result<(), DefinitionPublicationError> {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        Ok(())
+    } else {
+        Err(DefinitionPublicationError::Unsupported(
+            "Workflow definition updates require Linux or macOS exchange support",
+        ))
+    }
+}
+
+fn exchange_definition(
+    transaction: &CapDir,
+    temporary_name: &str,
+    bundle: &CapDir,
+) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::fd::AsFd;
+
+        rustix::fs::renameat_with(
+            transaction.as_fd(),
+            Path::new(temporary_name),
+            bundle.as_fd(),
+            Path::new(DEFINITION_FILE),
+            rustix::fs::RenameFlags::EXCHANGE,
+        )
+        .map_err(std::io::Error::from)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (transaction, temporary_name, bundle);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Workflow definition exchange is unavailable on this platform",
+        ))
+    }
+}
+
 fn update_definition_with_fault(
     trusted_root: &Path,
     id: &str,
@@ -587,6 +631,9 @@ fn update_definition_with_fault(
             "Workflow definition revision must increase by exactly one",
         ));
     }
+    // In particular, do not create a transaction directory, lock or stage on
+    // platforms where preserving the displaced target is unavailable.
+    require_update_support()?;
     let authority = Authority::open(trusted_root)?;
     authority.reject_clone_marker(id)?;
     let bundle = open_real_child_dir(&authority.root.skills_dir, Path::new(id))?;
@@ -637,39 +684,65 @@ fn update_definition_with_fault(
     if matches!(_fault, PublicationFault::BeforeRename) {
         return Err(injected_failure());
     }
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     if let PublicationFault::BeforeRenameHook(hook) = &_fault {
         hook(&authority.transaction, &bundle);
     }
-    // Handle-relative atomic replacement. Never truncate the visible file.
-    if authority
-        .transaction
-        .rename(&temporary_name, &bundle, DEFINITION_FILE)
-        .is_err()
-    {
-        return Err(DefinitionPublicationError::PublicationUncertain(
-            "Workflow update could not confirm publication; reload before retrying",
-        ));
-    }
+    // The outside editor need not take our lock. Preserve whichever entry is
+    // actually displaced, then verify it was the checked original. Ordinary
+    // rename would unlink an editor's replacement in this last-check window.
+    // Never fall back to rename or swap back over a later visible version.
+    let exchanged = exchange_definition(&authority.transaction, &temporary_name, &bundle);
     #[cfg(test)]
-    if matches!(_fault, PublicationFault::AfterRename) {
+    if exchanged.is_ok() && matches!(_fault, PublicationFault::AfterRename) {
         return Err(DefinitionPublicationError::PublicationUncertain(
             "Workflow update committed but durability could not be confirmed",
         ));
     }
-    authority.ensure_bundle_named(id, &bundle).map_err(|_| {
-        DefinitionPublicationError::PublicationUncertain("Workflow update authority changed")
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    if exchanged.is_ok() {
+        if let PublicationFault::AfterRenameHook(hook) = &_fault {
+            hook(&authority.transaction, &bundle);
+        }
+    }
+    // Attempt both barriers even if exchange reported an error or displaced
+    // an unexpected entry. Retain every entry on all uncertainty paths.
+    let published_sync = sync_cap_directory(&bundle);
+    let retained_sync = sync_cap_directory(&authority.transaction);
+    if exchanged.is_err() || published_sync.is_err() || retained_sync.is_err() {
+        return Err(DefinitionPublicationError::PublicationUncertain(
+            "Workflow update publication or durability could not be confirmed; reload before retrying",
+        ));
+    }
+    let confirmed = (|| -> Result<(), DefinitionPublicationError> {
+        authority.ensure_bundle_named(id, &bundle)?;
+        let (retained_bytes, _) = read_file(
+            &authority.transaction,
+            &temporary_name,
+            MAX_DEFINITION_BYTES,
+        )?;
+        if retained_bytes != old_bytes {
+            return Err(DefinitionPublicationError::Conflict(
+                "Workflow update displaced different definition bytes",
+            ));
+        }
+        ensure_file_unchanged(&authority.transaction, &temporary_name, &old_metadata)?;
+        let (published_bytes, _) = read_file(&bundle, DEFINITION_FILE, MAX_DEFINITION_BYTES)?;
+        let (published_skill, _) = read_file(&bundle, SKILL_FILE, MAX_SKILL_BYTES)?;
+        if published_bytes != bytes || published_skill != current.skill_bytes {
+            return Err(DefinitionPublicationError::Conflict(
+                "Workflow update target or immutable metadata changed after exchange",
+            ));
+        }
+        ensure_file_unchanged(&bundle, DEFINITION_FILE, &temporary)?;
+        ensure_file_unchanged(&bundle, SKILL_FILE, &skill_metadata)?;
+        authority.ensure_bundle_named(id, &bundle)
+    })();
+    confirmed.map_err(|_| {
+        DefinitionPublicationError::PublicationUncertain(
+            "Workflow update exchanged files but the original target or current publication changed; reload before retrying",
+        )
     })?;
-    ensure_cap_file_is_still_named(&bundle, Path::new(DEFINITION_FILE), &temporary).map_err(
-        |_| DefinitionPublicationError::PublicationUncertain("Workflow update target changed"),
-    )?;
-    sync_cap_directory(&bundle)
-        .and_then(|()| sync_cap_directory(&authority.transaction))
-        .map_err(|_| {
-            DefinitionPublicationError::PublicationUncertain(
-                "Workflow update committed but durability could not be confirmed",
-            )
-        })?;
     Ok(DefinitionSnapshot {
         bytes: bytes.to_vec(),
         digest: sha256(bytes),
@@ -725,6 +798,7 @@ mod tests {
         )
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn create_read_update_preserves_skill_and_added_resources() {
         let (root, original) = fixture();
@@ -763,6 +837,7 @@ mod tests {
         assert_eq!(read_definition(root.path(), ID).unwrap(), original);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn stale_digest_revision_and_immutable_skill_fail_without_writes() {
         let (root, original) = fixture();
@@ -796,6 +871,7 @@ mod tests {
         assert_eq!(read_definition(root.path(), ID).unwrap(), newer);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn same_revision_external_bytes_and_skill_changes_conflict() {
         let (root, original) = fixture();
@@ -823,6 +899,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn concurrent_updates_have_one_compare_and_swap_winner() {
         let (root, original) = fixture();
@@ -1038,6 +1115,7 @@ mod tests {
             read_definition(root.path(), ID),
             Err(DefinitionPublicationError::Conflict(_))
         ));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(matches!(
             update(root.path(), &original, &definition(ID, 2)),
             Err(DefinitionPublicationError::Conflict(_))
@@ -1052,6 +1130,7 @@ mod tests {
             read_definition(root.path(), ID),
             Err(DefinitionPublicationError::Conflict(_))
         ));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(matches!(
             update(root.path(), &original, &definition(ID, 2)),
             Err(DefinitionPublicationError::Conflict(_))
@@ -1085,6 +1164,7 @@ mod tests {
             .join("definition-unknown");
         std::fs::create_dir(&sentinel).unwrap();
         std::fs::write(sentinel.join("sentinel"), b"other owner's content").unwrap();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(matches!(
             update_definition_with_fault(
                 root.path(),
@@ -1127,19 +1207,24 @@ mod tests {
     #[test]
     fn failures_after_rename_report_uncertainty_and_preserve_committed_bytes() {
         let (root, original) = fixture();
-        assert!(matches!(
-            update_definition_with_fault(
-                root.path(),
-                ID,
-                &original.digest,
-                original.revision,
-                &original.skill_digest,
-                &definition(ID, 2),
-                PublicationFault::AfterRename
-            ),
-            Err(DefinitionPublicationError::PublicationUncertain(_))
-        ));
-        assert_eq!(read_definition(root.path(), ID).unwrap().revision, 2);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert!(matches!(
+                update_definition_with_fault(
+                    root.path(),
+                    ID,
+                    &original.digest,
+                    original.revision,
+                    &original.skill_digest,
+                    &definition(ID, 2),
+                    PublicationFault::AfterRename
+                ),
+                Err(DefinitionPublicationError::PublicationUncertain(_))
+            ));
+            assert_eq!(read_definition(root.path(), ID).unwrap().revision, 2);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(read_definition(root.path(), ID).unwrap(), original);
         assert!(matches!(
             create_definition_with_fault(
                 root.path(),
@@ -1210,15 +1295,133 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn retained_file_count(
+        root: &Path,
+        identity: bamboo_skills::clone_publication::CloneNodeIdentity,
+        bytes: &[u8],
+    ) -> usize {
+        std::fs::read_dir(root.join(CLONE_TRANSACTION_DIRECTORY))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let Ok(file) = std::fs::File::open(path) else {
+                    return false;
+                };
+                std_file_identity(&file) == Some(identity)
+                    && std::fs::read(path).unwrap() == bytes
+            })
+            .count()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn same_bytes_replacement_after_final_check_still_requires_original_identity() {
+        let (root, original) = fixture();
+        let replacement = original.bytes.clone();
+        let identity = Arc::new(std::sync::Mutex::new(None));
+        let captured = identity.clone();
+        let result = update_definition_with_fault(
+            root.path(),
+            ID,
+            &original.digest,
+            original.revision,
+            &original.skill_digest,
+            &definition(ID, 2),
+            PublicationFault::BeforeRenameHook(Arc::new(move |transaction, bundle| {
+                let name = format!("external-{}.yaml", uuid::Uuid::new_v4());
+                let metadata = create_file(transaction, &name, &replacement).unwrap();
+                *captured.lock().unwrap() = Some(cap_node_identity(&metadata));
+                transaction.rename(&name, bundle, DEFINITION_FILE).unwrap();
+            })),
+        );
+        assert!(matches!(
+            result,
+            Err(DefinitionPublicationError::PublicationUncertain(_))
+        ));
+        let identity = identity.lock().unwrap().unwrap();
+        assert_eq!(retained_file_count(root.path(), identity, &original.bytes), 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn later_editor_version_is_never_replaced_by_an_uncertainty_rollback() {
+        let (root, original) = fixture();
+        let path = root.path().join("skills").join(ID).join(DEFINITION_FILE);
+        let original_file = std::fs::File::open(&path).unwrap();
+        let original_identity = std_file_identity(&original_file).unwrap();
+        drop(original_file);
+        let mut later_bytes = definition(ID, 2);
+        later_bytes.extend_from_slice(b"\n# Later external editor version C\n");
+        let replacement = later_bytes.clone();
+        let later_identity = Arc::new(std::sync::Mutex::new(None));
+        let captured = later_identity.clone();
+        let result = update_definition_with_fault(
+            root.path(),
+            ID,
+            &original.digest,
+            original.revision,
+            &original.skill_digest,
+            &definition(ID, 2),
+            PublicationFault::AfterRenameHook(Arc::new(move |transaction, bundle| {
+                let name = format!("external-{}.yaml", uuid::Uuid::new_v4());
+                let metadata = create_file(transaction, &name, &replacement).unwrap();
+                *captured.lock().unwrap() = Some(cap_node_identity(&metadata));
+                transaction.rename(&name, bundle, DEFINITION_FILE).unwrap();
+            })),
+        );
+        assert!(matches!(
+            result,
+            Err(DefinitionPublicationError::PublicationUncertain(_))
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), later_bytes);
+        assert_eq!(
+            std_file_identity(&std::fs::File::open(&path).unwrap()),
+            *later_identity.lock().unwrap()
+        );
+        assert_eq!(
+            retained_file_count(root.path(), original_identity, &original.bytes),
+            1
+        );
+        assert_eq!(
+            std::fs::read(path.with_file_name(SKILL_FILE)).unwrap(),
+            original.skill_bytes
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn successful_updates_retain_each_displaced_version_outside_the_bundle() {
+        let (root, original) = fixture();
+        let path = root.path().join("skills").join(ID).join(DEFINITION_FILE);
+        let original_identity =
+            std_file_identity(&std::fs::File::open(&path).unwrap()).unwrap();
+        let revised = update(root.path(), &original, &definition(ID, 2)).unwrap();
+        let revised_identity = std_file_identity(&std::fs::File::open(&path).unwrap()).unwrap();
+        let latest = update(root.path(), &revised, &definition(ID, 3)).unwrap();
+        assert_eq!(read_definition(root.path(), ID).unwrap(), latest);
+        assert_eq!(
+            retained_file_count(root.path(), original_identity, &original.bytes),
+            1
+        );
+        assert_eq!(retained_file_count(root.path(), revised_identity, &revised.bytes), 1);
+        assert_eq!(
+            std::fs::read(path.with_file_name(SKILL_FILE)).unwrap(),
+            original.skill_bytes
+        );
+    }
+
     #[test]
     fn oversized_and_nonregular_existing_files_fail_closed() {
         let (root, original) = fixture();
+        assert_eq!(read_definition(root.path(), ID).unwrap(), original);
         let definition_file = root.path().join("skills").join(ID).join(DEFINITION_FILE);
         std::fs::write(&definition_file, vec![b' '; MAX_DEFINITION_BYTES + 1]).unwrap();
         assert!(matches!(
             read_definition(root.path(), ID),
             Err(DefinitionPublicationError::Conflict(_))
         ));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(matches!(
             update(root.path(), &original, &definition(ID, 2)),
             Err(DefinitionPublicationError::Conflict(_))
@@ -1229,11 +1432,43 @@ mod tests {
             read_definition(root.path(), ID),
             Err(DefinitionPublicationError::Conflict(_))
         ));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(matches!(
             update(root.path(), &original, &definition(ID, 2)),
             Err(DefinitionPublicationError::Conflict(_))
         ));
         assert!(definition_file.is_dir());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn unsupported_updates_do_not_create_or_change_publication_files() {
+        let (root, original) = fixture();
+        let transaction = root.path().join(CLONE_TRANSACTION_DIRECTORY);
+        let entries = || {
+            let mut names = std::fs::read_dir(&transaction)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let before = entries();
+        let missing = root.path().join("not-created");
+        assert!(matches!(
+            update(&missing, &original, &definition(ID, 2)),
+            Err(DefinitionPublicationError::Unsupported(_))
+        ));
+        assert!(!missing.exists());
+        let resource = root.path().join("skills").join(ID).join("notes.txt");
+        std::fs::write(&resource, b"user resource").unwrap();
+        assert!(matches!(
+            update(root.path(), &original, &definition(ID, 2)),
+            Err(DefinitionPublicationError::Unsupported(_))
+        ));
+        assert_eq!(entries(), before);
+        assert_eq!(read_definition(root.path(), ID).unwrap(), original);
+        assert_eq!(std::fs::read(resource).unwrap(), b"user resource");
     }
 
     #[cfg(unix)]

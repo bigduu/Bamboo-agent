@@ -55,8 +55,13 @@ The response returns the normalized definition, description, source,
 digest is SHA-256 of the exact `workflow.yaml` bytes; the second is SHA-256 of
 its immutable `SKILL.md` header/body. Neither token is the catalog's separate
 bundle `catalog_content_digest`. Echo both editing tokens for an update.
-Stale revision, changed metadata, replacement file identity or an existing
-create destination produces a conflict rather than an overwrite.
+An observed stale revision, changed metadata, replacement file identity or an
+existing create destination produces a conflict before publication. An external
+editor can still replace the definition after the final check. Updates exchange
+files atomically and retain the displaced entry outside catalog discovery; if
+its identity or bytes differ from the checked original, the API returns an
+uncertain publication error. The requested version may already be visible.
+This is not a conditional filesystem CAS against uncooperative editors.
 
 A filesystem save can succeed while a subsequent catalog refresh is unavailable;
 `saved: true, catalog_available: false` records that distinction. An uncertain
@@ -96,9 +101,18 @@ is not evidence that the old bytes survived.
   workspace and never overwrite the parent's runtime path from a legacy field.
 - Existing runs retain their immutable definition bundles. A new run must select
   the new revision explicitly; updates never rewrite a running or persisted run.
+- Definition updates currently require the descriptor-relative exchange primitive
+  on Linux or macOS and filesystem support for it. Other platforms, including
+  Windows, return HTTP 501 before update filesystem operations. Windows update
+  support has not been implemented or validated. Create, read and existing clone
+  publication keep their existing platform paths; this change does not certify
+  those paths on Windows.
 - Writes use the shared descriptor-bound publication lock, bounded no-follow
-  reads, no-replace creation and atomic file replacement. Failed/uncertain stages
-  are retained outside catalog discovery instead of deleting uncertain content.
+  reads, no-replace creation and preserving exchange for updates. Prior files
+  from successful updates and failed/uncertain stages are retained outside
+  catalog discovery. The API never swaps back over a later editor's version,
+  adopts retained entries or automatically removes them. An uncertain error is
+  not proof of crash durability or that the old bytes stayed at their old path.
 
 This API is the first authoring foundation. An Agent-facing mutation tool and a
 minimal creation/editing UI remain separate consumer work; the API alone is not

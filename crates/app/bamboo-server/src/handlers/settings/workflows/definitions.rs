@@ -322,6 +322,9 @@ fn publication_error(problem: DefinitionPublicationError) -> Box<HttpResponse> {
     match problem {
         DefinitionPublicationError::Invalid(message) => error(StatusCode::BAD_REQUEST, message),
         DefinitionPublicationError::Conflict(message) => error(StatusCode::CONFLICT, message),
+        DefinitionPublicationError::Unsupported(message) => {
+            error(StatusCode::NOT_IMPLEMENTED, message)
+        }
         DefinitionPublicationError::Io(problem)
             if problem.kind() == std::io::ErrorKind::NotFound =>
         {
@@ -588,6 +591,11 @@ pub async fn update_workflow_definition(
             StatusCode::BAD_REQUEST,
             "Update must keep the workflow id and increment its expected revision exactly once",
         ));
+    }
+    // Reject unsupported update publication before scope resolution or a
+    // definition read can create publication directories or lock files.
+    if let Err(problem) = definition_publication::require_update_support() {
+        return Ok(*publication_error(problem));
     }
     let mut scope = match scope_for(&state, body.target, body.session_id.as_deref()).await {
         Ok(value) => value,
