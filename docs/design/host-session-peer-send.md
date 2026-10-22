@@ -54,13 +54,25 @@ or global cross-process revocation.
 
 ## Identity, intent and receipts
 
-The shared existing `session-peer-v1` message identity uses source ID/birth,
-target ID/birth and operation ID. It excludes rotating grant UUID/revision and
-conversation generation. Reissuing a grant can retry an exact operation without
-duplicating it; the current grant and original invocation still need separate
-validation. Reusing that identity with changed text or delivery intent is a
-semantic conflict. The low-level port requires bounded plain text and the exact
-source/target/thread/operation envelope; it does not authorize reply or steer.
+Ordinary Root/Child send retains the existing `session-peer-v1` address using
+source ID/birth, target ID/birth and operation ID. A genuine Supervisor retains
+the existing `supervisor_followup` address using its SupervisorReference, target
+ID and operation ID, together with its unthreaded envelope. A pure Domain
+identity projection is shared by the engine and final writer; the legacy
+Supervisor writer uses that same identity helper. Host routing, delivery intent,
+rotating grant UUID/revision and conversation generation cannot allocate another
+address for the same logical operation. The final Host writer independently
+checks the current target birth even though the historical Supervisor address
+did not encode it. None of these identity bytes grants authority.
+
+Supervisor TriggerTurn retains the exact existing RespectSpecificWait intent
+wire, so an admitted legacy operation remains an exact retry after Host scope
+installation. QueueOnly uses an explicit inert intent at the same address;
+switching it to TriggerTurn is a conflict, as is changed text. Ordinary peer
+intents keep their existing wire. The current grant and original invocation
+still need separate final validation, including for every receipt replay. The
+low-level port requires bounded plain text and the exact source/target/thread/
+operation envelope; it does not authorize reply or steer.
 
 The same durable semantic receipts and immutable DeliveryIntent govern QueueOnly,
 TriggerTurn, activation failure and ACKed retries. QueueOnly may notify an
@@ -70,7 +82,7 @@ admission, not consumption, completion, additional authority or wait resolution.
 
 ## Source validation and remaining gates
 
-Fourteen new Rust case sources cover SendOnly for all three roles across Projects,
+Seventeen new Rust case sources cover SendOnly for all three roles across Projects,
 installed-scope/no-fallback routing, distinct inspection rights, grant reissue
 and frozen arguments, default unsupported adapters, activation failure/ACK retry,
 canonical identity/Project/metadata/ancestors, forged raw envelopes, complete
@@ -83,6 +95,11 @@ Additional deterministic Registry polls and a four-way paused legacy writer
 fixture cover absent/uncommitted slot publication, installation/revocation
 winning before admission, and the absence guard surviving a physical job's
 runtime shutdown without consuming permanent Registry caller capacity.
+A fixed Supervisor wire identity fixture and two real Inbox/adapter source cases
+cover legacy receipt → Host installation → exact retry, body/intent conflicts,
+revocation and queue/trigger sharing one operation address. A Host-only target
+with no Supervisor attachment proves that compatible wire identity does not
+borrow the old Supervisor authority.
 
 Direct `rustfmt --check`, `git diff --check` and source inventory are the only
 checks run in this slice. **Compilation, Cargo, Clippy and all Rust tests are
@@ -90,6 +107,7 @@ UNRUN** while the parent holds the Rust execution window. Proposed affected
 test commands, to be run only after that window is granted:
 
 ```text
+cargo test --locked -p bamboo-domain host_session_scope
 cargo test --locked -p bamboo-storage host_session_scope
 cargo test --locked -p bamboo-storage session_inbox::host_scope_tests
 cargo test --locked -p bamboo-server-tools --test scoped_session_messaging

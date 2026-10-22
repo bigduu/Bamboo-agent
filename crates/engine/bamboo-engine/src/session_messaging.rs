@@ -423,9 +423,8 @@ impl SessionMessenger {
             .map_err(|_| unauthorized())?
             .observation
             .identity;
-        let id = bamboo_domain::session_peer_message_id(
-            &caller.session_id,
-            caller.created_at,
+        let identity = bamboo_domain::HostSessionPeerIdentity::for_caller(
+            caller,
             &target.session_id,
             target.created_at,
             operation_id,
@@ -435,8 +434,8 @@ impl SessionMessenger {
             &target.session_id,
             operation_id,
             message,
-            id.clone(),
-            id.to_string(),
+            identity.message_id,
+            identity.thread_id,
             None,
         );
         let started = Instant::now();
@@ -765,7 +764,7 @@ impl SessionMessenger {
             operation_id,
             message,
             id,
-            thread_id,
+            Some(thread_id),
             in_reply_to,
         )
     }
@@ -777,7 +776,7 @@ impl SessionMessenger {
         operation_id: &str,
         message: &str,
         id: SessionMessageId,
-        thread_id: String,
+        thread_id: Option<String>,
         in_reply_to: Option<SessionMessageId>,
     ) -> SessionMessageEnvelope {
         SessionMessageEnvelope {
@@ -789,7 +788,7 @@ impl SessionMessenger {
             kind: SessionMessageKind::PeerMessage,
             body: SessionMessageBody::Content(SessionMessageContent::text(message)),
             created_at: chrono::Utc::now(),
-            thread_id: Some(thread_id),
+            thread_id,
             in_reply_to,
             attempt: None,
             correlation_id: Some(operation_id.into()),
@@ -1110,13 +1109,10 @@ impl SessionMessenger {
             )));
         }
         let envelope = SessionMessageEnvelope {
-            id: SessionMessageId::stable(
-                "supervisor_followup",
-                &serde_json::json!({
-                    "supervisor": supervisor,
-                    "target_session_id": target_session_id,
-                    "operation_id": operation_id,
-                }),
+            id: bamboo_domain::supervisor_followup_message_id(
+                supervisor,
+                target_session_id,
+                operation_id,
             ),
             source: SessionMessageSource::Session {
                 session_id: supervisor.session_id.clone(),

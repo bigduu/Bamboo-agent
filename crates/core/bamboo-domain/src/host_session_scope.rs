@@ -15,6 +15,100 @@ use crate::{
     SessionCallerReference, SessionKind,
 };
 
+/// The existing Supervisor logical operation address. Scope installation or
+/// a new delivery intent cannot allocate another message for the same call.
+/// This data is not authorization; the final writer still validates birth,
+/// current grants and the complete original caller under physical guards.
+pub fn supervisor_followup_message_id(
+    supervisor: &crate::SupervisorReference,
+    target_session_id: &str,
+    operation_id: &str,
+) -> crate::SessionMessageId {
+    crate::SessionMessageId::stable(
+        "supervisor_followup",
+        &serde_json::json!({
+            "supervisor": supervisor,
+            "target_session_id": target_session_id,
+            "operation_id": operation_id,
+        }),
+    )
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HostSessionPeerProtocol {
+    PeerV1,
+    SupervisorFollowup,
+}
+
+/// Pure wire/idempotency projection, never a grant. The physical writer must
+/// recompute it from the original caller whose canonical identity it checks.
+#[derive(Debug, Clone)]
+pub struct HostSessionPeerIdentity {
+    pub message_id: crate::SessionMessageId,
+    pub thread_id: Option<String>,
+    protocol: HostSessionPeerProtocol,
+}
+
+impl HostSessionPeerIdentity {
+    pub fn for_caller(
+        caller: &SessionCallerReference,
+        target_id: &str,
+        target_created_at: DateTime<Utc>,
+        operation_id: &str,
+    ) -> Self {
+        let (message_id, protocol) = match &caller.authority_identity {
+            SessionAuthorityIdentity::Supervisor { incarnation_id } => (
+                supervisor_followup_message_id(
+                    &crate::SupervisorReference {
+                        session_id: caller.session_id.clone(),
+                        incarnation_id: *incarnation_id,
+                    },
+                    target_id,
+                    operation_id,
+                ),
+                HostSessionPeerProtocol::SupervisorFollowup,
+            ),
+            SessionAuthorityIdentity::Ordinary => (
+                crate::session_peer_message_id(
+                    &caller.session_id,
+                    caller.created_at,
+                    target_id,
+                    target_created_at,
+                    operation_id,
+                ),
+                HostSessionPeerProtocol::PeerV1,
+            ),
+        };
+        let thread_id = match protocol {
+            HostSessionPeerProtocol::PeerV1 => Some(message_id.to_string()),
+            HostSessionPeerProtocol::SupervisorFollowup => None,
+        };
+        Self {
+            message_id,
+            thread_id,
+            protocol,
+        }
+    }
+
+    pub fn activation_intent(
+        &self,
+        delivery: crate::SessionMessageDeliveryIntent,
+    ) -> crate::SessionInboxActivationIntent {
+        match (self.protocol, delivery) {
+            // Retain the existing Supervisor trigger's exact durable wire.
+            // QueueOnly still has its own inert intent at this same address,
+            // so changing it later is a conflict rather than a second send.
+            (
+                HostSessionPeerProtocol::SupervisorFollowup,
+                crate::SessionMessageDeliveryIntent::TriggerTurn,
+            ) => crate::SessionInboxActivationIntent::new(
+                crate::SessionActivationPolicy::RespectSpecificWait,
+            ),
+            _ => crate::SessionInboxActivationIntent::with_delivery(delivery),
+        }
+    }
+}
+
 pub const HOST_SESSION_SCOPE_VERSION: u32 = 1;
 pub const MAX_HOST_SESSION_TARGETS: usize = 128;
 pub const MAX_HOST_SESSION_CREATES: usize = 32;
