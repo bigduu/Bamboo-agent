@@ -39,6 +39,29 @@
       }
     }
   ],
+  "detail_readback": {
+    "route": "GET /api/v1/sessions/{session_id}",
+    "example_scope": "synthetic summary fragments for token_usage presence only; not complete or captured responses",
+    "current_producer_none_shape": "token_usage omitted by SessionSummary skip_serializing_if=Option::is_none; no handler normalization",
+    "consumer_rule": "accept omitted or null token_usage as no usage; reject every non-null usage value",
+    "cases": [
+      {
+        "name": "current_producer_omits_none",
+        "detail_fragment": { "session": { "id": "synthetic-session", "message_count": 0 } },
+        "usage_cleared": true
+      },
+      {
+        "name": "explicit_null_consumer_compatibility_only",
+        "detail_fragment": { "session": { "id": "synthetic-session", "message_count": 0, "token_usage": null } },
+        "usage_cleared": true
+      },
+      {
+        "name": "nonnull_usage_is_not_cleared",
+        "detail_fragment": { "session": { "id": "synthetic-session", "message_count": 0, "token_usage": { "total_tokens": 123 } } },
+        "usage_cleared": false
+      }
+    ]
+  },
   "conversation_revision": "not_exposed_by_current_clear_endpoint",
   "event": { "kind": "SessionCleared", "session_id": "synthetic-session" },
   "full_conversation_reset": "separate_unimplemented_transaction_contract"

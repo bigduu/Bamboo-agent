@@ -85,9 +85,16 @@ fields alone do not establish that old native content reaches the next provider.
 That claim requires a controlled actual-provider-payload test.
 
 History exposes UI messages and compression events. Session detail exposes
-`token_usage` (null after a successful ordinary clear); it does not expose the
-conversation summary. A zero UI-message count does not prove every internal
-context field was reset.
+`token_usage` only when present. `SessionSummary.token_usage` uses
+`skip_serializing_if = "Option::is_none"`, so the current detail producer omits
+the field after clear sets it to `None`; it does not add an explicit `null`.
+The detail handler serializes that summary directly. A consumer checking clear
+readback must accept either field absence or JSON `null` as no usage, and reject
+a non-null usage value. The current-producer synthetic detail fragment omits the
+field; the explicit-null example tests consumer compatibility only.
+
+Session detail does not expose the conversation summary. A zero UI-message
+count does not prove every internal context field was reset.
 
 The existing account event is `SessionCleared {session_id}`. It has no clear
 reason, operation ID or conversation revision. The internal
