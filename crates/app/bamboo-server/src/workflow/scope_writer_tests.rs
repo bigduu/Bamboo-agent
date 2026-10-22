@@ -241,10 +241,10 @@ async fn workflow_chat_rejects_scope_change_until_physical_drain() {
     .await;
     let status = plain.status();
     let bytes = test::read_body(plain).await;
-    if status != StatusCode::OK {
+    if status != StatusCode::CREATED {
         fixture.finish_and_drain().await;
     }
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(status, StatusCode::CREATED, "{}", String::from_utf8_lossy(&bytes));
     for draining in [false, true] {
         if draining {
             fixture.state.workflow_runs.cancel_for_session(
@@ -283,7 +283,7 @@ async fn workflow_chat_rejects_scope_change_until_physical_drain() {
     .await;
     let status = response.status();
     let bytes = test::read_body(response).await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(status, StatusCode::CREATED, "{}", String::from_utf8_lossy(&bytes));
     assert_eq!(fixture.durable().await.workspace_path_meta(), Some(fixture.next_workspace.to_string_lossy().into_owned()));
     assert_eq!(fixture.provider_calls.load(Ordering::SeqCst), 0);
 }
