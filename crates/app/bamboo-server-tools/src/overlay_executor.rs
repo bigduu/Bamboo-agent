@@ -1500,6 +1500,12 @@ mod tests {
         struct LegacyAliasBase(std::sync::Arc<AtomicUsize>);
         #[async_trait]
         impl ToolExecutor for LegacyAliasBase {
+            fn for_session(
+                &self,
+                _session: &bamboo_domain::Session,
+            ) -> Option<std::sync::Arc<dyn ToolExecutor>> {
+                Some(std::sync::Arc::new(Self(self.0.clone())))
+            }
             async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
                 if call.function.name == "spawnSession" {
                     self.0.fetch_add(1, Ordering::SeqCst);
