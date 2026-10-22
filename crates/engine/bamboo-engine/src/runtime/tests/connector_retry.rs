@@ -4,6 +4,43 @@ use bamboo_llm::providers::anthropic::AnthropicProvider;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
+#[tokio::test]
+async fn actual_provider_failure_receipt_reaches_the_session_and_survives_cold_storage() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(recovery())
+        .mount(&server)
+        .await;
+    let provider = Arc::new(AnthropicProvider::new("fixture-key").with_base_url(server.uri()));
+    let (_temp, agent, storage) = build_direct_execute_agent(provider, None, None).await;
+    let mut session = Session::new("persistent-provider-diagnostic", "test-model");
+    session.add_message(Message::user("one synthetic request"));
+    storage.save_session(&session).await.unwrap();
+    let (tx, _rx) = mpsc::channel(128);
+    let error = agent
+        .execute(&mut session, direct_request(tx, CancellationToken::new()))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AgentError::LLMNonRetryable(_)));
+    let captured = bamboo_domain::LlmRequestDiagnostic::from_json(
+        session
+            .metadata
+            .get(bamboo_domain::LAST_RUN_LLM_DIAGNOSTIC_KEY)
+            .expect("the exact bootstrap observer must reach the executing Session"),
+    )
+    .unwrap();
+    assert!(captured.matches_error_message(&error.to_string()));
+    // The hosted terminal owner already performs these existing operations;
+    // this component test exercises the same durable Session representation.
+    session.set_last_run_error(error.to_string());
+    storage.save_session(&session).await.unwrap();
+    let cold = storage.load_session(&session.id).await.unwrap().unwrap();
+    let persisted = cold.last_run_diagnostic().unwrap();
+    assert_eq!(persisted.diagnostic_id(), captured.diagnostic_id());
+    assert!(persisted.matches_error_message(&cold.last_run_error().unwrap()));
+    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+}
+
 const RECOVERY: &str = "Authentication Error, Error in connector: Error querying the database: FATAL: the database system is not yet accepting connections\nDETAIL: Consistent recovery state has not been yet reached.";
 
 fn recovery() -> ResponseTemplate {

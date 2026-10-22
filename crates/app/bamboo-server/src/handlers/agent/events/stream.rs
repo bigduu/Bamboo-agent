@@ -194,8 +194,12 @@ impl Coalescer {
 }
 
 /// Serializes an event to an SSE `data:` frame, or `None` if serialization fails.
-fn event_sse_data(event: &AgentEvent) -> Option<String> {
-    serde_json::to_string(event)
+fn event_sse_data(
+    event: &AgentEvent,
+    session_id: &str,
+    persisted: Option<&bamboo_domain::LlmRequestDiagnostic>,
+) -> Option<String> {
+    super::super::llm_diagnostics::event_json(event, session_id, persisted)
         .ok()
         .map(|event_json| format!("data: {}\n\n", event_json))
 }
@@ -204,6 +208,8 @@ pub(super) fn terminal_response(
     budget_event_to_replay: Option<AgentEvent>,
     critical_events_to_replay: Vec<AgentEvent>,
     terminal_event: AgentEvent,
+    session_id: String,
+    diagnostic: Option<bamboo_domain::LlmRequestDiagnostic>,
 ) -> HttpResponse {
     HttpResponse::Ok()
         .append_header((header::CONTENT_TYPE, "text/event-stream; charset=utf-8"))
@@ -213,15 +219,14 @@ pub(super) fn terminal_response(
         .streaming(async_stream::stream! {
             // Replay cached critical state events first (task list, sub-sessions, …).
             for event in &critical_events_to_replay {
-                if let Some(sse_data) = as_sse_data(Some(event)) {
+                if let Some(sse_data) = as_sse_data(Some(event), &session_id) {
                     yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
                 }
             }
-            if let Some(sse_data) = as_sse_data(budget_event_to_replay.as_ref()) {
+            if let Some(sse_data) = as_sse_data(budget_event_to_replay.as_ref(), &session_id) {
                 yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
             }
-            if let Ok(event_json) = serde_json::to_string(&terminal_event) {
-                let sse_data = format!("data: {}\n\n", event_json);
+            if let Some(sse_data) = event_sse_data(&terminal_event, &session_id, diagnostic.as_ref()) {
                 yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
             }
             yield Ok::<_, actix_web::Error>(web::Bytes::from(done_sse_data()));
@@ -252,11 +257,11 @@ pub(super) fn live_stream_response(
                 ClarificationBoundary::from_replay(&critical_events_to_replay);
             // Replay cached critical state events first (task list, sub-sessions, …).
             for event in &critical_events_to_replay {
-                if let Some(sse_data) = as_sse_data(Some(event)) {
+                if let Some(sse_data) = as_sse_data(Some(event), &session_id) {
                     yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
                 }
             }
-            if let Some(sse_data) = as_sse_data(budget_event_to_replay.as_ref()) {
+            if let Some(sse_data) = as_sse_data(budget_event_to_replay.as_ref(), &session_id) {
                 yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
             }
 
@@ -333,7 +338,7 @@ pub(super) fn live_stream_response(
                                         disposition == StreamEventDisposition::ForwardAndClose;
                                     let is_child_completed =
                                         matches!(event, AgentEvent::SubAgentCompleted { .. });
-                                    let Ok(event_json) = serde_json::to_string(&event) else {
+                                    let Ok(event_json) = super::super::llm_diagnostics::event_json(&event, &session_id, None) else {
                                         continue;
                                     };
                                     let sse_data = format!("data: {}\n\n", event_json);
@@ -410,7 +415,7 @@ pub(super) fn live_stream_response(
                         }
                         _ = tokio::time::sleep_until(sleep_until), if flush_deadline.is_some() => {
                             if let Some(pending) = coalescer.take_pending() {
-                                if let Some(sse_data) = event_sse_data(&pending) {
+                                if let Some(sse_data) = event_sse_data(&pending, &session_id, None) {
                                     yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
                                 }
                             }
@@ -420,7 +425,7 @@ pub(super) fn live_stream_response(
                             // Flush any buffered tokens before the keepalive so
                             // ordering is preserved relative to the heartbeat.
                             if let Some(pending) = coalescer.take_pending() {
-                                if let Some(sse_data) = event_sse_data(&pending) {
+                                if let Some(sse_data) = event_sse_data(&pending, &session_id, None) {
                                     yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
                                 }
                                 flush_deadline = None;
@@ -440,7 +445,7 @@ pub(super) fn live_stream_response(
                                         // but keep the connection open and omit the boundary
                                         // Complete itself.
                                         if let Some(pending) = coalescer.take_pending() {
-                                            if let Some(sse_data) = event_sse_data(&pending) {
+                                            if let Some(sse_data) = event_sse_data(&pending, &session_id, None) {
                                                 yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
                                             }
                                         }
@@ -460,7 +465,7 @@ pub(super) fn live_stream_response(
                                     // coalescible event that merges/starts the buffer
                                     // returns nothing and stays buffered.
                                     for out in coalescer.push(event) {
-                                        if let Some(sse_data) = event_sse_data(&out) {
+                                        if let Some(sse_data) = event_sse_data(&out, &session_id, None) {
                                             yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
                                         }
                                     }
@@ -501,7 +506,7 @@ pub(super) fn live_stream_response(
                                     // not merge tokens across the gap and fabricate
                                     // adjacency the producer never emitted.
                                     if let Some(pending) = coalescer.take_pending() {
-                                        if let Some(sse_data) = event_sse_data(&pending) {
+                                        if let Some(sse_data) = event_sse_data(&pending, &session_id, None) {
                                             yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
                                         }
                                     }
@@ -513,7 +518,7 @@ pub(super) fn live_stream_response(
                                     // Flush any buffered tokens before closing so
                                     // content is never lost.
                                     if let Some(pending) = coalescer.take_pending() {
-                                        if let Some(sse_data) = event_sse_data(&pending) {
+                                        if let Some(sse_data) = event_sse_data(&pending, &session_id, None) {
                                             yield Ok::<_, actix_web::Error>(web::Bytes::from(sse_data));
                                         }
                                     }
@@ -527,11 +532,8 @@ pub(super) fn live_stream_response(
         })
 }
 
-fn as_sse_data(event: Option<&AgentEvent>) -> Option<String> {
-    let event = event?;
-    serde_json::to_string(event)
-        .ok()
-        .map(|event_json| format!("data: {}\n\n", event_json))
+fn as_sse_data(event: Option<&AgentEvent>, session_id: &str) -> Option<String> {
+    event_sse_data(event?, session_id, None)
 }
 
 fn done_sse_data() -> &'static str {

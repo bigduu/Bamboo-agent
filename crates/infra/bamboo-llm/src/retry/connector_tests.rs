@@ -186,7 +186,8 @@ async fn request_budget_is_shared_with_compatibility_fallbacks() {
         .mount(&server)
         .await;
     let cfg = config(2);
-    let budget = InitialRequestBudget::new(&cfg);
+    let session = uuid::Uuid::new_v4().to_string();
+    let budget = InitialRequestBudget::new(&cfg).with_session_id(Some(&session));
     for _ in 0..2 {
         assert_eq!(
             run(&server, &cfg, &budget)
@@ -203,6 +204,11 @@ async fn request_budget_is_shared_with_compatibility_fallbacks() {
         Err(LLMError::RequestFailed(_))
     ));
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    let events = diagnostics_for(&session);
+    assert!(events
+        .iter()
+        .all(|event| event["diagnostic_id"] == budget.diagnostic_id.to_string()));
+    assert_eq!(events.last().unwrap()["stop_reason"], "attempts_exhausted");
 }
 
 #[tokio::test]
@@ -291,7 +297,8 @@ async fn dropping_a_backoff_cancels_the_inline_request_without_later_attempts() 
         .mount(&server)
         .await;
     let cfg = config(4);
-    let budget = InitialRequestBudget::new(&cfg);
+    let session = uuid::Uuid::new_v4().to_string();
+    let budget = InitialRequestBudget::new(&cfg).with_session_id(Some(&session));
     let observer = Arc::new(InitialHttpRetryObserver::default());
     let mut future = Box::pin(observe_initial_http_retries(
         observer.clone(),
@@ -308,6 +315,12 @@ async fn dropping_a_backoff_cancels_the_inline_request_without_later_attempts() 
     drop(future);
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let events = diagnostics_for(&session);
+    assert_eq!(
+        events.last().unwrap()["stop_reason"],
+        "cancelled_or_dropped"
+    );
+    assert_eq!(events.last().unwrap()["phase"], "backoff");
 }
 
 async fn incomplete_error_server(status: u16) -> (String, tokio::task::JoinHandle<()>) {
@@ -382,4 +395,257 @@ async fn disabled_connector_retries_issue_exactly_one_request() {
         assert!(matches!(error, LLMError::RequestFailed(_)));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
+}
+
+struct SlowHeaders {
+    hits: Arc<AtomicUsize>,
+    recover: bool,
+}
+
+impl Respond for SlowHeaders {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        let first = self.hits.fetch_add(1, Ordering::SeqCst) == 0;
+        let response = ResponseTemplate::new(200).set_body_string("unread SSE body");
+        if first || !self.recover {
+            response.set_delay(Duration::from_secs(2))
+        } else {
+            response
+        }
+    }
+}
+
+fn short_budget(cfg: &RetryConfig, session: &str) -> InitialRequestBudget {
+    let mut budget = InitialRequestBudget::new(cfg).with_session_id(Some(session));
+    budget.attempt_timeout = Duration::from_millis(250);
+    budget.deadline = budget.started + Duration::from_millis(650);
+    budget
+}
+
+fn diagnostics_for(session: &str) -> Vec<serde_json::Value> {
+    recent_initial_request_diagnostics(session)
+        .into_iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn stalled_first_headers_retry_within_the_same_budget_then_return_unread_success() {
+    let server = MockServer::start().await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .respond_with(SlowHeaders {
+            hits: hits.clone(),
+            recover: true,
+        })
+        .mount(&server)
+        .await;
+    let cfg = config(4);
+    let session = uuid::Uuid::new_v4().to_string();
+    let budget = short_budget(&cfg, &session);
+    let response = run(&server, &cfg, &budget).await.unwrap();
+    assert_eq!(
+        response.into_response().text().await.unwrap(),
+        "unread SSE body"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests[0].body, requests[1].body);
+    assert_eq!(requests[0].headers, requests[1].headers);
+    let events = diagnostics_for(&session);
+    assert!(events
+        .iter()
+        .any(|event| event["event"] == "retry_scheduled"
+            && event["phase"] == "send_headers"
+            && event["upstream_outcome"] == "unknown"));
+    assert!(events
+        .iter()
+        .all(|event| event["diagnostic_id"] == budget.diagnostic_id.to_string()));
+    assert_eq!(events.last().unwrap()["event"], "response_returned");
+}
+
+#[tokio::test]
+async fn repeated_header_timeouts_exhaust_time_without_resetting_the_budget() {
+    let server = MockServer::start().await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .respond_with(SlowHeaders {
+            hits: hits.clone(),
+            recover: false,
+        })
+        .mount(&server)
+        .await;
+    let cfg = config(4);
+    let session = uuid::Uuid::new_v4().to_string();
+    let budget = short_budget(&cfg, &session);
+    let error = run(&server, &cfg, &budget).await.unwrap_err().to_string();
+    let sent = hits.load(Ordering::SeqCst);
+    assert!(
+        (2..=3).contains(&sent),
+        "stalled routes must get a bounded retry: {sent}"
+    );
+    assert!(error.contains("time budget exhausted"), "{error}");
+    assert!(!error.contains("attempt limit reached"), "{error}");
+    assert!(error.contains(&budget.diagnostic_id.to_string()));
+    let events = diagnostics_for(&session);
+    let stop = events.last().unwrap();
+    assert_eq!(stop["stop_reason"], "time_budget_exhausted");
+    assert_eq!(stop["remaining_budget_ms"], 0);
+    assert_eq!(stop["request_id"], stop["error_id"]);
+    assert_eq!(stop["upstream_outcome"], "unknown");
+    assert!(stop["run_id"].is_null());
+    // A compatibility fallback cannot mint another budget or send a fifth call.
+    assert!(run(&server, &cfg, &budget).await.is_err());
+    assert_eq!(hits.load(Ordering::SeqCst), sent);
+}
+
+#[tokio::test]
+async fn disabled_timeout_retries_stop_after_one_initial_request() {
+    for attempts in [0, 1] {
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("POST"))
+            .respond_with(SlowHeaders {
+                hits: hits.clone(),
+                recover: true,
+            })
+            .mount(&server)
+            .await;
+        let cfg = config(attempts);
+        let session = uuid::Uuid::new_v4().to_string();
+        let budget = short_budget(&cfg, &session);
+        let error = run(&server, &cfg, &budget).await.unwrap_err().to_string();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert!(error.contains("attempt limit reached"));
+        assert_eq!(
+            diagnostics_for(&session).last().unwrap()["stop_reason"],
+            "attempts_exhausted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dropping_header_wait_does_not_send_a_later_retry() {
+    let server = MockServer::start().await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .respond_with(SlowHeaders {
+            hits: hits.clone(),
+            recover: true,
+        })
+        .mount(&server)
+        .await;
+    let cfg = config(4);
+    let session = uuid::Uuid::new_v4().to_string();
+    let budget = InitialRequestBudget::new(&cfg).with_session_id(Some(&session));
+    let mut pending = Box::pin(run(&server, &cfg, &budget));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::select! {
+            _ = &mut pending => panic!("headers must remain pending"),
+            _ = async { while hits.load(Ordering::SeqCst) == 0 { tokio::task::yield_now().await; } } => {}
+        }
+    }).await.unwrap();
+    drop(pending);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let events = diagnostics_for(&session);
+    let stop = events.last().unwrap();
+    assert_eq!(stop["stop_reason"], "cancelled_or_dropped");
+    assert_eq!(stop["phase"], "send_headers");
+    assert_eq!(stop["upstream_outcome"], "unknown");
+}
+
+#[tokio::test]
+async fn successful_body_can_outlive_header_and_total_deadlines_without_replay() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut incoming = [0; 4096];
+        assert!(socket.read(&mut incoming).await.unwrap() > 0);
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabc")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        socket.write_all(b"def").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let cfg = config(4);
+    let mut budget = InitialRequestBudget::new(&cfg);
+    budget.attempt_timeout = Duration::from_millis(40);
+    budget.deadline = budget.started + Duration::from_millis(80);
+    let client = reqwest::Client::new();
+    let response =
+        send_anthropic_with_retry(&cfg, &budget, || client.get(format!("http://{address}/")))
+            .await
+            .unwrap();
+    assert_eq!(response.into_response().text().await.unwrap(), "abcdef");
+    assert_eq!(budget.attempts.load(Ordering::Relaxed), 1);
+    server.await.unwrap();
+}
+
+#[derive(Clone, Default)]
+struct InfoCapture(crate::providers::common::log_privacy_tests::EventCapture);
+
+impl tracing::Subscriber for InfoCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.level() <= &tracing::Level::INFO && metadata.target().starts_with("bamboo_llm")
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        tracing::Subscriber::event(&self.0, event);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn default_info_diagnostics_and_export_share_ids_and_exclude_secret_canaries() {
+    const SECRET: &str = "PRIVATE_retry_header_url_body_session_canary";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("request-id", SECRET)
+                .set_body_string(SECRET),
+        )
+        .mount(&server)
+        .await;
+    let capture = InfoCapture::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+    tracing::callsite::rebuild_interest_cache();
+    let cfg = config(2);
+    let budget = InitialRequestBudget::new(&cfg).with_session_id(Some(SECRET));
+    let client = reqwest::Client::new();
+    let url = format!("{}/{SECRET}?key={SECRET}", server.uri());
+    let error = send_anthropic_with_retry(&cfg, &budget, || {
+        client.post(&url).header("x-api-key", SECRET).body(SECRET)
+    })
+    .await
+    .unwrap_err()
+    .to_string();
+    let events = diagnostics_for(SECRET);
+    let exported = serde_json::to_string(&events).unwrap();
+    for text in [capture.0.text(), exported, error.clone()] {
+        assert!(
+            !text.contains(SECRET),
+            "secret canary escaped the diagnostic allowlist"
+        );
+        assert!(text.contains(&budget.diagnostic_id.to_string()));
+    }
+    assert!(capture.0.text().contains("attempt_start"));
+    assert!(capture.0.text().contains("retry_scheduled"));
+    assert!(capture.0.text().contains("stop"));
+    assert_eq!(events.last().unwrap()["stop_reason"], "attempts_exhausted");
+    assert!(diagnostics_for("different-session").is_empty());
+    assert!(error.contains("HTTP 503") && error.contains("temporary upstream failure"));
 }

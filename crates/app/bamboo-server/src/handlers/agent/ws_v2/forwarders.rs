@@ -831,12 +831,12 @@ pub(crate) fn spawn_agent_forwarder(
         // Replay cached critical state events first (task list, sub-sessions, …),
         // then the last budget event — mirroring the v1 SSE replay order.
         for event in critical_events_to_replay {
-            if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
+            if !emit_agent_event(&out, encoding, &ch, &seq, event, &session_id).await {
                 return;
             }
         }
         if let Some(event) = budget_event_to_replay {
-            if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
+            if !emit_agent_event(&out, encoding, &ch, &seq, event, &session_id).await {
                 return;
             }
         }
@@ -895,7 +895,7 @@ pub(crate) fn spawn_agent_forwarder(
                         let is_terminal = is_terminal_event(&event);
                         let is_child_completed =
                             matches!(event, AgentEvent::SubAgentCompleted { .. });
-                        if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
+                        if !emit_agent_event(&out, encoding, &ch, &seq, event, &session_id).await {
                             return;
                         }
                         if is_terminal {
@@ -987,7 +987,7 @@ pub(crate) fn spawn_agent_forwarder(
                 }
                 _ = tokio::time::sleep_until(sleep_until), if flush_deadline.is_some() => {
                     if let Some(pending) = coalescer.take_pending() {
-                        if !emit_agent_event(&out, encoding, &ch, &seq, pending).await {
+                        if !emit_agent_event(&out, encoding, &ch, &seq, pending, &session_id).await {
                             return;
                         }
                     }
@@ -1004,7 +1004,7 @@ pub(crate) fn spawn_agent_forwarder(
                             // new event when non-coalescible). Terminal events are
                             // non-coalescible, so any pending tokens flush first.
                             for out_event in coalescer.push(event) {
-                                if !emit_agent_event(&out, encoding, &ch, &seq, out_event).await {
+                                if !emit_agent_event(&out, encoding, &ch, &seq, out_event, &session_id).await {
                                     return;
                                 }
                             }
@@ -1050,7 +1050,7 @@ pub(crate) fn spawn_agent_forwarder(
                             // pending buffer so we never merge tokens across the
                             // gap and fabricate adjacency.
                             if let Some(pending) = coalescer.take_pending() {
-                                if !emit_agent_event(&out, encoding, &ch, &seq, pending).await {
+                                if !emit_agent_event(&out, encoding, &ch, &seq, pending, &session_id).await {
                                     return;
                                 }
                                 flush_deadline = None;
@@ -1074,7 +1074,7 @@ pub(crate) fn spawn_agent_forwarder(
                         Err(broadcast::error::RecvError::Closed) => {
                             // Flush any buffered tokens before closing.
                             if let Some(pending) = coalescer.take_pending() {
-                                let _ = emit_agent_event(&out, encoding, &ch, &seq, pending).await;
+                                let _ = emit_agent_event(&out, encoding, &ch, &seq, pending, &session_id).await;
                             }
                             return;
                         }
@@ -1114,6 +1114,13 @@ async fn replay_terminal_if_still_ready(
     let Ok(mut permits) = out.reserve_many(if control_only { 1 } else { 2 }).await else {
         return true;
     };
+    // Read diagnostic evidence before the publication locks. The final event
+    // must still match its exact Session/error; this snapshot grants no authority.
+    let diagnostic = if control_only {
+        None
+    } else {
+        super::super::llm_diagnostics::persisted(state.get_ref(), session_id).await
+    };
     loop {
         let session_guard = state.persistence.acquire_lock(session_id).await;
         let runners = match state.agent_runners.try_read() {
@@ -1141,7 +1148,9 @@ async fn replay_terminal_if_still_ready(
         // Both guards stay owned until synchronous enqueue. There is no async
         // publication window after the canonical work/runner/receiver recheck.
         if !control_only {
-            let Ok(event) = serde_json::to_value(event) else {
+            let Ok(event) =
+                super::super::llm_diagnostics::event_value(&event, session_id, diagnostic.as_ref())
+            else {
                 return false;
             };
             let Some(frame) = ServerEnvelope::event(ch, seq.next(), event).encode(encoding) else {
@@ -1271,8 +1280,9 @@ async fn emit_agent_event(
     ch: &str,
     seq: &AgentSeq,
     event: AgentEvent,
+    session_id: &str,
 ) -> bool {
-    let value = match serde_json::to_value(&event) {
+    let value = match super::super::llm_diagnostics::event_value(&event, session_id, None) {
         Ok(v) => v,
         // Skip an unserializable event but keep the forwarder alive (v1 parity).
         Err(_) => return true,
