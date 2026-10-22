@@ -56,6 +56,9 @@ pub enum AgentStatus {
 /// an in-progress agent execution.
 #[derive(Debug, Clone)]
 pub struct AgentRunner {
+    /// Physical outer-task lineage. Visible terminal status cannot replace it.
+    pub(crate) root_execution: Arc<super::root_execution_lifetime::RootExecutionLifetime>,
+    root_slot: super::root_execution_lifetime::RootRunnerSlot,
     /// Generation fence and activity clock shared only by this run's producers.
     pub event_publication: Arc<super::event_publication::EventPublication>,
 
@@ -124,6 +127,23 @@ impl Default for AgentRunner {
 }
 
 impl AgentRunner {
+    /// Denial-only maintenance signal; never a claim that this run is idle.
+    pub fn root_reset_admission_reserved(&self) -> bool {
+        self.root_execution.reset_admission_reserved()
+    }
+
+    /// The Host adapter must borrow the installed runner under its registry
+    /// read/write guard. Snapshot clones cannot reserve reset admission.
+    pub(crate) fn reserve_root_reset_admission(
+        &self,
+        session: &bamboo_domain::Session,
+        epoch: u64,
+        operation_id: Uuid,
+    ) -> std::io::Result<super::root_execution_lifetime::RootResetAdmission> {
+        self.root_slot
+            .reserve_reset_admission(session, epoch, operation_id)
+    }
+
     /// Includes lock-free event traffic as well as legacy diagnostic updates.
     pub fn last_activity_at(&self) -> Option<DateTime<Utc>> {
         self.last_event_at
@@ -141,7 +161,12 @@ impl AgentRunner {
     /// and `Pending` status.
     pub fn new() -> Self {
         let (event_sender, _) = broadcast::channel(Self::EVENT_CHANNEL_CAPACITY);
+        let root_execution = Arc::default();
         Self {
+            root_slot: super::root_execution_lifetime::RootRunnerSlot::new(Arc::clone(
+                &root_execution,
+            )),
+            root_execution,
             event_sender,
             event_publication: Arc::default(),
             visible_messages: Arc::default(),
@@ -157,6 +182,17 @@ impl AgentRunner {
             round_count: 0,
             run_id: Uuid::new_v4().to_string(),
         }
+    }
+
+    /// Normal replacement transfers the unique installed-slot responsibility.
+    /// Other removals (including server idle eviction) invalidate old tokens.
+    pub(super) fn transfer_root_slot(&mut self, previous: Option<&mut Self>) {
+        if let Some(previous) = previous {
+            previous.root_slot.disarm();
+        }
+        self.root_slot.disarm();
+        self.root_slot =
+            super::root_execution_lifetime::RootRunnerSlot::new(self.root_execution.clone());
     }
 
     /// Push a critical state event into the bounded replay cache.
