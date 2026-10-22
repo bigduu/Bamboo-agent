@@ -321,7 +321,8 @@ async fn actual_root_spawn_terminal_badge_precedes_real_join_and_actor_finish() 
         cache.clone(),
         store.clone(),
         Arc::new(bamboo_storage::LockedSessionStore::new(store.clone())),
-    );
+    )
+    .with_root_actor_directory(store.clone());
     let agent = Arc::new(
         crate::Agent::builder()
             .storage(store.clone())
