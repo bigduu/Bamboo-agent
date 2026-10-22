@@ -1,0 +1,23 @@
+{
+  "evidence_kind": "illustrative_wire_fixture_not_handler_execution",
+  "request": {
+    "action": "send",
+    "target_session_id": "authorized-target",
+    "operation_id": "stable-send-1",
+    "message": "Please report the current blocker.",
+    "delivery_intent": "trigger_turn"
+  },
+  "required_boundaries": {
+    "caller_from_original_host_context": true,
+    "caller_observation_is_grant": false,
+    "project_membership_is_cross_root_grant": false,
+    "supervisor_managed_link_is_ordinary_caller_grant": false,
+    "denied_scoped_sender_falls_back": false,
+    "supervisor_queue_only_supported_by_compatibility_adapter": false,
+    "accepted_receipt_proves_completion": false,
+    "unknown_outcome_allows_new_operation_id": false,
+    "default_runtime_registration_in_this_slice": false
+  },
+  "uncertain_error_prefix": "scoped_session_send_outcome_uncertain",
+  "rust_test_execution": "UNRUN"
+}

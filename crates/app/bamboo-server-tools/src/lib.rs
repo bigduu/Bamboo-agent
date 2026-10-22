@@ -20,6 +20,7 @@ pub mod parent_request_reply;
 pub mod plan;
 pub mod project_tools;
 pub mod registry_keys;
+pub mod scoped_session_messaging;
 pub mod session_control;
 pub mod session_inspector;
 pub mod session_message;
