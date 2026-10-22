@@ -26,7 +26,8 @@ semantics are unchanged. This is not an HTTP reset response or reset outcome.
 | --- | --- |
 | SDK retained execution check | Compare the caller with canonical admission before String input append. Invalid state or nonzero state without canonical readback refuses execution. |
 | Engine raw and registered admission | Compare before counted-loop early returns, including Sessions with no counted-loop metadata. The existing logical owner and physical binding checks remain. |
-| SDK input seal | Capture immutable generation before invoking a custom checkpoint; after return, validate both the mutable caller and accepted readback against that original observation before publishing New input. Matching input id/digest alone is insufficient. A misbehaving custom persister may already have mutated its own data; this check cannot undo arbitrary Host writes or classify them as not executed. |
+| SDK input seal | Capture immutable generation before invoking a custom checkpoint; after return (including an error), validate the mutable caller and then accepted readback against that original observation before publishing New input. Invalid generation and unavailable nonzero readback are explicit conversation refusals. Matching input id/digest alone is insufficient. A misbehaving custom persister may already have mutated its own data; this check cannot undo arbitrary Host writes or classify them as not executed. |
+| Actual loop seal caller | Propagate an explicit conversation refusal out of the production loop before setup completion, provider or tool execution. Preserve the existing warning-and-continue behavior for ordinary optional Skill sealing failures. A later check cannot treat a custom Host's replaced caller as the original operation. Portable prompt hooks precede sealing; this refusal does not undo those earlier hooks or Host effects. |
 | Initial/round Root authority adoption | Check generation before adopting mode/context authority or attempting initial Root publication. Scope identity itself is not revoked on reset. |
 | Tool authority/permission refresh | Check before copying canonical posture or permitting the next tool boundary, including nonzero state without a configured storage reader. |
 | Turn-boundary refresh | Check before permission audit/cursor adoption, queue migration, input claiming, history merge or input observation publication. A conflict is an explicit admission error with no adopted fields. |
@@ -40,7 +41,7 @@ Host idleness before reset. A mere read does not freeze concurrent execution.
 
 ## Synthetic fixtures and current limits
 
-Eight new test functions are supplied as source:
+Ten new test functions are supplied as source:
 
 - Canonical readback compatibility, invalid state, unavailable nonzero state,
   exact receipt equality, and same-conversation append.
@@ -58,13 +59,21 @@ Eight new test functions are supplied as source:
   generation, with no history adoption/write/ACK and retained claim.
 - Root/tool/turn refresh refusing newer-generation authority, queued input and
   history without changing the original Session/runtime or synthetic storage.
+- The complete production loop with custom checkpoint mutation of caller and/or
+  canonical readback, same-revision receipt change or invalid incoming state:
+  no AfterSessionSetup hook, provider, tool or Complete event follows refusal;
+  fake Host data remains present. This is a primary loop execution fixture,
+  not merely a direct call to the seal helper.
+- A positive complete-loop fixture preserving ordinary optional seal failure
+  behavior for a zero-state in-memory Host, with setup hook and synthetic
+  provider actually reached when these tests are eventually run.
 
 Controlled read ports model otherwise valid ledger payloads without performing
 a production reset. Fresh TempDirs, an in-process probe provider and existing
 synthetic Inbox fixtures are used; there are no real accounts or external
 tools. These are source fixtures, not provider-payload acceptance after reset.
 
-All eight new tests, inherited tests, typechecking, Cargo in every mode, Clippy,
+All ten new tests, inherited tests, typechecking, Cargo in every mode, Clippy,
 mixed-runtime, fault/cancellation, actual controlled provider payload and
 cross-client acceptance are **UNRUN** under the parent's build restriction.
 Only direct rustfmt, diff checks and independent exact-source review may be

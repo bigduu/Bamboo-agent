@@ -534,17 +534,31 @@ impl UntrustedExecutionInputs {
         }
         let final_digest = sdk_message_digest(message);
         let created_at = message.created_at;
-        let persistence = persistence.ok_or_else(invalid)?;
-        session
-            .validate_conversation_state()
-            .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
+        session.validate_conversation_state().map_err(|error| {
+            bamboo_agent_core::AgentError::Tool(format!("session_conversation_changed: {error}"))
+        })?;
+        let requires_canonical_generation = session.conversation_reset.is_some();
+        let persistence = persistence.ok_or_else(|| {
+            if requires_canonical_generation {
+                bamboo_agent_core::AgentError::Tool(
+                    "session_conversation_changed: canonical input persistence unavailable".into(),
+                )
+            } else {
+                invalid()
+            }
+        })?;
         let original_generation = session.conversation_generation_observation();
-        persistence
-            .checkpoint_runtime_session(session)
-            .await
+        let checkpoint = persistence.checkpoint_runtime_session(session).await;
+        original_generation
+            .check_canonical(session)
             .map_err(|error| {
-                bamboo_agent_core::AgentError::Tool(format!("SDK input checkpoint failed: {error}"))
+                bamboo_agent_core::AgentError::Tool(format!(
+                    "session_conversation_changed: {error}"
+                ))
             })?;
+        checkpoint.map_err(|error| {
+            bamboo_agent_core::AgentError::Tool(format!("SDK input checkpoint failed: {error}"))
+        })?;
         let accepted = persistence
             .load_runtime_session(&session.id)
             .await
@@ -553,13 +567,14 @@ impl UntrustedExecutionInputs {
                     "SDK input verification failed: {error}"
                 ))
             })?
-            .ok_or_else(invalid)?;
-        original_generation
-            .check_canonical(session)
-            .map_err(|error| {
-                bamboo_agent_core::AgentError::Tool(format!(
-                    "session_conversation_changed: {error}"
-                ))
+            .ok_or_else(|| {
+                if requires_canonical_generation {
+                    bamboo_agent_core::AgentError::Tool(
+                        "session_conversation_changed: canonical input readback unavailable".into(),
+                    )
+                } else {
+                    invalid()
+                }
             })?;
         original_generation
             .check_canonical(&accepted)
@@ -1311,6 +1326,7 @@ mod sdk_acceptance_tests {
     use super::*;
     use crate::runtime::managers::lifecycle::BoundedInputRequestBatch;
     use bamboo_agent_core::{Message, Role, Session};
+    use tokio_util::sync::CancellationToken;
 
     struct Repository {
         stored: std::sync::Mutex<Option<Session>>,
@@ -1392,6 +1408,207 @@ mod sdk_acceptance_tests {
         async fn load_runtime_session(&self, _: &str) -> std::io::Result<Option<Session>> {
             Ok(self.stored.lock().unwrap().clone())
         }
+    }
+
+    #[async_trait::async_trait]
+    impl bamboo_domain::Storage for ConversationChangingRepository {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            *self.stored.lock().unwrap() = Some(session.clone());
+            Ok(())
+        }
+        async fn load_session(&self, _: &str) -> std::io::Result<Option<Session>> {
+            Ok(self.stored.lock().unwrap().clone())
+        }
+        async fn delete_session(&self, _: &str) -> std::io::Result<bool> {
+            Err(std::io::Error::other("fixture never deletes a Session"))
+        }
+    }
+
+    #[derive(Default)]
+    struct SealLoopProbe {
+        provider_calls: std::sync::atomic::AtomicUsize,
+        tool_calls: std::sync::atomic::AtomicUsize,
+        setup_calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl bamboo_llm::LLMProvider for SealLoopProbe {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> bamboo_llm::provider::Result<bamboo_llm::LLMStream> {
+            self.provider_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(bamboo_llm::LLMChunk::Token("synthetic complete".into())),
+                Ok(bamboo_llm::LLMChunk::Done),
+            ])))
+        }
+    }
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for SealLoopProbe {
+        async fn execute(
+            &self,
+            _: &bamboo_agent_core::tools::ToolCall,
+        ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError>
+        {
+            self.tool_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(bamboo_agent_core::tools::ToolError::Execution(
+                "no fixture tools".into(),
+            ))
+        }
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            vec![]
+        }
+    }
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::AgentHook for SealLoopProbe {
+        fn point(&self) -> bamboo_domain::AgentHookPoint {
+            bamboo_domain::AgentHookPoint::AfterSessionSetup
+        }
+        async fn run(
+            &self,
+            _: bamboo_domain::AgentHookPoint,
+            _: &bamboo_domain::HookPayload,
+            _: &Session,
+        ) -> bamboo_domain::HookResult {
+            self.setup_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            bamboo_domain::HookResult::Continue
+        }
+    }
+
+    fn seal_loop_config(
+        inputs: UntrustedExecutionInputs,
+        persistence: Option<Arc<dyn RuntimeSessionPersistence>>,
+        storage: Option<Arc<dyn bamboo_domain::Storage>>,
+        probe: &Arc<SealLoopProbe>,
+    ) -> AgentLoopConfig {
+        let mut hooks = crate::runtime::HookRunner::new();
+        hooks.register(probe.clone());
+        AgentLoopConfig {
+            initial_untrusted_inputs: Some(inputs),
+            persistence,
+            storage,
+            skip_initial_user_message: true,
+            model_name: Some("synthetic-seal-model".into()),
+            hook_runner: Arc::new(hooks),
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn full_loop_stops_changed_or_invalid_seal_before_hooks_provider_and_complete() {
+        for mutate_caller in [false, true] {
+            for generation in ["advance", "same-revision", "invalid"] {
+                let mut session = Session::new("sdk-full-seal-refusal", "model");
+                if generation == "same-revision" {
+                    nonzero_conversation(&mut session);
+                }
+                if generation == "invalid" {
+                    session.conversation_reset = Some(Default::default());
+                }
+                let user = Message::user("synthetic current input");
+                let inputs = producer(&session, &user, true);
+                session.add_message(user);
+                let repository = Arc::new(ConversationChangingRepository {
+                    stored: std::sync::Mutex::new(Some(session.clone())),
+                    mutate_caller,
+                });
+                let probe = Arc::new(SealLoopProbe::default());
+                let config = seal_loop_config(
+                    inputs,
+                    Some(repository.clone()),
+                    Some(repository.clone()),
+                    &probe,
+                );
+                let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+                let error = crate::runtime::runner::run_agent_loop_with_config(
+                    &mut session,
+                    "synthetic current input".into(),
+                    tx,
+                    probe.clone(),
+                    probe.clone(),
+                    CancellationToken::new(),
+                    config,
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    error.to_string().contains("session_conversation_changed:"),
+                    "{generation}: {error}"
+                );
+                assert_eq!(
+                    probe
+                        .provider_calls
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
+                assert_eq!(
+                    probe.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
+                assert_eq!(
+                    probe.setup_calls.load(std::sync::atomic::Ordering::SeqCst),
+                    0
+                );
+                while let Ok(event) = rx.try_recv() {
+                    assert!(!matches!(
+                        event,
+                        bamboo_agent_core::AgentEvent::Complete { .. }
+                    ));
+                }
+                // The fake Host's accepted data is preserved, not rolled back
+                // or relabelled not-executed by the input-observation consumer.
+                assert!(repository
+                    .stored
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .conversation_reset
+                    .is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn full_loop_preserves_ordinary_optional_seal_failure_behavior() {
+        let mut session = Session::new("sdk-optional-seal", "model");
+        let user = Message::user("synthetic optional input");
+        let inputs = producer(&session, &user, true);
+        session.add_message(user);
+        let probe = Arc::new(SealLoopProbe::default());
+        let config = seal_loop_config(inputs, None, None, &probe);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1024);
+        crate::runtime::runner::run_agent_loop_with_config(
+            &mut session,
+            "synthetic optional input".into(),
+            tx,
+            probe.clone(),
+            probe.clone(),
+            CancellationToken::new(),
+            config,
+        )
+        .await
+        .unwrap();
+        assert!(
+            probe
+                .provider_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+        );
+        assert!(probe.setup_calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
     }
 
     #[tokio::test]
