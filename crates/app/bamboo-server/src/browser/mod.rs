@@ -8,6 +8,8 @@ mod persistence_tests;
 mod profile;
 #[cfg(test)]
 mod reset_tests;
+#[cfg(all(test, unix))]
+mod shared_manager_tests;
 #[cfg(test)]
 mod retirement_tests;
 #[cfg(all(test, unix))]
