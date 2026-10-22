@@ -1052,6 +1052,189 @@ struct RootOwnerPermissionProbe {
     deny: Arc<AtomicBool>,
 }
 
+fn retained_spawn_surface(
+    fixture: &Fixture,
+    calls: Arc<AtomicUsize>,
+) -> bamboo_server_tools::session_control::versioned::VersionedRootTools {
+    use bamboo_server_tools::session_control::versioned::{SpawnSessionTool, VersionedRootTools};
+    let registry = bamboo_tools::ToolRegistry::new();
+    registry
+        .register(LegacySpawnPermissionOwner {
+            name: "spawn_session",
+            calls,
+        })
+        .unwrap();
+    let builtin = Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(registry));
+    let spawn = Arc::new(SpawnSessionTool::new(
+        Arc::new(fixture.creator.clone()),
+        fixture.creator.store.clone(),
+        fixture.creator.config.clone(),
+        builtin.clone(),
+    ));
+    VersionedRootTools::new(
+        builtin.clone(),
+        spawn,
+        fixture.creator.store.clone(),
+        builtin,
+    )
+}
+
+#[tokio::test]
+async fn retained_custom_spawn_uses_legacy_owner_for_lookup_permissions_and_exact_execution() {
+    use bamboo_agent_core::tools::{
+        with_retained_tool_execution, FunctionCall, RetainedToolExecution, ToolCall,
+        ToolExecutionContext, ToolExecutor, FRAMEWORK_ROOT_SPAWN_CONTRACT_V1,
+    };
+    let f = Fixture::new().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let installed = retained_spawn_surface(&f, calls.clone());
+    for version in [None, Some(1), Some(2)] {
+        let mut session = Session::new(uuid::Uuid::new_v4().to_string(), "model");
+        session.session_version = version;
+        f.creator.store.save_session(&session).await.unwrap();
+        let tools = installed.for_session(&session).unwrap();
+        let args = json!({"private_custom_payload":"original argument"});
+        let call = ToolCall {
+            id: "retained-custom".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "spawn_session".into(),
+                arguments: args.to_string(),
+            },
+        };
+        let retained = RetainedToolExecution::new(&call, "spawn_session", true, None).unwrap();
+        assert!(retained.owner_is_available(tools.as_ref()));
+        let context = || ToolExecutionContext {
+            session_id: Some(&session.id),
+            root_session_id: Some(&session.id),
+            ..ToolExecutionContext::none(&call.id)
+        };
+        let before = calls.load(Ordering::SeqCst);
+        with_retained_tool_execution(Some(retained), async {
+            assert!(tools
+                .check_permissions_for_exact(&call, "spawn_session", &context())
+                .await
+                .unwrap()
+                .is_none());
+            let result = tools
+                .execute_exact_with_context_outcome(&call, "spawn_session", context())
+                .await
+                .unwrap();
+            assert_eq!(
+                value(result.into_tool_result()),
+                json!({"owner":"spawn_session", "args":args})
+            );
+            let mut changed = call.clone();
+            changed.function.arguments = "{}".into();
+            assert!(tools
+                .execute_exact_with_context_outcome(&changed, "spawn_session", context())
+                .await
+                .is_err());
+            if version == Some(2) {
+                let mut nested = call.clone();
+                nested.id = "new-nested-call".into();
+                assert!(tools
+                    .execute_exact_with_context_outcome(&nested, "spawn_session", context())
+                    .await
+                    .is_err());
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), before + 1);
+        assert_eq!(
+            tools.execution_contract_for_exact("spawn_session"),
+            (version == Some(2)).then_some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+        );
+        // A frozen Root contract selects the Root surface even for a legacy
+        // Session; its existing live v2 Supervisor gate still refuses it.
+        let root = RetainedToolExecution::new(
+            &call,
+            "spawn_session",
+            true,
+            Some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1),
+        )
+        .unwrap();
+        assert!(root.owner_is_available(tools.as_ref()));
+        assert!(with_retained_tool_execution(
+            Some(root),
+            tools.execute_exact_with_context_outcome(&call, "spawn_session", context())
+        )
+        .await
+        .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), before + 1);
+        assert_eq!(f.inbox.inspect(&session.id).await.unwrap().generation, 0);
+    }
+    assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn retained_root_contract_preserves_plan_disabled_and_original_supervisor_gates() {
+    use bamboo_agent_core::tools::{
+        with_retained_tool_execution, FunctionCall, RetainedToolExecution, ToolCall,
+        ToolExecutionContext, ToolExecutor, FRAMEWORK_ROOT_SPAWN_CONTRACT_V1,
+    };
+    let f = Fixture::new().await;
+    let session = f
+        .creator
+        .store
+        .load_session(&f.supervisor.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let installed = retained_spawn_surface(&f, calls.clone());
+    let tools = installed.for_session(&session).unwrap();
+    let call = ToolCall {
+        id: "retained-Root".into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "default::spawnSession".into(),
+            arguments: serde_json::to_string(&f.request).unwrap(),
+        },
+    };
+    for case in ["plan", "disabled", "missing_caller"] {
+        f.creator.config.write().await.tools.disabled = if case == "disabled" {
+            vec!["spawn_session".into()]
+        } else {
+            vec![]
+        };
+        let mut context = ToolExecutionContext {
+            session_id: Some(&session.id),
+            root_session_id: Some(&session.id),
+            executing_supervisor: ExecutingSupervisorObservation::capture_from_executing_session(
+                &session,
+            ),
+            ..ToolExecutionContext::none(&call.id)
+        };
+        context.plan_read_only = case == "plan";
+        if case == "missing_caller" {
+            context.executing_supervisor = None;
+        }
+        let root = RetainedToolExecution::new(
+            &call,
+            "spawn_session",
+            true,
+            Some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1),
+        )
+        .unwrap();
+        assert!(root.owner_is_available(tools.as_ref()));
+        with_retained_tool_execution(Some(root), async {
+            assert!(tools
+                .check_permissions_for_exact(&call, "spawn_session", &context)
+                .await
+                .is_err());
+            assert!(tools
+                .execute_exact_with_context_outcome(&call, "spawn_session", context)
+                .await
+                .is_err());
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(f.count().await, 1);
+    }
+    assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
+}
+
 #[async_trait]
 impl bamboo_tools::permission::PermissionChecker for RootOwnerPermissionProbe {
     async fn needs_confirmation(

@@ -18,7 +18,8 @@ use bamboo_engine::session_app::approval_replay::{
     apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
     repark_permission_replay, resolve_permission_replay_owner,
     restore_permission_replay_authorization, restore_permission_replay_caller,
-    validate_permission_replay_authority, ApprovalReplayDecision, PermissionReplayTarget,
+    restore_permission_replay_execution, validate_permission_replay_authority,
+    ApprovalReplayDecision, PermissionReplayTarget,
 };
 use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
 use bamboo_engine::session_app::provider_model::{persist_model_ref, session_effective_model_ref};
@@ -379,6 +380,17 @@ impl ResumeExecutionPort for AppStateResumeRef {
                         return;
                     }
                 };
+                let retained_execution = match restore_permission_replay_execution(
+                    &session,
+                    &replay_target,
+                    replay_owner.as_deref().unwrap_or(&tool_name),
+                ) {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        tracing::error!(%session_id, %error, "retained contract refused; markers preserved");
+                        return;
+                    }
+                };
                 let configured_mode = state
                     .permission_checker
                     .permission_config()
@@ -489,7 +501,9 @@ impl ResumeExecutionPort for AppStateResumeRef {
                             session.id.as_str(),
                             reexecute_tool_call_id.as_str(),
                             reexecute_request_generation.as_deref(),
-                            bamboo_agent_core::tools::with_executing_session_caller(
+                            bamboo_agent_core::tools::with_retained_tool_execution(
+                                retained_execution,
+                                bamboo_agent_core::tools::with_executing_session_caller(
                                 executing_caller.map(std::sync::Arc::new),
                                 executor.execute_exact_with_context_outcome(
                                     &tool_call,
@@ -514,6 +528,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                                     bash_completion_sink: None,
                                     pre_parsed_args: None,
                                 },
+                                ),
                                 ),
                             ),
                         )

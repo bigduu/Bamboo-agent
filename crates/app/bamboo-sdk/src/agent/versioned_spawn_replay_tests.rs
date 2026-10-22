@@ -4,12 +4,16 @@ use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 
 struct VersionedProbeTool {
     name: &'static str,
+    contract: Option<&'static str>,
     probe: Arc<Probe>,
 }
 #[async_trait]
 impl Tool for VersionedProbeTool {
     fn name(&self) -> &str {
         self.name
+    }
+    fn execution_contract(&self) -> Option<&'static str> {
+        self.contract
     }
     fn description(&self) -> &str {
         "record one approved scoped operation"
@@ -103,6 +107,7 @@ fn versioned_agent(fixture: &Fixture) -> (Arc<PermissionConfig>, Agent) {
         registry
             .register(VersionedProbeTool {
                 name,
+                contract: None,
                 probe: fixture.probe.clone(),
             })
             .unwrap();
@@ -119,6 +124,7 @@ fn versioned_agent(fixture: &Fixture) -> (Arc<PermissionConfig>, Agent) {
             root_builtin.clone(),
             Arc::new(VersionedProbeTool {
                 name: "spawn_session",
+                contract: Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1),
                 probe: fixture.probe.clone(),
             }),
         )
@@ -177,6 +183,25 @@ async fn versioned_spawn_typed_replay_reopens_with_original_owner_and_no_reinter
         let mut fixture = Fixture::new().await;
         let (pending, args) = versioned_pending(&fixture, version).await;
         let request = current_request(&pending);
+        let record = pending
+            .messages
+            .iter()
+            .find_map(|message| {
+                message.metadata.as_ref().and_then(|metadata| {
+                    metadata.get(bamboo_agent_core::tools::PENDING_TOOL_OPERATION_METADATA_KEY)
+                })
+            })
+            .unwrap();
+        assert_eq!(record["version"], json!(2));
+        assert_eq!(record["execution_contract_known"], json!(true));
+        assert_eq!(
+            record["execution_contract"],
+            if version == Some(2) {
+                json!(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+            } else {
+                Value::Null
+            }
+        );
         let expected = if version == Some(2) {
             "spawn_session"
         } else {
@@ -282,6 +307,7 @@ async fn versioned_spawn_untyped_replay_without_root_port_never_enters_the_child
     let registry = bamboo_tools::ToolRegistry::new();
     registry
         .register(VersionedProbeTool {
+            contract: None,
             name: "SubAgent",
             probe: fixture.probe.clone(),
         })
@@ -334,6 +360,7 @@ async fn frozen_legacy_child_replay_keeps_its_owner_after_a_new_exact_alias_shad
         for name in ["SubAgent", "spawnSession"] {
             registry
                 .register(VersionedProbeTool {
+                    contract: None,
                     name,
                     probe: fixture.probe.clone(),
                 })
@@ -406,4 +433,82 @@ async fn frozen_parked_arguments_cannot_be_replaced_before_sdk_replay() {
         request.permission_type,
         &request.resource
     ));
+}
+
+#[tokio::test]
+async fn malformed_or_unknown_root_contract_preserves_sdk_markers_and_unconsumed_approval() {
+    for case in [
+        "missing_contract",
+        "missing_known",
+        "unknown_owner",
+        "unsupported_id",
+        "old_v1_record",
+    ] {
+        let fixture = Fixture::new().await;
+        let (pending, _) = versioned_pending(&fixture, Some(2)).await;
+        let request = current_request(&pending);
+        let mut approved = fixture.approve(&request).await;
+        let record = approved
+            .messages
+            .iter_mut()
+            .find_map(|message| {
+                message.metadata.as_mut().and_then(|metadata| {
+                    metadata.get_mut(bamboo_agent_core::tools::PENDING_TOOL_OPERATION_METADATA_KEY)
+                })
+            })
+            .unwrap();
+        match case {
+            "missing_contract" => {
+                record.as_object_mut().unwrap().remove("execution_contract");
+            }
+            "missing_known" => {
+                record
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("execution_contract_known");
+            }
+            "unknown_owner" => {
+                record["execution_contract"] = Value::Null;
+                record["execution_contract_known"] = json!(false);
+            }
+            "unsupported_id" => record["execution_contract"] = json!("bamboo.spawn_root.future"),
+            "old_v1_record" => {
+                record["version"] = json!(1);
+                record.as_object_mut().unwrap().remove("execution_contract");
+                record
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("execution_contract_known");
+            }
+            _ => unreachable!(),
+        }
+        let history = serde_json::to_value(&approved.messages).unwrap();
+        let marker = approved
+            .metadata
+            .get(PERMISSION_REEXECUTE_METADATA_KEY)
+            .cloned();
+        let (config, agent) = versioned_agent(&fixture);
+        assert!(agent.run_session(&mut approved).await.is_err(), "{case}");
+        assert_eq!(
+            serde_json::to_value(&approved.messages).unwrap(),
+            history,
+            "{case}"
+        );
+        assert_eq!(
+            approved.metadata.get(PERMISSION_REEXECUTE_METADATA_KEY),
+            marker.as_ref(),
+            "{case}"
+        );
+        assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0, "{case}");
+        assert!(
+            !config.consume_once_for_generation(
+                &approved.id,
+                CALL,
+                &request.request_generation,
+                request.permission_type,
+                &request.resource
+            ),
+            "{case}"
+        );
+    }
 }

@@ -375,6 +375,12 @@ async fn execute_tool_call_only_with_execution_name_inner(
     execution_name: &str,
     mut ctx: ToolExecutionOnlyContext<'_>,
 ) -> Result<ToolExecutionOutcome, AgentError> {
+    let execution = bamboo_agent_core::tools::RetainedToolExecution::capture(
+        ctx.tool_call,
+        execution_name,
+        ctx.tools.as_ref(),
+    )
+    .map_err(|error| AgentError::Tool(error.to_string()))?;
     // Recheck the resolved exact executor identity even if the provider cites a
     // stale schema or the round's EffectiveCallableSet predates live tightening.
     // Reject before ToolStart, hooks, replay handling, and executor entry.
@@ -807,6 +813,8 @@ async fn execute_tool_call_only_with_execution_name_inner(
                 ctx.session_id,
                 ctx.tool_call,
                 execution_name,
+                execution.execution_contract(),
+                execution.contract_known(),
             )
         }),
         result: result.map_err(|error| error.to_string()),

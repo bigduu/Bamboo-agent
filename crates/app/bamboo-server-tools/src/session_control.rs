@@ -11,8 +11,9 @@ pub mod versioned {
 
     use async_trait::async_trait;
     use bamboo_agent_core::tools::{
-        ExecutingSupervisorObservation, Tool, ToolCall, ToolClass, ToolCtx, ToolError,
-        ToolExecutionContext, ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
+        retained_tool_execution_for, retained_tool_owner_lookup, ExecutingSupervisorObservation,
+        RetainedToolExecution, Tool, ToolCall, ToolClass, ToolCtx, ToolError, ToolExecutionContext,
+        ToolExecutor, ToolOutcome, ToolResult, ToolSchema, FRAMEWORK_ROOT_SPAWN_CONTRACT_V1,
     };
     use bamboo_domain::{Session, SessionCallerReference, Storage};
     use serde_json::Value;
@@ -113,6 +114,9 @@ pub mod versioned {
         fn name(&self) -> &str {
             "spawn_session"
         }
+        fn execution_contract(&self) -> Option<&'static str> {
+            Some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+        }
         fn description(&self) -> &str {
             "v2 Supervisor-only creation of an independent Ordinary Root in an explicit, existing Host-authorized Project/workspace. Read session_control(action=scope) for allowed_projects/state_revision; supply that revision, a stable operation UUID and one first instruction. Use a different Host-bound checkout when isolation is needed; this tool does not create or bind worktrees. SubAgent creates a Child sharing its parent's workspace. Exact retries reuse every request field and recover the existing creation/link/Inbox admission/activation; receipts do not mean task completion. No history, model, permissions or Project grants are inherited. A missing, disabled, stale or denied Root entry is a blocker, never an alias for Child spawning."
         }
@@ -203,6 +207,29 @@ pub mod versioned {
                 &self.legacy
             }
         }
+
+        fn retained_selected(
+            &self,
+            execution_name: &str,
+            execution: &RetainedToolExecution,
+        ) -> Result<&Arc<dyn ToolExecutor>, ToolError> {
+            match execution.execution_contract() {
+                Some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1) if execution_name == "spawn_session" => {
+                    Ok(&self.independent)
+                }
+                Some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1) => Err(ToolError::Execution(
+                    "retained Root contract has a different exact owner".into(),
+                )),
+                _ if execution_name == "spawn_session" && !execution.contract_known() => {
+                    Err(ToolError::Execution(
+                        "retained spawn owner has unknown provenance; resend explicitly".into(),
+                    ))
+                }
+                // The legacy chain still owns exact custom tools shadowed by
+                // the new Root overlay. Do not resolve their old spelling again.
+                _ => Ok(&self.legacy),
+            }
+        }
         fn classification_reference(&self, reference: &str) -> String {
             if self.contract == Some(true)
                 && bamboo_domain::independent_root_spawn_reference(reference)
@@ -265,6 +292,37 @@ pub mod versioned {
             execution_name: &str,
             ctx: &ToolExecutionContext<'_>,
         ) -> Result<&'a Arc<dyn ToolExecutor>, ToolError> {
+            if let Some(retained) = retained_tool_execution_for(call, execution_name)? {
+                let tools = self.retained_selected(execution_name, &retained)?;
+                if bamboo_domain::independent_root_spawn_reference(&call.function.name)
+                    || execution_name == "spawn_session"
+                {
+                    let id = ctx.session_id.ok_or_else(|| {
+                        ToolError::Execution("retained spawn requires its canonical Session".into())
+                    })?;
+                    let session = load_canonical(self.storage.as_ref(), id).await?;
+                    if self.contract.is_some_and(|contract| {
+                        contract != session.independent_root_spawn_contract()
+                    }) {
+                        return Err(ToolError::Execution(
+                            "spawn contract changed; reload the original Session".into(),
+                        ));
+                    }
+                }
+                if !tools.owns_exact_tool(execution_name)
+                    || (retained.contract_known()
+                        && tools.execution_contract_for_exact(execution_name)
+                            != retained.execution_contract())
+                {
+                    return Err(ToolError::Execution(
+                        "retained exact owner or execution contract is unavailable".into(),
+                    ));
+                }
+                if retained.execution_contract() == Some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1) {
+                    self.spawn.validate_context(&ctx.to_tool_ctx()).await?;
+                }
+                return Ok(tools);
+            }
             let mut independent_contract = self.contract == Some(true);
             let tools = if bamboo_domain::independent_root_spawn_reference(&call.function.name)
                 || execution_name == "spawn_session"
@@ -386,9 +444,20 @@ pub mod versioned {
             self.selected().list_tools()
         }
         fn owns_exact_tool(&self, name: &str) -> bool {
+            if let Some(retained) = retained_tool_owner_lookup(name) {
+                return self
+                    .retained_selected(name, &retained)
+                    .is_ok_and(|tools| tools.owns_exact_tool(name));
+            }
             self.selected().owns_exact_tool(name)
         }
         fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+            if let Some(retained) = retained_tool_owner_lookup(name) {
+                return self
+                    .retained_selected(name, &retained)
+                    .ok()
+                    .and_then(|tools| tools.exact_tool_owner(name));
+            }
             self.selected().exact_tool_owner(name)
         }
         fn tool_guidance(&self) -> Option<String> {

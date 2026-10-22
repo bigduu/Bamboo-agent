@@ -18,6 +18,10 @@ pub struct PendingToolOperation {
     result_message_id: String,
     tool_call: ToolCall,
     execution_name: String,
+    #[serde(default)]
+    execution_contract: Option<String>,
+    #[serde(default)]
+    execution_contract_known: Option<bool>,
     request_generation: String,
 }
 
@@ -35,8 +39,44 @@ impl PendingToolOperation {
             result_message_id: result_message_id.into(),
             tool_call: tool_call.clone(),
             execution_name: execution_name.into(),
+            execution_contract: None,
+            execution_contract_known: None,
             request_generation: request_generation.into(),
         }
+    }
+
+    pub fn capture_with_contract(
+        caller: SessionCallerReference,
+        result_message_id: &str,
+        tool_call: &ToolCall,
+        execution_name: &str,
+        request_generation: &str,
+        execution_contract: Option<&str>,
+        contract_known: bool,
+    ) -> Self {
+        let mut record = Self::capture(
+            caller,
+            result_message_id,
+            tool_call,
+            execution_name,
+            request_generation,
+        );
+        record.version = 2;
+        record.execution_contract = execution_contract.map(str::to_owned);
+        record.execution_contract_known = Some(contract_known);
+        record
+    }
+
+    pub fn has_execution_contract_record(&self) -> bool {
+        self.version == 2
+    }
+
+    pub fn execution_contract(&self) -> Option<&str> {
+        self.execution_contract.as_deref()
+    }
+
+    pub fn execution_contract_known(&self) -> bool {
+        self.execution_contract_known == Some(true)
     }
 
     pub fn execution_name(&self) -> &str {
@@ -50,7 +90,17 @@ impl PendingToolOperation {
     }
 
     pub fn metadata_value(&self) -> Value {
-        serde_json::to_value(self).expect("pending operation binding serializes")
+        let mut value = serde_json::to_value(self).expect("pending operation binding serializes");
+        if self.version == 1 {
+            // Repark keeps the legacy wire shape instead of upgrading missing
+            // provenance to an explicit current-owner observation.
+            let object = value
+                .as_object_mut()
+                .expect("operation record is an object");
+            object.remove("execution_contract");
+            object.remove("execution_contract_known");
+        }
+        value
     }
 
     /// Only after validating the previous generation and the next typed gate.
@@ -112,7 +162,21 @@ impl PendingToolOperation {
                     matching.next() == Some(tool_call) && matching.next().is_none()
                 })
         });
-        if record.version != 1
+        let contract_valid = match record.version {
+            1 => record.execution_contract.is_none() && record.execution_contract_known.is_none(),
+            2 => {
+                value.get("execution_contract").is_some()
+                    && record.execution_contract_known.is_some()
+                    && (record.execution_contract_known == Some(true)
+                        || record.execution_contract.is_none())
+                    && record
+                        .execution_contract
+                        .as_deref()
+                        .is_none_or(super::execution_contract::valid_execution_contract)
+            }
+            _ => false,
+        };
+        if !contract_valid
             || !record.caller.matches_session(session)
             || record.result_message_id != message.id
             || record.tool_call != *tool_call
@@ -244,6 +308,14 @@ mod tests {
         assert_eq!(next.tool_call, operation.tool_call);
         assert_eq!(next.caller, operation.caller);
         assert_eq!(next.execution_name(), operation.execution_name());
+        for record in [&operation, &next] {
+            assert!(!record.has_execution_contract_record());
+            assert!(record.metadata_value().get("execution_contract").is_none());
+            assert!(record
+                .metadata_value()
+                .get("execution_contract_known")
+                .is_none());
+        }
         session.messages[1].metadata.as_mut().unwrap()[PENDING_TOOL_OPERATION_METADATA_KEY] =
             next.metadata_value();
         assert!(PendingToolOperation::restore(&session, 1, &call, Some("generation-1")).is_err());
@@ -251,5 +323,94 @@ mod tests {
             PendingToolOperation::restore(&session, 1, &call, Some("generation-2")).unwrap(),
             Some(next)
         );
+    }
+
+    #[test]
+    fn v2_contract_is_explicit_bounded_and_never_guessed_from_missing_fields() {
+        for contract in [None, Some(super::super::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)] {
+            let (mut session, call) = parked(Session::new("root", "model"), Some(1));
+            let record = PendingToolOperation::capture_with_contract(
+                SessionCallerReference::from(&session),
+                &session.messages[1].id,
+                &call,
+                "spawn_session",
+                "generation-1",
+                contract,
+                true,
+            );
+            let value = record.metadata_value();
+            assert!(value.get("execution_contract").is_some());
+            assert_eq!(value["execution_contract"].as_str(), contract);
+            session.messages[1].metadata.as_mut().unwrap()[PENDING_TOOL_OPERATION_METADATA_KEY] =
+                value.clone();
+            let restored = PendingToolOperation::restore(&session, 1, &call, Some("generation-1"))
+                .unwrap()
+                .unwrap();
+            assert!(restored.has_execution_contract_record());
+            assert!(restored.execution_contract_known());
+            assert_eq!(restored.execution_contract(), contract);
+            let next = restored.for_generation("generation-2");
+            assert_eq!(next.execution_contract(), contract);
+            assert!(next.execution_contract_known());
+            for field in ["execution_contract", "execution_contract_known"] {
+                let mut damaged = value.clone();
+                damaged.as_object_mut().unwrap().remove(field);
+                session.messages[1].metadata.as_mut().unwrap()
+                    [PENDING_TOOL_OPERATION_METADATA_KEY] = damaged;
+                assert!(
+                    PendingToolOperation::restore(&session, 1, &call, Some("generation-1"))
+                        .is_err()
+                );
+            }
+            for invalid in [
+                serde_json::json!(""),
+                serde_json::json!(" has space"),
+                serde_json::json!("x".repeat(129)),
+            ] {
+                let mut damaged = value.clone();
+                damaged["execution_contract"] = invalid;
+                session.messages[1].metadata.as_mut().unwrap()
+                    [PENDING_TOOL_OPERATION_METADATA_KEY] = damaged;
+                assert!(
+                    PendingToolOperation::restore(&session, 1, &call, Some("generation-1"))
+                        .is_err()
+                );
+            }
+            let mut old = value.clone();
+            old["version"] = serde_json::json!(1);
+            session.messages[1].metadata.as_mut().unwrap()[PENDING_TOOL_OPERATION_METADATA_KEY] =
+                old;
+            assert!(
+                PendingToolOperation::restore(&session, 1, &call, Some("generation-1")).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_owner_remains_unknown_across_repark() {
+        let (mut session, call) = parked(Session::new("root", "model"), Some(2));
+        let unknown = PendingToolOperation::capture_with_contract(
+            SessionCallerReference::from(&session),
+            &session.messages[1].id,
+            &call,
+            "spawn_session",
+            "generation-1",
+            None,
+            false,
+        );
+        session.messages[1].metadata.as_mut().unwrap()[PENDING_TOOL_OPERATION_METADATA_KEY] =
+            unknown.metadata_value();
+        let restored = PendingToolOperation::restore(&session, 1, &call, Some("generation-1"))
+            .unwrap()
+            .unwrap();
+        assert!(!restored
+            .for_generation("generation-2")
+            .execution_contract_known());
+        let mut forged = unknown.metadata_value();
+        forged["execution_contract"] =
+            serde_json::json!(super::super::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1);
+        session.messages[1].metadata.as_mut().unwrap()[PENDING_TOOL_OPERATION_METADATA_KEY] =
+            forged;
+        assert!(PendingToolOperation::restore(&session, 1, &call, Some("generation-1")).is_err());
     }
 }
