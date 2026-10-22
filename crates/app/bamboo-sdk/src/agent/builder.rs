@@ -402,6 +402,10 @@ impl AgentBuilder {
     /// explicit at the call site. A fully injected
     /// [`default_tools`](Self::default_tools) executor owns its own permission
     /// behavior and is not wrapped by this setter.
+    /// The installed scoped Session sender requires a typed config even for an
+    /// unprompted posture: configure [`permission_mode`](Self::permission_mode)
+    /// to retain its legacy followup restrictions. A configless sender reports
+    /// unsupported instead of falling back to an ungated delivery path.
     ///
     /// Once gated, a tool call that needs approval suspends the run (a
     /// `NeedClarification`/`ToolApprovalRequested` event, session
@@ -715,11 +719,11 @@ impl AgentBuilder {
             let activation: Arc<dyn bamboo_domain::SessionActivationPort> =
                 activation_router.clone();
             let messenger = Arc::new(bamboo_engine::SessionMessenger::new(
-                sessions,
+                sessions.clone(),
                 inbox.clone(),
                 activation,
             ));
-            session_messenger = Some(messenger.clone());
+            session_messenger = Some((sessions, messenger.clone()));
             self.inner = self
                 .inner
                 .session_inbox(inbox)
@@ -788,9 +792,17 @@ impl AgentBuilder {
                     .register_tool(bamboo_server_tools::ProjectTool::new(sessions, projects))
                     .map_err(|error| SdkError::Build(error.to_string()))?;
             }
-            if let Some(messenger) = session_messenger {
+            if let Some((sessions, messenger)) = session_messenger {
                 builtin_tools
-                    .register_tool(bamboo_server_tools::SessionMessageTool::new(messenger))
+                    .register_tool(
+                        bamboo_server_tools::SessionMessageTool::new(messenger.clone())
+                            .with_scoped_sender(Arc::new(
+                                bamboo_server_tools::scoped_session_messaging::CanonicalSessionSendAdapter::new(
+                                    sessions,
+                                    messenger,
+                                ),
+                            )),
+                    )
                     .map_err(|error| SdkError::Build(error.to_string()))?;
             }
             if let (Some(manager), Some(sessions), Some(projects)) = (
@@ -1703,6 +1715,91 @@ mod tests {
         assert!(
             matches!(error, super::SdkError::Unsupported(message) if message.contains("with_defaults_for_data_dir"))
         );
+    }
+
+    #[tokio::test]
+    async fn defaults_scoped_sender_retains_legacy_deny_and_original_caller_at_canonical_inbox() {
+        use bamboo_agent_core::tools::with_executing_session_caller;
+        use bamboo_agent_core::Session;
+        use bamboo_domain::{SessionCallerReference, SessionInboxPort};
+        use bamboo_tools::permission::{
+            ConfigPermissionChecker, PermissionConfig, PermissionRule, PermissionType,
+        };
+
+        let home = tempfile::tempdir().unwrap();
+        let config = Arc::new(PermissionConfig::new());
+        config.set_enabled(false);
+        let agent = AgentBuilder::new()
+            .provider(Arc::new(NeverCalledProvider))
+            .permission_checker(Arc::new(ConfigPermissionChecker::new(config.clone())))
+            .session_delivery(bamboo_engine::SessionActivationRouter::new())
+            .with_defaults_for_data_dir(home.path().to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let tools = agent.inner.default_tools();
+        assert_eq!(
+            tools.execution_contract_for_exact("session_message"),
+            Some(bamboo_server_tools::session_message::SCOPED_SESSION_SEND_EXECUTION_CONTRACT)
+        );
+        assert!(tools
+            .execution_contract_for_exact("default::session_message")
+            .is_none());
+        let root = Session::new("sdk-scoped-root", "model");
+        let source = Session::new_child_of("sdk-scoped-source", &root, "model", "source");
+        let target = Session::new_child_of("sdk-scoped-target", &root, "model", "target");
+        for session in [&root, &source, &target] {
+            agent.storage().save_session(session).await.unwrap();
+        }
+        let inbox = bamboo_storage::FileSessionInbox::new(
+            agent.session_store.as_ref().unwrap().clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+        let legacy_resource = format!("session_control followup {}", target.id);
+        config.add_rule(PermissionRule::new(
+            PermissionType::ExecuteCommand,
+            &legacy_resource,
+            false,
+        ));
+        let call = ToolCall { id:"sdk-scoped-send".into(), tool_type:"function".into(), function:FunctionCall {
+            name:"session_message".into(), arguments:serde_json::json!({
+                "action":"send", "target_session_id":target.id, "operation_id":"sdk-scoped-operation",
+                "message":"bounded SDK input", "delivery_intent":"queue_only",
+            }).to_string(),
+        }};
+        let error = with_executing_session_caller(
+            Some(Arc::new(SessionCallerReference::from(&source))),
+            tools.execute_with_context(&call, execution_context(&source.id, &call.id)),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("legacy followup policy"));
+        assert_eq!(inbox.inspect(&target.id).await.unwrap().generation, 0);
+        assert!(config.remove_rule(PermissionType::ExecuteCommand, &legacy_resource));
+        let error = tools
+            .execute_with_context(&call, execution_context(&source.id, &call.id))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("authority_unavailable"));
+        let receipt = with_executing_session_caller(
+            Some(Arc::new(SessionCallerReference::from(&source))),
+            tools.execute_with_context(&call, execution_context(&source.id, &call.id)),
+        )
+        .await
+        .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&receipt.result).unwrap();
+        assert_eq!(receipt["admitted"], true);
+        assert_eq!(receipt["terminal"], "not_observed");
+        assert_eq!(inbox.inspect(&target.id).await.unwrap().generation, 1);
+        assert!(agent
+            .storage()
+            .load_session(&target.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .messages
+            .is_empty());
     }
 
     #[test]

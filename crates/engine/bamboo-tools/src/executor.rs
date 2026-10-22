@@ -655,6 +655,17 @@ impl BuiltinToolExecutor {
         }
         let tool_name = execution_name.to_string();
         let args = resolved_args.clone();
+        let framework_scoped_send = tool_name == "session_message"
+            && args.get("action").and_then(serde_json::Value::as_str) == Some("send")
+            && (self.local_execution_contract(execution_name)
+                == Some(
+                    crate::scoped_session_send_permission::SCOPED_SESSION_SEND_EXECUTION_CONTRACT,
+                )
+                || crate::scoped_session_send_permission::selected_framework_scoped_session_send(
+                    call,
+                    execution_name,
+                    &args,
+                ));
         if ctx.auto_approve_permissions && tool_name.eq_ignore_ascii_case("request_permissions") {
             return Err(ToolError::Execution(
                 "Auto mode cannot request expanded permissions; operate within existing hard boundaries"
@@ -672,6 +683,11 @@ impl BuiltinToolExecutor {
             )));
         }
         let Some(permission_checker) = &self.permission_checker else {
+            if framework_scoped_send {
+                return Err(ToolError::Execution(
+                    "scoped_session_send_permission_config_unsupported".into(),
+                ));
+            }
             return Ok(None);
         };
         let hook_permission_override = crate::current_hook_permission_override(&call.id);
@@ -733,7 +749,16 @@ impl BuiltinToolExecutor {
                 } else {
                     resource.clone()
                 };
-                let platform_hard_deny = permission_checker.hard_deny_reason(&context);
+                let platform_hard_deny = permission_checker.hard_deny_reason(&context).or_else(|| {
+                    framework_scoped_send
+                        .then(|| {
+                            crate::permission::tool_permissions::framework_scoped_session_send_restriction(&args)
+                                .ok()
+                                .and_then(|(_, legacy)| permission_checker.hard_deny_reason(&legacy))
+                                .map(|_| "scoped Session send denied by Host followup policy".into())
+                        })
+                        .flatten()
+                });
                 let config = permission_checker.permission_config();
                 let proxy = crate::approval::current_approval_proxy();
                 let request = if let Some(config) = config.as_ref() {
@@ -785,6 +810,9 @@ impl BuiltinToolExecutor {
                     };
                     let outcome = if framework_root_spawn {
                         config.evaluate_framework_root_spawn(evaluation)
+                    } else if framework_scoped_send {
+                        crate::scoped_session_send_permission::record_framework_scoped_session_send_evaluation(call, &args);
+                        config.evaluate_framework_scoped_session_send(evaluation)
                     } else {
                         config.evaluate(evaluation)
                     };
@@ -810,6 +838,11 @@ impl BuiltinToolExecutor {
                         crate::permission::PermissionOutcome::Ask(request) => request,
                     }
                 } else {
+                    if framework_scoped_send {
+                        return Err(ToolError::Execution(
+                            "scoped_session_send_permission_config_unsupported".into(),
+                        ));
+                    }
                     if proactive_permission_request {
                         return Err(ToolError::Execution(
                             "request_permissions requires a typed PermissionConfig and cannot fall back to a display-string approval"

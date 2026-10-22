@@ -13,6 +13,9 @@ use crate::scoped_session_messaging::{
     ScopedSessionSendError, ScopedSessionSendPort, ScopedSessionSendRequest,
 };
 
+pub const SCOPED_SESSION_SEND_EXECUTION_CONTRACT: &str =
+    bamboo_tools::scoped_session_send_permission::SCOPED_SESSION_SEND_EXECUTION_CONTRACT;
+
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum SessionMessageArgs {
@@ -71,6 +74,12 @@ impl SessionMessageTool {
 impl Tool for SessionMessageTool {
     fn name(&self) -> &str {
         "session_message"
+    }
+
+    fn execution_contract(&self) -> Option<&'static str> {
+        self.scoped_sender
+            .is_some()
+            .then_some(SCOPED_SESSION_SEND_EXECUTION_CONTRACT)
     }
 
     fn description(&self) -> &str {

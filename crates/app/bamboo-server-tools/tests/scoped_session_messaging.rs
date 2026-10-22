@@ -615,3 +615,260 @@ async fn unknown_outcome_and_invalid_request_do_not_mint_admission_or_a_new_oper
         0
     );
 }
+
+fn send_call(id: &str, args: &Value) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "session_message".into(),
+            arguments: args.to_string(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn overlay_legacy_ask_replays_one_typed_gate_then_reaches_the_canonical_inbox() {
+    use bamboo_agent_core::tools::with_executing_session_caller;
+    use bamboo_tools::permission::with_permission_replay_generation;
+
+    let fixture = Fixture::new().await;
+    let config = Arc::new(PermissionConfig::new());
+    config.set_ask_rules(["session_control".into()]);
+    config.add_rule(PermissionRule::new(
+        PermissionType::ExecuteCommand,
+        "session_message send",
+        true,
+    ));
+    let tools = OverlayToolExecutor::new(
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new_with_permissions(
+            Arc::new(ConfigPermissionChecker::new(config.clone())),
+        )),
+        Arc::new(fixture.tool()),
+    );
+    assert_eq!(
+        tools.execution_contract_for_exact("session_message"),
+        Some(bamboo_server_tools::session_message::SCOPED_SESSION_SEND_EXECUTION_CONTRACT)
+    );
+    assert!(tools
+        .execution_contract_for_exact("default::session_message")
+        .is_none());
+    let args = send(&fixture.recipient.id, "one-typed-send", Some("queue_only"));
+    let call = send_call("typed-message-call", &args);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let mut ctx = ToolExecutionContext::none(&call.id);
+    ctx.session_id = Some(&fixture.sender.id);
+    ctx.event_tx = Some(&tx);
+    let pending = tools.execute_with_context(&call, ctx).await.unwrap();
+    let payload: Value = serde_json::from_str(&pending.result).unwrap();
+    let request: bamboo_tools::permission::PermissionRequest =
+        serde_json::from_value(payload["permission_request"].clone()).unwrap();
+    assert_eq!(request.tool_name, "session_message");
+    assert_eq!(request.resource, "session_message send");
+    let displayed = format!("{payload} {:?}", rx.try_recv().unwrap());
+    for private in [
+        fixture.recipient.id.as_str(),
+        "one-typed-send",
+        "one bounded instruction",
+    ] {
+        assert!(!displayed.contains(private));
+    }
+    assert_eq!(
+        fixture
+            .inbox
+            .inspect(&fixture.recipient.id)
+            .await
+            .unwrap()
+            .generation,
+        0
+    );
+    config
+        .grant_once_for_generation(
+            &fixture.sender.id,
+            &call.id,
+            &request.request_generation,
+            PermissionType::ExecuteCommand,
+            request.resource.clone(),
+        )
+        .unwrap();
+    let mut replay = ToolExecutionContext::none(&call.id);
+    replay.session_id = Some(&fixture.sender.id);
+    let delivered = with_permission_replay_generation(
+        &fixture.sender.id,
+        &call.id,
+        Some(&request.request_generation),
+        with_executing_session_caller(
+            Some(Arc::new(SessionCallerReference::from(&fixture.sender))),
+            tools.execute_with_context(&call, replay),
+        ),
+    )
+    .await
+    .unwrap();
+    let receipt: Value = serde_json::from_str(&delivered.result).unwrap();
+    assert_eq!(receipt["admitted"], true);
+    assert_eq!(receipt["terminal"], "not_observed");
+    assert_eq!(
+        fixture
+            .inbox
+            .inspect(&fixture.recipient.id)
+            .await
+            .unwrap()
+            .generation,
+        1
+    );
+    // With two evaluations the once receipt would be consumed before the old
+    // Ask gate and execution would fail rather than publishing this envelope.
+    assert!(!config.consume_once(
+        &fixture.sender.id,
+        &call.id,
+        PermissionType::ExecuteCommand,
+        "session_message send"
+    ));
+}
+
+#[tokio::test]
+async fn builtin_exact_sender_uses_legacy_deny_but_same_named_custom_owner_is_not_reinterpreted() {
+    use bamboo_agent_core::tools::with_executing_session_caller;
+
+    let fixture = Fixture::new().await;
+    let config = Arc::new(PermissionConfig::new());
+    config.set_enabled(false);
+    config.add_rule(PermissionRule::new(
+        PermissionType::ExecuteCommand,
+        format!("session_control followup {}", fixture.recipient.id),
+        false,
+    ));
+    let builtin = bamboo_tools::BuiltinToolExecutor::new_with_permissions(Arc::new(
+        ConfigPermissionChecker::new(config.clone()),
+    ));
+    builtin.register_tool(fixture.tool()).unwrap();
+    let args = send(
+        &fixture.recipient.id,
+        "native-exact-send",
+        Some("queue_only"),
+    );
+    let call = send_call("native-message-call", &args);
+    let mut ctx = ToolExecutionContext::none(&call.id);
+    ctx.session_id = Some(&fixture.sender.id);
+    let error = with_executing_session_caller(
+        Some(Arc::new(SessionCallerReference::from(&fixture.sender))),
+        builtin.execute_with_context(&call, ctx),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("legacy followup policy"));
+    assert!(!error.to_string().contains(&fixture.recipient.id));
+    assert_eq!(
+        fixture
+            .inbox
+            .inspect(&fixture.recipient.id)
+            .await
+            .unwrap()
+            .generation,
+        0
+    );
+
+    struct CustomMessage;
+    #[async_trait]
+    impl Tool for CustomMessage {
+        fn name(&self) -> &str {
+            "session_message"
+        }
+        fn description(&self) -> &str {
+            "explicitly injected custom implementation"
+        }
+        fn parameters_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+        async fn invoke(
+            &self,
+            _args: Value,
+            _ctx: ToolCtx,
+        ) -> Result<ToolOutcome, bamboo_agent_core::ToolError> {
+            Ok(ToolOutcome::Completed(bamboo_agent_core::ToolResult::text(
+                true,
+                "custom owner",
+            )))
+        }
+    }
+    let registry = bamboo_tools::ToolRegistry::new();
+    registry.register(CustomMessage).unwrap();
+    let custom = bamboo_tools::BuiltinToolExecutor::with_registry_and_permissions(
+        registry,
+        Arc::new(ConfigPermissionChecker::new(config)),
+    );
+    assert!(custom
+        .execution_contract_for_exact("session_message")
+        .is_none());
+    assert_eq!(custom.execute(&call).await.unwrap().result, "custom owner");
+    assert_eq!(
+        fixture
+            .inbox
+            .inspect(&fixture.recipient.id)
+            .await
+            .unwrap()
+            .generation,
+        0
+    );
+}
+
+#[tokio::test]
+async fn scoped_sender_configless_and_opaque_permission_bases_fail_without_delivery() {
+    let fixture = Fixture::new().await;
+    let host = Arc::new(RejectingHost {
+        calls: AtomicUsize::new(0),
+        uncertain: false,
+    });
+    struct OpaqueAllow;
+    #[async_trait]
+    impl ToolExecutor for OpaqueAllow {
+        async fn execute(
+            &self,
+            _call: &ToolCall,
+        ) -> Result<bamboo_agent_core::ToolResult, bamboo_agent_core::ToolError> {
+            unreachable!("the overlay owns execution")
+        }
+        fn list_tools(&self) -> Vec<bamboo_agent_core::ToolSchema> {
+            Vec::new()
+        }
+    }
+    let bases: Vec<Arc<dyn ToolExecutor>> = vec![
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new_with_permissions(
+            Arc::new(bamboo_tools::permission::AllowAllPermissionChecker),
+        )),
+        Arc::new(OpaqueAllow),
+    ];
+    for base in bases {
+        let tools = OverlayToolExecutor::new(
+            base,
+            Arc::new(
+                SessionMessageTool::new(fixture.messenger.clone()).with_scoped_sender(host.clone()),
+            ),
+        );
+        let call = send_call(
+            "configless-message",
+            &send(
+                &fixture.recipient.id,
+                "unsupported-send",
+                Some("trigger_turn"),
+            ),
+        );
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.session_id = Some(&fixture.sender.id);
+        ctx.auto_approve_permissions = true;
+        ctx.bypass_permissions = true;
+        let error = tools.execute_with_context(&call, ctx).await.unwrap_err();
+        assert!(error.to_string().contains("permission_config_unsupported"));
+    }
+    assert_eq!(host.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .inbox
+            .inspect(&fixture.recipient.id)
+            .await
+            .unwrap()
+            .generation,
+        0
+    );
+}
