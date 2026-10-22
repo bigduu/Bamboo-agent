@@ -46,6 +46,7 @@ impl Drop for HostScopedSessionGuards {
 /// existing Inbox owns this value until every started filesystem job completes.
 pub(crate) struct HostScopedDeliveryGuards {
     pub(crate) inbox_dir: PathBuf,
+    pub(crate) identity: bamboo_domain::HostSessionPeerIdentity,
     _authority: HostScopedSessionGuards,
 }
 
@@ -366,9 +367,8 @@ impl SessionStoreV2 {
             .ok_or_else(|| denied("host_session_send_operation_missing"))?;
         bamboo_domain::SessionMessageId::parse(operation)
             .map_err(|error| denied(error.to_string()))?;
-        let id = bamboo_domain::session_peer_message_id(
-            &caller.session_id,
-            caller.created_at,
+        let identity = bamboo_domain::HostSessionPeerIdentity::for_caller(
+            caller,
             &target.identity.session_id,
             target.identity.created_at,
             operation,
@@ -386,8 +386,8 @@ impl SessionStoreV2 {
                 session_id: caller.session_id.clone(),
             })
             || envelope.kind != SessionMessageKind::PeerMessage
-            || envelope.id != id
-            || envelope.thread_id.as_deref() != Some(id.as_str())
+            || envelope.id != identity.message_id
+            || envelope.thread_id != identity.thread_id
             || envelope.in_reply_to.is_some()
             || envelope.attempt.is_some()
             || text.trim().is_empty()
@@ -416,6 +416,7 @@ impl SessionStoreV2 {
         };
         Ok(HostScopedDeliveryGuards {
             inbox_dir: self.abs_path_from_rel(&rel).join("inbox"),
+            identity,
             _authority: guards,
         })
     }

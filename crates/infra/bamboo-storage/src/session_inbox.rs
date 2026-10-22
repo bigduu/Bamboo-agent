@@ -2539,6 +2539,7 @@ impl SessionInboxPort for FileSessionInbox {
             .lock_host_scoped_peer_delivery(token, caller, envelope)
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        let intent = authority.identity.activation_intent(intent);
         // The same private Inbox transaction and owned filesystem jobs retain
         // the original scope publication and complete physical authority set.
         // Never reenter public delivery or widen the ordinary same-tree port.
@@ -2546,7 +2547,7 @@ impl SessionInboxPort for FileSessionInbox {
             envelope,
             InboxAuthority::HostScoped { _guard: authority },
             None,
-            Some(SessionInboxActivationIntent::with_delivery(intent)),
+            Some(intent),
         )
         .await
     }

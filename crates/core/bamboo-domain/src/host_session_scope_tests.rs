@@ -7,6 +7,63 @@ use crate::{
     DEFAULT_SUPERVISOR_SESSION_ID,
 };
 
+#[test]
+fn supervisor_operation_wire_stays_frozen_across_host_routing_and_intents() {
+    let mut caller = root(DEFAULT_SUPERVISOR_SESSION_ID);
+    caller.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap(),
+    };
+    let identity = HostSessionPeerIdentity::for_caller(
+        &SessionCallerReference::from(&caller),
+        "target",
+        caller.created_at,
+        "stable-operation",
+    );
+    // Captured from the existing namespace/serialized SupervisorReference.
+    // This fixed protocol fixture guards compatibility with durable receipts.
+    assert_eq!(
+        identity.message_id.as_str(),
+        "stable-f92c6a7742d8d8e9c473c9fcf99b4b33d009833698b951eb8e58799e1b7c32d1"
+    );
+    assert_eq!(identity.thread_id, None);
+    assert_eq!(
+        identity.activation_intent(crate::SessionMessageDeliveryIntent::TriggerTurn),
+        crate::SessionInboxActivationIntent::new(
+            crate::SessionActivationPolicy::RespectSpecificWait
+        )
+    );
+    assert_eq!(
+        identity.activation_intent(crate::SessionMessageDeliveryIntent::QueueOnly),
+        crate::SessionInboxActivationIntent::with_delivery(
+            crate::SessionMessageDeliveryIntent::QueueOnly
+        )
+    );
+    let another_target_lifetime = HostSessionPeerIdentity::for_caller(
+        &SessionCallerReference::from(&caller),
+        "target",
+        caller.created_at + chrono::Duration::seconds(1),
+        "stable-operation",
+    );
+    assert_eq!(identity.message_id, another_target_lifetime.message_id);
+    // Supervisor identity intentionally preserves the historical operation
+    // address. The final scope still checks each actual target birth.
+    let ordinary = root("ordinary");
+    let first = HostSessionPeerIdentity::for_caller(
+        &SessionCallerReference::from(&ordinary),
+        "target",
+        ordinary.created_at,
+        "stable-operation",
+    );
+    let second = HostSessionPeerIdentity::for_caller(
+        &SessionCallerReference::from(&ordinary),
+        "target",
+        ordinary.created_at + chrono::Duration::seconds(1),
+        "stable-operation",
+    );
+    assert_ne!(first.message_id, second.message_id);
+    assert_eq!(first.thread_id.as_deref(), Some(first.message_id.as_str()));
+}
+
 fn root(id: &str) -> Session {
     let mut session = Session::new(id, "synthetic-model");
     session.created_at = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
