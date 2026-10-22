@@ -57,7 +57,7 @@ impl SessionStoreV2 {
             )
             .collect();
         let _guards = self
-            .lock_host_scope_observations(&observations, None)
+            .lock_host_scope_observations(&observations, None, &[])
             .await?;
         // All filesystem observations completed under the physical guards. No
         // scope is published when validation fails or this awaiter disappears.
@@ -114,15 +114,26 @@ impl SessionStoreV2 {
         Ok(())
     }
 
-    async fn lock_host_scope_observations(
+    pub(super) async fn lock_host_scope_observations(
         &self,
         observations: &[HostScopeSessionObservation],
         scope: Option<HostSessionScopeUse>,
+        extra_root_ids: &[String],
     ) -> io::Result<HostScopedSessionGuards> {
         let lifecycle = self.lock_session_lifecycle_shared().await?;
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let mut ordered = BTreeSet::new();
         let mut roots = BTreeSet::new();
+        // A creation-purpose writer may reserve its new Root before creating
+        // any files. These are lock locations, never observations or grants.
+        if extra_root_ids.len() > bamboo_domain::MAX_HOST_SESSION_CREATES {
+            return Err(denied("host_session_scope_reserved_root_limit"));
+        }
+        for id in extra_root_ids {
+            validate_session_id(id)?;
+            ordered.insert((0, id.clone()));
+            roots.insert(id.clone());
+        }
         for observation in observations {
             observation
                 .validate()
@@ -193,7 +204,7 @@ impl SessionStoreV2 {
             .chain(targets.iter().map(|target| target.observation.clone()))
             .collect();
         let _guards = self
-            .lock_host_scope_observations(&observations, Some(scope))
+            .lock_host_scope_observations(&observations, Some(scope), &[])
             .await?;
         let current = self
             .peer_delivery_session(&caller.session_id, &caller.root_session_id)
@@ -220,7 +231,7 @@ impl SessionStoreV2 {
             .clone();
         let observations = [binding.caller.clone(), target.clone()];
         let _guards = self
-            .lock_host_scope_observations(&observations, Some(scope))
+            .lock_host_scope_observations(&observations, Some(scope), &[])
             .await?;
         let current = self
             .peer_delivery_session(&caller.session_id, &caller.root_session_id)
