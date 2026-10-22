@@ -11,7 +11,7 @@ use bamboo_agent_core::tools::{
 use bamboo_tickets::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 mod schema;
 pub mod semantic_schema;
@@ -43,7 +43,7 @@ pub fn overlay(
         base = Arc::new(super::OverlayToolExecutor::new(
             base,
             Arc::new(TicketTool {
-                app: Arc::downgrade(&app),
+                app: app.clone(),
                 name,
             }),
         ));
@@ -52,9 +52,7 @@ pub fn overlay(
 }
 
 pub struct TicketTool {
-    // Tool surfaces can outlive their Host through runtime back-references.
-    // An invocation upgrades once and retains its Host until every await ends.
-    app: Weak<TicketApplication>,
+    app: Arc<TicketApplication>,
     name: &'static str,
 }
 
@@ -94,10 +92,7 @@ impl TicketTool {
         let principal = Principal::Supervisor {
             session_id: caller.into(),
         };
-        let app = self.app.upgrade().ok_or_else(|| {
-            Error::AuthorityUnavailable("Ticket application is no longer available".into())
-        })?;
-        let (service, authority) = app.authority(principal.clone()).await?;
+        let (service, authority) = self.app.authority(principal.clone()).await?;
         let binding = service.published()?.1.binding;
         if binding.scope_id != format!("supervisor/{}", reference.incarnation_id)
             || binding.supervisor_session_id != reference.session_id
@@ -114,9 +109,9 @@ impl TicketTool {
                     ));
                 }
                 let pending = if ctx.plan_read_only {
-                    json!({"read_only":true,"message_id":app.oldest_unresolved_human()?})
+                    json!({"read_only":true,"message_id":self.app.oldest_unresolved_human()?})
                 } else {
-                    app.pending_message().await?
+                    self.app.pending_message().await?
                 };
                 let mut overview = serde_json::to_value(service.work_overview(&authority)?)?;
                 overview["pending_message"] = pending;
@@ -152,11 +147,12 @@ impl TicketTool {
             "work_update" | "work_dispatch" => {
                 if self.name == "work_update" && args.get("message_id").is_some() {
                     let request: SemanticMutation = decode(args)?;
-                    return app
+                    return self
+                        .app
                         .resolve_message(&request.message_id, &request.proposal)
                         .await;
                 }
-                if app.oldest_unresolved_human()?.is_some() {
+                if self.app.oldest_unresolved_human()?.is_some() {
                     return Err(Error::ResourceBlocked("resolve the oldest canonical Human input through work_update message_id/proposal first".into()));
                 }
                 let request: Mutation = decode(args)?;
@@ -197,10 +193,10 @@ impl TicketTool {
                     source: None,
                 };
                 if self.name == "work_dispatch" {
-                    app.dispatch(principal, &command).await
+                    self.app.dispatch(principal, &command).await
                 } else {
                     Ok(
-                        json!({"status":"committed", "receipt":app.update(principal, &command).await?}),
+                        json!({"status":"committed", "receipt":self.app.update(principal, &command).await?}),
                     )
                 }
             }

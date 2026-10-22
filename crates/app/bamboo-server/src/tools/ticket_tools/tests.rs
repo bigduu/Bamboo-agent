@@ -47,7 +47,7 @@ impl Fixture {
     }
     fn tool(&self, name: &'static str) -> TicketTool {
         TicketTool {
-            app: Arc::downgrade(&self.app),
+            app: self.app.clone(),
             name,
         }
     }
