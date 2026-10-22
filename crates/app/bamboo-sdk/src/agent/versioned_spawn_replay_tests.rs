@@ -21,6 +21,11 @@ impl Tool for VersionedProbeTool {
         bamboo_agent_core::ToolClass::MUTATING_SERIAL
     }
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
+        assert!(
+            ctx.executing_caller_for(ctx.session_id().expect("real SDK caller"))
+                .is_some(),
+            "fresh and retained SDK invocation must carry the original host observation"
+        );
         self.probe.calls.lock().unwrap().push(Invocation {
             name: self.name.into(),
             arguments: args,
@@ -284,10 +289,121 @@ async fn versioned_spawn_untyped_replay_without_root_port_never_enters_the_child
     let executor = std::sync::Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(registry));
     let agent = fixture.agent_with_executor(None, executor, None);
     let mut approved = agent.answer(&session.id, "Approve").await.unwrap().session;
-    agent.run_session(&mut approved).await.unwrap();
+    let history = serde_json::to_value(&approved.messages).unwrap();
+    let marker = approved
+        .metadata
+        .get(PERMISSION_REEXECUTE_METADATA_KEY)
+        .cloned();
+    let error = agent
+        .run_session(&mut approved)
+        .await
+        .expect_err("ambiguous historical spawn must remain parked");
+    assert!(
+        error.to_string().contains("no frozen owner/arguments"),
+        "{error}"
+    );
     assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
     assert!(fixture.probe.calls.lock().unwrap().is_empty());
-    assert!(approved.messages.iter().any(
-        |message| message.role == Role::Tool && message.content.contains("no longer available")
+    assert_eq!(serde_json::to_value(&approved.messages).unwrap(), history);
+    assert_eq!(
+        approved.metadata.get(PERMISSION_REEXECUTE_METADATA_KEY),
+        marker.as_ref()
+    );
+}
+
+#[tokio::test]
+async fn frozen_legacy_child_replay_keeps_its_owner_after_a_new_exact_alias_shadows_it() {
+    for version in [None, Some(1)] {
+        let mut fixture = Fixture::new().await;
+        let (pending, args) = versioned_pending(&fixture, version).await;
+        let request = current_request(&pending);
+        assert_eq!(request.tool_name, "SubAgent");
+        assert!(pending
+            .messages
+            .iter()
+            .any(
+                |message| message.metadata.as_ref().is_some_and(|metadata| metadata
+                    .get(bamboo_agent_core::tools::PENDING_TOOL_OPERATION_METADATA_KEY)
+                    .is_some())
+            ));
+        let approved = fixture.approve(&request).await;
+        fixture.reopen_store().await;
+        let config = Arc::new(PermissionConfig::new());
+        config.set_ask_rules(["SubAgent".into(), "spawnSession".into()]);
+        let registry = bamboo_tools::ToolRegistry::new();
+        for name in ["SubAgent", "spawnSession"] {
+            registry
+                .register(VersionedProbeTool {
+                    name,
+                    probe: fixture.probe.clone(),
+                })
+                .unwrap();
+        }
+        let executor = Arc::new(
+            bamboo_tools::BuiltinToolExecutor::with_registry_and_permissions(
+                registry,
+                Arc::new(ConfigPermissionChecker::new(config.clone())),
+            ),
+        );
+        assert_eq!(
+            executor
+                .resolve_reference_for_session(&approved, "default::spawnSession")
+                .as_deref(),
+            Some("spawnSession")
+        );
+        let restarted = fixture.agent_with_executor(Some(config), executor, None);
+        let completed = events(restarted.resume_stream(approved)).await;
+        assert!(
+            !completed
+                .iter()
+                .any(|event| matches!(event, AgentEvent::NeedClarification { .. })),
+            "{completed:?}"
+        );
+        let calls = fixture.probe.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "SubAgent");
+        assert_eq!(calls[0].arguments, args);
+        assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn frozen_parked_arguments_cannot_be_replaced_before_sdk_replay() {
+    let fixture = Fixture::new().await;
+    let (pending, _) = versioned_pending(&fixture, None).await;
+    let request = current_request(&pending);
+    let mut approved = fixture.approve(&request).await;
+    let call = approved
+        .messages
+        .iter_mut()
+        .find_map(|message| {
+            message
+                .tool_calls
+                .as_mut()
+                .and_then(|calls| calls.iter_mut().find(|call| call.id == CALL))
+        })
+        .unwrap();
+    call.function.arguments =
+        json!({"action":"create", "prompt":"different unapproved operation"}).to_string();
+    let (config, agent) = versioned_agent(&fixture);
+    let error = agent
+        .run_session(&mut approved)
+        .await
+        .expect_err("frozen argument mutation must refuse before grant restoration");
+    assert!(
+        error.to_string().contains("pending operation binding"),
+        "{error}"
+    );
+    assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+    assert!(fixture.probe.calls.lock().unwrap().is_empty());
+    assert!(approved
+        .metadata
+        .contains_key(PERMISSION_REEXECUTE_METADATA_KEY));
+    assert!(!config.consume_once_for_generation(
+        &approved.id,
+        CALL,
+        &request.request_generation,
+        request.permission_type,
+        &request.resource
     ));
 }

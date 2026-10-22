@@ -5,6 +5,7 @@ pub mod actor_snapshot;
 pub mod admission;
 pub mod authority;
 pub mod budget_types;
+pub mod caller;
 pub mod compatibility;
 pub mod composition;
 pub mod context_block;
@@ -41,6 +42,7 @@ pub use authority::*;
 pub use budget_types::{
     BudgetStrategy, ProviderPromptUsage, TokenBudget, TokenBudgetUsage, TokenUsageBreakdown,
 };
+pub use caller::*;
 pub use compatibility::*;
 pub use composition::*;
 pub use context_block::*;

@@ -16,7 +16,8 @@ use bamboo_engine::model_config_helper::{
 };
 use bamboo_engine::session_app::approval_replay::{
     apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
-    repark_permission_replay, restore_permission_replay_authorization,
+    repark_permission_replay, resolve_permission_replay_owner,
+    restore_permission_replay_authorization, restore_permission_replay_caller,
     validate_permission_replay_authority, ApprovalReplayDecision, PermissionReplayTarget,
 };
 use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
@@ -342,7 +343,17 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 let tool_name = tool_call.function.name.clone();
                 let executor = state.tools_for(crate::tools::ToolSurface::Root);
                 let executor = executor.for_session(&session).unwrap_or(executor);
-                let replay_owner = executor.resolve_reference_for_session(&session, &tool_name);
+                let replay_owner = match resolve_permission_replay_owner(
+                    &session,
+                    &replay_target,
+                    executor.as_ref(),
+                ) {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        tracing::error!(%session_id, %error, "retained permission operation refused; pending markers preserved");
+                        return;
+                    }
+                };
                 if replay_owner.is_none() && reexecute_request_generation.is_some() {
                     tracing::error!(%session_id, %tool_name, "approved replay has no registered execution owner; markers retained");
                     return;
@@ -355,6 +366,16 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     Ok(observation) => observation,
                     Err(error) => {
                         tracing::error!(%session_id, %error, "Supervisor approval replay binding failed closed");
+                        return;
+                    }
+                };
+                let executing_caller = match restore_permission_replay_caller(
+                    &session,
+                    &replay_target,
+                ) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        tracing::error!(%session_id, %error, "original caller replay binding failed closed; markers preserved");
                         return;
                     }
                 };
@@ -468,7 +489,9 @@ impl ResumeExecutionPort for AppStateResumeRef {
                             session.id.as_str(),
                             reexecute_tool_call_id.as_str(),
                             reexecute_request_generation.as_deref(),
-                            executor.execute_exact_with_context_outcome(
+                            bamboo_agent_core::tools::with_executing_session_caller(
+                                executing_caller.map(std::sync::Arc::new),
+                                executor.execute_exact_with_context_outcome(
                                     &tool_call,
                                     replay_owner,
                                 bamboo_agent_core::tools::ToolExecutionContext {
@@ -491,6 +514,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                                     bash_completion_sink: None,
                                     pre_parsed_args: None,
                                 },
+                                ),
                             ),
                         )
                         .await.map(bamboo_agent_core::tools::ToolOutcome::into_tool_result);

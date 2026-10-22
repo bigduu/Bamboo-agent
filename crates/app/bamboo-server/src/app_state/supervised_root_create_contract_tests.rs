@@ -1247,6 +1247,34 @@ async fn versioned_spawn_framework_owner_keeps_typed_approval_and_deny_before_si
         ),
         ..ToolExecutionContext::none(&call.id)
     };
+    // The public unbound exact gate must derive v2 from canonical storage,
+    // then reject before the additional permission gate is entered.
+    let checks_before = checks.load(Ordering::SeqCst);
+    let mut missing_observation = context();
+    missing_observation.executing_supervisor = None;
+    assert!(installed
+        .check_permissions_for_exact(&call, "spawn_session", &missing_observation)
+        .await
+        .is_err());
+    assert!(installed
+        .execute_exact_with_context_outcome(&call, "spawn_session", missing_observation)
+        .await
+        .is_err());
+    assert_eq!(checks.load(Ordering::SeqCst), checks_before);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    f.creator.config.write().await.disabled_tools = vec!["spawn_session".into()];
+    assert!(installed
+        .check_permissions_for_exact(&call, "spawn_session", &context())
+        .await
+        .is_err());
+    assert!(installed
+        .execute_exact_with_context_outcome(&call, "spawn_session", context())
+        .await
+        .is_err());
+    assert_eq!(checks.load(Ordering::SeqCst), checks_before);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    f.creator.config.write().await.disabled_tools.clear();
+
     let asks = [
         tools
             .check_permissions_for(&call, &context())
@@ -1312,4 +1340,44 @@ async fn versioned_spawn_framework_owner_keeps_typed_approval_and_deny_before_si
         .unwrap(),
         original
     );
+}
+
+#[tokio::test]
+async fn role_neutral_root_creation_adapter_preserves_existing_host_scope_and_caller_lifetime() {
+    use bamboo_domain::SessionCallerReference;
+    use bamboo_server_tools::session_control::root_creation::{
+        SessionRootCreatePort, SupervisorRootCreateAdapter,
+    };
+    let f = Fixture::new().await;
+    let adapter =
+        SupervisorRootCreateAdapter::new(Arc::new(f.creator.clone()), f.creator.store.clone());
+    let supervisor = f
+        .creator
+        .store
+        .load_execution_admission_snapshot(&f.supervisor.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let caller = SessionCallerReference::from(&supervisor);
+    let current_scope = adapter.scope(&caller).await.unwrap();
+    assert!(current_scope.success);
+    let mut stale = caller.clone();
+    stale.root_tool_authority_revision += 1;
+    assert!(adapter.scope(&stale).await.is_err());
+    let root = Session::new("role-neutral-no-grant", "model");
+    let child = Session::new_child_of("role-neutral-child-no-grant", &root, "model", "short child");
+    for session in [root, child] {
+        f.creator.store.save_session(&session).await.unwrap();
+        let before = f.count().await;
+        let caller = SessionCallerReference::from(&session);
+        let error = adapter
+            .create(&caller, f.request.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("session_root_scope_unavailable"),
+            "{error}"
+        );
+        assert_eq!(f.count().await, before);
+    }
 }

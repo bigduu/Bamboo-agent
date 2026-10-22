@@ -14,15 +14,18 @@ pub mod versioned {
         ExecutingSupervisorObservation, Tool, ToolCall, ToolClass, ToolCtx, ToolError,
         ToolExecutionContext, ToolExecutor, ToolOutcome, ToolResult, ToolSchema,
     };
-    use bamboo_domain::{Session, Storage};
+    use bamboo_domain::{Session, SessionCallerReference, Storage};
     use serde_json::Value;
     use tokio::sync::RwLock;
 
-    use super::root_creation::{SupervisedRootCreatePort, SupervisedRootCreateRequest};
+    use super::root_creation::{
+        SessionRootCreatePort, SupervisedRootCreatePort, SupervisedRootCreateRequest,
+        SupervisorRootCreateAdapter,
+    };
     use crate::overlay_executor::OverlayToolExecutor;
 
     pub struct SpawnSessionTool {
-        creator: Arc<dyn SupervisedRootCreatePort>,
+        creator: Arc<dyn SessionRootCreatePort>,
         storage: Arc<dyn Storage>,
         config: Arc<RwLock<bamboo_llm::Config>>,
         installed: Arc<dyn ToolExecutor>,
@@ -36,14 +39,17 @@ pub mod versioned {
             installed: Arc<dyn ToolExecutor>,
         ) -> Self {
             Self {
-                creator,
+                creator: Arc::new(SupervisorRootCreateAdapter::new(creator, storage.clone())),
                 storage,
                 config,
                 installed,
             }
         }
 
-        async fn validate_context(&self, ctx: &ToolCtx) -> Result<(), ToolError> {
+        async fn validate_context(
+            &self,
+            ctx: &ToolCtx,
+        ) -> Result<SessionCallerReference, ToolError> {
             if ctx.plan_read_only {
                 return Err(ToolError::Execution(
                     "spawn_session is unavailable in Plan mode".into(),
@@ -84,7 +90,7 @@ pub mod versioned {
                     "spawn_session is disabled by this Host".into(),
                 ));
             }
-            Ok(())
+            Ok(SessionCallerReference::from(&canonical))
         }
     }
 
@@ -117,18 +123,14 @@ pub mod versioned {
             ToolClass::MUTATING_SERIAL
         }
         async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
-            self.validate_context(&ctx).await?;
+            let caller = self.validate_context(&ctx).await?;
             let request: SupervisedRootCreateRequest =
                 serde_json::from_value(args).map_err(|error| {
                     ToolError::InvalidArguments(format!("invalid spawn_session request: {error}"))
                 })?;
             request.validate()?;
-            let supervisor = ctx
-                .executing_supervisor_for(ctx.session_id().expect("validated caller"))
-                .expect("validated observation")
-                .supervisor_reference();
             self.creator
-                .create(&supervisor, request)
+                .create(&caller, request)
                 .await
                 .map(ToolOutcome::Completed)
         }
@@ -253,6 +255,51 @@ pub mod versioned {
             }
             Ok((tools, name))
         }
+
+        /// An exact owner was already selected by live admission or restored
+        /// from a host-owned pending-operation binding. Revalidate the live
+        /// Session/owner gates without interpreting the historical alias again.
+        async fn route_exact<'a>(
+            &'a self,
+            call: &ToolCall,
+            execution_name: &str,
+            ctx: &ToolExecutionContext<'_>,
+        ) -> Result<&'a Arc<dyn ToolExecutor>, ToolError> {
+            let mut independent_contract = self.contract == Some(true);
+            let tools = if bamboo_domain::independent_root_spawn_reference(&call.function.name)
+                || execution_name == "spawn_session"
+            {
+                let id = ctx.session_id.ok_or_else(|| {
+                    ToolError::Execution(
+                        "retained spawn operation requires its canonical Session".into(),
+                    )
+                })?;
+                let session = load_canonical(self.storage.as_ref(), id).await?;
+                independent_contract = session.independent_root_spawn_contract();
+                if self
+                    .contract
+                    .is_some_and(|v2| v2 != session.independent_root_spawn_contract())
+                {
+                    return Err(ToolError::Execution(
+                        "spawn contract changed; reload the original Session".into(),
+                    ));
+                }
+                if session.independent_root_spawn_contract() {
+                    &self.independent
+                } else {
+                    &self.legacy
+                }
+            } else {
+                self.selected()
+            };
+            if !tools.owns_exact_tool(execution_name) {
+                return Err(ToolError::NotFound(execution_name.to_owned()));
+            }
+            if execution_name == "spawn_session" && independent_contract {
+                self.spawn.validate_context(&ctx.to_tool_ctx()).await?;
+            }
+            Ok(tools)
+        }
     }
 
     #[async_trait]
@@ -292,12 +339,7 @@ pub mod versioned {
             execution_name: &str,
             ctx: ToolExecutionContext<'_>,
         ) -> Result<ToolOutcome, ToolError> {
-            let (tools, name) = self.route(&call.function.name, &ctx).await?;
-            if name != execution_name {
-                return Err(ToolError::Execution(
-                    "approved execution owner differs from the Session spawn contract".into(),
-                ));
-            }
+            let tools = self.route_exact(call, execution_name, &ctx).await?;
             tools
                 .execute_exact_with_context_outcome(call, execution_name, ctx)
                 .await
@@ -316,12 +358,7 @@ pub mod versioned {
             execution_name: &str,
             ctx: &ToolExecutionContext<'_>,
         ) -> Result<Option<ToolOutcome>, ToolError> {
-            let (tools, name) = self.route(&call.function.name, ctx).await?;
-            if name != execution_name {
-                return Err(ToolError::Execution(
-                    "permission owner differs from the Session spawn contract".into(),
-                ));
-            }
+            let tools = self.route_exact(call, execution_name, ctx).await?;
             tools
                 .check_permissions_for_exact(call, execution_name, ctx)
                 .await
@@ -336,12 +373,7 @@ pub mod versioned {
             // Outer Work/broker overlays still use the real inner permission gate,
             // even though their registration is outside this wrapper's catalog.
             if execution_name == "spawn_session" {
-                let (tools, name) = self.route(&call.function.name, ctx).await?;
-                if name != execution_name {
-                    return Err(ToolError::Execution(
-                        "permission owner differs from the Session spawn contract".into(),
-                    ));
-                }
+                let tools = self.route_exact(call, execution_name, ctx).await?;
                 return tools
                     .check_permissions_for_resolved(call, execution_name, args, ctx)
                     .await;

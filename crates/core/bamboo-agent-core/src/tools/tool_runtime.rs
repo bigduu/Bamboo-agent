@@ -204,6 +204,8 @@ pub struct RunningHandle {
 pub struct ToolCtx {
     /// Bamboo session id executing the tool.
     pub session_id: Option<Arc<str>>,
+    /// Original dispatch observation; possession never grants Session access.
+    pub executing_caller: Option<Arc<bamboo_domain::SessionCallerReference>>,
     /// Lifetime captured by real dispatch; never refreshed from configuration.
     pub executing_supervisor: Option<super::ExecutingSupervisorObservation>,
     /// The model's tool call id.
@@ -235,6 +237,7 @@ impl ToolCtx {
     pub fn none(tool_call_id: impl Into<Arc<str>>) -> Self {
         Self {
             session_id: None,
+            executing_caller: None,
             executing_supervisor: None,
             tool_call_id: tool_call_id.into(),
             event_tx: None,
@@ -256,6 +259,17 @@ impl ToolCtx {
     /// The session id as `&str`, if present.
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
+    }
+
+    /// Only retain the incoming lifetime for nested work by the same caller.
+    /// Consumers must still revalidate it under their canonical authority locks.
+    pub fn executing_caller_for(
+        &self,
+        session_id: &str,
+    ) -> Option<&bamboo_domain::SessionCallerReference> {
+        self.executing_caller.as_deref().filter(|caller| {
+            self.session_id() == Some(session_id) && caller.session_id == session_id
+        })
     }
 
     /// Preserve the original observation for same-caller nested dispatch only.

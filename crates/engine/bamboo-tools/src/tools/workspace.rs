@@ -197,6 +197,7 @@ mod tests {
             .invoke(
                 json!({}),
                 ToolCtx {
+                    executing_caller: None,
                     executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from(session.as_str())),
                     tool_call_id: std::sync::Arc::from("call_1"),
@@ -234,6 +235,7 @@ mod tests {
             .invoke(
                 json!({"path": workspace.to_string_lossy()}),
                 ToolCtx {
+                    executing_caller: None,
                     executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from(session.as_str())),
                     tool_call_id: std::sync::Arc::from("call_1"),
@@ -259,6 +261,7 @@ mod tests {
             .invoke(
                 json!({}),
                 ToolCtx {
+                    executing_caller: None,
                     executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from(session.as_str())),
                     tool_call_id: std::sync::Arc::from("call_2"),
@@ -292,6 +295,7 @@ mod tests {
             .invoke(
                 json!({"path": "/tmp/bamboo-no-such-workspace-xyz-99999"}),
                 ToolCtx {
+                    executing_caller: None,
                     executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session_1")),
                     tool_call_id: std::sync::Arc::from("call_1"),

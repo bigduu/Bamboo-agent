@@ -172,6 +172,7 @@ async fn execute_and_apply_single_tool_call(
             session,
             config.permission_mode.unwrap_or_default(),
         );
+    let executing_caller = bamboo_domain::SessionCallerReference::from(&*session);
     let root_session_id = session.root_session_id.clone();
     let executing_supervisor =
         ExecutingSupervisorObservation::capture_from_executing_session(session);
@@ -295,6 +296,7 @@ async fn execute_and_apply_single_tool_call(
                     root_orchestration_only,
                     root_session_id: &root_session_id,
                     executing_supervisor,
+                    executing_caller: Some(&executing_caller),
                     round_id,
                     round,
                     tools,
@@ -851,6 +853,8 @@ async fn execute_round_tool_calls_inner(
                 session,
                 config.permission_mode.unwrap_or_default(),
             );
+            let executing_caller = bamboo_domain::SessionCallerReference::from(&*session);
+            let executing_caller = &executing_caller;
             let root_session_id = session.root_session_id.clone();
             let root_session_id = root_session_id.as_str();
             let executing_supervisor =
@@ -880,6 +884,7 @@ async fn execute_round_tool_calls_inner(
                                     root_orchestration_only,
                                     root_session_id,
                                     executing_supervisor,
+                                    executing_caller: Some(executing_caller),
                                     round_id,
                                     round,
                                     tools,
