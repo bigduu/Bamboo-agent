@@ -303,6 +303,11 @@ impl SessionStoreV2 {
                     compact_main::validate_full_main(&main_bytes)?;
                     let main: Session = serde_json::from_slice(&main_bytes)?;
                     let side: Session = serde_json::from_slice(&side_bytes)?;
+                    if main.conversation_reset.is_some() || side.conversation_reset.is_some() {
+                        return Err(conflict(
+                            "nonzero Supervisor proof cannot be reconstructed by migration",
+                        ));
+                    }
                     if main.id != DEFAULT_SUPERVISOR_SESSION_ID
                         || !matches!(
                             main.authority_identity,

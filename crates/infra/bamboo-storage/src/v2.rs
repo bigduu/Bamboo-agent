@@ -101,6 +101,7 @@ mod child_project;
 mod compact_main;
 #[cfg(test)]
 mod compact_main_tests;
+mod conversation_task_undo;
 mod default_actor_context;
 mod host_registry;
 mod root_actor_input;
@@ -125,6 +126,7 @@ mod parent_question_checkpoint;
 mod startup_sidecar_tests;
 #[cfg(test)]
 mod task_publication_lifetime_tests;
+use conversation_task_undo::TaskConversationWitness;
 use default_actor_context::DefaultWriterGuards;
 pub(crate) use default_actor_context::DefaultWriterPhysicalGuards;
 #[cfg(test)]
@@ -281,7 +283,7 @@ const RUNTIME_SIDECAR_FILE: &str = "runtime.json";
 /// Filenames are random UUIDs; untrusted session ids are never used as paths.
 const RUNTIME_TASK_TRANSACTION_DIR: &str = ".runtime-task-transactions";
 const RUNTIME_TASK_TRANSACTION_LOCK_FILE: &str = ".runtime-task-transactions.lock";
-const RUNTIME_TASK_TRANSACTION_VERSION: u32 = 1;
+const RUNTIME_TASK_TRANSACTION_VERSION: u32 = 2;
 /// Private rollback markers for crash-safe session copies. A live `.json`
 /// marker means the copy has not crossed its success boundary yet, so startup
 /// must remove every target projection before exposing the store.
@@ -377,6 +379,8 @@ struct TaskControlPlaneUndo {
     session_id: String,
     task_list: Option<TaskList>,
     task_list_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_witness: Option<TaskConversationWitness>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3618,6 +3622,7 @@ impl SessionStoreV2 {
                 ),
             ));
         }
+        reject_conversation_generation_change(current, &main)?;
 
         let runtime_path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let _ = Self::runtime_task_recovery_real_file(&runtime_path).await?;
@@ -3645,6 +3650,7 @@ impl SessionStoreV2 {
                 main.kind,
                 &main.root_session_id,
             )?;
+            reject_conversation_generation_change(sidecar, &main)?;
             if sidecar.parent_session_id != main.parent_session_id
                 || sidecar.parent_created_at != main.parent_created_at
             {
@@ -3709,7 +3715,7 @@ impl SessionStoreV2 {
         path: &Path,
         journal: &RuntimeTaskTransactionJournal,
     ) -> io::Result<()> {
-        if journal.version != RUNTIME_TASK_TRANSACTION_VERSION {
+        if !matches!(journal.version, 1 | RUNTIME_TASK_TRANSACTION_VERSION) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -3741,6 +3747,16 @@ impl SessionStoreV2 {
                 io::ErrorKind::InvalidData,
                 "runtime Task transaction journal pair is not lexically ordered",
             ));
+        }
+        for undo in [&journal.first, &journal.second] {
+            if (journal.version == RUNTIME_TASK_TRANSACTION_VERSION)
+                != undo.conversation_witness.is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Task journal version and conversation witness disagree",
+                ));
+            }
         }
         Ok(())
     }
@@ -3842,6 +3858,10 @@ impl SessionStoreV2 {
             ));
         };
         reject_incompatible_session_write(&current)?;
+        match undo.conversation_witness.as_ref() {
+            Some(witness) => witness.check_current(&current)?,
+            None => conversation_task_undo::check_legacy_zero_target(&current)?,
+        }
         current.task_list = undo.task_list.clone();
         current.set_task_list_version_meta(undo.task_list_version.clone());
         self.validate_runtime_task_recovery_write_target(&abs_dir, &current)
@@ -4069,6 +4089,41 @@ impl SessionStoreV2 {
         &self,
         journal: &SessionCopyTransactionJournal,
     ) -> io::Result<()> {
+        // Copy can only publish a new zero-generation Root. A retained legacy
+        // rollback marker cannot own a target that has since been reset. Check
+        // before hiding it in the index or deleting any canonical directory.
+        let target_dir = self.sessions_dir.join(&journal.target_id);
+        match fs::symlink_metadata(&target_dir).await {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                let main_path = target_dir.join("session.json");
+                let runtime_path = target_dir.join(RUNTIME_SIDECAR_FILE);
+                for path in [&main_path, &runtime_path] {
+                    if !Self::runtime_task_recovery_real_file(path).await? {
+                        return Err(other_io_error("copy rollback target pair is unavailable"));
+                    }
+                }
+                let raw = fs::read(&main_path).await?;
+                compact_main::validate_full_main(&raw)?;
+                let main: Session = serde_json::from_slice(&raw).map_err(io::Error::other)?;
+                let side = Self::read_runtime_sidecar_at(&runtime_path, &journal.target_id)
+                    .await?
+                    .ok_or_else(|| other_io_error("copy rollback target runtime is unavailable"))?;
+                if main.id != journal.target_id || main.kind != SessionKind::Root {
+                    return Err(other_io_error("copy rollback target identity changed"));
+                }
+                reject_incompatible_session_write(&main)?;
+                reject_incompatible_session_write(&side)?;
+                reject_conversation_generation_change(&main, &side)?;
+                conversation_task_undo::check_legacy_zero_target(&main)?;
+            }
+            Ok(_) => {
+                return Err(other_io_error(
+                    "copy rollback target is not a real directory",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         // Hide the target first. If cleanup later fails, the retained marker
         // makes startup retry before the store becomes available.
         let mut errors = Vec::new();
@@ -4086,7 +4141,6 @@ impl SessionStoreV2 {
             // retryable; this in-memory removal closes the local visibility gap.
             self.index.write().await.sessions.remove(&journal.target_id);
         }
-        let target_dir = self.sessions_dir.join(&journal.target_id);
         let revision_path = target_dir.join(SEARCH_INDEX_REVISION_FILE);
         let staging_dir = self.session_copy_staging_dir(journal);
         for path in [&target_dir, &staging_dir] {
@@ -4290,7 +4344,8 @@ impl SessionStoreV2 {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "Task target has no live Main")
             })?;
-        reject_incompatible_session_write(&durable)
+        reject_incompatible_session_write(&durable)?;
+        reject_conversation_generation_change(current, &durable)
     }
 
     async fn save_runtime_task_control_plane_if_matches(
@@ -4332,6 +4387,7 @@ impl SessionStoreV2 {
         self.validate_runtime_task_execution_contract(&current)
             .await?;
         self.validate_root_context_for_save(&current).await?;
+        reject_conversation_generation_change(original, &current)?;
         if current.authority_identity != original.authority_identity
             || current.supervisor_management != original.supervisor_management
             || !Self::runtime_task_owned_snapshot_matches(&current, original)?
@@ -4433,6 +4489,8 @@ impl SessionStoreV2 {
             .await?;
         self.validate_root_context_for_save(&current_first).await?;
         self.validate_root_context_for_save(&current_second).await?;
+        reject_conversation_generation_change(first_original, &current_first)?;
+        reject_conversation_generation_change(second_original, &current_second)?;
         if current_first.authority_identity != first_original.authority_identity
             || current_second.authority_identity != second_original.authority_identity
             || current_first.supervisor_management != first_original.supervisor_management
@@ -4480,11 +4538,13 @@ impl SessionStoreV2 {
             transaction_id,
             first: TaskControlPlaneUndo {
                 session_id: current_first.id.clone(),
+                conversation_witness: Some(TaskConversationWitness::capture(&current_first)?),
                 task_list: current_first.task_list.clone(),
                 task_list_version: first_version,
             },
             second: TaskControlPlaneUndo {
                 session_id: current_second.id.clone(),
+                conversation_witness: Some(TaskConversationWitness::capture(&current_second)?),
                 task_list: current_second.task_list.clone(),
                 task_list_version: second_version,
             },
@@ -8022,6 +8082,9 @@ mod tests {
             transaction_id,
             first: TaskControlPlaneUndo {
                 session_id: child_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&child_original).unwrap(),
+                ),
                 task_list: child_original.task_list.clone(),
                 task_list_version: child_original
                     .task_list_version_meta()
@@ -8029,6 +8092,9 @@ mod tests {
             },
             second: TaskControlPlaneUndo {
                 session_id: root_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&root_original).unwrap(),
+                ),
                 task_list: root_original.task_list.clone(),
                 task_list_version: root_original
                     .task_list_version_meta()
@@ -8248,6 +8314,9 @@ mod tests {
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
                 session_id: child_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&child_original).unwrap(),
+                ),
                 task_list: child_original.task_list.clone(),
                 task_list_version: child_original
                     .task_list_version_meta()
@@ -8255,6 +8324,9 @@ mod tests {
             },
             second: TaskControlPlaneUndo {
                 session_id: root_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&root_original).unwrap(),
+                ),
                 task_list: root_original.task_list.clone(),
                 task_list_version: root_original
                     .task_list_version_meta()
@@ -8313,6 +8385,9 @@ mod tests {
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
                 session_id: child_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&child_original).unwrap(),
+                ),
                 task_list: child_original.task_list.clone(),
                 task_list_version: child_original
                     .task_list_version_meta()
@@ -8320,6 +8395,9 @@ mod tests {
             },
             second: TaskControlPlaneUndo {
                 session_id: root_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&root_original).unwrap(),
+                ),
                 task_list: root_original.task_list.clone(),
                 task_list_version: root_original
                     .task_list_version_meta()
@@ -8375,6 +8453,9 @@ mod tests {
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
                 session_id: child_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&child_original).unwrap(),
+                ),
                 task_list: child_original.task_list.clone(),
                 task_list_version: child_original
                     .task_list_version_meta()
@@ -8382,6 +8463,9 @@ mod tests {
             },
             second: TaskControlPlaneUndo {
                 session_id: root_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&root_original).unwrap(),
+                ),
                 task_list: root_original.task_list.clone(),
                 task_list_version: root_original
                     .task_list_version_meta()

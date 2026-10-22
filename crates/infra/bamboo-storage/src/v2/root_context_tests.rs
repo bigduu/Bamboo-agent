@@ -1885,11 +1885,13 @@ async fn legacy_root_proof_migration_precedes_prepared_task_journal_recovery() {
         transaction_id,
         first: TaskControlPlaneUndo {
             session_id: initial.id.clone(),
+            conversation_witness: Some(TaskConversationWitness::capture(&initial).unwrap()),
             task_list: None,
             task_list_version: String::new(),
         },
         second: TaskControlPlaneUndo {
             session_id: child.id.clone(),
+            conversation_witness: Some(TaskConversationWitness::capture(&child).unwrap()),
             task_list: None,
             task_list_version: String::new(),
         },
