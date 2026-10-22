@@ -5753,13 +5753,10 @@ mod native_chat_scope {
                 ..Default::default()
             });
             let provider = Arc::new(NoModelCalls::default());
-            let mut state = crate::AppState::new_with_provider(
-                home.path().into(),
-                config,
-                provider.clone(),
-            )
-            .await
-            .unwrap();
+            let mut state =
+                crate::AppState::new_with_provider(home.path().into(), config, provider.clone())
+                    .await
+                    .unwrap();
             state.provider_registry.replace_with(ProviderRegistry::new(
                 std::collections::HashMap::from([(
                     "openai".into(),
@@ -5767,7 +5764,8 @@ mod native_chat_scope {
                 )]),
                 "openai".into(),
             ));
-            state.provider_router = Arc::new(ProviderModelRouter::new(state.provider_registry.clone()));
+            state.provider_router =
+                Arc::new(ProviderModelRouter::new(state.provider_registry.clone()));
             let state = web::Data::new(state);
             let mut session = Session::new(id, "test-model");
             session.title_generated = true;
@@ -5775,14 +5773,17 @@ mod native_chat_scope {
                 &a.canonicalize().unwrap(),
             ));
             session.add_message(Message::user("Keep the completed synthetic action"));
-            session.add_message(Message::assistant("", Some(vec![ToolCall {
-                id: "completed-synthetic-command".into(),
-                tool_type: "function".into(),
-                function: FunctionCall {
-                    name: "exec_command".into(),
-                    arguments: json!({"cmd":"synthetic action; never execute"}).to_string(),
-                },
-            }])));
+            session.add_message(Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: "completed-synthetic-command".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "exec_command".into(),
+                        arguments: json!({"cmd":"synthetic action; never execute"}).to_string(),
+                    },
+                }]),
+            ));
             session.add_message(Message::tool_result(
                 "completed-synthetic-command",
                 "COMPLETED_SYNTHETIC_RESULT exit_code=0",
@@ -5797,11 +5798,24 @@ mod native_chat_scope {
                 a.canonicalize().unwrap(),
                 "scope_fixture",
             );
-            Self { _home: home, state, provider, id: id.into(), a, b }
+            Self {
+                _home: home,
+                state,
+                provider,
+                id: id.into(),
+                a,
+                b,
+            }
         }
 
         async fn owner(&self) -> SessionExecutionReservation {
-            let session = self.state.storage.load_session(&self.id).await.unwrap().unwrap();
+            let session = self
+                .state
+                .storage
+                .load_session(&self.id)
+                .await
+                .unwrap()
+                .unwrap();
             let sender = self.state.get_session_event_sender(&self.id).await;
             let mut owner = match reserve_session_execution(
                 &self.state.agent,
@@ -5809,11 +5823,16 @@ mod native_chat_scope {
                 &self.state.session_event_senders,
                 &self.id,
                 &sender,
-            ).await {
+            )
+            .await
+            {
                 SessionExecutionReserveOutcome::Reserved(owner) => owner,
                 _ => panic!("synthetic Root must reserve its real execution"),
             };
-            owner.bind_root_actor(&self.state.agent, &session).await.unwrap();
+            owner
+                .bind_root_actor(&self.state.agent, &session)
+                .await
+                .unwrap();
             owner
         }
 
@@ -5821,14 +5840,20 @@ mod native_chat_scope {
             body["session_id"] = self.id.clone().into();
             body["model"] = "test-model".into();
             let app = test::init_service(
-                App::new().app_data(self.state.clone()).configure(crate::configure_routes),
-            ).await;
+                App::new()
+                    .app_data(self.state.clone())
+                    .configure(crate::configure_routes),
+            )
+            .await;
             let response = test::call_service(
                 &app,
-                test::TestRequest::post().uri("/api/v1/chat")
+                test::TestRequest::post()
+                    .uri("/api/v1/chat")
                     .peer_addr("127.0.0.1:5700".parse().unwrap())
-                    .set_json(body).to_request(),
-            ).await;
+                    .set_json(body)
+                    .to_request(),
+            )
+            .await;
             (response.status(), test::read_body_json(response).await)
         }
     }
@@ -5844,30 +5869,87 @@ mod native_chat_scope {
             };
             if phase == "pending" {
                 // Keep the genuine reservation; vary only its startup observation.
-                fixture.state.agent_runners.write().await.get_mut(&fixture.id).unwrap().status =
-                    crate::AgentStatus::Pending;
+                fixture
+                    .state
+                    .agent_runners
+                    .write()
+                    .await
+                    .get_mut(&fixture.id)
+                    .unwrap()
+                    .status = crate::AgentStatus::Pending;
             }
             let startup = (phase == "startup").then(|| {
                 crate::handlers::agent::events::begin_execute_startup(&fixture.state, &fixture.id)
             });
-            let before = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
-            let cache = fixture.state.sessions.get(&fixture.id).unwrap().read().clone();
-            let inbox = fixture.state.session_inbox.inspect(&fixture.id).await.unwrap();
+            let before = fixture
+                .state
+                .storage
+                .load_session(&fixture.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let cache = fixture
+                .state
+                .sessions
+                .get(&fixture.id)
+                .unwrap()
+                .read()
+                .clone();
+            let inbox = fixture
+                .state
+                .session_inbox
+                .inspect(&fixture.id)
+                .await
+                .unwrap();
             let workspace = bamboo_agent_core::workspace_state::get_workspace(&fixture.id);
-            let (status, response) = fixture.post(json!({
-                "message":"Continue without changing the active Source",
-                "workspace_path":fixture.b,
-            })).await;
+            let (status, response) = fixture
+                .post(json!({
+                    "message":"Continue without changing the active Source",
+                    "workspace_path":fixture.b,
+                }))
+                .await;
             assert_eq!(status, StatusCode::CONFLICT, "{response}");
-            assert_eq!(response["error"]["code"], "session_project_running_conflict");
-            let after = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
-            assert_eq!(serde_json::to_value(after).unwrap(), serde_json::to_value(before).unwrap());
             assert_eq!(
-                serde_json::to_value(fixture.state.sessions.get(&fixture.id).unwrap().read().clone()).unwrap(),
+                response["error"]["code"],
+                "session_project_running_conflict"
+            );
+            let after = fixture
+                .state
+                .storage
+                .load_session(&fixture.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(after).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    fixture
+                        .state
+                        .sessions
+                        .get(&fixture.id)
+                        .unwrap()
+                        .read()
+                        .clone()
+                )
+                .unwrap(),
                 serde_json::to_value(cache).unwrap(),
             );
-            assert_eq!(fixture.state.session_inbox.inspect(&fixture.id).await.unwrap(), inbox);
-            assert_eq!(bamboo_agent_core::workspace_state::get_workspace(&fixture.id), workspace);
+            assert_eq!(
+                fixture
+                    .state
+                    .session_inbox
+                    .inspect(&fixture.id)
+                    .await
+                    .unwrap(),
+                inbox
+            );
+            assert_eq!(
+                bamboo_agent_core::workspace_state::get_workspace(&fixture.id),
+                workspace
+            );
             assert_eq!(fixture.provider.0.load(Ordering::Relaxed), 0);
             drop(startup);
             if let Some(owner) = owner {
@@ -5879,50 +5961,127 @@ mod native_chat_scope {
     #[actix_web::test]
     async fn project_default_delta_and_project_reassignment_preserve_active_scope() {
         let fixture = Fixture::new("native-chat-scope-project-default").await;
-        let project = fixture.state.project_store.create_with_project_path(
-            "Synthetic Project", None, fixture.a.to_string_lossy(), Vec::new(),
-        ).unwrap();
-        let mut session = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+        let project = fixture
+            .state
+            .project_store
+            .create_with_project_path(
+                "Synthetic Project",
+                None,
+                fixture.a.to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+        let mut session = fixture
+            .state
+            .storage
+            .load_session(&fixture.id)
+            .await
+            .unwrap()
+            .unwrap();
         session.set_project_id_meta(project.id.to_string());
         session.metadata_version += 1;
         session.metadata.insert(
             bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.into(),
-            bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str().into(),
+            bamboo_engine::project_context::WorkspaceSource::ProjectDefault
+                .as_str()
+                .into(),
         );
         fixture.state.storage.save_session(&session).await.unwrap();
         fixture.state.sessions.insert(
-            fixture.id.clone(), Arc::new(bamboo_engine::SessionSnapshot::new(session)),
+            fixture.id.clone(),
+            Arc::new(bamboo_engine::SessionSnapshot::new(session)),
         );
         let owner = fixture.owner().await;
-        fixture.state.project_store.update_with_project_path(
-            &project.id, project.revision, &fixture.b.to_string_lossy(), |_| Ok(()),
-        ).unwrap();
-        let before = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
-        let inbox = fixture.state.session_inbox.inspect(&fixture.id).await.unwrap();
-        let (status, response) = fixture.post(json!({
-            "message":"Continue with workspace omitted",
-        })).await;
+        fixture
+            .state
+            .project_store
+            .update_with_project_path(
+                &project.id,
+                project.revision,
+                &fixture.b.to_string_lossy(),
+                |_| Ok(()),
+            )
+            .unwrap();
+        let before = fixture
+            .state
+            .storage
+            .load_session(&fixture.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let inbox = fixture
+            .state
+            .session_inbox
+            .inspect(&fixture.id)
+            .await
+            .unwrap();
+        let (status, response) = fixture
+            .post(json!({
+                "message":"Continue with workspace omitted",
+            }))
+            .await;
         assert_eq!(status, StatusCode::CONFLICT, "{response}");
-        assert_eq!(response["error"]["code"], "session_project_running_conflict");
         assert_eq!(
-            serde_json::to_value(fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap()).unwrap(),
+            response["error"]["code"],
+            "session_project_running_conflict"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                fixture
+                    .state
+                    .storage
+                    .load_session(&fixture.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
             serde_json::to_value(&before).unwrap(),
         );
-        assert_eq!(fixture.state.session_inbox.inspect(&fixture.id).await.unwrap(), inbox);
+        assert_eq!(
+            fixture
+                .state
+                .session_inbox
+                .inspect(&fixture.id)
+                .await
+                .unwrap(),
+            inbox
+        );
         assert_eq!(
             bamboo_agent_core::workspace_state::get_workspace(&fixture.id),
             Some(fixture.a.canonicalize().unwrap()),
         );
-        let other = fixture.state.project_store.create_with_project_path(
-            "Other Synthetic Project", None, fixture.a.to_string_lossy(), Vec::new(),
-        ).unwrap();
-        let (status, response) = fixture.post(json!({
-            "message":"Chat must not reassign membership", "project_id":other.id,
-        })).await;
+        let other = fixture
+            .state
+            .project_store
+            .create_with_project_path(
+                "Other Synthetic Project",
+                None,
+                fixture.a.to_string_lossy(),
+                Vec::new(),
+            )
+            .unwrap();
+        let (status, response) = fixture
+            .post(json!({
+                "message":"Chat must not reassign membership", "project_id":other.id,
+            }))
+            .await;
         assert_eq!(status, StatusCode::CONFLICT, "{response}");
-        assert_eq!(response["error"]["code"], "session_project_reassignment_required");
         assert_eq!(
-            serde_json::to_value(fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap()).unwrap(),
+            response["error"]["code"],
+            "session_project_reassignment_required"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                fixture
+                    .state
+                    .storage
+                    .load_session(&fixture.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
             serde_json::to_value(before).unwrap(),
         );
         assert_eq!(fixture.provider.0.load(Ordering::Relaxed), 0);
@@ -5940,33 +6099,84 @@ mod native_chat_scope {
                 std::os::unix::fs::symlink(&fixture.a, &alias).unwrap();
                 #[cfg(not(unix))]
                 let alias = fixture.a.join(".");
-                let mut session = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+                let mut session = fixture
+                    .state
+                    .storage
+                    .load_session(&fixture.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 session.set_workspace_path_meta(alias.to_string_lossy());
                 fixture.state.storage.save_session(&session).await.unwrap();
                 fixture.state.sessions.insert(
-                    fixture.id.clone(), Arc::new(bamboo_engine::SessionSnapshot::new(session)),
+                    fixture.id.clone(),
+                    Arc::new(bamboo_engine::SessionSnapshot::new(session)),
                 );
             }
             let owner = fixture.owner().await;
-            let before = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+            let before = fixture
+                .state
+                .storage
+                .load_session(&fixture.id)
+                .await
+                .unwrap()
+                .unwrap();
             let mut body = json!({"message":"SAME_SCOPE_CONTINUATION"});
-            if spelling != "omitted" { body["workspace_path"] = json!(fixture.a); }
+            if spelling != "omitted" {
+                body["workspace_path"] = json!(fixture.a);
+            }
             let (status, response) = fixture.post(body).await;
             assert_eq!(status, StatusCode::CREATED, "{response}");
-            assert_eq!(fixture.state.session_inbox.inspect(&fixture.id).await.unwrap().pending, 1);
-            let mut stored = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
-            let admitted = owner.execution_persistence().unwrap().admit_root_inbox(
-                &mut stored, fixture.state.session_inbox.clone(), Some(owner.run_id()),
-            ).await.unwrap().unwrap();
+            assert_eq!(
+                fixture
+                    .state
+                    .session_inbox
+                    .inspect(&fixture.id)
+                    .await
+                    .unwrap()
+                    .pending,
+                1
+            );
+            let mut stored = fixture
+                .state
+                .storage
+                .load_session(&fixture.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let admitted = owner
+                .execution_persistence()
+                .unwrap()
+                .admit_root_inbox(
+                    &mut stored,
+                    fixture.state.session_inbox.clone(),
+                    Some(owner.run_id()),
+                )
+                .await
+                .unwrap()
+                .unwrap();
             assert!(admitted.admission_error.is_none());
             assert_eq!(admitted.committed_messages.len(), 1);
-            let stored = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+            let stored = fixture
+                .state
+                .storage
+                .load_session(&fixture.id)
+                .await
+                .unwrap()
+                .unwrap();
             for message in &before.messages {
                 assert!(stored.messages.iter().any(|saved| {
                     serde_json::to_value(saved).unwrap() == serde_json::to_value(message).unwrap()
                 }));
             }
-            assert_eq!(stored.messages.iter().filter(|m| m.content == "SAME_SCOPE_CONTINUATION").count(), 1);
+            assert_eq!(
+                stored
+                    .messages
+                    .iter()
+                    .filter(|m| m.content == "SAME_SCOPE_CONTINUATION")
+                    .count(),
+                1
+            );
             assert_eq!(fixture.provider.0.load(Ordering::Relaxed), 0);
             owner.abandon().await;
         }
@@ -5976,16 +6186,33 @@ mod native_chat_scope {
     async fn idle_legacy_workspace_can_be_repaired() {
         let fixture = Fixture::new("native-chat-scope-idle-repair").await;
         std::fs::remove_dir(&fixture.a).unwrap();
-        let (status, response) = fixture.post(json!({
-            "message":"Repair the unavailable old workspace", "workspace_path":fixture.b,
-        })).await;
+        let (status, response) = fixture
+            .post(json!({
+                "message":"Repair the unavailable old workspace", "workspace_path":fixture.b,
+            }))
+            .await;
         assert_eq!(status, StatusCode::CREATED, "{response}");
-        let stored = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+        let stored = fixture
+            .state
+            .storage
+            .load_session(&fixture.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             crate::skill_runtime::workspace_identity(&stored).unwrap(),
             Some(fixture.b.canonicalize().unwrap()),
         );
-        assert_eq!(fixture.state.session_inbox.inspect(&fixture.id).await.unwrap().pending, 1);
+        assert_eq!(
+            fixture
+                .state
+                .session_inbox
+                .inspect(&fixture.id)
+                .await
+                .unwrap()
+                .pending,
+            1
+        );
         assert!(stored.messages.iter().any(|message| {
             message.tool_call_id.as_deref() == Some("completed-synthetic-command")
                 && message.content == "COMPLETED_SYNTHETIC_RESULT exit_code=0"
@@ -6016,15 +6243,32 @@ mod native_chat_scope {
         let saved = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             fixture.state.persistence.acquire_lock(&fixture.id),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         drop(saved);
         assert!(fixture.state.agent_runners.try_write().is_ok());
-        let session = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+        let session = fixture
+            .state
+            .storage
+            .load_session(&fixture.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             crate::skill_runtime::workspace_identity(&session).unwrap(),
             Some(fixture.b.canonicalize().unwrap()),
         );
-        assert_eq!(fixture.state.session_inbox.inspect(&fixture.id).await.unwrap().pending, 1);
+        assert_eq!(
+            fixture
+                .state
+                .session_inbox
+                .inspect(&fixture.id)
+                .await
+                .unwrap()
+                .pending,
+            1
+        );
         assert_eq!(fixture.provider.0.load(Ordering::Relaxed), 0);
     }
 }
