@@ -64,6 +64,7 @@ pub struct SessionExecutionReservation {
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     activation: SessionExecutionActivationOwnership,
     root_actor: Option<Box<RootActorExecution>>,
+    physical_admission: Option<super::root_execution_lifetime::RootRunAdmission>,
     execution_persistence: Option<Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
     persistence_bound: bool,
     selected_input: bool,
@@ -246,6 +247,7 @@ impl SessionExecutionReservation {
             runners,
             activation: SessionExecutionActivationOwnership::UnpublishedActivation(router),
             root_actor: None,
+            physical_admission: reservation.physical_admission,
             execution_persistence: None,
             persistence_bound: false,
             selected_input: false,
@@ -273,6 +275,7 @@ impl SessionExecutionReservation {
             runners,
             activation,
             root_actor: None,
+            physical_admission: reservation.physical_admission,
             execution_persistence: None,
             persistence_bound: false,
             selected_input: false,
@@ -545,10 +548,12 @@ pub async fn reserve_session_preparation(
         )
     };
     if runners.read().await.get(session_id).is_some_and(|runner| {
-        matches!(
-            runner.status,
-            super::runner_state::AgentStatus::Pending | super::runner_state::AgentStatus::Running
-        )
+        runner.root_reset_admission_reserved()
+            || matches!(
+                runner.status,
+                super::runner_state::AgentStatus::Pending
+                    | super::runner_state::AgentStatus::Running
+            )
     }) {
         return Err(busy());
     }
@@ -561,10 +566,12 @@ pub async fn reserve_session_preparation(
         reservation: Some(reservation),
     };
     if runners.read().await.get(session_id).is_some_and(|runner| {
-        matches!(
-            runner.status,
-            super::runner_state::AgentStatus::Pending | super::runner_state::AgentStatus::Running
-        )
+        runner.root_reset_admission_reserved()
+            || matches!(
+                runner.status,
+                super::runner_state::AgentStatus::Pending
+                    | super::runner_state::AgentStatus::Running
+            )
     }) {
         preparation.abandon().await;
         return Err(busy());
@@ -585,6 +592,7 @@ async fn reserve_logical_session(
         runners: runners.clone(),
         activation: SessionExecutionActivationOwnership::Unrouted,
         root_actor: None,
+        physical_admission: None,
         execution_persistence: None,
         persistence_bound: false,
         selected_input: false,
@@ -751,7 +759,10 @@ async fn reserve_session_execution_inner(
             .read()
             .await
             .get(session_id)
-            .filter(|runner| matches!(runner.status, super::runner_state::AgentStatus::Running))
+            .filter(|runner| {
+                runner.root_reset_admission_reserved()
+                    || matches!(runner.status, super::runner_state::AgentStatus::Running)
+            })
             .map(|runner| runner.run_id.clone())
         {
             return SessionExecutionReserveOutcome::AlreadyRunning { run_id };
@@ -770,11 +781,13 @@ async fn reserve_session_execution_inner(
         let identity = RunnerReservation {
             run_id: reservation.run_id.clone(),
             cancel_token: reservation.cancel_token.clone(),
+            physical_admission: None,
         };
         match reserve_runner_for_registration(runners, senders, session_id, event_sender, identity)
             .await
         {
-            ReserveOutcome::Reserved(_) => {
+            ReserveOutcome::Reserved(raw) => {
+                reservation.physical_admission = raw.physical_admission;
                 reservation.selected_input = selected_input;
                 return SessionExecutionReserveOutcome::Reserved(reservation);
             }
@@ -799,6 +812,7 @@ async fn reserve_session_execution_inner(
         runners: runners.clone(),
         activation: SessionExecutionActivationOwnership::Unrouted,
         root_actor: None,
+        physical_admission: reservation.physical_admission,
         execution_persistence: None,
         persistence_bound: false,
         selected_input,
@@ -1082,8 +1096,37 @@ pub fn spawn_session_execution_with_inputs(
 ) {
     let span_session_id = args.session_id.clone();
     let session_span = tracing::info_span!("agent_execution", session_id = %span_session_id);
+    let is_root = args.session.kind == bamboo_domain::SessionKind::Root;
+    let outer = if is_root {
+        match args
+            .execution_reservation
+            .physical_admission
+            .as_ref()
+            .map(|admission| admission.attach(&args.session))
+            .transpose()
+        {
+            Ok(outer) => outer,
+            Err(error) => {
+                // This new run cannot pass an obsolete/duplicate reset handoff.
+                // Abandon only its exact existing reservation; no other work.
+                tokio::spawn(async move {
+                    let _ = args
+                        .mpsc_tx
+                        .send(AgentEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    args.execution_reservation.abandon().await;
+                });
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let task_outer = outer.clone();
 
-    tokio::spawn(
+    let task = tokio::spawn(
         async move {
             let SessionExecutionArgs {
                 agent,
@@ -1295,6 +1338,10 @@ pub fn spawn_session_execution_with_inputs(
                 {
                     Ok(result) => result,
                     Err(panic) => {
+                        if let Some(outer) = &task_outer {
+                            outer
+                                .unconfirmed("Root loop unwound; physical effects are unconfirmed");
+                        }
                         let message = panic
                             .downcast_ref::<&str>()
                             .map(|s| (*s).to_string())
@@ -1461,6 +1508,11 @@ pub fn spawn_session_execution_with_inputs(
                 );
             let completed_at = chrono::Utc::now();
             if let Err(error) = &saved {
+                if let Some(outer) = &task_outer {
+                    outer.unconfirmed(format!(
+                        "Root final persistence outcome unconfirmed: {error}"
+                    ));
+                }
                 tracing::warn!("[{}] Failed to save session: {}", session_id, error);
             }
 
@@ -1474,6 +1526,9 @@ pub fn spawn_session_execution_with_inputs(
                     .send_and_wait(&mpsc_tx, session_id.clone())
                     .await
             {
+                if let Some(outer) = &task_outer {
+                    outer.unconfirmed("Root history publication barrier unconfirmed");
+                }
                 tracing::warn!(
                     session_id = %session_id,
                     "history commit barrier could not be published before runner finalization"
@@ -1487,6 +1542,11 @@ pub fn spawn_session_execution_with_inputs(
             // lingering in its optimistic-settle window.
             finalize_runner_exact(&runners, &session_id, &activation_run_id, &result).await;
 
+            #[cfg(test)]
+            if let Some(outer) = &task_outer {
+                outer.pause_before_actor_finish().await;
+            }
+
             if let Some(owner) = root_actor.take() {
                 let outcome = if result.as_ref().is_err_and(|error| error.is_cancelled()) {
                     bamboo_domain::ActorActivationFinish::Cancelled
@@ -1495,7 +1555,13 @@ pub fn spawn_session_execution_with_inputs(
                 } else {
                     bamboo_domain::ActorActivationFinish::Succeeded
                 };
-                owner.finish(outcome).await;
+                let finished = owner.finish_observed(outcome).await;
+                if let Err(error) = &finished {
+                    tracing::warn!(%session_id, %error, "Root Actor closure unconfirmed");
+                }
+                if let Some(outer) = &task_outer {
+                    outer.actor_finished(finished);
+                }
             }
 
             let finalization = if let Some(registration) = activation_registration.take() {
@@ -1504,6 +1570,11 @@ pub fn spawn_session_execution_with_inputs(
                 Ok(None)
             };
             if let Err(error) = finalization {
+                if let Some(outer) = &task_outer {
+                    outer.unconfirmed(format!(
+                        "Root registration finalization unconfirmed: {error}"
+                    ));
+                }
                 // Delivery is durable even if activation infrastructure is
                 // temporarily unavailable; startup/backlog reconciliation
                 // can retry without loss.
@@ -1558,9 +1629,21 @@ pub fn spawn_session_execution_with_inputs(
             }
 
             tracing::info!("[{}] Agent execution completed", session_id);
+            if let Some(outer) = &task_outer {
+                outer.tail_completed();
+            }
         }
         .instrument(session_span),
     );
+    if let Some(outer) = outer {
+        outer.retain(task);
+    } else if is_root {
+        // Legacy/custom composition has no supported Root issuer. Still join
+        // this actual task, but do not invent an observable physical receipt.
+        tokio::spawn(async move {
+            let _ = task.await;
+        });
+    }
 }
 
 // Keep the final writer and its rejection path directly regression-testable.
@@ -1739,24 +1822,33 @@ impl RootActorExecution {
         self.binding.persistence.clone()
     }
 
-    pub(super) async fn finish(mut self, outcome: bamboo_domain::ActorActivationFinish) {
-        self.stop_renewal.cancel();
-        if let Some(renewal) = self.renewal.take() {
-            let _ = renewal.await;
+    pub(super) async fn finish(self, outcome: bamboo_domain::ActorActivationFinish) {
+        if let Err(error) = self.finish_observed(outcome).await {
+            tracing::warn!(%error, "Root Actor closure unconfirmed");
         }
+    }
+
+    async fn finish_observed(
+        mut self,
+        outcome: bamboo_domain::ActorActivationFinish,
+    ) -> std::io::Result<()> {
+        self.stop_renewal.cancel();
+        let renewal = match self.renewal.take() {
+            Some(renewal) => renewal.await.map_err(std::io::Error::other),
+            None => Ok(()),
+        };
         let directory = self.binding.directory.clone();
         let fence = self.binding.owner.fence.clone();
         let finish = tokio::spawn(async move {
-            if let Err(error) = directory
+            directory
                 .finish_activation(&fence, chrono::Utc::now(), outcome)
                 .await
-            {
-                tracing::warn!(actor_id = %fence.actor_id, run_id = %fence.run_id,
-                    %error, "Root Actor finish rejected its obsolete execution fence");
-            }
+                .map(|_| ())
+                .map_err(std::io::Error::other)
         });
         self.binding.disarm_abandonment();
-        let _ = finish.await;
+        finish.await.map_err(std::io::Error::other)??;
+        renewal
     }
 }
 
@@ -2054,6 +2146,7 @@ mod reservation_tests {
             runners: runners.clone(),
             activation: SessionExecutionActivationOwnership::Unrouted,
             root_actor: None,
+            physical_admission: None,
             execution_persistence: None,
             persistence_bound: false,
             selected_input: false,
@@ -2088,6 +2181,7 @@ mod reservation_tests {
             runners: runners.clone(),
             activation: SessionExecutionActivationOwnership::RegistrationPending(router.clone()),
             root_actor: None,
+            physical_admission: None,
             execution_persistence: None,
             persistence_bound: false,
             selected_input: false,

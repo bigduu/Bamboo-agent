@@ -336,6 +336,11 @@ pub(crate) fn evict_idle_session_entries(
     let mut evicted = Vec::new();
 
     runners.retain(|session_id, runner| {
+        // The installed-slot identity participates in Root reset admission.
+        // Eviction cannot replace that reservation with a fresh raw lineage.
+        if runner.root_reset_admission_reserved() {
+            return true;
+        }
         let keep = match &runner.status {
             AgentStatus::Running => true,
             _ => {
