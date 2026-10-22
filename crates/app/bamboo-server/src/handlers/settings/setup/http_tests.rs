@@ -173,9 +173,13 @@ async fn hybrid_provider_setup_uses_core_cas_without_weakening_multi_section_gua
         "provider_type": "anthropic", "enabled": true, "api_key_from_env": true,
         "model": "claude-3-5-sonnet-20241022", "base_url": "http://127.0.0.1:9/v1"
     }});
+    // Seed the observed durable generation before boot through the typed store.
+    // The ordinary runtime PUT API intentionally rejects provider writes.
+    let providers: bamboo_config::ProvidersSection = serde_json::from_value(data).unwrap();
     facade
         .registry()
-        .commit_value(SectionId::Providers, provider.revision, data)
+        .providers
+        .commit(provider.revision, providers)
         .unwrap();
     drop(facade);
     let state = web::Data::new(isolated_state(dir.path()).await);
