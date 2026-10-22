@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{
@@ -34,6 +34,9 @@ const MAX_TOKENS: u64 = 2_000_000;
 mod agent_adapter;
 #[path = "project_scope.rs"]
 mod project_scope;
+#[cfg(test)]
+#[path = "scope_writer_tests.rs"]
+mod scope_writer_tests;
 use agent_adapter::{WorkflowAgentAdapter, READ_ONLY_AGENTS};
 const MAX_PINNED_DEFINITIONS_PER_RUN: usize = 32;
 const MAX_PINNED_BUNDLE_BYTES_PER_RUN: usize = 512 * 1024;
@@ -64,6 +67,59 @@ pub struct WorkflowRunAccess {
     agents: Arc<WorkflowAgentAdapter>,
     project_scope: Option<project_scope::WorkflowProjectScope>,
     scope_admissions: Arc<Mutex<BTreeMap<String, usize>>>,
+}
+
+struct WorkflowScopeSources {
+    engine: Weak<WorkflowRunEngine>,
+    admissions: Weak<Mutex<BTreeMap<String, usize>>>,
+}
+
+/// The base tools are assembled before their Workflow owner. Weak observations
+/// avoid the engine -> base tools -> engine ownership cycle.
+#[derive(Default)]
+pub(crate) struct WorkflowWorkspaceScopeGuard {
+    sources: OnceLock<WorkflowScopeSources>,
+}
+
+impl WorkflowWorkspaceScopeGuard {
+    pub(crate) fn bind(&self, access: &WorkflowRunAccess) -> Result<(), &'static str> {
+        self.sources
+            .set(WorkflowScopeSources {
+                engine: Arc::downgrade(&access.engine),
+                admissions: Arc::downgrade(&access.scope_admissions),
+            })
+            .map_err(|_| "Workflow workspace scope guard was already bound")
+    }
+}
+
+impl bamboo_server_tools::project_tools::WorkspaceScopeGuard for WorkflowWorkspaceScopeGuard {
+    fn scope_change_is_blocked(&self, session_id: &str) -> Result<bool, ToolError> {
+        let unavailable = || {
+            ToolError::Execution(
+                "Workflow scope authority is unavailable; Workspace change refused".to_string(),
+            )
+        };
+        let sources = self.sources.get().ok_or_else(unavailable)?;
+        let engine = sources.engine.upgrade().ok_or_else(unavailable)?;
+        let admissions = sources.admissions.upgrade().ok_or_else(unavailable)?;
+        Ok(workflow_scope_change_is_blocked(
+            admissions.as_ref(),
+            engine.as_ref(),
+            session_id,
+        ))
+    }
+}
+
+fn workflow_scope_change_is_blocked(
+    admissions: &Mutex<BTreeMap<String, usize>>,
+    engine: &WorkflowRunEngine,
+    session_id: &str,
+) -> bool {
+    let admitting = admissions
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains_key(session_id);
+    admitting || engine.is_session_active(session_id)
 }
 
 struct WorkflowScopeAdmission {
@@ -175,13 +231,13 @@ impl WorkflowRunAccess {
         })
     }
 
-    /// Called under the Session persistence lock by Project/Workspace PATCH.
+    /// Called under the Session persistence lock by scope writers.
     pub(crate) fn scope_change_is_blocked(&self, session_id: &str) -> bool {
-        self.scope_admissions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(session_id)
-            || self.engine.is_session_active(session_id)
+        workflow_scope_change_is_blocked(
+            self.scope_admissions.as_ref(),
+            self.engine.as_ref(),
+            session_id,
+        )
     }
 
     async fn with_scope_admission<F, Fut>(
@@ -1629,9 +1685,9 @@ mod tests {
         }
     }
 
-    struct BlockingWorkflowReadTool {
-        entered: Arc<Semaphore>,
-        release: Option<Arc<Semaphore>>,
+    pub(super) struct BlockingWorkflowReadTool {
+        pub(super) entered: Arc<Semaphore>,
+        pub(super) release: Option<Arc<Semaphore>>,
     }
 
     #[async_trait]
@@ -1706,7 +1762,7 @@ mod tests {
         (access, repo, directory, storage)
     }
 
-    async fn workflow_test_access() -> (
+    pub(super) async fn workflow_test_access() -> (
         WorkflowRunAccess,
         bamboo_engine::SessionRepository,
         tempfile::TempDir,

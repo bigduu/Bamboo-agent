@@ -121,10 +121,19 @@ fn project_workspace_error(
     }
 }
 
+/// Read-only observation of an existing execution owner's scope fence.
+///
+/// Callers hold the Session persistence lock. An unavailable owner must return
+/// an error, never an unblocked observation. This port creates no admission.
+pub trait WorkspaceScopeGuard: Send + Sync {
+    fn scope_change_is_blocked(&self, session_id: &str) -> Result<bool, ToolError>;
+}
+
 pub struct ProjectWorkspaceTool {
     sessions: SessionRepository,
     projects: Arc<ProjectStore>,
     workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
+    scope_guard: Option<Arc<dyn WorkspaceScopeGuard>>,
 }
 
 impl ProjectWorkspaceTool {
@@ -145,7 +154,13 @@ impl ProjectWorkspaceTool {
             sessions,
             projects,
             workspace_resolver,
+            scope_guard: None,
         }
+    }
+
+    pub fn with_scope_guard(mut self, guard: Arc<dyn WorkspaceScopeGuard>) -> Self {
+        self.scope_guard = Some(guard);
+        self
     }
 
     async fn session_project(
@@ -353,6 +368,17 @@ impl Tool for ProjectWorkspaceTool {
             // snapshot must never overwrite a concurrent message append or
             // publish a workspace under a Project identity that has changed.
             let persistence_guard = self.sessions.persistence().acquire_lock(session_id).await;
+            if let Some(guard) = &self.scope_guard {
+                if guard.scope_change_is_blocked(session_id)? {
+                    return Ok(completed(
+                        false,
+                        json!({
+                            "code": "session_project_running_conflict",
+                            "message": "A Workflow is admitting, running, or draining; Workspace change refused",
+                        }),
+                    ));
+                }
+            }
             let mut authoritative = self
                 .sessions
                 .storage()
@@ -425,13 +451,15 @@ impl Tool for ProjectWorkspaceTool {
                 session_id.to_string(),
                 Arc::new(bamboo_engine::SessionSnapshot::new(authoritative.clone())),
             );
-            drop(persistence_guard);
             project = authoritative_project;
             let stored = self.workspace_resolver.publish_resolved_workspace(
                 session_id,
                 final_path.clone(),
                 bamboo_engine::project_context::WorkspaceSource::Explicit.as_str(),
             );
+            // Publish under the same lock as the durable save. A later writer
+            // or Workflow admission must not observe an older registry scope.
+            drop(persistence_guard);
             let relocated = (stored != canonical).then_some(canonical);
             (
                 stored,

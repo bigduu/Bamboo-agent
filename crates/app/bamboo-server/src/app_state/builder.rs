@@ -580,6 +580,8 @@ impl AppState {
         })?;
 
         let diagnostics = Arc::new(crate::tools::diagnostics::DiagnosticsSource::default());
+        let workflow_workspace_scope_guard =
+            Arc::new(crate::workflow::WorkflowWorkspaceScopeGuard::default());
         let (base_tools, native_tool_ceiling, builtin_permission_executor) = build_base_tools(
             config.clone(),
             permission_checker.clone(),
@@ -600,6 +602,7 @@ impl AppState {
             memory_store.clone(),
             session_messenger.clone(),
             diagnostics.clone(),
+            workflow_workspace_scope_guard.clone(),
         );
 
         // The workflow engine executes against the base tool surface. The
@@ -615,6 +618,9 @@ impl AppState {
         .await
         .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
         .with_project_scope(project_store.clone(), workspace_resolver.clone());
+        workflow_workspace_scope_guard
+            .bind(&workflow_runs)
+            .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
 
         // Idle-evict completed runners together with their paired session event
         // senders (issue #346). Spawned here (not next to `agent_runners`) so it
