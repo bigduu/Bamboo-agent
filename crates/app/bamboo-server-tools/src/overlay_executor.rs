@@ -50,11 +50,26 @@ impl OverlayToolExecutor {
         args: &serde_json::Value,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
-        if let Some(outcome) = self
-            .base
-            .check_permissions_for_resolved(call, self.overlay.name(), args, ctx)
-            .await?
+        let base_check =
+            self.base
+                .check_permissions_for_resolved(call, self.overlay.name(), args, ctx);
+        let selected_contract = self.local_execution_contract(self.overlay.name());
+        let outcome = if self.overlay.name() == "session_message"
+            && args.get("action").and_then(serde_json::Value::as_str) == Some("send")
+            && selected_contract
+                == Some(crate::session_message::SCOPED_SESSION_SEND_EXECUTION_CONTRACT)
         {
+            bamboo_tools::scoped_session_send_permission::with_framework_scoped_session_send_restriction(
+                call,
+                args,
+                selected_contract,
+                base_check,
+            )
+            .await?
+        } else {
+            base_check.await?
+        };
+        if let Some(outcome) = outcome {
             return Ok(Some(outcome));
         }
         match &self.additional_permission_gate {
@@ -294,6 +309,12 @@ impl ToolExecutor for OverlayToolExecutor {
         } else {
             self.base.exact_tool_owner(name)
         }
+    }
+
+    fn local_execution_contract(&self, name: &str) -> Option<&'static str> {
+        (name == self.overlay.name())
+            .then(|| self.overlay.execution_contract())
+            .flatten()
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {

@@ -12,10 +12,10 @@ use std::time::Instant;
 use bamboo_agent_core::storage::Storage;
 use bamboo_domain::{
     ActorSession, Session, SessionActivationDisposition, SessionActivationError,
-    SessionActivationPolicy, SessionActivationPort, SessionInboxError, SessionInboxPort,
-    SessionInboxReceipt, SessionMessageBody, SessionMessageContent, SessionMessageDeliveryIntent,
-    SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
-    SupervisorReference,
+    SessionActivationPolicy, SessionActivationPort, SessionCallerReference, SessionInboxError,
+    SessionInboxPort, SessionInboxReceipt, SessionMessageBody, SessionMessageContent,
+    SessionMessageDeliveryIntent, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
+    SessionMessageSource, SupervisorReference,
 };
 
 /// A followup is one bounded peer instruction, not a context export or file transfer.
@@ -345,6 +345,7 @@ impl SessionMessenger {
             operation_id,
             message,
             None,
+            None,
         )
         .await
         .map(SessionPeerDeliveryReceipt::into_legacy)
@@ -366,6 +367,29 @@ impl SessionMessenger {
             operation_id,
             message,
             Some(intent),
+            None,
+        )
+        .await
+    }
+
+    /// Preserve the original executing caller before using the same peer
+    /// lifecycle/Project/Inbox writer as legacy delivery. An observation is
+    /// identity only; this never permits a different Root or widens authority.
+    pub async fn send_peer_observed(
+        &self,
+        caller: &SessionCallerReference,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        intent: Option<SessionMessageDeliveryIntent>,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
+        self.send_peer_delivery(
+            &caller.session_id,
+            target_session_id,
+            operation_id,
+            message,
+            intent,
+            Some(caller),
         )
         .await
     }
@@ -429,9 +453,16 @@ impl SessionMessenger {
         operation_id: &str,
         message: &str,
         intent: Option<SessionMessageDeliveryIntent>,
+        original_caller: Option<&SessionCallerReference>,
     ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         Self::validate_peer_input(operation_id, message)?;
         let (caller, target) = self.peer_pair(caller_session_id, target_session_id).await?;
+        if original_caller.is_some_and(|original| !original.matches_session(&caller)) {
+            return Err(SessionMessengerError::Unauthorized {
+                source_session_id: caller_session_id.into(),
+                target: target_session_id.into(),
+            });
+        }
         let id = Self::peer_message_id(&caller, &target, operation_id);
         let envelope = Self::peer_envelope(
             &caller,

@@ -247,6 +247,20 @@ pub trait ToolExecutor: Send + Sync {
         None
     }
 
+    /// Observe semantics through the existing exact-owner chain. Calling only
+    /// the owner's local hook avoids recursion when an owner returns `self`.
+    /// Opaque wrappers supply no provenance, even when their catalog has a name.
+    fn execution_contract_for_exact(&self, name: &str) -> Option<&'static str> {
+        self.exact_tool_owner(name)
+            .and_then(|owner| owner.local_execution_contract(name))
+    }
+
+    /// Only concrete owners override this hook. Transparent wrappers retain
+    /// their existing exact-owner forwarding instead of guessing provenance.
+    fn local_execution_contract(&self, _name: &str) -> Option<&'static str> {
+        None
+    }
+
     /// Server-level usage guidance to surface in the system prompt for whatever
     /// this executor currently exposes — e.g. the `instructions` an MCP server
     /// returns from `initialize`. Because it is derived from the live executor,
