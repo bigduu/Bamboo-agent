@@ -399,3 +399,81 @@ async fn host_send_keeps_the_stable_grant_but_never_upgrades_an_original_convers
         .is_err());
     assert_eq!(inbox.inspect(&target.id).await.unwrap().generation, 1);
 }
+
+#[tokio::test]
+async fn host_send_hint_and_physical_writer_ignore_missing_or_wrong_global_index() {
+    use bamboo_domain::{
+        SessionInboxLimits, SessionInboxPort, SessionMessageDeliveryIntent, SessionMessageEnvelope,
+        SessionMessageKind, SessionMessageSource,
+    };
+    for mode in ["missing", "wrong"] {
+        let (_home, store, caller, target) = fixture().await;
+        let poison = Session::new("ungranted-poison", "model");
+        store.save_session(&poison).await.unwrap();
+        let poison_dir = store.sessions_root_dir().join(&poison.id).join("inbox");
+        fs::create_dir_all(&poison_dir).await.unwrap();
+        // Reading a wrong transport directory as a hint would fail with
+        // NotADirectory. A SendOnly operation must never inspect this path.
+        fs::write(poison_dir.join("new"), b"untouched poison marker")
+            .await
+            .unwrap();
+        let token = store
+            .install_host_session_scope(
+                0,
+                binding(&caller, vec![], &target, [HostSessionRight::SendPeer], 1),
+            )
+            .await
+            .unwrap();
+        {
+            let mut index = store.index.write().await;
+            if mode == "missing" {
+                index.sessions.remove(&target.id);
+            } else {
+                index.sessions.get_mut(&target.id).unwrap().rel_path =
+                    SessionStoreV2::root_rel_path(&poison.id);
+            }
+        }
+        let id = bamboo_domain::session_peer_message_id(
+            &caller.id,
+            caller.created_at,
+            &target.id,
+            target.created_at,
+            "index-operation",
+        );
+        let mut envelope = SessionMessageEnvelope::user_input(&target.id, "canonical-only input");
+        envelope.id = id.clone();
+        envelope.source = SessionMessageSource::Session {
+            session_id: caller.id.clone(),
+        };
+        envelope.kind = SessionMessageKind::PeerMessage;
+        envelope.thread_id = Some(id.to_string());
+        envelope.correlation_id = Some("index-operation".into());
+        let target_dir = store.sessions_root_dir().join(&target.id).join("inbox");
+        let inbox =
+            crate::FileSessionInbox::new(std::sync::Arc::new(store), SessionInboxLimits::default());
+        let receipt = inbox
+            .deliver_host_scoped_peer_message(
+                &token,
+                &SessionCallerReference::from(&caller),
+                &envelope,
+                SessionMessageDeliveryIntent::QueueOnly,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.delivery.generation, 1, "{mode}");
+        assert_eq!(
+            fs::read_to_string(target_dir.join("generation"))
+                .await
+                .unwrap()
+                .trim(),
+            "1"
+        );
+        let mut reader = fs::read_dir(target_dir.join("new")).await.unwrap();
+        assert!(reader.next_entry().await.unwrap().is_some());
+        assert!(reader.next_entry().await.unwrap().is_none());
+        assert_eq!(
+            fs::read(poison_dir.join("new")).await.unwrap(),
+            b"untouched poison marker"
+        );
+    }
+}

@@ -58,12 +58,13 @@ admission, not consumption, completion, additional authority or wait resolution.
 
 ## Source validation and remaining gates
 
-Ten new Rust case sources cover SendOnly for all three roles across Projects,
+Eleven new Rust case sources cover SendOnly for all three roles across Projects,
 installed-scope/no-fallback routing, distinct inspection rights, grant reissue
 and frozen arguments, default unsupported adapters, activation failure/ACK retry,
 canonical identity/Project/metadata/ancestors, forged raw envelopes, complete
-ledger checks at unchanged revision, and a parked physical Maildir job after
-runtime shutdown retaining publication plus all physical guards. Every fixture
+ledger checks at unchanged revision, missing/wrong global index hints, and a
+parked physical Maildir job after runtime shutdown retaining publication plus
+all physical guards. Every fixture
 uses a fresh temporary directory; the nonzero-generation fixture only seeds
 synthetic future-producer bytes and is not a production reset writer.
 

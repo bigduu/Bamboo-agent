@@ -122,7 +122,7 @@ impl FileSessionInbox {
         target: &str,
         authority: InboxAuthority,
     ) -> Result<(PathBuf, OwnedFilesystem), SessionInboxError> {
-        let dir = self.inbox_dir(target).await?;
+        let dir = self.inbox_dir_with_authority(target, &authority).await?;
         if !self.has_scoped_transport_hint(&dir, target).await? {
             return self.filesystem_with_authority(target, authority).await;
         }
