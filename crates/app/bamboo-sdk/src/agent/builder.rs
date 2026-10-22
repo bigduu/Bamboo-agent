@@ -198,6 +198,10 @@ pub struct AgentBuilder {
         SessionInboxLimits,
         Arc<bamboo_engine::SessionActivationRouter>,
     )>,
+    /// Trusted Host port, applied only to the SDK defaults tool assembly.
+    /// Presence installs no Project, workspace, target or creation grant.
+    session_root_creator:
+        Option<Arc<dyn bamboo_server_tools::session_control::root_creation::SessionRootCreatePort>>,
 }
 
 impl AgentBuilder {
@@ -226,6 +230,7 @@ impl AgentBuilder {
             project_store: None,
             project_sessions: None,
             session_delivery: None,
+            session_root_creator: None,
         }
     }
 
@@ -491,6 +496,21 @@ impl AgentBuilder {
         self
     }
 
+    /// Install the Host's caller-scoped independent Root creation port for
+    /// defaults assembled by [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir).
+    /// The Host must preserve final caller/Project/workspace/Inbox/idempotency
+    /// authority. A missing port reports an explicit blocker; it never spawns a
+    /// Child. Explicit tools/no-tools/default-executor selections still win.
+    pub fn session_root_creator(
+        mut self,
+        creator: Arc<
+            dyn bamboo_server_tools::session_control::root_creation::SessionRootCreatePort,
+        >,
+    ) -> Self {
+        self.session_root_creator = Some(creator);
+        self
+    }
+
     // -- Explicit dependency injection (passthrough) ------------------------
 
     /// Inject a pre-built LLM provider, bypassing config-driven creation.
@@ -700,6 +720,16 @@ impl AgentBuilder {
     /// `instruction` and `model` are carried onto the `Agent` for
     /// [`Agent::run`](super::Agent::run).
     pub fn build(mut self) -> Result<Agent, SdkError> {
+        if self.session_root_creator.is_some()
+            && self.session_store.is_none()
+            && self.tools.is_none()
+            && self.default_tools_override.is_none()
+        {
+            return Err(SdkError::Unsupported(
+                "session_root_creator requires with_defaults_for_data_dir for the canonical caller store"
+                    .into(),
+            ));
+        }
         let mut session_messenger = None;
         if let Some((limits, activation_router)) = self.session_delivery.take() {
             let session_store = self
@@ -805,33 +835,37 @@ impl AgentBuilder {
                     )
                     .map_err(|error| SdkError::Build(error.to_string()))?;
             }
-            if let Some(store) = self.session_store.clone() {
-                let storage: Arc<dyn bamboo_agent_core::storage::Storage> = store.clone();
-                builtin_tools
-                    .register_tool(bamboo_server_tools::SessionInspectorTool::host_routed(
-                        store.clone(),
-                        storage.clone(),
-                    ))
-                    .map_err(|error| SdkError::Build(error.to_string()))?;
-                builtin_tools
-                    .register_tool(bamboo_server_tools::SessionInspectorTool::current(
-                        store, storage,
-                    ))
-                    .map_err(|error| SdkError::Build(error.to_string()))?;
-            }
             if let (Some(manager), Some(sessions), Some(projects)) = (
                 self.assembled_skill_manager.clone(),
                 self.project_sessions.clone(),
                 self.project_store.clone(),
             ) {
                 sdk_skills = Some(Arc::new(super::skill_runtime::DefaultSdkSkills::new(
-                    manager, config, sessions, projects,
+                    manager,
+                    config.clone(),
+                    sessions,
+                    projects,
                 )));
             }
-            let builtin_tools: Arc<dyn ToolExecutor> = Arc::new(builtin_tools);
+            let builtin_tools = Arc::new(builtin_tools);
+            let builtin_base: Arc<dyn ToolExecutor> = builtin_tools.clone();
             let executor: Arc<dyn ToolExecutor> = match self.assembled_mcp_tools.take() {
-                Some(mcp_tools) => Arc::new(CompositeToolExecutor::new(builtin_tools, mcp_tools)),
-                None => builtin_tools,
+                Some(mcp_tools) => Arc::new(CompositeToolExecutor::new(builtin_base, mcp_tools)),
+                None => builtin_base,
+            };
+            let executor = match self.session_store.clone() {
+                Some(store) => {
+                    let storage: Arc<dyn bamboo_agent_core::storage::Storage> = store.clone();
+                    bamboo_server_tools::framework_session_tools::assemble_framework_session_tools(
+                        executor,
+                        builtin_tools,
+                        store,
+                        storage,
+                        config,
+                        self.session_root_creator.take(),
+                    )
+                }
+                None => executor,
             };
             self.inner = self.inner.default_tools(executor);
         }
@@ -1894,6 +1928,106 @@ mod tests {
             } else {
                 assert!(observed.is_err());
             }
+        }
+    }
+
+    struct BlockedSdkRootPort(AtomicUsize);
+    #[async_trait]
+    impl bamboo_server_tools::session_control::root_creation::SessionRootCreatePort
+        for BlockedSdkRootPort
+    {
+        async fn scope(
+            &self,
+            _: &bamboo_domain::SessionCallerReference,
+        ) -> Result<ToolResult, ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::text(false, serde_json::json!({
+                "code":"host_root_first_input_unavailable", "message":"synthetic unconfigured first-input port"
+            }).to_string()))
+        }
+        async fn create(
+            &self,
+            _: &bamboo_domain::SessionCallerReference,
+            _: bamboo_server_tools::session_control::root_creation::SupervisedRootCreateRequest,
+        ) -> Result<ToolResult, ToolError> {
+            panic!("blocked scope must not start a Root writer")
+        }
+    }
+
+    #[tokio::test]
+    async fn defaults_install_fresh_root_tool_and_preserve_the_specific_host_port_blocker() {
+        use bamboo_agent_core::tools::{
+            with_executing_session_caller, FRAMEWORK_ROOT_SPAWN_CONTRACT_V1,
+        };
+        use bamboo_domain::{Session, SessionCallerReference};
+        for configured in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let port = Arc::new(BlockedSdkRootPort(AtomicUsize::new(0)));
+            let mut builder = AgentBuilder::new().provider(Arc::new(NeverCalledProvider));
+            if configured {
+                builder = builder.session_root_creator(port.clone());
+            }
+            let agent = builder
+                .with_defaults_for_data_dir(home.path().into())
+                .await
+                .unwrap()
+                .build()
+                .unwrap();
+            let tools = agent.inner.default_tools();
+            assert_eq!(
+                tools.execution_contract_for_exact("spawn_session"),
+                Some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+            );
+            assert!(
+                tools.owns_exact_tool("session_history")
+                    && tools.owns_exact_tool("session_history_current")
+            );
+            let mut caller = Session::new("sdk-default-root-caller", "model");
+            caller.session_version = None;
+            agent.storage().save_session(&caller).await.unwrap();
+            let call = ToolCall { id:"sdk-default-fresh-root".into(), tool_type:"function".into(), function:FunctionCall {
+                name:"spawnSession".into(), arguments:serde_json::json!({
+                    "operation_id":uuid::Uuid::new_v4(), "expected_state_revision":1,
+                    "project_id":"explicit-project", "workspace_path":"/explicit/host-bound", "message":"bounded instruction"
+                }).to_string(),
+            }};
+            let error = with_executing_session_caller(
+                Some(Arc::new(SessionCallerReference::from(&caller))),
+                tools.execute_with_context(&call, execution_context(&caller.id, &call.id)),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(if configured {
+                "host_root_first_input_unavailable"
+            } else {
+                "session_root_creator_unconfigured"
+            }));
+            assert_eq!(port.0.load(Ordering::SeqCst), usize::from(configured));
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_root_port_never_expands_explicit_sdk_tool_policy() {
+        for policy in 0..3 {
+            let home = tempfile::tempdir().unwrap();
+            let port = Arc::new(BlockedSdkRootPort(AtomicUsize::new(0)));
+            let builder = AgentBuilder::new()
+                .provider(Arc::new(NeverCalledProvider))
+                .session_root_creator(port.clone())
+                .with_defaults_for_data_dir(home.path().into())
+                .await
+                .unwrap();
+            let builder = match policy {
+                0 => builder.no_tools(),
+                1 => builder.tools(vec![]),
+                _ => builder.default_tools(Arc::new(
+                    bamboo_tools::BuiltinToolExecutor::with_registry(ToolRegistry::new()),
+                )),
+            };
+            let agent = builder.build().unwrap();
+            assert!(agent.inner.default_tools().list_tools().is_empty());
+            assert!(!agent.inner.default_tools().owns_exact_tool("spawn_session"));
+            assert_eq!(port.0.load(Ordering::SeqCst), 0);
         }
     }
 

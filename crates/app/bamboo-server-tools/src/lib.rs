@@ -12,6 +12,7 @@ pub mod cluster_tool;
 pub mod compact;
 pub mod deploy_agent;
 pub mod fabric_deploy;
+pub mod framework_session_tools;
 pub mod ledger;
 pub mod memory;
 pub mod notify;
