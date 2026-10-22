@@ -211,7 +211,98 @@ fn actual_file_write_receipt_replay_changed_payload_and_full_manifest_backup() {
 
 #[test]
 fn schema_four_file_evidence_survives_stopped_offline_transfer_without_downgrade() {
+    file_evidence_transfer_preserves_schema(false, false, false);
+}
+
+#[test]
+fn schema_five_project_and_file_evidence_survive_stopped_transfer_without_downgrade() {
+    file_evidence_transfer_preserves_schema(true, false, false);
+}
+
+#[test]
+fn schema_six_sprint_project_and_file_evidence_survive_stopped_transfer() {
+    file_evidence_transfer_preserves_schema(true, true, false);
+}
+
+#[test]
+fn schema_seven_planning_sprint_project_and_file_evidence_survive_stopped_transfer() {
+    file_evidence_transfer_preserves_schema(true, true, true);
+}
+
+fn file_evidence_transfer_preserves_schema(
+    with_project: bool,
+    with_sprint: bool,
+    with_planning: bool,
+) {
     let f = fixture();
+    if with_project {
+        let snapshot = f.service.published().unwrap().1;
+        let host = Authority::from_verified_host(
+            snapshot.binding.clone(),
+            Principal::User {
+                user_id: "owner".into(),
+            },
+        );
+        let linked = execute(
+            &f.service,
+            &host,
+            "linked-work",
+            vec![
+                Operation::Create {
+                    temp_id: "project-work".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    depends_on: BTreeSet::new(),
+                    contract: snapshot.tickets.values().next().unwrap().contract.clone(),
+                },
+                Operation::AssociateProject {
+                    ticket_id: "project-work".into(),
+                    project_id: bamboo_domain::ProjectId::parse("durable-project").unwrap(),
+                },
+            ],
+        )
+        .unwrap();
+        if with_sprint {
+            let sprint_id = SprintId::parse("planning").unwrap();
+            for (operation_id, action) in [
+                (
+                    "create-sprint",
+                    SprintAction::Create {
+                        definition: SprintDefinition {
+                            name: "Planning".into(),
+                            goal: "Preserve evidence".into(),
+                            starts_at: None,
+                            ends_at: None,
+                        },
+                    },
+                ),
+                (
+                    "add-sprint-member",
+                    SprintAction::Add {
+                        expected_revision: 1,
+                        work_id: linked.ids["project-work"].clone(),
+                    },
+                ),
+            ] {
+                let s = f.service.published().unwrap().1;
+                f.service
+                    .execute_sprint(
+                        &host,
+                        &SprintCommand {
+                            operation_id: operation_id.into(),
+                            binding: s.binding,
+                            expected_seq: s.seq,
+                            expected_epoch: s.authority_epoch,
+                            project_id: bamboo_domain::ProjectId::parse("durable-project").unwrap(),
+                            sprint_id: sprint_id.clone(),
+                            source: "schema transfer fixture".into(),
+                            action,
+                        },
+                    )
+                    .unwrap();
+            }
+        }
+    }
     let path = Path::new(&f.workspace.worktree).join("code.rs");
     let artifact = f
         .service
@@ -219,6 +310,28 @@ fn schema_four_file_evidence_survives_stopped_offline_transfer_without_downgrade
         .unwrap()
         .artifact
         .unwrap();
+    if with_planning {
+        let s = f.service.published().unwrap().1;
+        let work_id = s.assignments[&f.assignment].work_id.clone();
+        let user = Authority::from_verified_host(
+            s.binding.clone(),
+            Principal::User {
+                user_id: "owner".into(),
+            },
+        );
+        execute(
+            &f.service,
+            &user,
+            "owner-plan",
+            vec![Operation::SetPlanningMetadata {
+                ticket_id: work_id.clone(),
+                expected_record_revision: s.tickets[&work_id].record_revision,
+                priority: bamboo_domain::TaskPriority::High,
+                expected_completion_at: Some("2026-12-01T18:00:00+08:00".into()),
+            }],
+        )
+        .unwrap();
+    }
     let s = f.service.published().unwrap().1;
     let runtime = Authority::from_verified_host(s.binding.clone(), Principal::Runtime);
     execute(
@@ -269,7 +382,38 @@ fn schema_four_file_evidence_survives_stopped_offline_transfer_without_downgrade
     destination
         .activate_migrated_copy(&source, &user, &request, &proof)
         .unwrap();
-    assert_eq!(destination.published().unwrap().1.schema, 4);
+    let migrated = destination.published().unwrap().1;
+    assert_eq!(
+        migrated.schema,
+        if with_planning {
+            7
+        } else if with_sprint {
+            6
+        } else if with_project {
+            5
+        } else {
+            4
+        }
+    );
+    assert_eq!(migrated.sprint.sprints.len(), usize::from(with_sprint));
+    if with_sprint {
+        let sprint = &migrated.sprint.sprints[&SprintId::parse("planning").unwrap()];
+        assert_eq!(sprint.history.len(), 1);
+        assert_eq!(sprint.members.len(), 1);
+    }
+    assert_eq!(migrated.project.links.len(), usize::from(with_project));
+    if with_planning {
+        let work_id = &migrated.assignments[&f.assignment].work_id;
+        assert_eq!(
+            migrated.tickets[work_id].priority,
+            bamboo_domain::TaskPriority::High
+        );
+        assert_eq!(
+            migrated.tickets[work_id].expected_completion_at.as_deref(),
+            Some("2026-12-01T18:00:00+08:00")
+        );
+        assert_eq!(migrated.receipts["owner-plan"].principal, "user:owner");
+    }
     assert_eq!(
         destination
             .read_artifact(&user, &artifact, FILE_BYTES_LIMIT)

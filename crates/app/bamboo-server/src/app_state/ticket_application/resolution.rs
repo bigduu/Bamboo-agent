@@ -66,6 +66,11 @@ impl TicketApplication {
         }
         let (service, authority) = self.message_authority(message_id).await?;
         let prior = service.message_resolution(&authority, message_id)?;
+        if prior.proposal.is_some() {
+            // Reuse the core's frozen identity check before mutable Host facts
+            // can mask an altered retry. A saved proposal does not republish.
+            service.save_message_proposal(&authority, message_id, proposal)?;
+        }
         if prior.proposal.is_none()
             && self.oldest_unresolved_human()?.as_deref() != Some(message_id)
         {
@@ -76,7 +81,7 @@ impl TicketApplication {
         // Reject an unusable new Start before freezing its immutable proposal.
         // Already terminal groups replay their original receipts; the service
         // still checks the complete saved proposal identity below.
-        let workspaces = proposal
+        let pending_groups = proposal
             .groups
             .iter()
             .filter(|group| {
@@ -92,6 +97,9 @@ impl TicketApplication {
                     .and_then(|index| prior.groups.get(index))
                     .is_none_or(|saved| saved.status == ResolutionStatus::Proposed)
             })
+            .collect::<Vec<_>>();
+        let workspaces = pending_groups
+            .iter()
             .flat_map(|group| group.operations.iter())
             .filter_map(|op| match op {
                 SemanticOperation::Start { workspace, .. } => Some(workspace.clone()),
@@ -99,6 +107,15 @@ impl TicketApplication {
             })
             .collect();
         self.preflight_ticket_starts(workspaces).await?;
+        let snapshot = service.published()?.1;
+        for group in pending_groups {
+            let operations = group
+                .operations
+                .iter()
+                .map(SemanticOperation::to_typed_operation)
+                .collect::<Vec<_>>();
+            self.validate_project_snapshot_operations(&snapshot, &operations)?;
+        }
         service.save_message_proposal(&authority, message_id, proposal)?;
         let resolution = service.settle_message(&authority, message_id)?;
         let mut dispatch = Vec::new();

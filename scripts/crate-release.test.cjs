@@ -861,15 +861,18 @@ test('complete publication keeps canonical main CI authority and authenticates e
   assert.match(preflight, /source = run\["head_sha"\]/)
   assert.doesNotMatch(preflight, /matches\[0\]|--method=GET|accepted_ci_run/)
   assert.match(preflight, /assert pre\.get\("pull_requests"\) == \[\]/)
-  assert.match(preflight, /hashlib\.sha256\(raw\)\.hexdigest\(\) == PRODUCER_V1/)
+  assert.match(preflight, /hashlib\.sha256\(raw\)\.hexdigest\(\) in REVIEWED_PRODUCERS/)
   assert.match(preflight, /suite\["app"\]\["databaseId"\] == 15368/)
   assert.match(preflight, /actions\/runs\/\{pre\['id'\]\}\/attempts\/\{attempt\}\/jobs/)
   assert.match(preflight, /--allow-escape-sequences/)
   assert.match(preflight, /assert len\(records\) == 1/)
   assert.match(preflight, /tested\["parents"\]\] == \[base, head\]/)
   assert.match(preflight, /tested\["tree"\]\["sha"\] == commit\["tree"\]\["sha"\]/)
-  const producer = fs.readFileSync('scripts/tests/fixtures/main-authority-ci-v1.yml')
-  assert.ok(preflight.includes(`PRODUCER_V1 = "${sha256(producer)}"`))
+  for (const version of [1, 2]) {
+    const producer = fs.readFileSync(`scripts/tests/fixtures/main-authority-ci-v${version}.yml`)
+    assert.ok(preflight.includes(`PRODUCER_V${version} = "${sha256(producer)}"`))
+  }
+  assert.match(preflight, /REVIEWED_PRODUCERS = frozenset\(\(PRODUCER_V1, PRODUCER_V2\)\)/)
 })
 
 test('trusted manual publication and automatic receipts share a queue while dry runs stay credential-free', () => {
@@ -920,6 +923,24 @@ test('trusted manual publication and automatic receipts share a queue while dry 
   assert.match(ci, /queue: \$\{\{ github.event_name == 'push' && github.ref == 'refs\/heads\/main' && 'max' \|\| 'single' \}\}/)
   assert.match(ci, /cancel-in-progress: \$\{\{ github.event_name != 'push' \|\| github.ref != 'refs\/heads\/main' \}\}/)
   assert.match(ci, /node --test scripts\/ci-policy.test.cjs scripts\/crate-release.test.cjs/)
+})
+
+test('automatic publication grants only job-local Actions reads for its CI proof', () => {
+  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+  const automatic = workflow.split('  automatic:\n')[1].split('  executables:\n')[0]
+  const permissionBlock = automatic.match(/^    permissions:\n((?:      [a-z-]+: [a-z]+\n)+)/m)?.[1]
+  assert.ok(permissionBlock, 'automatic publication must declare its token permissions')
+  const verify = block => assert.deepEqual(Object.fromEntries(block.trim().split('\n')
+    .map(line => line.trim().split(': '))), { contents: 'write', actions: 'read' })
+  verify(permissionBlock)
+  for (const invalid of [
+    '      contents: write\n',
+    '      contents: write\n      actions: write\n',
+    '      contents: write\n      actions: read\n      checks: write\n',
+  ]) assert.throws(() => verify(invalid))
+  assert.match(automatic, /GH_TOKEN: \$\{\{ github\.token \}\}/)
+  assert.match(automatic, /actions\/runs\/\{/)
+  assert.match(automatic, /actions\/jobs\/\{job_id\}\/logs/)
 })
 
 test('the real manual version resolver has no signing or API dependency and never emits invalid output', (t) => {
@@ -1167,6 +1188,16 @@ print(json.dumps(result))
 
 test('automatic inline bootstrap requires actual normal merge and CI evidence without main protection', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t, workflowPython('Authorize the exact source before checkout'))
+})
+
+test('reviewed CI v2 preserves source admission and matches the current complete definition', async (t) => {
+  const v1 = fs.readFileSync('scripts/tests/fixtures/main-authority-ci-v1.yml', 'utf8')
+  const v2 = fs.readFileSync('scripts/tests/fixtures/main-authority-ci-v2.yml', 'utf8')
+  assert.equal(v2, fs.readFileSync('.github/workflows/ci.yml', 'utf8'))
+  const sourceJob = (definition) => definition.split('  validation-source:\n')[1].split('\n  quick-checks:')[0]
+  assert.equal(sourceJob(v2), sourceJob(v1))
+  assert.notEqual(sha256(v1), sha256(v2))
+  await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t, workflowPython('Authorize the exact source before checkout'), 'v2')
 })
 
 test('temporary manifest stamping uses exact internal dependency versions and real package versions', (t) => {

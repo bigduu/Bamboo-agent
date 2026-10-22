@@ -547,6 +547,21 @@ fn external_artifact_without_trusted_resolver_cannot_become_worker_context() {
         )
         .unwrap();
     let submission = service.execute(&worker, &request).unwrap().ids["s"].clone();
+    let snapshot = service.published().unwrap().1;
+    let assignment = &snapshot.assignments[&snapshot.submissions[&submission].assignment_id];
+    let runtime = Authority::from_verified_host(binding(), Principal::Runtime);
+    let stop = service
+        .prepare_command(
+            &runtime,
+            "external-runtime-stop",
+            vec![Operation::RuntimeStopped {
+                assignment_id: assignment.id.clone(),
+                receipt: assignment.runtime.clone().unwrap(),
+                completed: true,
+            }],
+        )
+        .unwrap();
+    service.execute(&runtime, &stop).unwrap();
     let user = Authority::from_verified_host(
         binding(),
         Principal::User {

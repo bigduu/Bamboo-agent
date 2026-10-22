@@ -423,6 +423,21 @@ fn model_proposal_cannot_turn_chatter_conditional_or_quoted_text_into_user_accep
         )
         .unwrap();
     let submission = service.execute(&worker, &submit).unwrap().ids["s"].clone();
+    // Acceptance-language tests must not be masked by an unrelated missing stop proof.
+    let snapshot = service.published().unwrap().1;
+    let assignment = &snapshot.assignments[&snapshot.submissions[&submission].assignment_id];
+    let stopped = service
+        .prepare_command(
+            &runtime,
+            "fixture-completed-stop",
+            vec![Operation::RuntimeStopped {
+                assignment_id: assignment.id.clone(),
+                receipt: assignment.runtime.clone().unwrap(),
+                completed: true,
+            }],
+        )
+        .unwrap();
+    service.execute(&runtime, &stopped).unwrap();
     for (i, (text, quote)) in [
         "A 做得不错",
         "I accept CA",

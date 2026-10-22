@@ -153,6 +153,14 @@ impl AtomicFileStore {
         bytes: &[u8],
     ) -> ConfigStoreResult<bool> {
         let _lock = self.lock()?;
+        self.write_bytes_if_state_locked(expected_sha256, bytes)
+    }
+
+    fn write_bytes_if_state_locked(
+        &self,
+        expected_sha256: Option<&str>,
+        bytes: &[u8],
+    ) -> ConfigStoreResult<bool> {
         let current = match std::fs::read(&self.path) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -213,6 +221,28 @@ impl AtomicFileStore {
     }
 
     fn lock(&self) -> ConfigStoreResult<FileLock> {
+        let lock = self.lock_unchecked()?;
+        // A writer may have passed its outer transaction guard before a
+        // share commit, then waited here. Recheck under the file lock so a
+        // crashed pending share cannot be overwritten by that queued writer.
+        crate::credential_migration::share_transaction::ensure_no_pending_share_member(&self.path)?;
+        Ok(lock)
+    }
+
+    /// The share coordinator already owns the migration lock and obtains all
+    /// participating file locks in one fixed order before taking its snapshot.
+    /// The returned handle installs without re-locking the same descriptor.
+    pub(crate) fn lock_for_share_transaction(self) -> ConfigStoreResult<LockedShareFileStore> {
+        let lock = FileLock(crate::credential_migration::share_transaction::lock_member(
+            &self.path,
+        )?);
+        Ok(LockedShareFileStore {
+            store: self,
+            _lock: lock,
+        })
+    }
+
+    fn lock_unchecked(&self) -> ConfigStoreResult<FileLock> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         create_dir(parent, self.sensitive)?;
         let lock_path = sibling_suffix(&self.path, "lock");
@@ -376,6 +406,22 @@ impl AtomicFileStore {
         let quarantine = sibling_suffix(&self.path, &format!("corrupt.{}", Uuid::new_v4()));
         self.install_at_with_mode(&quarantine, primary, existing_file_mode(&self.path))?;
         Ok(quarantine)
+    }
+}
+
+pub(crate) struct LockedShareFileStore {
+    store: AtomicFileStore,
+    _lock: FileLock,
+}
+
+impl LockedShareFileStore {
+    pub(crate) fn write_bytes_if_state(
+        &self,
+        expected_sha256: Option<&str>,
+        bytes: &[u8],
+    ) -> ConfigStoreResult<bool> {
+        self.store
+            .write_bytes_if_state_locked(expected_sha256, bytes)
     }
 }
 
