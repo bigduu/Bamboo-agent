@@ -103,7 +103,10 @@ impl ScopeWriterFixture {
             )
             .await
             .unwrap()
-            .with_project_scope(state.project_store.clone(), state.workspace_resolver.clone());
+            .with_project_scope(
+                state.project_store.clone(),
+                state.workspace_resolver.clone(),
+            );
         }
         let root_tools = state.tools_for(bamboo_server_tools::ToolSurface::Root);
         let root_tools = root_tools.for_session(&session).unwrap_or(root_tools);
@@ -194,7 +197,11 @@ impl ScopeWriterFixture {
     async fn finish_and_drain(&self) {
         self.release.add_permits(1);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while self.state.workflow_runs.scope_change_is_blocked(&self.session.id) {
+            while self
+                .state
+                .workflow_runs
+                .scope_change_is_blocked(&self.session.id)
+            {
                 tokio::task::yield_now().await;
             }
         })
@@ -208,7 +215,9 @@ impl ScopeWriterFixture {
             tool_type: "function".to_string(),
             function: FunctionCall {
                 name: "Workspace".to_string(),
-                arguments: path.map_or_else(|| json!({}), |path| json!({"path":path})).to_string(),
+                arguments: path
+                    .map_or_else(|| json!({}), |path| json!({"path":path}))
+                    .to_string(),
             },
         };
         let mut context = ToolExecutionContext::none(&call.id);
@@ -230,7 +239,13 @@ async fn workflow_chat_rejects_scope_change_until_physical_drain() {
             .configure(crate::routes::configure_routes),
     )
     .await;
-    assert!(fixture.state.agent_runners.read().await.get(&fixture.session.id).is_none());
+    assert!(fixture
+        .state
+        .agent_runners
+        .read()
+        .await
+        .get(&fixture.session.id)
+        .is_none());
     let plain = test::call_service(
         &app,
         test::TestRequest::post()
@@ -244,15 +259,25 @@ async fn workflow_chat_rejects_scope_change_until_physical_drain() {
     if status != StatusCode::CREATED {
         fixture.finish_and_drain().await;
     }
-    assert_eq!(status, StatusCode::CREATED, "{}", String::from_utf8_lossy(&bytes));
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     for draining in [false, true] {
         if draining {
-            fixture.state.workflow_runs.cancel_for_session(
-                &fixture.session.id,
-                fixture.run_id.as_deref().unwrap(),
-            ).await.unwrap();
+            fixture
+                .state
+                .workflow_runs
+                .cancel_for_session(&fixture.session.id, fixture.run_id.as_deref().unwrap())
+                .await
+                .unwrap();
         }
-        assert!(fixture.state.workflow_runs.scope_change_is_blocked(&fixture.session.id));
+        assert!(fixture
+            .state
+            .workflow_runs
+            .scope_change_is_blocked(&fixture.session.id));
         let before = fixture.durable().await;
         let response = test::call_service(
             &app,
@@ -267,7 +292,12 @@ async fn workflow_chat_rejects_scope_change_until_physical_drain() {
         if status != StatusCode::CONFLICT {
             fixture.finish_and_drain().await;
         }
-        assert_eq!(status, StatusCode::CONFLICT, "draining={draining}: {}", String::from_utf8_lossy(&bytes));
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "draining={draining}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"]["code"], "session_project_running_conflict");
         fixture.assert_scope_unchanged(&before).await;
@@ -283,8 +313,16 @@ async fn workflow_chat_rejects_scope_change_until_physical_drain() {
     .await;
     let status = response.status();
     let bytes = test::read_body(response).await;
-    assert_eq!(status, StatusCode::CREATED, "{}", String::from_utf8_lossy(&bytes));
-    assert_eq!(fixture.durable().await.workspace_path_meta(), Some(fixture.next_workspace.to_string_lossy().into_owned()));
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(
+        fixture.durable().await.workspace_path_meta(),
+        Some(fixture.next_workspace.to_string_lossy().into_owned())
+    );
     assert_eq!(fixture.provider_calls.load(Ordering::SeqCst), 0);
 }
 
@@ -293,12 +331,17 @@ async fn workflow_workspace_tool_rejects_scope_change_until_physical_drain() {
     let fixture = ScopeWriterFixture::new(true).await;
     for draining in [false, true] {
         if draining {
-            fixture.state.workflow_runs.cancel_for_session(
-                &fixture.session.id,
-                fixture.run_id.as_deref().unwrap(),
-            ).await.unwrap();
+            fixture
+                .state
+                .workflow_runs
+                .cancel_for_session(&fixture.session.id, fixture.run_id.as_deref().unwrap())
+                .await
+                .unwrap();
         }
-        assert!(fixture.state.workflow_runs.scope_change_is_blocked(&fixture.session.id));
+        assert!(fixture
+            .state
+            .workflow_runs
+            .scope_change_is_blocked(&fixture.session.id));
         let before = fixture.durable().await;
         let get = fixture.workspace_call(None).await;
         assert!(get.success, "{}", get.result);
@@ -314,7 +357,10 @@ async fn workflow_workspace_tool_rejects_scope_change_until_physical_drain() {
     fixture.finish_and_drain().await;
     let result = fixture.workspace_call(Some(&fixture.next_workspace)).await;
     assert!(result.success, "{}", result.result);
-    assert_eq!(fixture.durable().await.workspace_path_meta(), Some(fixture.next_workspace.to_string_lossy().into_owned()));
+    assert_eq!(
+        fixture.durable().await.workspace_path_meta(),
+        Some(fixture.next_workspace.to_string_lossy().into_owned())
+    );
     assert_eq!(fixture.provider_calls.load(Ordering::SeqCst), 0);
 }
 
@@ -328,7 +374,10 @@ async fn workspace_guard_is_fail_closed_and_retains_no_workflow_owner() {
     let owners = Arc::strong_count(&access.engine);
     guard.bind(&access).unwrap();
     assert_eq!(Arc::strong_count(&access.engine), owners);
-    assert!(guard.bind(&access).is_err(), "an installed owner cannot be rebound");
+    assert!(
+        guard.bind(&access).is_err(),
+        "an installed owner cannot be rebound"
+    );
     assert!(!guard.scope_change_is_blocked("idle").unwrap());
     drop(access);
     assert!(engine.upgrade().is_none());
@@ -346,20 +395,33 @@ async fn production_workspace_overlay_observes_owned_workflow_admission() {
     let worker_entered = entered.clone();
     let worker_release = release.clone();
     let request = tokio::spawn(async move {
-        access.with_scope_admission(&id, move |_| async move {
-            worker_entered.add_permits(1);
-            let _permit = worker_release.acquire().await.unwrap();
-            Err(WorkflowRunError::Preflight("controlled rejection".to_string()))
-        }).await
+        access
+            .with_scope_admission(&id, move |_| async move {
+                worker_entered.add_permits(1);
+                let _permit = worker_release.acquire().await.unwrap();
+                Err(WorkflowRunError::Preflight(
+                    "controlled rejection".to_string(),
+                ))
+            })
+            .await
     });
     tokio::time::timeout(std::time::Duration::from_secs(5), entered.acquire())
-        .await.unwrap().unwrap().forget();
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
     let before = fixture.durable().await;
-    assert!(fixture.state.workflow_runs.scope_change_is_blocked(&fixture.session.id));
+    assert!(fixture
+        .state
+        .workflow_runs
+        .scope_change_is_blocked(&fixture.session.id));
     let result = fixture.workspace_call(Some(&fixture.next_workspace)).await;
     request.abort();
     assert!(request.await.unwrap_err().is_cancelled());
-    assert!(fixture.state.workflow_runs.scope_change_is_blocked(&fixture.session.id));
+    assert!(fixture
+        .state
+        .workflow_runs
+        .scope_change_is_blocked(&fixture.session.id));
     release.add_permits(1);
     fixture.finish_and_drain().await;
     assert!(!result.success, "{}", result.result);
