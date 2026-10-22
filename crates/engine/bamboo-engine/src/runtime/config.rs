@@ -344,6 +344,16 @@ pub trait SkillExecutionHost: Send + Sync {
         current: Option<&crate::runtime::managers::lifecycle::BoundedInputRequestBatch>,
     ) -> Result<(), bamboo_agent_core::AgentError>;
 
+    /// Adopt only a scope transition already committed by this registered Host.
+    /// Ordinary canonical drift is not authorization to renew a Source.
+    async fn refresh_runtime_scope(
+        &self,
+        _session: &mut bamboo_agent_core::Session,
+        _execution_id: &str,
+    ) -> Result<(), bamboo_agent_core::AgentError> {
+        Ok(())
+    }
+
     async fn render_skill_prompt(
         &self,
         session: &bamboo_agent_core::Session,

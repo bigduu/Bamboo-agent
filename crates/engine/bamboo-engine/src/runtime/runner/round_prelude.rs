@@ -177,6 +177,21 @@ async fn refresh_round_boundary_inner(
         }
     }
 
+    // The registered Host may need its original persistence adapter to adopt a
+    // committed Workspace. Do this before taking the round's bounded Inbox
+    // observation: a checkpoint must not add inputs after that snapshot.
+    if let (Some(host), Some(execution_id)) =
+        (config.sdk_skill_execution_host.as_ref(), execution_id)
+    {
+        ensure_not_cancelled(
+            cancel_token,
+            metrics_collector,
+            &session.id,
+            session.messages.len(),
+        )?;
+        host.refresh_runtime_scope(session, execution_id).await?;
+    }
+
     let (turn_refresh, observation) = if let Some(execution_id) = execution_id {
         super::state_bridge::refresh_turn_boundary_with_observation(
             session,

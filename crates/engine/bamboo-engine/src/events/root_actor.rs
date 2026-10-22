@@ -29,6 +29,16 @@ impl RootActorEventPublication {
         self.owner.fence.actor_id == session_id && self.owner.fence.run_id == run_id
     }
 
+    /// Numeric observations and a process-local opaque identifier, never the
+    /// owner capability or lease-owner value.
+    pub(crate) fn diagnostic_identity(&self) -> (u64, u64, String) {
+        (
+            self.owner.fence.lease_epoch,
+            self.owner.fence.attempt,
+            crate::execution::workspace_diagnostics::fence_fingerprint(&self.owner.fence),
+        )
+    }
+
     pub async fn publish(
         &self,
         session_id: &str,

@@ -239,6 +239,21 @@ impl AppState {
             .await
     }
 
+    /// Preserve the genuine legacy Inbox consumer while injecting a local
+    /// provider. Only the existing recovery switch differs from normal setup.
+    #[cfg(test)]
+    pub(crate) async fn new_with_provider_for_legacy_ingress_test(
+        bamboo_home_dir: PathBuf,
+        config: Config,
+        provider: Arc<dyn LLMProvider>,
+    ) -> Result<Self, AppError> {
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
+        Self::new_with_provider_and_facade(
+            bamboo_home_dir, config, provider, false, None,
+            Arc::new(NoopToolEventPublisher), memory_store, false,
+        ).await
+    }
+
     /// Inject both provider and memory explicitly for isolated Host embeddings.
     pub async fn new_with_provider_and_memory_store(
         bamboo_home_dir: PathBuf,
@@ -582,6 +597,10 @@ impl AppState {
         let diagnostics = Arc::new(crate::tools::diagnostics::DiagnosticsSource::default());
         let workflow_workspace_scope_guard =
             Arc::new(crate::workflow::WorkflowWorkspaceScopeGuard::default());
+        let workspace_handoffs = Arc::new(
+            crate::skill_runtime::WorkspaceHandoffs::new(storage.clone(), agent_runners.clone())
+                .with_actor_directory(session_store.clone()),
+        );
         let (base_tools, native_tool_ceiling, builtin_permission_executor) = build_base_tools(
             config.clone(),
             permission_checker.clone(),
@@ -603,6 +622,7 @@ impl AppState {
             session_messenger.clone(),
             diagnostics.clone(),
             workflow_workspace_scope_guard.clone(),
+            workspace_handoffs.clone(),
         );
 
         // The workflow engine executes against the base tool surface. The
@@ -1236,6 +1256,7 @@ impl AppState {
             tool_factory.clone(),
         )
         .with_runners(agent_runners.clone())
+        .with_workspace_handoffs(workspace_handoffs.clone())
         .with_root_observer(child_completion_coordinator.root_tool_surface_observer());
         child_completion_coordinator.set_reserved_root_execution_adapter(Arc::new(
             move |agent, session, reservation, tools| {
@@ -1453,6 +1474,7 @@ impl AppState {
             project_store,
             project_context_resolver,
             workspace_resolver,
+            workspace_handoffs,
             session_repo,
             persistence,
             session_inbox,
