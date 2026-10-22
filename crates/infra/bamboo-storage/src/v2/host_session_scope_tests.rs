@@ -48,7 +48,8 @@ fn binding(
 #[tokio::test]
 async fn explicit_scope_reads_work_for_root_child_and_supervisor_without_role_impersonation() {
     let (_home, store, caller, target) = fixture().await;
-    let child = Session::new_child_of("child", &caller, "model", "short work");
+    let mut child = Session::new_child_of("child", &caller, "model", "short work");
+    child.set_project_id_meta("caller-project");
     store.save_session(&child).await.unwrap();
     store
         .get_or_create_default_supervisor("model")
@@ -205,7 +206,8 @@ async fn changed_target_project_or_metadata_requires_explicit_new_installation()
 #[tokio::test]
 async fn forged_child_ancestor_revision_never_publishes_scope_or_adopts_a_new_parent() {
     let (_home, store, caller, target) = fixture().await;
-    let child = Session::new_child_of("child", &caller, "model", "bounded work");
+    let mut child = Session::new_child_of("child", &caller, "model", "bounded work");
+    child.set_project_id_meta("caller-project");
     store.save_session(&child).await.unwrap();
     let ancestor = ActorAncestorObservation {
         actor_id: caller.id.clone(),

@@ -73,8 +73,11 @@ impl Fixture {
         let store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
         let mut root = Session::new("same-tree-root", "model");
         root.set_project_id_meta("project-a");
-        let sender = Session::new_child_of("same-tree-sender", &root, "model", "sender");
-        let recipient = Session::new_child_of("same-tree-recipient", &root, "model", "recipient");
+        let mut sender = Session::new_child_of("same-tree-sender", &root, "model", "sender");
+        let mut recipient =
+            Session::new_child_of("same-tree-recipient", &root, "model", "recipient");
+        sender.set_project_id_meta("project-a");
+        recipient.set_project_id_meta("project-a");
         for session in [&root, &sender, &recipient] {
             store.save_session(session).await.unwrap();
         }

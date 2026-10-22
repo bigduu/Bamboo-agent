@@ -99,6 +99,9 @@ async fn final_send_checks_canonical_project_metadata_birth_and_complete_ancesto
         } else {
             right.clone()
         };
+        // Child construction does not infer the Host's explicit Project grant.
+        caller.set_project_id_meta("left-project");
+        target.set_project_id_meta("right-project");
         for session in [&left, &right, &caller, &target] {
             store.save_session(session).await.unwrap();
         }
@@ -174,7 +177,8 @@ async fn raw_host_port_rejects_forged_source_thread_reply_kind_and_operation() {
     let home = tempfile::tempdir().unwrap();
     let store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
     let caller = Session::new("caller", "model");
-    let target = Session::new("target", "model");
+    let mut target = Session::new("target", "model");
+    target.set_project_id_meta("target-project");
     for session in [&caller, &target] {
         store.save_session(session).await.unwrap();
     }
@@ -234,7 +238,9 @@ fn scoped_publication_and_all_physical_guards_survive_started_job_shutdown() {
     let (caller, target, token) = f.runtime.block_on(async {
         let caller = Session::new("host-caller", "model");
         f.store.save_session(&caller).await.unwrap();
-        let target = f.store.load_session("target").await.unwrap().unwrap();
+        let mut target = f.store.load_session("target").await.unwrap().unwrap();
+        target.set_project_id_meta("target-project");
+        f.store.save_session(&target).await.unwrap();
         let token = install(&f.store, &caller, vec![], &target, vec![]).await;
         (caller, target, token)
     });
