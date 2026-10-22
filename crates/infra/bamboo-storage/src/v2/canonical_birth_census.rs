@@ -350,10 +350,61 @@ impl Collector {
     }
 }
 
+// Terminal cleanup only needs complete placement observation, not birth
+// authority. Stream metadata with constant memory so unrelated history cannot
+// exhaust birth-census budgets and prevent deletion. The bounded identity
+// census below stays unchanged; this observation grants neither execution nor
+// permission to purge. Duplicate locations and every unreadable/linked path
+// remain errors rather than evidence of absence.
+fn cleanup_location(home: &Path, id: &str) -> io::Result<Option<(PathBuf, String, SessionKind)>> {
+    fn directory(path: &Path) -> io::Result<bool> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_dir() => Ok(true),
+            Ok(_) => Err(other_io_error("canonical cleanup path is not a real directory")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    let sessions = home.join("sessions");
+    if !directory(&sessions)? {
+        return Ok(None);
+    }
+    let mut found = if directory(&sessions.join(id))? {
+        Some((sessions.join(id), id.to_owned(), SessionKind::Root))
+    } else {
+        None
+    };
+    for entry in std::fs::read_dir(&sessions)? {
+        let entry = entry?;
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_file() {
+            continue;
+        }
+        if !metadata.file_type().is_dir() {
+            return Err(other_io_error("canonical cleanup Root is not a real directory"));
+        }
+        let name = entry.file_name();
+        let root = name
+            .to_str()
+            .ok_or_else(|| other_io_error("invalid canonical cleanup Root name"))?;
+        validate_session_id(root)?;
+        let children = entry.path().join("children");
+        let target = children.join(id);
+        if directory(&children)? && directory(&target)? {
+            if found.is_some() {
+                return Err(other_io_error("ambiguous canonical cleanup placement"));
+            }
+            found = Some((target, root.to_owned(), SessionKind::Child));
+        }
+    }
+    Ok(found)
+}
+
 impl SessionStoreV2 {
     /// Read-only terminal-cleanup observation, never an execution/identity grant.
     /// A missing rebuildable index row is not absence: inspect canonical Root
-    /// and Child locations with the existing bounded, no-symlink locator. A
+    /// and Child locations with the metadata-only, no-symlink locator. A
     /// remaining tree under a canonically revoked Root is logically deleted.
     pub async fn session_is_canonically_absent(&self, id: &str) -> io::Result<bool> {
         validate_session_id(id)?;
@@ -361,22 +412,10 @@ impl SessionStoreV2 {
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let session = self.acquire_session_maintenance_lock(id).await?;
         let guards = DefaultWriterGuards::shared(lifecycle, task, session);
-        let mut collector = Collector {
-            home: self.bamboo_home_dir.clone(),
-            limits: Limits::default(),
-            counts: Counts::default(),
-            #[cfg(test)]
-            hook: None,
-        };
+        let home = self.bamboo_home_dir.clone();
         let id = id.to_owned();
-        let location = Self::default_writer_job(&guards, move || {
-            collector.locate(&id).map_err(|error| {
-                other_io_error(format!(
-                    "canonical cleanup observation unavailable: {error:?}"
-                ))
-            })
-        })
-        .await?;
+        let location =
+            Self::default_writer_job(&guards, move || cleanup_location(&home, &id)).await?;
         match location {
             None => Ok(true),
             Some((_, root, _)) => self.root_directory_is_revoked(&root).await,
@@ -392,26 +431,13 @@ impl SessionStoreV2 {
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let guards = Arc::new((lifecycle, task));
         let retained = guards.clone();
-        let mut collector = Collector {
-            home: self.bamboo_home_dir.clone(),
-            limits: Limits::default(),
-            counts: Counts::default(),
-            #[cfg(test)]
-            hook: None,
-        };
+        let home = self.bamboo_home_dir.clone();
         let target = id.to_owned();
         let present = tokio::task::spawn_blocking(move || {
             // Keep both global guards if the async waiter disappears. Ordinary
             // saves may still use shared guards, so this is admission only.
             let _guards = retained;
-            collector
-                .locate(&target)
-                .map(|location| location.is_some())
-                .map_err(|error| {
-                    other_io_error(format!(
-                        "canonical cleanup admission unavailable: {error:?}"
-                    ))
-                })
+            cleanup_location(&home, &target).map(|location| location.is_some())
         })
         .await
         .map_err(|_| other_io_error("canonical cleanup admission task failed"))??;
