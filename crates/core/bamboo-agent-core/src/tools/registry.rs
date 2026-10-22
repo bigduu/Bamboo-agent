@@ -103,6 +103,11 @@ use crate::tools::{FunctionSchema, ToolError, ToolSchema};
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
+    /// Stable implementation semantics, separate from the public tool name.
+    /// This is Host provenance only, never a permission or model argument.
+    fn execution_contract(&self) -> Option<&'static str> {
+        None
+    }
     /// Human-readable tool description for LLM.
     fn description(&self) -> &str;
     /// JSON Schema for tool parameters.
