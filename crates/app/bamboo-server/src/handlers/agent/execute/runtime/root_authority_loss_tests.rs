@@ -159,13 +159,21 @@ impl Fixture {
         persisted: &[u8],
         account_sequence: u64,
     ) {
-        assert!(matches!(self.next().await,
-            AgentEvent::Error { message } if message == INTERRUPTION));
-        // Wait for the actual asynchronous relay before checking that neither
-        // the interruption nor its normal UI notification enters durable state.
+        let AgentEvent::Error { message } = self.next().await else {
+            panic!("expected the exact obsolete run's interruption frame");
+        };
+        let prefix = format!("{INTERRUPTION} [actor_authority_conflict; RPA-");
+        let number = message
+            .strip_prefix(&prefix)
+            .and_then(|suffix| suffix.strip_suffix(']'))
+            .expect("typed authority classification and diagnostic number");
+        assert_eq!(number.len(), 32);
+        uuid::Uuid::parse_str(number).expect("searchable diagnostic UUID");
+        // The asynchronous user notification must retain the same diagnostic
+        // number, and neither frame may enter durable state or be replayed.
         assert!(matches!(self.next().await,
             AgentEvent::Notification { category, body, .. }
-            if category == "run_failed" && body == INTERRUPTION));
+            if category == "run_failed" && body == message));
         tokio::time::timeout(WAIT, input.closed())
             .await
             .expect("rejected HTTP forwarder releases its input receiver");

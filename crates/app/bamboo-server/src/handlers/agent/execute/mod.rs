@@ -11,6 +11,7 @@ mod types;
 
 pub use defaults::handler as defaults_handler;
 pub use handler::{handle_execute, handler};
+#[cfg(test)]
 pub(crate) use runtime::spawn_agent_execution;
 pub use types::{
     ExecuteClientSync, ExecuteRequest, ExecuteResponse, ExecuteSyncInfo, ExecuteSyncReason,

@@ -574,6 +574,71 @@ async fn publish_forwarded_event(
 const ROOT_AUTHORITY_LOST: &str =
     "This run was interrupted because its execution ownership was lost. Reload the conversation before retrying.";
 
+fn record_publication_rejection(
+    error: &std::io::Error,
+    session_id: &str,
+    run_id: &str,
+    event: Option<&AgentEvent>,
+    root_actor: Option<&crate::events::RootActorEventPublication>,
+    phase: &'static str,
+) -> String {
+    use super::workspace_diagnostics::{record_failure, WorkspaceLogContext};
+    let diagnostic_id = format!("RPA-{}", uuid::Uuid::new_v4().simple());
+    let request_id = event.and_then(|event| match event {
+        AgentEvent::ToolStart { tool_call_id, .. }
+        | AgentEvent::ToolComplete { tool_call_id, .. }
+        | AgentEvent::ToolError { tool_call_id, .. }
+        | AgentEvent::ToolLifecycle { tool_call_id, .. } => Some(tool_call_id.as_str()),
+        _ => None,
+    });
+    if let Some(owner) = root_actor {
+        let (lease_epoch, attempt, fence_id) = owner.diagnostic_identity();
+        tracing::warn!(target: "bamboo.execution_publication", %diagnostic_id,
+            lease_epoch, attempt, %fence_id, phase,
+            "Root publication rejected under captured execution fence");
+    }
+    record_failure(
+        WorkspaceLogContext {
+            session_id,
+            run_id: Some(run_id),
+            request_id,
+            diagnostic_id: Some(&diagnostic_id),
+        },
+        phase,
+        error,
+    )
+}
+
+struct RootInterruption<'a> {
+    session_id: &'a str,
+    run_id: &'a str,
+    runners: &'a Arc<RwLock<HashMap<String, AgentRunner>>>,
+    publication: &'a super::event_publication::EventPublication,
+    visible: &'a super::visible_messages::VisibleMessageStream,
+    cancel_token: &'a CancellationToken,
+}
+
+impl RootInterruption<'_> {
+    async fn close(self, diagnostic_id: &str) {
+        // Retain the original exact-owner cancellation/publication behavior.
+        // A diagnostic number never permits mutation or retries a tool.
+        self.cancel_token.cancel();
+        self.publication.retire().await;
+        self.visible.mark_terminal("error");
+        let guard = self.runners.read().await;
+        if let Some(runner) = guard
+            .get(self.session_id)
+            .filter(|runner| runner.run_id == self.run_id)
+        {
+            let _ = runner.event_sender.send(AgentEvent::Error {
+                message: format!(
+                    "{ROOT_AUTHORITY_LOST} [actor_authority_conflict; {diagnostic_id}]"
+                ),
+            });
+        }
+    }
+}
+
 /// Close only the obsolete run's live transport. This is not a runtime-state
 /// publication: it never enters the account journal, replay cache, or storage.
 /// The exact local runner guard keeps this fixed error ahead of any successor's
@@ -595,20 +660,24 @@ pub async fn interrupt_root_on_authority_loss(
     {
         return;
     }
-    // These capabilities were captured from the original runner. Never look
-    // up a replacement's cancellation token or publication fence.
-    cancel_token.cancel();
-    publication.retire().await;
-    visible.mark_terminal("error");
-    let guard = runners.read().await;
-    if let Some(runner) = guard
-        .get(session_id)
-        .filter(|runner| runner.run_id == run_id)
-    {
-        let _ = runner.event_sender.send(AgentEvent::Error {
-            message: ROOT_AUTHORITY_LOST.into(),
-        });
+    let diagnostic_id = record_publication_rejection(
+        error,
+        session_id,
+        run_id,
+        None,
+        None,
+        "root_authority_interrupt",
+    );
+    RootInterruption {
+        session_id,
+        run_id,
+        runners,
+        publication,
+        visible,
+        cancel_token,
     }
+    .close(&diagnostic_id)
+    .await;
 }
 
 /// The Root adapter passes its immutable capability before any Started frame.
@@ -674,17 +743,29 @@ pub fn create_event_forwarder_with_root_actor(
             )
             .await
             {
-                tracing::warn!(%session_id, %run_id, %error, "Root Started publication rejected");
-                interrupt_root_on_authority_loss(
+                let diagnostic_id = record_publication_rejection(
                     &error,
                     &session_id,
                     &run_id,
-                    &runners,
-                    &publication,
-                    &visible_messages,
-                    &cancel_token,
-                )
-                .await;
+                    Some(&frame),
+                    root_actor.as_ref(),
+                    "root_started_publication",
+                );
+                if error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+                {
+                    RootInterruption {
+                        session_id: &session_id,
+                        run_id: &run_id,
+                        runners: &runners,
+                        publication: &publication,
+                        visible: &visible_messages,
+                        cancel_token: &cancel_token,
+                    }
+                    .close(&diagnostic_id)
+                    .await;
+                }
                 return;
             }
             (publication, visible_messages, cancel_token)
@@ -807,17 +888,29 @@ pub fn create_event_forwarder_with_root_actor(
                 .await
             };
             if let Err(error) = result {
-                tracing::warn!(%session_id, %run_id, %error, "Root runtime publication rejected");
-                interrupt_root_on_authority_loss(
+                let diagnostic_id = record_publication_rejection(
                     &error,
                     &session_id,
                     &run_id,
-                    &runners,
-                    &publication,
-                    &visible_messages,
-                    &cancel_token,
-                )
-                .await;
+                    Some(&frame),
+                    root_actor.as_ref(),
+                    "root_runtime_publication",
+                );
+                if error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+                {
+                    RootInterruption {
+                        session_id: &session_id,
+                        run_id: &run_id,
+                        runners: &runners,
+                        publication: &publication,
+                        visible: &visible_messages,
+                        cancel_token: &cancel_token,
+                    }
+                    .close(&diagnostic_id)
+                    .await;
+                }
                 return;
             }
             if is_history_commit {
