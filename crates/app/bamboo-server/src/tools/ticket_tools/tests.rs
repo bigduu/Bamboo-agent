@@ -62,6 +62,41 @@ async fn invoke(tool: &TicketTool, args: Value, ctx: ToolCtx) -> (bool, Value) {
 }
 
 #[tokio::test]
+async fn cached_ticket_tools_do_not_own_or_recreate_a_dropped_application() {
+    let fixture = Fixture::new().await;
+    let tools: Vec<_> = NAMES.iter().map(|&name| fixture.tool(name)).collect();
+    let (ok, live) = invoke(&tools[0], json!({}), fixture.ctx()).await;
+    assert!(ok, "live canonical Supervisor authorizes the read: {live}");
+    let old_application = Arc::downgrade(&fixture.app);
+    let (before, old_writer) = {
+        let service = fixture.app.service().unwrap();
+        (service.published().unwrap().1, Arc::downgrade(&service))
+    };
+    let Fixture { _root: root, app, session } = fixture;
+    let writer_root = root.path().join("tickets")
+        .join(before.binding.scope_id.strip_prefix("supervisor/").unwrap());
+    let head = std::fs::read(writer_root.join("HEAD")).unwrap();
+    drop(app);
+    assert!(old_application.upgrade().is_none());
+    for tool in &tools {
+        let mut ctx = ToolCtx::none("retained-tool");
+        ctx.session_id = Some(Arc::from(session.id.as_str()));
+        ctx.executing_supervisor =
+            ExecutingSupervisorObservation::capture_from_executing_session(&session);
+        let (ok, unavailable) = invoke(tool, json!({}), ctx).await;
+        assert!(!ok, "cached {} must not recreate the Host", tool.name);
+        assert_eq!(unavailable["status_code"], 503, "{unavailable}");
+    }
+    assert_eq!(std::fs::read(writer_root.join("HEAD")).unwrap(), head);
+    let reopened = TicketService::open(&writer_root, before.binding.clone()).unwrap();
+    assert!(old_writer.upgrade().is_none());
+    let after = reopened.published().unwrap().1;
+    assert_eq!(after.authority_epoch, before.authority_epoch.checked_add(1).unwrap());
+    assert_eq!(canonical_bytes(&after.assignments).unwrap(), canonical_bytes(&before.assignments).unwrap());
+    assert_eq!(canonical_bytes(&after.intents).unwrap(), canonical_bytes(&before.intents).unwrap());
+}
+
+#[tokio::test]
 async fn ticket_tools_require_original_incarnation_and_ignore_no_json_authority() {
     let f = Fixture::new().await;
     let tool = f.tool("work_overview");
