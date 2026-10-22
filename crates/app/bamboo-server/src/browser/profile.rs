@@ -595,11 +595,11 @@ mod tests {
             .stdout(std::process::Stdio::piped())
             .kill_on_drop(true)
             .process_group(0);
-        let lifecycle = super::super::BrowserLifecycle::default();
+        let manager = super::super::BrowserManager::with_profile_root(root.clone());
         let session = super::super::BrowserSession::from_child_tracked(
             command.spawn().unwrap(),
             None,
-            &lifecycle,
+            &manager.lifecycle,
         )
         .unwrap();
         *session.profile_lease.lock().unwrap() = Some(lease);
@@ -619,6 +619,15 @@ mod tests {
         );
         assert!(!*session.cleanup.done.borrow());
         assert!(acquire_shared(&root).is_err());
+        // A manager must not wait on this deliberately unsettled cleanup
+        // notification after its bounded stop already reported failure.
+        manager
+            .sessions
+            .lock()
+            .await
+            .insert("synthetic-barrier-owner".into(), session.clone());
+        let shutdown =
+            tokio::time::timeout(std::time::Duration::from_millis(500), manager.shutdown()).await;
         drop(fault);
         session
             .terminate("synthetic directory barrier recovered")
@@ -628,6 +637,12 @@ mod tests {
             .load(std::sync::atomic::Ordering::Acquire));
         assert!(session.profile_lease.lock().unwrap().is_none());
         assert!(*session.cleanup.done.borrow());
+        // Drain the same owner on RED too, before reporting the timeout.
+        manager.shutdown().await;
+        assert!(
+            shutdown.is_ok(),
+            "shutdown waited forever for a failed directory barrier"
+        );
         assert!(acquire_shared(&root).is_ok());
     }
 
