@@ -372,9 +372,10 @@ impl SessionMessenger {
         .await
     }
 
-    /// Preserve the original executing caller before using the same peer
-    /// lifecycle/Project/Inbox writer as legacy delivery. An observation is
-    /// identity only; this never permits a different Root or widens authority.
+    /// Canonical compatibility send from the original executing caller. The
+    /// final Inbox retains a never-installed Host namespace plus the existing
+    /// peer lifecycle/Project authority. An installed/revoked scope refuses
+    /// this fallback; use the explicitly scoped sender for that namespace.
     pub async fn send_peer_observed(
         &self,
         caller: &SessionCallerReference,
@@ -531,7 +532,7 @@ impl SessionMessenger {
             id.to_string(),
             None,
         );
-        self.send_peer_envelope(envelope, &caller, &target, None, intent)
+        self.send_peer_envelope(envelope, &caller, &target, None, intent, original_caller)
             .await
     }
 
@@ -644,7 +645,7 @@ impl SessionMessenger {
             thread,
             Some(original.id.clone()),
         );
-        self.send_peer_envelope(envelope, &caller, &target, Some(&original), intent)
+        self.send_peer_envelope(envelope, &caller, &target, Some(&original), intent, None)
             .await
     }
 
@@ -802,6 +803,7 @@ impl SessionMessenger {
         target: &Session,
         reply_to: Option<&SessionMessageEnvelope>,
         intent: Option<SessionMessageDeliveryIntent>,
+        original_caller: Option<&SessionCallerReference>,
     ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         let started = Instant::now();
         let source = ActorSession::from_session(caller)
@@ -811,21 +813,29 @@ impl SessionMessenger {
         // These are the same births used for the stable message id. The inbox
         // must revalidate them under its retained lifecycle authority; a fresh
         // relationship read before generic delivery would still race rebirth.
-        let result = match intent {
-            Some(intent) => {
-                self.inbox
-                    .deliver_peer_message_with_intent(&envelope, &source, &target, reply_to, intent)
-                    .await
-            }
-            None => {
-                self.inbox
-                    .deliver_peer_message(&envelope, &source, &target, reply_to)
-                    .await
-                    .map(|delivery| bamboo_domain::SessionInboxDeliveryReceipt {
-                        delivery,
-                        // Preserve the historical peer activation contract.
-                        pending: true,
-                    })
+        let result = if let Some(original) = original_caller {
+            self.inbox
+                .deliver_unscoped_peer_message(original, &envelope, &source, &target, intent)
+                .await
+        } else {
+            match intent {
+                Some(intent) => {
+                    self.inbox
+                        .deliver_peer_message_with_intent(
+                            &envelope, &source, &target, reply_to, intent,
+                        )
+                        .await
+                }
+                None => {
+                    self.inbox
+                        .deliver_peer_message(&envelope, &source, &target, reply_to)
+                        .await
+                        .map(|delivery| bamboo_domain::SessionInboxDeliveryReceipt {
+                            delivery,
+                            // Preserve the historical peer activation contract.
+                            pending: true,
+                        })
+                }
             }
         };
         let delivery = match result {
@@ -1052,6 +1062,44 @@ impl SessionMessenger {
         operation_id: &str,
         message: &str,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        self.supervisor_followup_delivery(
+            supervisor,
+            target_session_id,
+            operation_id,
+            message,
+            None,
+        )
+        .await
+    }
+
+    /// Canonical sender fallback only. Its Inbox holds a real never-installed
+    /// namespace guard and the complete original caller through admission.
+    pub async fn supervisor_followup_observed(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        self.supervisor_followup_delivery(
+            supervisor,
+            target_session_id,
+            operation_id,
+            message,
+            Some(caller),
+        )
+        .await
+    }
+
+    async fn supervisor_followup_delivery(
+        &self,
+        supervisor: &SupervisorReference,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        original_caller: Option<&SessionCallerReference>,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
         bamboo_domain::validate_supervisor_target_id(target_session_id)
             .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
         SessionMessageId::parse(operation_id)
@@ -1083,15 +1131,23 @@ impl SessionMessenger {
             correlation_id: Some(operation_id.to_string()),
         };
         let started = Instant::now();
-        let delivery = self
-            .inbox
-            .deliver_supervisor_followup(supervisor, &envelope)
-            .await
-            .map_err(|error| {
-                let error = SessionMessengerError::Inbox(error);
-                self.record_rejection(&error);
-                error
-            })?;
+        let result = match original_caller {
+            Some(caller) => {
+                self.inbox
+                    .deliver_unscoped_supervisor_followup(caller, supervisor, &envelope)
+                    .await
+            }
+            None => {
+                self.inbox
+                    .deliver_supervisor_followup(supervisor, &envelope)
+                    .await
+            }
+        };
+        let delivery = result.map_err(|error| {
+            let error = SessionMessengerError::Inbox(error);
+            self.record_rejection(&error);
+            error
+        })?;
         let admission = self.record_admission(envelope, delivery, started);
         // Its specific-message RespectSpecificWait intent was published while
         // holding Supervisor authority. This grants no staged sibling prefix.

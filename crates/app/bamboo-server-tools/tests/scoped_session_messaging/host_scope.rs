@@ -15,6 +15,15 @@ async fn install(
     rights: &[HostSessionRight],
     revision: u64,
 ) -> HostSessionScopeToken {
+    let target_ancestors = if target.kind == bamboo_domain::SessionKind::Child {
+        assert_eq!(
+            target.parent_session_id.as_deref(),
+            Some(f.root.id.as_str())
+        );
+        vec![ancestor(&f.root)]
+    } else {
+        vec![]
+    };
     f.store
         .install_host_session_scope(
             revision - 1,
@@ -26,7 +35,8 @@ async fn install(
                 targets: BTreeMap::from([(
                     target.id.clone(),
                     HostSessionTargetScope {
-                        observation: HostScopeSessionObservation::capture(target, vec![]).unwrap(),
+                        observation: HostScopeSessionObservation::capture(target, target_ancestors)
+                            .unwrap(),
                         rights: rights.iter().copied().collect(),
                     },
                 )]),
@@ -46,10 +56,43 @@ fn ancestor(session: &Session) -> ActorAncestorObservation {
 }
 
 /// Existing adapters that do not implement the new port remain unsupported.
-struct LegacyOnlyInbox(Arc<FileSessionInbox>);
+struct LegacyOnlyInbox(
+    Arc<FileSessionInbox>,
+    Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+);
 
 #[async_trait]
 impl SessionInboxPort for LegacyOnlyInbox {
+    async fn deliver_unscoped_peer_message(
+        &self,
+        caller: &SessionCallerReference,
+        envelope: &bamboo_domain::SessionMessageEnvelope,
+        source: &bamboo_domain::ActorSession,
+        target: &bamboo_domain::ActorSession,
+        intent: Option<SessionMessageDeliveryIntent>,
+    ) -> Result<bamboo_domain::SessionInboxDeliveryReceipt, bamboo_domain::SessionInboxError> {
+        if let Some((entered, release)) = &self.1 {
+            entered.notify_one();
+            release.notified().await;
+        }
+        self.0
+            .deliver_unscoped_peer_message(caller, envelope, source, target, intent)
+            .await
+    }
+    async fn deliver_unscoped_supervisor_followup(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &SupervisorReference,
+        envelope: &bamboo_domain::SessionMessageEnvelope,
+    ) -> Result<bamboo_domain::SessionInboxReceipt, bamboo_domain::SessionInboxError> {
+        if let Some((entered, release)) = &self.1 {
+            entered.notify_one();
+            release.notified().await;
+        }
+        self.0
+            .deliver_unscoped_supervisor_followup(caller, supervisor, envelope)
+            .await
+    }
     async fn deliver(
         &self,
         envelope: &bamboo_domain::SessionMessageEnvelope,
@@ -109,7 +152,7 @@ async fn unsupported_host_inbox_never_retries_through_legacy_delivery() {
     .await;
     let messenger = Arc::new(SessionMessenger::new(
         f.store.clone(),
-        Arc::new(LegacyOnlyInbox(f.inbox.clone())),
+        Arc::new(LegacyOnlyInbox(f.inbox.clone(), None)),
         f.activation.clone(),
     ));
     let sender = CanonicalSessionSendAdapter::new(f.store.clone(), messenger);
@@ -198,6 +241,65 @@ async fn send_only_cross_root_works_for_root_child_and_supervisor_without_inspec
         .unwrap()
         .messages
         .is_empty());
+}
+
+#[tokio::test]
+async fn legacy_lookup_absence_cannot_survive_a_new_or_revoked_host_installation() {
+    for supervisor in [false, true] {
+        for revoke in [false, true] {
+            let f = Fixture::new().await;
+            let (caller, ancestors, target) = if supervisor {
+                let target = f.new_root("legacy-root-target").await;
+                (f.supervisor(&[&target.id]).await, vec![], target)
+            } else {
+                (f.sender.clone(), vec![ancestor(&f.root)], f.root.clone())
+            };
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let messenger = Arc::new(SessionMessenger::new(
+                f.store.clone(),
+                Arc::new(LegacyOnlyInbox(
+                    f.inbox.clone(),
+                    Some((entered.clone(), release.clone())),
+                )),
+                f.activation.clone(),
+            ));
+            let tool = SessionMessageTool::new(messenger.clone()).with_scoped_sender(Arc::new(
+                CanonicalSessionSendAdapter::new(f.store.clone(), messenger),
+            ));
+            let args = send(&target.id, "legacy-racing-operation", Some("trigger_turn"));
+            let ctx = Fixture::ctx(&caller);
+            let sending = tokio::spawn(async move { tool.invoke(args, ctx).await });
+            tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
+                .await
+                .unwrap();
+            install(
+                &f,
+                &caller,
+                ancestors,
+                &target,
+                &[HostSessionRight::InspectBoundedProgress],
+                1,
+            )
+            .await;
+            if revoke {
+                f.store
+                    .revoke_host_session_scope(&caller.id, 1)
+                    .await
+                    .unwrap();
+            }
+            release.notify_one();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(10), sending)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+            assert_eq!(f.inbox.inspect(&target.id).await.unwrap().generation, 0);
+            assert!(f.activation.requests.lock().await.is_empty());
+        }
+    }
 }
 
 #[tokio::test]

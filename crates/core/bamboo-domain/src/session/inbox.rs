@@ -1831,6 +1831,37 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// Canonical adapter compatibility only. The concrete writer must retain
+    /// proof that the caller's Host namespace is still never-installed through
+    /// physical admission, along with its original caller and existing peer
+    /// authority. A prior None lookup or one more preflight is insufficient.
+    async fn deliver_unscoped_peer_message(
+        &self,
+        _caller: &crate::SessionCallerReference,
+        _envelope: &SessionMessageEnvelope,
+        _source: &crate::ActorSession,
+        _target: &crate::ActorSession,
+        _intent: Option<SessionMessageDeliveryIntent>,
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "unscoped observed peer admission is unsupported".into(),
+        ))
+    }
+
+    /// The original Supervisor's existing attached followup authority, with
+    /// the same retained never-installed namespace and full caller fence.
+    /// This port preserves its existing RespectSpecificWait intent.
+    async fn deliver_unscoped_supervisor_followup(
+        &self,
+        _caller: &crate::SessionCallerReference,
+        _supervisor: &crate::SupervisorReference,
+        _envelope: &SessionMessageEnvelope,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "unscoped observed Supervisor admission is unsupported".into(),
+        ))
+    }
+
     /// Atomically admit a threaded peer input for one expected active run.
     /// Existing exact receipts replay without a new owner check or signal.
     /// A new delivery must retain the same runtime owner through the actual

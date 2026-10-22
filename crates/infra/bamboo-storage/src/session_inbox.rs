@@ -2551,6 +2551,75 @@ impl SessionInboxPort for FileSessionInbox {
         .await
     }
 
+    async fn deliver_unscoped_peer_message(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        envelope: &SessionMessageEnvelope,
+        source: &bamboo_domain::ActorSession,
+        target: &bamboo_domain::ActorSession,
+        intent: Option<SessionMessageDeliveryIntent>,
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
+        Self::validate_peer_route(envelope, source, target, None)?;
+        let authority = self
+            .sessions
+            .lock_unscoped_peer_delivery(caller, source, target)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        let mut receipt = self
+            .deliver_with_lifecycle_held_state(
+                envelope,
+                InboxAuthority::Unscoped { _guard: authority },
+                None,
+                Some(intent.map_or_else(
+                    || {
+                        SessionInboxActivationIntent::new(
+                            SessionActivationPolicy::InterruptSpecificWait,
+                        )
+                    },
+                    SessionInboxActivationIntent::with_delivery,
+                )),
+            )
+            .await?;
+        if intent.is_none() {
+            // The old omitted-intent API always requests legacy activation,
+            // including its exact retries. Explicit intents use real pending.
+            receipt.pending = true;
+        }
+        Ok(receipt)
+    }
+
+    async fn deliver_unscoped_supervisor_followup(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        supervisor: &bamboo_domain::SupervisorReference,
+        envelope: &SessionMessageEnvelope,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        if envelope.source
+            != (SessionMessageSource::Session {
+                session_id: supervisor.session_id.clone(),
+            })
+            || envelope.kind != bamboo_domain::SessionMessageKind::PeerMessage
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "Supervisor followup requires its original Session origin".into(),
+            ));
+        }
+        let authority = self
+            .sessions
+            .lock_unscoped_supervisor_delivery(caller, supervisor, &envelope.target_session_id)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        self.deliver_with_lifecycle_held(
+            envelope,
+            InboxAuthority::Unscoped { _guard: authority },
+            None,
+            Some(SessionInboxActivationIntent::new(
+                SessionActivationPolicy::RespectSpecificWait,
+            )),
+        )
+        .await
+    }
+
     async fn mark_activation_eligible(
         &self,
         target_session_id: &str,

@@ -151,7 +151,8 @@ impl ScopedSessionSendPort for CanonicalSessionSendAdapter {
                 return Err(ScopedSessionSendError::UnsupportedDeliveryIntent);
             }
             self.messenger
-                .supervisor_followup(
+                .supervisor_followup_observed(
+                    original,
                     &supervisor,
                     &request.target_session_id,
                     &request.operation_id,

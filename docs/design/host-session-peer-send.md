@@ -23,6 +23,18 @@ to legacy authority. The native permission evaluator, exact-owner approval
 replay, typed Once handling and Plan restrictions retain their existing paths.
 There is no additional evaluator or installation of actual user grants.
 
+A None lookup is only a routing hint. The compatibility Inbox ports retain
+an actual never-installed publication guard before acquiring the existing
+peer/Supervisor physical authority, then recheck the complete original caller
+under those locks. The same owned filesystem jobs carry both guards. An
+installation that wins before that final fence refuses the old route; one
+that arrives later waits for physical admission to finish. This uses the
+Registry map's owned read guard, plus an existing empty slot's publication
+guard, without allocating permanent caller slots for legacy traffic. It
+conservatively delays other callers' installations in this Store/issuer while
+that legacy physical work runs. The old non-Canonical APIs keep their existing
+contracts, and the new observed compatibility ports default to Unsupported.
+
 The default Domain Inbox implementation rejects the new port as unsupported.
 The concrete Store retains the current token's publication guard, then the
 existing lifecycle and Task shared gates, canonical depth/ID Session locks and
@@ -58,7 +70,7 @@ admission, not consumption, completion, additional authority or wait resolution.
 
 ## Source validation and remaining gates
 
-Eleven new Rust case sources cover SendOnly for all three roles across Projects,
+Fourteen new Rust case sources cover SendOnly for all three roles across Projects,
 installed-scope/no-fallback routing, distinct inspection rights, grant reissue
 and frozen arguments, default unsupported adapters, activation failure/ACK retry,
 canonical identity/Project/metadata/ancestors, forged raw envelopes, complete
@@ -67,6 +79,10 @@ parked physical Maildir job after runtime shutdown retaining publication plus
 all physical guards. Every fixture
 uses a fresh temporary directory; the nonzero-generation fixture only seeds
 synthetic future-producer bytes and is not a production reset writer.
+Additional deterministic Registry polls and a four-way paused legacy writer
+fixture cover absent/uncommitted slot publication, installation/revocation
+winning before admission, and the absence guard surviving a physical job's
+runtime shutdown without consuming permanent Registry caller capacity.
 
 Direct `rustfmt --check`, `git diff --check` and source inventory are the only
 checks run in this slice. **Compilation, Cargo, Clippy and all Rust tests are
@@ -74,7 +90,8 @@ UNRUN** while the parent holds the Rust execution window. Proposed affected
 test commands, to be run only after that window is granted:
 
 ```text
-cargo test --locked -p bamboo-storage host_scope
+cargo test --locked -p bamboo-storage host_session_scope
+cargo test --locked -p bamboo-storage session_inbox::host_scope_tests
 cargo test --locked -p bamboo-server-tools --test scoped_session_messaging
 cargo test --locked -p bamboo-engine session_messaging
 ```

@@ -22,12 +22,24 @@ struct ScopePublication {
     token: Option<HostSessionScopeToken>,
 }
 
+type ScopeSlots = BTreeMap<String, Arc<RwLock<ScopePublication>>>;
+
+/// A real publication read guard for legacy admission, never a serialized
+/// claim. Do not allocate a permanent caller slot for ordinary legacy traffic.
+/// The map read conservatively delays all installations in this issuer; an
+/// already-created empty slot also needs its publication guard for a Host
+/// writer that passed the map before this observation.
+pub(crate) struct HostSessionScopeAbsence {
+    _publication: Option<OwnedRwLockReadGuard<ScopePublication>>,
+    _slots: OwnedRwLockReadGuard<ScopeSlots>,
+}
+
 /// This instance is owned by one canonical SessionStore. Clones share the same
 /// issuer and fences. A newly constructed store has no installed grants.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HostSessionScopeRegistry {
     issuer: HostSessionScopeIssuer,
-    slots: Arc<RwLock<BTreeMap<String, Arc<RwLock<ScopePublication>>>>>,
+    slots: Arc<RwLock<ScopeSlots>>,
 }
 
 /// The final authority set retains this guard through owned physical work.
@@ -76,6 +88,30 @@ impl HostSessionScopePublication {
 impl HostSessionScopeRegistry {
     async fn slot(&self, id: &str) -> Option<Arc<RwLock<ScopePublication>>> {
         self.slots.read().await.get(id).cloned()
+    }
+
+    /// Acquire before lifecycle/Task/Session/tree locks and retain through
+    /// actual physical work. A lookup returning None is not this capability.
+    pub(crate) async fn retain_never_installed(
+        &self,
+        caller_id: &str,
+    ) -> io::Result<HostSessionScopeAbsence> {
+        let slots = self.slots.clone().read_owned().await;
+        let slot = slots.get(caller_id).cloned();
+        let publication = match slot {
+            Some(slot) => Some(slot.read_owned().await),
+            None => None,
+        };
+        if publication
+            .as_ref()
+            .is_some_and(|slot| slot.revision != 0 || slot.token.is_some())
+        {
+            return Err(denied("host_session_scope_legacy_namespace_changed"));
+        }
+        Ok(HostSessionScopeAbsence {
+            _publication: publication,
+            _slots: slots,
+        })
     }
 
     /// Publication is always acquired before lifecycle/Task/Session locks.

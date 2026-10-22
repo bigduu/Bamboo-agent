@@ -234,14 +234,29 @@ async fn raw_host_port_rejects_forged_source_thread_reply_kind_and_operation() {
 
 #[test]
 fn scoped_publication_and_all_physical_guards_survive_started_job_shutdown() {
+    for scoped in [false, true] {
+        physical_retention(scoped);
+    }
+}
+
+fn physical_retention(scoped: bool) {
     let f = Fixture::new();
     let (caller, target, token) = f.runtime.block_on(async {
-        let caller = Session::new("host-caller", "model");
-        f.store.save_session(&caller).await.unwrap();
         let mut target = f.store.load_session("target").await.unwrap().unwrap();
         target.set_project_id_meta("target-project");
         f.store.save_session(&target).await.unwrap();
-        let token = install(&f.store, &caller, vec![], &target, vec![]).await;
+        let mut caller = if scoped {
+            Session::new("host-caller", "model")
+        } else {
+            Session::new_child_of("legacy-caller", &target, "model", "short work")
+        };
+        caller.set_project_id_meta("target-project");
+        f.store.save_session(&caller).await.unwrap();
+        let token = if scoped {
+            Some(install(&f.store, &caller, vec![], &target, vec![]).await)
+        } else {
+            None
+        };
         (caller, target, token)
     });
     let original = SessionCallerReference::from(&caller);
@@ -252,20 +267,34 @@ fn scoped_publication_and_all_physical_guards_survive_started_job_shutdown() {
         .join("new")
         .join(format!("{:020}-{}.json", 1, wrapper.id.0));
     let job_token = token.clone();
+    let source_actor = bamboo_domain::ActorSession::from_session(&caller).unwrap();
+    let target_actor = bamboo_domain::ActorSession::from_session(&target).unwrap();
     let mut parked = Parked::start(
         f.inbox.clone(),
         "maildir_replace",
         path,
         move |inbox| async move {
-            inbox
-                .deliver_host_scoped_peer_message(
-                    &job_token,
-                    &original,
-                    &envelope,
-                    SessionMessageDeliveryIntent::QueueOnly,
-                )
-                .await
-                .map(|_| ())
+            match job_token {
+                Some(token) => inbox
+                    .deliver_host_scoped_peer_message(
+                        &token,
+                        &original,
+                        &envelope,
+                        SessionMessageDeliveryIntent::QueueOnly,
+                    )
+                    .await
+                    .map(|_| ()),
+                None => inbox
+                    .deliver_unscoped_peer_message(
+                        &original,
+                        &envelope,
+                        &source_actor,
+                        &target_actor,
+                        Some(SessionMessageDeliveryIntent::QueueOnly),
+                    )
+                    .await
+                    .map(|_| ()),
+            }
         },
     );
     parked.shutdown();
@@ -277,39 +306,72 @@ fn scoped_publication_and_all_physical_guards_survive_started_job_shutdown() {
     ));
     for id in [&caller.id, &target.id] {
         let hash = format!("{:x}.lock", Sha256::digest(id.as_bytes()));
-        for directory in [".session-write-locks", ".actor-tree-locks"] {
-            assert!(!probe(
-                &f.store.bamboo_home_dir().join(directory).join(&hash)
-            ));
-        }
+        assert!(!probe(
+            &f.store
+                .bamboo_home_dir()
+                .join(".session-write-locks")
+                .join(&hash)
+        ));
+    }
+    for root in std::collections::BTreeSet::from([&caller.root_session_id, &target.root_session_id])
+    {
+        let hash = format!("{:x}.lock", Sha256::digest(root.as_bytes()));
+        assert!(!probe(
+            &f.store
+                .bamboo_home_dir()
+                .join(".actor-tree-locks")
+                .join(hash)
+        ));
     }
     let store = f.store.clone();
     let caller_id = caller.id.clone();
+    let install_caller = caller.clone();
+    let install_target = target.clone();
     let revoke = f.runtime.spawn(async move {
-        store
-            .revoke_host_session_scope(&caller_id, 1)
-            .await
-            .unwrap()
+        if scoped {
+            store
+                .revoke_host_session_scope(&caller_id, 1)
+                .await
+                .unwrap()
+        } else {
+            install(
+                &store,
+                &install_caller,
+                vec![ancestor(&install_target)],
+                &install_target,
+                vec![],
+            )
+            .await;
+            1
+        }
     });
     let other = f.other_store.clone();
     let target_id = target.id.clone();
-    let mutation = f.runtime.spawn(async move {
-        let mut target = other.load_session(&target_id).await.unwrap().unwrap();
-        target.metadata_version += 1;
-        other.save_session(&target).await.unwrap();
+    let mutation = scoped.then(|| {
+        f.runtime.spawn(async move {
+            let mut target = other.load_session(&target_id).await.unwrap().unwrap();
+            target.metadata_version += 1;
+            other.save_session(&target).await.unwrap();
+        })
     });
     f.assert_waiting(&revoke);
-    f.assert_waiting(&mutation);
+    if let Some(mutation) = &mutation {
+        f.assert_waiting(mutation);
+    }
     parked.barrier.release();
-    assert_eq!(f.finish(revoke), 2);
-    f.finish(mutation);
-    assert!(f
-        .runtime
-        .block_on(
-            f.store
-                .find_host_session_scope(&SessionCallerReference::from(&caller))
-        )
-        .is_err());
+    assert_eq!(f.finish(revoke), if scoped { 2 } else { 1 });
+    if let Some(mutation) = mutation {
+        f.finish(mutation);
+    }
+    let current = f.runtime.block_on(
+        f.store
+            .find_host_session_scope(&SessionCallerReference::from(&caller)),
+    );
+    if scoped {
+        assert!(current.is_err());
+    } else {
+        assert!(current.unwrap().is_some());
+    }
     let backlog = f.runtime.block_on(f.other.inspect(&target.id)).unwrap();
     assert_eq!(backlog.generation, 1);
     assert_eq!(backlog.pending, 1);

@@ -138,3 +138,47 @@ async fn dropping_uncommitted_publication_or_wrong_caller_changes_no_scope() {
     let token = install(&registry, &caller, 1).await;
     assert!(registry.retain(&token, &observed).await.is_ok());
 }
+
+#[tokio::test]
+async fn absent_namespace_holds_publication_without_consuming_caller_slots() {
+    let registry = HostSessionScopeRegistry::default();
+    let held = registry
+        .retain_never_installed("legacy-caller")
+        .await
+        .unwrap();
+    assert!(registry.slots.read().await.is_empty());
+    let other = Session::new("another-caller", "model");
+    let publication = registry.begin_install(&other.id, 0);
+    tokio::pin!(publication);
+    assert!(
+        std::future::poll_fn(|cx| Poll::Ready(publication.as_mut().poll(cx).is_pending())).await
+    );
+    drop(held);
+    publication
+        .await
+        .unwrap()
+        .install(binding(&other, 1))
+        .unwrap();
+    assert_eq!(registry.slots.read().await.len(), 1);
+    assert!(registry.retain_never_installed(&other.id).await.is_err());
+    registry.revoke(&other.id, 1).await.unwrap();
+    assert!(registry.retain_never_installed(&other.id).await.is_err());
+}
+
+#[tokio::test]
+async fn uncommitted_slot_absence_retains_the_actual_slot_publication_guard() {
+    let registry = HostSessionScopeRegistry::default();
+    let caller = Session::new("legacy-caller", "model");
+    drop(registry.begin_install(&caller.id, 0).await.unwrap());
+    let existing = registry.slot(&caller.id).await.unwrap();
+    let held = registry.retain_never_installed(&caller.id).await.unwrap();
+    // This writer already selected the slot before the map read. Holding the
+    // map alone would not prevent it from publishing while admission runs.
+    let write = existing.write_owned();
+    tokio::pin!(write);
+    assert!(std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx).is_pending())).await);
+    drop(held);
+    drop(write.await);
+    install(&registry, &caller, 1).await;
+    assert!(registry.retain_never_installed(&caller.id).await.is_err());
+}
