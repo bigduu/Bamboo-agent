@@ -241,32 +241,34 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             &session,
             &execution_reservation,
             state.tools_for(crate::tools::ToolSurface::Root),
-        ).map(Some)
+        )
+        .map(Some)
     } else if crate::skill_runtime::ordinary_main(&session) {
-        state.workspace_handoffs.bind_legacy_execution(
-            &state.agent, &session, &execution_reservation,
-        ).map(|agent| Some((agent, state.tools_for(crate::tools::ToolSurface::Root))))
+        state
+            .workspace_handoffs
+            .bind_legacy_execution(&state.agent, &session, &execution_reservation)
+            .map(|agent| Some((agent, state.tools_for(crate::tools::ToolSurface::Root))))
     } else {
         Ok(None)
     };
     let native_binding = match binding {
-            Ok(binding) => binding,
-            Err(error) => {
-                execution_reservation.abandon().await;
-                super::fail_reserved_pending_startup(
-                    state,
-                    session_id,
-                    ready.startup_turn_id.as_deref(),
-                    &error.to_string(),
-                    ready.admission_reservation,
-                    ready.startup_guard,
-                )
-                .await;
-                return HttpResponse::ServiceUnavailable().json(serde_json::json!({
-                    "status": "rejected", "session_id": session_id,
-                    "error": crate::error::error_value(error.to_string())
-                }));
-            }
+        Ok(binding) => binding,
+        Err(error) => {
+            execution_reservation.abandon().await;
+            super::fail_reserved_pending_startup(
+                state,
+                session_id,
+                ready.startup_turn_id.as_deref(),
+                &error.to_string(),
+                ready.admission_reservation,
+                ready.startup_guard,
+            )
+            .await;
+            return HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "status": "rejected", "session_id": session_id,
+                "error": crate::error::error_value(error.to_string())
+            }));
+        }
     };
     let execution_persistence = execution_reservation.execution_persistence();
 

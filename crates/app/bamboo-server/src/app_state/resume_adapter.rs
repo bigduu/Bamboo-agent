@@ -130,7 +130,9 @@ impl ResumeExecutionPort for AppStateResumeRef {
         // Prepare the same execution-local Workspace bridge before response
         // publication or approved-tool replay can produce side effects.
         let workspace_agent = match self.0.workspace_handoffs.bind_legacy_execution(
-            &self.0.agent, &session, &execution_reservation,
+            &self.0.agent,
+            &session,
+            &execution_reservation,
         ) {
             Ok(agent) => agent,
             Err(error) => {
@@ -140,13 +142,15 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 return;
             }
         };
-        let execution_binding = Some((workspace_agent, self.0.tools_for(
-            if session.kind == bamboo_agent_core::SessionKind::Child {
-                crate::tools::ToolSurface::Child
-            } else {
-                crate::tools::ToolSurface::Root
-            },
-        )));
+        let execution_binding = Some((
+            workspace_agent,
+            self.0
+                .tools_for(if session.kind == bamboo_agent_core::SessionKind::Child {
+                    crate::tools::ToolSurface::Child
+                } else {
+                    crate::tools::ToolSurface::Root
+                }),
+        ));
 
         let config_snapshot = self.0.config.read().await.clone();
         let model = session.model.clone();
@@ -334,7 +338,8 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     // Resume has no per-request override channel; the
                     // config-level default (issue #221) still applies.
                     run_budget: None,
-                }.spawn_with_native_inputs(None, execution_binding);
+                }
+                .spawn_with_native_inputs(None, execution_binding);
                 return;
             }
             Some(id) => id,
@@ -675,7 +680,8 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 // Resume has no per-request override channel; the
                 // config-level default (issue #221) still applies.
                 run_budget: None,
-            }.spawn_with_native_inputs(None, execution_binding);
+            }
+            .spawn_with_native_inputs(None, execution_binding);
         });
     }
 }

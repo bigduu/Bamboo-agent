@@ -1181,7 +1181,9 @@ impl LegacyAfterRead {
         assert!(!ctx.bypass_permissions && !ctx.auto_approve_permissions);
         let state = self.probe.state.lock().unwrap().as_ref().unwrap().clone();
         *self.probe.retained_host.lock().unwrap() = Some(
-            state.workspace_handoffs.retain_legacy_execution(&self.probe.id)
+            state
+                .workspace_handoffs
+                .retain_legacy_execution(&self.probe.id),
         );
         let before = state
             .storage
@@ -1728,10 +1730,15 @@ async fn legacy_case(uncertain: bool) {
         // execution end closes it before router finalization, not at Arc Drop.
         assert!(probe.retained_host.lock().unwrap().is_some());
         probe.successor.store(true, Ordering::Release);
-        let (status, response) = http(&state, "/api/v1/chat", json!({
-            "session_id":id,"message":"Observe the committed workspace in a new turn",
-            "message_id":format!("legacy-successor-{}",uuid::Uuid::new_v4())
-        })).await;
+        let (status, response) = http(
+            &state,
+            "/api/v1/chat",
+            json!({
+                "session_id":id,"message":"Observe the committed workspace in a new turn",
+                "message_id":format!("legacy-successor-{}",uuid::Uuid::new_v4())
+            }),
+        )
+        .await;
         assert_eq!(status, StatusCode::CREATED, "{response}");
         let (status, response) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{response}");
@@ -1740,15 +1747,26 @@ async fn legacy_case(uncertain: bool) {
             while router.current_run_id(&id).await.is_some() {
                 tokio::task::yield_now().await;
             }
-        }).await.expect("successor Root must release before fixture cleanup");
-        assert!(probe.retained_host.lock().unwrap().is_some(), "hold the old Arc through successor");
+        })
+        .await
+        .expect("successor Root must release before fixture cleanup");
+        assert!(
+            probe.retained_host.lock().unwrap().is_some(),
+            "hold the old Arc through successor"
+        );
         assert_eq!(probe.trace.lock().unwrap().successor_requests, 1);
         let current = state.storage.load_session(&id).await.unwrap().unwrap();
         assert_eq!(current.workspace_path_meta().as_deref(), b.to_str());
         for call_id in [LEGACY_READ, LEGACY_TRIGGER, LEGACY_CWD] {
-            assert_eq!(current.messages.iter().filter(|message|
-                message.tool_call_id.as_deref() == Some(call_id)
-            ).count(), 1, "completed tools never replay in the successor");
+            assert_eq!(
+                current
+                    .messages
+                    .iter()
+                    .filter(|message| message.tool_call_id.as_deref() == Some(call_id))
+                    .count(),
+                1,
+                "completed tools never replay in the successor"
+            );
         }
     }
 }
