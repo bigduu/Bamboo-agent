@@ -411,7 +411,12 @@ mod live_disabled_tests {
         }
     }
 
-    fn offered(config: &AgentLoopConfig, tools: &TwoTools, session: &Session, name: &str) -> bool {
+    fn offered(
+        config: &AgentLoopConfig,
+        tools: &dyn ToolExecutor,
+        session: &Session,
+        name: &str,
+    ) -> bool {
         resolve_available_tool_schemas_for_session(config, tools, session)
             .iter()
             .any(|s| s.function.name == name)
