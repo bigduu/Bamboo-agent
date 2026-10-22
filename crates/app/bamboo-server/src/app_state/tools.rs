@@ -136,10 +136,9 @@ pub(super) fn build_base_tools(
         bamboo_server_tools::SessionMessageTool::new(session_messenger)
             .with_scoped_sender(scoped_sender),
     );
-    let with_messages: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        with_memory,
-        session_message_tool.clone(),
-    ));
+    // The shared factory installs this exact typed instance once, after the
+    // other Base overlays. A second message overlay would nest its single
+    // native permission-evaluation scope and consume/obscure the receipt.
 
     // `ledger` sits in the base layer (not root-only) so headless reminder
     // sessions fired by the schedule manager can read and transition the very
@@ -151,7 +150,7 @@ pub(super) fn build_base_tools(
             .with_project_store(project_store.clone()),
     );
     let with_ledger: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        with_messages,
+        with_memory,
         ledger_tool,
     ));
 
@@ -809,6 +808,18 @@ mod session_message_assembly_tests {
             (crate::tools::ToolSurface::WithTask, &child),
         ] {
             let tools = state.tools_for(surface);
+            for kind in bamboo_agent_core::tools::FrameworkSessionToolKind::ALL {
+                let proof = tools
+                    .framework_session_tool_for_exact(kind.execution_name())
+                    .unwrap();
+                assert_eq!(proof.kind(), kind);
+                assert!(Arc::ptr_eq(
+                    &proof.instance(),
+                    &tools
+                        .tool_instance_for_exact(kind.execution_name())
+                        .unwrap()
+                ));
+            }
             assert!(tools.owns_exact_tool("session_message"));
             assert_eq!(
                 tools.execution_contract_for_exact("session_message"),
@@ -958,6 +969,82 @@ mod session_message_assembly_tests {
             .unwrap()
             .messages
             .is_empty());
+        // The actual Base has one message overlay, so native Ask reaches the
+        // caller and a generation-bound Once is consumed by one evaluation.
+        config.set_enabled(true);
+        config.set_ask_rules(["session_control".into()]);
+        config.add_rule(PermissionRule::new(
+            PermissionType::ExecuteCommand,
+            "session_message send",
+            true,
+        ));
+        let mut once = call.clone();
+        once.id = "installed-once-send".into();
+        let mut args: serde_json::Value = serde_json::from_str(&once.function.arguments).unwrap();
+        args["operation_id"] = json!("installed-once-operation");
+        once.function.arguments = args.to_string();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut pending_ctx = ToolExecutionContext::none(&once.id);
+        pending_ctx.session_id = Some(&source.id);
+        pending_ctx.event_tx = Some(&tx);
+        let pending = tools
+            .execute_with_context(&once, pending_ctx)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&pending.result).unwrap();
+        let request: bamboo_tools::permission::PermissionRequest =
+            serde_json::from_value(payload["permission_request"].clone()).unwrap();
+        assert_eq!(request.tool_name, "session_message");
+        assert_eq!(request.resource, "session_message send");
+        assert_eq!(
+            state
+                .session_inbox
+                .inspect(&target.id)
+                .await
+                .unwrap()
+                .generation,
+            1
+        );
+        config
+            .grant_once_for_generation(
+                &source.id,
+                &once.id,
+                &request.request_generation,
+                PermissionType::ExecuteCommand,
+                request.resource.clone(),
+            )
+            .unwrap();
+        let mut replay = ToolExecutionContext::none(&once.id);
+        replay.session_id = Some(&source.id);
+        let receipt = bamboo_tools::permission::with_permission_replay_generation(
+            &source.id,
+            &once.id,
+            Some(&request.request_generation),
+            with_executing_session_caller(
+                Some(Arc::new(SessionCallerReference::from(&source))),
+                tools.execute_with_context(&once, replay),
+            ),
+        )
+        .await
+        .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&receipt.result).unwrap();
+        assert_eq!(receipt["admitted"], true);
+        assert_eq!(receipt["terminal"], "not_observed");
+        assert_eq!(
+            state
+                .session_inbox
+                .inspect(&target.id)
+                .await
+                .unwrap()
+                .generation,
+            2
+        );
+        assert!(!config.consume_once(
+            &source.id,
+            &once.id,
+            PermissionType::ExecuteCommand,
+            "session_message send"
+        ));
     }
 
     #[tokio::test]

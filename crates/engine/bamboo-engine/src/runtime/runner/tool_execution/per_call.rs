@@ -393,10 +393,14 @@ async fn execute_tool_call_only_with_execution_name_inner(
     let exact_owner_shadowed = reference != execution_name && ctx.tools.owns_exact_tool(reference);
     let session_kind =
         bamboo_agent_core::tools::FrameworkSessionToolKind::from_execution_name(execution_name);
+    let executing_child = ctx.executing_caller.as_ref().map_or_else(
+        // Missing root IDs are valid in retained ordinary Root history. They
+        // do not turn an explicit Standard tool embedding into a Child port.
+        || !ctx.root_session_id.is_empty() && ctx.root_session_id != ctx.session_id,
+        |caller| caller.kind == bamboo_domain::SessionKind::Child,
+    );
     let framework_unavailable = (execution_name == "spawn_session"
-        || ((ctx.root_orchestration_only
-            || executing_supervisor
-            || ctx.root_session_id != ctx.session_id)
+        || ((ctx.root_orchestration_only || executing_supervisor || executing_child)
             && session_kind.is_some()))
         && !ctx
             .tools
@@ -2176,6 +2180,8 @@ mod hook_tests {
         entered: Mutex<Vec<String>>,
         schemas: Vec<ToolSchema>,
         root_provenance: Option<bool>,
+        framework: Arc<crate::session_app::approval_replay::framework_fixture::FixtureTools>,
+        framework_proof: bool,
     }
 
     impl NameRecordingExecutor {
@@ -2184,6 +2190,11 @@ mod hook_tests {
                 entered: Mutex::new(Vec::new()),
                 schemas: schema_names.iter().copied().map(tool_schema).collect(),
                 root_provenance: Some(true),
+                framework:
+                    crate::session_app::approval_replay::framework_fixture::FixtureTools::new(
+                        schema_names,
+                    ),
+                framework_proof: true,
             }
         }
 
@@ -2218,6 +2229,21 @@ mod hook_tests {
         fn local_execution_contract(&self, name: &str) -> Option<&'static str> {
             (name == "spawn_session" && self.root_provenance == Some(true))
                 .then_some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+        }
+        fn local_tool_instance(
+            &self,
+            name: &str,
+        ) -> Option<Arc<dyn bamboo_agent_core::tools::Tool>> {
+            self.framework.local_tool_instance(name)
+        }
+        fn local_framework_session_tool(
+            &self,
+            name: &str,
+        ) -> Option<bamboo_agent_core::tools::HostFrameworkSessionTool> {
+            (self.framework_proof
+                && (name != "spawn_session" || self.root_provenance == Some(true)))
+            .then(|| self.framework.local_framework_session_tool(name))
+            .flatten()
         }
     }
 
@@ -5043,10 +5069,13 @@ mod hook_tests {
             CapabilityLoadingMode::LegacyFullCatalog,
             &[],
         );
-        for provenance in [None, Some(false)] {
+        for provenance in [None, Some(false), Some(true)] {
             for ultra in [false, true] {
                 let mut probe = NameRecordingExecutor::new(&["spawn_session", "SubAgent"]);
                 probe.root_provenance = provenance;
+                // Even an exact owner repeating the Root contract string
+                // cannot supply the missing concrete Host instance proof.
+                probe.framework_proof = false;
                 let concrete = Arc::new(probe);
                 let tools: Arc<dyn ToolExecutor> = concrete.clone();
                 let call = probe_call("spawn_session");
@@ -5171,6 +5200,59 @@ mod hook_tests {
                     }
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_standard_root_with_empty_root_id_keeps_explicit_nonframework_embedding() {
+        let names = [
+            "session_history",
+            "session_history_current",
+            "session_message",
+        ];
+        let callable =
+            effective_callable_set(&names, CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        for original_caller in [false, true] {
+            let mut session = Session::new("legacy-standard-root", "model");
+            session.session_version = None;
+            session.root_session_id.clear();
+            let caller = bamboo_domain::SessionCallerReference::from(&session);
+            let mut concrete = NameRecordingExecutor::new(&names);
+            concrete.framework_proof = false;
+            let concrete = Arc::new(concrete);
+            let tools: Arc<dyn ToolExecutor> = concrete.clone();
+            for name in names {
+                let call = probe_call(name);
+                let (tx, _rx) = mpsc::channel(64);
+                let outcome = execute_model_requested_tool_call_only(
+                    &callable,
+                    ToolExecutionOnlyContext {
+                        session_behavior_version: None,
+                        vision_support: true,
+                        output_cap: None,
+                        executing_caller: original_caller.then_some(&caller),
+                        executing_supervisor: None,
+                        tool_call: &call,
+                        event_tx: &tx,
+                        metrics_collector: None,
+                        session_id: &session.id,
+                        root_session_id: &session.root_session_id,
+                        root_orchestration_only: false,
+                        round_id: "legacy-empty-root",
+                        round: 0,
+                        tools: &tools,
+                        config: &AgentLoopConfig::default(),
+                        hook_session: None,
+                        hook_runtime_state: None,
+                        session_flags: ToolExecutionSessionFlags::from_session(&session),
+                        available_tool_schemas: &[],
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(outcome.result.is_ok(), "{original_caller}/{name}");
+            }
+            assert_eq!(concrete.entered(), names);
         }
     }
 

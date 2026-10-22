@@ -49,11 +49,17 @@ impl LocalChildTools {
         for denied in denied {
             // Resolve against all exact identities before applying restrictions:
             // an unavailable exact foreign::Read must never fall through to Read.
-            if let Some(name) = bamboo_domain::resolve_session_tool_reference(
-                session.session_version,
-                &denied,
-                |name| name == "SubAgent" || inner.owns_exact_tool(name),
-            ) {
+            let contains = |name: &str| name == "SubAgent" || inner.owns_exact_tool(name);
+            let resolved = if bamboo_domain::independent_root_spawn_reference(&denied) {
+                bamboo_domain::resolve_session_tool_reference(
+                    session.session_version,
+                    &denied,
+                    contains,
+                )
+            } else {
+                bamboo_domain::resolve_disabled_tool_reference_name(&denied, contains)
+            };
+            if let Some(name) = resolved {
                 subagent_denied |= name == "SubAgent";
                 disabled_names.insert(name.clone());
                 allowed.remove(&name);
@@ -98,6 +104,10 @@ impl LocalChildTools {
                     inner
                         .framework_session_tool_for_exact(kind.execution_name())
                         .filter(|proof| proof.kind() == kind && proof.is_current())
+                        // Keep every outer native permission restriction in the
+                        // current Host chain. The concrete instance remains the
+                        // same; its original factory chain is not a bypass.
+                        .and_then(|proof| proof.rebind(inner.clone()).ok())
                         .map(|proof| (kind.execution_name().to_owned(), proof))
                 })
                 .collect()
@@ -496,6 +506,8 @@ impl ToolExecutor for LocalChildTools {
 
 #[cfg(test)]
 mod tests {
+    mod framework_session;
+
     use super::*;
     use bamboo_agent_core::tools::{FunctionCall, ToolCtx};
     use bamboo_domain::{ActorActivationClaim, ActorDirectoryPort};

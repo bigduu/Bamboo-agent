@@ -1987,6 +1987,26 @@ mod tests {
                 tools.owns_exact_tool("session_history")
                     && tools.owns_exact_tool("session_history_current")
             );
+            for kind in [
+                bamboo_agent_core::tools::FrameworkSessionToolKind::History,
+                bamboo_agent_core::tools::FrameworkSessionToolKind::CurrentHistory,
+                bamboo_agent_core::tools::FrameworkSessionToolKind::SpawnRoot,
+            ] {
+                let proof = tools
+                    .framework_session_tool_for_exact(kind.execution_name())
+                    .unwrap();
+                assert_eq!(proof.kind(), kind);
+                assert!(Arc::ptr_eq(
+                    &proof.instance(),
+                    &tools
+                        .tool_instance_for_exact(kind.execution_name())
+                        .unwrap()
+                ));
+            }
+            // No configured coherent delivery port means no synthetic send.
+            assert!(tools
+                .framework_session_tool_for_exact("session_message")
+                .is_none());
             let mut caller = Session::new("sdk-default-root-caller", "model");
             caller.session_version = None;
             agent.storage().save_session(&caller).await.unwrap();
@@ -2032,6 +2052,13 @@ mod tests {
             let agent = builder.build().unwrap();
             assert!(agent.inner.default_tools().list_tools().is_empty());
             assert!(!agent.inner.default_tools().owns_exact_tool("spawn_session"));
+            assert!(bamboo_agent_core::tools::FrameworkSessionToolKind::ALL
+                .into_iter()
+                .all(|kind| agent
+                    .inner
+                    .default_tools()
+                    .framework_session_tool_for_exact(kind.execution_name())
+                    .is_none()));
             assert_eq!(port.0.load(Ordering::SeqCst), 0);
         }
     }
