@@ -456,6 +456,39 @@ async fn authorized_surface_schema_bounds_and_action_fields_match_execution() {
     }
 }
 
+#[tokio::test]
+async fn authorized_discovery_fields_survive_actual_provider_schema_normalization() {
+    let fixture = Fixture::new(false).await;
+    let schema = fixture.authorized_tool().parameters_schema();
+    let normalized =
+        bamboo_llm::providers::common::tool_schema::sanitize_openai_function_parameters_schema(
+            &schema,
+        );
+    assert_eq!(normalized["type"], "object");
+    assert_eq!(normalized["properties"], schema["properties"]);
+    assert_eq!(normalized["required"], json!(["action"]));
+    assert_eq!(
+        normalized["properties"]["action"]["enum"],
+        json!(["list", "inspect"])
+    );
+    for field in [
+        "action",
+        "query",
+        "limit",
+        "cursor",
+        "session_id",
+        "max_chars",
+    ] {
+        assert!(
+            normalized["properties"].get(field).is_some(),
+            "lost provider field: {field}"
+        );
+    }
+    assert_eq!(normalized["properties"]["limit"]["maximum"], 20);
+    assert_eq!(normalized["properties"]["max_chars"]["maximum"], 8000);
+    assert!(normalized.get("oneOf").is_none());
+}
+
 struct DeniedHostAdapter;
 
 #[async_trait]

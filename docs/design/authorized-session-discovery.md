@@ -93,11 +93,14 @@ state writer here.
 
 ## Validation status
 
-`tests/session_discovery.rs` adds eight synthetic persistence/tool cases for
+`tests/session_discovery.rs` adds nine synthetic persistence/tool cases for
 pagination/filter/restart, stale cursor/scope, caller forgery/replacement,
 target Project/birth/revoke, corrupt authority, Unicode/hidden-content bounds,
-schema/execution request constraints and ordinary-adapter denial with no global
-fallback. The existing scoped-history mode/restart case now expects authorized
+schema/execution request constraints, actual provider schema normalization and
+ordinary-adapter denial with no global fallback. Provider-visible parameters
+retain top-level `type`, `properties` and `required` because OpenAI transports
+strip top-level `oneOf`; the complete schema and execution still reject mixed
+action fields. The existing scoped-history mode/restart case now expects authorized
 directory access. Fixtures use temporary Session stores and no provider.
 
 The initial source freeze has only direct `rustfmt` parsing/format checks,

@@ -138,7 +138,20 @@ impl Tool for SessionInspectorTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         if self.access == SessionHistoryAccess::Authorized {
+            // OpenAI transports strip top-level combinators. Keep every
+            // usable field at the top; execution enforces action fields too.
             return json!({
+                "type":"object",
+                "properties": {
+                    "action":{"type":"string","enum":["list","inspect"]},
+                    "query":{"type":"string","maxLength":128,"description":"Target ID or Project filter for list."},
+                    "limit":{"type":"integer","minimum":1,"maximum":20},
+                    "cursor":{"type":"string","maxLength":4096},
+                    "session_id":{"type":"string","minLength":1,"maxLength":256},
+                    "max_chars":{"type":"integer","minimum":1,"maximum":8000}
+                },
+                "required":["action"],
+                "additionalProperties":false,
                 "oneOf": [
                     {
                         "type":"object",
