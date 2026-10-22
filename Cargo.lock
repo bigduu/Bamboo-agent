@@ -1059,7 +1059,7 @@ dependencies = [
  "dashmap",
  "libc",
  "opentelemetry 0.33.1",
- "opentelemetry-http",
+ "opentelemetry-http 0.33.1",
  "opentelemetry-otlp",
  "opentelemetry_sdk 0.33.1",
  "reqwest",
@@ -4886,6 +4886,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "opentelemetry-http"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "302249bd8ee804789faaa7b5b2cbf79bc61cb864714079c644e3828af5b7e811"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http 1.5.0",
+ "opentelemetry 0.33.1",
+]
+
+[[package]]
 name = "opentelemetry-otlp"
 version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4893,7 +4905,7 @@ checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
 dependencies = [
  "http 1.5.0",
  "opentelemetry 0.32.0",
- "opentelemetry-http",
+ "opentelemetry-http 0.32.0",
  "opentelemetry-proto",
  "opentelemetry_sdk 0.32.1",
  "prost",
