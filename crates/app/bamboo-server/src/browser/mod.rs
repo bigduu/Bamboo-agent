@@ -14,6 +14,8 @@ mod retirement_tests;
 mod shutdown_tests;
 #[cfg(test)]
 mod terminal_entry_tests;
+#[cfg(all(test, unix))]
+mod writer_lifecycle_tests;
 
 #[cfg(test)]
 pub(crate) fn test_profile_directory(root: &std::path::Path, session_id: &str) -> PathBuf {
