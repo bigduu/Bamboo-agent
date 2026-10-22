@@ -106,10 +106,14 @@ pub async fn handler(
                 "[{}] Events -> ONE-SHOT terminal stream (closing immediately); the client will treat this as a finished run",
                 session_id,
             );
+            let diagnostic =
+                super::super::llm_diagnostics::persisted(state.get_ref(), &session_id).await;
             return terminal_response(
                 budget_event_to_replay,
                 critical_events_to_replay,
                 terminal_event,
+                session_id,
+                diagnostic,
             );
         }
     }
