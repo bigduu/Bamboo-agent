@@ -555,6 +555,40 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn a_clean_physical_exit_keeps_its_lease_until_the_directory_barrier_recovers() {
+        struct ClearFault;
+        impl Drop for ClearFault {
+            fn drop(&mut self) { DIRECTORY_SYNC_FAILURE.with(|fault| *fault.borrow_mut() = None); }
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profiles");
+        let lease = acquire_shared(&root).unwrap();
+        let path = lease.path.clone();
+        let mut command = tokio::process::Command::new("/bin/cat");
+        command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .kill_on_drop(true).process_group(0);
+        let lifecycle = super::super::BrowserLifecycle::default();
+        let session = super::super::BrowserSession::from_child_tracked(command.spawn().unwrap(), None, &lifecycle).unwrap();
+        *session.profile_lease.lock().unwrap() = Some(lease);
+        session.begin_retirement("synthetic directory barrier").unwrap();
+        let fault = ClearFault;
+        DIRECTORY_SYNC_FAILURE.with(|target| *target.borrow_mut() = Some(path));
+        session.terminate("synthetic directory barrier").await;
+        assert!(session.reaped.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!session.close_confirmed.load(std::sync::atomic::Ordering::Acquire));
+        assert!(session.profile_lease.lock().unwrap().is_some(), "unlink without its directory barrier released the lease");
+        assert!(!*session.cleanup.done.borrow());
+        assert!(acquire_shared(&root).is_err());
+        drop(fault);
+        session.terminate("synthetic directory barrier recovered").await;
+        assert!(session.close_confirmed.load(std::sync::atomic::Ordering::Acquire));
+        assert!(session.profile_lease.lock().unwrap().is_none());
+        assert!(*session.cleanup.done.borrow());
+        assert!(acquire_shared(&root).is_ok());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn profile_creation_and_reuse_require_the_parent_directory_barrier() {
         struct ClearFault;

@@ -202,6 +202,108 @@ fn cancelled_startup_is_owned_and_shutdown_cannot_admit_another_writer() {
     });
 }
 
+#[test]
+fn pending_scope_close_joins_a_global_drain_without_killing_the_checkpoint() {
+    in_isolated_process("pending_scope_close_joins_a_global_drain_without_killing_the_checkpoint", |home| {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let root = home.join("profiles");
+            let manager = BrowserManager::with_profile_root(root);
+            manager.open("canonical-chat").await.unwrap();
+            let core = manager.shared.test_core().await.unwrap();
+            std::fs::write(home.join("delay-scope-close"), b"synthetic close gate").unwrap();
+            let owned = manager.clone();
+            let closing = tokio::spawn(async move { owned.close("canonical-chat").await });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !home.join("scope-close-started").exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
+            }).await.unwrap();
+            let reset = manager.reset_profiles().await.unwrap();
+            closing.await.unwrap().unwrap();
+            assert!(core.child.lock().unwrap().try_wait().unwrap().unwrap().success());
+            assert!(!core.kill_issued.load(Ordering::Acquire));
+            assert!(core.close_confirmed.load(Ordering::Acquire));
+            assert!(core.profile_lease.lock().unwrap().is_none());
+            assert!(!core.cleanup.is_quarantined());
+            assert!(!manager.lifecycle.unconfirmed_writers.load(Ordering::Acquire));
+            let launches = std::fs::read_to_string(home.join("launches")).unwrap();
+            assert!(PathBuf::from(launches.lines().next().unwrap()).join("drain-checkpoint").is_file());
+            drop(reset);
+            manager.shutdown().await;
+        });
+    });
+}
+
+#[test]
+fn a_scoped_mutation_waiting_for_stdin_cannot_run_after_its_chat_is_retired() {
+    in_isolated_process("a_scoped_mutation_waiting_for_stdin_cannot_run_after_its_chat_is_retired", |home| {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let manager = BrowserManager::with_profile_root(home.join("profiles"));
+            manager.open("canonical-chat-a").await.unwrap();
+            manager.open("canonical-chat-b").await.unwrap();
+            let core = manager.shared.test_core().await.unwrap();
+            let chat = manager.shared.test_chat("canonical-chat-a").unwrap();
+            let pipe = core.stdin.lock().await;
+            let mut queued = Box::pin(manager.command("canonical-chat-a", "synthetic_mutation_marker", json!({})));
+            assert!(futures::poll!(queued.as_mut()).is_pending());
+            let owned = manager.clone();
+            let closing = tokio::spawn(async move { owned.close("canonical-chat-a").await });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let mut state = Box::pin(chat.call("state", json!({}), BROWSER_COMMAND_DEADLINE));
+                    if matches!(futures::poll!(state.as_mut()), std::task::Poll::Ready(Err(BrowserError::NotOpen))) { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            drop(pipe);
+            let (mutation, closed) = tokio::join!(queued, closing);
+            assert!(matches!(mutation, Err(BrowserError::NotOpen)));
+            closed.unwrap().unwrap();
+            assert!(!home.join("queued-side-effect").exists(), "retired queued action reached the native host");
+            assert_eq!(manager.state("canonical-chat-b").await.unwrap()["profile_mode"], "shared");
+            assert_eq!(std::fs::read_to_string(home.join("launches")).unwrap().lines().count(), 1);
+            manager.close("canonical-chat-b").await.unwrap();
+            manager.shutdown().await;
+        });
+    });
+}
+
+#[test]
+fn ordinary_backpressure_is_nonfatal_and_scope_cleanup_keeps_reserved_admission() {
+    in_isolated_process("ordinary_backpressure_is_nonfatal_and_scope_cleanup_keeps_reserved_admission", |home| {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let manager = BrowserManager::with_profile_root(home.join("profiles"));
+            manager.open("canonical-chat-a").await.unwrap();
+            manager.open("canonical-chat-b").await.unwrap();
+            let core = manager.shared.test_core().await.unwrap();
+            std::fs::write(home.join("hold-state"), b"synthetic read gate").unwrap();
+            let readers: Vec<_> = (0..48).map(|_| {
+                let owned = manager.clone();
+                tokio::spawn(async move { owned.state("canonical-chat-a").await })
+            }).collect();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while std::fs::read_to_string(home.join("held-reads")).unwrap_or_default().lines().count() < 48 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.unwrap();
+            let refusal = tokio::time::timeout(Duration::from_millis(200), manager.state("canonical-chat-b")).await;
+            let nonfatal = !core.kill_issued.load(Ordering::Acquire)
+                && !manager.lifecycle.unconfirmed_writers.load(Ordering::Acquire);
+            // Scope close must enter despite every ordinary slot being held.
+            manager.close("canonical-chat-a").await.unwrap();
+            for reader in readers { assert!(reader.await.unwrap().is_err()); }
+            std::fs::remove_file(home.join("hold-state")).unwrap();
+            let sibling = manager.state("canonical-chat-b").await;
+            manager.close("canonical-chat-b").await.unwrap();
+            manager.shutdown().await;
+            assert!(matches!(refusal, Ok(Err(ref error)) if error.to_string() == "browser runtime busy"));
+            assert!(nonfatal);
+            assert_eq!(sibling.unwrap()["profile_mode"], "shared");
+            assert!(!core.kill_issued.load(Ordering::Acquire));
+            assert!(!core.cleanup.is_quarantined());
+            assert_eq!(std::fs::read_to_string(home.join("launches")).unwrap().lines().count(), 1);
+        });
+    });
+}
+
 const SYNTHETIC_HOST: &str = r#"import json, os, pathlib, sys, threading, time
 profile = pathlib.Path(os.environ['BAMBOO_BROWSER_PROFILE_DIR'])
 home = pathlib.Path(__file__).parent
@@ -210,9 +312,14 @@ with (home / 'launches').open('a') as output:
 (profile / 'synthetic-account-marker').write_text('synthetic data only')
 generation = 'a' * 24
 scopes = {}
+held = []
 output_lock = threading.Lock()
-def emit(request, result):
-    reply = {'id': request['id'], 'ok': True, 'result': result}
+def emit(request, result, error_code=None):
+    reply = {'id': request['id'], 'ok': error_code is None}
+    if error_code is None:
+        reply['result'] = result
+    else:
+        reply.update(code=error_code, error='synthetic scope closed')
     if request.get('version') == 2:
         reply.update(version=2, host_generation=generation)
         if 'scope_id' in request:
@@ -230,6 +337,16 @@ for line in sys.stdin:
     action = request['action']
     owner = request.get('scope_id', 'legacy')
     v2 = request.get('version') == 2
+    if action == 'state' and (home / 'hold-state').exists():
+        held.append(request)
+        with (home / 'held-reads').open('a') as output:
+            output.write('synthetic read held\n')
+        continue
+    if action == 'synthetic_mutation_marker':
+        (home / 'queued-side-effect').write_text('synthetic native side effect')
+    if action == 'scope_close' and (home / 'delay-scope-close').exists():
+        (home / 'scope-close-started').write_text('synthetic close barrier only')
+        continue
     if action == 'synthetic_wrong_owner':
         wrong = dict(request, scope_id='f' * 24)
         emit(wrong, {'done': True})
@@ -253,4 +370,12 @@ for line in sys.stdin:
         result = {'page_epoch': 1, 'tabs': [], 'active_tab_id': None,
                   'profile_mode': mode, 'storage_shared': mode == 'shared'}
     emit(request, result)
+    if action == 'scope_close':
+        for prior in held:
+            if prior.get('scope_id') == owner:
+                emit(prior, None, 'browser_scope_closed')
+        held = [prior for prior in held if prior.get('scope_id') != owner]
+if (home / 'delay-scope-close').exists():
+    time.sleep(0.15)
+    (profile / 'drain-checkpoint').write_text('synthetic physical EOF checkpoint')
 "#;
