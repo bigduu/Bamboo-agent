@@ -165,6 +165,44 @@ async fn local_task_resources_windows_foreground_cancel_reaps_descendants() {
     assert!(!directory.path().join("late").exists());
 }
 
+fn background_launch_observations(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|line| {
+            line.as_str() == "fixture-bash-entered" || line.starts_with("fixture-powershell-")
+        })
+        .take(4)
+        .map(|line| line.chars().take(640).collect())
+        .collect()
+}
+
+// Observe the gap before the first PowerShell marker without selecting a new
+// executable or gating its invocation on a successful lookup. Only Git Bash
+// receives Bash syntax; the existing cmd fallback keeps its original command.
+fn observed_background_command(native_command: &str, shell_arg: &str) -> String {
+    if shell_arg != "-lc" {
+        return native_command.to_owned();
+    }
+    // The command substitution may add a short-lived, still Job-owned Bash
+    // process. These are new diagnostic inputs, not a same-command replay.
+    // type -P observes a PATH candidate, not the eventual image identity.
+    // Diagnostics are best effort; the unchanged native command remains last,
+    // so no trailing printf or lookup status replaces its natural exit status.
+    format!(
+        concat!(
+            "builtin printf '%s\\n' 'fixture-bash-entered' || :; ",
+            "builtin printf '%s\\n' 'fixture-powershell-resolve-start' || :; ",
+            "if fixture_powershell=$(builtin type -P powershell.exe 2>/dev/null); then ",
+            "builtin printf 'fixture-powershell-resolved:%.512s\\n' \"$fixture_powershell\" || :; ",
+            "else fixture_lookup_status=$?; ",
+            "builtin printf 'fixture-powershell-unresolved:%s\\n' \"$fixture_lookup_status\" || :; fi; ",
+            "builtin printf '%s\\n' 'fixture-powershell-invoke' || :; ",
+            "{}"
+        ),
+        native_command
+    )
+}
+
 #[tokio::test]
 async fn local_task_resources_windows_background_scope_drain() {
     use crate::tools::bash_runtime;
@@ -172,7 +210,10 @@ async fn local_task_resources_windows_background_scope_drain() {
     let directory = tempfile::tempdir().unwrap();
     let scope = resources("background");
     let script = encoded(&tree_script_with_trace(directory.path(), false, true));
-    let command = format!("powershell.exe -NoProfile -NonInteractive -EncodedCommand {script}");
+    let native_command =
+        format!("powershell.exe -NoProfile -NonInteractive -EncodedCommand {script}");
+    let selected = bamboo_infrastructure::process::preferred_bash_shell();
+    let command = observed_background_command(&native_command, selected.arg);
     let shell = scope
         .scope(bash_runtime::spawn_background(
             &command,
@@ -217,6 +258,7 @@ async fn local_task_resources_windows_background_scope_drain() {
             let cleanup =
                 tokio::time::timeout(Duration::from_secs(10), scope.close_and_drain()).await;
             let (lines, _, _) = shell.read_output_since(0, None).await;
+            let launch = background_launch_observations(&lines);
             let mut tail = lines.iter().rev().take(16).collect::<Vec<_>>();
             tail.reverse();
             let tail = tail
@@ -230,21 +272,23 @@ async fn local_task_resources_windows_background_scope_drain() {
             // This branch always fails, even if cleanup succeeds. Status and
             // fixture PIDs are evidence, not process ownership or acceptance.
             panic!(
-                "background readiness failed: {reason}; phases={phases:?}; shell={selected:?}; env_source={}; before_status={before_status}; before_exit={before_exit:?}; owned_cleanup={cleanup:?}; after_status={}; after_exit={:?}; command_utf16_units={}; captured_tail={tail:?}",
+                "background readiness failed: {reason}; phases={phases:?}; launch={launch:?}; shell={selected:?}; env_source={}; before_status={before_status}; before_exit={before_exit:?}; owned_cleanup={cleanup:?}; after_status={}; after_exit={:?}; command_utf16_units={}; native_command_utf16_units={}; captured_tail={tail:?}",
                 shell.environment.source.as_str(),
                 shell.status(),
                 shell.exit_code().await,
                 command.encode_utf16().count(),
+                native_command.encode_utf16().count(),
             );
         }
     };
     eprintln!(
-        "background readiness observed: leader_marker={}; spawn_marker={}; descendant_marker={}; shell={:?}; command_utf16_units={}",
+        "background readiness observed: leader_marker={}; spawn_marker={}; descendant_marker={}; shell={:?}; command_utf16_units={}; native_command_utf16_units={}",
         directory.path().join("leader-started").is_file(),
         directory.path().join("spawn-returned").is_file(),
         directory.path().join("descendant-started").is_file(),
         bamboo_infrastructure::process::preferred_bash_shell(),
         command.encode_utf16().count(),
+        native_command.encode_utf16().count(),
     );
     let (receipt, ()) = tokio::join!(scope.close_and_drain(), actually_stopped(descendant));
     receipt.unwrap();
@@ -252,6 +296,10 @@ async fn local_task_resources_windows_background_scope_drain() {
     assert!(shell.exit_code().await.is_some());
     assert!(bash_runtime::get_shell(&shell.id).is_none());
     let (output, _, _) = shell.read_output_since(0, None).await;
+    eprintln!(
+        "background launch observations: {:?}",
+        background_launch_observations(&output)
+    );
     // Readout is stable after all completion/pump tasks have joined.
     assert_eq!(output, shell.read_output_since(0, None).await.0);
     assert!(!directory.path().join("late").exists());
