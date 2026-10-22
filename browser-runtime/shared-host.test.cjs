@@ -1,0 +1,125 @@
+'use strict';
+const assert = require('node:assert/strict');
+const { test } = require('node:test');
+const { spawn } = require('node:child_process');
+const { once } = require('node:events');
+const { randomBytes, createHash } = require('node:crypto');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const readline = require('node:readline');
+const http = require('node:http');
+
+async function fixture(t) {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-multi-chat-host-')));
+  const profile = path.join(root, createHash('sha256').update('synthetic-shared-account').digest('hex'));
+  const home = path.join(root, 'home');
+  fs.mkdirSync(profile, { mode: 0o700 }); fs.mkdirSync(home, { mode: 0o700 });
+  const server = http.createServer((request, response) => {
+    if (request.url === '/slow') { setTimeout(() => response.end('<title>Slow A</title>'), 350); return; }
+    response.setHeader('content-type', 'text/html');
+    response.end('<!doctype html><title>Synthetic shared</title><button onclick="alert(\'A only\')">Dialog</button>');
+  });
+  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const child = spawn(process.execPath, [path.join(__dirname, 'host.cjs')], {
+    env: { PATH: process.env.PATH, NODE_PATH: process.env.NODE_PATH || '', HOME: home,
+      TMPDIR: root, TEMP: root, TMP: root, BAMBOO_BROWSER_DOWNLOAD_ROOT: root,
+      BAMBOO_BROWSER_PROFILE_DIR: profile, BAMBOO_BROWSER_HOST_PROTOCOL: '2',
+      ...(process.env.BAMBOO_BROWSER_EXECUTABLE ? { BAMBOO_BROWSER_EXECUTABLE: process.env.BAMBOO_BROWSER_EXECUTABLE } : {}),
+      ...(process.env.PLAYWRIGHT_BROWSERS_PATH ? { PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH } : {}),
+    }, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const pending = new Map(); const events = []; let next = 1; let generation; let stderr = '';
+  child.stderr.on('data', bytes => { stderr = (stderr + bytes).slice(-5000); });
+  const exited = once(child, 'exit').then(([code, signal]) => {
+    for (const waiter of pending.values()) { clearTimeout(waiter.timer); waiter.reject(new Error(`host exit ${code}/${signal}: ${stderr}`)); }
+    pending.clear(); return { code, signal };
+  });
+  readline.createInterface({ input: child.stdout }).on('line', line => {
+    const value = JSON.parse(line);
+    if (value.event) { events.push(value); return; }
+    const waiter = pending.get(value.id); if (!waiter) return;
+    pending.delete(value.id); clearTimeout(waiter.timer);
+    if (value.ok) waiter.resolve(value.result);
+    else waiter.reject(Object.assign(new Error(value.error), { code: value.code }));
+  });
+  const call = (action, args = {}, owner) => new Promise((resolve, reject) => {
+    const id = next++;
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`${action} timeout: ${stderr}`)); }, 15000);
+    pending.set(id, { resolve, reject, timer });
+    child.stdin.write(JSON.stringify({ version: 2, id, action, args,
+      ...(generation ? { host_generation: generation } : {}),
+      ...(owner ? { scope_id: owner.id, scope_generation: owner.generation } : {}),
+    }) + '\n');
+  });
+  t.after(async () => {
+    child.stdin.end();
+    const result = await exited;
+    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+    // All files are synthetic. Retain them on an abnormal/unknown native exit.
+    if (result.code === 0) fs.rmSync(root, { recursive: true, force: true });
+  });
+  const info = await call('runtime_state'); generation = info.host_generation;
+  assert.equal(info.protocol_version, 2);
+  const open = async (mode = 'shared', owner = { id: randomBytes(12).toString('hex'), generation: randomBytes(12).toString('hex') }) => {
+    await call('scope_open', { profile_mode: mode }, owner);
+    return { ...owner,
+      state: () => call('state', {}, owner),
+      async visit(target = url) { const state = await this.state(); return call('navigate', { url: target, expected_epoch: state.page_epoch }, owner); },
+      async evaluate(code) { const state = await this.state(); return (await call('eval', { code, expected_epoch: state.page_epoch, expected_url: state.url }, owner)).value; },
+      close: () => call('scope_close', {}, owner),
+    };
+  };
+  return { info, call, open, url, events, profile };
+}
+
+test('one host routes shared chat pages independently and preserves the account profile on chat close', async t => {
+  const f = await fixture(t); const a = await f.open(); const b = await f.open();
+  const [sa, sb] = await Promise.all([a.visit(), b.visit()]);
+  assert.notEqual(sa.active_tab_id, sb.active_tab_id);
+  await a.evaluate('localStorage.setItem("shared-fixture", "yes"); document.cookie="shared-fixture=yes; Path=/"; true');
+  assert.deepEqual(await b.evaluate('({local:localStorage.getItem("shared-fixture"),cookie:document.cookie})'),
+    { local: 'yes', cookie: 'shared-fixture=yes' });
+  await assert.rejects(f.call('tab_activate', { tab_id: sb.active_tab_id, expected_epoch: (await a.state()).page_epoch }, a),
+    error => error.code === 'invalid_request');
+  await a.close(); assert.ok(fs.existsSync(f.profile));
+  assert.equal((await b.state()).active_tab_id, sb.active_tab_id);
+  assert.equal((await f.call('runtime_state')).browser_instance_id, f.info.browser_instance_id);
+  assert.equal(await b.evaluate('localStorage.getItem("shared-fixture")'), 'yes');
+  const frames = f.events.filter(event => event.event === 'frame' || event.event === 'frame_reset');
+  assert.ok(frames.some(event => event.scope_id === a.id));
+  assert.ok(frames.some(event => event.scope_id === b.id));
+  assert.ok(frames.every(event => event.scope_id === a.id && event.scope_generation === a.generation ||
+    event.scope_id === b.id && event.scope_generation === b.generation));
+});
+
+test('clean scopes use the same browser but inherit neither shared nor previous clean state', async t => {
+  const f = await fixture(t); const shared = await f.open(); await shared.visit();
+  await shared.evaluate('localStorage.setItem("shared-fixture","shared"); document.cookie="fixture=shared; Path=/"; true');
+  for (let i = 0; i < 2; i++) {
+    const clean = await f.open('clean'); await clean.visit();
+    assert.deepEqual(await clean.evaluate('({local:localStorage.getItem("shared-fixture"),cookie:document.cookie})'),
+      { local: null, cookie: '' });
+    await clean.evaluate('localStorage.setItem("shared-fixture","clean"); document.cookie="fixture=clean; Path=/"; true');
+    await clean.close();
+  }
+  assert.equal(await shared.evaluate('localStorage.getItem("shared-fixture")'), 'shared');
+  assert.equal((await f.call('runtime_state')).browser_instance_id, f.info.browser_instance_id);
+  assert.equal((await f.call('runtime_state')).scope_count, 1);
+});
+
+test('parallel navigation and a chat dialog do not block another chat or revive a closed generation', async t => {
+  const f = await fixture(t); const a = await f.open(); const b = await f.open(); await b.visit();
+  const slow = a.visit(f.url + '/slow');
+  const fast = await b.evaluate('document.title'); assert.equal(fast, 'Synthetic shared'); await slow;
+  await a.visit();
+  const state = await a.state();
+  const dialog = await f.call('click_selector', { selector: 'button', expected_epoch: state.page_epoch }, a);
+  assert.ok(dialog.pending_dialog);
+  assert.equal(await b.evaluate('document.title'), 'Synthetic shared');
+  await a.close();
+  await assert.rejects(f.call('state', {}, a), error => error.code === 'browser_scope_closed');
+  await assert.rejects(f.call('scope_open', { profile_mode: 'shared' }, a), error => error.code === 'browser_scope_closed');
+  assert.equal((await b.state()).url, f.url + '/');
+});
