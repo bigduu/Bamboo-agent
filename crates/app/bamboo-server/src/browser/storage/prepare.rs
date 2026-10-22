@@ -288,7 +288,7 @@ fn check_space(path: &Path) -> Result<(), BrowserError> {
 
 fn create_arguments(data_root: &Path, image: &Path) -> Result<Vec<OsString>, BrowserError> {
     let data_root = data_root.to_str().ok_or_else(|| unavailable("browser_storage_control_invalid"))?;
-    let hash = format!("{:x}", Sha256::digest(data_root.as_bytes()));
+    let hash: String = Sha256::digest(data_root.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect();
     let volume = format!("BambooBrowser_{}", &hash[..12]);
     Ok(["create", "-size", "512m", "-type", "UDIF", "-fs", "APFS", "-fsargs", "-q 402653184", "-volname"]
         .into_iter().map(OsString::from).chain([volume.into(), image.as_os_str().to_owned()]).collect())
@@ -400,7 +400,7 @@ mod tests {
         let arguments = create_arguments(Path::new("/synthetic/bamboo"), Path::new("/synthetic/bamboo/browser-storage-v1/account.dmg")).unwrap();
         let args: Vec<_> = arguments.iter().map(|value| value.to_str().unwrap()).collect();
         assert_eq!(&args[..10], ["create", "-size", "512m", "-type", "UDIF", "-fs", "APFS", "-fsargs", "-q 402653184", "-volname"]);
-        let tag = format!("{:x}", Sha256::digest(b"/synthetic/bamboo"));
+        let tag: String = Sha256::digest(b"/synthetic/bamboo").iter().map(|byte| format!("{byte:02x}")).collect();
         assert_eq!(args[10], format!("BambooBrowser_{}", &tag[..12]));
         assert_eq!(args[11], "/synthetic/bamboo/browser-storage-v1/account.dmg");
         assert_eq!(attach_arguments(Path::new("/synthetic/mounted"), Path::new("/synthetic/account.dmg")),
