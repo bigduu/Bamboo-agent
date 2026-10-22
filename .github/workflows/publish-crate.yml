@@ -1,6 +1,6 @@
 name: Publish Crate
 # BAMBOO_TRUSTED_PUBLICATION_POLICY_V1
-# BAMBOO_SHARED_EXECUTABLES_V1
+# BAMBOO_SHARED_EXECUTABLES_V2
 
 on:
   workflow_run:
@@ -388,6 +388,8 @@ jobs:
     outputs:
       source: ${{ steps.source.outputs.revision }}
       version: ${{ steps.version.outputs.version }}
+      executable_contract_version: ${{ steps.executable_policy.outputs.version }}
+      executable_matrix: ${{ steps.executable_policy.outputs.matrix }}
     steps:
       - name: Authorize the exact source before checkout
         id: source
@@ -662,23 +664,46 @@ jobs:
           test -z "$(git status --porcelain --untracked-files=all)"
 
       - name: Require the complete executable policy before reserving a version
+        id: executable_policy
         # Historical successful CI may be delivered after this workflow ships.
-        # Reject an older producer ABI before any reservation or crate upload.
+        # Select only a complete frozen v1 or v2 source contract before uploads.
         run: |
           python3 - <<'PY'
+          import json
+          import os
+          import re
           from pathlib import Path
+          source = Path('scripts/sidecar-release.cjs')
+          assert source.is_file() and not source.is_symlink(), 'Missing native producer source'
+          markers = [match.group(1) for line in source.read_text().splitlines()
+                     if (match := re.fullmatch(r'// BAMBOO_SHARED_EXECUTABLES_V([0-9]+)', line))]
+          assert len(markers) == 1 and markers[0] in {'1', '2'}, 'Unknown or ambiguous executable source contract'
+          version = int(markers[0])
           required = {
               'scripts/crate-release.cjs': None,
-              'scripts/sidecar-build.cjs': '// BAMBOO_SHARED_EXECUTABLES_V1',
-              'scripts/sidecar-release.cjs': '// BAMBOO_SHARED_EXECUTABLES_V1',
+              'scripts/sidecar-build.cjs': f'// BAMBOO_SHARED_EXECUTABLES_V{version}',
+              'scripts/sidecar-release.cjs': f'// BAMBOO_SHARED_EXECUTABLES_V{version}',
               'scripts/sidecar-browser-host.py': '# BAMBOO_SHARED_EXECUTABLES_V1',
-              '.github/workflows/publish-crate.yml': '# BAMBOO_SHARED_EXECUTABLES_V1',
+              '.github/workflows/publish-crate.yml': f'# BAMBOO_SHARED_EXECUTABLES_V{version}',
           }
           for name, marker in required.items():
               file = Path(name)
               assert file.is_file() and not file.is_symlink(), f'Source lacks complete executable publication policy: {name}'
               if marker:
-                  assert marker in file.read_text().splitlines(), f'Source has an incompatible executable publication ABI: {name}'
+                  found = [line for line in file.read_text().splitlines()
+                           if re.fullmatch(r'(//|#) BAMBOO_SHARED_EXECUTABLES_V[0-9]+', line)]
+                  assert found == [marker], f'Source has an incompatible executable publication ABI: {name}'
+          runners = {
+              'aarch64-apple-darwin': 'macos-latest',
+              'x86_64-apple-darwin': 'macos-15-intel',
+              'x86_64-pc-windows-msvc': 'windows-latest',
+              'x86_64-unknown-linux-gnu': 'ubuntu-22.04',
+          }
+          targets = list(runners) if version == 1 else [target for target in runners if target != 'x86_64-apple-darwin']
+          matrix = {'include': [{'target': target, 'os': runners[target]} for target in targets]}
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              stream.write(f'version={version}\n')
+              stream.write('matrix=' + json.dumps(matrix, separators=(',', ':')) + '\n')
           PY
 
       - name: Setup Node.js
@@ -792,20 +817,12 @@ jobs:
       x86_64_unknown_linux_gnu: ${{ steps.build.outputs.x86_64_unknown_linux_gnu }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-apple-darwin
-            os: macos-15-intel
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
+      matrix: ${{ fromJSON(needs.automatic.outputs.executable_matrix) }}
     env:
       SOURCE_REVISION: ${{ needs.automatic.outputs.source }}
       TARGET_VERSION: ${{ needs.automatic.outputs.version }}
       BAMBOO_RELEASE_TARGET: ${{ matrix.target }}
+      BAMBOO_EXECUTABLE_CONTRACT_VERSION: ${{ needs.automatic.outputs.executable_contract_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -847,6 +864,7 @@ jobs:
       SOURCE_REVISION: ${{ needs.automatic.outputs.source }}
       TARGET_VERSION: ${{ needs.automatic.outputs.version }}
       EXPECTED_BUILDS: ${{ toJSON(needs.executables.outputs) }}
+      BAMBOO_EXECUTABLE_CONTRACT_VERSION: ${{ needs.automatic.outputs.executable_contract_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -868,6 +886,7 @@ jobs:
           name: bamboo-executable-aarch64-apple-darwin-attempt-${{ fromJSON(needs.executables.outputs.aarch64_apple_darwin).runAttempt }}
           path: ${{ runner.temp }}/bamboo-executable-inputs/aarch64-apple-darwin
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        if: needs.automatic.outputs.executable_contract_version == '1'
         with:
           name: bamboo-executable-x86_64-apple-darwin-attempt-${{ fromJSON(needs.executables.outputs.x86_64_apple_darwin).runAttempt }}
           path: ${{ runner.temp }}/bamboo-executable-inputs/x86_64-apple-darwin

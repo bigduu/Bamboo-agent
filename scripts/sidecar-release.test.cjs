@@ -6,7 +6,21 @@ const path = require('node:path')
 const zlib = require('node:zlib')
 const { spawnSync } = require('node:child_process')
 const { pathToFileURL } = require('node:url')
-const release = require('./sidecar-release.cjs')
+const implementation = require('./sidecar-release.cjs')
+const legacySuite = process.env.BAMBOO_TEST_EXECUTABLE_CONTRACT === '1'
+const testContractVersion = legacySuite ? 1 : 2
+const testContract = implementation.contractForVersion(testContractVersion)
+// Run the same production functions with the version selected by the actual
+// source-bound entrypoint. The legacy child retains the complete original suite.
+const release = { ...implementation, TARGETS: testContract.targets,
+  MANIFEST: testContract.manifest, PROVENANCE: testContract.provenance,
+  createManifest: value => legacySuite ? JSON.parse(implementation.manifestBytes(value, 1)) : implementation.createManifest(value),
+  manifestBytes: (value, version = testContractVersion) => implementation.manifestBytes(value, version),
+  expectedBuildBindings: value => implementation.expectedBuildBindings(value, testContractVersion),
+  assembleRelease: value => implementation.assembleRelease({ contractVersion: testContractVersion, ...value }),
+  recoverPublishedRelease: value => implementation.recoverPublishedRelease({ contractVersion: testContractVersion, ...value }),
+  publishAssets: value => implementation.publishAssets({ contractVersion: testContractVersion, ...value }),
+}
 const { nativeTarget, buildEnvironment, verifyBuildMessages, verifyStampedVersions } = require('./sidecar-build.cjs')
 const { signReceipt, receiptBody } = require('./crate-release.cjs')
 
@@ -156,7 +170,7 @@ function receipt(target, bytes) {
     cargoMessagesSha256: '6'.repeat(64), stampedDiffSha256: '7'.repeat(64), frontendBytes }
 }
 
-function inputs(t, { targets = release.TARGETS } = {}) {
+function inputs(t, { targets = release.TARGETS, contractVersion = testContractVersion } = {}) {
   const root = temporary(t)
   const sourceRoot = path.join(root, 'source'), inputDirectory = path.join(root, 'inputs'), outputDirectory = path.join(root, 'output')
   for (const dir of [sourceRoot, inputDirectory, outputDirectory, path.join(sourceRoot, 'browser-runtime')]) fs.mkdirSync(dir)
@@ -173,12 +187,13 @@ function inputs(t, { targets = release.TARGETS } = {}) {
       sizeBytes: proof.sizeBytes, receiptSha256: release.sha256(receiptBytes), runAttempt: proof.runAttempt })
     receipts.push(proof)
   }
-  return { root, sourceRoot, inputDirectory, outputDirectory, receipts, identity, frontendBytes, expectedBuilds, signingKey }
+  return { root, sourceRoot, inputDirectory, outputDirectory, receipts, identity, frontendBytes, expectedBuilds, signingKey,
+    contractVersion }
 }
 
 const repairTargets = Object.freeze(['aarch64-apple-darwin', 'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu'])
 
-test('repair publication produces a distinct v2 contract for exactly ARM macOS, Windows and Linux', (t) => {
+if (!legacySuite) test('repair publication produces a distinct v2 contract for exactly ARM macOS, Windows and Linux', (t) => {
   const value = inputs(t, { targets: repairTargets })
   const manifest = release.assembleRelease(value)
   assert.equal(manifest.schemaVersion, 2)
@@ -193,11 +208,46 @@ test('repair publication produces a distinct v2 contract for exactly ARM macOS, 
   assert.deepEqual(Buffer.from(proof.manifestBytesBase64, 'base64'), bytes)
 })
 
-test('repair publication rejects Intel and every missing required platform', (t) => {
+if (!legacySuite) test('repair publication rejects Intel and every missing required platform', (t) => {
   for (const targets of [
     [...repairTargets, 'x86_64-apple-darwin'],
     ...repairTargets.map(missing => repairTargets.filter(target => target !== missing)),
   ]) assert.throws(() => release.assembleRelease(inputs(t, { targets })))
+})
+
+if (!legacySuite) test('v2 permits only the declared empty legacy output and preserves all required native bindings', (t) => {
+  const value = inputs(t)
+  const intel = release.targetOutputKey('x86_64-apple-darwin')
+  const expectedBuilds = { ...value.expectedBuilds, [intel]: '' }
+  assert.deepEqual([...release.expectedBuildBindings(expectedBuilds).keys()], repairTargets)
+  assert.equal(release.assembleRelease({ ...value, expectedBuilds }).schemaVersion, 2)
+  for (const extra of [{ [intel]: '{}' }, { [intel]: null }, { arbitrary: '' }]) {
+    assert.throws(() => release.expectedBuildBindings({ ...value.expectedBuilds, ...extra }))
+  }
+  for (const target of repairTargets) {
+    const missing = { ...expectedBuilds }; delete missing[release.targetOutputKey(target)]
+    assert.throws(() => release.expectedBuildBindings(missing))
+  }
+})
+
+if (!legacySuite) test('only one supported source ABI selects the job contract; the job cannot override it', (t) => {
+  const root = temporary(t), file = path.join(root, 'scripts/sidecar-release.cjs')
+  fs.mkdirSync(path.dirname(file))
+  for (const version of [1, 2]) {
+    fs.writeFileSync(file, `// BAMBOO_SHARED_EXECUTABLES_V${version}\n`)
+    assert.equal(release.sourceContractVersion(root), version)
+    assert.equal(release.boundSourceContract(root, { BAMBOO_EXECUTABLE_CONTRACT_VERSION: String(version) }), version)
+    assert.throws(() => release.boundSourceContract(root, { BAMBOO_EXECUTABLE_CONTRACT_VERSION: String(3 - version) }))
+    if (version === 1) assert.equal(release.boundSourceContract(root, {}), 1)
+    else assert.throws(() => release.boundSourceContract(root, {}))
+  }
+  for (const contents of ['', '// BAMBOO_SHARED_EXECUTABLES_V3\n', '// BAMBOO_SHARED_EXECUTABLES_V01\n',
+    '// BAMBOO_SHARED_EXECUTABLES_V1\n// BAMBOO_SHARED_EXECUTABLES_V2\n', 'x'.repeat(128 * 1024 + 1)]) {
+    fs.writeFileSync(file, contents); assert.throws(() => release.sourceContractVersion(root))
+  }
+  const real = path.join(root, 'real'); fs.writeFileSync(real, '// BAMBOO_SHARED_EXECUTABLES_V2\n')
+  fs.rmSync(file); fs.symlinkSync(real, file)
+  assert.throws(() => release.sourceContractVersion(root))
 })
 
 test('actual producer writes a deterministic three-regular-file USTAR host and complete embedded manifest', (t) => {
@@ -371,8 +421,8 @@ test('Cargo never inherits publication credentials or API-only/compiler-profile 
   for (const overrides of [{ BAMBOO_FRONTEND_BUILD_MODE: 'api-only' }, { RUSTFLAGS: '' }, { CARGO_PROFILE_RELEASE_LTO: 'off' }]) {
     assert.throws(() => buildEnvironment(overrides, '/own/target'))
   }
-  for (const [platform, arch, target] of [['darwin', 'arm64', release.TARGETS[0]], ['darwin', 'x64', release.TARGETS[1]],
-    ['win32', 'x64', release.TARGETS[2]], ['linux', 'x64', release.TARGETS[3]]]) assert.equal(nativeTarget(platform, arch), target)
+  for (const [platform, arch, target] of [['darwin', 'arm64', 'aarch64-apple-darwin'], ['darwin', 'x64', 'x86_64-apple-darwin'],
+    ['win32', 'x64', 'x86_64-pc-windows-msvc'], ['linux', 'x64', 'x86_64-unknown-linux-gnu']]) assert.equal(nativeTarget(platform, arch), target)
   assert.throws(() => nativeTarget('linux', 'arm64'))
 })
 
@@ -393,11 +443,28 @@ function publishingFixture(t) {
     upload: (file) => { const name = path.basename(file); uploads.push(name); stored.set(name, fs.readFileSync(file)) } } }
 }
 
+if (!legacySuite) test('v2 refuses foreign executable contracts and Intel assets before any recovery read or upload', async (t) => {
+  const value = publishingFixture(t)
+  for (const name of ['bamboo-sidecars-v1.json', 'bamboo-executables-provenance-v1.json',
+    'bamboo-sidecars-v3.json', 'bamboo-x86_64-apple-darwin']) {
+    let reads = 0
+    const candidate = { assets: [{ name }] }
+    await assert.rejects(() => release.publishAssets({ ...value.context, release: candidate,
+      readAsset: () => { reads++; throw new Error('foreign read') } }))
+    assert.deepEqual(value.uploads, [])
+    const outputDirectory = path.join(value.root, 'recovery-' + name); fs.mkdirSync(outputDirectory)
+    await assert.rejects(() => release.recoverPublishedRelease({ ...value, outputDirectory, release: candidate,
+      readAsset: () => { reads++; throw new Error('foreign read') } }))
+    assert.equal(reads, 0)
+    assert.deepEqual(fs.readdirSync(outputDirectory), [])
+  }
+})
+
 test('release assets upload once, verify each result, and commit the manifest last; identical reruns do no writes', async (t) => {
   const value = publishingFixture(t)
   assert.deepEqual(await release.publishAssets(value.context), { reused: false })
   assert.equal(value.uploads.at(-1), release.MANIFEST)
-  assert.equal(value.uploads.length, 7)
+  assert.equal(value.uploads.length, legacySuite ? 7 : 6)
   value.context.release.assets = [...value.stored.keys()].map((name) => ({ name }))
   value.uploads.length = 0
   assert.deepEqual(await release.publishAssets(value.context), { reused: true })
@@ -502,7 +569,7 @@ test('publication detects corrupted server responses before exposing a manifest'
   assert.ok(!value.uploads.includes(release.MANIFEST))
 })
 
-test('workflow retains the original successful-CI authority, one allocator/queue and the four standard native builds', () => {
+test('workflow retains successful-CI authority and binds its native matrix to the accepted source contract', () => {
   const source = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
   const matrix = source.split('  executables:\n')[1].split('  publish-executables:\n')[0]
   const final = source.split('  publish-executables:\n')[1]
@@ -510,14 +577,24 @@ test('workflow retains the original successful-CI authority, one allocator/queue
   assert.equal(source.split('bamboo-release-controller/scripts/crate-release.cjs" plan').length - 1, 1)
   assert.match(matrix, /needs: automatic/)
   assert.doesNotMatch(matrix, /contents: write|secrets\.|api-only|cargo publish/)
-  for (const target of release.TARGETS) assert.ok(matrix.includes(`target: ${target}\n`))
-  for (const runner of ['macos-latest', 'macos-15-intel', 'ubuntu-22.04', 'windows-latest']) assert.ok(matrix.includes(`os: ${runner}\n`))
+  assert.ok(matrix.includes('matrix: ${{ fromJSON(needs.automatic.outputs.executable_matrix) }}'))
+  assert.ok(matrix.includes('BAMBOO_EXECUTABLE_CONTRACT_VERSION: ${{ needs.automatic.outputs.executable_contract_version }}'))
+  assert.ok(final.includes('BAMBOO_EXECUTABLE_CONTRACT_VERSION: ${{ needs.automatic.outputs.executable_contract_version }}'))
+  assert.doesNotMatch(matrix, /inputs\./)
   assert.match(matrix, /persist-credentials: false/)
-  for (const target of release.TARGETS) {
+  for (const target of release.LEGACY_TARGETS) {
     const key = release.targetOutputKey(target)
     assert.ok(matrix.includes(key + ': ${{ steps.build.outputs.' + key + ' }}'))
     assert.ok(final.includes('name: bamboo-executable-' + target + '-attempt-${{ fromJSON(needs.executables.outputs.' + key + ').runAttempt }}'))
     assert.ok(final.includes('path: ${{ runner.temp }}/bamboo-executable-inputs/' + target))
+  }
+  const downloads = final.split('      - uses: actions/download-artifact@').slice(1)
+  for (const target of release.LEGACY_TARGETS) {
+    const step = downloads.find(block => block.includes('bamboo-executable-' + target + '-attempt-'))
+    assert.ok(step)
+    if (target === 'x86_64-apple-darwin') {
+      assert.match(step, /if: needs\.automatic\.outputs\.executable_contract_version == '1'/)
+    } else assert.doesNotMatch(step.split('\n      - ')[0], /\n        if:/)
   }
   assert.ok(matrix.includes('name: bamboo-executable-${{ matrix.target }}-attempt-${{ github.run_attempt }}'))
   assert.doesNotMatch(matrix, /overwrite: true/)
@@ -540,25 +617,55 @@ test('the actual source preflight rejects every missing or incompatible producer
   assert.ok(automatic.indexOf(name) < automatic.indexOf('Reserve or resume the exact release identity'))
   assert.ok(automatic.indexOf(name) < automatic.indexOf('Publish verified crates'))
   assert.doesNotMatch(preflight, /GH_TOKEN|CARGO_REGISTRY_TOKEN|crate-release.cjs (?:plan|publish)/)
-  const files = { 'scripts/crate-release.cjs': '', 'scripts/sidecar-build.cjs': '// BAMBOO_SHARED_EXECUTABLES_V1',
-    'scripts/sidecar-release.cjs': '// BAMBOO_SHARED_EXECUTABLES_V1',
-    'scripts/sidecar-browser-host.py': '# BAMBOO_SHARED_EXECUTABLES_V1',
-    '.github/workflows/publish-crate.yml': '# BAMBOO_SHARED_EXECUTABLES_V1' }
-  for (const [file, marker] of Object.entries(files)) {
-    fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true })
-    fs.writeFileSync(path.join(root, file), marker + '\n')
-  }
-  const run = () => spawnSync(process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3'),
-    ['-c', script], { cwd: root, encoding: 'utf8', env: { PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: '1' } })
-  assert.equal(run().status, 0)
-  for (const [file, marker] of Object.entries(files)) {
-    const target = path.join(root, file); fs.rmSync(target)
-    assert.notEqual(run().status, 0, `Missing source producer must stop before publication: ${file}`)
-    if (marker) {
-      fs.writeFileSync(target, 'legacy producer without this ABI\n')
-      assert.notEqual(run().status, 0, `An earlier incomplete producer must stop: ${file}`)
+  for (const version of [1, 2]) {
+    const sourceRoot = path.join(root, `source-v${version}`), output = path.join(root, `output-v${version}`)
+    const files = { 'scripts/crate-release.cjs': '',
+      'scripts/sidecar-build.cjs': `// BAMBOO_SHARED_EXECUTABLES_V${version}`,
+      'scripts/sidecar-release.cjs': `// BAMBOO_SHARED_EXECUTABLES_V${version}`,
+      'scripts/sidecar-browser-host.py': '# BAMBOO_SHARED_EXECUTABLES_V1',
+      '.github/workflows/publish-crate.yml': `# BAMBOO_SHARED_EXECUTABLES_V${version}` }
+    for (const [file, marker] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(sourceRoot, file)), { recursive: true })
+      fs.writeFileSync(path.join(sourceRoot, file), marker + '\n')
     }
-    fs.writeFileSync(target, marker + '\n')
+    const run = () => {
+      fs.rmSync(output, { force: true })
+      return spawnSync(process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3'),
+        ['-c', script], { cwd: sourceRoot, encoding: 'utf8', env: {
+          PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: '1', GITHUB_OUTPUT: output } })
+    }
+    assert.equal(run().status, 0)
+    const actual = Object.fromEntries(fs.readFileSync(output, 'utf8').trim().split('\n').map(line => {
+      const at = line.indexOf('='); return [line.slice(0, at), line.slice(at + 1)]
+    }))
+    assert.equal(actual.version, String(version))
+    const expected = [
+      { target: 'aarch64-apple-darwin', os: 'macos-latest' },
+      ...(version === 1 ? [{ target: 'x86_64-apple-darwin', os: 'macos-15-intel' }] : []),
+      { target: 'x86_64-pc-windows-msvc', os: 'windows-latest' },
+      { target: 'x86_64-unknown-linux-gnu', os: 'ubuntu-22.04' },
+    ]
+    assert.deepEqual(JSON.parse(actual.matrix), { include: expected })
+    for (const [file, marker] of Object.entries(files)) {
+      const target = path.join(sourceRoot, file); fs.rmSync(target)
+      assert.notEqual(run().status, 0, `Missing source producer must stop before publication: ${file}`)
+      assert.ok(!fs.existsSync(output))
+      if (marker) {
+        fs.writeFileSync(target, 'legacy producer without this ABI\n')
+        assert.notEqual(run().status, 0, `An earlier incomplete producer must stop: ${file}`)
+        assert.ok(!fs.existsSync(output))
+        fs.writeFileSync(target, marker + '\n' + marker + '\n')
+        assert.notEqual(run().status, 0, `Duplicate ABI must stop: ${file}`)
+        assert.ok(!fs.existsSync(output))
+      }
+      fs.writeFileSync(target, marker + '\n')
+    }
+    const producer = path.join(sourceRoot, 'scripts/sidecar-release.cjs')
+    for (const marker of ['// BAMBOO_SHARED_EXECUTABLES_V3', '// BAMBOO_SHARED_EXECUTABLES_V01']) {
+      fs.writeFileSync(producer, marker + '\n')
+      assert.notEqual(run().status, 0)
+      assert.ok(!fs.existsSync(output))
+    }
   }
 })
 
@@ -655,7 +762,7 @@ test('legacy checkpoint compatibility retains hash verification with and without
   }
 })
 
-test('checkpoint v1 recovery remains valid when the current manifest constructor changes', async (t) => {
+test(`checkpoint v${testContractVersion} recovery remains valid when the current manifest constructor changes`, async (t) => {
   const value = publishingFixture(t)
   value.context.upload = file => {
     if (path.basename(file) === release.MANIFEST) throw new Error('manifest interrupted')
@@ -683,13 +790,14 @@ test('checkpoint v1 recovery remains valid when the current manifest constructor
   }
 })
 
-test('frozen v1 recovery validation rejects foreign identities, targets and unsafe asset shapes', (t) => {
+test(`frozen v${testContractVersion} recovery validation rejects foreign identities, targets and unsafe asset shapes`, (t) => {
   const value = publishingFixture(t)
   const manifest = JSON.parse(fs.readFileSync(path.join(value.outputDirectory, release.MANIFEST)))
   const proof = JSON.parse(fs.readFileSync(path.join(value.outputDirectory, release.PROVENANCE)))
-  assert.equal(release.validateManifestV1(manifest, identity, proof.builds), manifest)
+  const validate = legacySuite ? release.validateManifestV1 : release.validateManifestV2
+  assert.equal(validate(manifest, identity, proof.builds), manifest)
   for (const mutate of [
-    x => { x.schemaVersion = 2 },
+    x => { x.schemaVersion = legacySuite ? 2 : 1 },
     x => { x.version = '2026.10.124' },
     x => { x.sourceRevision = '8'.repeat(40) },
     x => { x.unrecognized = true },
@@ -704,6 +812,18 @@ test('frozen v1 recovery validation rejects foreign identities, targets and unsa
     x => { x.browserHost.sha256 = 'not-a-digest' },
   ]) {
     const changed = clone(manifest); mutate(changed)
-    assert.throws(() => release.validateManifestV1(changed, identity, proof.builds))
+    assert.throws(() => validate(changed, identity, proof.builds))
   }
+})
+
+if (!legacySuite) test('the complete original controller contract suite also passes for frozen four-platform v1', (t) => {
+  const child = spawnSync(process.execPath, ['--test', '--test-reporter=tap', __filename], {
+    encoding: 'utf8', env: { ...process.env, BAMBOO_TEST_EXECUTABLE_CONTRACT: '1' }, maxBuffer: 8 * 1024 * 1024,
+  })
+  assert.equal(child.status, 0, child.stdout + child.stderr)
+  const counts = Object.fromEntries([...child.stdout.matchAll(/^# (tests|pass|fail|skipped|cancelled) (\d+)$/gm)]
+    .map(([, key, value]) => [key, Number(value)]))
+  assert.ok(counts.tests >= 27)
+  assert.equal(counts.fail, 0); assert.equal(counts.skipped, 0); assert.equal(counts.cancelled, 0)
+  t.diagnostic('Historical v1 suite: ' + JSON.stringify(counts))
 })
