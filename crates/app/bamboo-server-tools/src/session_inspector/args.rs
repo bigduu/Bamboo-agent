@@ -56,6 +56,13 @@ pub(super) enum SessionInspectorArgs {
     /// Materialize a bounded, immutable observation of this root or its tree.
     ExportContext { session_id: String },
 
+    /// Bounded persisted progress for one explicitly authorized target.
+    Inspect {
+        session_id: String,
+        #[serde(default)]
+        max_chars: Option<usize>,
+    },
+
     /// List sessions from the global index, with filtering/pagination.
     List {
         #[serde(default)]
@@ -74,6 +81,9 @@ pub(super) enum SessionInspectorArgs {
         limit: Option<usize>,
         #[serde(default)]
         offset: Option<usize>,
+        /// Used only by an authorized directory, never the global index.
+        #[serde(default)]
+        cursor: Option<String>,
     },
 
     /// Get a single session's index metadata (fast).
