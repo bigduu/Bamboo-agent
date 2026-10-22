@@ -210,7 +210,8 @@ async fn local_task_resources_windows_background_scope_drain() {
     let directory = tempfile::tempdir().unwrap();
     let scope = resources("background");
     let script = encoded(&tree_script_with_trace(directory.path(), false, true));
-    let native_command = format!("powershell.exe -NoProfile -NonInteractive -EncodedCommand {script}");
+    let native_command =
+        format!("powershell.exe -NoProfile -NonInteractive -EncodedCommand {script}");
     let selected = bamboo_infrastructure::process::preferred_bash_shell();
     let command = observed_background_command(&native_command, selected.arg);
     let shell = scope
