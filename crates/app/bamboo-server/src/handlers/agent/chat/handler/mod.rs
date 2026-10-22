@@ -860,6 +860,7 @@ async fn handle_chat(
         if workspace != session.workspace_path_meta() || project != session.project_id_meta() {
             let runners = state.agent_runners.clone().read_owned().await;
             let active = workflow_runner_is_active(runners.get(&session_id))
+                || state.workflow_runs.scope_change_is_blocked(&session_id)
                 || crate::handlers::agent::events::execute_startup_is_in_flight(
                     state.as_ref(),
                     &session_id,
