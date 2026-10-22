@@ -1494,6 +1494,14 @@ impl LLMProvider for LegacyProvider {
         if probe.successor.load(Ordering::Acquire) {
             assert_eq!(actual.workspace_path_meta().as_deref(), probe.b.to_str());
             assert_legacy_prompt_workspace_b(messages, &actual, probe);
+            let successor_host = state.workspace_handoffs.retain_legacy_execution(&probe.id);
+            assert!(
+                !Arc::ptr_eq(
+                    &successor_host,
+                    probe.retained_host.lock().unwrap().as_ref().unwrap()
+                ),
+                "the real successor must bind a distinct Legacy execution"
+            );
             trace.requests += 1;
             trace.successor_requests += 1;
             return Ok(Box::pin(futures::stream::iter([
@@ -1794,16 +1802,23 @@ async fn legacy_case(uncertain: bool) {
         // execution end closes it before router finalization, not at Arc Drop.
         assert!(probe.retained_host.lock().unwrap().is_some());
         probe.successor.store(true, Ordering::Release);
+        let successor_message_id = format!("legacy-successor-{}", uuid::Uuid::new_v4());
         let (status, response) = http(
             &state,
             "/api/v1/chat",
             json!({
                 "session_id":id,"message":"Observe the committed workspace in a new turn",
-                "message_id":format!("legacy-successor-{}",uuid::Uuid::new_v4())
+                "message_id":successor_message_id
             }),
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{response}");
+        let queued = state.storage.load_session(&id).await.unwrap().unwrap();
+        assert_eq!(
+            queued.metadata.get("chat.queued_ingress.v1"),
+            Some(&successor_message_id),
+            "the real successor retains referenced Legacy ingress"
+        );
         let (status, response) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{response}");
         assert!(matches!(done(&state, &id).await, AgentStatus::Completed));

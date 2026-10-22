@@ -269,7 +269,7 @@ impl ExecuteAdmissionCheck {
             Self::Checked(admission) => Ok(*admission),
             Self::NeedsRootReservation => Err(error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Native Root admission requires an execution reservation; retry execute",
+                "Root admission requires an execution reservation; retry execute",
             )
             .into()),
         }
@@ -287,7 +287,7 @@ pub(crate) async fn admit_for_execute(
 }
 
 impl AppState {
-    /// Native ordinary Roots must own their exact Actor writer before Inbox
+    /// Ordinary Roots must own their exact Actor writer before Inbox
     /// admission. Inspection only selects an attempt; the existing reservation
     /// protocol remains authoritative if another execution wins the race.
     pub(crate) async fn reserve_root_chat_for_execute(
@@ -317,7 +317,6 @@ impl AppState {
             return Ok(None);
         };
         if !crate::skill_runtime::registered_main(&session)
-            || session.metadata.contains_key("chat.queued_ingress.v1")
             || !self
                 .session_inbox
                 .inspect(id)
@@ -360,23 +359,6 @@ impl AppState {
         id: &str,
         reservation: Option<&SessionExecutionReservation>,
     ) -> ResponseResult<ExecuteAdmission> {
-        let legacy_queue = self
-            .storage
-            .load_session(id)
-            .await
-            .map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e))?
-            .is_some_and(|session| session.metadata.contains_key("chat.queued_ingress.v1"));
-        if legacy_queue {
-            // Preserve the existing data-only adapter for referenced transport.
-            // Its own checked owner/admission re-read remains authoritative.
-            return crate::handlers::agent::chat::admit_for_execute(self, id)
-                .await
-                .map(|inputs| ExecuteAdmission {
-                    inputs,
-                    generate_title: false,
-                    native_main: false,
-                });
-        }
         self.admit_chat_for_execute_inner(id, reservation).await
     }
 
@@ -404,7 +386,7 @@ impl AppState {
             // report completed/started and strand a sole pending ChildOutcome.
             return Err(error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Native Root admission changed before ownership; retry execute",
+                "Root admission changed before ownership; retry execute",
             )
             .into());
         }
@@ -427,7 +409,7 @@ impl AppState {
         &self,
         id: &str,
         reservation: Option<&SessionExecutionReservation>,
-        require_native_owner: bool,
+        require_root_owner: bool,
     ) -> ResponseResult<ExecuteAdmissionCheck> {
         let runners = self.agent_runners.read().await;
         if let Some(reservation) = reservation {
@@ -497,14 +479,14 @@ impl AppState {
             recover_user_handoff(self, &session).await?;
             return Ok(ExecuteAdmissionCheck::Checked(Box::default()));
         }
-        if require_native_owner
+        if require_root_owner
             && reservation.is_none()
-            && queued_id.is_none()
             && crate::skill_runtime::registered_main(&session)
         {
             // Eligibility was observed under this actual admission check, not
-            // the earlier HTTP selection. Never claim native owned-format work
-            // through unbound persistence. Reserving needs the registry writer.
+            // the earlier HTTP selection. A referenced Legacy User remains
+            // Legacy data, but owned-format work still needs the same genuine
+            // Root writer. Reserving needs the registry writer.
             drop(runners);
             return Ok(ExecuteAdmissionCheck::NeedsRootReservation);
         }
