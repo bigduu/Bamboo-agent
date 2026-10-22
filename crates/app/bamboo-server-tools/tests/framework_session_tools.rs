@@ -308,7 +308,7 @@ async fn shared_factory_keeps_plan_and_disabled_gates_before_the_caller_writer()
         .unwrap_err()
         .to_string()
         .contains("Plan"));
-    fixture.config.write().await.disabled_tools = vec!["spawnSession".into()];
+    fixture.config.write().await.tools.disabled = vec!["spawnSession".into()];
     assert!(fixture
         .invoke(&caller, &call, false)
         .await
