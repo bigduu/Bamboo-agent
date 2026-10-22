@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 use super::BrowserError;
 
 const CLOSE_PENDING: &str = ".bamboo-profile-close-pending";
+pub(super) const LAUNCH_ACTIVE: &str = ".bamboo-profile-launch-active-v1";
+const LAUNCH_MAGIC: &str = "BAMBOO_BROWSER_LAUNCH_V1\n";
 const WRITER_EXIT_UNCONFIRMED: &str = ".bamboo-profile-writer-exit-unconfirmed";
 const LEASES: &str = ".bamboo-profile-leases";
 const RESET_GATE: &str = ".bamboo-profile-reset.lock";
@@ -26,6 +28,7 @@ pub(super) struct Lease {
     // Control fences/locks above remain outside quota. The actual browser
     // profile and scratch are selected by this native bounded-storage owner.
     pub(super) storage: Option<std::sync::Arc<super::storage::Launch>>,
+    launch_generation: Option<String>,
     _lock: std::fs::File,
     // Never unlink this lock with the profile: queued openers may already hold
     // a descriptor to its inode. Open and deletion use the same stable lock.
@@ -71,6 +74,29 @@ pub(super) fn shared_directory(root: &Path) -> Result<PathBuf, BrowserError> {
 }
 
 impl Lease {
+    /// Persist before spawning any native writer. A crash must not release a
+    /// profile merely because this process's flock descriptors disappeared.
+    pub(super) fn begin_launch(&mut self) -> Result<&str, BrowserError> {
+        use std::io::Write;
+        if self.launch_generation.is_some() {
+            return Err(unavailable());
+        }
+        let generation = uuid::Uuid::new_v4().to_string();
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut marker = options.open(self.path.join(LAUNCH_ACTIVE)).map_err(|_| unavailable())?;
+        marker.write_all(format!("{LAUNCH_MAGIC}{generation}\n").as_bytes())
+            .and_then(|()| marker.sync_all()).map_err(|_| unavailable())?;
+        sync_directory(&self.path)?;
+        self.launch_generation = Some(generation);
+        Ok(self.launch_generation.as_deref().unwrap())
+    }
+
     /// This marker survives release of process-local descriptors. Native
     /// writer exit cannot be inferred from the Node process's wait status.
     pub(super) fn quarantine_writers(&self) -> Result<(), BrowserError> {
@@ -140,6 +166,42 @@ impl Lease {
     }
 
     pub(super) fn finish_close(&self) -> Result<(), BrowserError> {
+        // Only the owner that created this launch may remove its fence. This
+        // method is called after the native close/group barrier, never by a
+        // fresh opener, reset, Drop of an unused lease, or a PID-based probe.
+        match std::fs::symlink_metadata(self.path.join(LAUNCH_ACTIVE)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(unavailable()),
+            Ok(metadata) => {
+                use std::io::Read;
+                let generation = self.launch_generation.as_ref().ok_or_else(unavailable)?;
+                if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 128 {
+                    return Err(unavailable());
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                    if metadata.uid() != unsafe { libc::geteuid() }
+                        || metadata.permissions().mode() & 0o777 != 0o600 {
+                        return Err(unavailable());
+                    }
+                }
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NOFOLLOW);
+                }
+                let mut bytes = Vec::new();
+                options.open(self.path.join(LAUNCH_ACTIVE)).map_err(|_| unavailable())?
+                    .take(129).read_to_end(&mut bytes).map_err(|_| unavailable())?;
+                if bytes != format!("{LAUNCH_MAGIC}{generation}\n").as_bytes() {
+                    return Err(unavailable());
+                }
+                std::fs::remove_file(self.path.join(LAUNCH_ACTIVE)).map_err(|_| unavailable())?;
+            }
+        }
         match std::fs::remove_file(self.path.join(CLOSE_PENDING)) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -150,7 +212,7 @@ impl Lease {
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), BrowserError> {
+pub(super) fn sync_directory(path: &Path) -> Result<(), BrowserError> {
     use std::os::unix::fs::OpenOptionsExt;
     #[cfg(test)]
     if DIRECTORY_SYNC_FAILURE.with(|target| target.borrow().as_deref() == Some(path)) {
@@ -167,7 +229,7 @@ fn sync_directory(path: &Path) -> Result<(), BrowserError> {
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_: &Path) -> Result<(), BrowserError> {
+pub(super) fn sync_directory(_: &Path) -> Result<(), BrowserError> {
     Ok(())
 }
 
@@ -287,10 +349,27 @@ fn admission_gate(root: &Path, exclusive: bool) -> Result<std::fs::File, Browser
     Ok(gate)
 }
 
-pub(super) fn begin_reset(root: &Path) -> Result<std::fs::File, BrowserError> {
+pub(super) struct ResetGate {
+    // Arc ownership in the purge worker retains this inode if the HTTP waiter
+    // is cancelled. No erasure worker may outlive the actual exclusive gate.
+    _file: std::fs::File,
+    storage: std::sync::Mutex<Option<super::storage::reset::Owner>>,
+}
+
+impl ResetGate {
+    pub(super) fn finish_storage(&self) -> Result<(), BrowserError> {
+        let mut storage = self.storage.lock().unwrap();
+        if let Some(owner) = storage.as_mut() {
+            owner.finish()?;
+            *storage = None;
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn begin_reset(root: &Path) -> Result<ResetGate, BrowserError> {
     let root = root_directory(root, true)?.ok_or_else(unavailable)?;
     let gate = admission_gate(&root, true)?;
-    super::storage::guard_reset(&root)?;
     // Refuse before any canonical wipe, including a restart that lost the old
     // process's locks. This never clears an unknown writer's durable fence.
     for entry in std::fs::read_dir(&root).map_err(|_| unavailable())? {
@@ -305,10 +384,15 @@ pub(super) fn begin_reset(root: &Path) -> Result<std::fs::File, BrowserError> {
         validate_private_directory(&entry.path())?;
         reject_unconfirmed_writers(&entry.path())?;
     }
-    Ok(gate)
+    let storage = super::storage::reset::Owner::prepare(&root)?;
+    Ok(ResetGate { _file: gate, storage: std::sync::Mutex::new(storage) })
 }
 
 fn reject_unconfirmed_writers(path: &Path) -> Result<(), BrowserError> {
+    match std::fs::symlink_metadata(path.join(LAUNCH_ACTIVE)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(BrowserError::Unavailable("browser writer exit unconfirmed".into())),
+    }
     match std::fs::symlink_metadata(path.join(WRITER_EXIT_UNCONFIRMED)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         // Existing, malformed, linked or unreadable markers all fail closed.
@@ -395,6 +479,7 @@ fn acquire_key(root: &Path, profile_key: &str) -> Result<Lease, BrowserError> {
     Ok(Lease {
         path,
         storage: None,
+        launch_generation: None,
         _lock: lock,
         _lifecycle_lock: lifecycle_lock,
         _reset_gate: reset_gate,
@@ -535,6 +620,58 @@ pub(super) fn purge_all(root: &Path) -> Result<(), BrowserError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_launch_survives_lost_locks_and_blocks_reopen_delete_and_reset() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profiles");
+        let mut lease = acquire_shared(&root).unwrap();
+        let generation = lease.begin_launch().unwrap().to_owned();
+        let path = lease.path.clone();
+        assert_eq!(std::fs::read_to_string(path.join(LAUNCH_ACTIVE)).unwrap(),
+            format!("{LAUNCH_MAGIC}{generation}\n"));
+        drop(lease); // Models process-local lock loss, not a clean writer exit.
+        assert!(acquire_shared(&root).is_err());
+        assert!(remove_key_notifying(&root, &shared_key(), || panic!("not retired")).is_err());
+        assert!(begin_reset(&root).is_err());
+        assert!(path.join(LAUNCH_ACTIVE).is_file());
+    }
+
+    #[test]
+    fn only_the_same_lease_can_clear_its_exact_launch_generation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profiles");
+        let mut lease = acquire_shared(&root).unwrap();
+        let generation = lease.begin_launch().unwrap().to_owned();
+        assert!(lease.begin_launch().is_err());
+        let marker = lease.path.join(LAUNCH_ACTIVE);
+        std::fs::write(&marker, b"unknown generation\n").unwrap();
+        assert!(lease.finish_close().is_err());
+        assert!(marker.exists());
+        std::fs::write(&marker, format!("{LAUNCH_MAGIC}{generation}\n")).unwrap();
+        lease.finish_close().unwrap();
+        lease.finish_close().unwrap(); // A directory-barrier retry is idempotent.
+        assert!(!marker.exists());
+        drop(lease);
+        assert!(acquire_shared(&root).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_launch_directory_barrier_preserves_a_fence_for_the_next_process() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profiles");
+        let mut lease = acquire_shared(&root).unwrap();
+        let path = lease.path.clone();
+        DIRECTORY_SYNC_FAILURE.with(|target| *target.borrow_mut() = Some(path.clone()));
+        let result = lease.begin_launch();
+        DIRECTORY_SYNC_FAILURE.with(|target| *target.borrow_mut() = None);
+        assert!(result.is_err());
+        drop(lease);
+        assert!(path.join(LAUNCH_ACTIVE).is_file());
+        assert!(acquire_shared(&root).is_err());
+        assert!(begin_reset(&root).is_err());
+    }
 
     #[test]
     fn shared_account_namespace_survives_chat_retirement_and_rejects_reserved_ids() {

@@ -175,7 +175,7 @@ impl BrowserLifecycle {
 /// unlock, so local pre-reset/during-reset waiters cannot create a host.
 pub(crate) struct BrowserResetGuard<'a> {
     // Release the process-shared gate before allowing local opens again.
-    _profile_gate: Option<std::fs::File>,
+    _profile_gate: Option<Arc<profile::ResetGate>>,
     _opens: tokio::sync::RwLockWriteGuard<'a, ()>,
     lifecycle: &'a BrowserLifecycle,
     profile_root: Option<Arc<PathBuf>>,
@@ -195,6 +195,7 @@ impl BrowserResetGuard<'_> {
             return Ok(());
         };
         let retired = self.retired.clone();
+        let profile_gate = self._profile_gate.clone();
         let pending: Vec<_> = retired.lock().unwrap().iter().cloned().collect();
         tokio::task::spawn_blocking(move || {
             for id in pending {
@@ -202,7 +203,11 @@ impl BrowserResetGuard<'_> {
                     retired.lock().unwrap().remove(&id);
                 })?;
             }
-            profile::purge_all(&root)
+            profile::purge_all(&root)?;
+            if let Some(gate) = profile_gate {
+                gate.finish_storage()?;
+            }
+            Ok(())
         })
         .await
         .map_err(|_| BrowserError::Unavailable("browser reset interrupted".into()))?
@@ -267,8 +272,8 @@ struct BrowserSession {
     profile_lease: Mutex<Option<profile::Lease>>,
     /// Owns the host's TMPDIR, including Chromium's download scratch files.
     temp_dir: Mutex<Option<tempfile::TempDir>>,
-    #[cfg(unix)]
     process_group: Option<i32>,
+    group_exit_required: bool,
     stdin: AsyncMutex<Option<ChildStdin>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, BrowserError>>>>,
     next_id: AtomicU64,
@@ -316,8 +321,8 @@ impl Drop for BrowserSession {
             lease,
             temp_dir: self.temp_dir.get_mut().unwrap().take(),
             stdin: self.stdin.get_mut().take(),
-            #[cfg(unix)]
             process_group: self.process_group,
+            group_exit_required: self.group_exit_required,
             graceful,
             marked,
             clean_host_exit: self.clean_host_exit.load(Ordering::Acquire),
@@ -354,8 +359,8 @@ struct BrowserReaper {
     lease: Option<profile::Lease>,
     temp_dir: Option<tempfile::TempDir>,
     stdin: Option<ChildStdin>,
-    #[cfg(unix)]
     process_group: Option<i32>,
+    group_exit_required: bool,
     graceful: bool,
     marked: bool,
     clean_host_exit: bool,
@@ -374,7 +379,8 @@ impl BrowserReaper {
         let mut killed = false;
         let clean = loop {
             if let Ok(Some(status)) = self.child.lock().unwrap().try_wait() {
-                break self.clean_host_exit || (self.graceful && !killed && status.success());
+                break self.clean_host_exit || (self.graceful && !killed && status.success()
+                    && managed_group_exit_confirmed(self.group_exit_required, self.process_group));
             }
             if !killed && Instant::now() >= deadline {
                 self.cleanup.fence_writers();
@@ -451,6 +457,23 @@ fn kill_browser_process_group(group: i32) {
     if group > 0 && group != unsafe { libc::getpgrp() } {
         let _ = unsafe { libc::killpg(group, libc::SIGKILL) };
     }
+}
+
+/// Read-only barrier for the managed group, after waiting our actual child.
+/// ESRCH is the only positive result. EPERM, a live member or an unknown group
+/// retains the durable fence. This is not proof about escaped descendants.
+fn managed_group_exit_confirmed(required: bool, group: Option<i32>) -> bool {
+    if !required {
+        return true;
+    }
+    #[cfg(unix)]
+    if let Some(group) = group.filter(|group| *group > 0 && *group != unsafe { libc::getpgrp() }) {
+        return unsafe { libc::killpg(group, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    }
+    #[cfg(not(unix))]
+    let _ = group;
+    false
 }
 
 /// A cancelled HTTP/tool caller must not cancel the host deadline with it.
@@ -647,7 +670,22 @@ impl BrowserSession {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        let child = lifecycle.spawn_child(&mut command)?;
+        if lifecycle.bounded_storage {
+            let generation = profile_lease.as_mut().unwrap().begin_launch()?;
+            command.env("BAMBOO_BROWSER_STORAGE_GENERATION", generation);
+        }
+        let child = match lifecycle.spawn_child(&mut command) {
+            Ok(child) => child,
+            Err(error) => {
+                // spawn() failed before yielding a child. No writer was
+                // admitted; clear only this launch's exact marker. On a failed
+                // directory barrier the on-disk fence remains fail-closed.
+                if let Some(lease) = profile_lease.as_ref() {
+                    let _ = lease.finish_close();
+                }
+                return Err(error);
+            }
+        };
         let session = Self::from_child_tracked(child, Some(temp_dir), lifecycle)?;
         *session.profile_lease.lock().unwrap() = profile_lease;
         session.protocol_v2.store(shared, Ordering::Release);
@@ -688,7 +726,6 @@ impl BrowserSession {
         temp_dir: Option<tempfile::TempDir>,
         lifecycle: &BrowserLifecycle,
     ) -> Result<Arc<Self>, BrowserError> {
-        #[cfg(unix)]
         let process_group = child.id().and_then(|id| i32::try_from(id).ok());
         let stdin = child
             .stdin
@@ -715,8 +752,8 @@ impl BrowserSession {
             child: Arc::new(Mutex::new(child)),
             profile_lease: Mutex::new(None),
             temp_dir: Mutex::new(temp_dir),
-            #[cfg(unix)]
             process_group,
+            group_exit_required: lifecycle.bounded_storage,
             stdin: AsyncMutex::new(Some(stdin)),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -1047,7 +1084,8 @@ impl BrowserSession {
                 None
             };
             if let Some(clean) = graceful {
-                let clean = clean && !self.kill_issued.load(Ordering::Acquire);
+                let clean = clean && !self.kill_issued.load(Ordering::Acquire)
+                    && managed_group_exit_confirmed(self.group_exit_required, self.process_group);
                 self.reaped.store(true, Ordering::Release);
                 self.clean_host_exit.store(clean, Ordering::Release);
                 let confirmed = clean
@@ -1263,6 +1301,7 @@ mod tests {
             profile_lease: Mutex::new(None),
             temp_dir: Mutex::new(None),
             process_group,
+            group_exit_required: false,
             stdin: AsyncMutex::new(Some(stdin)),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -2392,9 +2431,9 @@ impl BrowserManager {
             // Own hosts released their shared gate. Foreign active owners
             // make reset fail before storage is deleted. Hold X through wipe.
             guard._profile_gate = Some(
-                tokio::task::spawn_blocking(move || profile::begin_reset(&root))
+                Arc::new(tokio::task::spawn_blocking(move || profile::begin_reset(&root))
                     .await
-                    .map_err(|_| BrowserError::Unavailable("browser reset interrupted".into()))??,
+                    .map_err(|_| BrowserError::Unavailable("browser reset interrupted".into()))??),
             );
         }
         Ok(guard)

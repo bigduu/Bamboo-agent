@@ -41,6 +41,7 @@ async fn clean_reaper_holds_lease_until_close_directory_barrier_recovers() {
         temp_dir: None,
         stdin,
         process_group,
+        group_exit_required: false,
         graceful: true,
         marked: true,
         clean_host_exit: false,

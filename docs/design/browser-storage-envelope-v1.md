@@ -68,9 +68,46 @@ control or scratch paths. Readiness must advertise the exact fixed-storage
 capability, so an older v2 host cannot silently ignore the boundary. A missing
 Mac provider returns `browser_storage_provider_not_ready`; unqualified Windows
 or Linux implementations return `browser_storage_provider_unsupported`.
-No production provisioning policy is selected by this source change. Until
-qualified reset cleanup exists, an existing storage envelope blocks canonical
-reset before history/control deletion instead of falsely claiming erasure.
+No fresh-storage provisioning executor is implemented by this source change.
+Missing or unmounted storage refuses browser admission. That is a functional
+gap in first-use/reboot recovery, not a request to deploy on real user data.
+Existing mounted storage can be qualified using the approved isolated fixture.
+The source-only reset candidate described below has not passed Rust or native
+acceptance; the earlier blanket refusal is not counted as working erasure.
+
+Before spawning a native writer, the account owner now writes and syncs a
+bounded launch UUID fence outside quota. A new process refuses any old active
+fence even after all previous flock descriptors have disappeared. The host
+requires that exact generation and a private, bounded marker. The UUID is
+lifecycle correlation, not authentication or proof of writer exit. Only the
+same lease may clear it after the native close barrier. Normal completion also
+requires the managed process group to be absent; EPERM, live members or an
+unknown group retain quarantine. This does not prove escaped descendants.
+
+## Explicit reset source candidate
+
+The reset gate is retained by the blocking purge worker, including after its
+HTTP waiter is cancelled. Before canonical history can be wiped, the Mac owner
+pins existing backing/role directories, rejects unknown active-writer fences,
+joins live native image/quota/UUID readback, and durably writes a pending reset
+record outside quota. A full volume can be inspected for reset without making
+it eligible for launch. Windows/Linux have no qualified reset provider.
+
+Only a successful canonical wipe reaches erasure. It unlinks contents of the
+seven known role directories using held directory descriptors and no-follow
+relative operations. It preserves the role directories, the fixed image and
+stable lease inodes. Unexpected devices, replaced pins or an incomplete
+traversal fail closed. Unknown top-level data is refused rather than silently
+left behind under a success receipt. No image is detached or reformatted.
+
+Failure retains the pending record and refuses a new browser. A subsequent
+explicit reset may retry under the same exclusive gate and freshly verified
+volume UUID; startup does not automatically replay erasure. Completion replaces
+the pending record atomically with a bounded completion record. A crash leaves
+either the durable pending fence or the identity of already-completed erasure.
+Later admission binds that UUID to fresh native readback. The private Node
+inspection helper is read-only and does not load Playwright; it grants neither
+erasure nor owner authentication. Actual erasure remains in the native owner.
 
 Pinned Playwright is loaded only after a scoped spawn hook is installed. The
 hook captures the actual native ChildProcess returned for the one expected
@@ -102,14 +139,14 @@ Those real-Chromium page tests still do not establish native quota acceptance.
 
 ## Remaining production work
 
-1. Qualify the native admission/held-descriptor and all-write-path wiring with
-   the coordinated Rust checks and an actual product fixture. No new Rust source
-   is represented as compiled by the Node results. Storage creation/attachment
-   and any old-data migration remain outside the existing experiment grant.
-2. Finish a qualified reset/recovery provider that preserves account data on
-   failure and checks writer exit before erasure. The current explicit refusal
-   is a feature boundary, not a completed reset implementation. Keep the
-   three-file published host format and existing locks/epochs.
+1. Qualify this frozen native admission/reset/lifecycle source with the queued
+   affected Rust tests, original compile/Clippy flags and fmt. Node results do
+   not compile Rust. Reuse old page/frontend acceptance only for unchanged input.
+2. Qualify the actual managed Chromium writer shutdown path against the retained
+   approved synthetic fixture. No test requires deploying on a real profile.
+   Reset filesystem failure/retry tests use private synthetic directories; the
+   backing and old synthetic baseline must not be erased to run those tests.
+   The three-file published host format and existing locks/epochs stay intact.
 3. Revalidate the outside-quota control fence and stable account lock through
    full-volume errors, restart and unknown writer recovery. Keep metadata
    bounded; do not turn it into a page-data journal or clear it on uncertainty.
@@ -127,6 +164,18 @@ Those real-Chromium page tests still do not establish native quota acceptance.
    unsupported/fail-closed behavior. This Mac proposal cannot certify their
    native runtime. No driver, privilege grant, system quota or mount setup on
    those platforms is authorized by this preparation.
+7. Decide the supported first-use/platform boundary before enabling this change
+   broadly. Existing-envelope admission is implemented; automatic fresh backing
+   preparation and post-reboot reattachment are not. A minimal future executor
+   would hold the native account/reset lease, create only a nonexistent private
+   536870912-byte backing, set the 402653184-byte quota at first format, and
+   verify actual OS identity before a writer starts. Its bounded pending journal
+   must preserve uncertain create/attach outcomes without overwrite, retry,
+   forced detach, migration or permission escalation. This is source work, not
+   a requirement to perform a production operation for code merge. Current
+   Windows/Linux refusal preserves files but disables the new browser path;
+   it is not claimed as nonbreaking cross-platform support. A Mac-only scope
+   must be accepted explicitly if the original four-platform promise changes.
 
 ## Approved actual Chromium experiment
 

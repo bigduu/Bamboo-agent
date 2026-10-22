@@ -5,7 +5,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
 const { IMAGE_BYTES, QUOTA_BYTES, ACCOUNT_KEY, macSharedStoragePlan,
-  validateMacStorageObservation, inspectMacSharedStorage } = require('./browser-storage-envelope.cjs');
+  validateMacStorageObservation, inspectMacSharedStorage,
+  validateMacStorageResetObservation, inspectMacStorageForReset } = require('./browser-storage-envelope.cjs');
 
 // Inert normalized observations only: no image, mount, browser or native
 // writer is created. These checks do not establish a real storage boundary.
@@ -50,6 +51,47 @@ test('a structurally valid observation grants neither launch, writer exit nor de
   assert.equal(result.launchAuthorized, false);
   assert.equal(result.writerExitProven, false);
   assert.equal(result.detachAuthorized, false);
+});
+
+test('reset identity can inspect a full volume without authorizing launch or erasure', () => {
+  const { plan, observation } = fixture(); observation.volume.usedBytes = QUOTA_BYTES;
+  assert.throws(() => validateMacStorageObservation(plan, observation));
+  const result = validateMacStorageResetObservation(plan, observation);
+  assert.equal(result.kind, 'validated_mac_storage_reset_observation_v1');
+  assert.equal(result.launchAuthorized, false);
+  assert.equal(result.writerExitProven, false);
+  assert.equal(result.detachAuthorized, false);
+});
+
+test('reset identity retains backing, quota and no-follow path checks at capacity', () => {
+  for (const mutate of [x => { x.paths.profile.symlink = true; },
+    x => { x.attachment.imagePath += '.other'; }, x => { x.volume.quotaBytes += 1; },
+    x => { x.image.format = 'SPRS'; }, x => { x.volume.usedBytes = IMAGE_BYTES + 1; }]) {
+    const { plan, observation } = fixture(); observation.volume.usedBytes = QUOTA_BYTES;
+    mutate(observation);
+    assert.throws(() => validateMacStorageResetObservation(plan, observation));
+  }
+});
+
+test('reset inspector uses only the same four native read operations on a full volume', () => {
+  const f = nativeFixture(); f.replies.apfs.Containers[0].Volumes[0].CapacityInUse = QUOTA_BYTES;
+  const result = inspectMacStorageForReset(f.plan, f.readers);
+  assert.equal(result.validation.kind, 'validated_mac_storage_reset_observation_v1');
+  assert.equal(f.calls.length, 4);
+  assert.ok(f.calls.every(([, verb]) => ['imageinfo', 'info', 'apfs'].includes(verb)));
+});
+
+test('private inspection helper refuses malformed args and missing backing without starting a browser', () => {
+  const { spawnSync } = require('node:child_process');
+  const host = path.join(__dirname, '../browser-runtime/host.cjs');
+  for (const args of [['--storage-reset-inspect-v1'], ['--storage-inspect-v1', 'relative'],
+    ['--storage-reset-inspect-v1', '/synthetic/nonexistent-owned-data-root'], ['--unknown']]) {
+    const result = spawnSync(process.execPath, [host, ...args], { encoding: 'utf8', timeout: 2000,
+      env: { PATH: '/usr/bin:/bin' } });
+    assert.equal(result.status, 2);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, 'browser storage inspection unavailable\n');
+  }
 });
 
 for (const [name, mutate] of [

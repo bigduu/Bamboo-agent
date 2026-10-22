@@ -3,6 +3,58 @@ use super::*;
 
 const UNKNOWN_WRITERS: &str = ".bamboo-profile-writer-exit-unconfirmed";
 
+#[tokio::test]
+async fn managed_group_barrier_refuses_live_members_and_accepts_only_reaped_empty_group() {
+    assert!(!managed_group_exit_confirmed(true, None));
+    assert!(!managed_group_exit_confirmed(true, Some(unsafe { libc::getpgrp() })));
+    let mut command = Command::new("/bin/sleep");
+    command.arg("5").kill_on_drop(true).process_group(0);
+    let mut child = command.spawn().unwrap();
+    let group = i32::try_from(child.id().unwrap()).unwrap();
+    assert!(!managed_group_exit_confirmed(true, Some(group)));
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    assert!(managed_group_exit_confirmed(true, Some(group)));
+}
+
+#[tokio::test]
+async fn clean_node_exit_with_a_remaining_group_member_retains_active_fence_and_scratch() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join("profiles");
+    let mut lease = profile::acquire_shared(&root).unwrap();
+    lease.begin_launch().unwrap();
+    lease.begin_close().unwrap();
+    let path = lease.path.clone();
+    let scratch = tempfile::Builder::new().tempdir_in(home.path()).unwrap();
+    let scratch_path = scratch.path().to_path_buf();
+    std::fs::write(scratch_path.join("sentinel"), b"synthetic").unwrap();
+    // This controlled child stands in for Node: it exits 0 while a synthetic
+    // member remains in its own group. That member only sleeps and naturally
+    // exits; it never writes a profile or any user data.
+    let mut command = Command::new("/usr/bin/python3");
+    command.arg("-c").arg("import os,time\nif os.fork() == 0:\n time.sleep(2)\n os._exit(0)\nos._exit(0)")
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true)
+        .process_group(0);
+    let mut child = command.spawn().unwrap();
+    let group = i32::try_from(child.id().unwrap()).unwrap();
+    assert!(child.wait().await.unwrap().success());
+    assert!(!managed_group_exit_confirmed(true, Some(group)));
+    let cleanup = Arc::new(BrowserCleanup {
+        session: Mutex::new(Weak::new()), done: watch::channel(false).0,
+        quarantined: Mutex::new(Vec::new()), unconfirmed_writers: Arc::new(AtomicBool::new(false)),
+        writer_admission: Arc::new(Mutex::new(())),
+    });
+    BrowserReaper { child: Arc::new(Mutex::new(child)), cleanup: cleanup.clone(),
+        lease: Some(lease), temp_dir: Some(scratch), stdin: None, process_group: Some(group),
+        group_exit_required: true, graceful: true, marked: true, clean_host_exit: false }.reap();
+    assert!(cleanup.is_quarantined());
+    assert!(path.join(profile::LAUNCH_ACTIVE).is_file());
+    assert!(profile_lock_is_held(&path));
+    assert_eq!(std::fs::read(scratch_path.join("sentinel")).unwrap(), b"synthetic");
+    // Let the non-writing fixture finish naturally before dropping temp data.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+}
+
 fn fixture(
     home: &std::path::Path,
     lifecycle: &BrowserLifecycle,

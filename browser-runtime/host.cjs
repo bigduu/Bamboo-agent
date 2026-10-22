@@ -87,6 +87,16 @@ function privateDirectory(value, expectedPath, device, owner) {
 // path descriptors. Caller JSON, an old receipt or a mount path alone is not
 // evidence. Passing this structural check never authorizes launch or detach.
 function validateMacStorageObservation(plan, value) {
+  return validateMacStorageIdentity(plan, value, false);
+}
+
+// Reset may reclaim a full volume, but uses every other backing/path check.
+// This separate entry point cannot weaken the launch admission predicate.
+function validateMacStorageResetObservation(plan, value) {
+  return validateMacStorageIdentity(plan, value, true);
+}
+
+function validateMacStorageIdentity(plan, value, resetting) {
   assert.ok(isDeepStrictEqual(plan, macSharedStoragePlan(plan.dataRoot)), 'Storage plan changed');
   keys(value, ['ownerUid', 'image', 'attachment', 'volume', 'mount', 'paths']);
   assert.ok(Number.isSafeInteger(value.ownerUid) && value.ownerUid >= 0);
@@ -110,7 +120,8 @@ function validateMacStorageObservation(plan, value) {
   assert.match(volume.deviceIdentifier, /^disk[0-9]+s[0-9]+$/);
   assert.equal(volume.quotaBytes, QUOTA_BYTES);
   assert.ok(Number.isSafeInteger(volume.usedBytes) && volume.usedBytes >= 0 &&
-    volume.usedBytes < QUOTA_BYTES, 'Full or unconfirmed storage refuses admission');
+    (resetting ? volume.usedBytes <= IMAGE_BYTES : volume.usedBytes < QUOTA_BYTES),
+  'Full or unconfirmed storage refuses admission');
   assert.equal(volume.filesystem, 'apfs');
   assert.equal(volume.writable, true);
   keys(value.attachment, ['imagePath', 'volumeDevice', 'volumeUuid', 'mountPoint']);
@@ -127,7 +138,8 @@ function validateMacStorageObservation(plan, value) {
   for (const [role, target] of Object.entries(plan.paths)) {
     privateDirectory(value.paths[role], target, mount.device, value.ownerUid);
   }
-  return { kind: 'validated_mac_storage_observation_v1', image: plan.image,
+  return { kind: resetting ? 'validated_mac_storage_reset_observation_v1' :
+    'validated_mac_storage_observation_v1', image: plan.image,
     volumeUuid: volume.uuid, imageBytes: IMAGE_BYTES, quotaBytes: QUOTA_BYTES,
     launchAuthorized: false, writerExitProven: false, detachAuthorized: false };
 }
@@ -146,6 +158,14 @@ function readMacPlist(executable, arguments_) {
 }
 
 function inspectMacSharedStorage(plan, readers = {}) {
+  return inspectMacStorageIdentity(plan, readers, false);
+}
+
+function inspectMacStorageForReset(plan, readers = {}) {
+  return inspectMacStorageIdentity(plan, readers, true);
+}
+
+function inspectMacStorageIdentity(plan, readers, resetting) {
   assert.ok(isDeepStrictEqual(plan, macSharedStoragePlan(plan.dataRoot)), 'Storage plan changed');
   const filesystem = readers.filesystem || nativeFs;
   const read = readers.readPlist || readMacPlist;
@@ -199,7 +219,8 @@ function inspectMacSharedStorage(plan, readers = {}) {
     attachment: { imagePath: images[0]['image-path'], volumeDevice: info.DeviceIdentifier,
       volumeUuid: info.VolumeUUID, mountPoint: info.MountPoint },
   };
-  return { observation, validation: validateMacStorageObservation(plan, observation) };
+  return { observation, validation: resetting ? validateMacStorageResetObservation(plan, observation) :
+    validateMacStorageObservation(plan, observation) };
 }
 
 
@@ -256,8 +277,29 @@ function productionStorageSettings(environment = process.env, readers = {}) {
     // Only metadata names are inspected. Never copy, parse or remove an old
     // cookie/database; its presence requires a separately approved migration.
     const entries = filesystem.readdirSync(control);
-    if (entries.some(name => name !== '.bamboo-profile.lock')) {
+    if (entries.some(name => name !== '.bamboo-profile.lock' &&
+        name !== '.bamboo-profile-launch-active-v1')) {
       throw storageUnavailable('browser_storage_migration_required');
+    }
+    // Correlate this owned launch with the native durable fence. This UUID is
+    // not authentication or proof of all-writer exit. A fresh owner must never
+    // adopt a previous launch simply because its process-local locks vanished.
+    let descriptor;
+    try {
+      const generation = environment.BAMBOO_BROWSER_STORAGE_GENERATION;
+      assert.match(generation, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+      descriptor = filesystem.openSync(path.join(control, '.bamboo-profile-launch-active-v1'),
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      const metadata = filesystem.fstatSync(descriptor);
+      assert.ok(metadata.isFile() && metadata.uid === owner &&
+        (metadata.mode & 0o777) === 0o600 && metadata.size <= 128);
+      const bytes = Buffer.alloc(129);
+      const length = filesystem.readSync(descriptor, bytes, 0, bytes.length, 0);
+      assert.equal(bytes.subarray(0, length).toString('utf8'), `BAMBOO_BROWSER_LAUNCH_V1\n${generation}\n`);
+    } catch (error) {
+      throw storageUnavailable('browser_storage_launch_fence_invalid', error);
+    } finally {
+      if (descriptor !== undefined) filesystem.closeSync(descriptor);
     }
     assert.equal(environment.BAMBOO_BROWSER_PROFILE_DIR, plan.paths.profile);
     for (const [name, role] of Object.entries({ HOME: 'home', XDG_CACHE_HOME: 'cache',
@@ -271,6 +313,10 @@ function productionStorageSettings(environment = process.env, readers = {}) {
       assert.equal(environment[name], scratch);
     }
     const inspected = (readers.inspect || inspectMacSharedStorage)(plan, readers);
+    if (environment.BAMBOO_BROWSER_STORAGE_VOLUME_UUID !== undefined) {
+      assert.equal(inspected.observation.volume.uuid.toLowerCase(),
+        environment.BAMBOO_BROWSER_STORAGE_VOLUME_UUID.toLowerCase());
+    }
     const device = inspected.observation.mount.device;
     assert.notEqual(controlStat.dev, device, 'Control fences must remain outside full storage');
     privatePath(scratch, device);
@@ -4042,7 +4088,26 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().catch(async error => {
+  const arguments_ = process.argv.slice(2);
+  if (arguments_.length) {
+    // Native reset uses this read-only helper under its exclusive stable gate.
+    // It neither imports Playwright nor creates/mounts/erases storage. Its JSON
+    // is not an erasure grant; the native owner still holds and verifies paths.
+    try {
+      assert.equal(arguments_.length, 2);
+      assert.ok(['--storage-inspect-v1', '--storage-reset-inspect-v1'].includes(arguments_[0]));
+      assert.equal(process.platform, 'darwin');
+      const plan = macSharedStoragePlan(arguments_[1]);
+      const result = arguments_[0] === '--storage-reset-inspect-v1' ?
+        inspectMacStorageForReset(plan) : inspectMacSharedStorage(plan);
+      process.stdout.write(JSON.stringify({ kind: result.validation.kind,
+        volumeUuid: result.validation.volumeUuid, imageBytes: IMAGE_BYTES, quotaBytes: QUOTA_BYTES,
+        mountDevice: result.observation.mount.device, imageDevice: result.observation.image.device }) + '\n');
+    } catch {
+      process.stderr.write('browser storage inspection unavailable\n');
+      process.exitCode = 2;
+    }
+  } else main().catch(async error => {
     process.stderr.write(`browser host failed: ${error.message || error}\n`);
     process.exitCode = 1;
     await closeHost().catch(() => {});
@@ -4050,5 +4115,6 @@ if (require.main === module) {
 } else {
   module.exports = { installScriptBlobCapture, installDownloadLinkInspector,
     IMAGE_BYTES, QUOTA_BYTES, ACCOUNT_KEY, macSharedStoragePlan,
-    validateMacStorageObservation, inspectMacSharedStorage };
+    validateMacStorageObservation, inspectMacSharedStorage,
+    validateMacStorageResetObservation, inspectMacStorageForReset };
 }

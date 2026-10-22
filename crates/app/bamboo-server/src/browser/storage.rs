@@ -8,6 +8,8 @@ use super::BrowserError;
 #[cfg(any(target_os = "macos", test))]
 use super::profile;
 
+pub(super) mod reset;
+
 #[cfg(target_os = "macos")]
 const IMAGE_BYTES: u64 = 536_870_912;
 
@@ -22,25 +24,12 @@ pub(super) struct Launch {
     pub(super) temporary: PathBuf,
     // Keep the actually opened mount/path descriptors with the account lease,
     // including quarantine. No Drop implementation detaches or removes them.
-    _directories: Vec<std::fs::File>,
+    _directories: Vec<(PathBuf, std::fs::File)>,
+    reset_volume_uuid: Option<String>,
 }
 
 fn unavailable(reason: &str) -> BrowserError {
     BrowserError::Unavailable(reason.into())
-}
-
-// Until a platform reset provider is qualified, a full canonical reset must
-// refuse before deleting history/control and falsely claiming browser erasure.
-// This check inspects metadata only and never detaches or removes a volume.
-pub(super) fn guard_reset(profile_root: &Path) -> Result<(), BrowserError> {
-    let root = profile_root
-        .parent()
-        .ok_or_else(|| unavailable("browser_storage_control_invalid"))?
-        .join("browser-storage-v1");
-    match std::fs::symlink_metadata(root) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        _ => Err(unavailable("browser_storage_reset_requires_qualified_owner")),
-    }
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -66,6 +55,7 @@ fn layout(control: &Path) -> Result<Launch, BrowserError> {
         data: mount.join("data"),
         temporary: mount.join("tmp"),
         _directories: Vec::new(),
+        reset_volume_uuid: None,
     })
 }
 
@@ -77,16 +67,25 @@ impl Launch {
 
     #[cfg(target_os = "macos")]
     pub(super) fn admit(control: &Path) -> Result<Self, BrowserError> {
+        let mut launch = Self::pin_existing(control, true)?;
+        launch.reset_volume_uuid = reset::launch_volume_uuid(&launch.data_root)?;
+        Ok(launch)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pin_existing(control: &Path, check_control: bool) -> Result<Self, BrowserError> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
         let mut launch = layout(control)?;
         // Inspect names only; never read cookies or import an old database.
-        for entry in std::fs::read_dir(control)
-            .map_err(|_| unavailable("browser_storage_control_invalid"))?
-        {
-            let entry = entry.map_err(|_| unavailable("browser_storage_control_invalid"))?;
-            if entry.file_name() != ".bamboo-profile.lock" {
-                return Err(unavailable("browser_storage_migration_required"));
+        if check_control {
+            for entry in std::fs::read_dir(control)
+                .map_err(|_| unavailable("browser_storage_control_invalid"))?
+            {
+                let entry = entry.map_err(|_| unavailable("browser_storage_control_invalid"))?;
+                if entry.file_name() != ".bamboo-profile.lock" {
+                    return Err(unavailable("browser_storage_migration_required"));
+                }
             }
         }
         let root = launch.data_root.join("browser-storage-v1");
@@ -108,16 +107,19 @@ impl Launch {
         if mount_metadata.dev() == image_metadata.dev() {
             return Err(unavailable("browser_storage_provider_not_ready"));
         }
-        let control_metadata = std::fs::symlink_metadata(control)
+        let control_metadata = std::fs::symlink_metadata(control.parent().ok_or_else(||
+            unavailable("browser_storage_control_invalid"))?)
             .map_err(|_| unavailable("browser_storage_control_invalid"))?;
         if control_metadata.dev() == mount_metadata.dev() {
             return Err(unavailable("browser_storage_control_inside_quota"));
         }
         let downloads = mount.join("downloads");
+        let profiles = mount.join("profiles");
         for path in [
             &launch.data_root,
             &root,
             &mount,
+            &profiles,
             &launch.profile,
             &launch.home,
             &launch.cache,
@@ -141,7 +143,7 @@ impl Launch {
             {
                 return Err(unavailable("browser_storage_path_invalid"));
             }
-            launch._directories.push(directory);
+            launch._directories.push((path.to_path_buf(), directory));
         }
         Ok(launch)
     }
@@ -155,6 +157,9 @@ impl Launch {
             .env("XDG_CACHE_HOME", &self.cache)
             .env("XDG_CONFIG_HOME", &self.config)
             .env("XDG_DATA_HOME", &self.data);
+        if let Some(uuid) = &self.reset_volume_uuid {
+            command.env("BAMBOO_BROWSER_STORAGE_VOLUME_UUID", uuid);
+        }
     }
 }
 
@@ -203,7 +208,7 @@ mod tests {
         std::fs::create_dir(&storage).unwrap();
         let marker = storage.join("synthetic-backing-not-a-disk-image");
         std::fs::write(&marker, b"must remain unchanged").unwrap();
-        assert!(guard_reset(&home.path().join("browser-profiles")).is_err());
+        assert!(reset::Owner::prepare(&home.path().join("browser-profiles")).is_err());
         assert_eq!(std::fs::read(marker).unwrap(), b"must remain unchanged");
     }
 
