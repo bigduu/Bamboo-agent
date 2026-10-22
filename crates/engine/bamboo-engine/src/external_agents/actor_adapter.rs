@@ -607,6 +607,7 @@ async fn append_fenced_remote_reply(
         .append_actor_transcript(bamboo_storage::ActorTranscriptAppend {
             fence: fence.clone(),
             expected_created_at: session.created_at,
+            expected_conversation_generation: session.conversation_generation_observation(),
             expected_messages: session.messages.clone(),
             expected_provider_transcript: session.provider_transcript.clone(),
             messages: vec![message],
@@ -4316,6 +4317,9 @@ impl ExternalChildRunner for ActorChildRunner {
                             .append_actor_transcript(bamboo_storage::ActorTranscriptAppend {
                                 fence: activation.fence.clone(),
                                 expected_created_at: activation.created_at,
+                                expected_conversation_generation: activation
+                                    .conversation_generation
+                                    .clone(),
                                 expected_messages: session.messages.clone(),
                                 expected_provider_transcript: activation
                                     .provider_transcript
@@ -4452,6 +4456,7 @@ struct PlainActorActivation {
     fence: ActorActivationFence,
     inbox_generation: u64,
     created_at: chrono::DateTime<chrono::Utc>,
+    conversation_generation: bamboo_domain::ConversationGenerationObservation,
     provider_transcript: bamboo_domain::ProviderTranscriptState,
     input_consumer: SessionInboxConsumerId,
     input_deadline: chrono::DateTime<chrono::Utc>,
@@ -4777,6 +4782,7 @@ impl PlainActorActivation {
                 fence: claimed.fence(),
                 inbox_generation: claimed.inbox_generation,
                 created_at: session.created_at,
+                conversation_generation: session.conversation_generation_observation(),
                 provider_transcript: session.provider_transcript.clone(),
                 input_consumer,
                 input_deadline,
@@ -4998,6 +5004,7 @@ impl PlainActorActivation {
             let request = bamboo_storage::ActorInputCheckpoint {
                 fence: self.fence.clone(),
                 expected_created_at: self.created_at,
+                expected_conversation_generation: self.conversation_generation.clone(),
                 claim: claim.clone(),
                 expected_messages: session.messages.clone(),
                 expected_provider_transcript: session.provider_transcript.clone(),
@@ -5077,6 +5084,7 @@ impl PlainActorActivation {
             let request = bamboo_storage::ActorTranscriptAppend {
                 fence: self.fence.clone(),
                 expected_created_at: self.created_at,
+                expected_conversation_generation: self.conversation_generation.clone(),
                 expected_messages: session.messages.clone(),
                 expected_provider_transcript: self.provider_transcript.clone(),
                 messages: vec![message.clone()],
@@ -5301,6 +5309,7 @@ impl PlainActorActivation {
                 let checkpoint = bamboo_storage::ActorInputCheckpoint {
                     fence: self.fence.clone(),
                     expected_created_at: self.created_at,
+                    expected_conversation_generation: self.conversation_generation.clone(),
                     claim: claim.clone(),
                     expected_messages: actual.messages.clone(),
                     expected_provider_transcript: actual.provider_transcript.clone(),
@@ -5872,6 +5881,7 @@ async fn commit_local_tool_history(
         || latest.parent_session_id != session.parent_session_id
         || latest.spawn_depth != session.spawn_depth
         || latest.project_id_meta() != session.project_id_meta()
+        || session.check_conversation_generation(&latest).is_err()
         || serde_json::to_value(&latest.provider_transcript)
             .map_err(|_| local_tool_history_unsupported())?
             != serde_json::to_value(&session.provider_transcript)
@@ -5909,10 +5919,11 @@ async fn commit_local_tool_history(
         .await
         .map_err(|_| local_tool_history_unsupported())?
         .ok_or_else(local_tool_history_unsupported)?;
-    if serde_json::to_value(&saved.provider_transcript)
-        .map_err(|_| local_tool_history_unsupported())?
-        != serde_json::to_value(&latest.provider_transcript)
+    if session.check_conversation_generation(&saved).is_err()
+        || serde_json::to_value(&saved.provider_transcript)
             .map_err(|_| local_tool_history_unsupported())?
+            != serde_json::to_value(&latest.provider_transcript)
+                .map_err(|_| local_tool_history_unsupported())?
     {
         return Err(local_tool_history_unsupported());
     }
@@ -6177,6 +6188,13 @@ async fn reconcile_already_admitted_claim(
                 session.id
             ))
         })?;
+    session
+        .check_conversation_generation(&latest)
+        .map_err(|error| {
+            AgentError::LLM(format!(
+                "canonical SessionInbox conversation changed: {error}"
+            ))
+        })?;
     let Some(message) = latest
         .messages
         .iter()
@@ -6246,6 +6264,7 @@ async fn checkpoint_and_ack_canonical_claim(
                 bamboo_storage::ActorClaimContextSeed {
                     fence: fence.clone(),
                     expected_created_at: session.created_at,
+                    expected_conversation_generation: session.conversation_generation_observation(),
                     expected_messages: session.messages.clone(),
                     expected_provider_transcript: session.provider_transcript.clone(),
                     expected_admission: session.session_inbox_admission().cloned(),
@@ -6379,7 +6398,9 @@ fn concrete_file_inbox(
 
 async fn adopt_latest_actor_context(store: &bamboo_storage::SessionStoreV2, session: &mut Session) {
     if let Ok(Some(latest)) = store.load_session(&session.id).await {
-        if latest.created_at == session.created_at {
+        if latest.created_at == session.created_at
+            && session.check_conversation_generation(&latest).is_ok()
+        {
             bamboo_domain::merge_session_inbox_admission(session, &latest);
             session.messages = latest.messages;
             session.provider_transcript = latest.provider_transcript;
@@ -6459,6 +6480,7 @@ async fn checkpoint_claim_context_before_dispatch(
                 bamboo_storage::ActorClaimContextSeed {
                     fence: fence.clone(),
                     expected_created_at: session.created_at,
+                    expected_conversation_generation: session.conversation_generation_observation(),
                     expected_messages: session.messages.clone(),
                     expected_provider_transcript: session.provider_transcript.clone(),
                     expected_admission: session.session_inbox_admission().cloned(),
@@ -13218,6 +13240,7 @@ mod tests {
                 .checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
                     fence: old.fence(),
                     expected_created_at: child.created_at,
+                    expected_conversation_generation: child.conversation_generation_observation(),
                     claim: claim.clone(),
                     expected_messages: child.messages.clone(),
                     expected_provider_transcript: child.provider_transcript.clone(),
@@ -13410,6 +13433,7 @@ mod tests {
                 .checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
                     fence: old.fence(),
                     expected_created_at: child.created_at,
+                    expected_conversation_generation: child.conversation_generation_observation(),
                     claim: claim.clone(),
                     expected_messages: child.messages.clone(),
                     expected_provider_transcript: child.provider_transcript.clone(),
@@ -13898,6 +13922,7 @@ mod tests {
             .checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
                 fence: activation.fence.clone(),
                 expected_created_at: child.created_at,
+                expected_conversation_generation: child.conversation_generation_observation(),
                 claim: claim.clone(),
                 expected_messages: child.messages.clone(),
                 expected_provider_transcript: child.provider_transcript.clone(),

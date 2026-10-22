@@ -568,6 +568,14 @@ impl SessionStoreV2 {
                 compact_main::validate_full_main(&main_bytes)?;
                 let main: Session = serde_json::from_slice(&main_bytes)?;
                 let side: Session = serde_json::from_slice(&side_bytes)?;
+                // A nonzero conversation already belongs to the new reset
+                // protocol. Missing proof is recovery-required, never a legacy
+                // migration even when both files happen to match.
+                if main.conversation_reset.is_some() || side.conversation_reset.is_some() {
+                    return Err(conflict(
+                        "nonzero conversation proof cannot be reconstructed by migration",
+                    ));
+                }
                 Self::validate_root_tool_authority_pair(
                     &RootToolAuthorityMain::from(&main),
                     &side,

@@ -53,6 +53,8 @@ impl ChildActorWriteProof {
             .map_err(conflict)?;
         let mut side: Session = actor_transcript::decode(&side).map_err(conflict)?;
         supervisor::validate_overlay(&main, Some(&side)).map_err(conflict)?;
+        main.check_conversation_generation(&side)
+            .map_err(conflict)?;
         for s in [&mut main, &mut side] {
             if s.kind == SessionKind::Root && s.root_session_id.is_empty() {
                 s.root_session_id = s.id.clone();
@@ -164,7 +166,10 @@ impl ChildActorWriteProof {
 
     pub(super) fn validate_candidate(&self, incoming: &Session) -> io::Result<()> {
         self.identity(incoming)?;
-        self.validate().map(|_| ())
+        let durable = self.validate()?;
+        incoming
+            .check_conversation_generation(&durable)
+            .map_err(conflict)
     }
 
     /// Normalize only this live Child execution's own clarification checkpoint.

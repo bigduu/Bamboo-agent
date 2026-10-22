@@ -374,3 +374,267 @@ async fn stale_merge_checkpoint_and_timestamp_newer_response_cache_do_not_publis
     drop(store);
     fixture.finish().await;
 }
+
+async fn running_generation_root(fixture: &Fixture) -> bamboo_domain::ActorActivationFence {
+    use bamboo_domain::ActorDirectoryPort;
+    let now = Utc::now();
+    let activation = fixture
+        .store
+        .claim_activation(&bamboo_domain::ActorActivationClaim {
+            actor_id: fixture.canonical.id.clone(),
+            run_id: "generation-run".into(),
+            lease_owner: "generation-host".into(),
+            lease_expires_at: now + chrono::Duration::minutes(5),
+            inbox_generation: 0,
+            placement_ref: None,
+            now,
+        })
+        .await
+        .unwrap();
+    fixture
+        .store
+        .start_activation(&activation.fence(), now)
+        .await
+        .unwrap();
+    activation.fence()
+}
+
+#[tokio::test]
+async fn a_fresh_actor_lease_cannot_refresh_an_old_root_writer_observation() {
+    let fixture = Fixture::new().await;
+    let fence = running_generation_root(&fixture).await;
+    let stale_owner = bamboo_domain::RootActorRuntimeWrite {
+        fence: fence.clone(),
+        created_at: fixture.original.created_at,
+        conversation_generation: fixture.original.conversation_generation_observation(),
+    };
+    let directory = fixture.store.sessions_root_dir().join(&fixture.original.id);
+    let before = fixture.files().await;
+    assert_conflict(
+        root_actor_runtime::RootActorWriteProof::new(directory.clone(), stale_owner)
+            .validate()
+            .unwrap_err(),
+    );
+    let current_owner = bamboo_domain::RootActorRuntimeWrite {
+        fence,
+        created_at: fixture.canonical.created_at,
+        conversation_generation: fixture.canonical.conversation_generation_observation(),
+    };
+    let proof = root_actor_runtime::RootActorWriteProof::new(directory, current_owner);
+    assert!(proof.validate().is_ok());
+    assert_conflict(proof.validate_candidate(&fixture.original).unwrap_err());
+    assert_eq!(fixture.files().await, before);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn raw_actor_append_and_model_context_reject_an_old_generation_without_writes() {
+    let fixture = Fixture::new().await;
+    let fence = running_generation_root(&fixture).await;
+    let before = fixture.files().await;
+    let mut request = ActorTranscriptAppend {
+        fence: fence.clone(),
+        expected_created_at: fixture.canonical.created_at,
+        expected_conversation_generation: fixture.original.conversation_generation_observation(),
+        // Make prefix equality insufficient by supplying the current prefix;
+        // the original execution observation must independently remain frozen.
+        expected_messages: fixture.canonical.messages.clone(),
+        expected_provider_transcript: fixture.canonical.provider_transcript.clone(),
+        messages: vec![Message::assistant("new generation reply", None)],
+        native_groups: vec![],
+    };
+    assert!(matches!(
+        fixture.store.append_actor_transcript(request.clone()).await,
+        Err(ActorTranscriptAppendError::ConversationChanged)
+    ));
+    assert_eq!(fixture.files().await, before);
+    let mut expected = fixture.canonical.clone();
+    expected.conversation_reset = None;
+    let model_request = ActorModelContextCheckpoint {
+        fence,
+        expected,
+        candidate: fixture.canonical.model_context_state.clone().unwrap(),
+        snapshot_blocks: vec![],
+    };
+    assert!(matches!(
+        fixture
+            .store
+            .checkpoint_actor_model_context(model_request)
+            .await,
+        Err(ActorModelContextError::SnapshotConflict)
+    ));
+    assert_eq!(fixture.files().await, before);
+    request.expected_conversation_generation =
+        fixture.canonical.conversation_generation_observation();
+    let committed = fixture
+        .store
+        .append_actor_transcript(request)
+        .await
+        .unwrap();
+    assert_eq!(
+        committed.conversation_reset,
+        fixture.canonical.conversation_reset
+    );
+    assert_eq!(
+        committed.messages.len(),
+        fixture.canonical.messages.len() + 1
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn raw_actor_input_refuses_a_stale_observation_before_admission_or_claim_ack() {
+    use bamboo_domain::{ActorDirectoryPort, SessionInboxPort};
+    let fixture = Fixture::new().await;
+    let store = Arc::new(
+        SessionStoreV2::new(fixture.home.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let inbox =
+        crate::FileSessionInbox::new(store.clone(), bamboo_domain::SessionInboxLimits::default());
+    let envelope = bamboo_domain::SessionMessageEnvelope::user_input(
+        &fixture.canonical.id,
+        "synthetic new input",
+    );
+    inbox
+        .deliver_with_activation_intent(
+            &envelope,
+            bamboo_domain::SessionActivationPolicy::RespectSpecificWait,
+            None,
+        )
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let claim = inbox
+        .claim_owned(
+            &fixture.canonical.id,
+            1,
+            None,
+            &bamboo_domain::SessionInboxLeaseRequest {
+                consumer: bamboo_domain::SessionInboxConsumerId::new(),
+                now,
+                duration: chrono::Duration::minutes(5),
+            },
+        )
+        .await
+        .unwrap()
+        .remove(0);
+    let activation = store
+        .claim_activation(&bamboo_domain::ActorActivationClaim {
+            actor_id: fixture.canonical.id.clone(),
+            run_id: "generation-input-run".into(),
+            lease_owner: claim.lease.consumer.as_str().into(),
+            lease_expires_at: claim.lease.expires_at,
+            inbox_generation: claim.claim.generation,
+            placement_ref: None,
+            now,
+        })
+        .await
+        .unwrap();
+    store
+        .start_activation(&activation.fence(), now)
+        .await
+        .unwrap();
+    let mut request = ActorInputCheckpoint {
+        fence: activation.fence(),
+        expected_created_at: fixture.canonical.created_at,
+        expected_conversation_generation: fixture.original.conversation_generation_observation(),
+        claim: claim.clone(),
+        expected_messages: fixture.canonical.messages.clone(),
+        expected_provider_transcript: fixture.canonical.provider_transcript.clone(),
+        expected_admission: fixture.canonical.session_inbox_admission().cloned(),
+    };
+    let before = fixture.files().await;
+    assert!(matches!(
+        inbox.checkpoint_actor_input(request.clone()).await,
+        Err(ActorInputCheckpointError::InvalidAuthority(
+            ActorTranscriptAppendError::ConversationChanged
+        ))
+    ));
+    assert_eq!(fixture.files().await, before);
+    assert!(!inbox
+        .was_admitted(&fixture.canonical.id, &envelope.id)
+        .await
+        .unwrap());
+    assert_eq!(
+        inbox.inspect(&fixture.canonical.id).await.unwrap().claimed,
+        1
+    );
+    request.expected_conversation_generation =
+        fixture.canonical.conversation_generation_observation();
+    let committed = inbox.checkpoint_actor_input(request).await.unwrap();
+    assert_eq!(
+        committed.session.conversation_reset,
+        fixture.canonical.conversation_reset
+    );
+    assert!(inbox
+        .was_admitted(&fixture.canonical.id, &envelope.id)
+        .await
+        .unwrap());
+    // Checkpoint is not ACK; generation validation never disposes a claim.
+    assert_eq!(
+        inbox.inspect(&fixture.canonical.id).await.unwrap().claimed,
+        1
+    );
+    store.flush_search_index().await;
+    drop(inbox);
+    drop(store);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn startup_does_not_reconstruct_a_nonzero_root_proof_when_both_marker_and_proof_are_missing()
+{
+    let fixture = Fixture::new().await;
+    let directory = fixture.store.sessions_root_dir().join(&fixture.original.id);
+    let proof = directory.join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE);
+    fs::remove_file(&proof).await.unwrap();
+    fs::remove_file(fixture.home.path().join(".root_tool_authority_proof_v1"))
+        .await
+        .unwrap();
+    let before = fixture.files().await;
+    let reopened = SessionStoreV2::new(fixture.home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert!(
+        !proof.exists(),
+        "startup manufactured a committed reset proof"
+    );
+    assert!(reopened.load_session(&fixture.canonical.id).await.is_err());
+    let after = fixture.files().await;
+    assert_eq!(before[0], after[0]);
+    assert_eq!(before[1], after[1]);
+    reopened.flush_search_index().await;
+    drop(reopened);
+    fixture.finish().await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+#[tokio::test]
+async fn retained_actor_projection_keeps_the_nonzero_ledger_in_its_checked_pair() {
+    use bamboo_domain::ActorSnapshotPort;
+    let fixture = Fixture::new().await;
+    let before = fixture.files().await;
+    // The retained-FD reader requires a canonical capability root; macOS /var
+    // is a symlink. Do not weaken the reader to fit the fixture path.
+    let retained = SessionStoreV2::new(fixture.home.path().canonicalize().unwrap())
+        .await
+        .unwrap();
+    let result = retained
+        .actor_subtree_snapshot(
+            bamboo_domain::ActorSnapshotPrincipal::host_owner(),
+            &fixture.canonical.id,
+            &fixture.canonical.id,
+            bamboo_domain::ActorSnapshotLimits::default(),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "nonzero sidecar projection was silently erased: {result:?}"
+    );
+    assert_eq!(fixture.files().await, before);
+    retained.flush_search_index().await;
+    drop(retained);
+    fixture.finish().await;
+}

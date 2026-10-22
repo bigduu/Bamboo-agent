@@ -236,6 +236,7 @@ async fn child_default_and_root_writers_remain_unprivileged() {
     let root_owner = RootActorRuntimeWrite {
         fence: f.owner.fence.clone(),
         created_at: f.base.created_at,
+        conversation_generation: f.base.conversation_generation_observation(),
     };
     assert!(f
         .a

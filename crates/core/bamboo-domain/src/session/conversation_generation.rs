@@ -6,7 +6,25 @@
 
 use sha2::{Digest, Sha256};
 
-use super::{Session, SessionKind};
+use super::{ConversationResetState, Session, SessionKind};
+
+/// Host-local data captured from the original caller. This is not serializable,
+/// is not a grant and is never refreshed from a new Actor lease. Identity and
+/// caller authority remain independently checked by their existing boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationGenerationObservation(Option<ConversationResetState>);
+
+impl ConversationGenerationObservation {
+    /// Check the whole ledger against a validated canonical Session. No context
+    /// is adopted, even when the observed revision number happens to match.
+    pub fn check_canonical(&self, canonical: &Session) -> Result<(), ConversationGenerationError> {
+        canonical.validate_conversation_state()?;
+        if self.0 != canonical.conversation_reset {
+            return Err(ConversationGenerationError::StaleGeneration);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ConversationGenerationError {
@@ -19,6 +37,11 @@ pub enum ConversationGenerationError {
 }
 
 impl Session {
+    /// Capture data only; final use validates canonical state and authority.
+    pub fn conversation_generation_observation(&self) -> ConversationGenerationObservation {
+        ConversationGenerationObservation(self.conversation_reset.clone())
+    }
+
     /// Observation only, never an authority grant. Invalid ledgers are rejected
     /// by `validate_conversation_state` and final canonical writer checks.
     pub fn conversation_revision(&self) -> u64 {

@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 pub struct ActorTranscriptAppend {
     pub fence: ActorActivationFence,
     pub expected_created_at: DateTime<Utc>,
+    pub expected_conversation_generation: bamboo_domain::ConversationGenerationObservation,
     pub expected_messages: Vec<Message>,
     pub expected_provider_transcript: ProviderTranscriptState,
     pub messages: Vec<Message>,
@@ -38,6 +39,8 @@ pub enum ActorTranscriptAppendError {
     InvalidSource,
     #[error("Actor transcript prefix changed; reload the durable snapshot")]
     PrefixConflict,
+    #[error("Actor conversation generation changed; reload the complete canonical Session")]
+    ConversationChanged,
     #[error("Actor transcript append payload is unsupported or has colliding identities")]
     UnsupportedPayload,
     #[error("Actor transcript native counter cannot advance")]
@@ -133,6 +136,8 @@ impl Source {
         let mut main: Session = decode(raw.as_bytes())?;
         let mut side: Session = decode(&side_bytes)?;
         supervisor::validate_overlay(&main, Some(&side))?;
+        main.check_conversation_generation(&side)
+            .map_err(|_| ActorTranscriptAppendError::InvalidSource)?;
         object(&raw)?;
         object(
             std::str::from_utf8(&side_bytes)
@@ -198,6 +203,15 @@ impl Source {
             && self.record_bytes == other.record_bytes
             && self.marker_bytes == other.marker_bytes
             && self.proof_bytes == other.proof_bytes
+    }
+
+    pub(super) fn require_conversation_generation(
+        &self,
+        expected: &bamboo_domain::ConversationGenerationObservation,
+    ) -> Result<()> {
+        expected
+            .check_canonical(&self.main)
+            .map_err(|_| ActorTranscriptAppendError::ConversationChanged)
     }
 }
 
@@ -498,6 +512,7 @@ impl SessionStoreV2 {
             })())
         })
         .await??;
+        source.require_conversation_generation(&request.expected_conversation_generation)?;
         let lineage = self.validate_actor_lineage(&source.entry.actor).await?;
         actor_checkpoint_lineage::validate_recorded_observations(
             &source.entry.actor.ancestor_observations,
