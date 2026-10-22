@@ -1145,6 +1145,81 @@ struct LegacyProbe {
 }
 struct LegacyProvider(Arc<LegacyProbe>);
 
+/// Observe the current typed ledger event in the actual provider request.
+/// The current event carries scope; earlier Workspace snapshots remain
+/// chronological history with an explicit superseding revision.
+fn assert_legacy_prompt_workspace_b(
+    messages: &[Message],
+    actual: &Session,
+    probe: &LegacyProbe,
+) -> usize {
+    let ledger = actual
+        .model_context_state
+        .as_ref()
+        .expect("durable model context");
+    let workspace_type = bamboo_domain::ContextBlockType::Workspace;
+    let baseline = ledger
+        .baselines
+        .get(&workspace_type)
+        .expect("active Workspace baseline");
+    let event = ledger
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.block_type == workspace_type)
+        .expect("current Workspace event");
+    assert_eq!(event.epoch, ledger.prefix_epoch);
+    assert_eq!(event.kind, bamboo_domain::ModelContextEventKind::Snapshot);
+    assert_eq!(event.revision, baseline.revision);
+    assert_eq!(event.content_sha256, baseline.content_sha256);
+    let delivered: Vec<_> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.id == event.id)
+        .collect();
+    assert_eq!(
+        delivered.len(),
+        1,
+        "current Workspace event must reach the real next prompt exactly once"
+    );
+    let (index, message) = delivered[0];
+    let expected = event.render_message();
+    assert_eq!(message.role, Role::User);
+    assert_eq!(message.content, expected.content);
+    assert_eq!(message.metadata, expected.metadata);
+    let workspace_sections: Vec<_> = message
+        .content
+        .split("<!-- BAMBOO_WORKSPACE_CONTEXT_START -->")
+        .skip(1)
+        .map(|section| {
+            section
+                .split_once("<!-- BAMBOO_WORKSPACE_CONTEXT_END -->")
+                .expect("complete current Workspace section")
+                .0
+        })
+        .collect();
+    assert!(
+        !workspace_sections.is_empty(),
+        "real next prompt must carry workspace context"
+    );
+    assert_eq!(workspace_sections.len(), 1, "one current Workspace section");
+    assert!(
+        workspace_sections.iter().all(|section| {
+            section.contains(probe.b.to_str().unwrap())
+                && !section.contains(probe.a.to_str().unwrap())
+        }),
+        "only the workspace section, not Project's retained primary path, must switch to B"
+    );
+    assert!(
+        messages
+            .iter()
+            .filter(|message| message.role == Role::System)
+            .all(|message| !message.content.contains("<!-- BAMBOO_WORKSPACE_CONTEXT_START -->")),
+        "mutable Workspace context must not rewrite the invariant System prefix"
+    );
+    index
+}
+
 /// A test observation around the actual Root executor. Every registration,
 /// exact owner, permission and scheduling decision remains the inner owner's.
 /// The Host hook runs after a distinct second Read has completed, inside
@@ -1416,6 +1491,7 @@ impl LLMProvider for LegacyProvider {
         let mut trace = probe.trace.lock().unwrap();
         if probe.successor.load(Ordering::Acquire) {
             assert_eq!(actual.workspace_path_meta().as_deref(), probe.b.to_str());
+            assert_legacy_prompt_workspace_b(messages, &actual, probe);
             trace.requests += 1;
             trace.successor_requests += 1;
             return Ok(Box::pin(futures::stream::iter([
@@ -1474,29 +1550,15 @@ impl LLMProvider for LegacyProvider {
                     bamboo_agent_core::workspace_state::peek_workspace(&probe.id),
                     Some(probe.b.clone())
                 );
-                let workspace_sections: Vec<_> = messages
+                let workspace_index = assert_legacy_prompt_workspace_b(messages, &actual, probe);
+                let trigger_index = messages
                     .iter()
-                    .filter(|message| message.role == Role::System)
-                    .flat_map(|message| {
-                        message
-                            .content
-                            .split("<!-- BAMBOO_WORKSPACE_CONTEXT_START -->")
-                            .skip(1)
-                    })
-                    .map(|section| {
-                        section
-                            .split("<!-- BAMBOO_WORKSPACE_CONTEXT_END -->")
-                            .next()
-                            .unwrap()
-                    })
-                    .collect();
+                    .rposition(|message| message.tool_call_id.as_deref() == Some(LEGACY_TRIGGER))
+                    .unwrap();
                 assert!(
-                    !workspace_sections.is_empty(),
-                    "real next prompt must carry workspace context"
+                    workspace_index > trigger_index,
+                    "the new Workspace snapshot must follow the real completed trigger result"
                 );
-                assert!(workspace_sections.iter().all(|section|
-                    section.contains(probe.b.to_str().unwrap()) && !section.contains(probe.a.to_str().unwrap())),
-                    "only the workspace section, not Project's retained primary path, must switch to B");
                 (
                     LEGACY_CWD,
                     "exec_command",
