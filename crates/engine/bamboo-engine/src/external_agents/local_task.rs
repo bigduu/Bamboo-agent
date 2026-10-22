@@ -181,7 +181,7 @@ impl Execution {
 pub struct LocalTaskChildRunner {
     bindings: Mutex<Bindings>,
     executions: Mutex<HashMap<String, Arc<Execution>>>,
-    coordinators: Mutex<Vec<tokio::task::JoinHandle<Result<(), String>>>>,
+    coordinators: Mutex<Vec<CoordinatorHandle>>,
     coordinator_errors: Mutex<Vec<String>>,
     concurrency: Arc<Semaphore>,
     admission: Arc<Semaphore>,
@@ -192,6 +192,22 @@ pub struct LocalTaskChildRunner {
     remote_roles: Vec<String>,
     approval_registry: Option<super::approval_registry::SharedApprovalRegistry>,
     approval_reviewer: Option<Arc<dyn super::actor_adapter::ChildApprovalReviewer>>,
+}
+
+type CoordinatorHandle = tokio::task::JoinHandle<Result<(), String>>;
+
+/// Shutdown may be cancelled while a publication tail still owns a writer.
+/// Keep the real join handle available to the next shutdown attempt.
+struct RetainedCoordinatorJoin<'a> {
+    queue: &'a Mutex<Vec<CoordinatorHandle>>,
+    handle: Option<CoordinatorHandle>,
+}
+impl Drop for RetainedCoordinatorJoin<'_> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            lock(self.queue).push(handle);
+        }
+    }
 }
 
 fn failure(error: impl std::fmt::Display) -> AgentError {
@@ -289,6 +305,13 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl LocalTaskChildRunner {
+    fn retain_shutdown_error(&self, error: String) {
+        let mut errors = lock(&self.coordinator_errors);
+        if !errors.contains(&error) {
+            errors.push(error);
+        }
+    }
+
     pub fn new(
         config: &Config,
         ceiling: Option<Arc<dyn NativeToolCeilingSource>>,
@@ -416,7 +439,13 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         lock(&self.bindings).store = store;
     }
     fn set_ticket_service(&self, service: Option<Arc<bamboo_tickets::TicketService>>) {
-        lock(&self.bindings).tickets = service;
+        let mut bindings = lock(&self.bindings);
+        // Serialize this check with the successful drain's cache release. A
+        // late scope publisher must not reattach a writer to a closed runner.
+        if service.is_some() && self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        bindings.tickets = service;
     }
     fn set_canonical_subagent_tool(&self, tool: Option<Arc<dyn bamboo_agent_core::tools::Tool>>) {
         lock(&self.bindings).subagent = tool;
@@ -1155,7 +1184,8 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         self.closed.store(true, Ordering::Release);
         self.admission.close();
         // Preparations take a permit before observing closed. Holding all of
-        // them here closes the snapshot race with an already admitted claim.
+        // them here closes the snapshot race with an already admitted claim
+        // and serializes shutdown callers through all joins and cache release.
         let _preparations = self
             .preparations
             .acquire_many(128)
@@ -1165,16 +1195,28 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         for execution in &executions {
             execution.cancel.cancel();
         }
-        let mut errors = Vec::new();
         for execution in &executions {
             execution.wait_for_handoff().await;
         }
-        let coordinators = std::mem::take(&mut *lock(&self.coordinators));
-        for coordinator in coordinators {
-            match coordinator.await {
+        loop {
+            let next = lock(&self.coordinators).pop();
+            let Some(coordinator) = next else { break };
+            let mut retained = RetainedCoordinatorJoin {
+                queue: &self.coordinators,
+                handle: Some(coordinator),
+            };
+            let result = retained
+                .handle
+                .as_mut()
+                .expect("retained coordinator")
+                .await;
+            retained.handle.take();
+            // Record each observed error before the next await, so cancelling
+            // this caller cannot discard a completed coordinator's failure.
+            match result {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => errors.push(error),
-                Err(error) => errors.push(error.to_string()),
+                Ok(Err(error)) => self.retain_shutdown_error(error),
+                Err(error) => self.retain_shutdown_error(error.to_string()),
             }
         }
         for execution in executions {
@@ -1182,19 +1224,19 @@ impl ExternalChildRunner for LocalTaskChildRunner {
             execution.heartbeat_stop.cancel();
             if let Some(heartbeat) = execution.heartbeat.lock().await.take() {
                 if let Err(error) = heartbeat.await {
-                    errors.push(error.to_string());
+                    self.retain_shutdown_error(error.to_string());
                 }
             }
             if let Some(task) = execution.task.lock().await.take() {
                 if let Err(error) = task.await {
-                    errors.push(error.to_string());
+                    self.retain_shutdown_error(error.to_string());
                 }
             }
             if let Err(error) = execution.resources.close_and_drain().await {
-                errors.push(error.to_string());
+                self.retain_shutdown_error(error.to_string());
             }
             if lock(&execution.stop).is_none() {
-                errors.push(format!(
+                self.retain_shutdown_error(format!(
                     "{} local stop remains unconfirmed",
                     execution.owner.fence.actor_id
                 ));
@@ -1203,8 +1245,16 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         // A setup accepted before shutdown may harvest an older coordinator
         // while handing off. Read this queue only after all handoffs/joins, so
         // its retained error cannot be lost between the two snapshots.
-        errors.extend(std::mem::take(&mut *lock(&self.coordinator_errors)));
+        // A consumed failed join cannot be re-confirmed by a later empty
+        // queue. Keep observed drain failures on this closed runtime, including
+        // across cancellation; repeated shutdown is not permission to forget.
+        let errors = lock(&self.coordinator_errors).clone();
         if errors.is_empty() {
+            // Only a confirmed physical drain, including publication-tail
+            // joins, can relinquish this cached canonical writer. Unknown stop
+            // or a failed drain keeps the original service and its real lock.
+            let retired_ticket_service = lock(&self.bindings).tickets.take();
+            drop(retired_ticket_service);
             Ok(())
         } else {
             Err(errors.join("; "))
