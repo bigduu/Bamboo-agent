@@ -123,7 +123,7 @@ pub fn error_chain(error: &(dyn Error + 'static)) -> Vec<Value> {
 /// typed filesystem/Project error. It does not create another operation ID.
 pub fn record_current_error(phase: &'static str, error: &(dyn Error + 'static)) {
     tracing::warn!(target: "bamboo.workspace_handoff", phase,
-        error_chain = %Value::Array(error_chain(error)),
+        error_chain = %serde_json::Value::Array(error_chain(error)),
         "Workspace operation failed before error conversion");
 }
 
@@ -151,7 +151,7 @@ pub fn record_failure(
         run_id = ?context.run_id.map(safe_identifier),
         request_id = ?context.request_id.map(safe_identifier),
         phase,
-        error_chain = %Value::Array(error_chain(error)),
+        error_chain = %serde_json::Value::Array(error_chain(error)),
         "Execution scope operation rejected");
     id
 }
