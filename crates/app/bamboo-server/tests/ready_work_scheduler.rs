@@ -1133,6 +1133,7 @@ async fn source_change_requires_explicit_adoption_and_a_new_native_start() {
         include_cancelled: false,
         include_archived: false,
         sprint_filter: None,
+        overdue_as_of: None,
         limit: 10,
         cursor: None,
         fixed_commit: None,
