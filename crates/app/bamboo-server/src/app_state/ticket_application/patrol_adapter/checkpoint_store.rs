@@ -33,9 +33,34 @@ mod physical {
 
     type PublicationFault = Box<dyn Fn(Boundary) -> std::io::Result<()> + Send + Sync>;
 
+    struct LockedDirectory(File);
+
+    impl LockedDirectory {
+        fn acquire(directory: File) -> Result<Self, PortError> {
+            FileExt::try_lock_exclusive(&directory).map_err(|_| PortError::Conflict)?;
+            Ok(Self(directory))
+        }
+    }
+
+    impl std::ops::Deref for LockedDirectory {
+        type Target = File;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl Drop for LockedDirectory {
+        fn drop(&mut self) {
+            // A duplicated or fork-inherited descriptor may outlive this owner.
+            // Closing our descriptor alone would leave its flock held.
+            let _ = FileExt::unlock(&self.0);
+        }
+    }
+
     pub struct PatrolCheckpointStore {
         root: PathBuf,
-        directory: File,
+        directory: LockedDirectory,
         writer: File,
         poisoned: bool,
         fault: Option<PublicationFault>,
@@ -49,6 +74,10 @@ mod physical {
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(root)
                 .map_err(|_| PortError::Unavailable)?;
+            // Retain the stable directory lock for this writer's entire lifetime.
+            // Named-lock removal/replacement/restoration cannot admit a peer.
+            // Root-namespace repair and mixed-version writers require quiescence.
+            let directory = LockedDirectory::acquire(directory)?;
             let writer = open_at(
                 &directory,
                 "patrol-writer.lock",
@@ -399,6 +428,36 @@ mod physical {
         }
 
         #[test]
+        fn lock_identity_dropped_store_unlocks_a_retained_directory_descriptor() {
+            let root = root();
+            let path = canonical(&root);
+            let first = PatrolCheckpointStore::open(&path).unwrap();
+            let retained = first.directory.try_clone().unwrap();
+            drop(first);
+            let second = PatrolCheckpointStore::open(&path).unwrap();
+            assert!(retained.metadata().unwrap().is_dir());
+            drop(second);
+            drop(retained);
+        }
+
+        #[test]
+        fn lock_identity_early_error_unlocks_a_retained_directory_descriptor() {
+            let root = root();
+            let path = canonical(&root);
+            let mut retained = None;
+            let attempt = (|| -> Result<(), PortError> {
+                let directory = LockedDirectory::acquire(File::open(&path).unwrap())?;
+                retained = Some(directory.try_clone().unwrap());
+                Err(PortError::Unavailable)
+            })();
+            assert_eq!(attempt, Err(PortError::Unavailable));
+            assert!(retained.as_ref().unwrap().metadata().unwrap().is_dir());
+            let second = PatrolCheckpointStore::open(&path).unwrap();
+            drop(second);
+            drop(retained);
+        }
+
+        #[test]
         fn lock_identity_restored_inode_cannot_hide_a_competing_cas() {
             let root = root();
             let path = canonical(&root);
@@ -451,7 +510,6 @@ mod physical {
                 }
             );
         }
-
 
         #[test]
         fn publication_failure_before_rename_retains_the_old_record() {
