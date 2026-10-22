@@ -55,8 +55,32 @@ Like any ordinary update, changing `updated_seq` can affect its existing oldest-
 ordering; no priority-based scheduling policy is enabled here. These edits do not
 steer a Worker, replace a contract, invalidate submitted evidence, grant tools,
 move Sprint membership, clear a resource claim or mark work complete. Inspect and Project board return the same
-Ticket fields. Sorting/filtering and fixed-as-of overdue projections remain
-separate query work; clients must not label an absent deadline as overdue.
+Ticket fields. Priority-based sorting remains separate query work. Clients must
+not label an absent deadline as overdue.
+
+## Fixed-as-of overdue board filter
+
+The existing Project board request accepts optional `overdue_as_of`, for example:
+
+```json
+{"project_id":"project-a","limit":25,"overdue_as_of":"2026-12-01T18:00:00+08:00"}
+```
+
+The read instant follows the same bounded RFC 3339/known-offset rules as the
+owner deadline. No Host clock, model estimate or runtime heartbeat is consulted.
+Only unfinished Work with a deadline strictly earlier than that instant matches;
+an equal deadline, no deadline, Accepted Work and Cancelled Work do not match.
+Paused/blocked Work retain their existing stages. Project visibility, archive
+selection and an optional Sprint filter still apply; counts describe the complete
+filtered snapshot before pagination.
+
+The exact `overdue_as_of` string is part of the cursor identity. Continue each
+page with that same literal and cursor; changing or removing the instant requires
+a fresh query, even when a different offset describes the same instant. A cursor
+keeps its original Ticket/planning snapshot while metadata changes. Omitting or
+sending null preserves the previous request serialization and cursor identity.
+This is a read-only selection and does not change priority, deadlines, receipts,
+claims, assignment identity, Sprint membership or scheduling.
 
 The first explicit planning mutation, including a reset to medium/null, advances
 the snapshot to schema 7 so schema-6 writers fail closed. This writer knows and
@@ -65,8 +89,8 @@ artifacts and stopped offline transfer retain schema 7 and the shared audit
 receipts; unknown future schemas remain read-only/rejected.
 
 Manual controls still use semantic Pause/Ready/Cancel/Accept operations. This
-metadata slice does not enable manual completion. A separate control change must
-require the exact Submission's Assignment to have host-confirmed
-`process_stopped`; `active_assignment: null`, an HTTP ACK, heartbeat timeout or
+metadata slice does not enable manual completion. The existing
+[control contract](TICKET_CONTROLS.md) requires the exact Submission's Assignment
+to have host-confirmed `process_stopped`; `active_assignment: null`, an HTTP ACK, heartbeat timeout or
 session disconnect cannot establish that fact. Explicit User acceptance and
 unverified Submission/evidence history remain required and visible.

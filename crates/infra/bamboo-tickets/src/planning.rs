@@ -19,21 +19,48 @@ where
     Option::<String>::deserialize(deserializer)
 }
 
+fn parse_instant(value: &str, field: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
+    let invalid = || {
+        Error::InvalidTransition(format!(
+            "{field} requires RFC 3339 with an explicit known offset"
+        ))
+    };
+    // RFC 3339 -00:00 represents an unknown offset, not an explicit timezone.
+    if value.len() > 64
+        || !value.is_ascii()
+        || !matches!(value.as_bytes().get(10), Some(b'T' | b't'))
+        || value.ends_with("-00:00")
+    {
+        return Err(invalid());
+    }
+    chrono::DateTime::parse_from_rfc3339(value).map_err(|_| invalid())
+}
+
 fn validate_deadline(deadline: Option<&str>) -> Result<()> {
     if let Some(value) = deadline {
-        // RFC 3339 -00:00 means an unknown local offset, not an explicit timezone.
-        if value.len() > 64
-            || !value.is_ascii()
-            || !matches!(value.as_bytes().get(10), Some(b'T' | b't'))
-            || value.ends_with("-00:00")
-            || chrono::DateTime::parse_from_rfc3339(value).is_err()
-        {
-            return Err(Error::InvalidTransition(
-                "expected completion requires RFC 3339 with an explicit known offset".into(),
-            ));
-        }
+        let _instant = parse_instant(value, "expected completion")?;
     }
     Ok(())
+}
+
+pub(crate) fn overdue_instant(value: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
+    parse_instant(value, "overdue_as_of")
+}
+
+pub(crate) fn is_overdue_at(
+    ticket: &crate::Ticket,
+    as_of: &chrono::DateTime<chrono::FixedOffset>,
+) -> Result<bool> {
+    if matches!(
+        ticket.state,
+        crate::WorkState::Accepted | crate::WorkState::Cancelled
+    ) {
+        return Ok(false);
+    }
+    match ticket.expected_completion_at.as_deref() {
+        Some(value) => Ok(&parse_instant(value, "expected completion")? < as_of),
+        None => Ok(false),
+    }
 }
 
 pub(crate) fn set(

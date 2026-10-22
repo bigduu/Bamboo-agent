@@ -124,6 +124,7 @@ impl Fixture {
             include_cancelled: false,
             include_archived: false,
             sprint_filter,
+            overdue_as_of: None,
             limit: 100,
             cursor: None,
             fixed_commit: None,
