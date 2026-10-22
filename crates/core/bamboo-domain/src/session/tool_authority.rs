@@ -54,8 +54,9 @@ impl RootThinkingMode {
 /// Exact execution identities admitted for an orchestration-only Root.
 /// Unknown tools, external providers, and legacy aliases do not enter this
 /// list; callers first resolve a registered execution identity.
-pub const ROOT_ORCHESTRATION_TOOLS: [&str; 16] = [
+pub const ROOT_ORCHESTRATION_TOOLS: [&str; 17] = [
     "SubAgent",
+    "spawn_session",
     "Plan",
     "Task",
     "session_history_current",
@@ -79,8 +80,7 @@ pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
 
 /// Exact management tools with their own live Supervisor/target authority gate.
 /// The history executor restricts Supervisor reads to this scope too.
-pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 3] =
-    ["session_control", "session_history", "spawn_session"];
+pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 2] = ["session_control", "session_history"];
 
 pub fn orchestration_only_allows_execution_name_for_supervisor(
     execution_name: &str,
@@ -166,15 +166,6 @@ impl Session {
 
     /// Defense in depth at both catalog projection and final dispatch.
     pub fn allows_model_tool_execution(&self, execution_name: &str) -> bool {
-        if execution_name == "spawn_session" {
-            return if self.independent_root_spawn_contract() {
-                self.supervisor_incarnation_id().is_some()
-            } else {
-                // An old exact custom registration is not the new framework
-                // capability; existing Standard ordinary execution is retained.
-                !self.model_orchestration_only_enabled()
-            };
-        }
         !self.model_orchestration_only_enabled()
             || orchestration_only_allows_execution_name_for_supervisor(
                 execution_name,

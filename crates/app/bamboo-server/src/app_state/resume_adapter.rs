@@ -15,11 +15,11 @@ use bamboo_engine::model_config_helper::{
     GOLD_CONFIG_METADATA_KEY,
 };
 use bamboo_engine::session_app::approval_replay::{
-    apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
-    repark_permission_replay, resolve_permission_replay_owner,
-    restore_permission_replay_authorization, restore_permission_replay_caller,
-    restore_permission_replay_execution, validate_permission_replay_authority,
-    ApprovalReplayDecision, PermissionReplayTarget,
+    apply_permission_replay_result, find_permission_replay_target,
+    refresh_retained_approval_replay_posture, repark_permission_replay,
+    resolve_permission_replay_owner, restore_permission_replay_authorization,
+    restore_permission_replay_caller, restore_permission_replay_execution,
+    validate_permission_replay_authority, ApprovalReplayDecision, PermissionReplayTarget,
 };
 use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
 use bamboo_engine::session_app::provider_model::{persist_model_ref, session_effective_model_ref};
@@ -396,11 +396,12 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     .permission_config()
                     .map(|config| config.mode())
                     .unwrap_or_default();
-                let decision = match refresh_approval_replay_posture(
+                let decision = match refresh_retained_approval_replay_posture(
                     state.storage.as_ref(),
                     &mut session,
                     configured_mode,
                     replay_owner.as_deref(),
+                    retained_execution.as_ref(),
                 )
                 .await
                 {

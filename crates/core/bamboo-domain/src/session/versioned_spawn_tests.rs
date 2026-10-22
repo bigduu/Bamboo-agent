@@ -126,34 +126,36 @@ fn legacy_and_explicit_v1_are_the_same_supported_tool_contract_on_refresh() {
 }
 
 #[test]
-fn root_spawn_reference_never_falls_back_to_child_in_v2() {
+fn fresh_root_spawn_reference_never_falls_back_to_child_in_any_supported_version() {
     for reference in [
         "spawn_session",
         "spawnSession",
         "default::spawn_session",
         "default::spawnSession",
     ] {
-        for version in [None, Some(1)] {
-            assert_eq!(
+        for version in [None, Some(1), Some(2)] {
+            assert!(
                 resolve_session_tool_reference(version, reference, |name| name == "SubAgent")
-                    .as_deref(),
+                    .is_none()
+            );
+            assert_eq!(
+                resolve_session_tool_reference(version, reference, |name| name == "spawn_session"
+                    || name == "SubAgent")
+                .as_deref(),
+                Some("spawn_session")
+            );
+            assert_eq!(
+                resolve_session_tool_reference(version, "SubAgent", |name| name == "spawn_session"
+                    || name == "SubAgent")
+                .as_deref(),
                 Some("SubAgent")
             );
         }
-        assert!(
-            resolve_session_tool_reference(Some(2), reference, |name| name == "SubAgent").is_none()
-        );
-        assert_eq!(
-            resolve_session_tool_reference(Some(2), reference, |name| name == "spawn_session"
-                || name == "SubAgent")
-            .as_deref(),
-            Some("spawn_session")
-        );
     }
 }
 
 #[test]
-fn only_v2_genuine_supervisors_gain_root_spawning_in_either_mode() {
+fn fresh_root_spawn_catalog_admission_is_role_neutral_and_grants_no_scope() {
     for version in [None, Some(1), Some(2)] {
         for ultra in [false, true] {
             for supervisor in [false, true] {
@@ -172,18 +174,14 @@ fn only_v2_genuine_supervisors_gain_root_spawning_in_either_mode() {
                         incarnation_id: uuid::Uuid::new_v4(),
                     };
                 }
-                let expected = if version == Some(2) {
-                    supervisor
-                } else {
-                    !ultra && !supervisor
-                };
                 assert_eq!(
                     session.allows_model_tool_execution("spawn_session"),
-                    expected,
+                    true,
                     "{version:?}/{ultra}/{supervisor}"
                 );
-                let child = Session::new_child_of("child", &session, "model", "child");
-                assert!(!child.allows_model_tool_execution("spawn_session"));
+                let mut child = Session::new_child_of("child", &session, "model", "child");
+                child.session_version = version;
+                assert!(child.allows_model_tool_execution("spawn_session"));
                 assert!(child.supervisor_incarnation_id().is_none());
             }
         }
@@ -229,7 +227,7 @@ fn assert_namespaced_spawn_keeps_unqualified_owner(framework_installed: bool) {
     assert_eq!(
         unshadowed.as_deref(),
         framework_installed.then_some("spawn_session"),
-        "without an exact owner, only an installed v2 Root port may own the alias"
+        "without an exact owner, only an installed Root port may own the fresh alias"
     );
 }
 

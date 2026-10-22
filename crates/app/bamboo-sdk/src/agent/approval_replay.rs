@@ -4,11 +4,12 @@ use super::{Agent, AgentError, AgentEvent, Message, Session};
 use bamboo_agent_core::tools::{ToolExecutor, ToolOutcome};
 use bamboo_agent_core::{PendingQuestion, PendingQuestionSource};
 use bamboo_engine::session_app::approval_replay::{
-    apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
-    repark_permission_replay, resolve_permission_replay_owner,
-    restore_permission_replay_authorization, restore_permission_replay_caller,
-    restore_permission_replay_execution, validate_pending_permission_replay_authority,
-    validate_permission_replay_authority, ApprovalReplayDecision, PermissionReplayTarget,
+    apply_permission_replay_result, find_permission_replay_target,
+    refresh_retained_approval_replay_posture, repark_permission_replay,
+    resolve_permission_replay_owner, restore_permission_replay_authorization,
+    restore_permission_replay_caller, restore_permission_replay_execution,
+    validate_pending_permission_replay_authority, validate_permission_replay_authority,
+    ApprovalReplayDecision, PermissionReplayTarget,
 };
 use bamboo_engine::session_app::respond::{
     PERMISSION_REEXECUTE_GENERATION_METADATA_KEY, PERMISSION_REEXECUTE_METADATA_KEY,
@@ -241,11 +242,12 @@ impl Agent {
             &target,
             replay_owner.as_deref().unwrap_or(tool_name),
         )?;
-        let decision = refresh_approval_replay_posture(
+        let decision = refresh_retained_approval_replay_posture(
             self.storage().as_ref(),
             session,
             self.permission_mode,
             replay_owner.as_deref(),
+            retained_execution.as_ref(),
         )
         .await?;
         let flags = match decision {

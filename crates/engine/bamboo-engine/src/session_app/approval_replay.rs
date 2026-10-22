@@ -1012,6 +1012,29 @@ pub async fn refresh_approval_replay_posture(
     }
 }
 
+/// Refresh the live policy, then preserve the historical custom-owner mode
+/// boundary. The common spawn name is for the proven framework Root tool;
+/// joining that allowlist cannot promote a retained custom implementation.
+pub async fn refresh_retained_approval_replay_posture(
+    storage: &dyn Storage,
+    session: &mut Session,
+    configured_mode: PermissionMode,
+    execution_name: Option<&str>,
+    execution: Option<&RetainedToolExecution>,
+) -> Result<ApprovalReplayDecision, AgentError> {
+    let decision =
+        refresh_approval_replay_posture(storage, session, configured_mode, execution_name).await?;
+    if matches!(decision, ApprovalReplayDecision::Execute(_))
+        && execution_name == Some("spawn_session")
+        && session.model_orchestration_only_enabled()
+        && execution.and_then(RetainedToolExecution::execution_contract)
+            != Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+    {
+        return Ok(ApprovalReplayDecision::BlockedByRootToolAuthority);
+    }
+    Ok(decision)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1201,6 +1224,61 @@ mod tests {
             "2026-08-14T00:00:00Z".to_string(),
         );
         session
+    }
+
+    #[tokio::test]
+    async fn common_spawn_name_does_not_promote_retained_custom_after_live_ultra_selection() {
+        for version in [None, Some(1), Some(2)] {
+            for contract in [
+                None,
+                Some("custom.spawn.v1"),
+                Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1),
+            ] {
+                let mut owned =
+                    session_with_mode("replay-original-owner", SessionPermissionMode::Default);
+                owned.session_version = version;
+                owned.metadata.insert(
+                    "permission_reexecute_tool_call_id".into(),
+                    "retained-custom".into(),
+                );
+                owned.add_message(Message::user("keep the original work"));
+                let markers = owned.metadata.clone();
+                let messages = serde_json::to_value(&owned.messages).unwrap();
+                let mut latest = owned.clone();
+                latest.set_root_orchestration_only(true).unwrap();
+                let storage = ReplayStorage {
+                    session: RwLock::new(Some(latest)),
+                    fail_load: false,
+                };
+                let call = ToolCall {
+                    id: "retained-custom".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "spawn_session".into(),
+                        arguments: "{}".into(),
+                    },
+                };
+                let execution =
+                    RetainedToolExecution::new(&call, "spawn_session", true, contract).unwrap();
+                let decision = refresh_retained_approval_replay_posture(
+                    &storage,
+                    &mut owned,
+                    PermissionMode::Default,
+                    Some("spawn_session"),
+                    Some(&execution),
+                )
+                .await
+                .unwrap();
+                if contract == Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1) {
+                    assert!(matches!(decision, ApprovalReplayDecision::Execute(_)));
+                } else {
+                    assert_eq!(decision, ApprovalReplayDecision::BlockedByRootToolAuthority);
+                }
+                assert!(owned.root_orchestration_only_enabled());
+                assert_eq!(owned.metadata, markers);
+                assert_eq!(serde_json::to_value(&owned.messages).unwrap(), messages);
+            }
+        }
     }
 
     #[tokio::test]

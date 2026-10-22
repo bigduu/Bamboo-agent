@@ -2,18 +2,19 @@
 
 pub mod root_creation;
 pub mod versioned {
-    //! Versioned registration of the scoped independent-Root creation port.
+    //! Fresh Root creation with separately selected retained operation owners.
     //!
-    //! Legacy Sessions retain the SubAgent alias. Binding selects an installed
-    //! owner and never creates a Project grant, checkout, execution or permission.
+    //! Supported legacy Sessions use the same fresh Root entry. Their retained
+    //! Child/custom operations still use their frozen semantic selector. Binding
+    //! never creates a Project grant, checkout, execution or permission.
 
     use std::sync::Arc;
 
     use async_trait::async_trait;
     use bamboo_agent_core::tools::{
-        retained_tool_execution_for, retained_tool_owner_lookup, ExecutingSupervisorObservation,
-        RetainedToolExecution, Tool, ToolCall, ToolClass, ToolCtx, ToolError, ToolExecutionContext,
-        ToolExecutor, ToolOutcome, ToolResult, ToolSchema, FRAMEWORK_ROOT_SPAWN_CONTRACT_V1,
+        retained_tool_execution_for, retained_tool_owner_lookup, RetainedToolExecution, Tool,
+        ToolCall, ToolClass, ToolCtx, ToolError, ToolExecutionContext, ToolExecutor, ToolOutcome,
+        ToolResult, ToolSchema, FRAMEWORK_ROOT_SPAWN_CONTRACT_V1,
     };
     use bamboo_domain::{Session, SessionCallerReference, Storage};
     use serde_json::Value;
@@ -39,8 +40,24 @@ pub mod versioned {
             config: Arc<RwLock<bamboo_llm::Config>>,
             installed: Arc<dyn ToolExecutor>,
         ) -> Self {
+            Self::new_with_caller_port(
+                Arc::new(SupervisorRootCreateAdapter::new(creator, storage.clone())),
+                storage,
+                config,
+                installed,
+            )
+        }
+
+        /// Install a trusted Host implementation with explicit caller scope.
+        /// The default constructor above keeps its strict Supervisor adapter.
+        pub fn new_with_caller_port(
+            creator: Arc<dyn SessionRootCreatePort>,
+            storage: Arc<dyn Storage>,
+            config: Arc<RwLock<bamboo_llm::Config>>,
+            installed: Arc<dyn ToolExecutor>,
+        ) -> Self {
             Self {
-                creator: Arc::new(SupervisorRootCreateAdapter::new(creator, storage.clone())),
+                creator,
                 storage,
                 config,
                 installed,
@@ -57,26 +74,44 @@ pub mod versioned {
                 ));
             }
             let caller = ctx.session_id().ok_or_else(|| {
-                ToolError::Execution(
-                    "spawn_session requires the original executing Supervisor Session".into(),
-                )
+                ToolError::Execution("spawn_session requires the original executing Session".into())
             })?;
-            let observation = ctx.executing_supervisor_for(caller).ok_or_else(|| {
+            let observation = ctx.executing_caller_for(caller).ok_or_else(|| {
                 ToolError::Execution(
-                    "spawn_session requires the original executing Supervisor identity".into(),
+                    "spawn_session requires the original Host-observed caller identity".into(),
                 )
             })?;
             let canonical = load_canonical(self.storage.as_ref(), caller).await?;
-            if !canonical.independent_root_spawn_contract()
-                || ExecutingSupervisorObservation::capture_from_executing_session(&canonical)
-                    != Some(observation)
-            {
+            if !observation.matches_session(&canonical) {
                 return Err(ToolError::Execution(
-                    "spawn_session requires the same live v2 Supervisor lifetime".into(),
+                    "spawn_session requires the same live caller lifetime and authority snapshot"
+                        .into(),
                 ));
             }
-            // Recheck live configuration after a permission pause, too. A disabled
-            // Root operation cannot become a Child operation or consume its request.
+            self.check_disabled(&canonical).await?;
+            // Scope comes only from the installed Host port. An ordinary caller
+            // has no implicit grant from its Project or management links.
+            let scope = self.creator.scope(observation).await?;
+            if !scope.success {
+                return Err(ToolError::Execution(
+                    "session_root_scope_unavailable: Host Root creation scope is blocked".into(),
+                ));
+            }
+            // The scope read may await another Host boundary. Retain the
+            // original observation; never refresh it from the later snapshot.
+            let final_canonical = load_canonical(self.storage.as_ref(), caller).await?;
+            if !observation.matches_session(&final_canonical) {
+                return Err(ToolError::Execution(
+                    "spawn_session caller changed during Host scope admission".into(),
+                ));
+            }
+            self.check_disabled(&final_canonical).await?;
+            Ok(observation.clone())
+        }
+
+        async fn check_disabled(&self, canonical: &Session) -> Result<(), ToolError> {
+            // Repeat after the awaited scope read and on approval replay. A
+            // disabled Root operation never becomes a Child operation.
             let config = self.config.read().await;
             if config.disabled_tool_references().iter().any(|reference| {
                 bamboo_domain::resolve_session_tool_reference(
@@ -91,7 +126,7 @@ pub mod versioned {
                     "spawn_session is disabled by this Host".into(),
                 ));
             }
-            Ok(SessionCallerReference::from(&canonical))
+            Ok(())
         }
     }
 
@@ -118,7 +153,7 @@ pub mod versioned {
             Some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
         }
         fn description(&self) -> &str {
-            "v2 Supervisor-only creation of an independent Ordinary Root in an explicit, existing Host-authorized Project/workspace. Read session_control(action=scope) for allowed_projects/state_revision; supply that revision, a stable operation UUID and one first instruction. Use a different Host-bound checkout when isolation is needed; this tool does not create or bind worktrees. SubAgent creates a Child sharing its parent's workspace. Exact retries reuse every request field and recover the existing creation/link/Inbox admission/activation; receipts do not mean task completion. No history, model, permissions or Project grants are inherited. A missing, disabled, stale or denied Root entry is a blocker, never an alias for Child spawning."
+            "Create an independent Ordinary Root in an explicit, existing Host-authorized Project/workspace. This fresh call has the same Root meaning in every supported Session version. Use the installed Host scope's exact revision, a stable operation UUID and one first instruction; missing caller scope is a blocker and grants no Project. The default Host adapter exposes scope through session_control(action=scope) to its authorized Supervisor. Use a different Host-bound checkout when isolation is needed; this tool does not create or bind worktrees. Explicit SubAgent creates a bounded Child sharing its parent's workspace. Exact retries reuse every request field and recover the existing creation/link/Inbox admission/activation; receipts do not mean task completion. No history, model, permissions or Project grants are inherited. A missing, disabled, stale or denied Root entry never falls back to Child spawning."
         }
         fn parameters_schema(&self) -> Value {
             super::root_creation::request_schema()
@@ -201,11 +236,7 @@ pub mod versioned {
             }
         }
         fn selected(&self) -> &Arc<dyn ToolExecutor> {
-            if self.contract == Some(true) {
-                &self.independent
-            } else {
-                &self.legacy
-            }
+            &self.independent
         }
 
         fn retained_selected(
@@ -231,9 +262,7 @@ pub mod versioned {
             }
         }
         fn classification_reference(&self, reference: &str) -> String {
-            if self.contract == Some(true)
-                && bamboo_domain::independent_root_spawn_reference(reference)
-            {
+            if bamboo_domain::independent_root_spawn_reference(reference) {
                 bamboo_domain::resolve_session_tool_reference(Some(2), reference, |name| {
                     self.independent.owns_exact_tool(name)
                 })
@@ -268,16 +297,12 @@ pub mod versioned {
             } else {
                 Some(1)
             };
-            let tools = if version == Some(2) {
-                &self.independent
-            } else {
-                &self.legacy
-            };
+            let tools = self.selected();
             let name = bamboo_domain::resolve_session_tool_reference(version, reference, |name| {
                 tools.owns_exact_tool(name)
             })
             .ok_or_else(|| ToolError::NotFound(reference.to_owned()))?;
-            if name == "spawn_session" && version == Some(2) {
+            if name == "spawn_session" {
                 self.spawn.validate_context(&ctx.to_tool_ctx()).await?;
             }
             Ok((tools, name))
@@ -323,7 +348,6 @@ pub mod versioned {
                 }
                 return Ok(tools);
             }
-            let mut independent_contract = self.contract == Some(true);
             let tools = if bamboo_domain::independent_root_spawn_reference(&call.function.name)
                 || execution_name == "spawn_session"
             {
@@ -333,7 +357,6 @@ pub mod versioned {
                     )
                 })?;
                 let session = load_canonical(self.storage.as_ref(), id).await?;
-                independent_contract = session.independent_root_spawn_contract();
                 if self
                     .contract
                     .is_some_and(|v2| v2 != session.independent_root_spawn_contract())
@@ -342,18 +365,14 @@ pub mod versioned {
                         "spawn contract changed; reload the original Session".into(),
                     ));
                 }
-                if session.independent_root_spawn_contract() {
-                    &self.independent
-                } else {
-                    &self.legacy
-                }
+                self.selected()
             } else {
                 self.selected()
             };
             if !tools.owns_exact_tool(execution_name) {
                 return Err(ToolError::NotFound(execution_name.to_owned()));
             }
-            if execution_name == "spawn_session" && independent_contract {
+            if execution_name == "spawn_session" {
                 self.spawn.validate_context(&ctx.to_tool_ctx()).await?;
             }
             Ok(tools)

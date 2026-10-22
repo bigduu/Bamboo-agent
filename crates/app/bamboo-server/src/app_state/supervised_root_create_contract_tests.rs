@@ -676,9 +676,335 @@ fn native_git(path: &std::path::Path, args: &[&str]) -> String {
 fn v2_context(session: &Session) -> ToolCtx {
     let mut ctx = ToolCtx::none("v2-native-spawn");
     ctx.session_id = Some(session.id.clone().into());
+    ctx.executing_caller = Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+        session,
+    )));
     ctx.executing_supervisor =
         ExecutingSupervisorObservation::capture_from_executing_session(session);
     ctx
+}
+
+async fn with_caller_fixture<F: std::future::Future>(session: &Session, dispatch: F) -> F::Output {
+    bamboo_agent_core::tools::with_executing_session_caller(
+        Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+            session,
+        ))),
+        dispatch,
+    )
+    .await
+}
+
+/// Seed only this disposable fixture as a pre-cutover stored Session. Production
+/// saves still cannot migrate a behavior stamp or replace the singleton.
+async fn seed_fixture_session_version(fixture: &Fixture, version: Option<u32>) {
+    for file in ["session.json", "runtime.json"] {
+        let path = fixture
+            .home
+            .path()
+            .join("sessions")
+            .join(&fixture.supervisor.session_id)
+            .join(file);
+        let mut value: Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        if file == "session.json" {
+            value
+                .as_object_mut()
+                .unwrap()
+                .remove("_bamboo_main_authority");
+        }
+        match version {
+            Some(version) => value["session_version"] = json!(version),
+            None => {
+                value.as_object_mut().unwrap().remove("session_version");
+            }
+        }
+        tokio::fs::write(path, serde_json::to_vec_pretty(&value).unwrap())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn fresh_spawn_creates_roots_for_legacy_supervisors_without_migrating_the_singleton() {
+    use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutionContext, ToolExecutor};
+    for version in [None, Some(1), Some(2)] {
+        let mut f = Fixture::new().await;
+        seed_fixture_session_version(&f, version).await;
+        let (creator, inbox, activation) = Fixture::open(f.home.path()).await;
+        f.creator = creator;
+        f.inbox = inbox;
+        f.activation = activation;
+        let session = f
+            .creator
+            .store
+            .load_execution_admission_snapshot(&f.supervisor.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.session_version, version);
+        let original = serde_json::to_value(&session).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let installed = retained_spawn_surface(&f, calls.clone());
+        let tools = installed.for_session(&session).unwrap();
+        assert!(tools
+            .list_tools()
+            .iter()
+            .any(|schema| schema.function.name == "spawn_session"));
+        let mut target = None;
+        for reference in ["spawn_session", "default::spawnSession"] {
+            let call = ToolCall {
+                id: format!("fresh-{reference}"),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: reference.into(),
+                    arguments: serde_json::to_string(&f.request).unwrap(),
+                },
+            };
+            let context = ToolExecutionContext {
+                session_id: Some(&session.id),
+                root_session_id: Some(&session.id),
+                ..ToolExecutionContext::none(&call.id)
+            };
+            let result =
+                with_caller_fixture(&session, tools.execute_with_context_outcome(&call, context))
+                    .await
+                    .unwrap();
+            let receipt = accepted(result.into_tool_result());
+            let id = receipt["target_session_id"].as_str().unwrap().to_owned();
+            if let Some(previous) = target.as_ref() {
+                assert_eq!(previous, &id);
+            }
+            let root = f.creator.store.load_session(&id).await.unwrap().unwrap();
+            assert_eq!(root.kind, bamboo_domain::SessionKind::Root);
+            assert!(root.parent_session_id.is_none());
+            assert_eq!(root.session_version, Some(2));
+            assert_eq!(f.inbox.inspect(&id).await.unwrap().generation, 1);
+            target = Some(id);
+        }
+        let reused = SupervisorSessionService::new(f.creator.store.clone())
+            .get_or_create_default("other-model")
+            .await
+            .unwrap();
+        assert_eq!(reused.session_id, f.supervisor.session_id);
+        assert_eq!(reused.incarnation_id, f.supervisor.incarnation_id);
+        assert!(!reused.created);
+        let after = f
+            .creator
+            .store
+            .load_execution_admission_snapshot(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let after_json = serde_json::to_value(&after).unwrap();
+        for field in [
+            "id",
+            "created_at",
+            "kind",
+            "parent_session_id",
+            "root_session_id",
+            "authority_identity",
+            "session_version",
+            "messages",
+            "model",
+            "workspace",
+            "root_orchestration_only",
+        ] {
+            assert_eq!(after_json[field], original[field], "{version:?}/{field}");
+        }
+        assert_eq!(
+            after
+                .supervisor_management
+                .as_ref()
+                .unwrap()
+                .allowed_projects,
+            session
+                .supervisor_management
+                .as_ref()
+                .unwrap()
+                .allowed_projects,
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no legacy Child/custom fallback"
+        );
+        assert_eq!(f.count().await, 2);
+        assert_eq!(f.activation.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+struct CallerRootPortProbe {
+    caller: bamboo_domain::SessionCallerReference,
+    project_id: bamboo_domain::ProjectId,
+    workspace_path: String,
+    scope_revision: u64,
+    allowed: AtomicBool,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl bamboo_server_tools::session_control::root_creation::SessionRootCreatePort
+    for CallerRootPortProbe
+{
+    async fn scope(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+    ) -> Result<ToolResult, bamboo_agent_core::tools::ToolError> {
+        if caller != &self.caller || !self.allowed.load(Ordering::SeqCst) {
+            return Err(bamboo_agent_core::tools::ToolError::Execution(
+                "fixture_scope_unavailable".into(),
+            ));
+        }
+        Ok(ToolResult::text(true, "fixture exact caller scope"))
+    }
+    async fn create(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        request: SupervisedRootCreateRequest,
+    ) -> Result<ToolResult, bamboo_agent_core::tools::ToolError> {
+        self.scope(caller).await?;
+        request.validate()?;
+        if request.project_id != self.project_id
+            || request.workspace_path != self.workspace_path
+            || request.expected_state_revision != self.scope_revision
+        {
+            return Err(bamboo_agent_core::tools::ToolError::Execution(
+                "fixture_explicit_creation_scope_mismatch".into(),
+            ));
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        // A port spy, not a production Root writer or a fixture grant issuer.
+        Ok(ToolResult::text(
+            true,
+            json!({"fixture_port_called":true,"caller":caller,"request":request}).to_string(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn generic_spawn_forwards_only_original_root_child_callers_to_an_explicit_host_port() {
+    use bamboo_domain::SessionCallerReference;
+    use bamboo_server_tools::session_control::versioned::SpawnSessionTool;
+    let f = Fixture::new().await;
+    for version in [None, Some(1), Some(2)] {
+        let mut root = Session::new(uuid::Uuid::new_v4().to_string(), "private-model");
+        root.session_version = version;
+        let mut child = Session::new_child_of(
+            uuid::Uuid::new_v4().to_string(),
+            &root,
+            "child-model",
+            "bounded Child",
+        );
+        child.session_version = version;
+        for session in [root, child] {
+            f.creator.store.save_session(&session).await.unwrap();
+            let original = serde_json::to_value(&session).unwrap();
+            let count = f.count().await;
+            let port = Arc::new(CallerRootPortProbe {
+                caller: SessionCallerReference::from(&session),
+                project_id: f.request.project_id.clone(),
+                workspace_path: f.request.workspace_path.clone(),
+                scope_revision: f.request.expected_state_revision,
+                allowed: AtomicBool::new(true),
+                calls: AtomicUsize::new(0),
+            });
+            let installed = Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(
+                bamboo_tools::ToolRegistry::new(),
+            ));
+            let tool = SpawnSessionTool::new_with_caller_port(
+                port.clone(),
+                f.creator.store.clone(),
+                f.creator.config.clone(),
+                installed.clone(),
+            );
+            let payload = serde_json::to_value(&f.request).unwrap();
+            let result = tool
+                .invoke(payload.clone(), v2_context(&session))
+                .await
+                .unwrap()
+                .into_tool_result();
+            let observed = value(result);
+            assert_eq!(observed["fixture_port_called"], true);
+            assert_eq!(
+                observed["caller"],
+                serde_json::to_value(SessionCallerReference::from(&session)).unwrap()
+            );
+            assert_eq!(observed["request"], payload);
+            for case in [
+                "missing_caller",
+                "wrong_caller",
+                "stale",
+                "plan",
+                "disabled",
+                "invalid_request",
+                "foreign_project",
+                "foreign_workspace",
+                "stale_scope",
+            ] {
+                let mut context = v2_context(&session);
+                let mut args = payload.clone();
+                match case {
+                    "missing_caller" => context.executing_caller = None,
+                    "wrong_caller" => context.session_id = Some("not-the-caller".into()),
+                    "stale" => {
+                        let mut stale = session.clone();
+                        stale.root_tool_authority_revision += 1;
+                        context = v2_context(&stale);
+                    }
+                    "plan" => context.plan_read_only = true,
+                    "disabled" => {
+                        f.creator.config.write().await.tools.disabled =
+                            vec!["default::spawnSession".into()]
+                    }
+                    "invalid_request" => args["workspace_path"] = json!(""),
+                    "foreign_project" => args["project_id"] = json!("foreign-project"),
+                    "foreign_workspace" => args["workspace_path"] = json!("/foreign/workspace"),
+                    "stale_scope" => args["expected_state_revision"] = json!(0),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    tool.invoke(args, context).await.is_err(),
+                    "{version:?}/{case}"
+                );
+                f.creator.config.write().await.tools.disabled.clear();
+                assert_eq!(port.calls.load(Ordering::SeqCst), 1, "{case}");
+            }
+            port.allowed.store(false, Ordering::SeqCst);
+            assert!(tool
+                .invoke(payload.clone(), v2_context(&session))
+                .await
+                .is_err());
+            let default = SpawnSessionTool::new(
+                Arc::new(f.creator.clone()),
+                f.creator.store.clone(),
+                f.creator.config.clone(),
+                installed,
+            );
+            let error = default
+                .invoke(payload, v2_context(&session))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("session_root_scope_unavailable"),
+                "{error}"
+            );
+            assert_eq!(f.count().await, count, "port spy created no Root or grant");
+            assert_eq!(
+                serde_json::to_value(
+                    f.creator
+                        .store
+                        .load_execution_admission_snapshot(&session.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                )
+                .unwrap(),
+                original
+            );
+            assert_eq!(f.inbox.inspect(&session.id).await.unwrap().generation, 0);
+        }
+    }
+    assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -823,8 +1149,8 @@ async fn versioned_spawn_disabled_stale_and_invalid_scope_refusals_have_no_side_
         )),
     );
     for case in [
-        "ordinary",
-        "child",
+        "missing_caller",
+        "wrong_caller_id",
         "stale",
         "plan",
         "disabled",
@@ -835,7 +1161,8 @@ async fn versioned_spawn_disabled_stale_and_invalid_scope_refusals_have_no_side_
         let mut ctx = v2_context(&canonical);
         let mut request = f.request.clone();
         match case {
-            "ordinary" | "child" => ctx.executing_supervisor = None,
+            "missing_caller" => ctx.executing_caller = None,
+            "wrong_caller_id" => ctx.session_id = Some("different-caller".into()),
             "stale" => {
                 let mut stale = canonical.clone();
                 stale.authority_identity = bamboo_domain::SessionAuthorityIdentity::Supervisor {
@@ -967,21 +1294,25 @@ async fn versioned_spawn_disabled_exact_shadow_does_not_block_framework_creation
         .as_deref(),
         Some("vendor::spawn_session")
     );
-    assert!(tools
-        .check_permissions_for_exact(&call, "spawn_session", &context())
-        .await
-        .unwrap()
-        .is_none());
+    assert!(with_caller_fixture(
+        &session,
+        tools.check_permissions_for_exact(&call, "spawn_session", &context())
+    )
+    .await
+    .unwrap()
+    .is_none());
     assert_eq!(
         f.count().await,
         1,
         "permission recheck must not create a Root"
     );
-    let result = tools
-        .execute_exact_with_context_outcome(&call, "spawn_session", context())
-        .await
-        .unwrap()
-        .into_tool_result();
+    let result = with_caller_fixture(
+        &session,
+        tools.execute_exact_with_context_outcome(&call, "spawn_session", context()),
+    )
+    .await
+    .unwrap()
+    .into_tool_result();
     let receipt = accepted(result);
     let target = receipt["target_session_id"].as_str().unwrap();
     assert_eq!(
@@ -1003,11 +1334,13 @@ async fn versioned_spawn_disabled_exact_shadow_does_not_block_framework_creation
         "other::spawn_session",
     ] {
         f.creator.config.write().await.tools.disabled = vec![disabled.into()];
-        let error = tools
-            .check_permissions_for_exact(&call, "spawn_session", &context())
-            .await
-            .err()
-            .expect("unshadowed disabled Root must still refuse");
+        let error = with_caller_fixture(
+            &session,
+            tools.check_permissions_for_exact(&call, "spawn_session", &context()),
+        )
+        .await
+        .err()
+        .expect("unshadowed disabled Root must still refuse");
         assert!(
             error.to_string().contains("disabled"),
             "{disabled}: {error}"
@@ -1110,43 +1443,44 @@ async fn retained_custom_spawn_uses_legacy_owner_for_lookup_permissions_and_exac
             ..ToolExecutionContext::none(&call.id)
         };
         let before = calls.load(Ordering::SeqCst);
-        with_retained_tool_execution(Some(retained), async {
-            assert!(tools
-                .check_permissions_for_exact(&call, "spawn_session", &context())
-                .await
-                .unwrap()
-                .is_none());
-            let result = tools
-                .execute_exact_with_context_outcome(&call, "spawn_session", context())
-                .await
-                .unwrap();
-            assert_eq!(
-                value(result.into_tool_result()),
-                json!({"owner":"spawn_session", "args":args})
-            );
-            let mut changed = call.clone();
-            changed.function.arguments = "{}".into();
-            assert!(tools
-                .execute_exact_with_context_outcome(&changed, "spawn_session", context())
-                .await
-                .is_err());
-            if version == Some(2) {
+        with_caller_fixture(
+            &session,
+            with_retained_tool_execution(Some(retained), async {
+                assert!(tools
+                    .check_permissions_for_exact(&call, "spawn_session", &context())
+                    .await
+                    .unwrap()
+                    .is_none());
+                let result = tools
+                    .execute_exact_with_context_outcome(&call, "spawn_session", context())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    value(result.into_tool_result()),
+                    json!({"owner":"spawn_session", "args":args})
+                );
+                let mut changed = call.clone();
+                changed.function.arguments = "{}".into();
+                assert!(tools
+                    .execute_exact_with_context_outcome(&changed, "spawn_session", context())
+                    .await
+                    .is_err());
                 let mut nested = call.clone();
                 nested.id = "new-nested-call".into();
                 assert!(tools
                     .execute_exact_with_context_outcome(&nested, "spawn_session", context())
                     .await
                     .is_err());
-            }
-        })
+            }),
+        )
         .await;
         assert_eq!(calls.load(Ordering::SeqCst), before + 1);
         assert_eq!(
             tools.execution_contract_for_exact("spawn_session"),
-            (version == Some(2)).then_some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+            Some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
         );
-        // A frozen Root contract selects the Root surface even for a legacy
-        // Session; its existing live v2 Supervisor gate still refuses it.
+        // A frozen Root contract selects Root in every supported Session;
+        // the default Host adapter still refuses this ungranted ordinary caller.
         let root = RetainedToolExecution::new(
             &call,
             "spawn_session",
@@ -1155,9 +1489,12 @@ async fn retained_custom_spawn_uses_legacy_owner_for_lookup_permissions_and_exac
         )
         .unwrap();
         assert!(root.owner_is_available(tools.as_ref()));
-        assert!(with_retained_tool_execution(
-            Some(root),
-            tools.execute_exact_with_context_outcome(&call, "spawn_session", context())
+        assert!(with_caller_fixture(
+            &session,
+            with_retained_tool_execution(
+                Some(root),
+                tools.execute_exact_with_context_outcome(&call, "spawn_session", context())
+            )
         )
         .await
         .is_err());
@@ -1168,7 +1505,7 @@ async fn retained_custom_spawn_uses_legacy_owner_for_lookup_permissions_and_exac
 }
 
 #[tokio::test]
-async fn retained_root_contract_preserves_plan_disabled_and_original_supervisor_gates() {
+async fn retained_root_contract_preserves_plan_disabled_and_original_caller_gates() {
     use bamboo_agent_core::tools::{
         with_retained_tool_execution, FunctionCall, RetainedToolExecution, ToolCall,
         ToolExecutionContext, ToolExecutor, FRAMEWORK_ROOT_SPAWN_CONTRACT_V1,
@@ -1218,16 +1555,21 @@ async fn retained_root_contract_preserves_plan_disabled_and_original_supervisor_
         )
         .unwrap();
         assert!(root.owner_is_available(tools.as_ref()));
-        with_retained_tool_execution(Some(root), async {
-            assert!(tools
-                .check_permissions_for_exact(&call, "spawn_session", &context)
-                .await
-                .is_err());
-            assert!(tools
-                .execute_exact_with_context_outcome(&call, "spawn_session", context)
-                .await
-                .is_err());
-        })
+        let caller = (case != "missing_caller")
+            .then(|| Arc::new(bamboo_domain::SessionCallerReference::from(&session)));
+        bamboo_agent_core::tools::with_executing_session_caller(
+            caller,
+            with_retained_tool_execution(Some(root), async {
+                assert!(tools
+                    .check_permissions_for_exact(&call, "spawn_session", &context)
+                    .await
+                    .is_err());
+                assert!(tools
+                    .execute_exact_with_context_outcome(&call, "spawn_session", context)
+                    .await
+                    .is_err());
+            }),
+        )
         .await;
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(f.count().await, 1);
@@ -1263,8 +1605,11 @@ impl bamboo_tools::permission::PermissionChecker for RootOwnerPermissionProbe {
 }
 
 #[tokio::test]
-async fn versioned_spawn_legacy_custom_owner_keeps_arguments_and_permission_route() {
-    use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolExecutionContext, ToolExecutor};
+async fn retained_legacy_custom_owner_keeps_arguments_and_permission_route_after_fresh_cutover() {
+    use bamboo_agent_core::tools::{
+        with_retained_tool_execution, FunctionCall, RetainedToolExecution, ToolCall,
+        ToolExecutionContext, ToolExecutor,
+    };
     use bamboo_server_tools::session_control::versioned::{SpawnSessionTool, VersionedRootTools};
     let f = Fixture::new().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1325,28 +1670,39 @@ async fn versioned_spawn_legacy_custom_owner_keeps_arguments_and_permission_rout
                         root_session_id: Some(&session.id),
                         ..ToolExecutionContext::none(&call.id)
                     };
-                    assert!(tools
-                        .check_permissions_for(&call, &context())
-                        .await
-                        .unwrap()
-                        .is_none());
-                    assert!(tools
-                        .check_permissions_for_exact(&call, name, &context())
-                        .await
-                        .unwrap()
-                        .is_none());
-                    assert!(tools
-                        .check_permissions_for_resolved(&call, name, &args, &context())
-                        .await
-                        .unwrap()
-                        .is_none());
-                    let result = tools
-                        .execute_exact_with_context_outcome(&call, name, context())
-                        .await
-                        .unwrap()
-                        .into_tool_result();
-                    assert!(result.success);
-                    assert_eq!(value(result), json!({"owner":name,"args":args}));
+                    if name == "spawn_session" {
+                        assert!(tools
+                            .check_permissions_for(&call, &context())
+                            .await
+                            .is_err());
+                    } else {
+                        assert!(tools
+                            .check_permissions_for(&call, &context())
+                            .await
+                            .unwrap()
+                            .is_none());
+                    }
+                    let retained = RetainedToolExecution::new(&call, name, true, None).unwrap();
+                    with_retained_tool_execution(Some(retained), async {
+                        assert!(tools
+                            .check_permissions_for_exact(&call, name, &context())
+                            .await
+                            .unwrap()
+                            .is_none());
+                        assert!(tools
+                            .check_permissions_for_resolved(&call, name, &args, &context())
+                            .await
+                            .unwrap()
+                            .is_none());
+                        let result = tools
+                            .execute_exact_with_context_outcome(&call, name, context())
+                            .await
+                            .unwrap()
+                            .into_tool_result();
+                        assert!(result.success);
+                        assert_eq!(value(result), json!({"owner":name,"args":args}));
+                    })
+                    .await;
                 }
             }
         }
@@ -1430,8 +1786,9 @@ async fn versioned_spawn_framework_owner_keeps_typed_approval_and_deny_before_si
         ),
         ..ToolExecutionContext::none(&call.id)
     };
-    // The public unbound exact gate must derive v2 from canonical storage,
-    // then reject before the additional permission gate is entered.
+    // The public unbound exact gate still rejects a missing original caller
+    // before the additional permission gate is entered. Supervisor flags alone
+    // cannot reconstruct a generic caller observation.
     let checks_before = checks.load(Ordering::SeqCst);
     let mut missing_observation = context();
     missing_observation.executing_supervisor = None;
@@ -1446,39 +1803,46 @@ async fn versioned_spawn_framework_owner_keeps_typed_approval_and_deny_before_si
     assert_eq!(checks.load(Ordering::SeqCst), checks_before);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     f.creator.config.write().await.disabled_tools = vec!["spawn_session".into()];
-    assert!(installed
-        .check_permissions_for_exact(&call, "spawn_session", &context())
-        .await
-        .is_err());
-    assert!(installed
-        .execute_exact_with_context_outcome(&call, "spawn_session", context())
-        .await
-        .is_err());
+    assert!(with_caller_fixture(
+        &session,
+        installed.check_permissions_for_exact(&call, "spawn_session", &context())
+    )
+    .await
+    .is_err());
+    assert!(with_caller_fixture(
+        &session,
+        installed.execute_exact_with_context_outcome(&call, "spawn_session", context())
+    )
+    .await
+    .is_err());
     assert_eq!(checks.load(Ordering::SeqCst), checks_before);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     f.creator.config.write().await.disabled_tools.clear();
 
-    let asks = [
-        tools
-            .check_permissions_for(&call, &context())
-            .await
-            .unwrap()
-            .unwrap(),
-        tools
-            .check_permissions_for_exact(&call, "spawn_session", &context())
-            .await
-            .unwrap()
-            .unwrap(),
-        tools
-            .check_permissions_for_resolved(&call, "spawn_session", &args, &context())
-            .await
-            .unwrap()
-            .unwrap(),
-        tools
-            .execute_exact_with_context_outcome(&call, "spawn_session", context())
-            .await
-            .unwrap(),
-    ];
+    let asks = with_caller_fixture(&session, async {
+        [
+            tools
+                .check_permissions_for(&call, &context())
+                .await
+                .unwrap()
+                .unwrap(),
+            tools
+                .check_permissions_for_exact(&call, "spawn_session", &context())
+                .await
+                .unwrap()
+                .unwrap(),
+            tools
+                .check_permissions_for_resolved(&call, "spawn_session", &args, &context())
+                .await
+                .unwrap()
+                .unwrap(),
+            tools
+                .execute_exact_with_context_outcome(&call, "spawn_session", context())
+                .await
+                .unwrap(),
+        ]
+    })
+    .await;
     for outcome in asks {
         let payload = value(outcome.into_tool_result());
         assert_eq!(payload["status"], "awaiting_permission_approval");
@@ -1495,9 +1859,11 @@ async fn versioned_spawn_framework_owner_keeps_typed_approval_and_deny_before_si
         );
     }
     deny.store(true, Ordering::SeqCst);
-    let result = tools
-        .execute_exact_with_context_outcome(&call, "spawn_session", context())
-        .await;
+    let result = with_caller_fixture(
+        &session,
+        tools.execute_exact_with_context_outcome(&call, "spawn_session", context()),
+    )
+    .await;
     assert!(
         matches!(result, Err(bamboo_agent_core::tools::ToolError::Execution(ref error)) if error.contains("Host denied exact Root operation")),
         "{result:?}"
