@@ -68,9 +68,9 @@ pub trait ScopedSessionSendPort: Send + Sync {
     ) -> Result<SessionPeerDeliveryReceipt, ScopedSessionSendError>;
 }
 
-/// Compatibility composition of the existing durable writers. Ordinary/Child
-/// calls remain same-tree; only the actual original Supervisor uses its own
-/// explicitly attached followup route. No new Host grant is issued here.
+/// Prefer an explicitly installed Host scope for every caller role. Only a
+/// never-installed namespace uses the existing same-tree or original Supervisor
+/// followup writer. This composition never issues or widens a Host grant.
 pub struct CanonicalSessionSendAdapter {
     storage: Arc<dyn Storage>,
     messenger: Arc<SessionMessenger>,
@@ -99,6 +99,31 @@ impl ScopedSessionSendPort for CanonicalSessionSendAdapter {
         let original = ctx
             .executing_caller_for(id)
             .ok_or(ScopedSessionSendError::AuthorityUnavailable)?;
+        // The installed Host namespace is selected before role compatibility.
+        // A stale/revoked/unsupported namespace is an explicit refusal. Only
+        // never-installed None can use the existing Supervisor/same-tree route.
+        let token = self
+            .storage
+            .find_host_session_scope(original)
+            .await
+            .map_err(|_| ScopedSessionSendError::AuthorityUnavailable)?;
+        if let Some(token) = token {
+            let intent = request
+                .delivery_intent
+                .ok_or(ScopedSessionSendError::UnsupportedDeliveryIntent)?;
+            return self
+                .messenger
+                .send_host_scoped_peer(
+                    &token,
+                    original,
+                    &request.target_session_id,
+                    &request.operation_id,
+                    &request.message,
+                    intent,
+                )
+                .await
+                .map_err(Into::into);
+        }
         let canonical = self
             .storage
             .load_execution_admission_snapshot(id)

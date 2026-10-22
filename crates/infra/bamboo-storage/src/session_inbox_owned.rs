@@ -148,6 +148,9 @@ pub(crate) enum InboxAuthority {
     Peer {
         _guard: crate::v2::PeerDeliveryGuard,
     },
+    HostScoped {
+        _guard: crate::v2::host_session_scope::HostScopedDeliveryGuards,
+    },
 }
 struct OwnedScope {
     _process: OwnedMutexGuard<()>,
@@ -609,6 +612,7 @@ impl FileSessionInbox {
     ) -> Result<(PathBuf, OwnedFilesystem), SessionInboxError> {
         let dir = match &authority {
             InboxAuthority::Peer { _guard } => _guard.inbox_dir.clone(),
+            InboxAuthority::HostScoped { _guard } => _guard.inbox_dir.clone(),
             _ => self.inbox_dir(target).await?,
         };
         let process = self.lock_process(&dir).await;

@@ -1,5 +1,8 @@
 //! Supported complete-send routes over temporary canonical Inbox data only.
 
+#[path = "scoped_session_messaging/host_scope.rs"]
+mod host_scope;
+
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,

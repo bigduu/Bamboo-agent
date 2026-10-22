@@ -52,6 +52,9 @@ pub fn canonical_json_bytes(value: &serde_json::Value) -> Vec<u8> {
 /// admitted messages use the envelope id as their stable [`Message::id`].
 pub const SESSION_INBOX_ADMITTED_CAPACITY: usize = 4096;
 
+/// One peer instruction is bounded text, not a transcript or attachment export.
+pub const MAX_SESSION_PEER_MESSAGE_BYTES: usize = 16 * 1024;
+
 /// Globally unique idempotency key supplied by the sender.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
@@ -121,6 +124,26 @@ impl Default for SessionMessageId {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Existing peer idempotency identity, shared by same-tree and Host-scoped
+/// routes. Grant/issuer revisions and conversation generations cannot allocate
+/// another delivery for the same logical operation and immutable lifetimes.
+pub fn session_peer_message_id(
+    source_session_id: &str,
+    source_created_at: DateTime<Utc>,
+    target_session_id: &str,
+    target_created_at: DateTime<Utc>,
+    operation_id: &str,
+) -> SessionMessageId {
+    SessionMessageId::stable(
+        "session-peer-v1",
+        &serde_json::json!({
+            "source": source_session_id, "source_birth": source_created_at,
+            "target": target_session_id, "target_birth": target_created_at,
+            "operation_id": operation_id,
+        }),
+    )
 }
 
 impl std::fmt::Display for SessionMessageId {
@@ -1788,6 +1811,23 @@ pub trait SessionInboxPort: Send + Sync {
     ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
         Err(SessionInboxError::Storage(
             "explicit peer delivery intent is unsupported".into(),
+        ))
+    }
+
+    /// One explicit SendPeer-authorized Host operation. The concrete backend
+    /// must retain the current installation publication fence plus canonical
+    /// caller/target/complete-lineage guards through the physical receipt job.
+    /// Caller observations and serialized binding data alone never grant it.
+    /// This new-thread text port does not grant inspect, reply or steer rights.
+    async fn deliver_host_scoped_peer_message(
+        &self,
+        _token: &crate::HostSessionScopeToken,
+        _caller: &crate::SessionCallerReference,
+        _envelope: &SessionMessageEnvelope,
+        _intent: SessionMessageDeliveryIntent,
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "Host-scoped peer SessionInbox admission is unsupported".into(),
         ))
     }
 

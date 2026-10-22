@@ -2527,6 +2527,30 @@ impl SessionInboxPort for FileSessionInbox {
             .await
     }
 
+    async fn deliver_host_scoped_peer_message(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &bamboo_domain::SessionCallerReference,
+        envelope: &SessionMessageEnvelope,
+        intent: SessionMessageDeliveryIntent,
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
+        let authority = self
+            .sessions
+            .lock_host_scoped_peer_delivery(token, caller, envelope)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        // The same private Inbox transaction and owned filesystem jobs retain
+        // the original scope publication and complete physical authority set.
+        // Never reenter public delivery or widen the ordinary same-tree port.
+        self.deliver_with_lifecycle_held_state(
+            envelope,
+            InboxAuthority::HostScoped { _guard: authority },
+            None,
+            Some(SessionInboxActivationIntent::with_delivery(intent)),
+        )
+        .await
+    }
+
     async fn mark_activation_eligible(
         &self,
         target_session_id: &str,
@@ -2807,6 +2831,10 @@ mod owned_tests;
 #[cfg(test)]
 #[path = "session_inbox_receipt_tests.rs"]
 mod receipt_tests;
+
+#[cfg(test)]
+#[path = "session_inbox_host_scope_tests.rs"]
+mod host_scope_tests;
 
 #[cfg(test)]
 mod tests {

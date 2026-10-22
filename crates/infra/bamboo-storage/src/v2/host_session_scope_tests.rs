@@ -269,3 +269,133 @@ async fn opposite_cross_root_reads_use_one_canonical_lock_order() {
     assert!(a_read.is_ok());
     assert!(b_read.is_ok());
 }
+
+#[tokio::test]
+async fn host_send_keeps_the_stable_grant_but_never_upgrades_an_original_conversation_ledger() {
+    use bamboo_domain::{
+        conversation_reset_snapshot_sha256, prepare_conversation_reset,
+        ConversationResetPreparation, ConversationResetReadSafety, ConversationResetRequest,
+        SessionInboxLimits, SessionInboxPort, SessionMessageBody, SessionMessageContent,
+        SessionMessageDeliveryIntent, SessionMessageEnvelope, SessionMessageKind,
+        SessionMessageSource,
+    };
+    let (_home, store, caller, target) = fixture().await;
+    let original = SessionCallerReference::from(&caller);
+    let token = store
+        .install_host_session_scope(
+            0,
+            binding(&caller, vec![], &target, [HostSessionRight::SendPeer], 1),
+        )
+        .await
+        .unwrap();
+    let request = ConversationResetRequest {
+        session_id: caller.id.clone(),
+        operation_id: format!("0:{}", uuid::Uuid::new_v4()),
+        expected_birth_token: caller.root_mode_birth_token(),
+        expected_conversation_revision: 0,
+        expected_snapshot_sha256: conversation_reset_snapshot_sha256(&caller).unwrap(),
+    };
+    let ConversationResetPreparation::Prepared(prepared) = prepare_conversation_reset(
+        &caller,
+        &Default::default(),
+        &request,
+        ConversationResetReadSafety::IdleObserved,
+        Utc::now(),
+    )
+    .unwrap() else {
+        panic!("pure synthetic preparation")
+    };
+    let mut canonical = prepared.proposed_session;
+    canonical.conversation_reset = Some(prepared.proposed_state);
+    // Synthetic future-producer bytes in this fresh TempDir, with no actor.
+    // This fixture does not invoke a reset endpoint or add a production writer.
+    let directory = store.sessions_root_dir().join(&caller.id);
+    fs::write(
+        directory.join("session.json"),
+        compact_main::serialize_main(&canonical).unwrap(),
+    )
+    .await
+    .unwrap();
+    fs::write(
+        directory.join(RUNTIME_SIDECAR_FILE),
+        serde_json::to_vec_pretty(&runtime_sidecar_snapshot(&canonical)).unwrap(),
+    )
+    .await
+    .unwrap();
+    SessionStoreV2::write_staged_root_tool_proof(&directory, &canonical)
+        .await
+        .unwrap();
+    let id = bamboo_domain::session_peer_message_id(
+        &caller.id,
+        caller.created_at,
+        &target.id,
+        target.created_at,
+        "ledger-operation",
+    );
+    let envelope = SessionMessageEnvelope {
+        thread_id: Some(id.to_string()),
+        id,
+        source: SessionMessageSource::Session {
+            session_id: caller.id.clone(),
+        },
+        target_session_id: target.id.clone(),
+        kind: SessionMessageKind::PeerMessage,
+        body: SessionMessageBody::Content(SessionMessageContent::text("bounded instruction")),
+        created_at: Utc::now(),
+        in_reply_to: None,
+        attempt: None,
+        correlation_id: Some("ledger-operation".into()),
+    };
+    let store = std::sync::Arc::new(store);
+    assert!(store
+        .find_host_session_scope(&original)
+        .await
+        .unwrap()
+        .unwrap()
+        .same_installation(&token));
+    let inbox = crate::FileSessionInbox::new(store, SessionInboxLimits::default());
+    assert!(inbox
+        .deliver_host_scoped_peer_message(
+            &token,
+            &original,
+            &envelope,
+            SessionMessageDeliveryIntent::QueueOnly
+        )
+        .await
+        .is_err());
+    assert_eq!(inbox.inspect(&target.id).await.unwrap().generation, 0);
+    let current = SessionCallerReference::from(&canonical);
+    let first = inbox
+        .deliver_host_scoped_peer_message(
+            &token,
+            &current,
+            &envelope,
+            SessionMessageDeliveryIntent::QueueOnly,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.delivery.generation, 1);
+    let mut different_ledger = current;
+    let receipt = different_ledger
+        .conversation_reset
+        .as_mut()
+        .unwrap()
+        .receipts
+        .last_mut()
+        .unwrap();
+    receipt.expected_snapshot_sha256 = if receipt.expected_snapshot_sha256 == "a".repeat(64) {
+        "b".repeat(64)
+    } else {
+        "a".repeat(64)
+    };
+    assert!(inbox
+        .deliver_host_scoped_peer_message(
+            &token,
+            &different_ledger,
+            &envelope,
+            SessionMessageDeliveryIntent::QueueOnly
+        )
+        .await
+        .is_err());
+    assert_eq!(inbox.inspect(&target.id).await.unwrap().generation, 1);
+}

@@ -21,7 +21,7 @@ use bamboo_domain::{
 /// A followup is one bounded peer instruction, not a context export or file transfer.
 pub const MAX_SUPERVISOR_FOLLOWUP_BYTES: usize = 16 * 1024;
 
-pub const MAX_PEER_MESSAGE_BYTES: usize = 16 * 1024;
+pub const MAX_PEER_MESSAGE_BYTES: usize = bamboo_domain::MAX_SESSION_PEER_MESSAGE_BYTES;
 pub const MAX_PEER_TARGETS: usize = 128;
 pub const MAX_PEER_TARGET_RESULT_BYTES: usize = 32 * 1024;
 const MAX_PEER_TARGET_TITLE_BYTES: usize = 256;
@@ -394,6 +394,64 @@ impl SessionMessenger {
         .await
     }
 
+    /// One explicitly installed SendPeer grant, including independent Roots.
+    /// No inspect right or public target read is needed to build this bounded
+    /// envelope. The Inbox validates the original caller and token at its final
+    /// retained authority boundary; these binding bytes are observations only.
+    pub async fn send_host_scoped_peer(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &SessionCallerReference,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        intent: SessionMessageDeliveryIntent,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
+        Self::validate_peer_input(operation_id, message)?;
+        Self::validate_peer_session_id(target_session_id)?;
+        let unauthorized = || SessionMessengerError::Unauthorized {
+            source_session_id: caller.session_id.clone(),
+            target: target_session_id.into(),
+        };
+        if !token.binding().caller.identity.matches_caller(caller) {
+            return Err(unauthorized());
+        }
+        let target = &token
+            .binding()
+            .target(target_session_id, bamboo_domain::HostSessionRight::SendPeer)
+            .map_err(|_| unauthorized())?
+            .observation
+            .identity;
+        let id = bamboo_domain::session_peer_message_id(
+            &caller.session_id,
+            caller.created_at,
+            &target.session_id,
+            target.created_at,
+            operation_id,
+        );
+        let envelope = Self::peer_envelope_for_ids(
+            &caller.session_id,
+            &target.session_id,
+            operation_id,
+            message,
+            id.clone(),
+            id.to_string(),
+            None,
+        );
+        let started = Instant::now();
+        let delivery = self
+            .inbox
+            .deliver_host_scoped_peer_message(token, caller, &envelope, intent)
+            .await
+            .map_err(|error| {
+                let error = SessionMessengerError::Inbox(error);
+                self.record_rejection(&error);
+                error
+            })?;
+        self.finish_peer_delivery(envelope, delivery, started, Some(intent))
+            .await
+    }
+
     /// Active-run-only peer input. The Inbox owns exact retry recovery and
     /// retains its original authority through the runtime's publication CAS.
     /// This never cancels a run, requests activation or reconstructs an owner.
@@ -681,13 +739,12 @@ impl SessionMessenger {
     }
 
     fn peer_message_id(caller: &Session, target: &Session, operation_id: &str) -> SessionMessageId {
-        SessionMessageId::stable(
-            "session-peer-v1",
-            &serde_json::json!({
-                "source": caller.id, "source_birth": caller.created_at,
-                "target": target.id, "target_birth": target.created_at,
-                "operation_id": operation_id,
-            }),
+        bamboo_domain::session_peer_message_id(
+            &caller.id,
+            caller.created_at,
+            &target.id,
+            target.created_at,
+            operation_id,
         )
     }
 
@@ -701,12 +758,33 @@ impl SessionMessenger {
         thread_id: String,
         in_reply_to: Option<SessionMessageId>,
     ) -> SessionMessageEnvelope {
+        Self::peer_envelope_for_ids(
+            &caller.id,
+            &target.id,
+            operation_id,
+            message,
+            id,
+            thread_id,
+            in_reply_to,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn peer_envelope_for_ids(
+        caller_id: &str,
+        target_id: &str,
+        operation_id: &str,
+        message: &str,
+        id: SessionMessageId,
+        thread_id: String,
+        in_reply_to: Option<SessionMessageId>,
+    ) -> SessionMessageEnvelope {
         SessionMessageEnvelope {
             id,
             source: SessionMessageSource::Session {
-                session_id: caller.id.clone(),
+                session_id: caller_id.into(),
             },
-            target_session_id: target.id.clone(),
+            target_session_id: target_id.into(),
             kind: SessionMessageKind::PeerMessage,
             body: SessionMessageBody::Content(SessionMessageContent::text(message)),
             created_at: chrono::Utc::now(),
@@ -758,6 +836,17 @@ impl SessionMessenger {
                 return Err(error);
             }
         };
+        self.finish_peer_delivery(envelope, delivery, started, intent)
+            .await
+    }
+
+    async fn finish_peer_delivery(
+        &self,
+        envelope: SessionMessageEnvelope,
+        delivery: bamboo_domain::SessionInboxDeliveryReceipt,
+        started: Instant,
+        intent: Option<SessionMessageDeliveryIntent>,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         let pending = delivery.pending;
         let admission = self.record_admission(envelope, delivery.delivery, started);
         // Exact explicit retries of ACKed/cancelled/dead deliveries cannot
