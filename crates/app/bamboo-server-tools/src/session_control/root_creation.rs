@@ -129,9 +129,9 @@ pub(super) fn request_schema() -> Value {
         "properties": {
             "operation_id":{"type":"string", "format":"uuid", "description":"Fresh non-nil UUID for one creation. Reuse exactly this UUID and every request field after an uncertain response; never allocate another operation to recover it."},
             "expected_state_revision":{"type":"integer", "minimum":0, "description":"Exact management state_revision returned by scope. A new operation must reload scope after a conflict; exact retries keep the original request."},
-            "project_id":{"type":"string", "minLength":1, "description":"An explicit existing Project in the Supervisor's current Host-configured allowed_projects. Creation never grants another Project."},
-            "workspace_path":{"type":"string", "minLength":1, "maxLength":4096, "description":"Explicit existing workspace already bound to this Project by the Host; no inheritance from the Supervisor, path registration, or worktree creation."},
-            "message":{"type":"string", "minLength":1, "maxLength":16384, "description":"One explicit first instruction, at most 16 KiB UTF-8. No private Supervisor history is copied."},
+            "project_id":{"type":"string", "minLength":1, "description":"An explicit existing Project in the caller's current Host-configured creation scope. Creation never grants another Project."},
+            "workspace_path":{"type":"string", "minLength":1, "maxLength":4096, "description":"Explicit existing workspace already bound to this Project by the Host; no caller workspace inheritance, path registration, or worktree creation."},
+            "message":{"type":"string", "minLength":1, "maxLength":16384, "description":"One explicit first instruction, at most 16 KiB UTF-8. No private caller history is copied."},
             "title":{"type":["string","null"], "minLength":1, "maxLength":256}
         },
         "required":["operation_id","expected_state_revision","project_id","workspace_path","message"]
