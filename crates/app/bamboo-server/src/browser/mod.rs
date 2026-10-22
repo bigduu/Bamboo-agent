@@ -96,6 +96,24 @@ struct BrowserLifecycle {
     opens: tokio::sync::RwLock<()>,
     owners: Mutex<Vec<Arc<BrowserCleanup>>>,
     unconfirmed_writers: Arc<AtomicBool>,
+    // Serializes only synchronous child creation with the irreversible fence.
+    // Never hold this across a host probe, filesystem I/O or an async wait.
+    writer_admission: Arc<Mutex<()>>,
+}
+
+impl BrowserLifecycle {
+    fn ensure_writer_admission(&self) -> Result<(), BrowserError> {
+        if self.unconfirmed_writers.load(Ordering::Acquire) {
+            return Err(BrowserError::Unavailable("browser writer exit unconfirmed".into()));
+        }
+        Ok(())
+    }
+
+    fn spawn_child(&self, command: &mut Command) -> Result<Child, BrowserError> {
+        let _admission = self.writer_admission.lock().unwrap();
+        self.ensure_writer_admission()?;
+        command.spawn().map_err(|error| BrowserError::Unavailable(error.to_string()))
+    }
 }
 
 /// Held through canonical reset and cache clear. Epoch changes before
@@ -142,6 +160,7 @@ struct BrowserCleanup {
     done: watch::Sender<bool>,
     quarantined: Mutex<Vec<BrowserQuarantine>>,
     unconfirmed_writers: Arc<AtomicBool>,
+    writer_admission: Arc<Mutex<()>>,
 }
 
 struct BrowserQuarantine {
@@ -160,13 +179,17 @@ impl BrowserCleanup {
         !self.quarantined.lock().unwrap().is_empty()
     }
 
+    fn fence_writers(&self) {
+        let _admission = self.writer_admission.lock().unwrap();
+        self.unconfirmed_writers.store(true, Ordering::Release);
+    }
+
     fn quarantine(&self, lease: Option<profile::Lease>, scratch: Option<tempfile::TempDir>) {
+        self.fence_writers();
         self.quarantined.lock().unwrap().push(BrowserQuarantine {
             _lease: lease,
             _scratch: scratch.map(tempfile::TempDir::keep),
         });
-        // Do not accumulate new live hosts behind an unresolved owned writer.
-        self.unconfirmed_writers.store(true, Ordering::Release);
         self.finish();
     }
 
@@ -220,6 +243,9 @@ impl Drop for BrowserSession {
         let graceful = lease.is_some()
             && !self.kill_issued.load(Ordering::Acquire)
             && !self.reaped.load(Ordering::Acquire);
+        if !graceful && !self.clean_host_exit.load(Ordering::Acquire) {
+            self.cleanup.fence_writers();
+        }
         // Establish the replay fence before returning from Drop, not after a
         // new thread happens to be scheduled (the process can exit meanwhile).
         let marked = lease
@@ -293,6 +319,7 @@ impl BrowserReaper {
                 break self.clean_host_exit || (self.graceful && !killed && status.success());
             }
             if !killed && Instant::now() >= deadline {
+                self.cleanup.fence_writers();
                 #[cfg(unix)]
                 if let Some(group) = self.process_group {
                     kill_browser_process_group(group);
@@ -302,6 +329,11 @@ impl BrowserReaper {
             }
             std::thread::sleep(Duration::from_millis(10));
         };
+        if !clean {
+            // The in-memory admission fence must not depend on successful
+            // durable-marker I/O, which may fail or wait for recovery forever.
+            self.cleanup.fence_writers();
+        }
         if let Some(lease) = &self.lease {
             if clean {
                 // Unlink may succeed before its directory barrier fails. Keep
@@ -486,9 +518,7 @@ impl BrowserSession {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        let child = command
-            .spawn()
-            .map_err(|error| BrowserError::Unavailable(error.to_string()))?;
+        let child = lifecycle.spawn_child(&mut command)?;
         let session = Self::from_child_tracked(child, Some(temp_dir), lifecycle)?;
         *session.profile_lease.lock().unwrap() = profile_lease;
         let mut abort_guard = BrowserCallAbortGuard::new(session.clone(), None);
@@ -533,6 +563,7 @@ impl BrowserSession {
             done: watch::channel(false).0,
             quarantined: Mutex::new(Vec::new()),
             unconfirmed_writers: lifecycle.unconfirmed_writers.clone(),
+            writer_admission: lifecycle.writer_admission.clone(),
         });
         let session = Arc::new(Self {
             cleanup: cleanup.clone(),
@@ -711,6 +742,7 @@ impl BrowserSession {
     }
 
     fn signal_stop(&self) {
+        self.cleanup.fence_writers();
         if let Some(lease) = self.profile_lease.lock().unwrap().as_ref() {
             self.retiring.store(true, Ordering::Release);
             // Forced deadlines/cancellation cannot promise a final checkpoint.
@@ -761,6 +793,7 @@ impl BrowserSession {
     }
 
     fn quarantine_resources(&self) {
+        self.cleanup.fence_writers();
         if self.cleanup.is_quarantined() {
             return;
         }
@@ -1020,6 +1053,7 @@ mod tests {
                 done: watch::channel(false).0,
                 quarantined: Mutex::new(Vec::new()),
                 unconfirmed_writers: Arc::new(AtomicBool::new(false)),
+                writer_admission: Arc::new(Mutex::new(())),
             }),
             profile_lease: Mutex::new(None),
             temp_dir: Mutex::new(None),
@@ -2266,13 +2300,12 @@ impl BrowserManager {
                 "browser manager shut down".into(),
             ));
         }
-        if self.lifecycle.unconfirmed_writers.load(Ordering::Acquire) {
-            return Err(BrowserError::Unavailable("browser writer exit unconfirmed".into()));
-        }
+        self.lifecycle.ensure_writer_admission()?;
         // Serialize only this chat's open/close lifecycle. Starting Chromium
         // or probing a slow host must not block unrelated chat sessions.
         let gate = self.session_gate(session_id);
         let _guard = gate.lock().await;
+        self.lifecycle.ensure_writer_admission()?;
         if self.retired.lock().unwrap().contains(session_id) {
             return Err(BrowserError::NotOpen);
         }
