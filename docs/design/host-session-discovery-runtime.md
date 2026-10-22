@@ -19,6 +19,9 @@ Only never-installed absence in the current store instance can select the real
 original Supervisor adapter. Ordinary callers without a Host read scope receive
 an explicit blocker; Project membership, supervision, IDs and cursors grant
 nothing. ListMetadata and InspectBoundedProgress remain separate rights.
+Legacy list/inspect recheck original caller and then Host absence before
+returning; an installation or revocation during the old reader's awaits rejects
+the old observation instead of switching routes or leaking its wider result.
 
 ## Pages and original operations
 
@@ -42,7 +45,10 @@ completion is claimed. It adds no history to another Session.
 Server Root and SDK defaults use the new `host_routed` viewer. SDK defaults also
 register the exact filtered `session_history_current` tool. Explicit SDK
 tools/no-tools/default-executor choices retain precedence. Base/Child surface
-and native ceiling integration remain with their separate owner.
+and native ceiling integration remain with their separate owner. The existing
+ordinary Ultra orchestration allowlist still blocks `session_history`; this
+slice does not claim that model path is enabled before the surface owner's
+change.
 
 Every routed list/inspect uses the router. The ordinary Root viewer's legacy
 global listing/search and known-ID peer raw history, metadata, compressed cache
@@ -73,12 +79,13 @@ operations keep their separate exact replay selector.
 
 ## Validation status
 
-Ten new Rust case sources cover six temporary canonical Host/router cases, one
+Eleven new Rust case sources cover seven temporary canonical Host/router cases, one
 pure large-ledger cursor case, both real Server/SDK assembly entries, and the
 bound-version Overlay regression. They include all three caller roles, right
 separation, metadata privacy, bounded visible progress, query/grant/generation
 changes, known-ID/raw/global bypass rejection, true legacy Supervisor absence,
-unsupported/final denial, revocation and a fresh store issuer. Scope installs
+unsupported/final denial, revocation, a fresh store issuer and publication
+changes while both legacy readers are paused. Scope installs and revocations
 occur only in temporary fixtures, never in user configuration or production
 assembly. There are no provider calls or actual history reset operations.
 

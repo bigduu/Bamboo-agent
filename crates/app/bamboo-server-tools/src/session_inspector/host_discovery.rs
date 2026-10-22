@@ -246,7 +246,11 @@ impl SessionDiscoveryPort for SessionDiscoveryRouter {
             Some(token) => self.host.list_with_token(caller, &token, request).await,
             None => {
                 require_legacy_supervisor(ctx)?;
-                self.supervisor.list(ctx, request).await
+                let page = self.supervisor.list(ctx, request).await?;
+                // Publication may have narrowed/revoked the legacy route while
+                // its canonical reader was waiting. Do not return its old view.
+                require_absent_host_for_legacy_history(self.storage.as_ref(), ctx).await?;
+                Ok(page)
             }
         }
     }
@@ -266,7 +270,9 @@ impl SessionDiscoveryPort for SessionDiscoveryRouter {
             Some(token) => self.host.inspect_with_token(caller, &token, request).await,
             None => {
                 require_legacy_supervisor(ctx)?;
-                self.supervisor.inspect(ctx, request).await
+                let observation = self.supervisor.inspect(ctx, request).await?;
+                require_absent_host_for_legacy_history(self.storage.as_ref(), ctx).await?;
+                Ok(observation)
             }
         }
     }
@@ -309,7 +315,10 @@ pub(super) async fn require_absent_host_for_legacy_history(
     ctx: &ToolCtx,
 ) -> Result<(), ToolError> {
     require_legacy_supervisor(ctx)?;
+    validate_original_caller(storage, ctx).await?;
     let caller = original_caller(ctx)?;
+    // Keep the final Host publication observation last: a caller validation
+    // await after it could otherwise miss a new installation or revocation.
     if storage
         .find_host_session_scope(caller)
         .await
@@ -318,7 +327,7 @@ pub(super) async fn require_absent_host_for_legacy_history(
     {
         return Err(ToolError::Execution("session_discovery_bounded_scope: an installed Host scope grants only metadata/bounded progress; use list/inspect".into()));
     }
-    validate_original_caller(storage, ctx).await
+    Ok(())
 }
 
 #[cfg(test)]

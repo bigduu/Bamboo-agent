@@ -8,8 +8,8 @@ use bamboo_agent_core::{Message, Session, Storage, Tool, ToolCtx};
 use bamboo_domain::{
     ActorAncestorObservation, HostScopeSessionObservation, HostSessionRight as Right,
     HostSessionScopeBinding, HostSessionScopeToken, HostSessionTargetScope, SessionCallerReference,
-    SupervisorManagementMutation as Mutation, SupervisorManagementRequest, SupervisorReference,
-    HOST_SESSION_SCOPE_VERSION,
+    SupervisorLinkObservation, SupervisorManagementMutation as Mutation,
+    SupervisorManagementRequest, SupervisorReference, HOST_SESSION_SCOPE_VERSION,
 };
 use bamboo_server_tools::session_inspector::{
     discovery::{AuthorizedSessionListRequest, SessionDiscoveryPort},
@@ -546,6 +546,119 @@ struct UnavailableHost {
     store: Arc<SessionStoreV2>,
     installed_but_denied: bool,
 }
+
+struct PauseLegacyRead {
+    store: Arc<SessionStoreV2>,
+    inspect: bool,
+    paused: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl Storage for PauseLegacyRead {
+    async fn save_session(&self, _: &Session) -> io::Result<()> {
+        panic!("discovery must not write")
+    }
+    async fn delete_session(&self, _: &str) -> io::Result<bool> {
+        panic!("discovery must not delete")
+    }
+    async fn load_session(&self, _: &str) -> io::Result<Option<Session>> {
+        panic!("no plain target/history fallback")
+    }
+    async fn load_root_authority(&self, id: &str) -> io::Result<Option<Session>> {
+        self.store.load_root_authority(id).await
+    }
+    async fn load_execution_admission_snapshot(&self, id: &str) -> io::Result<Option<Session>> {
+        self.store.load_execution_admission_snapshot(id).await
+    }
+    async fn find_host_session_scope(
+        &self,
+        caller: &SessionCallerReference,
+    ) -> io::Result<Option<HostSessionScopeToken>> {
+        self.store.find_host_session_scope(caller).await
+    }
+    async fn inspect_supervisor_link(
+        &self,
+        supervisor: &SupervisorReference,
+        target: &str,
+    ) -> io::Result<SupervisorLinkObservation> {
+        let observation = self
+            .store
+            .inspect_supervisor_link(supervisor, target)
+            .await?;
+        if !self.inspect {
+            self.paused.notify_one();
+            self.resume.notified().await;
+        }
+        Ok(observation)
+    }
+    async fn load_supervisor_managed_session(
+        &self,
+        supervisor: &SupervisorReference,
+        target: &str,
+    ) -> io::Result<Option<Session>> {
+        let session = self
+            .store
+            .load_supervisor_managed_session(supervisor, target)
+            .await?;
+        if self.inspect {
+            self.paused.notify_one();
+            self.resume.notified().await;
+        }
+        Ok(session)
+    }
+}
+
+#[tokio::test]
+async fn legacy_list_and_inspect_reject_host_installation_or_revocation_while_waiting() {
+    for inspect in [false, true] {
+        for revoke in [false, true] {
+            let fixture = Fixture::new().await;
+            let supervisor = fixture.supervisor().await;
+            let storage = Arc::new(PauseLegacyRead {
+                store: fixture.store.clone(),
+                inspect,
+                paused: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+            });
+            let tool = SessionInspectorTool::host_routed(fixture.store.clone(), storage.clone());
+            let request = if inspect {
+                json!({"action":"inspect","session_id":fixture.targets[0].id})
+            } else {
+                json!({"action":"list"})
+            };
+            let ctx = Fixture::ctx(&supervisor);
+            let read = tokio::spawn(async move { tool.invoke(request, ctx).await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), storage.paused.notified())
+                .await
+                .expect("legacy reader reaches its synthetic pause");
+            // Only temporary fixture authority changes. The old reader already
+            // observed A, but the newly published grant permits only B's metadata.
+            fixture
+                .install(&supervisor, vec![], &[(1, vec![Right::ListMetadata])], 0)
+                .await;
+            if revoke {
+                fixture
+                    .store
+                    .revoke_host_session_scope(&supervisor.id, 1)
+                    .await
+                    .unwrap();
+            }
+            storage.resume.notify_one();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+                .await
+                .expect("legacy reader completes after release")
+                .unwrap()
+                .unwrap_err();
+            assert!(error.to_string().contains(if revoke {
+                "authority_unavailable"
+            } else {
+                "bounded_scope"
+            }));
+        }
+    }
+}
+
 #[async_trait]
 impl Storage for UnavailableHost {
     async fn save_session(&self, _: &Session) -> io::Result<()> {
