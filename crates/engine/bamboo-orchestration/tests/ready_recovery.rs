@@ -2481,3 +2481,127 @@ async fn concurrent_revokes_both_wait_for_the_old_synchronous_host_poll() {
 async fn aborted_revoke_does_not_lose_the_old_synchronous_barrier_generation() {
     check_sync_revoke_barrier(true).await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn pending_metadata_preserves_retry_identity_window_and_original_intent_budget() {
+    let fixture = Fixture::new();
+    let store = Arc::new(MemoryStore::default());
+    let clock = Clock::new();
+    fixture
+        .host
+        .dispatch_actions
+        .lock()
+        .unwrap()
+        .push_back(DispatchAction::CommitThenFail(HostError::Unavailable));
+    fixture
+        .host
+        .ensure_actions
+        .lock()
+        .unwrap()
+        .push_back(EnsureAction::Fail(HostError::Io));
+    let scheduler = fixture.install(&store, &clock).await;
+    assert_blocked(
+        scheduler.reconcile(fixture.host.as_ref()).await.unwrap(),
+        &fixture.grant.work_id,
+        ReadyBlockKind::Transient,
+    );
+    let original = store.value(&fixture.key());
+    assert_eq!(original.record.attempts, 1);
+    assert!(matches!(
+        &original.record.request,
+        Some(ReadyRetryRequest::Start { .. })
+    ));
+    let started = fixture.host.service().published().unwrap().1;
+    let assignment = started.assignments.values().next().unwrap().clone();
+    let key = assignment.dispatch_key.clone();
+    let intent = started.intents[&key].clone();
+    let adopted_hash = started.project.assignment_contexts[&assignment.id].clone();
+    let mut context = started.project.contexts[&adopted_hash].clone();
+    context.project_revision += 1;
+    fixture.host.execute(
+        Principal::User {
+            user_id: "pending-context-owner".into(),
+        },
+        "same-input-metadata-candidate",
+        vec![Operation::SetProjectContext {
+            work_id: fixture.grant.work_id.clone(),
+            context,
+        }],
+    );
+    let pending = fixture.host.service().published().unwrap().1;
+    assert_eq!(pending.authority_epoch, started.authority_epoch);
+    assert_eq!(
+        pending.project.assignment_contexts[&assignment.id],
+        adopted_hash
+    );
+    assert_ne!(
+        pending.project.work_contexts[&fixture.grant.work_id],
+        adopted_hash
+    );
+    assert_eq!(
+        canonical_bytes(&pending.assignments).unwrap(),
+        canonical_bytes(&started.assignments).unwrap()
+    );
+    assert_eq!(
+        canonical_bytes(&pending.intents).unwrap(),
+        canonical_bytes(&started.intents).unwrap()
+    );
+    assert_eq!(
+        store.value(&fixture.key()),
+        original,
+        "canonical metadata cannot create, refund or extend retry metadata"
+    );
+    assert_deferred(
+        scheduler.reconcile(fixture.host.as_ref()).await.unwrap(),
+        &fixture.grant.work_id,
+        original.record.next_check_at_ms,
+        1,
+    );
+    assert_eq!(
+        store.value(&fixture.key()),
+        original,
+        "a pending candidate cannot bypass the original backoff or replace its Start request"
+    );
+    assert!(fixture.host.ensures.lock().unwrap().is_empty());
+
+    clock.advance(1_000).await;
+    assert_blocked(
+        scheduler.reconcile(fixture.host.as_ref()).await.unwrap(),
+        &fixture.grant.work_id,
+        ReadyBlockKind::Transient,
+    );
+    let retried = store.value(&fixture.key()).record;
+    assert_eq!(retried.identity_hash, original.record.identity_hash);
+    assert_eq!(retried.authority_epoch, original.record.authority_epoch);
+    assert_eq!(retried.created_at_ms, original.record.created_at_ms);
+    assert_eq!(retried.expires_at_ms, original.record.expires_at_ms);
+    assert_eq!(
+        retried.attempts, 2,
+        "the real ensure attempt is charged, never reset"
+    );
+    assert_eq!(retried.phase, ReadyRetryPhase::Deferred);
+    assert_eq!(
+        retried.request,
+        Some(ReadyRetryRequest::Intent {
+            dispatch_key: key.clone(),
+            spec_hash: intent.spec_hash.clone(),
+        })
+    );
+    assert_eq!(fixture.host.dispatches.lock().unwrap().len(), 1);
+    let ensures = fixture.host.ensures.lock().unwrap();
+    assert_eq!(ensures.len(), 1);
+    assert_eq!(
+        ensures[0],
+        (key.clone(), intent.immutable_spec.clone(), ROUNDS)
+    );
+    drop(ensures);
+    assert_eq!(fixture.host.preflights.lock().unwrap().len(), 1);
+    let after = fixture.host.service().published().unwrap().1;
+    assert_eq!(after.assignments.len(), 1);
+    assert_eq!(after.intents.len(), 1);
+    assert_eq!(after.intents[&key].immutable_spec, intent.immutable_spec);
+    assert_eq!(
+        canonical_bytes(&after).unwrap(),
+        canonical_bytes(&pending).unwrap()
+    );
+}

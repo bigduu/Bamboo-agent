@@ -140,7 +140,11 @@ impl ReadyAdmissionFence {
 pub trait ReadyWorkHost: Send + Sync {
     async fn authority(&self) -> Result<(Arc<TicketService>, Authority)>;
     async fn check_budget(&self, max_rounds: u32) -> Result<()>;
+    /// Candidate preflight for a fresh Start, never a replacement for the
+    /// immutable dispatch checks required when ensuring an existing intent.
     async fn preflight(&self, command: &Command) -> Result<()>;
+    /// Revalidate the original spec against current Host resources before any
+    /// pending admission; do not substitute the Work's newer context candidate.
     async fn ensure(
         &self,
         key: &str,
@@ -493,27 +497,37 @@ impl ReadyWorkScheduler {
                 None
             };
             let eligible = async {
+                // A committed pending attempt keeps its adopted context. A
+                // newer Work candidate is only eligible for a future Start.
+                let context_hash = match pending {
+                    Some(assignment) => snapshot.project.assignment_contexts.get(&assignment.id),
+                    None => snapshot.project.work_contexts.get(&work.id),
+                };
                 if snapshot.project.links.get(&work.id) != Some(&policy.project_id)
-                    || snapshot.project.work_contexts.get(&work.id) != Some(&grant.context_hash)
+                    || context_hash != Some(&grant.context_hash)
                     || work.contract_revision != grant.contract_revision
                 {
                     return Err(Error::ScopeDenied(
                         "Host Project/context decision is stale".into(),
                     ));
                 }
-                let command = Command {
-                    operation_id: String::new(),
-                    binding: snapshot.binding.clone(),
-                    expected_seq: snapshot.seq,
-                    expected_epoch: snapshot.authority_epoch,
-                    source: None,
-                    operations: vec![Operation::Start {
-                        work_id: work.id.clone(),
-                        temp_id: "assignment".into(),
-                        workspace: Some(grant.workspace.clone()),
-                    }],
-                };
-                host.preflight(&command).await?;
+                if pending.is_none() {
+                    let command = Command {
+                        operation_id: String::new(),
+                        binding: snapshot.binding.clone(),
+                        expected_seq: snapshot.seq,
+                        expected_epoch: snapshot.authority_epoch,
+                        source: None,
+                        operations: vec![Operation::Start {
+                            work_id: work.id.clone(),
+                            temp_id: "assignment".into(),
+                            workspace: Some(grant.workspace.clone()),
+                        }],
+                    };
+                    host.preflight(&command).await?;
+                }
+                // Pending attempts reach ensure_fenced with their immutable
+                // spec; the Host checks that spec's live resources before send.
                 // Filter poisoned/overlapping resources before oldest-first
                 // selection. Start remains the atomic authoritative validator.
                 if snapshot.assignments.values().any(|assignment| {
