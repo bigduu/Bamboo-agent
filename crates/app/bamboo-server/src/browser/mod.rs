@@ -2387,15 +2387,29 @@ impl BrowserManager {
         }
         // Poll every stop before waiting for any one host's close deadline.
         // join_all keeps draining the remaining hosts even if one close fails.
-        for result in futures::future::join_all(sessions.into_iter().map(Self::stop_session)).await
+        let mut unsettled = Vec::new();
+        for (owner, result) in
+            futures::future::join_all(sessions.into_iter().map(|session| async move {
+                let owner = session.cleanup.clone();
+                (owner, Self::stop_session(session).await)
+            }))
+            .await
         {
             if let Err(error) = result {
                 tracing::warn!(%error, "browser shutdown did not confirm persistence");
+                unsettled.push(owner);
             }
         }
         // Records also cover hosts whose final Arc already started a detached
         // Drop reaper. Waiting on durable completion avoids a Weak/Drop race.
         for owner in owners {
+            if unsettled.iter().any(|failed| Arc::ptr_eq(failed, &owner)) {
+                // This owner's bounded stop already failed. Preserve its
+                // resources/unfinished notification for recovery; waiting on
+                // the same failed I/O barrier here would hang shutdown forever.
+                // Other owners, including detached reapers, still drain below.
+                continue;
+            }
             owner.wait().await;
             if owner.is_quarantined() {
                 tracing::warn!(
