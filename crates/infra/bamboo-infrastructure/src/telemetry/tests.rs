@@ -350,6 +350,86 @@ mod otlp {
     }
 
     #[test]
+    fn retryable_collector_status_is_sent_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1/traces", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let collector = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut requests = 0;
+            loop {
+                assert!(Instant::now() < deadline, "collector was not stopped");
+                let mut socket = match listener.accept() {
+                    Ok((socket, _)) => socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        // Drain already queued requests before acknowledging shutdown.
+                        match finished_rx.try_recv() {
+                            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                return requests;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("collector accept: {error}"),
+                };
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    headers.push(byte[0]);
+                    assert!(headers.len() < 8192);
+                }
+                let headers = String::from_utf8(headers).unwrap();
+                assert!(headers.starts_with("POST /v1/traces HTTP/1.1\r\n"));
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(|value| value.parse().unwrap())
+                    })
+                    .unwrap();
+                assert!(content_length > 0 && content_length < 64 * 1024);
+                let mut body = vec![0; content_length];
+                socket.read_exact(&mut body).unwrap();
+                requests += 1;
+                // Close each response so every attempted export is counted.
+                socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+            }
+        });
+        let provider = config::build_provider(&config(endpoint)).unwrap();
+        let tracer = provider.tracer_with_scope(scope());
+        Observation::start_with(&tracer, "invoke_agent", SpanKind::Internal, vec![])
+            .finish(Outcome::Success);
+        // A rejected export may make flush fail; its send count is the contract.
+        let _ = provider.force_flush();
+        let started = Instant::now();
+        let shutdown = provider.shutdown_with_timeout(Duration::from_secs(2));
+        let shutdown_elapsed = started.elapsed();
+        let _ = finished_tx.send(());
+        let requests = collector.join().unwrap();
+        assert!(shutdown.is_ok(), "collector shutdown failed: {shutdown:?}");
+        assert!(
+            shutdown_elapsed < Duration::from_secs(3),
+            "shutdown exceeded timeout tolerance"
+        );
+        assert_eq!(requests, 1, "retryable collector status retried the export");
+    }
+
+    #[test]
     fn ambient_otel_headers_and_resources_cannot_leak_credentials() {
         // A subprocess gives this test private environment variables without
         // racing unrelated tests or mutating the embedding host's environment.
