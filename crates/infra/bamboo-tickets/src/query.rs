@@ -84,6 +84,9 @@ pub struct TicketView {
     pub assignments: Vec<Assignment>,
     pub requests: Vec<PendingRequest>,
     pub submissions: Vec<Submission>,
+    /// Opt-in owner control facts; absence on an older producer is unsupported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controls: Option<WorkControlFacts>,
     #[serde(default = "all_inspect_sections")]
     pub sections: BTreeSet<InspectSection>,
 }
@@ -94,8 +97,10 @@ pub enum InspectSection {
     Assignments,
     Requests,
     Submissions,
+    Controls,
 }
 
+/// Legacy default history sections. Owner control facts require explicit opt-in.
 pub fn all_inspect_sections() -> BTreeSet<InspectSection> {
     BTreeSet::from([
         InspectSection::Assignments,
@@ -370,6 +375,9 @@ impl TicketService {
                 "inspect <=32 IDs, depth<=4, budget 128..65536".into(),
             ));
         }
+        if options.sections.contains(&InspectSection::Controls) {
+            authority.user()?;
+        }
         let (commit, snapshot) = self.query_snapshot(authority, "inspect", None, fixed_commit)?;
         let refs = visible(authority, &snapshot)?;
         let mut selected: BTreeSet<_> = ids.iter().cloned().collect();
@@ -428,11 +436,15 @@ impl TicketService {
                 ticket.current_submission = ticket.accepted_submission.clone();
                 ticket.import_source = None;
             }
+            let controls = (ticket.kind == TicketKind::Work
+                && options.sections.contains(&InspectSection::Controls))
+            .then(|| crate::controls::facts(&snapshot, &ticket));
             data.push(TicketView {
                 ticket,
                 assignments,
                 requests,
                 submissions,
+                controls,
                 sections: options.sections.clone(),
             });
         }
@@ -453,14 +465,16 @@ impl TicketService {
         if !(1..=100).contains(&limit) {
             return Err(Error::InvalidTransition("changes limit 1..100".into()));
         }
+        // Old cursor offsets cannot survive adding Sprint rows to historical commits.
         let hash = content_hash(&canonical_bytes(
-            &serde_json::json!({"changes_since":since_seq}),
+            &serde_json::json!({"changes_since":since_seq,"changes_projection":2}),
         )?);
         let (commit, snapshot) = self.query_snapshot(authority, &hash, cursor, None)?;
         if since_seq > snapshot.seq {
             return Err(Error::ResyncRequired);
         }
         let refs = visible(authority, &snapshot)?;
+        let include_sprints = authority.supervisor().is_ok();
         let mut next = Some(commit.clone());
         let mut changes = Vec::new();
         let mut scanned = 0;
@@ -485,6 +499,20 @@ impl TicketService {
                     entity: "ticket".into(),
                     id: ticket.id.clone(),
                 });
+            }
+            if include_sprints {
+                for sprint in state
+                    .sprint
+                    .sprints
+                    .values()
+                    .filter(|s| s.updated_seq == state.seq)
+                {
+                    changes.push(WorkChange {
+                        seq: state.seq,
+                        entity: "sprint".into(),
+                        id: sprint.id.as_str().into(),
+                    });
+                }
             }
             for a in state.assignments.values().filter(|a| {
                 refs.contains(&a.work_id)

@@ -94,8 +94,9 @@ function assertManualVersion(version, now = new Date()) {
   return version
 }
 
-function validateSource({ eventName, event, repository, sourceRevision }) {
+function validateSource({ eventName, event, repository, sourceRevision, sourceTree, validation }) {
   assert.match(sourceRevision, SHA)
+  // A caller-supplied historical dispatch proof is not new publication authority.
   assert.equal(eventName, 'workflow_run', 'Unsupported release trigger')
   const run = event.workflow_run
   assert.equal(run?.name, 'CI')
@@ -160,6 +161,7 @@ function selectVersion({ identity, crates, receipts, versions, occupiedVersions 
 async function plan(context) {
   assert.equal(context.automatic, true, 'Receipt controller is only for automatic main publication')
   const { identity, crates } = context
+  await context.assertCurrentMain()
   context.assertSigningKey()
   const releases = await context.releases()
   const receipts = []
@@ -185,7 +187,8 @@ async function plan(context) {
   }
   const receipt = { schemaVersion: 1, version, identity, crates,
     frontendBytes: context.frontendBytes, automatic: true, completed: false,
-    ciRun: context.ciRun || null, packageChecksums: {} }
+    ciRun: context.ciRun || null, packageChecksums: {},
+    ...(context.validation ? { validation: context.validation } : {}) }
   // Reserve before uploading any crate. An uncertain GitHub write is recovered
   // by reading this exact tag on a rerun, never by allocating another version.
   const reserved = await context.reserve(receipt)
@@ -196,6 +199,7 @@ async function plan(context) {
 
 async function publish(context, release, receipt) {
   assert.equal(context.automatic, true, 'Receipt controller is only for automatic main publication')
+  await context.assertCurrentMain()
   context.assertSigningKey()
   context.verifyReceipt(receipt)
   validateReceipt(receipt, context.identity, context.crates)
@@ -399,7 +403,7 @@ function receiptBody(receipt) {
   return `${receipt.completed ? 'Published' : 'Reserved'} Bamboo ${receipt.version}.\n\n` +
     `Source: [${sourceRevision}](https://github.com/${repository}/commit/${sourceRevision})\n\n` +
     `Frontend: ${frontend.packageName}@${frontend.packageVersion}\n\n` +
-    (receipt.ciRun ? `Validated main CI: ${receipt.ciRun}\n\n` : '') +
+    (receipt.ciRun ? `Validated release CI: ${receipt.ciRun}\n\n` : '') +
     'Provenance binds the source, preserved frontend bytes and each crate checksum.\n\n' +
     `<!-- bamboo-release-provenance\n${JSON.stringify(receipt)}\n-->`
 }
@@ -488,13 +492,33 @@ async function registryFetch(url, allowMissing = false) {
   return response
 }
 
+// A successful queued run does not authorize publication after main advances.
+// Re-read the fixed repository immediately before each external write; failures
+// stop before the write. Historical recovery keeps its existing authority path.
+async function assertCurrentMain(repository, sourceRevision, readBranch = () => github(repository, 'branches/main')) {
+  assert.equal(repository, 'bigduu/Bamboo-agent')
+  assert.match(sourceRevision, /^[0-9a-f]{40}$/)
+  const branch = await readBranch()
+  assert.equal(branch.name, 'main')
+  assert.equal(branch.commit?.sha, sourceRevision, 'Publication source is no longer current main')
+}
+
+async function currentMainWrite(guard, write) {
+  await guard()
+  return write()
+}
+
 function makeContext(env = process.env) {
   const repository = env.GITHUB_REPOSITORY
   assert.equal(repository, 'bigduu/Bamboo-agent')
   const sourceRevision = command(['git', 'rev-parse', 'HEAD']).trim()
   const event = JSON.parse(fs.readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))
-  const automatic = validateSource({ eventName: env.GITHUB_EVENT_NAME, event, repository, sourceRevision })
-  return makeVerifiedContext(env, repository, sourceRevision, event.workflow_run, automatic)
+  const validation = env.SOURCE_VALIDATION ? JSON.parse(env.SOURCE_VALIDATION) : undefined
+  const automatic = validateSource({ eventName: env.GITHUB_EVENT_NAME, event, repository, sourceRevision,
+    sourceTree: command(['git', 'rev-parse', 'HEAD^{tree}']).trim(), validation })
+  const context = makeVerifiedContext(env, repository, sourceRevision, validation?.ciRun || event.workflow_run, automatic, true)
+  if (validation) context.validation = validation
+  return context
 }
 
 function makeRecoveryContext(env = process.env) {
@@ -503,7 +527,7 @@ function makeRecoveryContext(env = process.env) {
   return makeVerifiedContext(env, env.GITHUB_REPOSITORY, source, run, true)
 }
 
-function makeVerifiedContext(env, repository, sourceRevision, run, automatic) {
+function makeVerifiedContext(env, repository, sourceRevision, run, automatic, requireCurrentMain = false) {
   assert.ok(env.CARGO_REGISTRY_TOKEN, 'Missing CARGO_REGISTRY_TOKEN')
   assertSigningConfiguration(env.BAMBOO_RELEASE_SIGNING_KEY, env.BAMBOO_RELEASE_SIGNING_KEY_SHA256)
   const frontendDirectory = 'crates/app/bamboo-server/frontend_package'
@@ -540,7 +564,10 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic) {
     fs.writeFileSync(archive, bytes)
     return { bytes, entry: (file) => command(['tar', '-xOf', archive, `${name}-${version}/${file}`], { encoding: null }) }
   }
+  const guard = requireCurrentMain ? () => assertCurrentMain(repository, sourceRevision) : async () => {}
+  const write = (action) => currentMainWrite(guard, action)
   const context = { automatic, identity, frontendBytes, crates, receiptFile,
+    assertCurrentMain: guard,
     ciRun: run.html_url,
     releases: async () => paginated('releases?per_page=100'),
     tags: async () => paginated('tags?per_page=100').map((tag) => tag.name.replace(/^v/, '')),
@@ -578,25 +605,25 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic) {
       if (!tag) return null
       return tag.object?.type === 'commit' ? tag.object.sha : undefined
     },
-    reserve: async (receipt) => github(repository, 'releases', {
+    reserve: async (receipt) => write(() => github(repository, 'releases', {
       tag_name: `v${receipt.version}`, target_commitish: sourceRevision,
       name: `Bamboo v${receipt.version}`, draft: true,
       body: receiptBody(signReceipt(receipt, env.BAMBOO_RELEASE_SIGNING_KEY)),
-    }),
+    })),
     ensureTag: async (_release, receipt) => {
       const ref = `tags/v${receipt.version}`
       let tag = github(repository, `git/ref/${ref}`, undefined, undefined, true)
       // Tag creation checks repository/workflow write authority before the
       // first crates.io upload. Queued historical source must never discover
       // a release-token permission failure only after publishing all crates.
-      if (!tag) tag = github(repository, 'git/refs', { ref: `refs/${ref}`, sha: sourceRevision })
+      if (!tag) tag = await write(() => github(repository, 'git/refs', { ref: `refs/${ref}`, sha: sourceRevision }))
       assert.equal(tag.object.type, 'commit', 'Reserved release tag must be a direct commit ref')
       assert.equal(tag.object.sha, sourceRevision, 'Reserved release tag points to different source')
     },
     saveReceipt: async (release, receipt) => {
       signReceipt(receipt, env.BAMBOO_RELEASE_SIGNING_KEY)
       fs.writeFileSync(receiptFile, `${JSON.stringify(receipt, null, 2)}\n`)
-      github(repository, `releases/${release.id}`, { tag_name: `v${receipt.version}`, body: receiptBody(receipt) }, 'PATCH')
+      await write(() => github(repository, `releases/${release.id}`, { tag_name: `v${receipt.version}`, body: receiptBody(receipt) }, 'PATCH'))
     },
     ensureFrontend: async (release, receipt) => {
       const current = github(repository, `releases/${release.id}`)
@@ -608,8 +635,8 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic) {
         verifyFiles: async (bytes) => verifyPreservedFrontend(stagedFrontend, bytes),
         writeFiles: async (bytes) => bytes.forEach((content, index) => fs.writeFileSync(path.join(frontendDirectory, names[index]), content)),
         saveReceipt: async () => context.saveReceipt(release, receipt),
-        upload: async () => command(['gh', 'release', 'upload', `v${receipt.version}`,
-          ...names.map((name) => path.join(frontendDirectory, name)), '--clobber', '--repo', repository]),
+        upload: async () => write(() => command(['gh', 'release', 'upload', `v${receipt.version}`,
+          ...names.map((name) => path.join(frontendDirectory, name)), '--clobber', '--repo', repository])),
       })
     },
     registry: async (name, version) => {
@@ -622,9 +649,9 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic) {
       return sha256(fs.readFileSync(path.join(target, 'package', `${name}-${version}.crate`)))
     },
     cargoPublish: async (name) => {
-      const result = spawnCommand(['cargo', 'publish', '--locked', '--allow-dirty', '-p', name], {
+      const result = await write(() => spawnCommand(['cargo', 'publish', '--locked', '--allow-dirty', '-p', name], {
         encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
-      })
+      }))
       if (result.error) throw result.error
       const output = `${result.stdout || ''}${result.stderr || ''}`
       process.stdout.write(output)
@@ -636,10 +663,10 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic) {
     },
     wait: async (seconds) => new Promise((resolve) => setTimeout(resolve, seconds * 1000)),
     complete: async (release, receipt, makeLatest) => {
-      command(['gh', 'release', 'upload', `v${receipt.version}`, receiptFile, '--clobber', '--repo', repository])
-      return github(repository, `releases/${release.id}`, {
+      await write(() => command(['gh', 'release', 'upload', `v${receipt.version}`, receiptFile, '--clobber', '--repo', repository]))
+      return write(() => github(repository, `releases/${release.id}`, {
         tag_name: `v${receipt.version}`, draft: false, make_latest: makeLatest ? 'true' : 'false', body: receiptBody(receipt),
-      }, 'PATCH')
+      }, 'PATCH'))
     },
   }
   return context
@@ -663,7 +690,7 @@ async function main() {
 }
 
 module.exports = { assertVersion, assertManualVersion, validateSource, validateReceipt, nextVersion, selectVersion,
-  plan, publish, makeContext, makeRecoveryContext, sha256, githubArgs, receiptBody, readBodyReceipt,
+  plan, publish, makeContext, makeRecoveryContext, assertCurrentMain, currentMainWrite, sha256, githubArgs, receiptBody, readBodyReceipt,
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
   verifyRegistrySource, highestStableVersion, spawnCommand, command }

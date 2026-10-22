@@ -3,7 +3,6 @@
 use super::{Agent, AgentError, AgentEvent, Message, Session};
 use bamboo_agent_core::tools::{ToolExecutor, ToolOutcome};
 use bamboo_agent_core::{PendingQuestion, PendingQuestionSource};
-use bamboo_domain::resolve_tool_reference_name;
 use bamboo_engine::session_app::approval_replay::{
     apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
     repark_permission_replay, restore_permission_replay_authorization,
@@ -91,10 +90,9 @@ fn validate_request(
     // Requests name the selected execution identity, while history and pending
     // questions retain the caller's spelling. Exact custom registrations must
     // win before builtin aliases, just as they do in the live executor.
-    let execution_name = resolve_tool_reference_name(&target.tool_call().function.name, |name| {
-        executor.owns_exact_tool(name)
-    })
-    .ok_or_else(|| invalid("current tool is unavailable"))?;
+    let execution_name = executor
+        .resolve_reference_for_session(session, &target.tool_call().function.name)
+        .ok_or_else(|| invalid("current tool is unavailable"))?;
     if request.session_id != session.id
         || request.request_id != target.tool_call().id
         || request.tool_name != execution_name
@@ -142,6 +140,9 @@ impl Agent {
             return Err(invalid("generation marker has no tool-call marker"));
         }
         let executor = self.inner.default_tools();
+        let executor = executor
+            .for_session(session)
+            .unwrap_or_else(|| executor.clone());
 
         if let Some(pending) = session.pending_question.as_ref() {
             if let Some(message) = latest_result(session, &pending.tool_call_id) {
@@ -224,9 +225,9 @@ impl Agent {
 
         let tool_call = target.tool_call();
         let tool_name = &tool_call.function.name;
-        let replay_owner = execution_name.clone().or_else(|| {
-            resolve_tool_reference_name(tool_name, |name| executor.owns_exact_tool(name))
-        });
+        let replay_owner = execution_name
+            .clone()
+            .or_else(|| executor.resolve_reference_for_session(session, tool_name));
         let executing_supervisor = validate_permission_replay_authority(
             session,
             &target,

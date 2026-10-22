@@ -226,7 +226,7 @@ async fn tampered_sidecar_proof_and_recreated_incarnation_are_rejected() {
 }
 
 #[tokio::test]
-async fn large_transcript_does_not_enter_supervisor_control_plane_or_management() {
+async fn large_transcript_scope_omits_history_and_corrupt_history_blocks_management() {
     let (_home, store, _old_reference) = fixture().await;
     assert!(store
         .delete_session(DEFAULT_SUPERVISOR_SESSION_ID)
@@ -263,12 +263,18 @@ async fn large_transcript_does_not_enter_supervisor_control_plane_or_management(
     // The large main file can become unreadable as a full Session without
     // granting or hiding authority on the bounded control-plane path.
     let main = dir.join("session.json");
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&fs::read(&main).await.unwrap()).unwrap();
+    let valid_main = fs::read(&main).await.unwrap();
+    let section_end = compact_main::section_length(&valid_main).unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&valid_main).unwrap();
+    value.as_object_mut().unwrap().remove(compact_main::MEMBER);
     value["messages"] = serde_json::json!({"invalid": "transcript shape"});
-    fs::write(&main, serde_json::to_vec(&value).unwrap())
-        .await
-        .unwrap();
+    let flat = serde_json::to_vec(&value).unwrap();
+    let mut corrupt_main = valid_main[..section_end].to_vec();
+    corrupt_main.extend_from_slice(&flat[1..]);
+    assert!(compact_main::validate_full_main(&corrupt_main)
+        .unwrap()
+        .is_some());
+    fs::write(&main, &corrupt_main).await.unwrap();
     assert!(store.load_session(&reference.session_id).await.is_err());
     assert_eq!(
         store
@@ -278,16 +284,47 @@ async fn large_transcript_does_not_enter_supervisor_control_plane_or_management(
             .state_revision,
         1
     );
-    let changed = store
-        .mutate_supervisor_management(&SupervisorManagementRequest {
-            supervisor: reference.clone(),
-            expected_state_revision: 1,
-            mutation: SupervisorManagementMutation::ConfigureProjectScope {
-                allowed_projects: ["project-b".parse().unwrap()].into(),
-            },
-        })
+    let mut before = Vec::new();
+    for path in [
+        main.clone(),
+        dir.join(RUNTIME_SIDECAR_FILE),
+        dir.join(supervisor_proof::SUPERVISOR_PROOF_FILE),
+        dir.join(root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE),
+        store.index_path().to_path_buf(),
+    ] {
+        before.push((path.clone(), fs::read(path).await.ok()));
+    }
+    let request = SupervisorManagementRequest {
+        supervisor: reference.clone(),
+        expected_state_revision: 1,
+        mutation: SupervisorManagementMutation::ConfigureProjectScope {
+            allowed_projects: ["project-b".parse().unwrap()].into(),
+        },
+    };
+    let error = store
+        .mutate_supervisor_management(&request)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error
+        .to_string()
+        .starts_with("invalid source session.json:"));
+    for (path, bytes) in before {
+        assert_eq!(fs::read(path).await.ok(), bytes);
+    }
+    assert_eq!(
+        store
+            .inspect_supervisor_scope(&reference)
+            .await
+            .unwrap()
+            .state_revision,
+        1
+    );
+
+    // Management publication still requires a valid canonical Main. Restoring
+    // that evidence permits the same CAS, without relaxing compatibility guards.
+    fs::write(&main, &valid_main).await.unwrap();
+    let changed = store.mutate_supervisor_management(&request).await.unwrap();
     assert_eq!(changed.state_revision, 2);
 }
 

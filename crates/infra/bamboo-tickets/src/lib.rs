@@ -1,17 +1,22 @@
 //! Trusted-host application service. No model, network or Worker runs under its lock.
 //! This store owns contracts, not Session transcripts or Jiandu memory.
 mod claiming;
+mod controls;
 mod file_reconciliation;
 mod migration;
 mod model;
+mod planning;
 mod project;
 mod query;
 mod resolution;
 mod service;
+mod sprint;
+mod sprint_query;
 pub mod store;
 mod workspace_files;
 
 pub use claiming::*;
+pub use controls::WorkControlFacts;
 pub use file_reconciliation::*;
 pub use migration::*;
 pub use model::*;
@@ -19,6 +24,8 @@ pub use project::*;
 pub use query::*;
 pub use resolution::*;
 pub use service::{validate_native_tool_ceiling, Authority, Principal, TicketService};
+pub use sprint::*;
+pub use sprint_query::*;
 pub use store::{FaultPoint, Health, PublicationFault};
 pub use workspace_files::{FileOperation, FileReply, FILE_BYTES_LIMIT};
 

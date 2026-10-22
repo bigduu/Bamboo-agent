@@ -149,6 +149,7 @@ async fn run_agent_loop_with_config_inner(
         }
         super::state_bridge::ensure_initial_root_tool_authority(session, config.storage.as_ref())
             .await?;
+        let tools = tools.for_session(session).unwrap_or_else(|| tools.clone());
         let mut state: LoopRunState = initialize_loop_state(
             session,
             initial_message.as_str(),

@@ -84,13 +84,36 @@ pub(crate) fn set_context(
         .tickets
         .get(id)
         .ok_or_else(|| invalid("work not found"))?;
-    if work.kind != TicketKind::Work
-        || work.active_assignment.is_some()
-        || !matches!(work.state, WorkState::Draft | WorkState::Ready)
-    {
-        return Err(invalid(
-            "context adoption requires stopped Draft/Ready Work",
-        ));
+    if work.kind != TicketKind::Work || work.archived {
+        return Err(invalid("context requires an unarchived Work"));
+    }
+    let stopped = work.active_assignment.is_none()
+        && matches!(work.state, WorkState::Draft | WorkState::Ready);
+    if !stopped {
+        // A live Assignment always keeps its immutable DispatchSpec/context.
+        // Only metadata revisions may be queued; changing actual inputs or the
+        // selected binding still requires the existing confirmed-stop boundary.
+        let adopted = work
+            .active_assignment
+            .as_ref()
+            .filter(|_| matches!(work.state, WorkState::Active | WorkState::Blocked))
+            .and_then(|id| snapshot.project.assignment_contexts.get(id))
+            .and_then(|hash| snapshot.project.contexts.get(hash))
+            .ok_or_else(|| invalid("context adoption requires stopped Draft/Ready Work"))?;
+        if !same_execution_inputs(adopted, context) {
+            return Err(invalid("running context inputs require a confirmed stop"));
+        }
+        let current = snapshot
+            .project
+            .work_contexts
+            .get(id)
+            .and_then(|hash| snapshot.project.contexts.get(hash))
+            .ok_or_else(|| invalid("current context missing"))?;
+        if context.project_revision < current.project_revision
+            || context.resource_revision < current.resource_revision
+        {
+            return Err(Error::RevisionConflict);
+        }
     }
     if snapshot.project.links.get(id) != Some(&context.project_id)
         || work.contract_revision != context.contract_revision
@@ -110,6 +133,16 @@ pub(crate) fn set_context(
     work.record_revision += 1;
     work.updated_seq = snapshot.seq;
     Ok(())
+}
+
+// Project/resource counters also change for a rename or another registered
+// directory. Those metadata changes do not change this Assignment's inputs.
+fn same_execution_inputs(a: &ProjectContextSnapshot, b: &ProjectContextSnapshot) -> bool {
+    a.project_id == b.project_id
+        && a.workspace_binding == b.workspace_binding
+        && a.contract_revision == b.contract_revision
+        && a.contract == b.contract
+        && a.sources == b.sources
 }
 
 fn validate_context(context: &ProjectContextSnapshot) -> Result<()> {
@@ -284,6 +317,9 @@ pub struct ProjectBoardRow {
     pub stage: Option<ProjectBoardStage>,
     pub context: Option<ProjectContextSnapshot>,
     pub adopted_context: Option<ProjectContextSnapshot>,
+    /// Candidate waiting for the next Start; never modifies the live Assignment.
+    #[serde(default)]
+    pub pending_context: Option<ProjectContextSnapshot>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProjectBoardCounts {
@@ -309,6 +345,11 @@ pub struct ProjectBoardRequest {
     pub include_cancelled: bool,
     #[serde(default)]
     pub include_archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprint_filter: Option<SprintBoardFilter>,
+    /// Owner deadline filter evaluated at an explicit instant, never the Host clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overdue_as_of: Option<String>,
     pub limit: usize,
     pub cursor: Option<ReadCursor>,
     pub fixed_commit: Option<String>,
@@ -326,12 +367,20 @@ impl TicketService {
         if !(1..=100).contains(&request.limit) {
             return Err(invalid("board limit 1..100"));
         }
-        let hash = content_hash(&canonical_bytes(&(
-            "project-board-v1",
-            &request.project_id,
-            request.include_cancelled,
-            request.include_archived,
-        ))?);
+        let overdue_as_of = request
+            .overdue_as_of
+            .as_deref()
+            .map(crate::planning::overdue_instant)
+            .transpose()?;
+        let base_hash = crate::sprint_query::board_query_hash(request)?;
+        let hash = match request.overdue_as_of.as_deref() {
+            None => base_hash,
+            Some(as_of) => content_hash(&canonical_bytes(&(
+                "project-board-overdue-v1",
+                &base_hash,
+                as_of,
+            ))?),
+        };
         let (commit, snapshot) = self.query_snapshot(
             authority,
             &hash,
@@ -339,14 +388,38 @@ impl TicketService {
             request.fixed_commit.as_deref(),
         )?;
         let visible = crate::query::visible(authority, &snapshot)?;
+        let sprint_members = crate::sprint_query::board_members(
+            &snapshot,
+            &request.project_id,
+            request.sprint_filter.as_ref(),
+        )?;
         let mut counts = ProjectBoardCounts::default();
         let mut rows = Vec::new();
+        let mut latest_adoptions: BTreeMap<&str, &Assignment> = BTreeMap::new();
+        for assignment in snapshot.assignments.values() {
+            let latest = latest_adoptions
+                .entry(&assignment.work_id)
+                .or_insert(assignment);
+            if assignment.generation > latest.generation {
+                *latest = assignment;
+            }
+        }
         for ticket in snapshot.tickets.values().filter(|t| {
             t.kind == TicketKind::Work
                 && visible.contains(&t.id)
                 && snapshot.project.links.get(&t.id) == Some(&request.project_id)
                 && (request.include_archived || !t.archived)
+                && sprint_members
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&t.id))
         }) {
+            let matches_deadline = match &overdue_as_of {
+                Some(as_of) => crate::planning::is_overdue_at(ticket, as_of)?,
+                None => true,
+            };
+            if !matches_deadline {
+                continue;
+            }
             counts.total += 1;
             if ticket.state == WorkState::Cancelled {
                 counts.cancelled += 1;
@@ -381,7 +454,13 @@ impl TicketService {
                         .as_ref()
                         .and_then(|id| snapshot.submissions.get(id))
                         .map(|s| &s.assignment_id)
+                })
+                .or_else(|| {
+                    // Preserve the last actual adoption after a confirmed stop.
+                    latest_adoptions.get(ticket.id.as_str()).map(|a| &a.id)
                 });
+            let candidate_hash = snapshot.project.work_contexts.get(&ticket.id);
+            let adopted_hash = adopted.and_then(|id| snapshot.project.assignment_contexts.get(id));
             rows.push(ProjectBoardRow {
                 ticket: ticket.clone(),
                 stage: column,
@@ -391,8 +470,11 @@ impl TicketService {
                     .get(&ticket.id)
                     .and_then(|h| snapshot.project.contexts.get(h))
                     .cloned(),
-                adopted_context: adopted
-                    .and_then(|id| snapshot.project.assignment_contexts.get(id))
+                adopted_context: adopted_hash
+                    .and_then(|h| snapshot.project.contexts.get(h))
+                    .cloned(),
+                pending_context: candidate_hash
+                    .filter(|hash| adopted_hash != Some(*hash))
                     .and_then(|h| snapshot.project.contexts.get(h))
                     .cloned(),
             });

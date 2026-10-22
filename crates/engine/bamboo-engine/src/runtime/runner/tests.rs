@@ -129,6 +129,10 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
     });
 
     let mut session = Session::new("session-ctx-test", "ignored");
+    // This pre-existing custom-tool probe retains its historical contract.
+    // v2 reserves this spelling for genuine Supervisor Root creation; that
+    // identity boundary is covered by the versioned_spawn dispatch matrix.
+    session.session_version = Some(1);
 
     let (event_tx, _event_rx) = mpsc::channel(64);
     let config = AgentLoopConfig {

@@ -284,6 +284,7 @@ fn revoking_accepted_input_cancels_active_dependents_without_releasing_stop_proo
         let dependent = create(&service, "dependent", BTreeSet::from([upstream.clone()]));
         let (id, worker) = start(&service, &upstream, "upstream-start");
         let submission = submit(&service, &id, &worker, "upstream-submit");
+        confirm_submission_stopped(&service, &submission);
         execute(
             &service,
             &user(),
@@ -388,6 +389,21 @@ fn start(service: &TicketService, work: &str, op: &str) -> (String, Authority) {
     });
     (id, worker)
 }
+fn confirm_submission_stopped(service: &TicketService, submission: &str) {
+    let snapshot = service.published().unwrap().1;
+    let a = &snapshot.assignments[&snapshot.submissions[submission].assignment_id];
+    execute(
+        service,
+        &runtime(),
+        &format!("fixture-stop-{submission}"),
+        vec![Operation::RuntimeStopped {
+            assignment_id: a.id.clone(),
+            receipt: a.runtime.clone().unwrap(),
+            completed: true,
+        }],
+    );
+}
+
 fn submit(service: &TicketService, id: &str, worker: &Authority, op: &str) -> String {
     let artifact = service.store_artifact(&runtime(), b"result").unwrap();
     execute(
@@ -508,6 +524,7 @@ fn single_work_closed_loop_requires_exact_submission_and_user_acceptance() {
             &command(&service, "auto-accept", accept.clone())
         )
         .is_err());
+    confirm_submission_stopped(&service, &submission);
     execute(&service, &user(), "accept-A", accept);
     assert_eq!(
         service.published().unwrap().1.tickets[&work].accepted_submission,
@@ -779,6 +796,7 @@ fn supervisor_rejection_rework_preserves_exact_evidence_and_user_acceptance() {
         canonical_bytes(&service.published().unwrap()).unwrap(),
         before_stale_reject
     );
+    confirm_submission_stopped(&service, &corrected);
     blocked_dependency("consumer-after-technical-verification");
     execute(
         &service,
@@ -1325,6 +1343,7 @@ fn submitted_does_not_unlock_dependency_and_revoked_inputs_require_review() {
         ),
         Err(Error::ResourceBlocked(_))
     ));
+    confirm_submission_stopped(&service, &submission);
     execute(
         &service,
         &user(),

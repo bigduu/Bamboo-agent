@@ -1,0 +1,905 @@
+//! Portable, explicitly selected configuration data. This module performs no
+//! filesystem/environment access, provider discovery, network I/O or execution.
+//! Decoding and conflict planning are pure: callers must separately authorize
+//! and transactionally apply a plan. Omitted values never express deletion.
+
+mod codec;
+mod planning;
+mod selection;
+#[cfg(test)]
+mod tests;
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+use bamboo_domain::ReasoningEffort;
+use serde::{Deserialize, Serialize};
+
+pub use codec::{decode_bundle, encode_bundle, MAX_SHARE_STRING_BYTES, SHARE_PREFIX};
+pub use planning::{plan_import, preview_bundle};
+pub use selection::select_bundle;
+
+pub const MAX_SHARE_BUNDLE_BYTES: usize = 512 * 1024;
+const MAX_PROVIDERS: usize = 64;
+const MAX_ENV_VARS: usize = 256;
+const MAX_SUBAGENT_MODELS: usize = 64;
+const MAX_MODELS: usize = 256;
+const MAX_VALUE_BYTES: usize = 32 * 1024;
+
+/// Diagnostics deliberately carry neither user input nor serde/crypto errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ShareError {
+    #[error("Configuration share exceeds a supported size or depth limit")]
+    Limit,
+    #[error("Unsupported configuration share version or encryption format")]
+    Unsupported,
+    #[error("Invalid configuration share data")]
+    Invalid,
+    #[error("This configuration share requires a passphrase of 12 to 1024 bytes")]
+    PassphraseRequired,
+    #[error("Unable to authenticate configuration share; check its passphrase and integrity")]
+    Authentication,
+    #[error("Configuration share selection includes an unavailable item")]
+    Selection,
+    #[error("Configuration share contains an unsafe environment variable or URL")]
+    Unsafe,
+    #[error("Configuration share contains an unresolved provider reference")]
+    Reference,
+    #[error("Configuration share conflicts require an explicit valid decision")]
+    Conflict,
+}
+
+pub type ShareResult<T> = Result<T, ShareError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareScenario {
+    Chat,
+    Fast,
+    TaskSummary,
+    Vision,
+    MemoryBackground,
+    Planning,
+    Search,
+    CodeReview,
+    SubAgent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShareProviderType {
+    Openai,
+    Anthropic,
+    Gemini,
+    Copilot,
+    Bodhi,
+}
+
+impl ShareProviderType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+            Self::Copilot => "copilot",
+            Self::Bodhi => "bodhi",
+        }
+    }
+}
+
+/// Deliberately independent of ProviderInstanceConfig: its flattened `extra`,
+/// request overrides, host credential references and ciphertext are excluded.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareProvider {
+    pub id: String,
+    pub provider_type: ShareProviderType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub responses_only_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_models: Option<Vec<String>>,
+}
+
+impl fmt::Debug for ShareProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShareProvider").finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareModelRef {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// `None` means name/metadata only, never Clear. Every included value (even a
+/// non-secret entry or empty string) requires an encrypted share envelope.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareEnvVar {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub secret: bool,
+}
+
+impl fmt::Debug for ShareEnvVar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShareEnvVar").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareBundle {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ShareProvider>,
+    #[serde(
+        default,
+        deserialize_with = "unique_map",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub scenarios: BTreeMap<ShareScenario, ShareModelRef>,
+    #[serde(
+        default,
+        deserialize_with = "unique_map",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub subagent_models: BTreeMap<String, ShareModelRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<ShareEnvVar>,
+}
+
+impl fmt::Debug for ShareBundle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShareBundle")
+            .field("providers", &self.providers.len())
+            .field("scenarios", &self.scenarios.len())
+            .field("subagent_models", &self.subagent_models.len())
+            .field("env", &self.env.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareSelection {
+    #[serde(default)]
+    pub providers: BTreeSet<String>,
+    #[serde(default)]
+    pub provider_api_keys: BTreeSet<String>,
+    #[serde(default)]
+    pub provider_base_urls: BTreeSet<String>,
+    #[serde(default)]
+    pub scenarios: BTreeSet<ShareScenario>,
+    #[serde(default)]
+    pub subagent_models: BTreeSet<String>,
+    /// Key = selected variable name. Value = include its value explicitly.
+    #[serde(default, deserialize_with = "unique_map")]
+    pub env: BTreeMap<String, bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ShareConflictChoice {
+    Skip,
+    Replace,
+    Rename { target: String },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareDecisions {
+    #[serde(default, deserialize_with = "unique_map")]
+    pub providers: BTreeMap<String, ShareConflictChoice>,
+    #[serde(default, deserialize_with = "unique_map")]
+    pub scenarios: BTreeMap<ShareScenario, ShareConflictChoice>,
+    #[serde(default, deserialize_with = "unique_map")]
+    pub subagent_models: BTreeMap<String, ShareConflictChoice>,
+    #[serde(default, deserialize_with = "unique_map")]
+    pub env: BTreeMap<String, ShareConflictChoice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareProviderPreview {
+    pub id: String,
+    pub provider_type: ShareProviderType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub has_api_key: bool,
+    pub has_base_url: bool,
+    /// Scheme/host/port only; never credentials, a path, query or fragment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_origin: Option<String>,
+    /// Same-ID Replace may reuse the target's stored key or retained runtime
+    /// env binding. The binding can win even when an incoming key is included;
+    /// this metadata does not assert that an env value is currently present.
+    /// Rename never inherits the previous identity's key or binding.
+    #[serde(default)]
+    pub retains_existing_api_key: bool,
+    /// Replace changes/introduces an origin while retaining other destination
+    /// settings, which may include credentials. This is deliberately broader
+    /// than the API-key metadata above; Rename and Skip do not reuse settings.
+    #[serde(default)]
+    pub credential_origin_risk: bool,
+    pub conflict: bool,
+    /// Same-ID Replace must retain the provider type. A different type can
+    /// only be skipped or renamed to a fresh identity with no target settings.
+    pub replace_allowed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareScenarioPreview {
+    pub scenario: ShareScenario,
+    pub provider: String,
+    pub model: String,
+    pub conflict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareSubagentPreview {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    pub conflict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShareEnvPreview {
+    pub name: String,
+    pub has_value: bool,
+    pub secret: bool,
+    pub conflict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharePreview {
+    pub providers: Vec<ShareProviderPreview>,
+    pub scenarios: Vec<ShareScenarioPreview>,
+    pub subagent_models: Vec<ShareSubagentPreview>,
+    pub env: Vec<ShareEnvPreview>,
+    pub contains_secrets: bool,
+}
+
+impl ShareBundle {
+    pub fn contains_secrets(&self) -> bool {
+        self.providers.iter().any(|p| p.api_key.is_some())
+            || self.env.iter().any(|entry| entry.value.is_some())
+    }
+
+    pub fn validate(&self) -> ShareResult<()> {
+        if self.providers.len() > MAX_PROVIDERS
+            || self.env.len() > MAX_ENV_VARS
+            || self.subagent_models.len() > MAX_SUBAGENT_MODELS
+        {
+            return Err(ShareError::Limit);
+        }
+        let mut ids = BTreeSet::new();
+        for provider in &self.providers {
+            validate_id(&provider.id)?;
+            if !ids.insert(&provider.id) {
+                return Err(ShareError::Invalid);
+            }
+            if let Some(label) = &provider.label {
+                validate_text(label, 256)?;
+            }
+            if let Some(url) = &provider.base_url {
+                validate_base_url(url)?;
+            }
+            if let Some(key) = &provider.api_key {
+                validate_text(key, MAX_VALUE_BYTES)?;
+                if crate::patch::is_masked_api_key(key) {
+                    return Err(ShareError::Invalid);
+                }
+            }
+            for model in [
+                &provider.model,
+                &provider.fast_model,
+                &provider.vision_model,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                validate_text(model, 512)?;
+            }
+            validate_models(&provider.responses_only_models)?;
+            if let Some(models) = &provider.runtime_models {
+                validate_models(models)?;
+            }
+        }
+        for (name, reference) in &self.subagent_models {
+            validate_id(name)?;
+            validate_reference(reference, &ids)?;
+        }
+        for reference in self.scenarios.values() {
+            validate_reference(reference, &ids)?;
+        }
+        let mut names = BTreeSet::new();
+        for entry in &self.env {
+            validate_env_name(&entry.name)?;
+            if !names.insert(canonical_env_name(&entry.name)) {
+                return Err(ShareError::Invalid);
+            }
+            if entry
+                .value
+                .as_ref()
+                .is_some_and(|v| v.len() > MAX_VALUE_BYTES || v.contains('\0'))
+            {
+                return Err(ShareError::Limit);
+            }
+        }
+        if serde_json::to_vec(self)
+            .map_err(|_| ShareError::Invalid)?
+            .len()
+            > MAX_SHARE_BUNDLE_BYTES
+        {
+            return Err(ShareError::Limit);
+        }
+        Ok(())
+    }
+}
+
+fn validate_reference(reference: &ShareModelRef, ids: &BTreeSet<&String>) -> ShareResult<()> {
+    validate_id(&reference.provider)?;
+    validate_text(&reference.model, 512)?;
+    if !ids.contains(&reference.provider) {
+        return Err(ShareError::Reference);
+    }
+    Ok(())
+}
+
+fn validate_models(models: &[String]) -> ShareResult<()> {
+    if models.len() > MAX_MODELS {
+        return Err(ShareError::Limit);
+    }
+    let mut seen = BTreeSet::new();
+    for model in models {
+        validate_text(model, 512)?;
+        if !seen.insert(model) {
+            return Err(ShareError::Invalid);
+        }
+    }
+    Ok(())
+}
+
+fn validate_text(value: &str, max: usize) -> ShareResult<()> {
+    if value.len() > max {
+        return Err(ShareError::Limit);
+    }
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(ShareError::Invalid);
+    }
+    Ok(())
+}
+
+fn validate_id(value: &str) -> ShareResult<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+        || value == "."
+        || value == ".."
+    {
+        return Err(ShareError::Invalid);
+    }
+    Ok(())
+}
+
+fn validate_base_url(value: &str) -> ShareResult<()> {
+    validate_text(value, 4096)?;
+    let url = url::Url::parse(value).map_err(|_| ShareError::Unsafe)?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ShareError::Unsafe);
+    }
+    Ok(())
+}
+
+/// Portable identity for an already validated ASCII environment name. Every
+/// platform uses the same case-folding rule; keep the original name for display
+/// and use the target's existing spelling when replacing a matching entry.
+pub fn canonical_env_name(name: &str) -> String {
+    name.to_ascii_uppercase()
+}
+
+/// Import changes only app-managed env entries. Reject runtime/loader/config
+/// selectors rather than letting a portable bundle change execution authority.
+/// This reserves known standard-tool control namespaces; it is not a sandbox
+/// for arbitrary or future consumers of otherwise permitted environment names.
+pub fn validate_env_name(name: &str) -> ShareResult<()> {
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| b.is_ascii_alphabetic() || b == b'_' || (i > 0 && b.is_ascii_digit()))
+    {
+        return Err(ShareError::Invalid);
+    }
+    let upper = canonical_env_name(name);
+    let forbidden = [
+        "PATH",
+        "HOME",
+        "USER",
+        "USERNAME",
+        "SHELL",
+        "COMSPEC",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "WINDIR",
+        "TMP",
+        "TEMP",
+        "TMPDIR",
+        "IFS",
+        "ENV",
+        "BASH_ENV",
+        "ZDOTDIR",
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTC_LINKER",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTFLAGS",
+        "RUSTDOCFLAGS",
+        "CROSS_COMPILE",
+        "LDSHARED",
+        "CL",
+        "_CL_",
+        "LINK",
+        "_LINK_",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_SSH",
+        "GIT_SSH_COMMAND",
+        "SSH_ASKPASS",
+        "SUDO_ASKPASS",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "GODEBUG",
+        "GOFLAGS",
+        "GOTOOLCHAIN",
+        "R_PROFILE",
+        "R_ENVIRON",
+        "PSMODULEPATH",
+        "PROMPT_COMMAND",
+        "BASHOPTS",
+        "SHELLOPTS",
+        "PAGER",
+        "EDITOR",
+        "VISUAL",
+        "GIT_EDITOR",
+        "GIT_PAGER",
+        "LESSOPEN",
+        "CLASSPATH",
+        "PHPRC",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        "BROWSER",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "LOCPATH",
+        "NLSPATH",
+        "LIBPATH",
+        "SHLIB_PATH",
+        "TCLLIBPATH",
+    ];
+    // Native conversion/provider/profiler and language module selectors:
+    // sourceware.org/glibc/manual/latest/html_node/Generic-Conversion-Interface.html
+    // github.com/bminor/glibc/blob/master/sysdeps/generic/unsecvars.h
+    // docs.openssl.org/master/man7/openssl-env/
+    // learn.microsoft.com/en-us/dotnet/core/runtime-config/debugging-profiling
+    // learn.microsoft.com/en-us/dotnet/core/runtime-config/garbage-collector
+    // github.com/mono/mono/blob/main/man/mono.1
+    let prefixes = [
+        "LD_",
+        "DYLD_",
+        "NODE_",
+        "NPM_",
+        "PYTHON",
+        "PERL",
+        "RUBY",
+        "BAMBOO_",
+        "BODHI_",
+        "COPILOT_",
+        "OPENAI_",
+        "ANTHROPIC_",
+        "GEMINI_",
+        "GOOGLE_",
+        "GIT_",
+        "CARGO_",
+        "RUSTUP_",
+        "DOTNET_",
+        "BASH_FUNC_",
+        "JAVA_",
+        "JDK_",
+        "PHP_",
+        "ELECTRON_",
+        "GCONV_",
+        "GLIBC_",
+        "OPENSSL_",
+        "CORECLR_",
+        "COR_",
+        "GIO_",
+        "GTK_",
+        "QT_",
+        "LUA_",
+        "TCL_",
+        "JULIA_",
+        "R_",
+        "COMPLUS_",
+        "MONO_",
+    ];
+    if forbidden.contains(&upper.as_str())
+        || prefixes.iter().any(|p| upper.starts_with(p))
+        || compiler_control_env(&upper)
+        || package_control_env(&upper)
+        || utility_control_env(&upper)
+        || cloud_control_env(&upper)
+        || vcs_control_env(&upper)
+    {
+        return Err(ShareError::Unsafe);
+    }
+    Ok(())
+}
+
+fn vcs_control_env(upper: &str) -> bool {
+    // VCS configuration, extension, hook and external-program controls. HG/P4
+    // use names without an underscore; Breezy documents BRZPATH while current
+    // external-command code still reads the historical BZRPATH. Reserve these
+    // known tool namespaces conservatively, including their identity/encoding
+    // settings, rather than claiming every member executes a program. Perforce
+    // also accepts bare DIFF/MERGE; Fossil's Tcl override is outside FOSSIL_.
+    // mercurial-scm.org/help/topics/environment
+    // mercurial-scm.org/help/topics/config#extensions
+    // github.com/apache/subversion/blob/trunk/subversion/libsvn_ra_svn/client.c
+    // github.com/apache/subversion/blob/trunk/subversion/libsvn_subr/cmdline_editor.c
+    // github.com/apache/subversion/blob/trunk/subversion/svn/util.c
+    // lists.ubuntu.com/archives/bazaar-commits/2010-October/018133.html
+    // breezy-vcs.org/doc/en/user-reference/env-variables-help.html
+    // github.com/breezy-team/breezy/blob/master/breezy/externalcommand.py
+    // fossil-scm.org/home/doc/tip/www/env-opts.md
+    // help.perforce.com/helix-core/server-apps/cmdref/current/Content/CmdRef/P4_port_SYSTEMIGNORE.html
+    // help.perforce.com/helix-core/server-apps/cmdref/current/Content/CmdRef/P4DIFF.html
+    // help.perforce.com/helix-core/server-apps/cmdref/current/Content/CmdRef/P4MERGE.html
+    let prefixes = ["HG", "SVN_", "BZR_", "BRZ_", "FOSSIL_", "P4"];
+    ["BZRPATH", "BRZPATH", "DIFF", "MERGE", "TH1_ENABLE_TCL"].contains(&upper)
+        || prefixes.iter().any(|prefix| upper.starts_with(prefix))
+}
+
+fn cloud_control_env(upper: &str) -> bool {
+    // A selected configuration can contain executable credential helpers,
+    // plugins, hooks or scripts even when the variable contains only a path.
+    // Reserve the known orchestration/plugin namespaces conservatively; for
+    // wider cloud/IaC namespaces keep ordinary region/identity/input data and
+    // reject their documented execution, config and code-resolution controls.
+    // Python interpreter-selector families are reserved as controls without
+    // claiming every suffix is an environment input in every SDK version.
+    // Execution depends on a later tool invocation, mode and platform. This
+    // bounded policy is not a sandbox for arbitrary future environment consumers.
+    // kubernetes.io/docs/reference/access-authn-authz/authentication/#client-go-credential-plugins
+    // kubernetes.io/docs/reference/kubectl/generated/kubectl_diff/
+    // helm.sh/docs/topics/plugins/
+    // docs.docker.com/reference/cli/docker/#configuration-files
+    // github.com/docker/cli/blob/master/cli-plugins/manager/candidate.go
+    // docs.podman.io/en/latest/markdown/podman-compose.1.html
+    // github.com/containers/common/blob/main/docs/containers.conf.5.md
+    // docs.ansible.com/projects/ansible/latest/reference_appendices/config.html
+    // docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html
+    // docs.aws.amazon.com/cli/latest/userguide/cli-configure-sourcing-external.html
+    // github.com/boto/botocore/blob/develop/botocore/configprovider.py
+    // github.com/boto/botocore/blob/develop/botocore/session.py#L395-L427
+    // github.com/boto/botocore/blob/develop/botocore/credentials.py#L993
+    // learn.microsoft.com/en-us/cli/azure/azure-cli-configuration
+    // learn.microsoft.com/en-us/cli/azure/azure-cli-extensions-overview
+    // docs.cloud.google.com/sdk/gcloud/reference/topic/startup
+    // docs.cloud.google.com/sdk/docs/configurations
+    // docs.cloud.google.com/iam/docs/workload-identity-federation-with-other-providers#executable-sourced-credentials
+    // developer.hashicorp.com/terraform/cli/config/environment-variables
+    // developer.hashicorp.com/terraform/cli/config/config-file
+    // developer.hashicorp.com/terraform/plugin/debugging
+    // docs.terragrunt.com/reference/cli/commands/run/
+    // docs.terragrunt.com/reference/hcl/functions/#run_cmd
+    // github.com/gruntwork-io/terragrunt/blob/v0.67.16/docs/_docs/04_reference/cli-options.md
+    // nix.dev/manual/nix/2.33/command-ref/conf-file.html
+    // nix.dev/manual/nix/2.33/command-ref/nix-shell.html
+    // nix.dev/manual/nix/2.33/command-ref/env-common.html
+    // developer.hashicorp.com/vagrant/docs/other/environmental-variables
+    // developer.hashicorp.com/vagrant/docs/vagrantfile#load-order-and-merging
+    // github.com/hashicorp/vagrant/blob/main/lib/vagrant/environment.rb
+    // github.com/hashicorp/vagrant/blob/main/lib/vagrant/plugin/manager.rb
+    let prefixes = [
+        "KUBE_",
+        "KUBECTL_",
+        "HELM_",
+        "DOCKER_",
+        "PODMAN_",
+        "CONTAINERS_",
+        "ANSIBLE_",
+        "TG_",
+        "TERRAGRUNT_",
+        "NIX_",
+        "VAGRANT_",
+        "AZURE_EXTENSION_",
+        "CLOUDSDK_PYTHON",
+        "CLOUDSDK_GSUTIL_PYTHON",
+        "CLOUDSDK_BQ_PYTHON",
+        "TF_CLI_ARGS_",
+    ];
+    [
+        "KUBECONFIG",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_PAGER",
+        "AZURE_CONFIG_DIR",
+        "CLOUDSDK_CONFIG",
+        "CLOUDSDK_ACTIVE_CONFIG_NAME",
+        "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+        "TF_CLI_CONFIG_FILE",
+        "TERRAFORM_CONFIG",
+        "TF_CLI_ARGS",
+        "TF_DATA_DIR",
+        "TF_PLUGIN_CACHE_DIR",
+        "TF_REATTACH_PROVIDERS",
+    ]
+    .contains(&upper)
+        || prefixes.iter().any(|prefix| upper.starts_with(prefix))
+}
+
+fn utility_control_env(upper: &str) -> bool {
+    // Known utility configuration, pager/preprocessor, extension and startup
+    // controls. Their execution paths have tool/mode/option conditions; keeping
+    // their namespaces reserved does not assert every setting executes code.
+    // github.com/BurntSushi/ripgrep/blob/master/GUIDE.md
+    // github.com/junegunn/fzf/blob/master/man/man1/fzf.1
+    // github.com/sharkdp/bat#using-a-different-pager
+    // dandavison.github.io/delta/environment-variables.html
+    // gitlab.com/man-db/man-db/-/blob/main/man/man1/man.man1
+    // github.com/gwsw/less/blob/master/less.nro.VER
+    // gnu.org/software/tar/manual/html_section/using-tar-options.html
+    // gnu.org/software/tar/manual/html_section/checkpoints.html
+    // download.samba.org/pub/rsync/rsync.1
+    // gnu.org/software/gawk/manual/html_node/AWKPATH-Variable.html
+    // gnu.org/software/gawk/manual/html_node/Options.html
+    // gnu.org/software/bash/manual/html_node/Bash-Builtins.html
+    // gnu.org/software/bash/manual/html_node/Controlling-the-Prompt.html
+    // zsh.sourceforge.io/Doc/Release/Parameters.html#Parameters-Used-By-The-Shell
+    // github.com/vim/vim/blob/master/runtime/doc/starting.txt
+    // github.com/vim/vim/blob/master/runtime/doc/gui.txt
+    // github.com/neovim/neovim/blob/master/runtime/plugin/rplugin.vim
+    // github.com/emacs-mirror/emacs/blob/master/doc/lispref/loading.texi
+    let prefixes = [
+        "RIPGREP_", "FZF_", "BAT_", "DELTA_", "LESS_", "LESSKEY", "RSYNC_", "BASH_", "NVIM_",
+    ];
+    [
+        "MANPAGER",
+        "MANOPT",
+        "LESS",
+        "LESSCLOSE",
+        "LESSSECURE",
+        "LESSSECURE_ALLOW",
+        "LESSSECURE_DISALLOW",
+        "TAR_OPTIONS",
+        "AWKPATH",
+        "AWKLIBPATH",
+        "PS0",
+        "PS1",
+        "PS2",
+        "PS4",
+        "FPATH",
+        "VIMINIT",
+        "EXINIT",
+        "GVIMINIT",
+        "VIMRUNTIME",
+        "EMACSLOADPATH",
+    ]
+    .contains(&upper)
+        || prefixes.iter().any(|prefix| upper.starts_with(prefix))
+}
+
+fn package_control_env(upper: &str) -> bool {
+    // Standard package/language config, script, interpreter, hook and runtime
+    // resolution/trust controls. Reserving these tool namespaces is conservative;
+    // it does not assert that every setting executes a program. RUBYGEMS_ is
+    // already covered by the RUBY prefix. RAKELIB is a CLI parameter in current
+    // Rake, not an automatically read environment setting.
+    // guides.rubygems.org/command-reference/bundle-config/
+    // guides.rubygems.org/command-reference/#gem-environment
+    // github.com/rubygems/rubygems/blob/master/lib/rubygems/config_file.rb
+    // ruby.github.io/rake/doc/command_line_usage_rdoc.html
+    // github.com/ruby/rake/blob/master/lib/rake/application.rb
+    // github.com/rbenv/rbenv#environment-variables
+    // pip.pypa.io/en/stable/cli/pip_config/
+    // docs.astral.sh/uv/reference/environment/
+    // pipenv.pypa.io/en/latest/configuration.html
+    // python-poetry.org/docs/configuration/
+    // docs.gradle.org/current/userguide/init_scripts.html
+    // maven.apache.org/configure.html
+    // ant.apache.org/manual/running.html
+    // getcomposer.org/doc/articles/plugins.md
+    // getcomposer.org/doc/03-cli.md#environment-variables
+    // yarnpkg.com/configuration/yarnrc#yarnPath
+    // bun.com/docs/runtime/environment-variables#configuring-bun
+    // github.com/nodejs/corepack#environment-variables
+    // pnpm.io/configuring#environment-variables
+    // pnpm.io/cli/run#scriptshell
+    // docs.deno.com/runtime/reference/env_variables/
+    let prefixes = [
+        "BUNDLE_",
+        "GEM_",
+        "RBENV_",
+        "RAKE_",
+        "PIP_",
+        "UV_",
+        "PIPENV_",
+        "POETRY_",
+        "GRADLE_",
+        "MAVEN_",
+        "ANT_",
+        "COMPOSER_",
+        "YARN_",
+        "BUN_",
+        "COREPACK_",
+        "PNPM_",
+        "DENO_",
+    ];
+    ["GEMRC", "RAKEOPT", "COMPOSER", "JAVACMD"].contains(&upper)
+        || prefixes.iter().any(|prefix| upper.starts_with(prefix))
+}
+
+fn compiler_control_env(upper: &str) -> bool {
+    // Cargo -> cc-rs -> native tool/build-driver policy groups: executable and
+    // option selection; program/library search; startup scripts/toolchains.
+    // Reserve standard compiler/cache/build-driver control namespaces and
+    // entry points. The share feature does not launch these tools.
+    // GNU Make does not interpret an environment-supplied MFLAGS value; it is
+    // historical output compatibility, so it is not added as an input control.
+    // gcc.gnu.org/onlinedocs/gcc/Environment-Variables.html
+    // gnu.org/software/make/manual/html_node/MAKEFILES-Variable.html
+    // gnu.org/software/make/manual/html_node/Options_002fRecursion.html
+    // gnu.org/software/autoconf/manual/autoconf-2.72/html_node/Site-Defaults.html
+    // gnu.org/software/autoconf/manual/autoconf-2.72/html_node/config_002estatus-Invocation.html
+    // cmake.org/cmake/help/latest/manual/cmake-env-variables.7.html
+    // ccache.dev/manual/4.11.3.html
+    // github.com/mozilla/sccache/blob/main/docs/Configuration.md
+    // distcc.org/man/distcc_1.html
+    // github.com/icecc/icecream/blob/master/README.md
+    if [
+        "COMPILER_PATH",
+        "LIBRARY_PATH",
+        "MAKE",
+        "MAKEFLAGS",
+        "GNUMAKEFLAGS",
+        "MAKEFILES",
+        "CONFIG_SHELL",
+        "CONFIG_SITE",
+    ]
+    .contains(&upper)
+        || ["GCC_", "CMAKE_", "CCACHE_", "SCCACHE_", "DISTCC_", "ICECC_"]
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
+    {
+        return true;
+    }
+    // Tool/flags namespaces also reserve build-kind and target-qualified forms,
+    // without rejecting HOST_/TARGET_ application variables in general.
+    // doc.rust-lang.org/cargo/reference/environment-variables.html
+    // docs.rs/cc/latest/cc/#external-configuration-via-environment-variables
+    // docs.rs/pkg-config/latest/pkg_config/#cross-compilation
+    // gnu.org/software/make/manual/html_node/Implicit-Variables.html
+    // gnu.org/software/automake/manual/html_node/Flag-Variables-Ordering.html
+    // github.com/numpy/numpy/blob/v1.26.4/numpy/distutils/fcompiler/__init__.py
+    // learn.microsoft.com/en-us/cpp/build/reference/cl-environment-variables
+    // learn.microsoft.com/en-us/cpp/build/reference/linking
+    let name = upper
+        .strip_prefix("HOST_")
+        .or_else(|| upper.strip_prefix("TARGET_"))
+        .unwrap_or(upper);
+    [
+        "CC",
+        "CXX",
+        "CPP",
+        "AR",
+        "AS",
+        "LD",
+        "FC",
+        "F77",
+        "F90",
+        "RANLIB",
+        "NM",
+        "STRIP",
+        "PKG_CONFIG",
+        "NVCC",
+        "CFLAGS",
+        "CXXFLAGS",
+        "CPPFLAGS",
+        "LDFLAGS",
+        "ARFLAGS",
+        "RANLIBFLAGS",
+        "FCFLAGS",
+        "FFLAGS",
+        "F77FLAGS",
+        "F90FLAGS",
+        "ASFLAGS",
+    ]
+    .iter()
+    .any(|tool| {
+        name == *tool
+            || name
+                .strip_prefix(*tool)
+                .is_some_and(|suffix| suffix.starts_with('_'))
+    })
+}
+
+fn unique_map<'de, D, K, V>(deserializer: D) -> Result<BTreeMap<K, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    K: Deserialize<'de> + Ord,
+    V: Deserialize<'de>,
+{
+    struct MapVisitor<K, V>(std::marker::PhantomData<(K, V)>);
+    impl<'de, K, V> serde::de::Visitor<'de> for MapVisitor<K, V>
+    where
+        K: Deserialize<'de> + Ord,
+        V: Deserialize<'de>,
+    {
+        type Value = BTreeMap<K, V>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a map with unique keys")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut result = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry()? {
+                if result.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate map key"));
+                }
+            }
+            Ok(result)
+        }
+    }
+    deserializer.deserialize_map(MapVisitor(std::marker::PhantomData))
+}

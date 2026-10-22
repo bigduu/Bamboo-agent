@@ -1,16 +1,15 @@
 name: CI
 
 on:
+  push:
+    branches: [ main ]
   workflow_dispatch:
     inputs:
       snapshot_sha:
         description: Exact 40-character SHA of the selected ref to validate as one frozen batch
         required: true
         type: string
-  # Dev admission requires a real compile; related tests run in the executor
-  # before merge. Full CI tests belong to snapshots, promotions and main pushes.
-  push:
-    branches: [ main ]
+  # Protected main-push CI supplies the existing automatic publication authority.
   pull_request:
     branches: [ dev, main ]
 
@@ -101,6 +100,9 @@ jobs:
 
       - name: Test fast workflow and release policies
         run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs
+
+      - name: Test Supervisor driver and owned loopback process binding
+        run: node --test scripts/supervisor-native-acceptance.test.cjs
 
   promotion-source:
     name: Promotion Source
@@ -228,6 +230,10 @@ jobs:
       - name: Test CI workflow policy
         if: needs.validation-source.outputs.full == 'true'
         run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs
+
+      - name: Test Supervisor driver and owned loopback process binding
+        if: needs.validation-source.outputs.full == 'true'
+        run: node --test scripts/supervisor-native-acceptance.test.cjs
 
       - name: Test frontend artifact and release policies
         if: github.event_name != 'pull_request' || github.base_ref == 'main'
@@ -502,6 +508,10 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
+
+      - name: Test Supervisor driver and owned loopback process binding
+        if: runner.os != 'Linux'
+        run: node --test scripts/supervisor-native-acceptance.test.cjs
 
       - name: Test frontend artifact and release policies
         if: runner.os != 'Linux'

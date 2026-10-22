@@ -436,6 +436,11 @@ test('recovery rejects unsigned/tampered/foreign checkpoints, missing assets and
     (stored) => { const p = JSON.parse(original); delete p.authentication; stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
     (stored) => { const p = JSON.parse(original); p.builds[0].sha256 = '8'.repeat(64); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
     (stored) => { const p = JSON.parse(original); p.runId = '999'; signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
+    (stored) => { const p = JSON.parse(original); p.workflowRevision = '9'.repeat(40); signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
+    (stored) => { const p = JSON.parse(original); p.runAttempt = 0; signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
+    (stored) => { const p = JSON.parse(original); p.ciRun += '/foreign'; signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
+    (stored) => { const p = JSON.parse(original); p.manifestBytesBase64 = '!'; signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
+    (stored) => { const p = JSON.parse(original); const m = JSON.parse(Buffer.from(p.manifestBytesBase64, 'base64')); m.sourceRevision = '8'.repeat(40); const bytes = Buffer.from(JSON.stringify(m)); p.manifestBytesBase64 = bytes.toString('base64'); p.manifestSha256 = release.sha256(bytes); signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
     (stored) => { const p = JSON.parse(original); p.sourceRevision = '8'.repeat(40); signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
     (stored) => { const p = JSON.parse(original); p.kind = 'another-protocol'; signReceipt(p, signingKey); stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(p))) },
     (stored) => { stored.delete(target) },
@@ -478,7 +483,7 @@ test('workflow retains the original successful-CI authority, one allocator/queue
   const matrix = source.split('  executables:\n')[1].split('  publish-executables:\n')[0]
   const final = source.split('  publish-executables:\n')[1]
   assert.match(source, /group: bamboo-crate-publication\n  queue: max\n  cancel-in-progress: false/)
-  assert.equal(source.split('run: node scripts/crate-release.cjs plan').length - 1, 1)
+  assert.equal(source.split('bamboo-release-controller/scripts/crate-release.cjs" plan').length - 1, 1)
   assert.match(matrix, /needs: automatic/)
   assert.doesNotMatch(matrix, /contents: write|secrets\.|api-only|cargo publish/)
   for (const target of release.TARGETS) assert.ok(matrix.includes(`target: ${target}\n`))
@@ -496,7 +501,7 @@ test('workflow retains the original successful-CI authority, one allocator/queue
   assert.ok(final.includes('EXPECTED_BUILDS: ${{ toJSON(needs.executables.outputs) }}'))
   assert.match(final, /needs: \[automatic, executables\]/)
   assert.match(final, /environment: bamboo-release\n    permissions:\n      contents: write/)
-  assert.match(final, /run: node scripts\/sidecar-release.cjs publish/)
+  assert.match(final, /bamboo-release-controller\/scripts\/sidecar-release.cjs" publish/)
   assert.doesNotMatch(final, /--clobber|cargo build|cargo publish|inputs\./)
 })
 
@@ -530,5 +535,151 @@ test('the actual source preflight rejects every missing or incompatible producer
       assert.notEqual(run().status, 0, `An earlier incomplete producer must stop: ${file}`)
     }
     fs.writeFileSync(target, marker + '\n')
+  }
+})
+
+test('a fresh dispatch after main advances completes the original signed checkpoint without expired job artifacts', async (t) => {
+  const value = publishingFixture(t)
+  value.context.upload = (file) => {
+    const name = path.basename(file)
+    if (name === release.MANIFEST) throw new Error('manifest upload interrupted')
+    value.stored.set(name, fs.readFileSync(file))
+  }
+  await assert.rejects(() => release.publishAssets(value.context), /manifest upload interrupted/)
+  assert.ok(value.stored.has(release.PROVENANCE)); assert.ok(!value.stored.has(release.MANIFEST))
+  const freshDispatch = { ...identity, workflowRevision: '8'.repeat(40), runId: '101', runAttempt: 1 }
+  const outputDirectory = path.join(value.root, 'fresh-dispatch-recovery'); fs.mkdirSync(outputDirectory)
+  const assets = () => [...value.stored.keys()].map(name => ({ name }))
+  // No artifact input/bindings are supplied: only authenticated public checkpoint assets survive.
+  await release.recoverPublishedRelease({ identity: freshDispatch, sourceRoot: value.sourceRoot,
+    outputDirectory, frontendBytes, signingKey, release: { assets: assets() },
+    readAsset: asset => value.stored.get(asset.name) })
+  for (const name of fs.readdirSync(value.outputDirectory)) {
+    assert.deepEqual(fs.readFileSync(path.join(outputDirectory, name)), fs.readFileSync(path.join(value.outputDirectory, name)))
+  }
+  const uploads = []
+  await release.publishAssets({ directory: outputDirectory, release: { assets: assets() },
+    readAsset: asset => value.stored.get(asset.name), listAssets: assets,
+    upload: file => { uploads.push(path.basename(file)); value.stored.set(path.basename(file), fs.readFileSync(file)) } })
+  assert.deepEqual(uploads, [release.MANIFEST])
+  const original = JSON.parse(value.stored.get(release.PROVENANCE))
+  assert.equal(original.runId, identity.runId)
+  assert.equal(original.workflowRevision, identity.workflowRevision)
+})
+
+test('checkpoint recovery preserves the signed original manifest serialization after controller changes', async (t) => {
+  const value = publishingFixture(t)
+  const manifest = JSON.parse(fs.readFileSync(path.join(value.outputDirectory, release.MANIFEST)))
+  const originalBytes = Buffer.from(`${JSON.stringify(manifest, null, 4)}\n`)
+  const proof = JSON.parse(fs.readFileSync(path.join(value.outputDirectory, release.PROVENANCE)))
+  proof.manifestSha256 = release.sha256(originalBytes)
+  proof.manifestBytesBase64 = originalBytes.toString('base64')
+  signReceipt(proof, signingKey)
+  fs.writeFileSync(path.join(value.outputDirectory, release.MANIFEST), originalBytes)
+  fs.writeFileSync(path.join(value.outputDirectory, release.PROVENANCE), `${JSON.stringify(proof, null, 2)}\n`)
+  value.context.upload = file => {
+    const name = path.basename(file)
+    if (name === release.MANIFEST) throw new Error('manifest transport interrupted')
+    value.stored.set(name, fs.readFileSync(file))
+  }
+  await assert.rejects(() => release.publishAssets(value.context), /manifest transport interrupted/)
+  const outputDirectory = path.join(value.root, 'original-controller-bytes'); fs.mkdirSync(outputDirectory)
+  await release.recoverPublishedRelease({ ...value, outputDirectory,
+    identity: { ...identity, workflowRevision: '8'.repeat(40), runId: '101', runAttempt: 1 },
+    release: { assets: [...value.stored.keys()].map(name => ({ name })) },
+    readAsset: asset => value.stored.get(asset.name) })
+  assert.deepEqual(fs.readFileSync(path.join(outputDirectory, release.MANIFEST)), originalBytes)
+  assert.deepEqual(fs.readFileSync(path.join(outputDirectory, release.PROVENANCE)), value.stored.get(release.PROVENANCE))
+})
+
+test('signed checkpoint recovery never invokes a changed current browser-host builder', async (t) => {
+  const value = publishingFixture(t)
+  value.context.upload = file => {
+    if (path.basename(file) === release.MANIFEST) throw new Error('manifest interrupted')
+    value.stored.set(path.basename(file), fs.readFileSync(file))
+  }
+  await assert.rejects(() => release.publishAssets(value.context), /manifest interrupted/)
+  const outputDirectory = path.join(value.root, 'no-new-builder'); fs.mkdirSync(outputDirectory)
+  const previous = process.env.PYTHON
+  process.env.PYTHON = process.execPath
+  try {
+    await release.recoverPublishedRelease({ ...value, outputDirectory,
+      sourceRoot: path.join(value.root, 'unavailable-current-builder-inputs'),
+      identity: { ...identity, workflowRevision: '8'.repeat(40), runId: '101', runAttempt: 1 },
+      release: { assets: [...value.stored.keys()].map(name => ({ name })) },
+      readAsset: asset => value.stored.get(asset.name) })
+  } finally {
+    if (previous === undefined) delete process.env.PYTHON
+    else process.env.PYTHON = previous
+  }
+  for (const name of fs.readdirSync(value.outputDirectory)) {
+    assert.deepEqual(fs.readFileSync(path.join(outputDirectory, name)), fs.readFileSync(path.join(value.outputDirectory, name)))
+  }
+})
+
+test('legacy checkpoint compatibility retains hash verification with and without its committed manifest', async (t) => {
+  const value = publishingFixture(t); await release.publishAssets(value.context)
+  const proof = JSON.parse(value.stored.get(release.PROVENANCE)); delete proof.manifestBytesBase64; signReceipt(proof, signingKey)
+  value.stored.set(release.PROVENANCE, Buffer.from(`${JSON.stringify(proof, null, 2)}\n`))
+  for (const committed of [true, false]) {
+    const stored = new Map(value.stored)
+    if (!committed) stored.delete(release.MANIFEST)
+    const outputDirectory = path.join(value.root, `legacy-${committed}`); fs.mkdirSync(outputDirectory)
+    await release.recoverPublishedRelease({ ...value, outputDirectory,
+      release: { assets: [...stored.keys()].map(name => ({ name })) }, readAsset: asset => stored.get(asset.name) })
+    assert.deepEqual(fs.readFileSync(path.join(outputDirectory, release.MANIFEST)), fs.readFileSync(path.join(value.outputDirectory, release.MANIFEST)))
+  }
+})
+
+test('checkpoint v1 recovery remains valid when the current manifest constructor changes', async (t) => {
+  const value = publishingFixture(t)
+  value.context.upload = file => {
+    if (path.basename(file) === release.MANIFEST) throw new Error('manifest interrupted')
+    value.stored.set(path.basename(file), fs.readFileSync(file))
+  }
+  await assert.rejects(() => release.publishAssets(value.context), /manifest interrupted/)
+  // Load the real controller with only its moving constructor changed. All
+  // recovery, authentication, schema and transport code remains production code.
+  const filename = require.resolve('./sidecar-release.cjs')
+  const source = fs.readFileSync(filename, 'utf8')
+  const marker = 'function createManifest({ version, sourceRevision, artifacts, browserHost }) {'
+  assert.equal(source.split(marker).length, 2)
+  const Module = require('node:module')
+  const changed = new Module(filename, module)
+  changed.filename = filename
+  changed.paths = module.paths
+  changed._compile(source.replace(marker, `${marker}\n  throw new Error('new controller manifest constructor invoked')`), filename)
+  const outputDirectory = path.join(value.root, 'frozen-v1-recovery'); fs.mkdirSync(outputDirectory)
+  await changed.exports.recoverPublishedRelease({ ...value, outputDirectory,
+    identity: { ...identity, workflowRevision: '8'.repeat(40), runId: '101', runAttempt: 1 },
+    release: { assets: [...value.stored.keys()].map(name => ({ name })) },
+    readAsset: asset => value.stored.get(asset.name) })
+  for (const name of [release.MANIFEST, release.PROVENANCE]) {
+    assert.deepEqual(fs.readFileSync(path.join(outputDirectory, name)), fs.readFileSync(path.join(value.outputDirectory, name)))
+  }
+})
+
+test('frozen v1 recovery validation rejects foreign identities, targets and unsafe asset shapes', (t) => {
+  const value = publishingFixture(t)
+  const manifest = JSON.parse(fs.readFileSync(path.join(value.outputDirectory, release.MANIFEST)))
+  const proof = JSON.parse(fs.readFileSync(path.join(value.outputDirectory, release.PROVENANCE)))
+  assert.equal(release.validateManifestV1(manifest, identity, proof.builds), manifest)
+  for (const mutate of [
+    x => { x.schemaVersion = 2 },
+    x => { x.version = '2026.10.124' },
+    x => { x.sourceRevision = '8'.repeat(40) },
+    x => { x.unrecognized = true },
+    x => { x.artifacts.pop() },
+    x => { x.artifacts[1] = clone(x.artifacts[0]) },
+    x => { x.artifacts[0].assetName = '../bamboo' },
+    x => { x.artifacts[0].sha256 = 'f'.repeat(64) },
+    x => { x.artifacts[0].buildMode = 'api-only' },
+    x => { x.browserHost.files[0].path = '../escape' },
+    x => { x.browserHost.files.push(clone(x.browserHost.files[0])) },
+    x => { x.browserHost.files[0].sizeBytes = 8 * 1024 * 1024 },
+    x => { x.browserHost.sha256 = 'not-a-digest' },
+  ]) {
+    const changed = clone(manifest); mutate(changed)
+    assert.throws(() => release.validateManifestV1(changed, identity, proof.builds))
   }
 })

@@ -37,6 +37,7 @@ pub use patrol_adapter::PatrolCheckpointStore;
 mod ready_retry_store;
 mod resolution;
 mod scheduling;
+mod sprints;
 pub use bamboo_orchestration::{ReadyBlockKind, ReadyReconcile, ReadyWorkGrant, ReadyWorkPolicy};
 pub use ready_retry_store::{FileReadyRetryStore, ReadyRetryFilePhase, ReadyRetryPublicationFault};
 #[cfg(test)]
@@ -416,20 +417,53 @@ impl TicketApplication {
         if snapshot.receipts.contains_key(&command.operation_id) {
             return Ok(());
         }
-        for op in &command.operations {
+        self.validate_project_snapshot_operations(&snapshot, &command.operations)
+    }
+
+    fn validate_project_snapshot_operations(
+        &self,
+        snapshot: &bamboo_tickets::Snapshot,
+        operations: &[Operation],
+    ) -> Result<()> {
+        let mut links = snapshot.project.links.clone();
+        let mut created = BTreeSet::new();
+        for op in operations {
             let (project_id, context, adopting) = match op {
-                Operation::AssociateProject { project_id, .. } => (project_id, None, false),
+                Operation::Create {
+                    temp_id, parent, ..
+                } => {
+                    // Allocation shadows earlier spellings, including canonical IDs.
+                    links.remove(temp_id);
+                    created.insert(temp_id.clone());
+                    if let Some(project_id) = parent
+                        .as_ref()
+                        .and_then(|parent| links.get(parent))
+                        .cloned()
+                    {
+                        self.validate_project_context(&project_id, None, false)?;
+                        links.insert(temp_id.clone(), project_id);
+                    }
+                    continue;
+                }
+                Operation::AssociateProject {
+                    ticket_id,
+                    project_id,
+                } => {
+                    links.insert(ticket_id.clone(), project_id.clone());
+                    (project_id, None, false)
+                }
                 Operation::SetProjectContext { context, .. } => {
                     (&context.project_id, Some(context), true)
                 }
                 Operation::Start { work_id, .. } => {
-                    let Some(project_id) = snapshot.project.links.get(work_id) else {
+                    let Some(project_id) = links.get(work_id) else {
                         continue;
                     };
                     let context = snapshot
                         .project
                         .work_contexts
                         .get(work_id)
+                        .filter(|_| !created.contains(work_id))
                         .and_then(|hash| snapshot.project.contexts.get(hash))
                         .ok_or_else(|| {
                             Error::InvalidTransition("Project context is required".into())
@@ -724,21 +758,7 @@ impl TicketApplication {
                 .get(&spec.assignment_id)
                 .is_some_and(|a| a.runtime.is_none())
             {
-                self.validate_project_operations(
-                    &service,
-                    &Command {
-                        operation_id: String::new(),
-                        binding: snapshot.binding,
-                        expected_seq: snapshot.seq,
-                        expected_epoch: snapshot.authority_epoch,
-                        operations: vec![Operation::Start {
-                            work_id: spec.work_id.clone(),
-                            temp_id: String::new(),
-                            workspace: spec.workspace.clone(),
-                        }],
-                        source: None,
-                    },
-                )?;
+                self.validate_dispatch_project_context(&snapshot, spec)?;
             }
             // Also guard a previously published pending intent when operator
             // placement changes before its admission/retry.

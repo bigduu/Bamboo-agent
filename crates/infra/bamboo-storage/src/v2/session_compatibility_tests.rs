@@ -911,11 +911,20 @@ async fn session_version_task_legacy_stamps_keep_cas_and_undo_usable() {
                 )
                 .await;
             }
+            // This fixture models legacy data explicitly. New Sessions now use
+            // v2; changing only one file would create a real contract conflict.
+            let main_stamp = if missing_main { None } else { Some(1) };
+            let runtime_stamp = if missing_main { Some(1) } else { None };
             for id in ["tx-child", "tx-root"] {
-                task_set_stamp(&storage, id, missing_main, None).await;
+                task_set_stamp(&storage, id, true, main_stamp).await;
+                task_set_stamp(&storage, id, false, runtime_stamp).await;
             }
             let before = task_contract_bytes(home.path()).await;
-            if let Some((child, child_updated, root, root_updated)) = staged {
+            if let Some((mut child, mut child_updated, mut root, mut root_updated)) = staged {
+                for snapshot in [&mut child, &mut child_updated, &mut root, &mut root_updated] {
+                    snapshot.session_version = runtime_stamp;
+                    snapshot.observe_main_session_version(main_stamp);
+                }
                 let applied = if operation == "single" {
                     storage
                         .save_task_control_plane_if_matches(&child, &child_updated)
@@ -1232,7 +1241,9 @@ async fn session_version_writer_clear_compatible_none_v1_preserves_main_stamp() 
 async fn session_version_copied_root_selects_current_contract_without_changing_source() {
     let mut failures = Vec::new();
     for id in ["tx-root", "tx-child"] {
-        for contract in ["current", "legacy", "main", "session", "runtime", "context"] {
+        for contract in [
+            "current", "v1", "legacy", "main", "session", "runtime", "context",
+        ] {
             let home = tempfile::tempdir().unwrap();
             let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
             super::tests::seed_runtime_task_transaction_pair(&storage)
@@ -1245,9 +1256,10 @@ async fn session_version_copied_root_selects_current_contract_without_changing_s
             )
             .await
             .unwrap();
-            if contract == "legacy" {
-                task_set_stamp(&storage, id, true, None).await;
-                task_set_stamp(&storage, id, false, None).await;
+            if contract == "legacy" || contract == "v1" {
+                let stamp = (contract == "v1").then_some(1);
+                task_set_stamp(&storage, id, true, stamp).await;
+                task_set_stamp(&storage, id, false, stamp).await;
             } else if contract != "current" {
                 writer_future_contract(&directory, contract).await;
             }
@@ -1303,7 +1315,7 @@ async fn session_version_copied_root_selects_current_contract_without_changing_s
                 let raw: Value = serde_json::from_slice(&bytes).unwrap();
                 if raw["session_version"] != json!(bamboo_domain::CURRENT_SESSION_VERSION) {
                     failures.push(format!(
-                        "{id}/{contract}/{name}: new Root was not stamped v1"
+                        "{id}/{contract}/{name}: new Root was not stamped with the current contract"
                     ));
                 }
             }
@@ -1314,4 +1326,207 @@ async fn session_version_copied_root_selects_current_contract_without_changing_s
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\\n"));
+}
+
+#[tokio::test]
+async fn versioned_spawn_known_contract_mismatch_survives_reopen_and_refuses_both_checkpoints() {
+    for (main, runtime) in [
+        (Some(1), Some(2)),
+        (Some(2), Some(1)),
+        (None, Some(2)),
+        (Some(2), None),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let mut session = Session::new("known-version-pair", "model");
+        session.add_message(Message::user(
+            "retain goal and history for explicit continuation",
+        ));
+        session.metadata.insert(
+            "retained_pending_operation".into(),
+            "never consume on a contract conflict".into(),
+        );
+        storage.save_session(&session).await.unwrap();
+        change_stamp(home.path(), &session.id, main, runtime).await;
+        let before = pair(home.path(), &session.id).await;
+        drop(storage);
+        let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let loaded = reopened.load_session(&session.id).await.unwrap().unwrap();
+        let report = loaded.execution_compatibility();
+        assert!(report.history_readable && !report.execution_allowed);
+        assert!(report
+            .conflicts
+            .iter()
+            .any(|c| c.code == "session_version_mismatch"));
+        assert!(report
+            .conflicts
+            .iter()
+            .all(|c| c.code != "unsupported_session_version"));
+        assert_eq!(loaded.messages[0].content, session.messages[0].content);
+        assert!(reopened.save_session(&loaded).await.is_err());
+        assert!(reopened.save_runtime_state(&loaded).await.is_err());
+        assert_eq!(pair(home.path(), &session.id).await, before);
+    }
+}
+
+#[tokio::test]
+async fn versioned_spawn_runtime_checkpoint_cannot_reinterpret_a_known_contract() {
+    for (retained, incoming) in [
+        (Some(2), None),
+        (Some(2), Some(1)),
+        (Some(1), Some(2)),
+        (None, Some(2)),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let mut session = Session::new("immutable-contract", "model");
+        session.session_version = retained;
+        session.add_message(Message::user("Keep the original instruction and contract"));
+        storage.save_session(&session).await.unwrap();
+        let before = pair(home.path(), &session.id).await;
+        let mut stale: Session =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        stale.session_version = incoming;
+        stale
+            .metadata
+            .insert("not_published".into(), "rejected runtime contract".into());
+        let error = storage
+            .save_runtime_state(&stale)
+            .await
+            .expect_err("a runtime checkpoint must not change the retained tool contract");
+        assert!(
+            error
+                .to_string()
+                .contains("session_version_change_requires_new_session"),
+            "{error}"
+        );
+        assert_eq!(pair(home.path(), &session.id).await, before);
+        let fresh = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let loaded = fresh.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(loaded.session_version, retained);
+        assert!(loaded.execution_compatibility().execution_allowed);
+    }
+}
+
+#[tokio::test]
+async fn versioned_spawn_legacy_full_checkpoint_uses_the_current_sidecar_control_schema() {
+    for version in [None, Some(1), Some(2)] {
+        let home = tempfile::tempdir().unwrap();
+        let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let mut session = Session::new("canonical-sidecar-control", "model");
+        session.session_version = version;
+        session.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new(&session.id));
+        session.add_message(Message::user("retain the original instruction"));
+        storage.save_session(&session).await.unwrap();
+        let mut stale_main = session.clone();
+        stale_main.agent_runtime_state.as_mut().unwrap().version = 99;
+        let directory = home.path().join("sessions").join(&session.id);
+        tokio::fs::write(
+            directory.join("session.json"),
+            serde_json::to_vec(&stale_main).unwrap(),
+        )
+        .await
+        .unwrap();
+        let fresh = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let mut loaded = fresh.load_session(&session.id).await.unwrap().unwrap();
+        assert!(
+            loaded.execution_compatibility().execution_allowed,
+            "{version:?}"
+        );
+        assert_eq!(
+            loaded.agent_runtime_state.as_ref().unwrap().version,
+            bamboo_domain::AGENT_RUNTIME_STATE_VERSION
+        );
+        loaded.title = "current canonical control".into();
+        fresh.save_runtime_state(&loaded).await.unwrap();
+        fresh
+            .save_session(&loaded)
+            .await
+            .expect("a supported v1 Main is not fresher control authority than its valid sidecar");
+        let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let final_session = reopened.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(final_session.session_version, version);
+        assert_eq!(final_session.title, "current canonical control");
+        assert_eq!(
+            final_session.messages[0].content,
+            session.messages[0].content
+        );
+        assert!(final_session.execution_compatibility().execution_allowed);
+    }
+}
+
+#[tokio::test]
+async fn versioned_spawn_runtime_checkpoint_without_sidecar_refuses_root_and_child_without_writes()
+{
+    for child in [false, true] {
+        for (retained, incoming) in [
+            (None, Some(2)),
+            (Some(1), Some(2)),
+            (Some(2), None),
+            (Some(2), Some(1)),
+            (None, Some(1)),
+            (Some(1), None),
+            (Some(2), Some(2)),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let storage = SessionStoreV2::new(home.path().into()).await.unwrap();
+            let parent = Session::new("sidecar-parent", "model");
+            storage.save_session(&parent).await.unwrap();
+            let mut original = if child {
+                Session::new_child_of("main-without-sidecar", &parent, "model", "child")
+            } else {
+                Session::new("main-without-sidecar", "model")
+            };
+            original.session_version = retained;
+            original.add_message(Message::user(
+                "Keep the retained Main contract and instruction",
+            ));
+            storage.save_session(&original).await.unwrap();
+            let directory = task_member_directory(&storage, &original.id).await;
+            let main_path = directory.join("session.json");
+            let runtime_path = directory.join("runtime.json");
+            // Model retained pre-split Main bytes, not an invented writer exemption.
+            let main_bytes = serde_json::to_vec_pretty(&original).unwrap();
+            assert!(super::compact_main::validate_full_main(&main_bytes)
+                .unwrap()
+                .is_none());
+            tokio::fs::write(&main_path, &main_bytes).await.unwrap();
+            tokio::fs::remove_file(&runtime_path).await.unwrap();
+            let index_before = tokio::fs::read(storage.index_path()).await.unwrap();
+            let parent_before = pair(home.path(), &parent.id).await;
+            let mut checkpoint: Session =
+                serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+            checkpoint.session_version = incoming;
+            checkpoint.title = "candidate runtime checkpoint".into();
+            assert!(checkpoint.execution_compatibility().execution_allowed);
+            let expected_guard = if child {
+                "Child Project or identity changed or unavailable: canonical Child runtime sidecar is missing"
+            } else {
+                "Root context changed or unavailable: canonical runtime file is missing"
+            };
+            for store in [
+                storage,
+                SessionStoreV2::new(home.path().into()).await.unwrap(),
+            ] {
+                let error = store.save_runtime_state(&checkpoint).await.expect_err(
+                    "missing runtime authority must refuse before contract comparison or publication",
+                );
+                assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                assert!(
+                    error.to_string().contains(expected_guard),
+                    "{child}/{retained:?}->{incoming:?}: {error}"
+                );
+                assert!(
+                    !runtime_path.exists(),
+                    "a refused checkpoint cannot reconstruct runtime authority"
+                );
+                assert_eq!(tokio::fs::read(&main_path).await.unwrap(), main_bytes);
+                assert_eq!(
+                    tokio::fs::read(store.index_path()).await.unwrap(),
+                    index_before
+                );
+                assert_eq!(pair(home.path(), &parent.id).await, parent_before);
+            }
+        }
+    }
 }
