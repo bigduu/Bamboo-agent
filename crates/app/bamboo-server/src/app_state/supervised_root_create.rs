@@ -1,6 +1,6 @@
-//! New supervised Roots compose the existing creation receipt, canonical
-//! management writer and lifetime-fenced Inbox. There is no second queue,
-//! relationship registry or persistent execution grant.
+//! Scoped Roots share one creation receipt, workspace/Project, candidate and
+//! publication flow. Supervisor management and finite Host creation retain
+//! distinct final authority and Inbox ports; neither is a second create chain.
 
 use std::sync::Arc;
 
@@ -13,6 +13,11 @@ use bamboo_server_tools::session_control::root_creation::{
 };
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
+
+#[path = "supervised_root_create_authority.rs"]
+mod authority;
+use authority::CreationAuthority;
+pub(super) use authority::HostRootFirstInputPort;
 
 use super::session_create_operations::{
     key_digest, payload_fingerprint, SessionCreateOperationRecord, SessionCreateOperationStore,
@@ -60,6 +65,9 @@ fn workspace_code(error: &crate::project_context::SessionWorkspaceValidationErro
 }
 
 fn io_code(error: &std::io::Error) -> &'static str {
+    if error.to_string() == "host_session_create_pending_root_absent_requires_recovery" {
+        return "creation_recovery_required";
+    }
     match error.kind() {
         std::io::ErrorKind::PermissionDenied => "scope_denied",
         std::io::ErrorKind::WouldBlock => "scope_revision_conflict",
@@ -120,52 +128,40 @@ impl SupervisedRootCreator {
         supervisor: &SupervisorReference,
         request: SupervisedRootCreateRequest,
     ) -> Result<ToolResult, ToolError> {
+        let authority = CreationAuthority::legacy_supervisor(supervisor.clone());
+        self.create_authorized_inner(&authority, request).await
+    }
+
+    async fn create_authorized_inner(
+        &self,
+        authority: &CreationAuthority,
+        request: SupervisedRootCreateRequest,
+    ) -> Result<ToolResult, ToolError> {
         let operation_id = request.operation_id;
-        // Domain separation uses NUL, which a normal HTTP Idempotency-Key
-        // cannot contain. No raw key, instruction or private context is stored.
-        let digest = key_digest(&format!(
-            "supervised-root:v1\0{}\0{}\0{}",
-            supervisor.session_id, supervisor.incarnation_id, operation_id
-        ));
-        // The UUID is also bound to the source lifetime + operation digest.
-        // A damaged outer receipt cannot select an unrelated historical Root,
-        // and expiry can never allocate a second UUID for the same operation.
-        let reserved_id = uuid::Uuid::parse_str(&digest[..32])
-            .expect("SHA-256 prefix is a simple UUID")
-            .to_string();
-        let fingerprint = payload_fingerprint(&(supervisor, &request))
-            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
-        let scope = match self.store.inspect_supervisor_scope(supervisor).await {
-            Ok(scope) => scope,
+        let (digest, reserved_id, fingerprint) = authority.operation_identity(&request)?;
+        let state_revision = match authority.validate_request(self, &request).await {
+            Ok(revision) => revision,
             Err(error) => {
                 return Ok(blocked(
                     operation_id,
                     None,
                     "authorization",
-                    io_code(&error),
-                    error,
+                    error.code,
+                    error.message,
                 ))
             }
         };
-        if !scope.allowed_projects.contains(&request.project_id) {
-            return Ok(blocked(
-                operation_id,
-                None,
-                "authorization",
-                "scope_denied",
-                "Project is outside the current explicit Supervisor scope",
-            ));
-        }
         let _claim = self.operations.lock(&digest).await.map_err(|error| {
             ToolError::Execution(format!("creation claim unavailable: {error}"))
         })?;
-        let existing = self
-            .operations
-            .load_claimed(&digest)
-            .await
-            .map_err(|error| {
-                ToolError::Execution(format!("creation receipt unavailable: {error}"))
-            })?;
+        let mut existing = if authority.is_host() {
+            // Exact Host operation truth is never expired/pruned by a retry.
+            // Its reserved birth must survive process restart and grant rotation.
+            self.operations.load_for_status(&digest).await
+        } else {
+            self.operations.load_claimed(&digest).await
+        }
+        .map_err(|error| ToolError::Execution(format!("creation receipt unavailable: {error}")))?;
         if let Some(existing) = &existing {
             if existing.session_id != reserved_id {
                 return Ok(blocked(
@@ -186,6 +182,22 @@ impl SupervisedRootCreator {
                 ));
             }
         }
+        if authority.is_host() {
+            if let Some(operation) = existing
+                .as_mut()
+                .filter(|record| record.expires_at.is_some())
+            {
+                // A genuine Supervisor can retain the same operation when an
+                // explicit Host scope replaces its legacy route. Pin that
+                // already validated receipt before any terminal early return.
+                operation.expires_at = None;
+                self.operations.save(operation).await.map_err(|error| {
+                    ToolError::Execution(format!(
+                        "Host creation receipt retention unavailable: {error}"
+                    ))
+                })?;
+            }
+        }
         if let Some(operation) = existing
             .as_ref()
             .filter(|operation| operation.status == StoredOperationStatus::Failed)
@@ -194,13 +206,13 @@ impl SupervisedRootCreator {
                 "This creation has a terminal failure receipt; inspect it before starting a distinct operation"));
         }
         let replayed = existing.is_some();
-        if !replayed && scope.state_revision != request.expected_state_revision {
+        if !replayed && state_revision != request.expected_state_revision {
             return Ok(blocked(
                 operation_id,
                 None,
                 "authorization",
                 "scope_revision_conflict",
-                "Supervisor management changed; reload scope before a new creation operation",
+                "Creation scope changed; reload scope before a new creation operation",
             ));
         }
         let mut operation = existing.unwrap_or_else(|| {
@@ -225,6 +237,15 @@ impl SupervisedRootCreator {
                     ))
                 }
             };
+        if let Err(error) = authority.validate_workspace(&request, &workspace) {
+            return Ok(blocked(
+                operation_id,
+                replayed.then_some(id.as_str()),
+                "workspace",
+                error.code,
+                error.message,
+            ));
+        }
         let mut candidate = self.build_candidate(&operation, &request, &workspace).await;
         if let Err(error) = self
             .project_context
@@ -246,13 +267,8 @@ impl SupervisedRootCreator {
                 ToolError::Execution(format!("creation reservation unavailable: {error}"))
             })?;
         }
-        let relation = match self
-            .store
-            .create_and_attach_supervised_root(
-                supervisor,
-                request.expected_state_revision,
-                &candidate,
-            )
+        let relation = match authority
+            .create_root(self, &request, &candidate, replayed)
             .await
         {
             Ok(relation) => relation,
@@ -260,7 +276,11 @@ impl SupervisedRootCreator {
                 return Ok(blocked(
                     operation_id,
                     Some(&id),
-                    "creation_or_link",
+                    if authority.is_host() {
+                        "creation"
+                    } else {
+                        "creation_or_link"
+                    },
                     io_code(&error),
                     error,
                 ))
@@ -281,6 +301,7 @@ impl SupervisedRootCreator {
                 &id,
                 relation.state_revision,
                 relation.link_revision,
+                relation.linked,
                 delivery,
                 true,
             ));
@@ -296,10 +317,18 @@ impl SupervisedRootCreator {
                 error,
             ));
         }
-        let result = self
-            .messenger
-            .supervisor_followup(supervisor, &id, &operation_id.to_string(), &request.message)
-            .await;
+        // A preflight never replaces the concrete port's final held-lock
+        // authority. Keep the original caller/token through that handoff.
+        if let Err(error) = authority.validate_request(self, &request).await {
+            return Ok(blocked(
+                operation_id,
+                Some(&id),
+                "first_input",
+                error.code,
+                error.message,
+            ));
+        }
+        let result = authority.first_input(self, &request, &candidate).await;
         let (receipt, activation) = match result {
             Ok(receipt) => (
                 receipt.delivery,
@@ -336,12 +365,18 @@ impl SupervisedRootCreator {
             "activation_pending" | "activation_retry_required"
         ) {
             operation.mark_succeeded();
+            if authority.is_host() {
+                // Host operation identity is permanent even when a grant or
+                // conversation rotates. Never make a missing receipt a new op.
+                operation.expires_at = None;
+            }
         }
         let mut response = completed(
             &request,
             &id,
             relation.state_revision,
             relation.link_revision,
+            relation.linked,
             &delivery,
             replayed,
         );
@@ -431,20 +466,32 @@ fn completed(
     id: &str,
     state_revision: u64,
     link_revision: Option<u64>,
+    linked: Option<bool>,
     delivery: &SupervisedRootDelivery,
     replayed: bool,
 ) -> ToolResult {
-    ToolResult::text(delivery.activation != "activation_retry_required", json!({
+    let mut response = json!({
         "action":"create", "operation_id":request.operation_id, "target_session_id":id,
-        "project_id":request.project_id, "created_durable":true, "linked":true,
+        "project_id":request.project_id, "created_durable":true, "linked":linked,
         "state_revision":state_revision, "link_revision":link_revision,
         "admitted":true, "receipt_id":delivery.receipt_id, "generation":delivery.generation,
         "activation":delivery.activation, "replayed":replayed,
         "code":if matches!(delivery.activation.as_str(), "activation_pending" | "activation_retry_required") {
             delivery.activation.as_str()
         } else {"admitted"},
-        "note":"Creation, relationship and first input are durable, not task completion. A replay is historical admission, not a new run or current activation status. Retry exactly this request for uncertain activation. No Work/Ticket, isolated worktree, Supervisor context or additional permission is created. Recovery uses the existing 24-hour terminal receipt window."
-    }).to_string())
+        "note":if linked == Some(true) {
+            "Creation, relationship and first input are durable, not task completion. A replay is historical admission, not a new run or current activation status. Retry exactly this request for uncertain activation. No Work/Ticket, isolated worktree, Supervisor context or additional permission is created. Recovery uses the existing 24-hour terminal receipt window."
+        } else {
+            "Creation and first input are durable, not task completion. No management link or target grant is created. A replay is historical admission, not a new run or current activation status. Retry only the unchanged request with its original operation UUID. The Host reservation remains retained across grant and conversation changes."
+        }
+    });
+    if linked.is_none() {
+        response["management_link_changed"] = json!(false);
+    }
+    ToolResult::text(
+        delivery.activation != "activation_retry_required",
+        response.to_string(),
+    )
 }
 
 #[cfg(test)]
