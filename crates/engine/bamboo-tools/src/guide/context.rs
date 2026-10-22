@@ -3,6 +3,8 @@
 //! This module provides language detection and context building for generating
 //! localized tool usage guidelines that match the language of the system prompt.
 
+const GIT_TOOL_GUIDANCE: &str = "For Git work, prefer available dedicated Git tools over reconstructing repository state by reading files one by one. Start with status and staged/unstaged diff; for branch comparison or conflicts, inspect the merge base, unique commits, and unmerged index before reading the necessary diff hunks and surrounding source to resolve intent. Batch independent read-only queries. Preserve dirty user work and unique commits; verify the resolved diff and relevant checks. Use exec_command only when a dedicated tool cannot provide the needed operation and your role permits shell execution. A Supervisor without shell access delegates Git execution to an authorized worker and reviews its evidence; missing tools never expand permissions.";
+
 /// Language options for guide generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuideLanguage {
@@ -80,7 +82,8 @@ impl GuideBuildContext {
                 "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms to bound each wait; completion does not send an automatic user notification. Unread completed results expire five minutes after completion, including during a diagnostic pause; handles do not survive Host restart. Poll required commands to a terminal result before finishing the task.",
                 "When polling reports sustained silence and repeated empty readouts, follow its advisory: do useful work or check one command-owned progress signal before polling again. Quiet output or an existing report does not prove completion; keep the handle, continue waiting when appropriate, and report a concrete blocker if progress cannot be established. A Human-controlled Root can pause polling after the reminder is repeatedly ignored, retaining the command handle for continuation. Do not stop/restart a command only because it is quiet.",
                 "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
-                "For commit requests: inspect git status, git diff, and recent git log first; commit only when explicitly requested; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
+                GIT_TOOL_GUIDANCE,
+                "For commit requests: inspect git status, git diff, and recent git log first; commit within current or standing user authorization; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
                 "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
                 "When referencing code locations in responses, use file_path:line_number format.",
                 "Use Plan to delegate planning to its read-only child and keep the root session in normal orchestration mode. Use ExitPlanMode only to leave an already-active legacy plan-mode session.",
@@ -98,7 +101,8 @@ impl GuideBuildContext {
                 "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms to bound each wait; completion does not send an automatic user notification. Unread completed results expire five minutes after completion, including during a diagnostic pause; handles do not survive Host restart. Poll required commands to a terminal result before finishing the task.",
                 "When polling reports sustained silence and repeated empty readouts, follow its advisory: do useful work or check one command-owned progress signal before polling again. Quiet output or an existing report does not prove completion; keep the handle, continue waiting when appropriate, and report a concrete blocker if progress cannot be established. A Human-controlled Root can pause polling after the reminder is repeatedly ignored, retaining the command handle for continuation. Do not stop/restart a command only because it is quiet.",
                 "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
-                "For commit requests: inspect git status, git diff, and recent git log first; commit only when explicitly requested; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
+                GIT_TOOL_GUIDANCE,
+                "For commit requests: inspect git status, git diff, and recent git log first; commit within current or standing user authorization; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
                 "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
                 "When referencing code locations in responses, use file_path:line_number format.",
                 "Use Plan to delegate planning to its read-only child and keep the root session in normal orchestration mode. Use ExitPlanMode only to leave an already-active legacy plan-mode session.",
@@ -153,6 +157,30 @@ mod tests {
             assert!(guidance.contains("follow its advisory"));
             assert!(guidance.contains("does not prove completion"));
             assert!(!guidance.contains("Bash"));
+        }
+    }
+
+    #[test]
+    fn best_practices_prefer_git_tools_and_preserve_role_and_work_boundaries() {
+        for language in [GuideLanguage::Chinese, GuideLanguage::English] {
+            let guidance = GuideBuildContext {
+                language,
+                ..GuideBuildContext::default()
+            }
+            .best_practices()
+            .join("\n");
+            for required in [
+                "prefer available dedicated Git tools",
+                "status and staged/unstaged diff",
+                "merge base, unique commits, and unmerged index",
+                "necessary diff hunks and surrounding source",
+                "Preserve dirty user work and unique commits",
+                "Supervisor without shell access delegates Git execution to an authorized worker",
+                "missing tools never expand permissions",
+                "current or standing user authorization",
+            ] {
+                assert!(guidance.contains(required), "missing {required}");
+            }
         }
     }
 
