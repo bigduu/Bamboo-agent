@@ -5835,27 +5835,196 @@ mod native_chat_scope {
 
     #[actix_web::test]
     async fn active_followup_rejects_scope_delta_before_publication() {
-        let fixture = Fixture::new("native-chat-scope-running").await;
+        for phase in ["running", "pending", "startup"] {
+            let fixture = Fixture::new(&format!("native-chat-scope-{phase}")).await;
+            let owner = if phase == "startup" {
+                None
+            } else {
+                Some(fixture.owner().await)
+            };
+            if phase == "pending" {
+                // Keep the genuine reservation; vary only its startup observation.
+                fixture.state.agent_runners.write().await.get_mut(&fixture.id).unwrap().status =
+                    crate::AgentStatus::Pending;
+            }
+            let startup = (phase == "startup").then(|| {
+                crate::handlers::agent::events::begin_execute_startup(&fixture.state, &fixture.id)
+            });
+            let before = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+            let cache = fixture.state.sessions.get(&fixture.id).unwrap().read().clone();
+            let inbox = fixture.state.session_inbox.inspect(&fixture.id).await.unwrap();
+            let workspace = bamboo_agent_core::workspace_state::get_workspace(&fixture.id);
+            let (status, response) = fixture.post(json!({
+                "message":"Continue without changing the active Source",
+                "workspace_path":fixture.b,
+            })).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{response}");
+            assert_eq!(response["error"]["code"], "session_project_running_conflict");
+            let after = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+            assert_eq!(serde_json::to_value(after).unwrap(), serde_json::to_value(before).unwrap());
+            assert_eq!(
+                serde_json::to_value(fixture.state.sessions.get(&fixture.id).unwrap().read().clone()).unwrap(),
+                serde_json::to_value(cache).unwrap(),
+            );
+            assert_eq!(fixture.state.session_inbox.inspect(&fixture.id).await.unwrap(), inbox);
+            assert_eq!(bamboo_agent_core::workspace_state::get_workspace(&fixture.id), workspace);
+            assert_eq!(fixture.provider.0.load(Ordering::Relaxed), 0);
+            drop(startup);
+            if let Some(owner) = owner {
+                owner.abandon().await;
+            }
+        }
+    }
+
+    #[actix_web::test]
+    async fn project_default_delta_and_project_reassignment_preserve_active_scope() {
+        let fixture = Fixture::new("native-chat-scope-project-default").await;
+        let project = fixture.state.project_store.create_with_project_path(
+            "Synthetic Project", None, fixture.a.to_string_lossy(), Vec::new(),
+        ).unwrap();
+        let mut session = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+        session.set_project_id_meta(project.id.to_string());
+        session.metadata_version += 1;
+        session.metadata.insert(
+            bamboo_engine::project_context::WORKSPACE_SOURCE_METADATA_KEY.into(),
+            bamboo_engine::project_context::WorkspaceSource::ProjectDefault.as_str().into(),
+        );
+        fixture.state.storage.save_session(&session).await.unwrap();
+        fixture.state.sessions.insert(
+            fixture.id.clone(), Arc::new(bamboo_engine::SessionSnapshot::new(session)),
+        );
         let owner = fixture.owner().await;
+        fixture.state.project_store.update_with_project_path(
+            &project.id, project.revision, &fixture.b.to_string_lossy(), |_| Ok(()),
+        ).unwrap();
         let before = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
-        let cache = fixture.state.sessions.get(&fixture.id).unwrap().read().clone();
         let inbox = fixture.state.session_inbox.inspect(&fixture.id).await.unwrap();
-        let workspace = bamboo_agent_core::workspace_state::get_workspace(&fixture.id);
         let (status, response) = fixture.post(json!({
-            "message":"Continue without changing the active Source",
-            "workspace_path":fixture.b,
+            "message":"Continue with workspace omitted",
         })).await;
         assert_eq!(status, StatusCode::CONFLICT, "{response}");
         assert_eq!(response["error"]["code"], "session_project_running_conflict");
-        let after = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
-        assert_eq!(serde_json::to_value(after).unwrap(), serde_json::to_value(before).unwrap());
         assert_eq!(
-            serde_json::to_value(fixture.state.sessions.get(&fixture.id).unwrap().read().clone()).unwrap(),
-            serde_json::to_value(cache).unwrap(),
+            serde_json::to_value(fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(&before).unwrap(),
         );
         assert_eq!(fixture.state.session_inbox.inspect(&fixture.id).await.unwrap(), inbox);
-        assert_eq!(bamboo_agent_core::workspace_state::get_workspace(&fixture.id), workspace);
+        assert_eq!(
+            bamboo_agent_core::workspace_state::get_workspace(&fixture.id),
+            Some(fixture.a.canonicalize().unwrap()),
+        );
+        let other = fixture.state.project_store.create_with_project_path(
+            "Other Synthetic Project", None, fixture.a.to_string_lossy(), Vec::new(),
+        ).unwrap();
+        let (status, response) = fixture.post(json!({
+            "message":"Chat must not reassign membership", "project_id":other.id,
+        })).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{response}");
+        assert_eq!(response["error"]["code"], "session_project_reassignment_required");
+        assert_eq!(
+            serde_json::to_value(fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap(),
+        );
         assert_eq!(fixture.provider.0.load(Ordering::Relaxed), 0);
         owner.abandon().await;
+    }
+
+    #[actix_web::test]
+    async fn same_scope_followup_and_alias_are_admitted_once() {
+        for spelling in ["omitted", "same", "alias"] {
+            let fixture = Fixture::new(&format!("native-chat-scope-positive-{spelling}")).await;
+            if spelling == "alias" {
+                #[cfg(unix)]
+                let alias = fixture._home.path().join("workspace-alias");
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&fixture.a, &alias).unwrap();
+                #[cfg(not(unix))]
+                let alias = fixture.a.join(".");
+                let mut session = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+                session.set_workspace_path_meta(alias.to_string_lossy());
+                fixture.state.storage.save_session(&session).await.unwrap();
+                fixture.state.sessions.insert(
+                    fixture.id.clone(), Arc::new(bamboo_engine::SessionSnapshot::new(session)),
+                );
+            }
+            let owner = fixture.owner().await;
+            let before = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+            let mut body = json!({"message":"SAME_SCOPE_CONTINUATION"});
+            if spelling != "omitted" { body["workspace_path"] = json!(fixture.a); }
+            let (status, response) = fixture.post(body).await;
+            assert_eq!(status, StatusCode::CREATED, "{response}");
+            assert_eq!(fixture.state.session_inbox.inspect(&fixture.id).await.unwrap().pending, 1);
+            let mut stored = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+            let admitted = owner.execution_persistence().unwrap().admit_root_inbox(
+                &mut stored, fixture.state.session_inbox.clone(), Some(owner.run_id()),
+            ).await.unwrap().unwrap();
+            assert!(admitted.admission_error.is_none());
+            assert_eq!(admitted.committed_messages.len(), 1);
+            let stored = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+            for message in &before.messages {
+                assert!(stored.messages.iter().any(|saved| {
+                    serde_json::to_value(saved).unwrap() == serde_json::to_value(message).unwrap()
+                }));
+            }
+            assert_eq!(stored.messages.iter().filter(|m| m.content == "SAME_SCOPE_CONTINUATION").count(), 1);
+            assert_eq!(fixture.provider.0.load(Ordering::Relaxed), 0);
+            owner.abandon().await;
+        }
+    }
+
+    #[actix_web::test]
+    async fn idle_legacy_workspace_can_be_repaired() {
+        let fixture = Fixture::new("native-chat-scope-idle-repair").await;
+        std::fs::remove_dir(&fixture.a).unwrap();
+        let (status, response) = fixture.post(json!({
+            "message":"Repair the unavailable old workspace", "workspace_path":fixture.b,
+        })).await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
+        let stored = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+        assert_eq!(
+            crate::skill_runtime::workspace_identity(&stored).unwrap(),
+            Some(fixture.b.canonicalize().unwrap()),
+        );
+        assert_eq!(fixture.state.session_inbox.inspect(&fixture.id).await.unwrap().pending, 1);
+        assert!(stored.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("completed-synthetic-command")
+                && message.content == "COMPLETED_SYNTHETIC_RESULT exit_code=0"
+        }));
+        assert_eq!(fixture.provider.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[actix_web::test]
+    async fn scope_commit_keeps_runner_gate_after_http_disconnect() {
+        let fixture = Fixture::new("native-chat-scope-disconnect").await;
+        let barrier = super::super::ingress::install_native_post_save(&fixture.id);
+        {
+            let chat = fixture.post(json!({
+                "message":"Commit the idle workspace change once", "workspace_path":fixture.b,
+            }));
+            tokio::pin!(chat);
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::select! {
+                    permit = barrier.reached.acquire() => permit.unwrap().forget(),
+                    response = &mut chat => panic!("Chat returned before owned commit: {response:?}"),
+                }
+            }).await.unwrap();
+            assert!(fixture.state.agent_runners.try_write().is_err());
+            // The real response future is dropped while its owned commit waits.
+        }
+        assert!(fixture.state.agent_runners.try_write().is_err());
+        barrier.resume.add_permits(1);
+        let saved = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fixture.state.persistence.acquire_lock(&fixture.id),
+        ).await.unwrap();
+        drop(saved);
+        assert!(fixture.state.agent_runners.try_write().is_ok());
+        let session = fixture.state.storage.load_session(&fixture.id).await.unwrap().unwrap();
+        assert_eq!(
+            crate::skill_runtime::workspace_identity(&session).unwrap(),
+            Some(fixture.b.canonicalize().unwrap()),
+        );
+        assert_eq!(fixture.state.session_inbox.inspect(&fixture.id).await.unwrap().pending, 1);
+        assert_eq!(fixture.provider.0.load(Ordering::Relaxed), 0);
     }
 }
