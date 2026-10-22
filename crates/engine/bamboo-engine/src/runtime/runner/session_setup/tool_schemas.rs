@@ -693,6 +693,7 @@ mod live_disabled_tests {
 
     #[test]
     fn fresh_spawn_catalog_does_not_promote_opaque_or_custom_canonical_names() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
         struct Unproven(bool);
         #[async_trait::async_trait]
         impl ToolExecutor for Unproven {
@@ -717,15 +718,49 @@ mod live_disabled_tests {
                     "spawn_session"
                 ));
             }
+            for ultra in [false, true] {
+                for supervisor in [false, true] {
+                    let mut session = Session::new(
+                        if supervisor {
+                            DEFAULT_SUPERVISOR_SESSION_ID
+                        } else {
+                            "contract-only-root-name"
+                        },
+                        "model",
+                    );
+                    session.session_version = version;
+                    session.set_root_orchestration_only(ultra).unwrap();
+                    if supervisor {
+                        session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                            incarnation_id: uuid::Uuid::new_v4(),
+                        };
+                    }
+                    assert!(!offered(
+                        &AgentLoopConfig::default(),
+                        &VersionedCatalog {
+                            root_installed: true
+                        },
+                        &session,
+                        "spawn_session"
+                    ));
+                }
+            }
         }
     }
 
     #[test]
     fn fresh_spawn_catalog_keeps_root_schema_separate_and_native_disabled_exact() {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
-        let tools = VersionedCatalog {
-            root_installed: true,
-        };
+        let tools = crate::session_app::approval_replay::framework_fixture::FixtureTools::new(&[
+            "SubAgent",
+            "session_control",
+            "work_dispatch",
+            "spawn_session",
+        ]);
+        let expected = tools
+            .framework_session_tool_for_exact("spawn_session")
+            .expect("actual fixture Host instance")
+            .schema();
         for version in [None, Some(1), Some(2)] {
             for ultra in [false, true] {
                 for supervisor in [false, true] {
@@ -745,25 +780,29 @@ mod live_disabled_tests {
                         };
                     }
                     let config = AgentLoopConfig::default();
-                    let schemas =
-                        resolve_available_tool_schemas_for_session(&config, &tools, &session);
+                    let schemas = resolve_available_tool_schemas_for_session(
+                        &config,
+                        tools.as_ref(),
+                        &session,
+                    );
                     let root = schemas.iter().find(|s| s.function.name == "spawn_session");
                     assert!(root.is_some());
                     if let Some(root) = root {
-                        assert_eq!(
-                            root.function.description,
-                            "actual spawn_session owner contract"
-                        );
+                        assert_eq!(root.function.description, expected.function.description);
+                        assert_eq!(root.function.parameters, expected.function.parameters);
                     }
                     for reference in ["spawn_session", "spawnSession", "default::spawn_session"] {
                         let config = AgentLoopConfig {
                             disabled_tools: BTreeSet::from([reference.to_owned()]),
                             ..Default::default()
                         };
-                        let schemas =
-                            resolve_available_tool_schemas_for_session(&config, &tools, &session);
+                        let schemas = resolve_available_tool_schemas_for_session(
+                            &config,
+                            tools.as_ref(),
+                            &session,
+                        );
                         assert!(schemas.iter().all(|s| s.function.name != "spawn_session"));
-                        assert_eq!(schemas.iter().any(|s| s.function.name == "SubAgent"), true);
+                        assert!(schemas.iter().any(|s| s.function.name == "SubAgent"));
                     }
                 }
             }
