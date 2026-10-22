@@ -2,9 +2,10 @@
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ToolError, ToolResult};
-use bamboo_domain::{ProjectId, SupervisorReference};
+use bamboo_domain::{ProjectId, SessionCallerReference, Storage, SupervisorReference};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +49,78 @@ pub trait SupervisedRootCreatePort: Send + Sync {
         supervisor: &SupervisorReference,
         request: SupervisedRootCreateRequest,
     ) -> Result<ToolResult, ToolError>;
+}
+
+/// Role-neutral Host seam. A caller reference identifies the original lifetime;
+/// the implementation must authorize its current Project/workspace scope and
+/// reuse the canonical Root/Inbox/idempotency writers. It is not a model grant.
+#[async_trait]
+pub trait SessionRootCreatePort: Send + Sync {
+    async fn scope(&self, caller: &SessionCallerReference) -> Result<ToolResult, ToolError>;
+    async fn create(
+        &self,
+        caller: &SessionCallerReference,
+        request: SupervisedRootCreateRequest,
+    ) -> Result<ToolResult, ToolError>;
+}
+
+/// Compatibility adapter for the currently installed Host authorization. Keep
+/// every existing singleton/scope/birth/Project/Inbox guard in the old writer.
+/// Other callers require a separately installed, scoped Host implementation.
+pub struct SupervisorRootCreateAdapter {
+    creator: Arc<dyn SupervisedRootCreatePort>,
+    storage: Arc<dyn Storage>,
+}
+
+impl SupervisorRootCreateAdapter {
+    pub fn new(creator: Arc<dyn SupervisedRootCreatePort>, storage: Arc<dyn Storage>) -> Self {
+        Self { creator, storage }
+    }
+
+    async fn authorize(
+        &self,
+        caller: &SessionCallerReference,
+    ) -> Result<SupervisorReference, ToolError> {
+        let canonical = self
+            .storage
+            .load_execution_admission_snapshot(&caller.session_id)
+            .await
+            .map_err(|error| {
+                ToolError::Execution(format!("Session Root authority read failed: {error}"))
+            })?
+            .ok_or_else(|| ToolError::Execution("Session Root caller is unavailable".into()))?;
+        canonical
+            .check_execution_compatibility()
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        if !caller.matches_session(&canonical) {
+            return Err(ToolError::Execution(
+                "Session Root caller lifetime or authority changed".into(),
+            ));
+        }
+        let incarnation_id = canonical.supervisor_incarnation_id().ok_or_else(|| {
+            ToolError::Execution("session_root_scope_unavailable: this Host has no Root creation grant adapter for the caller".into())
+        })?;
+        Ok(SupervisorReference {
+            session_id: canonical.id,
+            incarnation_id,
+        })
+    }
+}
+
+#[async_trait]
+impl SessionRootCreatePort for SupervisorRootCreateAdapter {
+    async fn scope(&self, caller: &SessionCallerReference) -> Result<ToolResult, ToolError> {
+        self.creator.scope(&self.authorize(caller).await?).await
+    }
+
+    async fn create(
+        &self,
+        caller: &SessionCallerReference,
+        request: SupervisedRootCreateRequest,
+    ) -> Result<ToolResult, ToolError> {
+        let supervisor = self.authorize(caller).await?;
+        self.creator.create(&supervisor, request).await
+    }
 }
 
 pub(super) fn request_schema() -> Value {

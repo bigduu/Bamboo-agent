@@ -804,6 +804,7 @@ pub fn update_or_append_tool_result_message(
 fn result_payload_has_supervisor_authority(message: &Message) -> bool {
     serde_json::from_str::<serde_json::Value>(&message.content).ok().is_some_and(|payload| {
         payload.get(bamboo_agent_core::tools::ExecutingSupervisorObservation::PERMISSION_REPLAY_METADATA_KEY).is_some()
+            || payload.get(bamboo_agent_core::tools::PENDING_TOOL_OPERATION_METADATA_KEY).is_some()
     })
 }
 
@@ -2051,6 +2052,40 @@ mod receipt_persistence_tests {
             serde_json::to_value(read_cached_session(repo.cache(), &session.id).unwrap()).unwrap(),
             cache_before,
             "a rejected response must not publish a cache snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_cannot_smuggle_frozen_operation_through_a_typed_answer() {
+        let (mut session, request, receipt) = pending_permission("frozen-payload-refusal");
+        let current = session.messages.last_mut().unwrap();
+        let mut payload: serde_json::Value = serde_json::from_str(&current.content).unwrap();
+        payload[bamboo_agent_core::tools::PENDING_TOOL_OPERATION_METADATA_KEY] =
+            serde_json::json!({"version":1});
+        current.content = payload.to_string();
+        let (_directory, store, repo) = repository(&mut session).await;
+        let before =
+            serde_json::to_value(store.load_session(&session.id).await.unwrap().unwrap()).unwrap();
+        let guard = acquire_pending_response_guard(&session.id).await;
+        let result = submit_pending_permission_response_checked_guarded(
+            &repo,
+            input(&session.id),
+            Some(request.request_id),
+            receipt,
+            &guard,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(RespondError::InvalidResponse(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            serde_json::to_value(store.load_session(&session.id).await.unwrap().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(read_cached_session(repo.cache(), &session.id).unwrap()).unwrap(),
+            before
         );
     }
 }

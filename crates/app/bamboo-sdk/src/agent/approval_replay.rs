@@ -5,9 +5,9 @@ use bamboo_agent_core::tools::{ToolExecutor, ToolOutcome};
 use bamboo_agent_core::{PendingQuestion, PendingQuestionSource};
 use bamboo_engine::session_app::approval_replay::{
     apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
-    repark_permission_replay, restore_permission_replay_authorization,
-    validate_pending_permission_replay_authority, validate_permission_replay_authority,
-    ApprovalReplayDecision, PermissionReplayTarget,
+    repark_permission_replay, resolve_permission_replay_owner,
+    restore_permission_replay_authorization, validate_pending_permission_replay_authority,
+    validate_permission_replay_authority, ApprovalReplayDecision, PermissionReplayTarget,
 };
 use bamboo_engine::session_app::respond::{
     PERMISSION_REEXECUTE_GENERATION_METADATA_KEY, PERMISSION_REEXECUTE_METADATA_KEY,
@@ -41,10 +41,12 @@ fn typed_request(message: &Message) -> Result<Option<PermissionRequest>, AgentEr
     let payload = serde_json::from_str::<serde_json::Value>(&message.content).ok();
     let authority_key =
         bamboo_agent_core::tools::ExecutingSupervisorObservation::PERMISSION_REPLAY_METADATA_KEY;
-    if payload
-        .as_ref()
-        .is_some_and(|value| value.get(authority_key).is_some())
-    {
+    if payload.as_ref().is_some_and(|value| {
+        value.get(authority_key).is_some()
+            || value
+                .get(bamboo_agent_core::tools::PENDING_TOOL_OPERATION_METADATA_KEY)
+                .is_some()
+    }) {
         return Err(invalid(
             "Supervisor authority cannot originate in the result payload",
         ));
@@ -87,12 +89,10 @@ fn validate_request(
     request: &PermissionRequest,
     executor: &dyn ToolExecutor,
 ) -> Result<String, AgentError> {
-    // Requests name the selected execution identity, while history and pending
-    // questions retain the caller's spelling. Exact custom registrations must
-    // win before builtin aliases, just as they do in the live executor.
-    let execution_name = executor
-        .resolve_reference_for_session(session, &target.tool_call().function.name)
-        .ok_or_else(|| invalid("current tool is unavailable"))?;
+    // Replay consumes the original host operation binding, independently of
+    // fresh-call aliases. Preserve the caller's spelling and argument bytes.
+    let execution_name = resolve_permission_replay_owner(session, target, executor)?
+        .ok_or_else(|| invalid("retained execution owner is unavailable"))?;
     if request.session_id != session.id
         || request.request_id != target.tool_call().id
         || request.tool_name != execution_name
@@ -225,9 +225,10 @@ impl Agent {
 
         let tool_call = target.tool_call();
         let tool_name = &tool_call.function.name;
-        let replay_owner = execution_name
-            .clone()
-            .or_else(|| executor.resolve_reference_for_session(session, tool_name));
+        let replay_owner = match execution_name {
+            Some(name) => Some(name),
+            None => resolve_permission_replay_owner(session, &target, executor.as_ref())?,
+        };
         let executing_supervisor = validate_permission_replay_authority(
             session,
             &target,
@@ -295,13 +296,10 @@ impl Agent {
                 pre_parsed_args: None,
             };
             let dispatch = async {
-                match execution_name.as_deref() {
-                    Some(name) => executor
-                        .execute_exact_with_context_outcome(tool_call, name, ctx)
-                        .await
-                        .map(ToolOutcome::into_tool_result),
-                    None => executor.execute_with_context(tool_call, ctx).await,
-                }
+                executor
+                    .execute_exact_with_context_outcome(tool_call, &replay_owner, ctx)
+                    .await
+                    .map(ToolOutcome::into_tool_result)
             };
             let (result, execution_error) = match with_permission_replay_generation(
                 &session.id,

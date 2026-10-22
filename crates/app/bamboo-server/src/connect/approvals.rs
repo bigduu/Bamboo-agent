@@ -32,8 +32,9 @@ use bamboo_engine::runtime::execution::agent_spawn::{
 };
 use bamboo_engine::session_app::approval_replay::{
     apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
-    repark_permission_replay, restore_permission_replay_authorization,
-    validate_permission_replay_authority, ApprovalReplayDecision, PermissionReplayTarget,
+    repark_permission_replay, resolve_permission_replay_owner,
+    restore_permission_replay_authorization, validate_permission_replay_authority,
+    ApprovalReplayDecision, PermissionReplayTarget,
 };
 use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
 use bamboo_engine::session_app::repository::SessionAccess;
@@ -786,7 +787,17 @@ impl ResumeExecutionPort for ConnectResumePort {
                 let tool_name = tool_call.function.name.clone();
                 let executor = ctx.tools.clone();
                 let executor = executor.for_session(&session).unwrap_or(executor);
-                let replay_owner = executor.resolve_reference_for_session(&session, &tool_name);
+                let replay_owner = match resolve_permission_replay_owner(
+                    &session,
+                    &replay_target,
+                    executor.as_ref(),
+                ) {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        tracing::error!(%session_id, %error, "retained permission operation refused; pending markers preserved");
+                        return;
+                    }
+                };
                 if replay_owner.is_none() && reexecute_request_generation.is_some() {
                     tracing::error!(%session_id, %tool_name, "connect approved replay has no registered execution owner; markers retained");
                     return;

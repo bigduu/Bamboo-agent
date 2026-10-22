@@ -12,7 +12,7 @@ use bamboo_agent_core::tools::{
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_domain::{
     AgentHookPoint, AgentRuntimeState, EffectiveCallableSet, HookPayload, HookResult,
-    HookToolOutcome,
+    HookToolOutcome, SessionCallerReference,
 };
 use bamboo_metrics::MetricsCollector;
 
@@ -93,6 +93,8 @@ pub(super) struct ToolExecutionOnlyContext<'a> {
     pub root_session_id: &'a str,
     /// Original executing lifetime captured before this call is handed off.
     pub executing_supervisor: Option<ExecutingSupervisorObservation>,
+    /// Role-neutral caller captured at the same admission boundary.
+    pub executing_caller: Option<&'a SessionCallerReference>,
     pub round_id: &'a str,
     pub round: usize,
     pub tools: &'a Arc<dyn ToolExecutor>,
@@ -792,8 +794,16 @@ async fn execute_tool_call_only_with_execution_name_inner(
 
     Ok(ToolExecutionOutcome {
         output_cap: Some(output_cap),
-        permission_replay_origin: ctx.executing_supervisor.map(|observation| {
-            PermissionReplayOrigin::new(observation, ctx.session_id, ctx.tool_call, execution_name)
+        permission_replay_origin: (ctx.executing_caller.is_some()
+            || ctx.executing_supervisor.is_some())
+        .then(|| {
+            PermissionReplayOrigin::new(
+                ctx.executing_caller.cloned(),
+                ctx.executing_supervisor,
+                ctx.session_id,
+                ctx.tool_call,
+                execution_name,
+            )
         }),
         result: result.map_err(|error| error.to_string()),
         needs_human,
@@ -1168,7 +1178,10 @@ async fn apply_tool_execution_outcome_inner(
             &command,
             &ctx.tool_call.id,
             ctx.round,
-            outcome.permission_replay_origin.is_some(),
+            outcome
+                .permission_replay_origin
+                .as_ref()
+                .is_some_and(PermissionReplayOrigin::has_supervisor_observation),
             read_only,
             feedback_cap,
         )
@@ -1712,6 +1725,7 @@ mod task_progress_tests {
                         session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
+                        executing_caller: None,
                         executing_supervisor: None,
                         tool_call: &call,
                         event_tx: &event_tx,
@@ -2521,6 +2535,7 @@ mod hook_tests {
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
+                executing_caller: None,
                 executing_supervisor: None,
                 tool_call: call,
                 event_tx,
@@ -2709,6 +2724,7 @@ mod hook_tests {
                     session_behavior_version: None,
                     vision_support: true,
                     output_cap: cap,
+                    executing_caller: None,
                     executing_supervisor: None,
                     tool_call: &call,
                     event_tx: &event_tx,
@@ -2855,6 +2871,7 @@ mod hook_tests {
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
+                executing_caller: None,
                 executing_supervisor: None,
                 tool_call,
                 event_tx,
@@ -3024,6 +3041,7 @@ mod hook_tests {
                         session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
+                        executing_caller: None,
                         executing_supervisor: observation,
                         tool_call: &call,
                         event_tx: &tx,
@@ -3112,6 +3130,7 @@ mod hook_tests {
                         session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
+                        executing_caller: None,
                         executing_supervisor: observation,
                         tool_call: &call,
                         event_tx: &tx,
@@ -3266,6 +3285,7 @@ mod hook_tests {
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
+                executing_caller: None,
                 executing_supervisor: None,
                 tool_call: &unloaded_call,
                 event_tx: &event_tx,
@@ -3629,6 +3649,7 @@ mod hook_tests {
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
+                executing_caller: None,
                 executing_supervisor: None,
                 tool_call: &tool_call,
                 event_tx: &event_tx,
@@ -3697,6 +3718,7 @@ mod hook_tests {
             session_behavior_version: None,
             vision_support: true,
             output_cap: None,
+            executing_caller: None,
             executing_supervisor: None,
             tool_call: &tool_call,
             event_tx: &event_tx,
@@ -3780,6 +3802,7 @@ mod hook_tests {
             session_behavior_version: None,
             vision_support: true,
             output_cap: None,
+            executing_caller: None,
             executing_supervisor: None,
             tool_call: &tool_call,
             event_tx: &event_tx,
@@ -3839,6 +3862,7 @@ mod hook_tests {
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
+                executing_caller: None,
                 executing_supervisor: None,
                 tool_call: &tool_call,
                 event_tx: &event_tx,
@@ -4399,6 +4423,7 @@ mod hook_tests {
                             session_behavior_version: Some(2),
                             vision_support: true,
                             output_cap: None,
+                            executing_caller: None,
                             executing_supervisor:
                                 ExecutingSupervisorObservation::capture_from_executing_session(
                                     &session,
@@ -4638,6 +4663,7 @@ mod hook_tests {
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: Some(97),
+                executing_caller: None,
                 executing_supervisor: None,
                 tool_call: &tool_call,
                 event_tx: &event_tx,
@@ -4702,6 +4728,7 @@ mod hook_tests {
             session_behavior_version: None,
             vision_support: true,
             output_cap: None,
+            executing_caller: None,
             executing_supervisor: None,
             tool_call: &tool_call,
             event_tx: &event_tx,
@@ -4790,6 +4817,7 @@ mod hook_tests {
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
+                executing_caller: None,
                 executing_supervisor: None,
                 tool_call: call,
                 event_tx: &event_tx,
@@ -5014,6 +5042,7 @@ mod hook_tests {
                                 session_behavior_version: version,
                                 vision_support: true,
                                 output_cap: None,
+                                executing_caller: None,
                                 executing_supervisor:
                                     ExecutingSupervisorObservation::capture_from_executing_session(
                                         &session,
@@ -5122,6 +5151,7 @@ mod hook_tests {
                     session_behavior_version: Some(2),
                     vision_support: true,
                     output_cap: None,
+                    executing_caller: None,
                     executing_supervisor:
                         ExecutingSupervisorObservation::capture_from_executing_session(&session),
                     tool_call: &call,
