@@ -142,7 +142,8 @@ async fn unsupported_update_is_501_while_create_and_read_stay_available() {
 #[actix_web::test]
 async fn authoring_create_read_update_conflicts_and_pinned_revisions() {
     let data = tempfile::tempdir().unwrap();
-    let state = web::Data::new(AppState::new(data.path().to_path_buf()).await.unwrap());
+    let home = data.path().canonicalize().unwrap();
+    let state = web::Data::new(AppState::new(home.clone()).await.unwrap());
     let app = webtest::init_service(App::new().app_data(state.clone()).service(routes())).await;
     let create = json!({"target":"user","description":"Inspect the checkout", "definition":definition("authored-flow",1)});
     let response = webtest::call_service(
@@ -194,13 +195,25 @@ async fn authoring_create_read_update_conflicts_and_pinned_revisions() {
     )
     .await;
     assert_eq!(duplicate.status(), StatusCode::CONFLICT);
-    let read: Value = webtest::call_and_read_body_json(
+    let response = webtest::call_service(
         &app,
         webtest::TestRequest::get()
             .uri("/definitions/authored-flow?target=user")
             .to_request(),
     )
     .await;
+    let status = response.status();
+    let bytes = webtest::read_body(response).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "body={}, raw_home={}, canonical_home={}, winner_root={:?}",
+        String::from_utf8_lossy(&bytes),
+        data.path().display(),
+        home.display(),
+        store.get_workflow_root("authored-flow").await,
+    );
+    let read: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(read["content_digest"], first["content_digest"]);
     assert_eq!(read["skill_digest"], first["skill_digest"]);
     assert_eq!(read["saved"], false);
@@ -736,8 +749,9 @@ async fn unassigned_legacy_session_keeps_its_durable_workspace() {
 #[actix_web::test]
 async fn nested_definitions_require_available_pins_and_cannot_cycle_through_replaced_root() {
     let data = tempfile::tempdir().unwrap();
-    let state = web::Data::new(AppState::new(data.path().to_path_buf()).await.unwrap());
-    let app = webtest::init_service(App::new().app_data(state).service(routes())).await;
+    let home = data.path().canonicalize().unwrap();
+    let state = web::Data::new(AppState::new(home.clone()).await.unwrap());
+    let app = webtest::init_service(App::new().app_data(state.clone()).service(routes())).await;
     let mut nested = definition("nested-flow", 1);
     nested["steps"][0] =
         json!({"id":"inspect","type":"workflow","workflow_id":"leaf-flow","revision":1,"args":{}});
@@ -774,7 +788,23 @@ async fn nested_definitions_require_available_pins_and_cannot_cycle_through_repl
             .to_request(),
     )
     .await;
-    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let status = rejected.status();
+    let bytes = webtest::read_body(rejected).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "body={}, raw_home={}, canonical_home={}, winner_root={:?}",
+        String::from_utf8_lossy(&bytes),
+        data.path().display(),
+        home.display(),
+        state
+            .skill_manager
+            .store_for_workspace(None)
+            .await
+            .unwrap()
+            .get_workflow_root("leaf-flow")
+            .await,
+    );
     let updated = webtest::call_service(
         &app,
         webtest::TestRequest::put()

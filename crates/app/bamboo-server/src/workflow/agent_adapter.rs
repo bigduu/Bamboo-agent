@@ -657,6 +657,7 @@ mod tests {
         parent.set_workspace_path_meta(current_workspace.to_string_lossy());
         // A real workspace PATCH updates canonical metadata but can leave the
         // child-compatibility field pointing at the previous workspace.
+        parent.metadata_version = parent.metadata_version.checked_add(1).unwrap();
         state.storage.save_session(&parent).await.unwrap();
         state.workspace_resolver.publish_resolved_workspace(
             &parent.id,
@@ -732,6 +733,7 @@ mod tests {
             .unwrap();
         parent.set_project_id_meta(project.id.to_string());
         parent.set_workspace_path_meta(workspace.to_string_lossy());
+        parent.metadata_version = parent.metadata_version.checked_add(1).unwrap();
         state.storage.save_session(&parent).await.unwrap();
         let adapter = &state.workflow_runs.agents;
         let selected = adapter
@@ -746,6 +748,7 @@ mod tests {
             .create_with_project_path("Foreign owner", None, foreign.to_string_lossy(), vec![])
             .unwrap();
         parent.set_workspace_path_meta(foreign.to_string_lossy());
+        parent.metadata_version = parent.metadata_version.checked_add(1).unwrap();
         state.storage.save_session(&parent).await.unwrap();
         state.workspace_resolver.publish_resolved_workspace(
             &parent.id,
