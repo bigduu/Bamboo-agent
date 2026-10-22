@@ -1,12 +1,20 @@
 //! Cold synthetic storage fixtures. No provider, account or real-user Session.
 
 use super::*;
+use crate::v2::default_actor_context_tests::DefaultWriteHook;
 use bamboo_domain::{
     ActorAncestorObservation, HostScopeSessionObservation, HostSessionCreateScope,
     HostSessionRight, HostSessionScopeBinding, HostSessionScopeToken, Message,
     DEFAULT_SUPERVISOR_SESSION_ID, HOST_SESSION_SCOPE_VERSION,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+struct ReleaseHook(Arc<DefaultWriteHook>);
+impl Drop for ReleaseHook {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
 
 async fn fixture() -> (tempfile::TempDir, SessionStoreV2, Session) {
     let home = tempfile::tempdir().unwrap();
@@ -64,7 +72,8 @@ async fn install(
 #[tokio::test]
 async fn explicit_create_permit_creates_independent_root_for_each_original_role() {
     let (home, store, caller) = fixture().await;
-    let child = Session::new_child_of("child", &caller, "model", "short child work");
+    let mut child = Session::new_child_of("child", &caller, "model", "short child work");
+    child.set_project_id_meta(caller.project_id_meta().unwrap());
     store.save_session(&child).await.unwrap();
     store
         .get_or_create_default_supervisor("model")
@@ -378,4 +387,81 @@ async fn a_different_valid_generation_cannot_use_the_same_stable_creation_scope(
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     assert!(error.to_string().contains("operation_caller_changed"));
     assert!(store.load_session(&candidate.id).await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn aborted_creation_keeps_tree_publication_and_scope_locked_until_physical_completion() {
+    let (home, store, caller) = fixture().await;
+    let store = Arc::new(store);
+    let operation = Uuid::new_v4();
+    let candidate = request_candidate(&caller, operation, &home.path().join("workspace"));
+    let target_id = candidate.id.clone();
+    let token = install(
+        &store,
+        &caller,
+        vec![],
+        operation,
+        &candidate,
+        0,
+        BTreeSet::new(),
+    )
+    .await;
+    let hook = DefaultWriteHook::install(
+        &store,
+        ACTOR_TREE_REVISION_FILE,
+        DurableWritePhase::BeforeReplace,
+        false,
+    );
+    let _release = ReleaseHook(hook.clone());
+    let observed = SessionCallerReference::from(&caller);
+    let job = {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .create_host_scoped_root(&token, &observed, operation, Some(1), &candidate)
+                .await
+        })
+    };
+    hook.wait();
+    job.abort();
+    assert!(job.await.unwrap_err().is_cancelled());
+    let mut revoke = Box::pin(store.revoke_host_session_scope(&caller.id, 1));
+    assert!(futures::poll!(revoke.as_mut()).is_pending());
+    for path in [
+        home.path().join(SESSION_LIFECYCLE_LOCK_FILE),
+        home.path().join(RUNTIME_TASK_TRANSACTION_LOCK_FILE),
+        store.session_write_lock_path(&caller.id),
+        store.session_write_lock_path(&target_id),
+    ] {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let result = FileExt::try_lock_exclusive(&file);
+        if result.is_ok() {
+            FileExt::unlock(&file).unwrap();
+        }
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+    hook.release();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), revoke)
+            .await
+            .unwrap()
+            .unwrap(),
+        2
+    );
+    assert!(home
+        .path()
+        .join("sessions")
+        .join(&target_id)
+        .join(ACTOR_TREE_REVISION_FILE)
+        .is_file());
+    assert!(!home
+        .path()
+        .join("sessions")
+        .join(&target_id)
+        .join("session.json")
+        .exists());
 }

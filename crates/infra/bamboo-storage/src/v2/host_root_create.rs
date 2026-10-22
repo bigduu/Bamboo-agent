@@ -32,7 +32,7 @@ impl SessionStoreV2 {
         let scope = self.host_scope_registry.retain(token, caller).await?;
         let binding = scope.token().binding();
         let permit = binding
-            .create(operation_id, &project, workspace)
+            .create(operation_id, &project, &workspace)
             .map_err(|error| denied(error.to_string()))?;
         if !permit.created_target_rights.is_empty() {
             // Publishing a new target grant requires its own explicit Host CAS.

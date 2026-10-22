@@ -2413,6 +2413,20 @@ impl SessionStoreV2 {
     /// order. This publication precedes every public tree write, so an
     /// interrupted operation creates at most an unnecessary gap.
     async fn bump_actor_tree_revision(&self, root: &Session) -> io::Result<()> {
+        let (path, bytes) = self.prepare_actor_tree_revision(root).await?;
+        durable_atomic_write(&path, &bytes).await
+    }
+
+    async fn bump_actor_tree_revision_with_default_writer(
+        &self,
+        root: &Session,
+        guards: &Arc<DefaultWriterGuards>,
+    ) -> io::Result<()> {
+        let (path, bytes) = self.prepare_actor_tree_revision(root).await?;
+        self.write_default_bytes(&path, bytes, guards).await
+    }
+
+    async fn prepare_actor_tree_revision(&self, root: &Session) -> io::Result<(PathBuf, Vec<u8>)> {
         if root.kind != SessionKind::Root
             || (!root.root_session_id.is_empty() && root.id != root.root_session_id)
         {
@@ -2456,7 +2470,7 @@ impl SessionStoreV2 {
         }
         marker.project_id = normalized_project_id(root);
         let bytes = serde_json::to_vec(&marker).map_err(io::Error::other)?;
-        durable_atomic_write(&path, &bytes).await
+        Ok((path, bytes))
     }
 
     /// For a Root that is still invisible in a staging directory. The marker
@@ -6638,7 +6652,8 @@ impl SessionStoreV2 {
                 self.actor_tree_root_for_child_write(root_id).await?
             };
             if let Some(root) = root.as_ref() {
-                self.bump_actor_tree_revision(root).await?;
+                self.bump_actor_tree_revision_with_default_writer(root, guards)
+                    .await?;
             }
         }
 

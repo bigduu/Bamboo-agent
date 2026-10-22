@@ -6,8 +6,12 @@ not yet connect the application creation service or first-input Inbox purpose.
 Those are mandatory before claiming that ordinary callers can complete spawn.
 All Rust tests and compilation remain **UNRUN**.
 
-The reservation key uses only immutable caller ID/birth and operation UUID,
-with a separate `host-root:v1` hash domain. Rotating grant ID, issuer, scope
+Ordinary/Child reservation keys use immutable caller ID/birth and operation UUID,
+with a separate `host-root:v1` hash domain. A genuine Supervisor retains its
+existing `supervised-root:v1` ID/incarnation/operation address so changing from
+legacy authorization to an installed Host scope cannot allocate a second Root.
+The application must retain that route's existing complete-request fingerprint
+and first-input message identity too. Rotating grant ID, issuer, scope
 revision, conversation ledger, mode and workspace cannot select a second UUID.
 The existing application operation store must freeze the complete request,
 fingerprint, reserved birth and UUID before calling this writer; a key or receipt
@@ -32,8 +36,9 @@ A missing Root on that retry returns an explicit recovery blocker rather than
 guessing that an uncertain operation never ran or recreating lost work. Normal
 deletion revocation and partial/corrupt canonical pairs retain existing guards.
 
-Default writer jobs retain the complete Host physical set after caller
-cancellation. The shared save path reuses an already-held tree only when the
+Default writer jobs, including the Actor-tree revision marker, retain the
+complete Host physical set after caller cancellation. The shared save path
+reuses an already-held tree only when the
 retained physical guard reports that exact acquired Root tree; other writers
 continue to acquire their existing tree guard. This prevents reacquiring its
 own non-reentrant lock and is not a caller-supplied skip flag.
