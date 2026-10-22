@@ -170,6 +170,12 @@ pub async fn get_session(
                     ));
                 }
             };
+            // Pair this optional receipt with its exact canonical error; keep
+            // the existing index presentation for legacy failures without one.
+            if let Some(diagnostic) = durable_session.last_run_diagnostic() {
+                summary.last_run_error = durable_session.last_run_error();
+                summary.last_run_diagnostic = Some(diagnostic);
+            }
             summary.execution_compatibility = Some(durable_session.execution_compatibility());
             summary.root_orchestration_only =
                 Some(durable_session.root_orchestration_only_enabled());

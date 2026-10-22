@@ -8,31 +8,7 @@ use super::*;
 const MAX_RECENT_EVENTS: usize = 128;
 const MAX_SESSION_EVENTS: usize = 12;
 
-#[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RequestStopReason {
-    AttemptsExhausted,
-    TimeBudgetExhausted,
-    RetryDelayExceedsBudget,
-    NonRetryableTransport,
-    UnclassifiedErrorBody,
-    CancelledOrDropped,
-}
-
-impl RequestStopReason {
-    fn guidance(self) -> &'static str {
-        match self {
-            Self::AttemptsExhausted => "Automatic retry attempt limit reached",
-            Self::TimeBudgetExhausted => "Automatic retry time budget exhausted",
-            Self::RetryDelayExceedsBudget => {
-                "Required retry delay exceeds the remaining time budget"
-            }
-            Self::NonRetryableTransport => "Transport failure is not automatically retryable",
-            Self::UnclassifiedErrorBody => "Upstream error response could not be safely classified",
-            Self::CancelledOrDropped => "Request cancelled or its caller stopped waiting",
-        }
-    }
-}
+pub use bamboo_domain::LlmRequestStopReason as RequestStopReason;
 
 /// Only host-generated IDs, hashed local correlation and finite classifications
 /// enter this DTO. No upstream ID/header, URL, error chain or content is copied.
@@ -114,6 +90,33 @@ fn push_bounded(events: &mut VecDeque<InitialRequestDiagnostic>, event: InitialR
     events.push_back(event);
 }
 
+fn public_summary(event: &InitialRequestDiagnostic) -> Option<bamboo_domain::LlmRequestDiagnostic> {
+    if event.stop_reason.is_none() {
+        return None;
+    }
+    bamboo_domain::LlmRequestDiagnostic::from_json(&serde_json::to_string(event).ok()?)
+}
+
+/// Optional live-event projection. Session-scoped and matched against the exact
+/// generated error, never against an arbitrary UUID in upstream error prose.
+pub fn public_request_diagnostic(
+    session_id: &str,
+    message: &str,
+) -> Option<bamboo_domain::LlmRequestDiagnostic> {
+    if message.len() > 4096 {
+        return None;
+    }
+    let hash = crate::providers::common::log_identity(session_id);
+    recent_events()
+        .lock()
+        .ok()?
+        .iter()
+        .rev()
+        .filter(|event| event.session_hash.as_deref() == Some(hash.as_str()))
+        .filter_map(public_summary)
+        .find(|diagnostic| diagnostic.matches_error_message(message))
+}
+
 impl AttemptObservation {
     fn refresh(&mut self) {
         let now = Instant::now();
@@ -193,6 +196,13 @@ impl InitialRequestBudget {
             observation.diagnostic.error_id = Some(self.diagnostic_id);
         }
         let d = &observation.diagnostic;
+        if let Some(summary) = public_summary(d) {
+            let _ = INITIAL_HTTP_RETRY_OBSERVER.try_with(|observer| {
+                if let Ok(mut terminal) = observer.terminal_diagnostic.lock() {
+                    *terminal = Some(summary);
+                }
+            });
+        }
         // JSON comes exclusively from the typed allowlist above, never from
         // ambient tracing events. INFO is retained by the default file sink.
         if let Ok(json) = serde_json::to_string(d) {

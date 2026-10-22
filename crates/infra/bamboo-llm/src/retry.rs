@@ -36,7 +36,8 @@ use crate::provider::LLMError;
 
 mod diagnostics;
 pub use diagnostics::{
-    recent_initial_request_diagnostics, InitialRequestDiagnostic, RequestStopReason,
+    public_request_diagnostic, recent_initial_request_diagnostics, InitialRequestDiagnostic,
+    RequestStopReason,
 };
 use diagnostics::{AttemptObservation, CancellationObservation};
 
@@ -53,12 +54,19 @@ pub struct InitialHttpRetry {
 pub struct InitialHttpRetryObserver {
     last: Mutex<Option<InitialHttpRetry>>,
     budget_managed: AtomicBool,
+    terminal_diagnostic: Mutex<Option<bamboo_domain::LlmRequestDiagnostic>>,
 }
 
 impl InitialHttpRetryObserver {
     /// Whether the provider owns a bounded request policy for this bootstrap.
     pub fn request_budget_managed(&self) -> bool {
         self.budget_managed.load(Ordering::Relaxed)
+    }
+
+    /// Evidence captured by this exact provider bootstrap, independent of the
+    /// bounded process log buffer and concurrent sessions.
+    pub fn terminal_diagnostic(&self) -> Option<bamboo_domain::LlmRequestDiagnostic> {
+        self.terminal_diagnostic.lock().ok().and_then(|d| d.clone())
     }
 
     pub fn last(&self) -> Option<InitialHttpRetry> {
