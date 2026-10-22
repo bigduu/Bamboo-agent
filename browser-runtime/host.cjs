@@ -4033,6 +4033,7 @@ async function finishCloseHost() {
 
 async function main() {
   hostStorageSettings = productionStorageSettings();
+  if (hostStorageSettings) process.chdir(hostStorageSettings.scratch);
   const downloadRoot = process.env.BAMBOO_BROWSER_DOWNLOAD_ROOT || os.tmpdir();
   downloadDir = await fs.mkdtemp(path.join(downloadRoot, 'bamboo-browser-download-'));
   const sessionCookies = await readProfile();
