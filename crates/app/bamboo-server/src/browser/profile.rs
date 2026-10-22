@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use super::BrowserError;
 
 const CLOSE_PENDING: &str = ".bamboo-profile-close-pending";
+const WRITER_EXIT_UNCONFIRMED: &str = ".bamboo-profile-writer-exit-unconfirmed";
 const LEASES: &str = ".bamboo-profile-leases";
 const RESET_GATE: &str = ".bamboo-profile-reset.lock";
 const RETIRED: &[u8] = b"BAMBOO_BROWSER_RETIRED_V1\n";
@@ -29,6 +30,39 @@ pub(super) struct Lease {
 }
 
 impl Lease {
+    /// This marker survives release of process-local descriptors. Native
+    /// writer exit cannot be inferred from the Node process's wait status.
+    pub(super) fn quarantine_writers(&self) -> Result<(), BrowserError> {
+        self.begin_close()?;
+        let marker = self.path.join(WRITER_EXIT_UNCONFIRMED);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(&marker) {
+            Ok(file) => file.sync_all().map_err(|_| unavailable())?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata = std::fs::symlink_metadata(&marker).map_err(|_| unavailable())?;
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return Err(unavailable());
+                }
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NOFOLLOW);
+                }
+                options.open(&marker).and_then(|file| file.sync_all()).map_err(|_| unavailable())?;
+            }
+            Err(_) => return Err(unavailable()),
+        }
+        sync_directory(&self.path)
+    }
+
     // A forced fallback must never replay the checkpoint from before logout.
     // Keep the marker on any unconfirmed close; do not delete site data.
     pub(super) fn begin_close(&self) -> Result<(), BrowserError> {
@@ -203,7 +237,30 @@ fn admission_gate(root: &Path, exclusive: bool) -> Result<std::fs::File, Browser
 
 pub(super) fn begin_reset(root: &Path) -> Result<std::fs::File, BrowserError> {
     let root = root_directory(root, true)?.ok_or_else(unavailable)?;
-    admission_gate(&root, true)
+    let gate = admission_gate(&root, true)?;
+    // Refuse before any canonical wipe, including a restart that lost the old
+    // process's locks. This never clears an unknown writer's durable fence.
+    for entry in std::fs::read_dir(&root).map_err(|_| unavailable())? {
+        let entry = entry.map_err(|_| unavailable())?;
+        if entry.file_name() == LEASES || entry.file_name() == RESET_GATE {
+            continue;
+        }
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(valid_key) {
+            return Err(unavailable());
+        }
+        validate_private_directory(&entry.path())?;
+        reject_unconfirmed_writers(&entry.path())?;
+    }
+    Ok(gate)
+}
+
+fn reject_unconfirmed_writers(path: &Path) -> Result<(), BrowserError> {
+    match std::fs::symlink_metadata(path.join(WRITER_EXIT_UNCONFIRMED)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // Existing, malformed, linked or unreadable markers all fail closed.
+        _ => Err(BrowserError::Unavailable("browser writer exit unconfirmed".into())),
+    }
 }
 
 fn lifecycle_lock(root: &Path, session_id: &str) -> Result<std::fs::File, BrowserError> {
@@ -268,6 +325,7 @@ pub(super) fn acquire(root: &Path, session_id: &str) -> Result<Lease, BrowserErr
     }
     let path = directory(&root, session_id)?;
     let lock = lock_file(&path.join(".bamboo-profile.lock"))?;
+    reject_unconfirmed_writers(&path)?;
     match std::fs::symlink_metadata(path.join(CLOSE_PENDING)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         _ => return Err(unavailable()),
@@ -321,6 +379,7 @@ fn remove_key_notifying(
         Err(_) => return Err(unavailable()),
         Ok(_) => {
             validate_private_directory(&path)?;
+            reject_unconfirmed_writers(&path)?;
             true
         }
     };

@@ -95,6 +95,7 @@ struct BrowserLifecycle {
     reset_epoch: AtomicU64,
     opens: tokio::sync::RwLock<()>,
     owners: Mutex<Vec<Arc<BrowserCleanup>>>,
+    unconfirmed_writers: Arc<AtomicBool>,
 }
 
 /// Held through canonical reset and cache clear. Epoch changes before
@@ -137,12 +138,36 @@ impl BrowserResetGuard<'_> {
 
 struct BrowserCleanup {
     session: Mutex<Weak<BrowserSession>>,
+    // Settled is not an all-writer exit proof. Quarantine is a distinct result.
     done: watch::Sender<bool>,
+    quarantined: Mutex<Vec<BrowserQuarantine>>,
+    unconfirmed_writers: Arc<AtomicBool>,
+}
+
+struct BrowserQuarantine {
+    // Hold all profile/reset/lifecycle locks while the owner remains alive.
+    _lease: Option<profile::Lease>,
+    // keep() deliberately disables TempDir's destructive Drop on uncertainty.
+    _scratch: Option<PathBuf>,
 }
 
 impl BrowserCleanup {
     fn finish(&self) {
         self.done.send_replace(true);
+    }
+
+    fn is_quarantined(&self) -> bool {
+        !self.quarantined.lock().unwrap().is_empty()
+    }
+
+    fn quarantine(&self, lease: Option<profile::Lease>, scratch: Option<tempfile::TempDir>) {
+        self.quarantined.lock().unwrap().push(BrowserQuarantine {
+            _lease: lease,
+            _scratch: scratch.map(tempfile::TempDir::keep),
+        });
+        // Do not accumulate new live hosts behind an unresolved owned writer.
+        self.unconfirmed_writers.store(true, Ordering::Release);
+        self.finish();
     }
 
     async fn wait(&self) {
@@ -172,6 +197,9 @@ struct BrowserSession {
     kill_issued: AtomicBool,
     retiring: AtomicBool,
     close_confirmed: AtomicBool,
+    // The existing owned host-close contract, not an independent OS-native
+    // descendant-containment proof. The capacity finding remains open.
+    clean_host_exit: AtomicBool,
     reaped: AtomicBool,
     frame_epoch: AtomicU64,
     active_tab_id: Mutex<Option<String>>,
@@ -181,7 +209,10 @@ struct BrowserSession {
 
 impl Drop for BrowserSession {
     fn drop(&mut self) {
-        if self.reaped.load(Ordering::Acquire) && self.profile_lease.get_mut().unwrap().is_none() {
+        if self.reaped.load(Ordering::Acquire)
+            && self.profile_lease.get_mut().unwrap().is_none()
+            && self.temp_dir.get_mut().unwrap().is_none()
+        {
             self.cleanup.finish();
             return;
         }
@@ -197,7 +228,7 @@ impl Drop for BrowserSession {
         let can_detach = lease.is_none() || marked;
         let resources = BrowserReaper {
             child: self.child.clone(),
-            cleanup: Some(self.cleanup.clone()),
+            cleanup: self.cleanup.clone(),
             lease,
             temp_dir: self.temp_dir.get_mut().unwrap().take(),
             stdin: self.stdin.get_mut().take(),
@@ -205,6 +236,7 @@ impl Drop for BrowserSession {
             process_group: self.process_group,
             graceful,
             marked,
+            clean_host_exit: self.clean_host_exit.load(Ordering::Acquire),
         };
         if !can_detach {
             // With no durable fence, Drop cannot safely return and let process
@@ -234,7 +266,7 @@ impl Drop for BrowserSession {
 /// signalling a process is not evidence that it has stopped using its profile.
 struct BrowserReaper {
     child: Arc<Mutex<Child>>,
-    cleanup: Option<Arc<BrowserCleanup>>,
+    cleanup: Arc<BrowserCleanup>,
     lease: Option<profile::Lease>,
     temp_dir: Option<tempfile::TempDir>,
     stdin: Option<ChildStdin>,
@@ -242,6 +274,7 @@ struct BrowserReaper {
     process_group: Option<i32>,
     graceful: bool,
     marked: bool,
+    clean_host_exit: bool,
 }
 
 impl BrowserReaper {
@@ -257,7 +290,7 @@ impl BrowserReaper {
         let mut killed = false;
         let clean = loop {
             if let Ok(Some(status)) = self.child.lock().unwrap().try_wait() {
-                break self.graceful && !killed && status.success();
+                break self.clean_host_exit || (self.graceful && !killed && status.success());
             }
             if !killed && Instant::now() >= deadline {
                 #[cfg(unix)]
@@ -281,12 +314,23 @@ impl BrowserReaper {
                 // If disk I/O prevented the marker, retaining the lease is the
                 // replay fence. Do not release an unmarked, unconfirmed profile.
                 while !marked {
-                    marked = lease.begin_close().is_ok();
+                    marked = lease.quarantine_writers().is_ok();
                     if !marked {
                         std::thread::sleep(Duration::from_millis(250));
                     }
                 }
             }
+        }
+        if !clean {
+            // A prior CLOSE_PENDING marker is only a replay fence. Persist the
+            // stronger deletion/reset fence before releasing any descriptors.
+            if let Some(lease) = &self.lease {
+                while lease.quarantine_writers().is_err() {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+            self.cleanup.quarantine(self.lease.take(), self.temp_dir.take());
+            return;
         }
         if let Some(directory) = self.temp_dir.take() {
             let path = directory.path().to_path_buf();
@@ -303,11 +347,9 @@ impl BrowserReaper {
         }
         // Completion is published only after actual wait, scratch cleanup and
         // release of both profile locks. A process shutdown awaits this record.
-        let cleanup = self.cleanup.take();
+        let cleanup = self.cleanup.clone();
         drop(self);
-        if let Some(cleanup) = cleanup {
-            cleanup.finish();
-        }
+        cleanup.finish();
     }
 }
 
@@ -489,6 +531,8 @@ impl BrowserSession {
         let cleanup = Arc::new(BrowserCleanup {
             session: Mutex::new(Weak::new()),
             done: watch::channel(false).0,
+            quarantined: Mutex::new(Vec::new()),
+            unconfirmed_writers: lifecycle.unconfirmed_writers.clone(),
         });
         let session = Arc::new(Self {
             cleanup: cleanup.clone(),
@@ -506,6 +550,7 @@ impl BrowserSession {
             kill_issued: AtomicBool::new(false),
             retiring: AtomicBool::new(false),
             close_confirmed: AtomicBool::new(false),
+            clean_host_exit: AtomicBool::new(false),
             reaped: AtomicBool::new(false),
             frame_epoch: AtomicU64::new(0),
             active_tab_id: Mutex::new(None),
@@ -515,7 +560,7 @@ impl BrowserSession {
         *cleanup.session.lock().unwrap() = Arc::downgrade(&session);
         {
             let mut owners = lifecycle.owners.lock().unwrap();
-            owners.retain(|owner| !*owner.done.borrow());
+            owners.retain(|owner| !*owner.done.borrow() || owner.is_quarantined());
             owners.push(cleanup);
         }
         let weak = Arc::downgrade(&session);
@@ -696,6 +741,9 @@ impl BrowserSession {
     }
 
     fn release_profile(&self) {
+        if !self.clean_host_exit.load(Ordering::Acquire) {
+            return;
+        }
         let mut lease = self.profile_lease.lock().unwrap();
         if self.retiring.load(Ordering::Acquire)
             && !self.close_confirmed.load(Ordering::Acquire)
@@ -712,12 +760,35 @@ impl BrowserSession {
         }
     }
 
+    fn quarantine_resources(&self) {
+        if self.cleanup.is_quarantined() {
+            return;
+        }
+        let mut lease = self.profile_lease.lock().unwrap();
+        if let Some(lease) = lease.as_ref() {
+            if let Err(error) = lease.quarantine_writers() {
+                // Keep ownership for the Drop reaper's existing durable-fence
+                // retry path. No I/O failure authorizes deletion or unlock.
+                tracing::warn!(%error, "could not persist unknown browser writer fence");
+                return;
+            }
+        }
+        let owned_lease = lease.take();
+        drop(lease);
+        let scratch = self.temp_dir.lock().unwrap().take();
+        self.cleanup.quarantine(owned_lease, scratch);
+    }
+
     async fn terminate(&self, reason: &'static str) {
         self.mark_dead(reason);
         let _guard = self.termination.lock().await;
         if self.reaped.load(Ordering::Acquire) {
-            self.cleanup_temp_dir().await;
-            self.release_profile();
+            if self.clean_host_exit.load(Ordering::Acquire) {
+                self.cleanup_temp_dir().await;
+                self.release_profile();
+            } else {
+                self.quarantine_resources();
+            }
             return;
         }
         if self.retiring.load(Ordering::Acquire) && !self.kill_issued.load(Ordering::Acquire) {
@@ -747,6 +818,7 @@ impl BrowserSession {
             };
             if let Some(clean) = graceful {
                 self.reaped.store(true, Ordering::Release);
+                self.clean_host_exit.store(clean, Ordering::Release);
                 let confirmed = clean
                     && self
                         .profile_lease
@@ -755,8 +827,12 @@ impl BrowserSession {
                         .as_ref()
                         .is_some_and(|lease| lease.finish_close().is_ok());
                 self.close_confirmed.store(confirmed, Ordering::Release);
-                self.cleanup_temp_dir().await;
-                self.release_profile();
+                if clean {
+                    self.cleanup_temp_dir().await;
+                    self.release_profile();
+                } else {
+                    self.quarantine_resources();
+                }
                 return;
             }
             // The marker intentionally survives an unconfirmed/forced close.
@@ -781,13 +857,15 @@ impl BrowserSession {
         } else {
             tracing::warn!("browser host did not exit after process termination");
         }
-        self.cleanup_temp_dir().await;
         if self.reaped.load(Ordering::Acquire) {
-            self.release_profile();
+            self.quarantine_resources();
         }
     }
 
     async fn cleanup_temp_dir(&self) {
+        if !self.clean_host_exit.load(Ordering::Acquire) {
+            return;
+        }
         let temp_dir = { self.temp_dir.lock().unwrap().take() };
         if let Some(temp_dir) = temp_dir {
             let path = temp_dir.path().to_path_buf();
@@ -940,6 +1018,8 @@ mod tests {
             cleanup: Arc::new(BrowserCleanup {
                 session: Mutex::new(Weak::new()),
                 done: watch::channel(false).0,
+                quarantined: Mutex::new(Vec::new()),
+                unconfirmed_writers: Arc::new(AtomicBool::new(false)),
             }),
             profile_lease: Mutex::new(None),
             temp_dir: Mutex::new(None),
@@ -953,6 +1033,7 @@ mod tests {
             kill_issued: AtomicBool::new(false),
             retiring: AtomicBool::new(false),
             close_confirmed: AtomicBool::new(false),
+            clean_host_exit: AtomicBool::new(false),
             reaped: AtomicBool::new(false),
             frame_epoch: AtomicU64::new(0),
             active_tab_id: Mutex::new(None),
@@ -2037,6 +2118,9 @@ impl BrowserManager {
         }
         for owner in owners {
             owner.wait().await;
+            if owner.is_quarantined() {
+                return Err(BrowserError::Unavailable("browser writer exit unconfirmed".into()));
+            }
         }
         if let Some(root) = &self.profile_root {
             let root = root.clone();
@@ -2051,7 +2135,8 @@ impl BrowserManager {
         Ok(guard)
     }
 
-    /// Finish process-owned browser work before an executable can return.
+    /// Retire owned hosts before teardown and retain any uncertain native
+    /// writer's resources. Quarantine is not successful native-domain exit.
     /// Open is fenced first; its read guard includes spawn/readiness, so no
     /// in-flight startup can escape the following owner snapshot.
     pub async fn shutdown(&self) {
@@ -2089,6 +2174,9 @@ impl BrowserManager {
         // Drop reaper. Waiting on durable completion avoids a Weak/Drop race.
         for owner in owners {
             owner.wait().await;
+            if owner.is_quarantined() {
+                tracing::warn!("browser shutdown retained an unconfirmed writer's locks and scratch");
+            }
         }
     }
 
@@ -2177,6 +2265,9 @@ impl BrowserManager {
             return Err(BrowserError::Unavailable(
                 "browser manager shut down".into(),
             ));
+        }
+        if self.lifecycle.unconfirmed_writers.load(Ordering::Acquire) {
+            return Err(BrowserError::Unavailable("browser writer exit unconfirmed".into()));
         }
         // Serialize only this chat's open/close lifecycle. Starting Chromium
         // or probing a slow host must not block unrelated chat sessions.
@@ -2434,8 +2525,10 @@ impl BrowserManager {
         // The map entry is gone and old Arcs cannot write. Persistent hosts
         // receive EOF for bounded final checkpointing, not a queued RPC.
         session.terminate("browser session closed").await;
-        if session.retiring.load(Ordering::Acquire)
-            && !session.close_confirmed.load(Ordering::Acquire)
+        if !session.reaped.load(Ordering::Acquire)
+            || session.cleanup.is_quarantined()
+            || (session.retiring.load(Ordering::Acquire)
+                && !session.close_confirmed.load(Ordering::Acquire))
         {
             return Err(BrowserError::Unavailable(
                 "browser profile close unconfirmed".into(),
