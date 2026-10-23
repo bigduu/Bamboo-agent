@@ -9,8 +9,9 @@ Draft #2150.
 
 The first freeze implements `session/conversation_reset.rs`: a pure request,
 decision, prospective ledger and candidate transformation, registered in Domain.
-Eight synthetic test functions cover preservation/purge, exact replay, stale
-preview, pending/live/unknown refusal, schema/overflow, digest ordering, Child
+Nine synthetic test functions cover preservation/purge, a legacy-only prompt
+snapshot, exact replay, stale preview, pending/live/unknown refusal,
+schema/overflow, digest ordering, Child
 refusal, receipt eviction and rejection of force/role/permission arguments.
 
 It changes no persisted `Session` field, Main frame/proof, storage publisher,
@@ -21,7 +22,7 @@ and confirms the complete result. **An activated idle Supervisor cannot yet be
 cleared through this code.** No user data or account has been used.
 
 Direct rustfmt parsing/format checks and `git diff --check` are static evidence.
-Cargo, compilation, the eight tests, transaction recovery and actual provider
+Cargo, compilation, the nine tests, transaction recovery and actual provider
 payload acceptance are unrun until the parent transfers the shared Rust window.
 
 ## Existing authority and reusable seams
@@ -199,7 +200,7 @@ remain required before the user outcome is called delivered.
 
 ## Required actual tests after the Rust window
 
-The eight current Domain tests are preparation-only source. They do not prove a
+The nine current Domain tests are preparation-only source. They do not prove a
 storage transaction or actual provider request.
 
 The next affected suite must create a Supervisor and an Ordinary Root in isolated
