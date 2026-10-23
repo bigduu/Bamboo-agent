@@ -1,5 +1,81 @@
-//! Process-owned browser sessions shared by HTTP workbench requests and agent tools.
-//! Each chat session has one isolated Playwright context in a child Node process.
+//! One account browser process with chat-owned pages and optional clean contexts.
+//! The HTTP workbench and agent tools share the same canonical chat scope.
+
+#[cfg(all(test, unix))]
+mod concurrent_drain_tests;
+mod launch_admission;
+#[cfg(test)]
+mod lease_free_retirement_tests;
+#[cfg(test)]
+mod persistence_tests;
+#[cfg(test)]
+mod platform_mode_tests;
+mod profile;
+mod shared;
+mod storage;
+pub use shared::BrowserProfileMode;
+#[cfg(test)]
+mod reset_tests;
+#[cfg(test)]
+mod retirement_tests;
+#[cfg(all(test, unix))]
+mod shared_manager_tests;
+#[cfg(all(test, unix))]
+mod shutdown_tests;
+#[cfg(test)]
+mod terminal_entry_tests;
+#[cfg(all(test, unix))]
+mod writer_lifecycle_tests;
+
+#[cfg(test)]
+pub(crate) fn test_profile_directory(root: &std::path::Path, session_id: &str) -> PathBuf {
+    profile::directory(root, session_id).expect("isolated browser profile fixture")
+}
+
+#[cfg(test)]
+pub(crate) fn test_retired_count(browser: &BrowserManager) -> usize {
+    browser.retired.lock().unwrap().len()
+}
+
+/// Existing EOF/marker fixtures model persistence, not browser pages. Adapt
+/// their wire envelope to the production v2 owner contract without replacing
+/// any physical EOF, checkpoint or filesystem-failure behavior they exercise.
+#[cfg(all(test, unix))]
+fn test_shared_protocol(script: String) -> String {
+    const ADAPTER: &str = r#"import json
+_fixture_loads = json.loads
+_fixture_dumps = json.dumps
+_fixture_requests = {}
+_fixture_modes = {}
+def _fixture_decode(line, *args, **kwargs):
+    request = _fixture_loads(line, *args, **kwargs)
+    if isinstance(request, dict) and request.get('version') == 2:
+        _fixture_requests[request['id']] = request
+    return request
+def _fixture_encode(value, *args, **kwargs):
+    if isinstance(value, dict) and 'id' in value:
+        request = _fixture_requests.pop(value['id'], None)
+        if request is not None:
+            value = dict(value, version=2, host_generation='a' * 24)
+            action = request.get('action')
+            if action == 'runtime_state':
+                value['result'] = {'protocol_version':2, 'host_generation':'a' * 24,
+                    'browser_instance_id':'b' * 24, 'scope_count':0, 'profile_modes':['shared','clean']}
+            else:
+                owner = request['scope_id']
+                value.update(scope_id=owner, scope_generation=request['scope_generation'])
+                if action == 'scope_close':
+                    _fixture_modes.pop(owner, None)
+                    value['result'] = {'closed':True}
+                else:
+                    mode = _fixture_modes.setdefault(owner, request.get('args', {}).get('profile_mode', 'shared'))
+                    value['result'] = dict(value.get('result', {}), profile_mode=mode, storage_shared=mode == 'shared')
+    return _fixture_dumps(value, *args, **kwargs)
+json.loads = _fixture_decode
+json.dumps = _fixture_encode
+"#;
+    [ADAPTER, &script].join("\n")
+}
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -19,6 +95,9 @@ const BROWSER_IDLE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const BROWSER_COMMAND_DEADLINE: Duration = Duration::from_secs(30);
 const BROWSER_EVAL_DEADLINE: Duration = Duration::from_secs(5);
 const BROWSER_REAP_DEADLINE: Duration = Duration::from_secs(2);
+// Playwright's browser-process close has its own 30-second bound. Leave time
+// for that close and Node's final cleanup; command cancellation stays separate.
+const BROWSER_CLOSE_DEADLINE: Duration = Duration::from_secs(35);
 
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserError {
@@ -26,6 +105,10 @@ pub enum BrowserError {
     Unavailable(String),
     #[error("browser session not open")]
     NotOpen,
+    #[error("close this chat browser before changing profile mode")]
+    ProfileModeConflict,
+    #[error("browser runtime busy")]
+    Busy,
     #[error("browser page changed; refresh state and retry")]
     StaleEpoch,
     #[error("browser dialog is no longer pending")]
@@ -50,25 +133,209 @@ pub struct BrowserFrame {
 
 #[derive(Clone, Default)]
 pub struct BrowserManager {
+    profile_root: Option<Arc<PathBuf>>,
+    shared: Arc<shared::SharedManager>,
     sessions: Arc<AsyncMutex<HashMap<String, Arc<BrowserSession>>>>,
     session_gates: Arc<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
     retired: Arc<Mutex<HashSet<String>>>,
     cleanup_started: Arc<AtomicBool>,
+    lifecycle: Arc<BrowserLifecycle>,
+}
+
+/// Tracks this manager's hosts even after removal from its live-session map.
+/// A cleanup record survives the final session Arc and its detached reaper.
+#[derive(Default)]
+struct BrowserLifecycle {
+    bounded_storage: bool,
+    ephemeral_clean: bool,
+    stopping: AtomicBool,
+    reset_epoch: AtomicU64,
+    opens: tokio::sync::RwLock<()>,
+    owners: Mutex<Vec<Arc<BrowserCleanup>>>,
+    unconfirmed_writers: Arc<AtomicBool>,
+    // Serializes only synchronous child creation with the irreversible fence.
+    // Never hold this across a host probe, filesystem I/O or an async wait.
+    writer_admission: Arc<Mutex<()>>,
+}
+
+impl BrowserLifecycle {
+    fn for_platform(platform: &str) -> Self {
+        let ephemeral_clean = matches!(platform, "linux" | "windows");
+        Self {
+            bounded_storage: !ephemeral_clean,
+            ephemeral_clean,
+            ..Self::default()
+        }
+    }
+
+    fn new_profile_mode(
+        &self,
+        requested: Option<BrowserProfileMode>,
+    ) -> Result<BrowserProfileMode, BrowserError> {
+        let mode = requested.unwrap_or_default();
+        if self.ephemeral_clean && mode != BrowserProfileMode::Clean {
+            return Err(BrowserError::Unavailable(
+                "browser_shared_profile_unsupported: request clean explicitly".into(),
+            ));
+        }
+        Ok(mode)
+    }
+
+    fn configure_profile(&self, command: &mut Command, profile: Option<&std::path::Path>) {
+        if self.ephemeral_clean {
+            command.env("BAMBOO_BROWSER_EPHEMERAL_CLEAN", "1");
+        } else if let Some(profile) = profile {
+            command.env("BAMBOO_BROWSER_PROFILE_DIR", profile);
+        }
+    }
+
+    fn ensure_writer_admission(&self) -> Result<(), BrowserError> {
+        if self.unconfirmed_writers.load(Ordering::Acquire) {
+            return Err(BrowserError::Unavailable(
+                "browser writer exit unconfirmed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn spawn_child(&self, command: &mut Command) -> Result<Child, BrowserError> {
+        let _admission = self.writer_admission.lock().unwrap();
+        self.ensure_writer_admission()?;
+        command
+            .spawn()
+            .map_err(|error| BrowserError::Unavailable(error.to_string()))
+    }
+}
+
+/// Held through canonical reset and cache clear. Epoch changes before
+/// unlock, so local pre-reset/during-reset waiters cannot create a host.
+pub(crate) struct BrowserResetGuard<'a> {
+    // Release the process-shared gate before allowing local opens again.
+    _profile_gate: Option<Arc<profile::ResetGate>>,
+    _opens: tokio::sync::RwLockWriteGuard<'a, ()>,
+    lifecycle: &'a BrowserLifecycle,
+    profile_root: Option<Arc<PathBuf>>,
+    retired: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for BrowserResetGuard<'_> {
+    fn drop(&mut self) {
+        self.lifecycle.reset_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl BrowserResetGuard<'_> {
+    /// Only a complete canonical wipe authorizes purging orphaned keys.
+    pub(crate) async fn purge_profiles(&self) -> Result<(), BrowserError> {
+        let Some(root) = self.profile_root.clone() else {
+            return Ok(());
+        };
+        let retired = self.retired.clone();
+        let profile_gate = self._profile_gate.clone();
+        let pending: Vec<_> = retired.lock().unwrap().iter().cloned().collect();
+        tokio::task::spawn_blocking(move || {
+            for id in pending {
+                profile::remove_notifying(&root, &id, || {
+                    retired.lock().unwrap().remove(&id);
+                })?;
+            }
+            profile::purge_all(&root)?;
+            if let Some(gate) = profile_gate {
+                gate.finish_storage()?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| BrowserError::Unavailable("browser reset interrupted".into()))?
+    }
+}
+
+struct BrowserCleanup {
+    session: Mutex<Weak<BrowserSession>>,
+    // Settled is not an all-writer exit proof. Quarantine is a distinct result.
+    done: watch::Sender<bool>,
+    quarantined: Mutex<Vec<BrowserQuarantine>>,
+    unconfirmed_writers: Arc<AtomicBool>,
+    writer_admission: Arc<Mutex<()>>,
+}
+
+struct BrowserQuarantine {
+    // Hold all profile/reset/lifecycle locks while the owner remains alive.
+    _lease: Option<profile::Lease>,
+    // keep() deliberately disables TempDir's destructive Drop on uncertainty.
+    _scratch: Option<PathBuf>,
+}
+
+impl BrowserCleanup {
+    fn register(lifecycle: &BrowserLifecycle) -> Arc<Self> {
+        let cleanup = Arc::new(Self {
+            session: Mutex::new(Weak::new()),
+            done: watch::channel(false).0,
+            quarantined: Mutex::new(Vec::new()),
+            unconfirmed_writers: lifecycle.unconfirmed_writers.clone(),
+            writer_admission: lifecycle.writer_admission.clone(),
+        });
+        let mut owners = lifecycle.owners.lock().unwrap();
+        owners.retain(|owner| !*owner.done.borrow() || owner.is_quarantined());
+        owners.push(cleanup.clone());
+        cleanup
+    }
+
+    fn finish(&self) {
+        self.done.send_replace(true);
+    }
+
+    fn is_quarantined(&self) -> bool {
+        !self.quarantined.lock().unwrap().is_empty()
+    }
+
+    fn fence_writers(&self) {
+        let _admission = self.writer_admission.lock().unwrap();
+        self.unconfirmed_writers.store(true, Ordering::Release);
+    }
+
+    fn quarantine(&self, lease: Option<profile::Lease>, scratch: Option<tempfile::TempDir>) {
+        self.fence_writers();
+        self.quarantined.lock().unwrap().push(BrowserQuarantine {
+            _lease: lease,
+            _scratch: scratch.map(tempfile::TempDir::keep),
+        });
+        self.finish();
+    }
+
+    async fn wait(&self) {
+        let mut done = self.done.subscribe();
+        while !*done.borrow_and_update() {
+            if done.changed().await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 struct BrowserSession {
-    child: Mutex<Child>,
+    child: Arc<Mutex<Child>>,
+    cleanup: Arc<BrowserCleanup>,
+    protocol_v2: AtomicBool,
+    shared_router: Mutex<Weak<shared::SharedRuntime>>,
+    handshake_generation: Mutex<Option<String>>,
+    profile_lease: Mutex<Option<profile::Lease>>,
     /// Owns the host's TMPDIR, including Chromium's download scratch files.
     temp_dir: Mutex<Option<tempfile::TempDir>>,
-    #[cfg(unix)]
     process_group: Option<i32>,
-    stdin: AsyncMutex<ChildStdin>,
+    group_exit_required: bool,
+    stdin: AsyncMutex<Option<ChildStdin>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, BrowserError>>>>,
     next_id: AtomicU64,
     frames: watch::Sender<Option<Arc<BrowserFrame>>>,
     shutdown: watch::Sender<bool>,
     termination: AsyncMutex<()>,
     kill_issued: AtomicBool,
+    retiring: AtomicBool,
+    close_confirmed: AtomicBool,
+    // The existing owned host-close contract, not an independent OS-native
+    // descendant-containment proof. The capacity finding remains open.
+    clean_host_exit: AtomicBool,
     reaped: AtomicBool,
     frame_epoch: AtomicU64,
     active_tab_id: Mutex<Option<String>>,
@@ -78,9 +345,173 @@ struct BrowserSession {
 
 impl Drop for BrowserSession {
     fn drop(&mut self) {
-        if !self.reaped.load(Ordering::Acquire) {
-            self.signal_stop();
+        if self.reaped.load(Ordering::Acquire)
+            && self.profile_lease.get_mut().unwrap().is_none()
+            && self.temp_dir.get_mut().unwrap().is_none()
+        {
+            self.cleanup.finish();
+            return;
         }
+        let lease = self.profile_lease.get_mut().unwrap().take();
+        let graceful = (lease.is_some() || self.retiring.load(Ordering::Acquire))
+            && !self.kill_issued.load(Ordering::Acquire)
+            && !self.reaped.load(Ordering::Acquire);
+        if !graceful && !self.clean_host_exit.load(Ordering::Acquire) {
+            self.cleanup.fence_writers();
+        }
+        // Establish the replay fence before returning from Drop, not after a
+        // new thread happens to be scheduled (the process can exit meanwhile).
+        let marked = lease
+            .as_ref()
+            .is_some_and(|lease| lease.begin_close().is_ok());
+        let can_detach = lease.is_none() || marked;
+        let resources = BrowserReaper {
+            child: self.child.clone(),
+            cleanup: self.cleanup.clone(),
+            lease,
+            temp_dir: self.temp_dir.get_mut().unwrap().take(),
+            stdin: self.stdin.get_mut().take(),
+            process_group: self.process_group,
+            group_exit_required: self.group_exit_required,
+            graceful,
+            marked,
+            clean_host_exit: self.clean_host_exit.load(Ordering::Acquire),
+            native_launch_unadmitted: false,
+        };
+        if !can_detach {
+            // With no durable fence, Drop cannot safely return and let process
+            // exit release the only remaining lease. Wait for clean exit or I/O
+            // recovery. This path is only for a failed profile marker write.
+            resources.reap();
+            return;
+        }
+        resources.spawn();
+    }
+}
+
+impl BrowserReaper {
+    fn spawn(self) {
+        let resources = Arc::new(Mutex::new(Some(self)));
+        let worker = resources.clone();
+        if std::thread::Builder::new()
+            .name("browser-host-reaper".into())
+            .spawn(move || {
+                let resources = worker.lock().unwrap().take().unwrap();
+                resources.reap();
+            })
+            .is_err()
+        {
+            // A failed thread spawn must not drop the lease before the child.
+            let resources = resources.lock().unwrap().take().unwrap();
+            resources.reap();
+        }
+    }
+}
+
+/// Outlives the async runtime and every manager/session Arc. In particular,
+/// signalling a process is not evidence that it has stopped using its profile.
+struct BrowserReaper {
+    child: Arc<Mutex<Child>>,
+    cleanup: Arc<BrowserCleanup>,
+    lease: Option<profile::Lease>,
+    temp_dir: Option<tempfile::TempDir>,
+    stdin: Option<ChildStdin>,
+    process_group: Option<i32>,
+    group_exit_required: bool,
+    graceful: bool,
+    marked: bool,
+    clean_host_exit: bool,
+    // Only the owned prelaunch guard sets this before ANY grant attempt.
+    // It is not an exit-code/PID inference about an admitted native writer.
+    native_launch_unadmitted: bool,
+}
+
+impl BrowserReaper {
+    fn reap(mut self) {
+        let mut marked = self.marked;
+        drop(self.stdin.take());
+        let deadline = Instant::now()
+            + if self.graceful {
+                BROWSER_CLOSE_DEADLINE
+            } else {
+                Duration::ZERO
+            };
+        let mut killed = false;
+        let clean = loop {
+            if let Ok(Some(status)) = self.child.lock().unwrap().try_wait() {
+                let group_gone =
+                    managed_group_exit_confirmed(self.group_exit_required, self.process_group);
+                break self.clean_host_exit
+                    || (self.native_launch_unadmitted && group_gone)
+                    || (self.graceful && !killed && status.success() && group_gone);
+            }
+            if !killed && Instant::now() >= deadline {
+                if !self.native_launch_unadmitted {
+                    self.cleanup.fence_writers();
+                }
+                #[cfg(unix)]
+                if let Some(group) = self.process_group {
+                    kill_browser_process_group(group);
+                }
+                let _ = self.child.lock().unwrap().start_kill();
+                killed = true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if !clean {
+            // The in-memory admission fence must not depend on successful
+            // durable-marker I/O, which may fail or wait for recovery forever.
+            self.cleanup.fence_writers();
+        }
+        if let Some(lease) = &self.lease {
+            if clean && !self.native_launch_unadmitted {
+                // Unlink may succeed before its directory barrier fails. Keep
+                // the lease until that barrier is confirmed, even if a retry
+                // finds the marker already absent.
+                while lease.finish_close().is_err() {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            } else if !clean {
+                // If disk I/O prevented the marker, retaining the lease is the
+                // replay fence. Do not release an unmarked, unconfirmed profile.
+                while !marked {
+                    marked = lease.quarantine_writers().is_ok();
+                    if !marked {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+            }
+        }
+        if !clean {
+            // A prior CLOSE_PENDING marker is only a replay fence. Persist the
+            // stronger deletion/reset fence before releasing any descriptors.
+            if let Some(lease) = &self.lease {
+                while lease.quarantine_writers().is_err() {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+            self.cleanup
+                .quarantine(self.lease.take(), self.temp_dir.take());
+            return;
+        }
+        if let Some(directory) = self.temp_dir.take() {
+            let path = directory.path().to_path_buf();
+            if directory.close().is_err() {
+                for _ in 0..10 {
+                    std::thread::sleep(Duration::from_millis(25));
+                    match std::fs::remove_dir_all(&path) {
+                        Ok(()) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+        // Completion is published only after actual wait, scratch cleanup and
+        // release of both profile locks. A process shutdown awaits this record.
+        let cleanup = self.cleanup.clone();
+        drop(self);
+        cleanup.finish();
     }
 }
 
@@ -91,6 +522,23 @@ fn kill_browser_process_group(group: i32) {
     if group > 0 && group != unsafe { libc::getpgrp() } {
         let _ = unsafe { libc::killpg(group, libc::SIGKILL) };
     }
+}
+
+/// Read-only barrier for the managed group, after waiting our actual child.
+/// ESRCH is the only positive result. EPERM, a live member or an unknown group
+/// retains the durable fence. This is not proof about escaped descendants.
+fn managed_group_exit_confirmed(required: bool, group: Option<i32>) -> bool {
+    if !required {
+        return true;
+    }
+    #[cfg(unix)]
+    if let Some(group) = group.filter(|group| *group > 0 && *group != unsafe { libc::getpgrp() }) {
+        return unsafe { libc::killpg(group, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    }
+    #[cfg(not(unix))]
+    let _ = group;
+    false
 }
 
 /// A cancelled HTTP/tool caller must not cancel the host deadline with it.
@@ -138,8 +586,10 @@ impl Drop for BrowserCallAbortGuard {
         if !self.armed {
             return;
         }
-        self.session.mark_dead("browser command cancelled");
-        self.session.signal_stop();
+        if !self.session.retiring.load(Ordering::Acquire) {
+            self.session.mark_dead("browser command cancelled");
+            self.session.signal_stop();
+        }
         let session = self.session.clone();
         let managed = self.managed.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -177,9 +627,97 @@ fn restrict_host_environment(command: &mut Command) {
     }
 }
 
+/// Bound native buffering before allocation, including an unterminated record.
+/// A compromised or broken host cannot make lines() grow without a limit.
+async fn read_host_line<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let bytes = reader.fill_buf().await?;
+        if bytes.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "incomplete browser frame",
+                ))
+            };
+        }
+        let end = bytes.iter().position(|byte| *byte == b'\n');
+        let length = end.map_or(bytes.len(), |index| index + 1);
+        if line.len().saturating_add(length) > shared::MAX_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "browser frame too large",
+            ));
+        }
+        line.extend_from_slice(&bytes[..length]);
+        reader.consume(length);
+        if end.is_some() {
+            return Ok(Some(line));
+        }
+    }
+}
+
+fn create_host_temporary_directory(
+    parent: Option<&std::path::Path>,
+) -> std::io::Result<tempfile::TempDir> {
+    let mut temporary = tempfile::Builder::new();
+    temporary.prefix("bamboo-browser-session-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Set permissions at creation; never chmod an existing directory.
+        temporary.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    match parent {
+        Some(parent) => temporary.tempdir_in(parent),
+        None => temporary.tempdir(),
+    }
+}
+
 impl BrowserSession {
-    async fn spawn() -> Result<Arc<Self>, BrowserError> {
+    async fn spawn(
+        profile_lease: Option<profile::Lease>,
+        lifecycle: &BrowserLifecycle,
+    ) -> Result<Arc<Self>, BrowserError> {
+        Self::spawn_protocol(profile_lease, lifecycle, false).await
+    }
+
+    async fn spawn_protocol(
+        mut profile_lease: Option<profile::Lease>,
+        lifecycle: &BrowserLifecycle,
+        shared: bool,
+    ) -> Result<Arc<Self>, BrowserError> {
         let script = host_script();
+        // Compatibility guard, not authentication. An older host must not
+        // ignore the new permit and launch a writer before native admission.
+        let verified_admission_host = if lifecycle.bounded_storage {
+            Some(launch_admission::verify_host(&script)?)
+        } else {
+            None
+        };
+        let _verified_clean_host = if lifecycle.ephemeral_clean {
+            Some(launch_admission::verify_clean_host(&script)?)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        let script = if shared
+            && !lifecycle.bounded_storage
+            && !lifecycle.ephemeral_clean
+            && std::env::var_os("BAMBOO_BROWSER_HOST_SCRIPT").is_none()
+        {
+            // Explicit component fixture: real pages/EOF, mocked quota only.
+            // This path and constructor do not exist in production builds.
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../browser-runtime/test-host-fixture.cjs")
+        } else {
+            script
+        };
         if !script.is_file() {
             return Err(BrowserError::Unavailable(format!(
                 "host script not found at {} (set BAMBOO_BROWSER_HOST_SCRIPT)",
@@ -189,12 +727,41 @@ impl BrowserSession {
         let node = std::env::var_os("BAMBOO_BROWSER_NODE").unwrap_or_else(|| "node".into());
         let mut command = Command::new(node);
         restrict_host_environment(&mut command);
-        let temp_dir = tempfile::Builder::new()
-            .prefix("bamboo-browser-session-")
-            .tempdir()
-            .map_err(|_| {
-                BrowserError::Unavailable("unable to create browser temporary directory".into())
+        if shared {
+            command.env("BAMBOO_BROWSER_HOST_PROTOCOL", "2");
+        }
+        lifecycle.configure_profile(
+            &mut command,
+            profile_lease.as_ref().map(|lease| lease.path.as_path()),
+        );
+        if lifecycle.bounded_storage {
+            let mut lease = profile_lease.take().ok_or_else(|| {
+                BrowserError::Unavailable("browser_storage_control_invalid".into())
             })?;
+            // The actual native account/reset locks move into the worker.
+            // Cancellation drops the waiter, not a still-running preparation
+            // owner or its pending create/attach journal.
+            profile_lease = Some(
+                tokio::task::spawn_blocking(move || {
+                    lease.storage = Some(Arc::new(storage::Launch::prepare(&lease.path)?));
+                    Ok::<_, BrowserError>(lease)
+                })
+                .await
+                .map_err(|_| {
+                    BrowserError::Unavailable("browser_storage_preparation_interrupted".into())
+                })??,
+            );
+        }
+        let bounded = profile_lease
+            .as_ref()
+            .and_then(|lease| lease.storage.as_ref());
+        if let Some(storage) = bounded {
+            storage.configure(&mut command);
+        }
+        let temporary_parent = bounded.map(|storage| storage.temporary.as_path());
+        let temp_dir = create_host_temporary_directory(temporary_parent).map_err(|_| {
+            BrowserError::Unavailable("unable to create browser temporary directory".into())
+        })?;
         command.env("TMPDIR", temp_dir.path());
         // Node's os.tmpdir() uses TEMP/TMP on Windows. The host also receives
         // this owned path explicitly for its download directory.
@@ -209,27 +776,94 @@ impl BrowserSession {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        let child = command
-            .spawn()
-            .map_err(|error| BrowserError::Unavailable(error.to_string()))?;
-        let session = Self::from_child(child, Some(temp_dir))?;
+        let attempt = verified_admission_host
+            .as_ref()
+            .map(|_| uuid::Uuid::new_v4());
+        if let Some(attempt) = attempt {
+            command.env("BAMBOO_BROWSER_LAUNCH_ATTEMPT", attempt.to_string());
+        }
+        let startup_deadline = Instant::now() + BROWSER_COMMAND_DEADLINE;
+        // A spawn failure has no child, permission or newly created marker.
+        // Never clear a pre-existing launch generation on that error.
+        let child = lifecycle.spawn_child(&mut command)?;
+        let session = if let Some(attempt) = attempt {
+            let admitted = launch_admission::admit(
+                child,
+                profile_lease.take().unwrap(),
+                temp_dir,
+                lifecycle,
+                attempt,
+                startup_deadline,
+            )
+            .await?;
+            Self::from_child_owned(
+                admitted.child,
+                Some(admitted.scratch),
+                lifecycle,
+                Some(admitted.lease),
+                Some(admitted.cleanup),
+            )?
+        } else {
+            Self::from_child_owned(child, Some(temp_dir), lifecycle, profile_lease, None)?
+        };
+        session.protocol_v2.store(shared, Ordering::Release);
         let mut abort_guard = BrowserCallAbortGuard::new(session.clone(), None);
         // The first state request doubles as a readiness probe. A missing
         // Playwright package or Chromium binary fails here, not on first click.
-        let readiness = session.call("state", json!({})).await;
+        let readiness = session
+            .call_with_deadline(
+                if shared { "runtime_state" } else { "state" },
+                json!({}),
+                startup_deadline.saturating_duration_since(Instant::now()),
+            )
+            .await;
         if readiness.is_err() {
             session.terminate("browser host unavailable").await;
         }
         abort_guard.disarm();
-        readiness?;
+        let readiness = readiness?;
+        let generation = session.handshake_generation.lock().unwrap().clone();
+        if shared
+            && !shared::valid_handshake(
+                &readiness,
+                generation.as_deref(),
+                lifecycle.bounded_storage,
+                lifecycle.ephemeral_clean,
+            )
+        {
+            let _ = session.begin_retirement("incompatible shared browser host");
+            session.terminate("incompatible shared browser host").await;
+            return Err(BrowserError::Unavailable(
+                "incompatible shared browser host".into(),
+            ));
+        }
         Ok(session)
     }
 
+    #[cfg(test)]
     fn from_child(
-        mut child: Child,
+        child: Child,
         temp_dir: Option<tempfile::TempDir>,
     ) -> Result<Arc<Self>, BrowserError> {
-        #[cfg(unix)]
+        Self::from_child_tracked(child, temp_dir, &BrowserLifecycle::default())
+    }
+
+    #[cfg(test)]
+    fn from_child_tracked(
+        child: Child,
+        temp_dir: Option<tempfile::TempDir>,
+        lifecycle: &BrowserLifecycle,
+    ) -> Result<Arc<Self>, BrowserError> {
+        Self::from_child_owned(child, temp_dir, lifecycle, None, None)
+    }
+
+    fn from_child_owned(
+        mut child: Child,
+        temp_dir: Option<tempfile::TempDir>,
+        lifecycle: &BrowserLifecycle,
+        profile_lease: Option<profile::Lease>,
+        cleanup: Option<Arc<BrowserCleanup>>,
+    ) -> Result<Arc<Self>, BrowserError> {
         let process_group = child.id().and_then(|id| i32::try_from(id).ok());
         let stdin = child
             .stdin
@@ -241,40 +875,92 @@ impl BrowserSession {
             .ok_or_else(|| BrowserError::Unavailable("browser host stdout not available".into()))?;
         let (frames, _) = watch::channel(None);
         let (shutdown, _) = watch::channel(false);
+        let cleanup = cleanup.unwrap_or_else(|| BrowserCleanup::register(lifecycle));
         let session = Arc::new(Self {
-            child: Mutex::new(child),
+            cleanup: cleanup.clone(),
+            protocol_v2: AtomicBool::new(false),
+            shared_router: Mutex::new(Weak::new()),
+            handshake_generation: Mutex::new(None),
+            child: Arc::new(Mutex::new(child)),
+            profile_lease: Mutex::new(profile_lease),
             temp_dir: Mutex::new(temp_dir),
-            #[cfg(unix)]
             process_group,
-            stdin: AsyncMutex::new(stdin),
+            group_exit_required: lifecycle.bounded_storage,
+            stdin: AsyncMutex::new(Some(stdin)),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             frames,
             shutdown,
             termination: AsyncMutex::new(()),
             kill_issued: AtomicBool::new(false),
+            retiring: AtomicBool::new(false),
+            close_confirmed: AtomicBool::new(false),
+            clean_host_exit: AtomicBool::new(false),
             reaped: AtomicBool::new(false),
             frame_epoch: AtomicU64::new(0),
             active_tab_id: Mutex::new(None),
             alive: AtomicBool::new(true),
             last_used: Mutex::new(Instant::now()),
         });
+        *cleanup.session.lock().unwrap() = Arc::downgrade(&session);
         let weak = Arc::downgrade(&session);
         tokio::spawn(async move { Self::read_messages(weak, stdout).await });
         Ok(session)
     }
 
     async fn read_messages(weak: Weak<Self>, stdout: tokio::process::ChildStdout) {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let Some(session) = weak.upgrade() else { break };
-            if !session.alive.load(Ordering::Acquire) {
-                break;
-            }
-            let Ok(message) = serde_json::from_str::<Value>(&line) else {
-                tracing::warn!("browser host sent malformed JSON");
+        let mut reader = BufReader::new(stdout);
+        while let Ok(Some(line)) = read_host_line(&mut reader).await {
+            let Some(session) = weak.upgrade() else {
                 continue;
             };
+            if !session.alive.load(Ordering::Acquire) {
+                // Keep draining until EOF while controlled retirement flushes
+                // and closes Chromium. Closing stdout early can disrupt that
+                // shutdown; no late frame/reply is published to retired Arcs.
+                continue;
+            }
+            let parsed = serde_json::from_slice::<Value>(&line);
+            let message = match parsed {
+                Ok(value) if line.len() <= shared::MAX_FRAME_BYTES => value,
+                _ if session.protocol_v2.load(Ordering::Acquire) => {
+                    session.signal_stop();
+                    session.terminate("invalid shared browser transport").await;
+                    return;
+                }
+                _ => {
+                    tracing::warn!("browser host sent malformed JSON");
+                    continue;
+                }
+            };
+            let router = session.shared_router.lock().unwrap().upgrade();
+            if let Some(router) = router {
+                if !router.deliver(&message) {
+                    session.signal_stop();
+                    session
+                        .terminate("invalid shared browser owner tuple")
+                        .await;
+                    return;
+                }
+                continue;
+            }
+            if session.protocol_v2.load(Ordering::Acquire) {
+                // Only the initial unscoped runtime_state reply is legal until
+                // the router is installed. Handshake never admits a chat.
+                let generation = message.get("host_generation").and_then(Value::as_str);
+                if message.get("version").and_then(Value::as_u64) != Some(2)
+                    || message.get("id").and_then(Value::as_u64) != Some(1)
+                    || !generation.is_some_and(shared::valid_handle)
+                    || message.get("scope_id").is_some()
+                    || message.get("scope_generation").is_some()
+                    || message.get("event").is_some()
+                {
+                    session.signal_stop();
+                    session.terminate("invalid shared browser handshake").await;
+                    return;
+                }
+                *session.handshake_generation.lock().unwrap() = generation.map(str::to_owned);
+            }
             if message.get("event").and_then(Value::as_str) == Some("frame") {
                 session.accept_frame(&message);
                 continue;
@@ -301,6 +987,9 @@ impl BrowserSession {
                         Some("dialog_pending") => BrowserError::DialogPending,
                         Some("invalid_url" | "invalid_request") => {
                             BrowserError::Invalid(error.to_string())
+                        }
+                        Some("browser_storage_unavailable") => {
+                            BrowserError::Unavailable(error.to_string())
                         }
                         _ => BrowserError::Failed(error.to_string()),
                     })
@@ -393,6 +1082,10 @@ impl BrowserSession {
             return;
         }
         self.shutdown.send_replace(true);
+        let router = self.shared_router.lock().unwrap().upgrade();
+        if let Some(router) = router {
+            router.fail_all(reason);
+        }
         self.frames.send_replace(None);
         *self.active_tab_id.lock().unwrap() = None;
         let pending = std::mem::take(&mut *self.pending.lock().unwrap());
@@ -402,6 +1095,13 @@ impl BrowserSession {
     }
 
     fn signal_stop(&self) {
+        self.cleanup.fence_writers();
+        if let Some(lease) = self.profile_lease.lock().unwrap().as_ref() {
+            self.retiring.store(true, Ordering::Release);
+            // Forced deadlines/cancellation cannot promise a final checkpoint.
+            // release_profile retains the lease if even this marker cannot be written.
+            let _ = lease.begin_close();
+        }
         if self.kill_issued.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -416,12 +1116,125 @@ impl BrowserSession {
         }
     }
 
+    fn begin_retirement(&self, reason: &'static str) -> Result<(), BrowserError> {
+        if let Some(lease) = self.profile_lease.lock().unwrap().as_ref() {
+            lease.begin_close()?;
+        }
+        // EOF retirement belongs to every owned host. Only durable profiles
+        // need a close marker; a clean temporary host has no such lease.
+        self.retiring.store(true, Ordering::Release);
+        self.mark_dead(reason);
+        Ok(())
+    }
+
+    fn release_profile(&self) {
+        if !self.clean_host_exit.load(Ordering::Acquire) {
+            return;
+        }
+        let mut lease = self.profile_lease.lock().unwrap();
+        if self.retiring.load(Ordering::Acquire) && !self.close_confirmed.load(Ordering::Acquire) {
+            // A failed unlink-directory barrier cannot release the writer
+            // lease, even if restoring a pending-close marker would succeed.
+            return;
+        }
+        lease.take();
+        drop(lease);
+        if self.reaped.load(Ordering::Acquire) {
+            self.cleanup.finish();
+        }
+    }
+
+    fn quarantine_resources(&self) {
+        self.cleanup.fence_writers();
+        if self.cleanup.is_quarantined() {
+            return;
+        }
+        let mut lease = self.profile_lease.lock().unwrap();
+        if let Some(lease) = lease.as_ref() {
+            if let Err(error) = lease.quarantine_writers() {
+                // Keep ownership for the Drop reaper's existing durable-fence
+                // retry path. No I/O failure authorizes deletion or unlock.
+                tracing::warn!(%error, "could not persist unknown browser writer fence");
+                return;
+            }
+        }
+        let owned_lease = lease.take();
+        drop(lease);
+        let scratch = self.temp_dir.lock().unwrap().take();
+        self.cleanup.quarantine(owned_lease, scratch);
+    }
+
     async fn terminate(&self, reason: &'static str) {
         self.mark_dead(reason);
         let _guard = self.termination.lock().await;
         if self.reaped.load(Ordering::Acquire) {
-            self.cleanup_temp_dir().await;
+            if self.clean_host_exit.load(Ordering::Acquire) {
+                if self.retiring.load(Ordering::Acquire)
+                    && !self.close_confirmed.load(Ordering::Acquire)
+                {
+                    let confirmed = self
+                        .profile_lease
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_none_or(|lease| lease.finish_close().is_ok());
+                    self.close_confirmed.store(confirmed, Ordering::Release);
+                }
+                self.cleanup_temp_dir().await;
+                self.release_profile();
+            } else {
+                self.quarantine_resources();
+            }
             return;
+        }
+        if self.retiring.load(Ordering::Acquire) && !self.kill_issued.load(Ordering::Acquire) {
+            if let Some(lease) = self.profile_lease.lock().unwrap().as_ref() {
+                let _ = lease.begin_close();
+            }
+            // A blocked write end must not consume the Chromium flush budget.
+            // The alive fence has already prevented all later writes.
+            let eof_sent = tokio::time::timeout(BROWSER_REAP_DEADLINE, async {
+                self.stdin.lock().await.take();
+            })
+            .await
+            .is_ok();
+            let graceful = if eof_sent {
+                tokio::time::timeout(BROWSER_CLOSE_DEADLINE, async {
+                    loop {
+                        if let Some(status) = self.child.lock().unwrap().try_wait().ok().flatten() {
+                            return status.success();
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .ok()
+            } else {
+                None
+            };
+            if let Some(clean) = graceful {
+                let clean = clean
+                    && !self.kill_issued.load(Ordering::Acquire)
+                    && managed_group_exit_confirmed(self.group_exit_required, self.process_group);
+                self.reaped.store(true, Ordering::Release);
+                self.clean_host_exit.store(clean, Ordering::Release);
+                let confirmed = clean
+                    && self
+                        .profile_lease
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_none_or(|lease| lease.finish_close().is_ok());
+                self.close_confirmed.store(confirmed, Ordering::Release);
+                if clean {
+                    self.cleanup_temp_dir().await;
+                    self.release_profile();
+                } else {
+                    self.quarantine_resources();
+                }
+                return;
+            }
+            // The marker intentionally survives an unconfirmed/forced close.
         }
         self.signal_stop();
         let reaped = tokio::time::timeout(BROWSER_REAP_DEADLINE, async {
@@ -443,10 +1256,15 @@ impl BrowserSession {
         } else {
             tracing::warn!("browser host did not exit after process termination");
         }
-        self.cleanup_temp_dir().await;
+        if self.reaped.load(Ordering::Acquire) {
+            self.quarantine_resources();
+        }
     }
 
     async fn cleanup_temp_dir(&self) {
+        if !self.clean_host_exit.load(Ordering::Acquire) {
+            return;
+        }
         let temp_dir = { self.temp_dir.lock().unwrap().take() };
         if let Some(temp_dir) = temp_dir {
             let path = temp_dir.path().to_path_buf();
@@ -489,7 +1307,11 @@ impl BrowserSession {
             return Err(BrowserError::Unavailable("browser host exited".into()));
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let line = serde_json::to_vec(&json!({"id": id, "action": action, "args": args}))
+        let mut request = json!({"id": id, "action": action, "args": args});
+        if self.protocol_v2.load(Ordering::Acquire) {
+            request["version"] = json!(2);
+        }
+        let line = serde_json::to_vec(&request)
             .map_err(|error| BrowserError::Invalid(error.to_string()))?;
         let (sender, receiver) = oneshot::channel();
         let mut shutdown = self.shutdown.subscribe();
@@ -502,10 +1324,13 @@ impl BrowserSession {
         }
         let _pending_guard = BrowserPendingCallGuard { session: self, id };
         let exchange = async {
-            let mut stdin = self.stdin.lock().await;
+            let mut owned_stdin = self.stdin.lock().await;
             if !self.alive.load(Ordering::Acquire) {
                 return Err(BrowserError::Unavailable("browser host exited".into()));
             }
+            let stdin = owned_stdin
+                .as_mut()
+                .ok_or_else(|| BrowserError::Unavailable("browser host exited".into()))?;
             stdin
                 .write_all(&line)
                 .await
@@ -518,7 +1343,7 @@ impl BrowserSession {
                 .flush()
                 .await
                 .map_err(|error| BrowserError::Unavailable(error.to_string()))?;
-            drop(stdin);
+            drop(owned_stdin);
             receiver
                 .await
                 .map_err(|_| BrowserError::Unavailable("browser host exited".into()))?
@@ -548,6 +1373,35 @@ impl BrowserSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_host_scratch_is_private_and_preserves_existing_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("existing-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let sentinel = parent.join("existing-sentinel");
+        std::fs::write(&sentinel, b"preserve synthetic existing data").unwrap();
+        let before = parent.metadata().unwrap().permissions().mode();
+
+        let scratch = create_host_temporary_directory(Some(&parent)).unwrap();
+        let scratch_path = scratch.path().to_path_buf();
+        assert_eq!(scratch.path().parent(), Some(parent.as_path()));
+        assert_eq!(
+            scratch.path().metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(parent.metadata().unwrap().permissions().mode(), before);
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"preserve synthetic existing data"
+        );
+        drop(scratch);
+        assert!(!scratch_path.exists());
+        assert!(sentinel.is_file());
+    }
 
     #[test]
     fn only_known_read_actions_survive_caller_cancellation() {
@@ -592,16 +1446,31 @@ mod tests {
         let (frames, _) = watch::channel(None);
         let (shutdown, _) = watch::channel(!alive);
         Arc::new(BrowserSession {
-            child: Mutex::new(child),
+            protocol_v2: AtomicBool::new(false),
+            shared_router: Mutex::new(Weak::new()),
+            handshake_generation: Mutex::new(None),
+            child: Arc::new(Mutex::new(child)),
+            cleanup: Arc::new(BrowserCleanup {
+                session: Mutex::new(Weak::new()),
+                done: watch::channel(false).0,
+                quarantined: Mutex::new(Vec::new()),
+                unconfirmed_writers: Arc::new(AtomicBool::new(false)),
+                writer_admission: Arc::new(Mutex::new(())),
+            }),
+            profile_lease: Mutex::new(None),
             temp_dir: Mutex::new(None),
             process_group,
-            stdin: AsyncMutex::new(stdin),
+            group_exit_required: false,
+            stdin: AsyncMutex::new(Some(stdin)),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             frames,
             shutdown,
             termination: AsyncMutex::new(()),
             kill_issued: AtomicBool::new(false),
+            retiring: AtomicBool::new(false),
+            close_confirmed: AtomicBool::new(false),
+            clean_host_exit: AtomicBool::new(false),
             reaped: AtomicBool::new(false),
             frame_epoch: AtomicU64::new(0),
             active_tab_id: Mutex::new(None),
@@ -1338,12 +2207,15 @@ mod tests {
     async fn browser_host_environment_drops_parent_secrets() {
         let mut command = Command::new("/usr/bin/env");
         command.env("OPENAI_API_KEY", "sentinel-do-not-inherit");
+        command.env("BAMBOO_BROWSER_PROFILE_DIR", "sentinel-foreign-profile");
         restrict_host_environment(&mut command);
         let output = command.output().await.unwrap();
         assert!(output.status.success());
         let environment = String::from_utf8(output.stdout).unwrap();
         assert!(!environment.contains("OPENAI_API_KEY"));
         assert!(!environment.contains("sentinel-do-not-inherit"));
+        assert!(!environment.contains("BAMBOO_BROWSER_PROFILE_DIR"));
+        assert!(!environment.contains("sentinel-foreign-profile"));
     }
 
     #[cfg(unix)]
@@ -1402,6 +2274,196 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn closing_a_chat_releases_its_profile_after_reaping_with_old_references_alive() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("browser-profiles");
+        let browser = BrowserManager::with_fixture_profile_root(root.clone());
+        let session = fake_host("cat >/dev/null", &[]);
+        *session.profile_lease.lock().unwrap() = Some(profile::acquire(&root, "chat-a").unwrap());
+        browser
+            .sessions
+            .lock()
+            .await
+            .insert("chat-a".into(), session.clone());
+        assert!(profile::acquire(&root, "chat-a").is_err());
+        let other = profile::acquire(&root, "chat-b").unwrap();
+
+        browser.close("chat-a").await.unwrap();
+
+        assert!(session.reaped.load(Ordering::Acquire));
+        assert!(session.profile_lease.lock().unwrap().is_none());
+        assert!(session.child.lock().unwrap().try_wait().unwrap().is_some());
+        assert!(profile::acquire(&root, "chat-a").is_ok());
+        assert!(profile::acquire(&root, "chat-b").is_err());
+        drop(other);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idle_reclamation_releases_the_profile_without_deleting_durable_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("browser-profiles");
+        let browser = BrowserManager::with_fixture_profile_root(root.clone());
+        let lease = profile::acquire(&root, "idle-chat").unwrap();
+        let path = lease.path.clone();
+        let sentinel = path.join("synthetic-site-data");
+        std::fs::write(&sentinel, b"synthetic durable state").unwrap();
+        let session = fake_host("cat >/dev/null", &[]);
+        *session.last_used.lock().unwrap() = Instant::now() - BROWSER_IDLE_TTL;
+        *session.profile_lease.lock().unwrap() = Some(lease);
+        browser
+            .sessions
+            .lock()
+            .await
+            .insert("idle-chat".into(), session.clone());
+
+        assert_eq!(browser.sweep_idle(BROWSER_IDLE_TTL).await, 1);
+
+        assert!(session.reaped.load(Ordering::Acquire));
+        assert!(session.profile_lease.lock().unwrap().is_none());
+        let reopened = profile::acquire(&root, "idle-chat").unwrap();
+        assert_eq!(reopened.path, path);
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"synthetic durable state");
+        assert!(!browser.retired.lock().unwrap().contains("idle-chat"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires the Playwright Chromium runtime"]
+    async fn shared_manager_reuses_account_state_across_chats_and_restart() {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let fixture = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0; 4096];
+                    if stream.read(&mut request).await.is_ok() {
+                        let body = "<!doctype html><title>Isolated manager profile fixture</title>";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                });
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("browser-profiles");
+        let browser = BrowserManager::with_fixture_profile_root(root.clone());
+        let opened = browser.open("chat-a").await.unwrap();
+        assert_eq!(opened["profile_mode"], "shared");
+        assert_eq!(
+            browser.open("chat-a").await.unwrap()["page_epoch"],
+            opened["page_epoch"]
+        );
+        assert!(profile::acquire_shared(&root).is_err());
+        let page = browser
+            .command(
+                "chat-a",
+                "navigate",
+                json!({"expected_epoch":opened["page_epoch"],"url":url}),
+            )
+            .await
+            .unwrap();
+        let seed = r#"(async () => {
+            document.cookie = 'fixture-session=synthetic; SameSite=Strict; Path=/';
+            document.cookie = 'fixture-persistent=synthetic; Max-Age=3600; SameSite=Strict; Path=/';
+            localStorage.setItem('manager-fixture', 'synthetic');
+            const db = await new Promise((resolve, reject) => {
+                const request = indexedDB.open('manager-fixture', 1);
+                request.onupgradeneeded = () => request.result.createObjectStore('values');
+                request.onsuccess = () => resolve(request.result); request.onerror = reject;
+            });
+            await new Promise((resolve, reject) => {
+                const transaction = db.transaction('values', 'readwrite');
+                transaction.objectStore('values').put('synthetic', 'marker');
+                transaction.oncomplete = resolve; transaction.onerror = reject;
+            });
+            db.close(); return true;
+        })()"#;
+        assert_eq!(
+            browser
+                .eval(
+                    "chat-a",
+                    json!({"code":seed,"expected_epoch":page["page_epoch"],"expected_url":url})
+                )
+                .await
+                .unwrap()["value"],
+            true
+        );
+        let probe = r#"(async () => {
+            const db = await new Promise((resolve, reject) => {
+                const request = indexedDB.open('manager-fixture', 1);
+                request.onupgradeneeded = () => request.result.createObjectStore('values');
+                request.onsuccess = () => resolve(request.result); request.onerror = reject;
+            });
+            const indexed = await new Promise((resolve, reject) => {
+                const request = db.transaction('values').objectStore('values').get('marker');
+                request.onsuccess = () => resolve(request.result === 'synthetic'); request.onerror = reject;
+            });
+            db.close(); return {
+                sessionCookie: document.cookie.includes('fixture-session=synthetic'),
+                persistentCookie: document.cookie.includes('fixture-persistent=synthetic'),
+                localStorage: localStorage.getItem('manager-fixture') === 'synthetic', indexedDB: indexed
+            };
+        })()"#;
+        let other = browser.open("chat-b").await.unwrap();
+        let page = browser
+            .command(
+                "chat-b",
+                "navigate",
+                json!({"expected_epoch":other["page_epoch"],"url":url}),
+            )
+            .await
+            .unwrap();
+        let other_state = browser
+            .eval(
+                "chat-b",
+                json!({"code":probe,"expected_epoch":page["page_epoch"],"expected_url":url}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            other_state["value"],
+            json!({"sessionCookie":true,"persistentCookie":true,"localStorage":true,"indexedDB":true})
+        );
+        browser.close("chat-b").await.unwrap();
+        browser.close("chat-a").await.unwrap();
+        assert!(profile::acquire_shared(&root).is_ok());
+
+        let restarted = BrowserManager::with_fixture_profile_root(root);
+        let opened = restarted.open("chat-a").await.unwrap();
+        let page = restarted
+            .command(
+                "chat-a",
+                "navigate",
+                json!({"expected_epoch":opened["page_epoch"],"url":url}),
+            )
+            .await
+            .unwrap();
+        let restored = restarted
+            .eval(
+                "chat-a",
+                json!({"code":probe,"expected_epoch":page["page_epoch"],"expected_url":url}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            restored["value"],
+            json!({"sessionCookie":true,"persistentCookie":true,"localStorage":true,"indexedDB":true})
+        );
+        restarted.close("chat-a").await.unwrap();
+        fixture.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn idle_sweep_closes_inactive_host_but_keeps_polled_chat_reopenable() {
         let browser = BrowserManager::default();
         assert!(!browser.cleanup_started.load(Ordering::Acquire));
@@ -1438,6 +2500,171 @@ mod tests {
 }
 
 impl BrowserManager {
+    /// Production supplies a data-directory-owned root. Default managers used
+    /// by isolated protocol tests retain their explicitly ephemeral behavior.
+    pub fn with_profile_root(root: PathBuf) -> Self {
+        Self::with_profile_root_for_platform(root, std::env::consts::OS)
+    }
+
+    fn with_profile_root_for_platform(root: PathBuf, platform: &str) -> Self {
+        Self {
+            profile_root: Some(Arc::new(root)),
+            lifecycle: Arc::new(BrowserLifecycle::for_platform(platform)),
+            ..Self::default()
+        }
+    }
+
+    // Existing protocol/EOF fixtures have no real browser or kernel storage
+    // provider. Their explicit constructor is absent from production builds.
+    // New storage-admission tests always exercise with_profile_root instead.
+    #[cfg(test)]
+    fn with_fixture_profile_root(root: PathBuf) -> Self {
+        Self {
+            profile_root: Some(Arc::new(root)),
+            ..Self::default()
+        }
+    }
+
+    /// Drain owners and fence admission through a canonical reset. This does
+    /// not permanently shut down the manager or destroy still-live history.
+    pub(crate) async fn reset_profiles(&self) -> Result<BrowserResetGuard<'_>, BrowserError> {
+        let mut guard = BrowserResetGuard {
+            _profile_gate: None,
+            _opens: self.lifecycle.opens.write().await,
+            lifecycle: &self.lifecycle,
+            profile_root: self.profile_root.clone(),
+            retired: self.retired.clone(),
+        };
+        if self.lifecycle.stopping.load(Ordering::Acquire) {
+            return Err(BrowserError::Unavailable(
+                "browser manager shut down".into(),
+            ));
+        }
+        let mut sessions: Vec<_> = std::mem::take(&mut *self.sessions.lock().await)
+            .into_values()
+            .collect();
+        if let Some(core) = self.shared.drain().await {
+            if !sessions.iter().any(|known| Arc::ptr_eq(known, &core)) {
+                sessions.push(core);
+            }
+        }
+        let owners = self.lifecycle.owners.lock().unwrap().clone();
+        for owner in &owners {
+            if let Some(session) = owner.session.lock().unwrap().upgrade() {
+                if !sessions.iter().any(|known| Arc::ptr_eq(known, &session)) {
+                    sessions.push(session);
+                }
+            }
+        }
+        for session in &sessions {
+            if let Err(error) = session.begin_retirement("browser history resetting") {
+                tracing::warn!(%error, "browser reset could not mark its profile");
+                session.mark_dead("browser history resetting");
+                session.signal_stop();
+            }
+        }
+        // Poll every stop before waiting for any one host's close deadline.
+        // join_all keeps draining the remaining hosts even if one close fails.
+        let mut close_error = None;
+        for result in futures::future::join_all(sessions.into_iter().map(Self::stop_session)).await
+        {
+            if let Err(error) = result {
+                // Terminal purge may finish an unconfirmed close after both
+                // stable locks prove that the actual host has been reaped.
+                tracing::warn!(%error, "browser reset did not confirm persistence");
+                close_error = Some(error);
+            }
+        }
+        if let Some(error) = close_error {
+            return Err(error);
+        }
+        for owner in owners {
+            owner.wait().await;
+            if owner.is_quarantined() {
+                return Err(BrowserError::Unavailable(
+                    "browser writer exit unconfirmed".into(),
+                ));
+            }
+        }
+        if let Some(root) = &self.profile_root {
+            let root = root.clone();
+            // Own hosts released their shared gate. Foreign active owners
+            // make reset fail before storage is deleted. Hold X through wipe.
+            guard._profile_gate = Some(Arc::new(
+                tokio::task::spawn_blocking(move || profile::begin_reset(&root))
+                    .await
+                    .map_err(|_| BrowserError::Unavailable("browser reset interrupted".into()))??,
+            ));
+        }
+        Ok(guard)
+    }
+
+    /// Retire owned hosts before teardown and retain any uncertain native
+    /// writer's resources. Quarantine is not successful native-domain exit.
+    /// Open is fenced first; its read guard includes spawn/readiness, so no
+    /// in-flight startup can escape the following owner snapshot.
+    pub async fn shutdown(&self) {
+        self.lifecycle.stopping.store(true, Ordering::Release);
+        let _opens = self.lifecycle.opens.write().await;
+        let mut sessions: Vec<_> = std::mem::take(&mut *self.sessions.lock().await)
+            .into_values()
+            .collect();
+        if let Some(core) = self.shared.drain().await {
+            if !sessions.iter().any(|known| Arc::ptr_eq(known, &core)) {
+                sessions.push(core);
+            }
+        }
+        let owners = self.lifecycle.owners.lock().unwrap().clone();
+        for owner in &owners {
+            let session = owner.session.lock().unwrap().upgrade();
+            if let Some(session) = session {
+                if !sessions.iter().any(|known| Arc::ptr_eq(known, &session)) {
+                    sessions.push(session);
+                }
+            }
+        }
+        // Fence all old Arcs before waiting for any one Chromium checkpoint.
+        for session in &sessions {
+            if let Err(error) = session.begin_retirement("browser manager shutting down") {
+                tracing::warn!(%error, "browser shutdown could not mark its profile");
+                session.mark_dead("browser manager shutting down");
+                session.signal_stop();
+            }
+        }
+        // Poll every stop before waiting for any one host's close deadline.
+        // join_all keeps draining the remaining hosts even if one close fails.
+        let mut unsettled = Vec::new();
+        for (owner, result) in
+            futures::future::join_all(sessions.into_iter().map(|session| async move {
+                let owner = session.cleanup.clone();
+                (owner, Self::stop_session(session).await)
+            }))
+            .await
+        {
+            if let Err(error) = result {
+                tracing::warn!(%error, "browser shutdown did not confirm persistence");
+                unsettled.push(owner);
+            }
+        }
+        // Records also cover hosts whose final Arc already started a detached
+        // Drop reaper. Waiting on durable completion avoids a Weak/Drop race.
+        for owner in owners {
+            if unsettled.iter().any(|failed| Arc::ptr_eq(failed, &owner)) {
+                // This owner's bounded stop already failed. Preserve its
+                // resources/unfinished notification for recovery; waiting on
+                // the same failed I/O barrier here would hang shutdown forever.
+                // Other owners, including detached reapers, still drain below.
+                continue;
+            }
+            owner.wait().await;
+            if owner.is_quarantined() {
+                tracing::warn!(
+                    "browser shutdown retained an unconfirmed writer's locks and scratch"
+                );
+            }
+        }
+    }
+
     /// Start one sweep only after a browser page exists. AppState instances that
     /// never open Chromium do not leave timers behind.
     fn start_idle_cleanup(&self) -> bool {
@@ -1448,22 +2675,41 @@ impl BrowserManager {
         let weak_gates = Arc::downgrade(&self.session_gates);
         let weak_retired = Arc::downgrade(&self.retired);
         let weak_started = Arc::downgrade(&self.cleanup_started);
+        let weak_lifecycle = Arc::downgrade(&self.lifecycle);
+        let weak_shared = Arc::downgrade(&self.shared);
+        let profile_root = self.profile_root.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(BROWSER_IDLE_SWEEP_INTERVAL).await;
-                let (Some(sessions), Some(session_gates), Some(retired), Some(cleanup_started)) = (
+                let (
+                    Some(sessions),
+                    Some(session_gates),
+                    Some(retired),
+                    Some(cleanup_started),
+                    Some(lifecycle),
+                    Some(shared),
+                ) = (
                     weak_sessions.upgrade(),
                     weak_gates.upgrade(),
                     weak_retired.upgrade(),
                     weak_started.upgrade(),
-                ) else {
+                    weak_lifecycle.upgrade(),
+                    weak_shared.upgrade(),
+                )
+                else {
                     break;
                 };
+                if lifecycle.stopping.load(Ordering::Acquire) {
+                    break;
+                }
                 let browser = BrowserManager {
+                    profile_root: profile_root.clone(),
+                    shared,
                     sessions,
                     session_gates,
                     retired,
                     cleanup_started,
+                    lifecycle,
                 };
                 let reaped = browser.sweep_idle(BROWSER_IDLE_TTL).await;
                 if reaped > 0 {
@@ -1485,13 +2731,73 @@ impl BrowserManager {
         gate
     }
 
+    /// Snapshot before any asynchronous Session preflight. This is only a
+    /// reset-race fence, never a credential or a Session access grant.
+    pub(crate) fn open_epoch(&self) -> u64 {
+        self.lifecycle.reset_epoch.load(Ordering::Acquire)
+    }
+
     pub async fn open(&self, session_id: &str) -> Result<Value, BrowserError> {
+        self.open_in_epoch(session_id, self.open_epoch()).await
+    }
+
+    pub async fn open_with_mode(
+        &self,
+        session_id: &str,
+        mode: Option<BrowserProfileMode>,
+    ) -> Result<Value, BrowserError> {
+        self.open_with_mode_in_epoch(session_id, self.open_epoch(), mode)
+            .await
+    }
+
+    pub(crate) async fn open_in_epoch(
+        &self,
+        session_id: &str,
+        epoch: u64,
+    ) -> Result<Value, BrowserError> {
+        self.open_with_mode_in_epoch(session_id, epoch, None).await
+    }
+
+    pub(crate) async fn open_with_mode_in_epoch(
+        &self,
+        session_id: &str,
+        epoch: u64,
+        mode: Option<BrowserProfileMode>,
+    ) -> Result<Value, BrowserError> {
+        let _opens = self.lifecycle.opens.read().await;
+        if epoch != self.open_epoch() {
+            return Err(BrowserError::NotOpen);
+        }
+        if self.lifecycle.stopping.load(Ordering::Acquire) {
+            return Err(BrowserError::Unavailable(
+                "browser manager shut down".into(),
+            ));
+        }
+        self.lifecycle.ensure_writer_admission()?;
         // Serialize only this chat's open/close lifecycle. Starting Chromium
         // or probing a slow host must not block unrelated chat sessions.
         let gate = self.session_gate(session_id);
         let _guard = gate.lock().await;
+        self.lifecycle.ensure_writer_admission()?;
         if self.retired.lock().unwrap().contains(session_id) {
             return Err(BrowserError::NotOpen);
+        }
+        if let Some(root) = &self.profile_root {
+            let result = self
+                .shared
+                .open(root, &self.lifecycle, session_id, mode)
+                .await;
+            if result.is_ok() {
+                self.start_idle_cleanup();
+            }
+            return result;
+        }
+        // Explicit standalone managers retain the old ephemeral protocol for
+        // callers without an account data root; production never falls back.
+        if mode.is_some_and(|mode| mode != BrowserProfileMode::Shared) {
+            return Err(BrowserError::Unavailable(
+                "clean mode requires an account browser root".into(),
+            ));
         }
         let existing = {
             let sessions = self.sessions.lock().await;
@@ -1521,7 +2827,12 @@ impl BrowserManager {
             session.terminate("browser host unavailable").await;
             self.remove_if_same(session_id, &session).await;
         }
-        let session = BrowserSession::spawn().await?;
+        let profile_lease = self
+            .profile_root
+            .as_ref()
+            .map(|root| profile::acquire(root, session_id))
+            .transpose()?;
+        let session = BrowserSession::spawn(profile_lease, &self.lifecycle).await?;
         let mut abort_guard = BrowserCallAbortGuard::new(
             session.clone(),
             Some((self.clone(), session_id.to_string())),
@@ -1572,6 +2883,12 @@ impl BrowserManager {
         args: Value,
         deadline: Duration,
     ) -> Result<Value, BrowserError> {
+        if self.profile_root.is_some() && self.shared.contains(session_id) {
+            return self
+                .shared
+                .command(session_id, action, args, deadline)
+                .await;
+        }
         let session = {
             let sessions = self.sessions.lock().await;
             let session = sessions
@@ -1623,43 +2940,162 @@ impl BrowserManager {
     }
 
     pub async fn close(&self, session_id: &str) -> Result<(), BrowserError> {
-        let gate = self.session_gate(session_id);
-        let _guard = gate.lock().await;
-        self.close_locked(session_id).await
+        let browser = self.clone();
+        let session_id = session_id.to_owned();
+        tokio::spawn(async move {
+            let gate = browser.session_gate(&session_id);
+            let _guard = gate.lock().await;
+            browser.close_locked(&session_id).await
+        })
+        .await
+        .map_err(|_| BrowserError::Unavailable("browser close interrupted".into()))?
     }
 
-    /// Permanently end a deleted chat's browser lifecycle in this process.
-    /// A tool call queued behind deletion cannot create a late orphaned host.
+    /// Pure observation for a missing-Session cleanup retry. Never create a
+    /// profile, lease or terminal fence from a caller-supplied ID here.
+    pub(crate) async fn has_cleanup_evidence(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, BrowserError> {
+        if self.retired.lock().unwrap().contains(session_id) {
+            return Ok(true);
+        }
+        if self.sessions.lock().await.contains_key(session_id) || self.shared.contains(session_id) {
+            return Ok(true);
+        }
+        match &self.profile_root {
+            Some(root) => profile::has_evidence(root, session_id),
+            None => Ok(false),
+        }
+    }
+
+    /// Permanently end a deleted chat's browser lifecycle. Shared account site
+    /// data belongs to the account and survives individual chat deletion.
+    /// Request cancellation must not abandon cleanup after storage deletion.
     pub async fn retire(&self, session_id: &str) -> Result<(), BrowserError> {
+        self.retire_requested(session_id, false).await
+    }
+
+    /// The caller observed a real storage/profile target and confirmed its
+    /// canonical deletion. Persist the terminal fence even if it never opened
+    /// Chromium, so a previously queued open cannot reconstruct its profile.
+    pub(crate) async fn retire_deleted_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(), BrowserError> {
+        self.retire_requested(session_id, true).await
+    }
+
+    async fn retire_requested(
+        &self,
+        session_id: &str,
+        known_deleted: bool,
+    ) -> Result<(), BrowserError> {
+        let browser = self.clone();
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            let result = browser.retire_owned(&session_id, known_deleted).await;
+            if let Err(error) = &result {
+                tracing::warn!(%error, "deleted chat browser profile cleanup failed");
+            }
+            result
+        })
+        .await
+        .map_err(|_| BrowserError::Unavailable("browser profile cleanup interrupted".into()))?
+    }
+
+    async fn retire_owned(
+        &self,
+        session_id: &str,
+        known_deleted: bool,
+    ) -> Result<(), BrowserError> {
         let gate = self.session_gate(session_id);
         let _guard = gate.lock().await;
+        if self.profile_root.is_some()
+            && !known_deleted
+            && !self.has_cleanup_evidence(session_id).await?
+        {
+            return Ok(());
+        }
+        // In production this RAM fence covers only close -> durable marker
+        // handoff, or a failed handoff awaiting retry. Ephemeral test managers
+        // have no disk authority and retain their fence for that instance.
         self.retired.lock().unwrap().insert(session_id.to_string());
-        self.close_locked(session_id).await
+        let closed = self.close_locked(session_id).await;
+        if let Some(root) = &self.profile_root {
+            // A canonical chat deletion retains account-wide data. This old
+            // chat key can purge only its own legacy directory; the reserved
+            // shared account key is never derived from a canonical Session ID.
+            closed?;
+            let root = root.clone();
+            let session_id = session_id.to_string();
+            let retired = self.retired.clone();
+            tokio::task::spawn_blocking(move || {
+                profile::remove_notifying(&root, &session_id, || {
+                    retired.lock().unwrap().remove(&session_id);
+                })
+            })
+            .await
+            .map_err(|_| BrowserError::Unavailable("browser profile cleanup interrupted".into()))?
+        } else {
+            closed
+        }
     }
 
     async fn close_locked(&self, session_id: &str) -> Result<(), BrowserError> {
+        if self.profile_root.is_some() && self.shared.contains(session_id) {
+            return self.shared.close(session_id).await;
+        }
         let session = {
             let mut sessions = self.sessions.lock().await;
-            let session = sessions.remove(session_id);
-            if let Some(session) = &session {
-                session.mark_dead("browser session closed");
+            if let Some(session) = sessions.get(session_id) {
+                session.begin_retirement("browser session closed")?;
             }
-            session
+            sessions.remove(session_id)
         };
         if let Some(session) = session {
-            Self::stop_session(session).await;
+            Self::stop_session(session).await?;
         }
         Ok(())
     }
 
-    async fn stop_session(session: Arc<BrowserSession>) {
-        // The map entry is already gone. Do not enqueue a graceful `close`
-        // behind an in-flight command: callers that hold this Arc must be
-        // stopped before they can write another action to the retired page.
+    async fn stop_session(session: Arc<BrowserSession>) -> Result<(), BrowserError> {
+        // The map entry is gone and old Arcs cannot write. Persistent hosts
+        // receive EOF for bounded final checkpointing, not a queued RPC.
         session.terminate("browser session closed").await;
+        if !session.reaped.load(Ordering::Acquire)
+            || session.cleanup.is_quarantined()
+            || (session.retiring.load(Ordering::Acquire)
+                && !session.close_confirmed.load(Ordering::Acquire))
+        {
+            return Err(BrowserError::Unavailable(
+                "browser profile close unconfirmed".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn sweep_idle(&self, ttl: Duration) -> usize {
+        let mut shared_closed = 0;
+        if self.profile_root.is_some() {
+            let candidates = self.shared.idle_candidates(ttl);
+            let retirements = candidates.into_iter().map(|id| async move {
+                let gate = self.session_gate(&id);
+                let _guard = gate.lock().await;
+                if !self.shared.is_idle(&id, ttl) {
+                    return false;
+                }
+                if let Err(error) = self.shared.close(&id).await {
+                    tracing::warn!(%error, "shared chat idle close unconfirmed");
+                }
+                true
+            });
+            shared_closed = futures::future::join_all(retirements)
+                .await
+                .into_iter()
+                .filter(|closed| *closed)
+                .count();
+        }
         let candidates: Vec<String> = self
             .sessions
             .lock()
@@ -1668,8 +3104,7 @@ impl BrowserManager {
             .filter(|(_, session)| session.idle_for(ttl))
             .map(|(session_id, _)| session_id.clone())
             .collect();
-        let mut reaped = 0;
-        for session_id in candidates {
+        let retirements = candidates.into_iter().map(|session_id| async move {
             // Open and close are serialized for this chat. Commands and frame
             // polls touch their session while holding the map lock, so the
             // recheck/removal cannot race a newly active request.
@@ -1681,21 +3116,33 @@ impl BrowserManager {
                     .get(&session_id)
                     .is_some_and(|session| session.idle_for(ttl))
                 {
-                    let session = sessions.remove(&session_id);
-                    if let Some(session) = &session {
-                        session.mark_dead("browser session idle");
+                    let session = sessions.get(&session_id).unwrap();
+                    match session.begin_retirement("browser session idle") {
+                        Ok(()) => sessions.remove(&session_id),
+                        Err(error) => {
+                            tracing::warn!(%error, "browser idle retirement could not mark its profile");
+                            None
+                        }
                     }
-                    session
                 } else {
                     None
                 }
             };
             if let Some(session) = session {
-                Self::stop_session(session).await;
-                reaped += 1;
+                if let Err(error) = Self::stop_session(session).await {
+                    tracing::warn!(%error, "browser idle retirement did not confirm persistence");
+                }
+                true
+            } else {
+                false
             }
-        }
-        reaped
+        });
+        shared_closed
+            + futures::future::join_all(retirements)
+                .await
+                .into_iter()
+                .filter(|reaped| *reaped)
+                .count()
     }
 
     pub async fn frame(
@@ -1704,6 +3151,9 @@ impl BrowserManager {
         after: u64,
         wait_ms: u64,
     ) -> Result<Option<Arc<BrowserFrame>>, BrowserError> {
+        if self.profile_root.is_some() && self.shared.contains(session_id) {
+            return self.shared.frame(session_id, after, wait_ms).await;
+        }
         let session = {
             let sessions = self.sessions.lock().await;
             let session = sessions

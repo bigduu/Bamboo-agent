@@ -8,7 +8,7 @@ use bamboo_agent_core::tools::{
 };
 use serde_json::{json, Value};
 
-use crate::browser::{BrowserError, BrowserManager};
+use crate::browser::{BrowserError, BrowserManager, BrowserProfileMode};
 
 pub struct BrowserTool {
     browser: Arc<BrowserManager>,
@@ -25,6 +25,20 @@ fn text_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, ToolError> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ToolError::InvalidArguments(format!("browser requires nonempty {name}")))
+}
+
+fn profile_mode_arg(args: &Value) -> Result<Option<BrowserProfileMode>, ToolError> {
+    let Some(value) = args.get("profile_mode") else {
+        return Ok(None);
+    };
+    if args.get("action").and_then(Value::as_str) != Some("tabs") {
+        return Err(ToolError::InvalidArguments(
+            "browser profile_mode is only accepted with tabs".into(),
+        ));
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|_| ToolError::InvalidArguments("profile_mode must be shared or clean".into()))
 }
 
 fn tab_id_arg(args: &Value) -> Result<&str, ToolError> {
@@ -366,7 +380,7 @@ impl Tool for BrowserTool {
     }
 
     fn description(&self) -> &str {
-        "Operate the browser context shared with this chat's right workbench. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click, hover, drag, fill or press a target, select native HTML options, set one in-memory file input, type into the focused element, scroll, or download one file through a CSS selector. set_file_input requires a CSS selector, basename filename, MIME type and strict base64 bytes of at most 1 MiB; it never reads a local path. Download resolves an actionable main-frame CSS <a href> in the shared page, then follows its direct HTTP(S) link from a script-free private page in the same BrowserContext; it does not run the source page's onclick/JavaScript or change shared tabs. It returns at most 256 KiB as Base64 with filename, byte_count and SHA-256. It accepts up to five verifiable HTTP(S) redirects (301, 302, 303, 307, 308) in the same private main frame; URL credentials and HTTPS-to-HTTP downgrade are rejected. A selected element without a direct href may return one Blob created and activated inside its direct synchronous click handler; delegated, delayed/async, or ambiguous script downloads fail closed. Unverifiable redirect chains, final HTML/Refresh responses, sites requiring Referer or enforcing CSP sandbox, and pages with unverified response provenance (including some popups) return download_unverifiable. It cannot fetch an arbitrary URL or save to a chosen path. Hover accepts a CSS selector or viewport x/y; drag accepts source_selector/target_selector or x/y/to_x/to_y. A page handler may navigate during hover or drag and advance page_epoch; use the returned state before the next action. A page JavaScript dialog appears as pending_dialog in the action result or tabs state; answer its exact dialog_id and page_epoch with dialog_respond before another mutation. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
+        "Operate this chat's pages shared with its right workbench. Chats normally reuse one account browser and persistent site storage, with separate owned tabs; this is shared login state, not security isolation. A clean mode selected for this chat uses a fresh temporary context in the same browser. Automatic tool open preserves the chat's active mode. List, create, activate or close tabs; read the active tab's DOM snapshot or screenshot; navigate, use history, resize the viewport, click, hover, drag, fill or press a target, select native HTML options, set one in-memory file input, type into the focused element, scroll, or download one file through a CSS selector. set_file_input requires a CSS selector, basename filename, MIME type and strict base64 bytes of at most 1 MiB; it never reads a local path. Download resolves an actionable main-frame CSS <a href> in the shared page, then follows its direct HTTP(S) link from a script-free private page in the same BrowserContext; it does not run the source page's onclick/JavaScript or change shared tabs. It returns at most 256 KiB as Base64 with filename, byte_count and SHA-256. It accepts up to five verifiable HTTP(S) redirects (301, 302, 303, 307, 308) in the same private main frame; URL credentials and HTTPS-to-HTTP downgrade are rejected. A selected element without a direct href may return one Blob created and activated inside its direct synchronous click handler; delegated, delayed/async, or ambiguous script downloads fail closed. Unverifiable redirect chains, final HTML/Refresh responses, sites requiring Referer or enforcing CSP sandbox, and pages with unverified response provenance (including some popups) return download_unverifiable. It cannot fetch an arbitrary URL or save to a chosen path. Hover accepts a CSS selector or viewport x/y; drag accepts source_selector/target_selector or x/y/to_x/to_y. A page handler may navigate during hover or drag and advance page_epoch; use the returned state before the next action. A page JavaScript dialog appears as pending_dialog in the action result or tabs state; answer its exact dialog_id and page_epoch with dialog_respond before another mutation. Snapshot [ref=e...] markers are not stable locators; use a target or CSS selector. The tabs belong to the current chat session; no session ID argument is accepted. Take a snapshot and pass its page_epoch before interacting with a previously seen view."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -374,6 +388,7 @@ impl Tool for BrowserTool {
             "type":"object",
             "properties": {
                 "action":{"type":"string","enum":["tabs","new_tab","activate_tab","close_tab","navigate","history","viewport","snapshot","click","click_at","hover","drag","fill","select_option","set_file_input","type","press","key","scroll","download","screenshot","dialog_respond"]},
+                "profile_mode":{"type":"string","enum":["shared","clean"],"description":"Optional with tabs only: explicitly open shared or clean. Omit to preserve an active scope/default. An active scope must be closed in the workbench before switching; unsupported shared never becomes clean automatically."},
                 "tab_id":{"type":"string","description":"Opaque tab ID from tabs/state; required for activate_tab and close_tab"},
                 "dialog_id":{"type":"string","description":"Opaque pending_dialog ID from this chat; required for dialog_respond"},
                 "accept":{"type":"boolean","description":"Accept or dismiss the exact pending JavaScript dialog"},
@@ -471,7 +486,11 @@ impl Tool for BrowserTool {
                 ToolError::InvalidArguments("invalid browser in-memory file input".into())
             })?;
         }
-        let state = self.browser.open(session_id).await.map_err(browser_error)?;
+        let state = self
+            .browser
+            .open_with_mode(session_id, profile_mode_arg(&args)?)
+            .await
+            .map_err(browser_error)?;
         let epoch = args
             .get("expected_epoch")
             .and_then(Value::as_u64)
@@ -560,6 +579,31 @@ impl Tool for BrowserTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_mode_is_explicit_strict_and_only_accepted_with_tabs() {
+        assert_eq!(profile_mode_arg(&json!({"action":"tabs"})).unwrap(), None);
+        for (value, mode) in [
+            ("clean", BrowserProfileMode::Clean),
+            ("shared", BrowserProfileMode::Shared),
+        ] {
+            assert_eq!(
+                profile_mode_arg(&json!({"action":"tabs","profile_mode":value})).unwrap(),
+                Some(mode)
+            );
+        }
+        for value in [Value::Null, json!(true), json!("unknown"), json!(1)] {
+            assert!(profile_mode_arg(&json!({"action":"tabs","profile_mode":value})).is_err());
+        }
+        for action in ["navigate", "download", "set_file_input", "new_tab"] {
+            assert!(profile_mode_arg(&json!({"action":action,"profile_mode":"clean"})).is_err());
+        }
+        let tool = BrowserTool::new(Arc::new(BrowserManager::default()));
+        assert_eq!(
+            tool.parameters_schema()["properties"]["profile_mode"]["enum"],
+            json!(["shared", "clean"])
+        );
+    }
 
     #[test]
     fn browser_tool_advertises_existing_host_controls_as_mutating_actions() {

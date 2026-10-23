@@ -92,6 +92,8 @@ mod actor_snapshot_tests;
 mod actor_snapshot_windows_tests;
 #[cfg(test)]
 mod actor_transcript_tests;
+#[cfg(test)]
+mod browser_cleanup_observation_tests;
 mod child_actor_runtime;
 #[cfg(test)]
 mod child_actor_runtime_tests;
@@ -5495,6 +5497,18 @@ impl SessionStoreV2 {
     }
 
     pub async fn cleanup(&self, mode: CleanupMode, keep_pinned: bool) -> io::Result<CleanupResult> {
+        self.cleanup_with_progress(mode, keep_pinned)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// Preserve the actual locked batch on partial failure. Callers may then
+    /// confirm canonical absence and finish terminal resources for deleted IDs.
+    pub async fn cleanup_with_progress(
+        &self,
+        mode: CleanupMode,
+        keep_pinned: bool,
+    ) -> Result<CleanupResult, CleanupFailure> {
         let lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
         let guards = Arc::new(SessionDeletionGuards {
@@ -5585,6 +5599,9 @@ impl SessionStoreV2 {
         // Pre-compute full deleted id set for a truthful response payload.
         let mut deleted_ids = HashSet::<String>::new();
         for root_id in delete_root_ids.iter() {
+            // Legacy Roots may have an empty root_session_id in their index
+            // row. The selected Root itself is always part of its deletion.
+            deleted_ids.insert(root_id.clone());
             for e in entries.iter().filter(|e| e.root_session_id == *root_id) {
                 deleted_ids.insert(e.id.clone());
             }
@@ -5592,20 +5609,48 @@ impl SessionStoreV2 {
         for child_id in delete_child_ids.iter() {
             deleted_ids.insert(child_id.clone());
         }
-
-        // Apply deletions (roots first; they delete children implicitly).
-        for root_id in delete_root_ids.iter() {
-            let _ = self
-                .delete_session_recursive_locked(root_id, true, &guards)
-                .await?;
-        }
-        for child_id in delete_child_ids.iter() {
-            let _ = self
-                .delete_session_recursive_locked(child_id, true, &guards)
-                .await?;
+        // A Root removal unlinks the canonical children tree even if its
+        // rebuildable index omits a Child. Census before any batch deletion,
+        // under the same exclusive lifecycle guard as the physical removals.
+        for root_id in &delete_root_ids {
+            match self.canonical_root_child_ids(root_id).await {
+                Ok(children) => deleted_ids.extend(children),
+                Err(error) => {
+                    let mut candidate_session_ids: Vec<_> = deleted_ids.into_iter().collect();
+                    candidate_session_ids.sort();
+                    return Err(CleanupFailure {
+                        error,
+                        candidate_session_ids,
+                    });
+                }
+            }
         }
         let mut deleted_session_ids: Vec<String> = deleted_ids.into_iter().collect();
         deleted_session_ids.sort();
+
+        // Apply deletions (roots first; they delete children implicitly).
+        for root_id in delete_root_ids.iter() {
+            if let Err(error) = self
+                .delete_session_recursive_locked(root_id, true, &guards)
+                .await
+            {
+                return Err(CleanupFailure {
+                    error,
+                    candidate_session_ids: deleted_session_ids,
+                });
+            }
+        }
+        for child_id in delete_child_ids.iter() {
+            if let Err(error) = self
+                .delete_session_recursive_locked(child_id, true, &guards)
+                .await
+            {
+                return Err(CleanupFailure {
+                    error,
+                    candidate_session_ids: deleted_session_ids,
+                });
+            }
+        }
         Ok(CleanupResult {
             deleted_count: deleted_session_ids.len(),
             deleted_session_ids,
@@ -5621,58 +5666,92 @@ impl SessionStoreV2 {
     /// Root revocations remain canonical so surviving processes cannot restore
     /// their deleted snapshots after this reset.
     pub async fn dev_reset(&self) -> io::Result<()> {
-        let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
-        let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked(&_runtime_task)
-            .await?;
-        self.recover_all_session_copy_transactions_locked().await?;
-
-        let deleted_search_sources = self
-            .index
-            .read()
+        self.dev_reset_with_progress()
             .await
-            .sessions
-            .values()
-            .map(|entry| {
-                (
-                    entry.id.clone(),
-                    self.abs_path_from_rel(&entry.rel_path)
-                        .join(SEARCH_INDEX_REVISION_FILE),
-                )
-            })
-            .collect::<Vec<_>>();
+            .map(|_| ())
+            .map_err(|failure| failure.error)
+    }
 
-        // Revoke canonical Roots before removing the tree, including Roots
-        // omitted by this process's stale index. Preserve the revocations
-        // outside sessions/: stale writers may survive this development reset.
-        let mut roots = fs::read_dir(&self.sessions_dir).await?;
-        while let Some(root) = roots.next_entry().await? {
-            if root.file_type().await?.is_dir() {
-                if let Some(id) = root.file_name().to_str() {
-                    self.revoke_root_lifetime(id).await?;
+    /// Return exact canonical cleanup candidates, preserving partial failure.
+    /// The legacy ioResult API keeps the same revocation/write boundary.
+    pub async fn dev_reset_with_progress(&self) -> Result<CleanupResult, CleanupFailure> {
+        let mut candidates = Vec::new();
+        let result: io::Result<()> = async {
+            let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
+            let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
+            self.recover_all_runtime_task_transactions_locked(&_runtime_task)
+                .await?;
+            self.recover_all_session_copy_transactions_locked().await?;
+
+            let deleted_search_sources = self
+                .index
+                .read()
+                .await
+                .sessions
+                .values()
+                .map(|entry| {
+                    (
+                        entry.id.clone(),
+                        self.abs_path_from_rel(&entry.rel_path)
+                            .join(SEARCH_INDEX_REVISION_FILE),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            // Revoke canonical Roots before removing the tree, including Roots
+            // omitted by this process's stale index. Preserve the revocations
+            // outside sessions/: stale writers may survive this development reset.
+            match fs::read_dir(&self.sessions_dir).await {
+                Ok(mut roots) => {
+                    while let Some(root) = roots.next_entry().await? {
+                        if root.file_type().await?.is_dir() {
+                            if let Some(id) = root.file_name().to_str() {
+                                // Census actual canonical IDs under the same exclusive
+                                // lifecycle/Task guards, including unindexed Children.
+                                candidates.push(id.to_owned());
+                                candidates.extend(self.canonical_root_child_ids(id).await?);
+                                self.revoke_root_lifetime(id).await?;
+                            }
+                        }
+                    }
                 }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
-        }
-        match fs::remove_dir_all(&self.sessions_dir).await {
-            Ok(()) => sync_parent_directory_entry(&self.sessions_dir).await?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        fs::create_dir_all(&self.sessions_dir).await?;
-        sync_parent_directory_entry(&self.sessions_dir).await?;
+            match fs::remove_dir_all(&self.sessions_dir).await {
+                Ok(()) => sync_parent_directory_entry(&self.sessions_dir).await?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            fs::create_dir_all(&self.sessions_dir).await?;
+            sync_parent_directory_entry(&self.sessions_dir).await?;
 
-        // Reset through the same cross-process rebase/publish boundary as every
-        // other index mutation; dev reset must not race a stale direct writer.
-        self.update_index(|index| {
-            *index = SessionsIndex::empty();
+            // Reset through the same cross-process rebase/publish boundary as every
+            // other index mutation; dev reset must not race a stale direct writer.
+            self.update_index(|index| {
+                *index = SessionsIndex::empty();
+                Ok(())
+            })
+            .await?;
+            for (session_id, revision_path) in deleted_search_sources {
+                self.search_index_queue
+                    .enqueue_delete(&session_id, revision_path);
+            }
             Ok(())
-        })
-        .await?;
-        for (session_id, revision_path) in deleted_search_sources {
-            self.search_index_queue
-                .enqueue_delete(&session_id, revision_path);
         }
-        Ok(())
+        .await;
+        candidates.sort();
+        candidates.dedup();
+        match result {
+            Ok(()) => Ok(CleanupResult {
+                deleted_count: candidates.len(),
+                deleted_session_ids: candidates,
+            }),
+            Err(error) => Err(CleanupFailure {
+                error,
+                candidate_session_ids: candidates,
+            }),
+        }
     }
 
     /// Delete a session. If the session is a root, deletes its entire directory (and all child sessions).
@@ -5684,6 +5763,53 @@ impl SessionStoreV2 {
         session_id: &str,
         force: bool,
     ) -> io::Result<bool> {
+        self.delete_session_recursive_with_progress(session_id, force)
+            .await
+            .map(|result| result.deleted)
+            .map_err(|failure| failure.error)
+    }
+
+    // The caller holds lifecycle/Task exclusivity. Do not trust derived index
+    // rows to describe everything remove_dir_all will unlink below a Root.
+    async fn canonical_root_child_ids(&self, root_id: &str) -> io::Result<Vec<String>> {
+        validate_session_id(root_id)?;
+        let root = self.sessions_dir.join(root_id);
+        let children = root.join("children");
+        for directory in [&self.sessions_dir, &root, &children] {
+            match fs::symlink_metadata(directory).await {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => {
+                    return Err(other_io_error(
+                        "canonical session tree is not a real directory",
+                    ))
+                }
+            }
+        }
+        let mut entries = fs::read_dir(children).await?;
+        let mut ids = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
+                let id = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| other_io_error("invalid canonical Child directory name"))?;
+                validate_session_id(&id)?;
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// Report the true locked subtree candidates, including children admitted
+    /// after a caller's preflight and children whose Root index row is absent.
+    pub async fn delete_session_recursive_with_progress(
+        &self,
+        session_id: &str,
+        force: bool,
+    ) -> Result<SessionDeletionResult, CleanupFailure> {
         let lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
         let guards = Arc::new(SessionDeletionGuards {
@@ -5693,8 +5819,41 @@ impl SessionStoreV2 {
         self.recover_all_runtime_task_transactions_locked(&guards.runtime_task)
             .await?;
         self.recover_all_session_copy_transactions_locked().await?;
-        self.delete_session_recursive_locked(session_id, force, &guards)
+        validate_session_id(session_id)?;
+        let mut candidate_session_ids: Vec<String> = self
+            .index
+            .read()
             .await
+            .sessions
+            .values()
+            .filter(|entry| entry.id == session_id || entry.root_session_id == session_id)
+            .map(|entry| entry.id.clone())
+            .collect();
+        candidate_session_ids.push(session_id.to_string());
+        match self.canonical_root_child_ids(session_id).await {
+            Ok(children) => candidate_session_ids.extend(children),
+            Err(error) => {
+                return Err(CleanupFailure {
+                    error,
+                    candidate_session_ids,
+                })
+            }
+        }
+        candidate_session_ids.sort();
+        candidate_session_ids.dedup();
+        match self
+            .delete_session_recursive_locked(session_id, force, &guards)
+            .await
+        {
+            Ok(deleted) => Ok(SessionDeletionResult {
+                deleted,
+                candidate_session_ids,
+            }),
+            Err(error) => Err(CleanupFailure {
+                error,
+                candidate_session_ids,
+            }),
+        }
     }
 
     async fn remove_child_directory(
@@ -5842,6 +6001,29 @@ pub enum CleanupMode {
 pub struct CleanupResult {
     pub deleted_count: usize,
     pub deleted_session_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct CleanupFailure {
+    pub error: io::Error,
+    /// Selected while holding the same lifecycle lock as the actual deletes.
+    /// These are candidates, not proof that every ID was removed.
+    pub candidate_session_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct SessionDeletionResult {
+    pub deleted: bool,
+    pub candidate_session_ids: Vec<String>,
+}
+
+impl From<io::Error> for CleanupFailure {
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            candidate_session_ids: Vec::new(),
+        }
+    }
 }
 
 /// Atomically write `bytes` to `path`: write a uniquely-named temp file in the

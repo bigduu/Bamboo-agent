@@ -1,5 +1,166 @@
 use super::*;
+
+#[tokio::test]
+async fn cleanup_admission_does_not_create_unknown_session_lock_files() {
+    fn names(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+        let mut result: Vec<_> = std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        result.sort();
+        result
+    }
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let path = home.path().join(".session-write-locks");
+    let before = names(&path);
+    for id in [
+        "never-created-one",
+        "never-created-two",
+        "never-created-three",
+    ] {
+        assert!(!store
+            .session_has_canonical_cleanup_evidence(id)
+            .await
+            .unwrap());
+    }
+    assert_eq!(names(&path), before);
+    assert!(store.session_write_locks.is_empty());
+}
 use std::sync::{Condvar, Mutex as StdMutex};
+
+async fn unindexed_child_fixture() -> (tempfile::TempDir, SessionStoreV2, Session, Session) {
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let root = Session::new("canonical-deletion-root", "model");
+    let child = Session::new_child_of("canonical-deletion-child", &root, "model", "child");
+    store.save_session(&root).await.unwrap();
+    store.save_session(&child).await.unwrap();
+    store
+        .update_index(|index| {
+            index.sessions.remove(&child.id);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(store.get_index_entry(&child.id).await.is_none());
+    assert!(store.load_session(&child.id).await.unwrap().is_none());
+    (home, store, root, child)
+}
+
+#[tokio::test]
+async fn root_deletion_progress_includes_canonical_children_missing_from_index() {
+    let (home, store, root, child) = unindexed_child_fixture().await;
+    let result = store
+        .delete_session_recursive_with_progress(&root.id, true)
+        .await
+        .unwrap();
+    assert!(result.deleted);
+    assert!(!home.path().join("sessions").join(&root.id).exists());
+    let mut expected = vec![root.id, child.id];
+    expected.sort();
+    assert_eq!(result.candidate_session_ids, expected);
+}
+
+#[tokio::test]
+async fn root_cleanup_progress_includes_canonical_children_missing_from_index() {
+    let (home, store, root, child) = unindexed_child_fixture().await;
+    let result = store
+        .cleanup_with_progress(CleanupMode::All, false)
+        .await
+        .unwrap();
+    assert!(!home.path().join("sessions").join(&root.id).exists());
+    let mut expected = vec![root.id, child.id];
+    expected.sort();
+    assert_eq!(result.deleted_session_ids, expected);
+    assert_eq!(result.deleted_count, 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn root_deletion_progress_rejects_a_linked_sessions_container() {
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let root = Session::new("linked-canonical-root", "model");
+    store.save_session(&root).await.unwrap();
+    store.flush_search_index().await;
+    let sessions = home.path().join("sessions");
+    let outside = home.path().join("owned-outside-sessions");
+    let before = std::fs::read(sessions.join(&root.id).join("session.json")).unwrap();
+    std::fs::rename(&sessions, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &sessions).unwrap();
+    let result = store
+        .delete_session_recursive_with_progress(&root.id, true)
+        .await;
+    let preserved = std::fs::read(outside.join(&root.id).join("session.json")).ok();
+    // Restore this fixture's container before asserting, including on RED.
+    std::fs::remove_file(&sessions).unwrap();
+    std::fs::rename(&outside, &sessions).unwrap();
+    assert!(
+        result.is_err(),
+        "linked canonical containers must fail closed"
+    );
+    assert_eq!(preserved, Some(before));
+}
+
+#[tokio::test]
+async fn root_deletion_reports_late_children_without_relying_on_a_root_index_row() {
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let root = Session::new("deletion-progress-root", "model");
+    store.save_session(&root).await.unwrap();
+    let preflight = store.list_index_entries().await;
+    assert_eq!(preflight.len(), 1);
+    let child = Session::new_child_of("deletion-progress-late-child", &root, "model", "child");
+    store.save_session(&child).await.unwrap();
+    // Exact interleaving: caller preflight precedes this admitted Child. The
+    // Root remains canonical even if its rebuildable index row is missing.
+    store
+        .update_index(|index| {
+            index.sessions.remove(&root.id);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(store.get_index_entry(&root.id).await.is_none());
+    let result = store
+        .delete_session_recursive_with_progress(&root.id, true)
+        .await
+        .unwrap();
+    assert!(result.deleted);
+    let mut expected = vec![root.id.clone(), child.id.clone()];
+    expected.sort();
+    assert_eq!(result.candidate_session_ids, expected);
+    assert!(store.load_session(&root.id).await.unwrap().is_none());
+    assert!(store.load_session(&child.id).await.unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_cleanup_retains_the_exact_locked_batch_for_terminal_resource_cleanup() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let blocked = Session::new("cleanup-progress-blocked", "model");
+    let other = Session::new("cleanup-progress-other", "model");
+    store.save_session(&blocked).await.unwrap();
+    store.save_session(&other).await.unwrap();
+    store.flush_search_index().await;
+    let directory = home.path().join("sessions").join(&blocked.id);
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = store.cleanup_with_progress(CleanupMode::All, false).await;
+    if directory.exists() {
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let failure = result.expect_err("fixture must fail a real directory removal");
+    assert_eq!(failure.error.kind(), io::ErrorKind::PermissionDenied);
+    let mut expected = vec![blocked.id, other.id];
+    expected.sort();
+    assert_eq!(failure.candidate_session_ids, expected);
+    // Whether the unordered batch reached the other Root first or not, the
+    // caller receives every actual candidate, including the failed step.
+}
 
 const ROOT: &str = "delete-guard-root";
 const CHILD: &str = "delete-guard-child";

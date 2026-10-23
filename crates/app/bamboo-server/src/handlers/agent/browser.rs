@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::app_state::AppState;
-use crate::browser::BrowserError;
+use crate::browser::{BrowserError, BrowserProfileMode};
 
 fn error_response(error: BrowserError) -> HttpResponse {
     let (status, code) = match &error {
@@ -15,6 +15,14 @@ fn error_response(error: BrowserError) -> HttpResponse {
             "browser_unavailable",
         ),
         BrowserError::NotOpen => (actix_web::http::StatusCode::NOT_FOUND, "browser_not_open"),
+        BrowserError::ProfileModeConflict => (
+            actix_web::http::StatusCode::CONFLICT,
+            "browser_profile_mode_conflict",
+        ),
+        BrowserError::Busy => (
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+            "browser_busy",
+        ),
         BrowserError::StaleEpoch => (actix_web::http::StatusCode::CONFLICT, "stale_epoch"),
         BrowserError::StaleDialog => (actix_web::http::StatusCode::CONFLICT, "stale_dialog"),
         BrowserError::DialogPending => (actix_web::http::StatusCode::CONFLICT, "dialog_pending"),
@@ -50,14 +58,123 @@ fn valid_tab_id(tab_id: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-pub async fn open(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BrowserOpenRequest {
+    // Missing means preserve/default. Explicit null is an invalid mode.
+    #[serde(default, deserialize_with = "explicit_profile_mode")]
+    profile_mode: Option<BrowserProfileMode>,
+}
+
+fn explicit_profile_mode<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<BrowserProfileMode>, D::Error> {
+    BrowserProfileMode::deserialize(decoder).map(Some)
+}
+
+fn parse_open_request(body: &[u8]) -> Result<BrowserOpenRequest, BrowserError> {
+    if body.is_empty() {
+        return Ok(BrowserOpenRequest::default());
+    }
+    if body.len() > 256 {
+        return Err(BrowserError::Invalid(
+            "browser open request too large".into(),
+        ));
+    }
+    // Derived struct decoding also accepts sequences such as [] with default
+    // fields. The HTTP contract allows only an object (or no body at all).
+    if body
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        != Some(b'{')
+    {
+        return Err(BrowserError::Invalid(
+            "browser open request must be an object".into(),
+        ));
+    }
+    serde_json::from_slice(body)
+        .map_err(|_| BrowserError::Invalid("profile_mode must be shared or clean".into()))
+}
+
+pub async fn open(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    body: web::Bytes,
+) -> HttpResponse {
     let session_id = path.into_inner();
+    let epoch = state.browser.open_epoch();
     if !known_session(&state, &session_id).await {
         return missing_session();
     }
-    match state.browser.open(&session_id).await {
+    let request = match parse_open_request(&body) {
+        Ok(request) => request,
+        Err(error) => return error_response(error),
+    };
+    match state
+        .browser
+        .open_with_mode_in_epoch(&session_id, epoch, request.profile_mode)
+        .await
+    {
         Ok(value) => HttpResponse::Ok().json(value),
         Err(error) => error_response(error),
+    }
+}
+
+#[cfg(test)]
+mod profile_contract_tests {
+    use super::*;
+
+    #[test]
+    fn open_accepts_only_empty_or_strict_optional_profile_mode() {
+        for bytes in [b"".as_slice(), b"{}", b" \n{}\r\n"] {
+            assert_eq!(parse_open_request(bytes).unwrap().profile_mode, None);
+        }
+        assert_eq!(
+            parse_open_request(br#"{"profile_mode":"shared"}"#)
+                .unwrap()
+                .profile_mode,
+            Some(BrowserProfileMode::Shared)
+        );
+        assert_eq!(
+            parse_open_request(br#"{"profile_mode":"clean"}"#)
+                .unwrap()
+                .profile_mode,
+            Some(BrowserProfileMode::Clean)
+        );
+        for bytes in [
+            b"null".as_slice(),
+            b"[]",
+            br#"["clean"]"#,
+            b"[null]",
+            br#"[{"profile_mode":"clean"}]"#,
+            b" ",
+            b"true",
+            br#"{"profile_mode":null}"#,
+            br#"{"profile_mode":"unknown"}"#,
+            br#"{"profile_mode":"clean","session_id":"other"}"#,
+            br#"{"profile_mode":"shared","profile_mode":"clean"}"#,
+        ] {
+            assert!(
+                matches!(parse_open_request(bytes), Err(BrowserError::Invalid(_))),
+                "unexpectedly accepted request: {}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn mode_conflict_keeps_the_existing_409_error_envelope() {
+        let response = error_response(BrowserError::ProfileModeConflict);
+        assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
+        assert_eq!(
+            error_response(BrowserError::NotOpen).status(),
+            actix_web::http::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            error_response(BrowserError::Busy).status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }
 
