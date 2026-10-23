@@ -3337,12 +3337,21 @@ mod optional_model_e2e {
         let state = new_state().await;
         let session_id = "workflow-reserved-before-commit";
         seed_active_instruction_workflow(&state, session_id, "plan").await;
-        let before = state
+        let mut before = state
             .storage
             .load_session(session_id)
             .await
             .expect("load seeded session")
             .expect("seeded session");
+        // This race changes the Workflow, not the Workspace. Resolve the
+        // fixture's initial default before reserving the concurrent runner so
+        // the request does not also retain the Source-scope runners read lock.
+        state
+            .project_context_resolver
+            .refresh_session_prompt_read_only(&mut before)
+            .await
+            .expect("seed the fixture's canonical default Workspace");
+        state.save_and_cache_session(&mut before).await;
         let expected_workflow_metadata = workflow_runtime_metadata(&before);
         let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
         let review = catalog
@@ -3393,10 +3402,9 @@ mod optional_model_e2e {
 
         let mut runner = crate::app_state::AgentRunner::new();
         runner.status = crate::app_state::AgentStatus::Pending;
-        state
-            .agent_runners
-            .write()
+        tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, state.agent_runners.write())
             .await
+            .expect("Workflow-only fixture must not hold the Source-scope runners lock")
             .insert(session_id.to_string(), runner);
         barrier.resume.add_permits(1);
 
@@ -5594,11 +5602,18 @@ async fn root_chat_receipt_disconnected_commit_retains_real_owner_and_single_dur
     let home = tempfile::tempdir().unwrap();
     let state = web::Data::new(crate::AppState::new(home.path().into()).await.unwrap());
     let id = "root-chat-disconnected-receipt";
+    let workspace = home.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut initial = Session::new(id, "test-model");
+    initial.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
+        &workspace.canonicalize().unwrap(),
+    ));
     state
-        .storage
-        .save_session(&Session::new(id, "test-model"))
+        .project_context_resolver
+        .refresh_session_prompt_read_only(&mut initial)
         .await
         .unwrap();
+    state.storage.save_session(&initial).await.unwrap();
     let root = state.storage.load_session(id).await.unwrap().unwrap();
     let sender = state.get_session_event_sender(id).await;
     let mut owner = match reserve_session_execution(

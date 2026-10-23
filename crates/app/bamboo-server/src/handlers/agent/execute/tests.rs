@@ -1465,7 +1465,7 @@ mod execution_input_http {
                 .unwrap();
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             assert!(String::from_utf8_lossy(&bytes)
-                .contains("Native Root admission changed before ownership; retry execute"));
+                .contains("Root admission changed before ownership; retry execute"));
             let contender = contender.take().unwrap();
             let writer = contender.root_actor_writer().unwrap();
             contender_run = Some(contender.run_id().to_owned());
@@ -2288,11 +2288,14 @@ mod execution_input_http {
                 input_taps().lock().unwrap().remove(&id).unwrap().is_empty(),
                 "failed startup has no execution handoff"
             );
-            // Early Native admission creates a real reservation. Its existing
-            // abandonment contract retains an exact Cancelled slot.
+            // A legacy message id does not make this ordinary Root ineligible
+            // for reservation. Any actual slot must retain its exact cancelled
+            // ownership after rejected startup.
+            let canonical = state.storage.load_session(&id).await.unwrap().unwrap();
             let runners = state.agent_runners.read().await;
             if let Some(runner) = runners.get(&id) {
-                assert!(native);
+                assert!(crate::skill_runtime::registered_main(&canonical));
+                assert!(!runner.run_id.is_empty());
                 assert!(matches!(runner.status, AgentStatus::Cancelled));
             }
             drop(runners);

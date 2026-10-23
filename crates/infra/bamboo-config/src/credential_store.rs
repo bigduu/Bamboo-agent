@@ -3550,11 +3550,8 @@ mod tests {
             .open(dir.path().join(".config-credential-migration.lock"))
             .unwrap();
         migration_lock.lock().unwrap();
-        std::fs::write(
-            dir.path().join("config-credential-migration.json"),
-            b"manifest-commit-window",
-        )
-        .unwrap();
+        // Prepare the synthetic committed member before opening the manifest
+        // window. Ordinary writers must not bypass a pending transaction guard.
         store
             .replace_unchecked(
                 reference.clone(),
@@ -3563,6 +3560,12 @@ mod tests {
                 1,
             )
             .unwrap();
+
+        std::fs::write(
+            dir.path().join("config-credential-migration.json"),
+            b"manifest-commit-window",
+        )
+        .unwrap();
 
         let (started_tx, started_rx) = mpsc::channel();
         let (resolve_result_tx, resolve_result_rx) = mpsc::channel();
