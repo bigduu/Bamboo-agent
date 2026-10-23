@@ -4019,7 +4019,12 @@ function emit(message) {
 }
 
 function replyEnvelope(request, payload, v2, hostGeneration) {
-  return { id: Number.isSafeInteger(request?.id) ? request.id : null, ...payload,
+  // Keep internal capacity subtypes while emitting the canonical v2 busy code
+  // already mapped by the native client to HTTP 503 browser_busy.
+  const response = v2 && payload.ok === false &&
+    ['browser_download_busy', 'browser_scope_busy'].includes(payload.code)
+    ? { ...payload, code: 'browser_busy' } : payload;
+  return { id: Number.isSafeInteger(request?.id) ? request.id : null, ...response,
     ...(v2 ? { version: 2, host_generation: hostGeneration,
       scope_id: request?.scope_id, scope_generation: request?.scope_generation } : {}) };
 }
