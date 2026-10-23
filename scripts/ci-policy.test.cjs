@@ -240,6 +240,29 @@ test("locked test builds are separate from source-bound ten-minute crate blocks"
   assert.match(controller, /No tests were omitted|no tests were omitted/u)
 })
 
+test("every aggregate uses its build plan's exact Cargo target directory", () => {
+  const cargoTarget = (source) => source.match(/^      CARGO_TARGET_DIR: (.+)$/mu)?.[1]
+  const cases = [
+    ["test", "Require every default block and doctest result", "test-build"],
+    ["test", "Require the real standalone SSH result", "test-ssh-build"],
+    ["e2e-test", "Require every all-feature crate block", "e2e-build"],
+  ]
+  const validate = (aggregate, stepName, build) => {
+    const step = aggregate.split(`      - name: ${stepName}\n`)[1]?.split(/\n      - /u)[0]
+    assert.ok(step, `missing aggregate step: ${stepName}`)
+    const actual = step.match(/^          CARGO_TARGET_DIR: (.+)$/mu)?.[1] ?? cargoTarget(aggregate)
+    const expected = cargoTarget(job(build))
+    assert.ok(expected, `missing build target directory: ${build}`)
+    assert.equal(actual, expected, `${stepName} must retain its compiled plan environment`)
+    assert.ok(step.includes(`\${{ needs.${build}.outputs.plan_id }}`))
+  }
+  for (const [aggregate, step, build] of cases) validate(job(aggregate), step, build)
+  const wrong = job("test").replace(
+    "          CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-ssh-live\n", "",
+  )
+  assert.throws(() => validate(wrong, cases[1][1], cases[1][2]), /compiled plan environment/u)
+})
+
 test("promotion retains required checks without repeating platform coverage", () => {
   assert.match(job("promotion-source"), /name: Promotion Source\n/u)
   assert.match(job("lint"), /name: Lint\n/u)

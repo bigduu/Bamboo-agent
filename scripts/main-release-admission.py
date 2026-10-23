@@ -257,7 +257,7 @@ REVIEWED_PRODUCERS = frozenset((PRODUCER_V1, PRODUCER_V2))
 # by a sentinel. Then independently authenticate the actual helper bytes below.
 # This breaks the workflow -> helper -> workflow hash cycle, without excluding
 # a job, global environment, trigger, command or permission from review.
-CURRENT_PRODUCER = "aa775e0e206b5511c244d4207cd53ca30fe4aff0bb3b5275bc97e40f4b6b7dea"
+CURRENT_PRODUCER = "99a869c4a744a9d307563a43bd4c7781a1bf893b97cb9f4666a4238bde6cd5c0"
 # Preserve the already-reviewed admission producer with its original helper.
 # It has no shard jobs; it cannot satisfy the new grouped producer contract.
 LEGACY_ADMISSION_PRODUCER = "3c3af3e002a8abb341db0bb4020f29491ed32208b0b0953ebb6ed2b289c4390c"
