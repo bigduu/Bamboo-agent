@@ -591,6 +591,15 @@ pub struct Fixture {
     pub synthetic_config: Vec<u8>,
     provider: actix_web::dev::ServerHandle,
 }
+
+pub fn fixture_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap()
+}
+
 #[allow(dead_code)] // Shared by integration targets using different fixture cases.
 impl Fixture {
     pub async fn new() -> Self {
@@ -656,11 +665,7 @@ impl Fixture {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let base = format!("http://127.0.0.1:{port}/api/v1");
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .unwrap();
+        let client = fixture_http_client();
         let mut host = start_with_fault(&data, port, fault);
         ready(&client, &base, &mut host, &data).await;
 

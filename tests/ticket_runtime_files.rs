@@ -8,6 +8,104 @@ use fixture::{command, post, Fixture};
 use serde_json::json;
 use std::{path::Path, process::Command, sync::atomic::Ordering, time::Duration};
 
+#[actix_web::test]
+async fn inspect_uses_fresh_connection_after_idle_peer_close_without_retry() {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::{atomic::AtomicUsize, mpsc, Arc};
+
+    fn accept(listener: &TcpListener) -> std::io::Result<TcpStream> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match listener.accept() {
+                Ok((peer, _)) => {
+                    peer.set_nonblocking(false)?;
+                    return Ok(peer);
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    fn reply(peer: &mut TcpStream, expected: &str, body: &str) -> std::io::Result<()> {
+        peer.set_read_timeout(Some(Duration::from_secs(3)))?;
+        peer.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let mut head = Vec::new();
+        let mut byte = [0];
+        while !head.ends_with(b"\r\n\r\n") {
+            peer.read_exact(&mut byte)?;
+            head.push(byte[0]);
+            assert!(head.len() < 8192, "bounded fixture request head");
+        }
+        assert!(head.starts_with(expected.as_bytes()), "request line");
+        let length = String::from_utf8_lossy(&head)
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map_or(0, |(_, length)| length.trim().parse::<usize>().unwrap());
+        assert!(length < 8192, "bounded fixture request body");
+        peer.read_exact(&mut vec![0; length])?;
+        write!(
+            peer,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+            body.len()
+        )?;
+        peer.flush()
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}/api/v1", listener.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server_calls = calls.clone();
+    let (close, close_requested) = mpsc::channel();
+    let (closed, idle_closed) = mpsc::channel();
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let mut first = accept(&listener)?;
+        reply(
+            &mut first,
+            "GET /api/v1/health HTTP/1.1\r\n",
+            r#"{"ready":true}"#,
+        )?;
+        close_requested
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        let _ = first.shutdown(Shutdown::Both);
+        closed.send(()).unwrap();
+        let mut second = accept(&listener)?;
+        server_calls.fetch_add(1, Ordering::SeqCst);
+        reply(
+            &mut second,
+            "POST /api/v1/tickets/inspect HTTP/1.1\r\n",
+            r#"{"data":[]}"#,
+        )
+    });
+    let client = fixture::fixture_http_client();
+    assert_eq!(fixture::get(&client, &base, "/health").await["ready"], true);
+    close.send(()).unwrap();
+    // As in the existing ordinary-Root transport regression, hold this
+    // current-thread reactor until the live service has closed its idle peer.
+    idle_closed.recv_timeout(Duration::from_secs(3)).unwrap();
+    let response = client
+        .post(format!("{base}/tickets/inspect"))
+        .json(&json!({"ids": ["fixture-work"]}))
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response.text().await,
+        Err(error) => Err(error),
+    };
+    let served = server.join().unwrap();
+    assert!(response.is_ok(), "inspect after idle close: {response:?}");
+    assert_eq!(response.unwrap(), r#"{"data":[]}"#);
+    served.expect("the same live service accepted the fresh connection");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one inspect, no retry");
+}
+
 #[cfg(feature = "ticket-runtime-fixtures")]
 #[actix_web::test]
 async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewriting_or_acceptance()
