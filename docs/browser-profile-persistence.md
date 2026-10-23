@@ -60,5 +60,18 @@ state across chats, clean-context isolation, manager/host restart, page ownershi
 canonical retirement and I/O-failure fences. It uses no real account credentials.
 Physical reboot/power-loss and native Windows/Linux browser runtime acceptance
 remain separate. A clean Node exit or close callback is not an OS-level proof
-that every Chromium writer exited. The open capacity finding remains unresolved:
-this change introduces no hard disk quota or production storage migration.
+that every Chromium writer exited. The macOS source now selects a fixed
+536870912-byte backing image with a 402653184-byte APFS volume quota for the
+account profile and its writable runtime paths. That implementation still needs
+source-matched first-use and normal-restart acceptance; the earlier quota
+experiment alone does not qualify it. Windows/Linux production admission
+currently refuses with `browser_storage_provider_unsupported`, including clean
+mode, rather than selecting an unbounded fallback. These platforms are not
+qualified by the successful macOS component tests.
+
+Only the original leased owner may clear its launch fence after confirmed
+shutdown. A new process refuses an old active or unknown-writer fence; there is
+no automatic recovery or fence-clearing API. Consumers must allow Bamboo's
+graceful shutdown to complete. Force-killing the server skips that cleanup and
+can leave future browser opens unavailable even after its child processes exit.
+No production data has been migrated by the isolated validation.

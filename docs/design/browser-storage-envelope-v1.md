@@ -1,11 +1,19 @@
 # Shared browser storage boundary preparation
 
-Remote PR head `d9154725` is unpublished and still has no hard storage bound. The
-local candidate adds admission to existing bounded storage and explicit native
-root waiting, but its Rust integration is uncompiled and no production storage
-has been prepared. The open capacity finding on PR #2102 continues to block
-merge. No image creation, attachment, quota mutation, production migration or
-all-writer containment acceptance follows from the Node tests in this change.
+The source now includes macOS first-use preparation, bounded-storage admission
+and explicit native-root waiting. Historical head `d9154725` had no hard bound;
+that description does not apply to the current implementation. The later
+`b6df19bb` startup-permission slice passed its compile, Clippy, fmt and eight
+focused Rust checks. Those results do not qualify a newly merged dependency
+graph or the product's actual first-use/restart path. The failed product
+first-use fixture and the partial Chromium capacity experiment remain separate
+evidence; neither is a passing product acceptance.
+
+The remaining merge assessment concerns those actual behaviors, not merely
+whether an old finding is outdated. No production migration or all-writer
+containment acceptance follows from Node tests, and a successful compile-only
+CI check is not a full Rust test run. Windows/Linux production admission remains
+explicitly unsupported; clean mode does not bypass that refusal.
 
 ## What changed with shared mode
 
@@ -29,8 +37,8 @@ inspector included in `browser-runtime/host.cjs`; requiring either does not load
 Playwright or launch a native process. The proposed backing is 536870912 bytes, with a single APFS volume
 quota of 402653184 bytes. The one shared account profile and all temporary clean
 context data share that envelope, so each is bounded by the same aggregate
-ceiling. This is a candidate based on the small synthetic experiment, not an
-approved production default or two independent per-profile quota levels.
+ceiling. These are the current macOS source defaults, not two independent
+per-profile quota levels or a claim of completed native acceptance.
 `imageBytes` is the logical backing-file bound, not proof that host snapshots,
 clones, filesystem metadata or retained old extents fit in that many physical
 bytes. The actual backing allocation and those overheads need separate target
@@ -100,11 +108,11 @@ floor is a pressure check, not a quota claim. The kernel volume quota and fixed
 backing supply the candidate hard bound. The Node inspector is still read-only;
 all create/attach execution stays with the native leased owner.
 
-These are uncompiled source changes, not a tested storage provider. Ordinary
-Rust unit fixtures cannot run image mutations: their compile-time-only runner
-records an attempted step and refuses it. Real source-matched CLI preparation
-is qualified separately against explicitly approved isolated targets. No test
-needs production deployment. The reset candidate below also remains unverified.
+Ordinary Rust unit fixtures cannot run image mutations: their compile-time-only
+runner records an attempted step and refuses it. Real source-matched CLI
+preparation must be qualified separately against approved isolated targets;
+component compilation and lifecycle tests do not replace that acceptance. No
+test needs production deployment or removal of an old failure fence.
 
 Before spawning a native writer, the account owner now writes and syncs a
 bounded launch UUID fence outside quota. A new process refuses any old active
