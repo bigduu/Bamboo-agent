@@ -9,12 +9,12 @@ on:
         description: Exact 40-character SHA of the selected ref to validate as one frozen batch
         required: true
         type: string
-  # Protected main-push CI supplies the existing automatic publication authority.
+  # Main-push CI authenticates pre-merge acceptance for automatic publication.
   pull_request:
     branches: [ dev, main ]
 
 # Queue every main push for its own release gate; supersede iterative PR/manual
-# validation independently. Promotion builds still fan out to three platforms.
+# validation independently. Full promotion validation still covers three platforms.
 concurrency:
   group: ci-${{ github.event_name }}-${{ (github.event_name == 'workflow_dispatch' && inputs.snapshot_sha) || github.event.pull_request.number || github.ref }}
   # Every main merge needs a completed CI gate before its own publication.
@@ -25,6 +25,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   PYTHONDONTWRITEBYTECODE: "1"
+  RUST_MIN_STACK: "8388608"
+  CARGO_INCREMENTAL: "0"
   # This frozen batch restores existing caches without adding paid storage.
   # The main anchor also covers its first normal promotion push.
   BAMBOO_RELEASE_CACHE_WRITE_ALLOWED: >-
@@ -69,12 +71,56 @@ jobs:
               ;;
             push)
               test "$GITHUB_REF" = refs/heads/main
-              full=true
               ;;
             *) exit 1 ;;
           esac
           printf 'Event source: %s; full validation: %s\n' "$GITHUB_SHA" "$full"
           printf 'full=%s\n' "$full" >> "$GITHUB_OUTPUT"
+
+  main-release-admission:
+    name: Main Release Admission
+    needs: validation-source
+    if: always() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Authenticate completed release acceptance before checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RESULT: ${{ needs.validation-source.result }}
+          FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
+          ADMISSION_MODE: main
+          ADMISSION_HELPER_SHA256: "f533b31b001d3a261cf86369e2eebc464b343b21100066e04429ded192f8b1fc"
+        run: |
+          python3 - <<'PYTHON'
+          import base64
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          assert repository == "bigduu/Bamboo-agent"
+          revision = os.environ["GITHUB_WORKFLOW_SHA"]
+          expected = os.environ["ADMISSION_HELPER_SHA256"]
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          assert re.fullmatch(r"[0-9a-f]{64}", expected)
+          # Fixed-origin GET only, before any source checkout or credential-bearing code.
+          response = json.loads(subprocess.check_output(
+              ["gh", "api", "--hostname", "github.com",
+               f"repos/{repository}/contents/scripts/main-release-admission.py?ref={revision}"],
+              text=True, timeout=30))
+          assert response["encoding"] == "base64" and len(response["content"]) <= 180000
+          body = base64.b64decode(response["content"], validate=False)
+          assert len(body) <= 128000 and hashlib.sha256(body).hexdigest() == expected, "Unknown admission verifier"
+          exec(compile(body, "pinned-main-release-admission", "exec"), {
+              "__name__": "__main__", "ADMISSION_SCRIPT_SHA256": expected,
+          })
+          PYTHON
 
   quick-checks:
     name: Quick Checks
@@ -99,7 +145,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Test fast workflow and release policies
-        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs
+        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs scripts/test-groups-ci.test.cjs
 
       - name: Test Supervisor driver and owned loopback process binding
         run: node --test scripts/supervisor-native-acceptance.test.cjs
@@ -190,7 +236,12 @@ jobs:
 
   test:
     name: Test
-    needs: validation-source
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
+    needs: [validation-source, main-release-admission, test-build, test-blocks, test-doctests, test-ssh-build, test-ssh]
     # A source-gate failure must fail required Test, never turn it into a skip.
     if: always() && !cancelled()
     runs-on: ubuntu-latest
@@ -200,19 +251,25 @@ jobs:
         env:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
+          MAIN_ADMISSION_RESULT: ${{ needs.main-release-admission.result }}
         shell: bash
         run: |
           set -euo pipefail
           test "$SOURCE_RESULT" = success
           case "$GITHUB_EVENT_NAME:${GITHUB_BASE_REF:-}:$FULL_VALIDATION" in
             pull_request:dev:false|pull_request:main:true|workflow_dispatch::true) ;;
-            push::true) test "$GITHUB_REF" = refs/heads/main ;;
+            push::false)
+              test "$GITHUB_REF" = refs/heads/main
+              test "$MAIN_ADMISSION_RESULT" = success
+              ;;
             *) exit 1 ;;
           esac
 
       - uses: actions/checkout@v7
+        if: github.event_name != 'push'
 
       - name: Require the exact clean event source
+        if: github.event_name != 'push'
         shell: bash
         run: |
           set -euo pipefail
@@ -223,24 +280,25 @@ jobs:
           sha256sum Cargo.lock
 
       - name: Setup Node.js
+        if: github.event_name != 'push'
         uses: actions/setup-node@v7
         with:
-          node-version: lts/*
+          node-version: ${{ needs.test-build.outputs.node || '24' }}
 
       - name: Test CI workflow policy
         if: needs.validation-source.outputs.full == 'true'
-        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs
+        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs scripts/test-groups-ci.test.cjs
 
       - name: Test Supervisor driver and owned loopback process binding
         if: needs.validation-source.outputs.full == 'true'
         run: node --test scripts/supervisor-native-acceptance.test.cjs
 
       - name: Test frontend artifact and release policies
-        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        if: needs.validation-source.outputs.full == 'true'
         run: node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
 
       - name: Stage frontend package
-        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        if: needs.validation-source.outputs.full == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -248,11 +306,13 @@ jobs:
           node -e "for (const file of ['crates/app/bamboo-server/frontend_package/lotus-frontend.zip', 'crates/app/bamboo-server/frontend_package/frontend-manifest.json']) require('node:fs').accessSync(file)"
 
       - name: Install Rust
+        if: github.event_name != 'push'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
       - name: Record the full validation toolchain
+        if: github.event_name != 'push'
         run: |
           rustc --version --verbose
           cargo --version --verbose
@@ -262,14 +322,16 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Rust cache
+        if: github.event_name != 'push'
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-test-${{ runner.os }}
+          workspaces: . -> target/grouped-default
           # Keep iterative dev PR caches; main PRs restore from their base branch.
           save-if: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'dev')) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Verify published server crate owns the frontend package
-        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        if: needs.validation-source.outputs.full == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -286,26 +348,38 @@ jobs:
           done
 
       - name: Build locked Rust workspace
+        if: github.event_name == 'pull_request' && github.base_ref == 'dev'
         run: cargo build --locked
 
-      - name: Compile locked Rust test targets
+      - name: Install artifact transport
         if: needs.validation-source.outputs.full == 'true'
-        timeout-minutes: 15
-        run: cargo test --locked --no-run
-        env:
-          RUST_MIN_STACK: "8388608"
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/ci-artifacts
 
-      - name: Test locked Rust workspace
+      - name: Require every default block and doctest result
         if: needs.validation-source.outputs.full == 'true'
-        timeout-minutes: 45
-        run: cargo test --locked --no-fail-fast
-        # Deep actor-runtime tests need the same thread stack on CI as the
-        # verified local workspace sweep; Rust's default is too small on Linux.
         env:
-          RUST_MIN_STACK: "8388608"
+          GH_TOKEN: ${{ github.token }}
+        uses: ./.github/actions/grouped-tests
+        with:
+          command: summary
+          plan-id: ${{ needs.test-build.outputs.plan_id }}
+          plan-key: ${{ needs.test-build.outputs.plan_key }}
+          directory: target/ci-summary/default
+
+      - name: Require the real standalone SSH result
+        if: needs.validation-source.outputs.full == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-ssh-live
+        uses: ./.github/actions/grouped-tests
+        with:
+          command: summary
+          plan-id: ${{ needs.test-ssh-build.outputs.plan_id }}
+          plan-key: ${{ needs.test-ssh-build.outputs.plan_key }}
+          directory: target/ci-summary/ssh
 
       - name: Preserve failed synthetic Ticket fixture evidence
-        if: failure()
+        if: failure() && github.event_name != 'push'
         uses: actions/upload-artifact@v7
         with:
           name: ticket-fixture-failure-${{ github.run_id }}-${{ github.run_attempt }}
@@ -318,26 +392,358 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Build examples
-        if: github.event_name != 'pull_request' || github.base_ref == 'main'
-        # Compile-only (no network/config needed): guards `examples/*.rs` —
-        # and the README SDK snippet each one's doc comment mirrors — against
-        # drifting from the real API (bamboo-agent#255).
-        run: cargo build --locked --examples
-
-      - name: Run real SSH/SFTP transport test
-        if: github.event_name != 'pull_request' || github.base_ref == 'main'
-        timeout-minutes: 10
-        run: scripts/run-russh-live.sh
-
       - name: Require the exact clean source after full validation
-        if: always()
+        if: always() && github.event_name != 'push'
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           source_status="$(git status --porcelain --untracked-files=all)"
           test -z "$source_status"
+
+  test-build:
+    name: Test Build
+    needs: validation-source
+    if: needs.validation-source.outputs.full == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
+    outputs:
+      plan_id: ${{ steps.compile.outputs.plan_id }}
+      plan_key: ${{ steps.compile.outputs.plan_key }}
+      blocks: ${{ steps.compile.outputs.blocks }}
+      docs: ${{ steps.compile.outputs.docs }}
+      has_docs: ${{ steps.compile.outputs.has_docs }}
+      node: ${{ steps.compile.outputs.node }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-test-${{ runner.os }}
+          workspaces: . -> target/grouped-default
+          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
+      - name: Stage frontend package
+        run: node scripts/frontend-package.cjs stage
+      - name: Build locked Rust workspace
+        run: cargo build --locked
+      - name: Build examples
+        run: cargo build --locked --examples
+      - name: Install artifact transport
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/ci-artifacts
+      - name: Compile and enumerate default blocks
+        id: compile
+        uses: ./.github/actions/grouped-tests
+        with:
+          command: build
+          profile: default
+          directory: target/ci-evidence/default
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-build-diagnostics-default-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/ci-evidence/default/*.json
+            target/ci-evidence/default/*.log
+            target/ci-evidence/default/doc-inventory/*.json
+            target/ci-evidence/default/doc-inventory/*.log
+          if-no-files-found: error
+          retention-days: 7
+
+  e2e-build:
+    name: E2E Build
+    needs: validation-source
+    if: needs.validation-source.outputs.full == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-all-features
+    outputs:
+      plan_id: ${{ steps.compile.outputs.plan_id }}
+      plan_key: ${{ steps.compile.outputs.plan_key }}
+      blocks: ${{ steps.compile.outputs.blocks }}
+      docs: ${{ steps.compile.outputs.docs }}
+      has_docs: ${{ steps.compile.outputs.has_docs }}
+      node: ${{ steps.compile.outputs.node }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-e2e-${{ runner.os }}
+          workspaces: . -> target/grouped-all-features
+          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
+      - name: Stage frontend package
+        run: node scripts/frontend-package.cjs stage
+      - name: Install artifact transport
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/ci-artifacts
+      - name: Compile and enumerate all-features blocks
+        id: compile
+        uses: ./.github/actions/grouped-tests
+        with:
+          command: build
+          profile: all-features
+          directory: target/ci-evidence/all-features
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-build-diagnostics-all-features-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/ci-evidence/all-features/*.json
+            target/ci-evidence/all-features/*.log
+            target/ci-evidence/all-features/doc-inventory/*.json
+            target/ci-evidence/all-features/doc-inventory/*.log
+          if-no-files-found: error
+          retention-days: 7
+
+  test-ssh-build:
+    name: Test SSH Build
+    needs: [validation-source, test-build]
+    if: needs.validation-source.outputs.full == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-ssh-live
+    outputs:
+      plan_id: ${{ steps.compile.outputs.plan_id }}
+      plan_key: ${{ steps.compile.outputs.plan_key }}
+      blocks: ${{ steps.compile.outputs.blocks }}
+      docs: ${{ steps.compile.outputs.docs }}
+      has_docs: ${{ steps.compile.outputs.has_docs }}
+      node: ${{ steps.compile.outputs.node }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-ssh-${{ runner.os }}
+          workspaces: . -> target/grouped-ssh-live
+          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
+      - name: Stage frontend package
+        run: node scripts/frontend-package.cjs stage
+      - name: Install artifact transport
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/ci-artifacts
+      - name: Compile and enumerate ssh-live blocks
+        id: compile
+        uses: ./.github/actions/grouped-tests
+        with:
+          command: build
+          profile: ssh-live
+          directory: target/ci-evidence/ssh-live
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-build-diagnostics-ssh-live-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/ci-evidence/ssh-live/*.json
+            target/ci-evidence/ssh-live/*.log
+            target/ci-evidence/ssh-live/doc-inventory/*.json
+            target/ci-evidence/ssh-live/doc-inventory/*.log
+          if-no-files-found: error
+          retention-days: 7
+
+  test-blocks:
+    name: Test Block (${{ matrix.id }})
+    needs: [validation-source, test-build]
+    if: needs.validation-source.outputs.full == 'true' && needs.test-build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.test-build.outputs.blocks) }}
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
+    steps:
+      - name: Start the cumulative block budget
+        shell: bash
+        run: echo "BAMBOO_BLOCK_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.test-build.outputs.node }}
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install artifact transport
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/ci-artifacts
+      - name: Execute one source-bound crate block
+        env:
+          PLAN_ID: ${{ needs.test-build.outputs.plan_id }}
+          PLAN_KEY: ${{ needs.test-build.outputs.plan_key }}
+          BLOCK_ID: ${{ matrix.id }}
+        uses: ./.github/actions/grouped-tests
+        with:
+          command: run
+          plan-id: ${{ env.PLAN_ID }}
+          plan-key: ${{ env.PLAN_KEY }}
+          block-id: ${{ env.BLOCK_ID }}
+          directory: target/ci-blocks/${{ matrix.id }}
+      - name: Preserve partial block failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: partial-default-${{ matrix.id }}-${{ github.run_attempt }}
+          path: |
+            target/ci-blocks/${{ matrix.id }}/logs/
+            /tmp/bamboo-1481-ticket-lifecycle-*/host/host.log
+            /tmp/bamboo-1481-ticket-lifecycle-*/host/question-readiness.json
+            /tmp/bamboo-1754-required-packet-*/host.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  e2e-blocks:
+    name: E2E Block (${{ matrix.id }})
+    needs: [validation-source, e2e-build]
+    if: needs.validation-source.outputs.full == 'true' && needs.e2e-build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.e2e-build.outputs.blocks) }}
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-all-features
+    steps:
+      - name: Start the cumulative block budget
+        shell: bash
+        run: echo "BAMBOO_BLOCK_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.e2e-build.outputs.node }}
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install artifact transport
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/ci-artifacts
+      - name: Execute one source-bound crate block
+        env:
+          PLAN_ID: ${{ needs.e2e-build.outputs.plan_id }}
+          PLAN_KEY: ${{ needs.e2e-build.outputs.plan_key }}
+          BLOCK_ID: ${{ matrix.id }}
+        uses: ./.github/actions/grouped-tests
+        with:
+          command: run
+          plan-id: ${{ env.PLAN_ID }}
+          plan-key: ${{ env.PLAN_KEY }}
+          block-id: ${{ env.BLOCK_ID }}
+          directory: target/ci-blocks/${{ matrix.id }}
+      - name: Preserve partial block failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: partial-all-features-${{ matrix.id }}-${{ github.run_attempt }}
+          path: |
+            target/ci-blocks/${{ matrix.id }}/logs/
+            /tmp/bamboo-1481-ticket-lifecycle-*/host/host.log
+            /tmp/bamboo-1481-ticket-lifecycle-*/host/question-readiness.json
+            /tmp/bamboo-1754-required-packet-*/host.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  test-doctests:
+    name: Test Doctest (${{ matrix.id }})
+    needs: [validation-source, test-build]
+    if: needs.validation-source.outputs.full == 'true' && needs.test-build.result == 'success' && needs.test-build.outputs.has_docs == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.test-build.outputs.docs) }}
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
+    steps:
+      - name: Start the cumulative block budget
+        shell: bash
+        run: echo "BAMBOO_BLOCK_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.test-build.outputs.node }}
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install artifact transport
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/ci-artifacts
+      - name: Execute one source-bound crate block
+        env:
+          PLAN_ID: ${{ needs.test-build.outputs.plan_id }}
+          PLAN_KEY: ${{ needs.test-build.outputs.plan_key }}
+          BLOCK_ID: ${{ matrix.id }}
+        uses: ./.github/actions/grouped-tests
+        with:
+          command: run
+          plan-id: ${{ env.PLAN_ID }}
+          plan-key: ${{ env.PLAN_KEY }}
+          block-id: ${{ env.BLOCK_ID }}
+          directory: target/ci-blocks/${{ matrix.id }}
+      - name: Preserve partial block failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: partial-default-${{ matrix.id }}-${{ github.run_attempt }}
+          path: |
+            target/ci-blocks/${{ matrix.id }}/logs/
+            /tmp/bamboo-1481-ticket-lifecycle-*/host/host.log
+            /tmp/bamboo-1481-ticket-lifecycle-*/host/question-readiness.json
+            /tmp/bamboo-1754-required-packet-*/host.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  test-ssh:
+    name: Test SSH
+    needs: [validation-source, test-ssh-build]
+    if: needs.validation-source.outputs.full == 'true' && needs.test-ssh-build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-ssh-live
+    steps:
+      - name: Start the cumulative block budget
+        shell: bash
+        run: echo "BAMBOO_BLOCK_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.test-ssh-build.outputs.node }}
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install artifact transport
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/ci-artifacts
+      - name: Execute the original real SSH fixture from its standalone artifact
+        env:
+          PLAN_ID: ${{ needs.test-ssh-build.outputs.plan_id }}
+          PLAN_KEY: ${{ needs.test-ssh-build.outputs.plan_key }}
+          BLOCK_ID: ${{ fromJSON(needs.test-ssh-build.outputs.blocks).include[0].id }}
+        uses: ./.github/actions/grouped-tests
+        with:
+          command: run
+          plan-id: ${{ env.PLAN_ID }}
+          plan-key: ${{ env.PLAN_KEY }}
+          block-id: ${{ env.BLOCK_ID }}
+          directory: target/ci-blocks/ssh
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: partial-ssh-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/ci-blocks/ssh/logs/
+          if-no-files-found: warn
+          retention-days: 7
 
   msrv:
     name: MSRV (Rust 1.95)
@@ -428,25 +834,34 @@ jobs:
 
   e2e-test:
     name: E2E Tests
-    needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    needs: [validation-source, e2e-build, e2e-blocks]
+    if: always() && !cancelled() && needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-all-features
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
         with:
-          shared-key: bamboo-ci-e2e-${{ runner.os }}
-          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
-
-      - name: Run all-feature library and integration tests
-        run: cargo test --locked --no-fail-fast --all-features --lib --tests
+          node-version: ${{ needs.e2e-build.outputs.node || '24' }}
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install artifact transport
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/ci-artifacts
+      - name: Require every all-feature crate block
         env:
-          RUST_MIN_STACK: "8388608"
+          GH_TOKEN: ${{ github.token }}
+          PLAN_ID: ${{ needs.e2e-build.outputs.plan_id }}
+          PLAN_KEY: ${{ needs.e2e-build.outputs.plan_key }}
+        uses: ./.github/actions/grouped-tests
+        with:
+          command: summary
+          plan-id: ${{ env.PLAN_ID }}
+          plan-key: ${{ env.PLAN_KEY }}
+          directory: target/ci-summary/all-features
 
   lint:
     name: Lint

@@ -1,10 +1,11 @@
-// Run the production inline bootstrap unchanged. Only GitHub's read transport
-// is replaced; ancestry uses an actual disposable Git merge graph.
+// Run the production loader and pinned verifier unchanged. Only GitHub's read
+// transport is replaced; ancestry uses an actual disposable Git merge graph.
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
+const { createHash } = require('node:crypto')
 const copy = (value) => JSON.parse(JSON.stringify(value))
 const FULL = ['Validation Source', 'Test', 'E2E Tests', 'Lint',
   'MSRV (Rust 1.95)', 'Security Audit', 'cargo-deny (licenses/bans/advisories/sources)',
@@ -14,8 +15,9 @@ const FULL = ['Validation Source', 'Test', 'E2E Tests', 'Lint',
 
 const PLATFORMS = ['Build (ubuntu-latest)', 'Build (macos-latest)', 'Build (windows-latest)']
 
-async function verify(t, bootstrap, producer = 'v1') {
-  assert.match(producer, /^v[12]$/)
+async function verify(t, bootstrap, producer = 'v1', mode = 'publication', options = {}) {
+  assert.match(producer, /^v[123]$/)
+  assert.ok(['publication', 'main'].includes(mode))
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-main-authority-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const git = (...args) => {
@@ -25,7 +27,10 @@ async function verify(t, bootstrap, producer = 'v1') {
   }
   git('init', '-q')
   // Frozen producer bytes, not an active workflow or a caller-authored receipt.
-  const definition = fs.readFileSync(path.join(__dirname, `fixtures/main-authority-ci-${producer}.yml`))
+  const definition = fs.readFileSync(producer === 'v3' ? '.github/workflows/ci.yml'
+    : path.join(__dirname, `fixtures/main-authority-ci-${producer}.yml`))
+  const helper = fs.readFileSync('scripts/main-release-admission.py')
+  const helperDigest = createHash('sha256').update(helper).digest('hex')
   fs.mkdirSync(path.join(directory, '.github/workflows'), { recursive: true })
   fs.writeFileSync(path.join(directory, '.github/workflows/ci.yml'), definition)
   git('add', '.github/workflows/ci.yml')
@@ -56,16 +61,40 @@ async function verify(t, bootstrap, producer = 'v1') {
   const ci = (id, event, sha, ref) => ({ id, run_attempt: 1, name: 'CI', path: '.github/workflows/ci.yml',
     event, head_sha: sha, head_branch: ref, status: 'completed', conclusion: 'success',
     repository: repo, head_repository: repo })
-  const mainCI = ci(111, 'push', source, 'main')
+  const mainCI = { ...ci(111, 'push', source, 'main'), workflow_id: 237621118,
+    check_suite_id: 555, check_suite_node_id: 'CS_main' }
   const pull = { number: 42, state: 'closed', merged: true, draft: false, merge_commit_sha: source,
     merged_at: '2026-10-20T03:00:00Z', base: { ref: 'main', sha: base, repo }, head: { ref: release, sha: head, repo } }
   const pre = { ...ci(222, 'pull_request', head, release), workflow_id: 237621118,
     check_suite_id: 444, check_suite_node_id: 'CS_fixture', pull_requests: [pull] }
   const steps = ['Set up job', 'Bind full validation to the actual event snapshot', 'Complete job']
     .map((name, i) => ({ name, number: i + 1, status: 'completed', conclusion: 'success' }))
-  const jobs = (id, promotion) => ({ jobs: [...FULL, ...(promotion ? [...PLATFORMS, 'Promotion Source'] : [])].map((name, i) => ({
-    id: id * 100 + i, name, run_id: id, run_attempt: 1, head_sha: head, head_branch: release,
-    steps, status: 'completed', conclusion: 'success', completed_at: '2026-10-20T02:59:00Z' })) })
+  const plans = [
+    {profile: 'default', label: 'Test', inventory: 2, doctests: 1, packages: ['bamboo-config'], blocks: [
+      {id: 'bamboo-config-lib-0', package: 'bamboo-config', kind: 'libtest', count: 2, ignored: 0, timeoutSeconds: 600},
+      {id: 'bamboo-config-doc-0', package: 'bamboo-config', kind: 'doctest', count: 1, ignored: 0, timeoutSeconds: 600}]},
+    {profile: 'all-features', label: 'E2E', inventory: 3, doctests: 0, packages: ['bamboo-engine'], blocks: [
+      {id: 'bamboo-engine-lib-0', package: 'bamboo-engine', kind: 'libtest', count: 3, ignored: 0, timeoutSeconds: 600}]},
+    {profile: 'ssh-live', label: 'Test SSH', inventory: 1, doctests: 0, packages: ['bamboo-broker'], blocks: [
+      {id: 'bamboo-broker-russh-0', package: 'bamboo-broker', kind: 'ssh', count: 1, ignored: 0, timeoutSeconds: 600}]},
+  ].map((p, index) => ({...p, schema: 'bamboo-ci-test-plan/v1', sha: snapshot,
+    tree: git('rev-parse', `${source}^{tree}`), producerAttempt: 1, planId: 900 + index,
+    planKey: createHash('sha256').update(p.profile).digest('hex')}))
+  const blockName = (plan, block) => plan.profile === 'ssh-live' ? 'Test SSH'
+    : `${plan.label} ${block.kind === 'doctest' ? 'Doctest' : 'Block'} (${block.id})`
+  const groupedNames = plans.flatMap(p => [p.label + ' Build', ...p.blocks.map(b => blockName(p, b))])
+  const mainSkipped = ['Test Build', 'E2E Build', 'Test SSH Build', 'Test SSH',
+    'Test Block (${{ matrix.id }})', 'E2E Block (${{ matrix.id }})', 'Test Doctest (${{ matrix.id }})']
+  const jobs = (id, promotion) => ({ jobs: (!promotion && producer === 'v3'
+    ? ['Validation Source', 'Test', 'Main Release Admission', 'Quick Checks', 'Promotion Source',
+      'E2E Tests', 'Lint', 'MSRV (Rust 1.95)', 'Security Audit', 'cargo-deny (licenses/bans/advisories/sources)',
+      'Documentation', 'TLS Fixture (${{ matrix.os }})', 'ToolEvent Recorder E2E (${{ matrix.os }})', 'Build (${{ matrix.os }})', ...mainSkipped]
+    : [...FULL, ...(producer === 'v3' ? groupedNames : []), ...(promotion ? [...PLATFORMS, 'Promotion Source'] : [])]).map((name, i) => ({
+    id: id * 100 + i, name, run_id: id, run_attempt: 1,
+    head_sha: promotion ? head : source, head_branch: promotion ? release : 'main',
+    steps, status: 'completed', conclusion: !promotion && producer === 'v3'
+      && !['Validation Source', 'Test', 'Main Release Admission'].includes(name) ? 'skipped' : 'success',
+    completed_at: '2026-10-20T02:59:00Z' })) })
   const commitObject = (sha) => ({ sha, tree: { sha: git('rev-parse', `${sha}^{tree}`) },
     parents: git('show', '-s', '--format=%P', sha).split(' ').map(sha => ({ sha })) })
   const routes = {
@@ -82,6 +111,10 @@ async function verify(t, bootstrap, producer = 'v1') {
     [`git/commits/${snapshot}`]: commitObject(snapshot),
     [`contents/.github/workflows/ci.yml?ref=${head}`]: { encoding: 'base64', content: definition.toString('base64') },
     [`contents/.github/workflows/ci.yml?ref=${snapshot}`]: { encoding: 'base64', content: definition.toString('base64') },
+    [`contents/.github/workflows/ci.yml?ref=${source}`]: { encoding: 'base64', content: definition.toString('base64') },
+    ...Object.fromEntries([controller, head, snapshot, source].map(sha => [
+      `contents/scripts/main-release-admission.py?ref=${sha}`, { encoding: 'base64', content: helper.toString('base64') }])),
+    'actions/runs/111/attempts/1/jobs?per_page=100&page=1': jobs(111, false),
     'actions/runs/222/attempts/1/jobs?per_page=100&page=1': jobs(222, true),
     'actions/jobs/22200': jobs(222, true).jobs[0],
     'actions/jobs/22200/logs': { raw: `2026-10-20T02:58:00Z \x1b[36;1mSet up runner\x1b[0m\n2026-10-20T02:58:00.0000000Z Event source: ${snapshot}; full validation: true\n` },
@@ -93,6 +126,29 @@ async function verify(t, bootstrap, producer = 'v1') {
           repositoryFileUrl: `https://github.com/${repository}/blob/${head}/.github/workflows/ci.yml` } } } } },
     [`actions/workflows/ci.yml/runs?event=pull_request&head_sha=${head}&per_page=100&page=1`]: { workflow_runs: [pre] },
   }
+  const recordLog = (marker, record) => `2026-10-20T02:58:00Z ${marker} ${Buffer.from(JSON.stringify(record)).toString('base64')}\n`
+  if (producer === 'v3') for (const job of jobs(222, true).jobs) {
+    let raw = ''
+    for (const plan of plans) {
+      if (job.name === plan.label + ' Build') raw += recordLog('GROUPED_TEST_PLAN', plan)
+      for (const block of plan.blocks) if (job.name === blockName(plan, block)) raw += recordLog('GROUPED_TEST_RESULT', {
+        schema: 'bamboo-ci-test-result/v1', planKey: plan.planKey, block: block.id, package: block.package,
+        profile: plan.profile, sha: plan.sha, sourceTree: plan.tree, attempt: 1, status: 'passed', exitCode: 0,
+        expected: block.count, timeoutSeconds: 600, testDurationMs: 200,
+        counts: {passed: block.count - block.ignored, failed: 0, ignored: block.ignored}})
+      if (job.name === (plan.profile === 'all-features' ? 'E2E Tests' : 'Test')) raw += recordLog('GROUPED_TEST_SUMMARY', {
+        planKey: plan.planKey, profile: plan.profile, sha: plan.sha, tree: plan.tree,
+        inventory: plan.inventory, doctests: plan.doctests, blocks: plan.blocks.length, status: 'passed',
+        counts: {passed: plan.inventory + plan.doctests, failed: 0, ignored: 0}})
+    }
+    if (raw) routes[`actions/jobs/${job.id}/logs`] = {raw}
+  }
+  routes['graphql/main'] = copy(routes.graphql)
+  Object.assign(routes['graphql/main'].data.node, { databaseId: 555, commit: { oid: source },
+    workflowRun: { databaseId: 111, event: 'push', runAttempt: 1,
+      workflow: { databaseId: mainCI.workflow_id, name: 'CI' },
+      file: { path: '.github/workflows/ci.yml', repositoryName: repository,
+        repositoryFileUrl: `https://github.com/${repository}/blob/${source}/.github/workflows/ci.yml` } } })
   const bin = path.join(directory, 'bin')
   fs.mkdirSync(bin)
   fs.writeFileSync(path.join(bin, 'gh'), `#!/usr/bin/env python3
@@ -103,8 +159,8 @@ if 'graphql' in sys.argv:
     query = sys.argv[sys.argv.index('-f') + 1]
     assert query.startswith('query=query($suite:ID!){node(id:$suite){... on CheckSuite{')
     assert 'mutation' not in query and query.count('workflowRun') == 1
-    assert sys.argv[-2:] == ['-f', 'suite=CS_fixture']
-    route = 'graphql'
+    assert sys.argv[-2] == '-f' and sys.argv[-1] in ['suite=CS_fixture', 'suite=CS_main']
+    route = 'graphql/main' if sys.argv[-1] == 'suite=CS_main' else 'graphql'
 else:
     route = sys.argv[-1]
     assert route.startswith('repos/bigduu/Bamboo-agent/')
@@ -133,25 +189,61 @@ else:
   const eventFile = path.join(directory, 'event.json')
   const routeFile = path.join(directory, 'routes.json')
   const output = path.join(directory, 'output')
+  // Keep the CLI contract assertions in the transport, but execute that shim
+  // in-process. Thousands of Python startups would slow the dev policy gate;
+  // real Git ancestry still goes through the original subprocess transport.
+  const runner = `import contextlib, io, os, pathlib, subprocess, sys
+from unittest.mock import patch
+real_output = subprocess.check_output
+shim = pathlib.Path(os.environ['FIXTURE_GH_SHIM']).read_text()
+def output(arguments, **options):
+    if arguments[0] != 'gh': return real_output(arguments, **options)
+    capture = io.StringIO()
+    with patch.object(sys, 'argv', arguments), contextlib.redirect_stdout(capture):
+        exec(compile(shim, '<fixture-read-only-gh>', 'exec'), {'__name__': '__fixture__'})
+    value = capture.getvalue()
+    return value if options.get('text') else value.encode()
+with patch('subprocess.check_output', output):
+    exec(compile(os.environ['FIXTURE_BOOTSTRAP'], '<production-bootstrap>', 'exec'))
+`
   function run(change = () => {}, environment = {}) {
-    const input = { routes: copy(routes), event: { workflow_run: copy(mainCI) } }
+    const input = { routes: copy(routes), event: mode === 'publication' ? { workflow_run: copy(mainCI) }
+      : { ref: 'refs/heads/main', after: source, repository: repo } }
     change(input)
     fs.writeFileSync(routeFile, JSON.stringify(input.routes))
     fs.writeFileSync(eventFile, JSON.stringify(input.event))
     fs.writeFileSync(calls, '')
     fs.writeFileSync(output, '')
-    const result = spawnSync('python3', ['-c', bootstrap], { encoding: 'utf8', timeout: 30000, env: {
+    const result = spawnSync('python3', ['-c', runner], { encoding: 'utf8', timeout: 30000, env: {
       PATH: `${bin}:${process.env.PATH}`, HOME: directory, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8',
       GITHUB_REPOSITORY: repository, GITHUB_EVENT_NAME: 'workflow_run', GITHUB_EVENT_PATH: eventFile,
       GITHUB_SHA: controller, GITHUB_WORKFLOW_SHA: controller, GITHUB_REF: 'refs/heads/dev',
       GITHUB_REF_PROTECTED: 'true', GITHUB_WORKFLOW_REF: `${repository}/.github/workflows/publish-crate.yml@refs/heads/dev`,
       GITHUB_OUTPUT: output, GH_TOKEN: 'dummy-read-only-metadata-token',
+      FIXTURE_GH_SHIM: path.join(bin, 'gh'), FIXTURE_BOOTSTRAP: bootstrap,
+      ADMISSION_MODE: mode, ADMISSION_HELPER_SHA256: helperDigest,
+      ...(mode === 'main' ? { GITHUB_EVENT_NAME: 'push', GITHUB_REF: 'refs/heads/main',
+        GITHUB_SHA: source, GITHUB_WORKFLOW_SHA: source,
+        GITHUB_WORKFLOW_REF: `${repository}/.github/workflows/ci.yml@refs/heads/main`,
+        SOURCE_RESULT: 'success', FULL_VALIDATION: 'false' } : {}),
       FIXTURE_CALLS: calls, FIXTURE_ROUTES: routeFile, FIXTURE_REPOSITORY: directory, ...environment } })
     return { ...result, output: fs.readFileSync(output, 'utf8'), calls: fs.readFileSync(calls, 'utf8') }
   }
+  if (options.exercise) return options.exercise({run, base, source, head, controller})
   const empty = x => {
     x.routes['actions/runs/222'].pull_requests = []
     x.routes[`actions/workflows/ci.yml/runs?event=pull_request&head_sha=${head}&per_page=100&page=1`].workflow_runs[0].pull_requests = []
+  }
+  const expandedSkipped = x => {
+    const expand = list => list.flatMap(job => {
+      if (!job.name.includes('${{ matrix.os }}')) return [job]
+      const platforms = job.name.startsWith('TLS Fixture') ? ['macos-latest', 'windows-latest']
+        : ['ubuntu-latest', 'macos-latest', 'windows-latest']
+      return platforms.map((platform, index) => ({ ...copy(job), id: job.id * 10 + index,
+        name: job.name.replace('${{ matrix.os }}', platform) }))
+    })
+    for (const route of ['actions/runs/111/jobs?filter=latest&per_page=100&page=1',
+      'actions/runs/111/attempts/1/jobs?per_page=100&page=1']) x.routes[route].jobs = expand(x.routes[route].jobs)
   }
   for (const [name, change] of [
     ['empty association uses authenticated historical source job', empty],
@@ -170,12 +262,43 @@ else:
     }],
     ['failed-only CI rerun retains earlier successful job attempts', x => {
       x.routes['actions/runs/222'].run_attempt = 2
+      x.routes.graphql.data.node.workflowRun.runAttempt = 2
       x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs[0].run_attempt = 2
+      x.routes['actions/runs/222/attempts/2/jobs?per_page=100&page=1'] = copy(x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'])
+      x.routes['actions/jobs/22200'].run_attempt = 2
     }],
-  ]) await t.test(name, () => {
+    ...(producer === 'v3' ? [['failed shard alone can rerun while earlier build and shards remain valid', x => {
+      x.routes['actions/runs/222'].run_attempt = 2
+      x.routes.graphql.data.node.workflowRun.runAttempt = 2
+      const list = x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs
+      const job = list.find(j => j.name.startsWith('Test Block ('))
+      job.run_attempt = 2
+      x.routes['actions/runs/222/attempts/2/jobs?per_page=100&page=1'] = {jobs: [copy(job)]}
+      const route = `actions/jobs/${job.id}/logs`
+      const encoded = x.routes[route].raw.trim().split(' ').at(-1)
+      const record = JSON.parse(Buffer.from(encoded, 'base64')); record.attempt = 2
+      x.routes[route].raw = recordLog('GROUPED_TEST_RESULT', record)
+    }]] : []),
+    ...(producer === 'v3' && mode === 'publication' ? [['complete expanded skipped matrices remain compatible', expandedSkipped]] : []),
+  ].filter(([name]) => !(producer === 'v3' && name === 'main push legitimately skips platform builds already checked before merge'))) await t.test(name, () => {
     const result = run(change)
     assert.equal(result.status, 0, result.stderr)
-    assert.equal(result.output, `revision=${source}\n`)
+    const output = result.output.trimEnd().split('\n')
+    assert.equal(output[0], `revision=${source}`)
+    if (producer === 'v3' && mode === 'publication') {
+      assert.equal(output.length, 2)
+      assert.ok(output[1].startsWith('validation='))
+      const proof = JSON.parse(output[1].slice('validation='.length))
+      assert.equal(proof.kind, 'bamboo-main-release-admission/v1')
+      assert.equal(proof.sourceRevision, source)
+      assert.equal(proof.sourceTree, git('rev-parse', `${source}^{tree}`))
+      assert.equal(proof.ciRun.id, 111)
+      assert.equal(proof.ciRun.head_sha, source)
+      assert.equal(proof.premerge.runId, 222)
+      assert.equal(proof.premerge.snapshotRevision, snapshot)
+      assert.equal(proof.releaseHead, head)
+      assert.equal(proof.baseRevision, base)
+    } else assert.equal(output.length, 1, 'Legacy receipts must retain their original signed shape')
   })
   const negatives = [
     ['no source PR, even when main happens to be protected', x => {
@@ -210,10 +333,82 @@ else:
       x.routes[`actions/workflows/ci.yml/runs?event=pull_request&head_sha=${head}&per_page=100&page=1`].workflow_runs.unshift(red)
       x.routes['actions/runs/333'] = red
     }],
+    ['newer exact-input run appears during proof', x => {
+      const route = `actions/workflows/ci.yml/runs?event=pull_request&head_sha=${head}&per_page=100&page=1`
+      const original = copy(x.routes[route])
+      x.routes[route] = { sequence: [original,
+        { workflow_runs: [{ ...copy(pre), id: 333, conclusion: 'failure' }, copy(pre)] }] }
+    }],
+    ['full job claims an unexecuted attempt', x => {
+      x.routes['actions/runs/222'].run_attempt = 2
+      x.routes.graphql.data.node.workflowRun.runAttempt = 2
+      x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs[1].run_attempt = 2
+      x.routes['actions/runs/222/attempts/2/jobs?per_page=100&page=1'] = { jobs: [] }
+    }],
   ]
-  for (const name of FULL) negatives.push([`main CI cannot skip ${name}`, x => {
+  for (const name of producer === 'v3' ? ['Validation Source', 'Test', 'Main Release Admission'] : FULL) negatives.push([`main CI cannot skip ${name}`, x => {
     x.routes['actions/runs/111/jobs?filter=latest&per_page=100&page=1'].jobs.find(job => job.name === name).conclusion = 'skipped'
   }])
+  if (producer === 'v3') {
+    const shard = jobs(222, true).jobs.find(j => j.name.startsWith('Test Block ('))
+    const mutateShardRecord = (x, change) => {
+      const route = `actions/jobs/${shard.id}/logs`
+      const record = JSON.parse(Buffer.from(x.routes[route].raw.trim().split(' ').at(-1), 'base64'))
+      change(record); x.routes[route].raw = recordLog('GROUPED_TEST_RESULT', record)
+    }
+    for (const conclusion of ['skipped', 'failure', 'cancelled']) negatives.push([`aggregate green cannot hide ${conclusion} shard`, x => {
+      x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs.find(j => j.id === shard.id).conclusion = conclusion
+    }])
+    negatives.push(['missing shard cannot hide behind green summaries', x => {
+      const list = x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs
+      list.splice(list.findIndex(j => j.id === shard.id), 1)
+    }])
+    negatives.push(['different compile input cannot reuse an old green shard', x => mutateShardRecord(x, r => { r.planKey = 'e'.repeat(64) })])
+    negatives.push(['shard over ten minutes cannot be admitted', x => mutateShardRecord(x, r => { r.testDurationMs = 600001 })])
+    negatives.push(['ignored cases cannot hide failed shard cases', x => mutateShardRecord(x, r => { r.counts.ignored = r.expected; r.counts.passed = 0 })])
+    negatives.push(['shard has no source-bound count receipt', x => { x.routes[`actions/jobs/${shard.id}/logs`].raw = 'no result\n' }])
+    const changeDefinition = (x, transform, revision = head) => {
+      x.routes[`contents/.github/workflows/ci.yml?ref=${revision}`].content =
+        Buffer.from(transform(definition.toString())).toString('base64')
+    }
+    for (const [name, transform] of [
+      ['changed required job command', text => text.replace('cargo test --locked --no-fail-fast', 'true')],
+      ['changed trigger', text => text.replace('branches: [ dev, main ]', 'branches: [ dev ]')],
+      ['changed helper pin', text => text.replace(helperDigest, 'f'.repeat(64))],
+      ['duplicate helper pin', text => `${text}\n# ADMISSION_HELPER_SHA256: "${helperDigest}"\n`],
+      ['missing helper pin', text => text.replace(`ADMISSION_HELPER_SHA256: "${helperDigest}"`, 'REMOVED_PIN: true')],
+    ]) negatives.push([name, x => changeDefinition(x, transform)])
+    negatives.push(['changed immutable producer helper bytes', x => {
+      x.routes[`contents/scripts/main-release-admission.py?ref=${head}`].content = Buffer.from('raise Exception("foreign helper")\n').toString('base64')
+    }])
+    negatives.push(['changed controller helper bytes', x => {
+      x.routes[`contents/scripts/main-release-admission.py?ref=${mode === 'main' ? source : controller}`].content = Buffer.from('raise Exception("foreign controller")\n').toString('base64')
+    }])
+    if (mode === 'publication') {
+      negatives.push(['light main admission cannot hide a full test failure', x => {
+        x.routes['actions/runs/111/jobs?filter=latest&per_page=100&page=1'].jobs.find(job => job.name === 'Lint').conclusion = 'failure'
+      }])
+      negatives.push(['unknown main definition cannot claim admission', x => changeDefinition(x, text => `${text}\n# foreign main\n`, source)])
+      negatives.push(['main admission attempt membership differs', x => {
+        x.routes['actions/runs/111/attempts/1/jobs?per_page=100&page=1'].jobs.find(job => job.name === 'Main Release Admission').run_attempt = 9
+      }])
+      negatives.push(['mixed literal and expanded skipped matrix is ambiguous', x => {
+        const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=100&page=1'].jobs
+        jobs.push({ ...copy(jobs.at(-1)), id: 99999, name: 'Build (ubuntu-latest)' })
+      }])
+      negatives.push(['partial expanded skipped matrix cannot hide a platform', x => {
+        expandedSkipped(x)
+        const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=100&page=1'].jobs
+        jobs.splice(jobs.findIndex(job => job.name === 'Build (windows-latest)'), 1)
+      }])
+    } else {
+      for (const [name, change] of [
+        ['main push payload changed source', x => { x.event.after = foreign }],
+        ['main push payload changed ref', x => { x.event.ref = 'refs/heads/dev' }],
+        ['main push payload changed repository', x => { x.event.repository.full_name = 'foreign/repo' }],
+      ]) negatives.push([name, change])
+    }
+  }
   for (const name of PLATFORMS) negatives.push([`pre-merge CI cannot skip ${name}`, x => {
     x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs.find(job => job.name === name).conclusion = 'skipped'
   }])
@@ -271,16 +466,25 @@ else:
       x.routes['actions/runs/333'] = red
     }],
   ]) negatives.push([`empty association rejects ${name}`, x => { empty(x); change(x) }])
-  for (const [name, change] of negatives) await t.test(name, () => {
+  for (const [name, change] of negatives.filter(([name]) => !(mode === 'main' &&
+    /^(server main CI|stale delivered main CI|wrong CI workflow|foreign main CI|main CI |empty association rejects main)/.test(name)))) await t.test(name, () => {
     const result = run(change)
     assert.notEqual(result.status, 0, `${name}: ${result.stdout}`)
     assert.equal(result.output, '', 'No untrusted source may reach checkout/credentials/reservation/upload')
   })
-  for (const [name, environment] of [
+  for (const [name, environment] of mode === 'publication' ? [
     ['manual complete dispatch stays forbidden', { GITHUB_EVENT_NAME: 'workflow_dispatch' }],
     ['wrong workflow controller ref', { GITHUB_REF: 'refs/heads/main' }],
     ['unprotected workflow controller', { GITHUB_REF_PROTECTED: 'false' }],
     ['controller outside protected dev history', { GITHUB_WORKFLOW_SHA: foreign }],
+    ['API transport fails closed', { FIXTURE_API_FAILURE: 'true' }],
+  ] : [
+    ['wrong main event', { GITHUB_EVENT_NAME: 'workflow_dispatch' }],
+    ['wrong main controller ref', { GITHUB_REF: 'refs/heads/dev' }],
+    ['main workflow/source mismatch', { GITHUB_WORKFLOW_SHA: controller }],
+    ['main source admission failure', { SOURCE_RESULT: 'failure' }],
+    ['main cannot claim full mode', { FULL_VALIDATION: 'true' }],
+    ['wrong main verifier pin', { ADMISSION_HELPER_SHA256: 'f'.repeat(64) }],
     ['API transport fails closed', { FIXTURE_API_FAILURE: 'true' }],
   ]) await t.test(name, () => {
     const result = run(undefined, environment)

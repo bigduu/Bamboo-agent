@@ -9,7 +9,8 @@ const { assertVersion, assertManualVersion, validateSource, validateReceipt, nex
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend,
   shouldMakeLatest, gitIsAncestor, canonicalJson, signReceipt, authenticateReceipt,
   readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration, verifyRegistrySource, highestStableVersion,
-  command, spawnCommand, assertCurrentMain, currentMainWrite } = require('./crate-release.cjs')
+  command, spawnCommand, assertCurrentMain, currentMainWrite, createPreparation, validatePreparation,
+  resumePrepared, assertAdmissionCompatibility } = require('./crate-release.cjs')
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 const sourceRevision = 'a'.repeat(40)
@@ -69,6 +70,95 @@ const completedReceipt = (version, revision) => makeReceipt({ version,
   identity: { ...clone(identity), sourceRevision: revision }, completed: true,
   packageChecksums: Object.fromEntries(crates.map((crate) => [crate, checksum])) })
 
+const preparationIdentity = { repository: identity.repository, sourceRevision, sourceTree: '1'.repeat(40),
+  workflowRevision: '2'.repeat(40), runId: '123', runAttempt: 1, version: '2026.10.8', ciRun: null }
+
+test('original signed admission tolerates only a later attempt of the identical main CI run', async () => {
+  const recorded = { schemaVersion: 1, sourceRevision, ciRun: { id: 100, run_attempt: 1, html_url: 'fixture/main/100' },
+    premerge: { runId: 90, runAttempt: 1, snapshotRevision: '1'.repeat(40) } }
+  const current = { ...clone(recorded), ciRun: { ...recorded.ciRun, run_attempt: 2 } }
+  const originalBytes = JSON.stringify(signReceipt({ validation: recorded }, signingKey))
+  assert.equal(assertAdmissionCompatibility(recorded, current), true)
+  assert.equal(assertAdmissionCompatibility(undefined, undefined), true)
+  assert.equal(JSON.stringify(signReceipt({ validation: recorded }, signingKey)), originalBytes,
+    'Original signed fields remain immutable')
+  for (const value of [undefined, { ...current, ciRun: { ...current.ciRun, run_attempt: 0 } },
+    { ...current, ciRun: { ...current.ciRun, run_attempt: '2' } },
+    { ...current, ciRun: { ...current.ciRun, id: 101 } },
+    { ...current, sourceRevision: '2'.repeat(40) },
+    { ...current, premerge: { ...current.premerge, runId: 91 } },
+    { ...current, premerge: { ...current.premerge, runAttempt: 2 } },
+    { ...current, premerge: { ...current.premerge, snapshotRevision: '2'.repeat(40) } },
+  ]) assert.throws(() => assertAdmissionCompatibility(recorded, value))
+  assert.throws(() => assertAdmissionCompatibility(current, recorded))
+  assert.throws(() => assertAdmissionCompatibility(undefined, current))
+  const receipt = makeReceipt({ validation: recorded })
+  const prepared = createPreparation({ release: release(receipt), receipt }, { ...preparationIdentity, validation: current }, 2)
+  assert.deepEqual(prepared.receipt.validation, recorded)
+  validatePreparation(prepared, { ...preparationIdentity, runAttempt: 2, validation: current }, 2)
+  const { context } = fixture({ releases: async () => [release(receipt)] })
+  const resumed = await resumePrepared(context, prepared, { ...preparationIdentity, runAttempt: 2, validation: current }, 2)
+  assert.deepEqual(resumed.receipt.validation, recorded)
+  const upgraded = makeReceipt({ validation: current })
+  context.releases = async () => [release(upgraded)]
+  await assert.rejects(() => resumePrepared(context, prepared,
+    { ...preparationIdentity, runAttempt: 2, validation: current }, 2), /deep-equal/)
+})
+
+test('preparation output freezes one signed reservation and accepts later attempts of the same run', () => {
+  const receipt = makeReceipt()
+  const prepared = createPreparation({ release: release(receipt), receipt }, preparationIdentity, 2)
+  receipt.packageChecksums['bamboo-domain'] = checksum
+  assert.deepEqual(prepared.receipt.packageChecksums, {}, 'Snapshot must not mutate with the crate publisher')
+  validatePreparation(prepared, { ...preparationIdentity, runAttempt: 3 }, 2)
+  for (const mutate of [
+    p => { p.runId = '124' }, p => { p.runAttempt = 4 }, p => { p.runAttempt = 0 },
+    p => { p.workflowRevision = '3'.repeat(40) }, p => { p.sourceTree = '3'.repeat(40) },
+    p => { p.sourceRevision = '3'.repeat(40) }, p => { p.repository = 'foreign/repository' },
+    p => { p.releaseId = 0 }, p => { p.contractVersion = 1 },
+    p => { p.receipt.version = '2026.10.9' }, p => { p.receipt.automatic = false },
+    p => { delete p.receipt.authentication }, p => { p.receipt.identity.sourceRevision = '4'.repeat(40) },
+  ]) {
+    const changed = clone(prepared); mutate(changed)
+    assert.throws(() => validatePreparation(changed, { ...preparationIdentity, runAttempt: 3 }, 2))
+  }
+})
+
+test('crate fan-out resumes the same version using fresh signed progress and sealed frontend bytes', async () => {
+  const initial = makeReceipt()
+  const prepared = createPreparation({ release: release(initial), receipt: initial }, preparationIdentity, 2)
+  const progress = makeReceipt({ completed: true, packageChecksums: Object.fromEntries(crates.map(name => [name, checksum])) })
+  const entry = release(progress, { draft: false })
+  const { context, calls } = fixture({ releases: async () => [entry], registry: async () => ({ checksum }),
+    ensureFrontend: async (_release, _receipt, options) => { assert.deepEqual(options, { sealed: true }); calls.push('sealed-frontend') } })
+  const resumed = await resumePrepared(context, prepared, { ...preparationIdentity, runAttempt: 2 }, 2)
+  assert.equal(resumed.release.id, entry.id)
+  assert.deepEqual(resumed.receipt, progress)
+  assert.deepEqual(calls, ['tag', 'sealed-frontend'])
+  await publish(context, resumed.release, resumed.receipt)
+  assert.ok(!calls.includes('reserve'), 'No worker may allocate a second version')
+  assert.ok(!calls.some(call => call.startsWith('publish:')), 'Completed closure is verified without uploading again')
+})
+
+test('crate resume refuses lost reservations, forged progress and changed prepared frontend before publication', async () => {
+  const initial = makeReceipt()
+  const prepared = createPreparation({ release: release(initial), receipt: initial }, preparationIdentity, 2)
+  for (const entry of [null, release(initial, { id: 43 }),
+    release(initial, { tag_name: 'v2026.10.9' }), release(initial, { target_commitish: 'main' }),
+    release(makeReceipt({ frontendBytes: { ...frontendBytes, archiveSha256: '1'.repeat(64) } })),
+    release({ ...initial, completed: true }),
+    release(makeReceipt({ completed: false }), { draft: false }),
+  ]) {
+    const { context, calls } = fixture({ releases: async () => entry ? [entry] : [] })
+    await assert.rejects(() => resumePrepared(context, prepared, preparationIdentity, 2))
+    assert.deepEqual(calls, [])
+  }
+  const forged = clone(prepared); forged.receipt.frontendBytes.archiveSha256 = '2'.repeat(64)
+  const { context, calls } = fixture({ releases: async () => [release(initial)] })
+  await assert.rejects(() => resumePrepared(context, forged, preparationIdentity, 2), /authentication failed/)
+  assert.deepEqual(calls, [])
+})
+
 test('automatic release accepts only the exact successful same-repository main push CI', () => {
   const base = { eventName: 'workflow_run', repository: identity.repository, sourceRevision,
     workflowRevision: 'c'.repeat(40), event: { workflow_run: { name: 'CI', event: 'push',
@@ -84,6 +174,42 @@ test('automatic release accepts only the exact successful same-repository main p
   }
   assert.throws(() => validateSource({ ...base, eventName: 'workflow_dispatch' }), /Unsupported/)
   assert.throws(() => validateSource({ ...base, eventName: 'push' }), /Unsupported/)
+})
+
+test('admission provenance binds the real main run and separately records full pre-merge acceptance', () => {
+  const repository = identity.repository
+  const run = { id: 111, run_attempt: 2, name: 'CI', event: 'push', conclusion: 'success',
+    head_branch: 'main', head_sha: sourceRevision, status: 'completed',
+    repository: { full_name: repository }, head_repository: { full_name: repository },
+    html_url: `https://github.com/${repository}/actions/runs/111` }
+  const validation = { schemaVersion: 1, kind: 'bamboo-main-release-admission/v1', repository,
+    sourceRevision, sourceTree: '1'.repeat(40), releasePr: 42,
+    cutRevision: '2'.repeat(40), releaseHead: '3'.repeat(40), baseRevision: '4'.repeat(40), ciRun: clone(run),
+    premerge: { runId: 222, runAttempt: 1, workflowId: 333, checkSuiteId: 444,
+      snapshotRevision: '5'.repeat(40), url: `https://github.com/${repository}/actions/runs/222` } }
+  const request = { eventName: 'workflow_run', event: { workflow_run: run }, repository, sourceRevision,
+    sourceTree: validation.sourceTree, validation }
+  assert.equal(validateSource(request), true)
+  for (const change of [
+    proof => { proof.schemaVersion = 9 }, proof => { proof.kind = 'arbitrary-status' },
+    proof => { proof.sourceRevision = '6'.repeat(40) }, proof => { proof.sourceTree = '7'.repeat(40) },
+    proof => { proof.releaseHead = 'dev' }, proof => { proof.releasePr = 0 },
+    proof => { proof.ciRun.run_attempt++ }, proof => { proof.ciRun.head_sha = proof.releaseHead },
+    proof => { proof.ciRun.html_url = proof.premerge.url }, proof => { proof.ciRun.repository.full_name = 'foreign/repo' },
+    proof => { proof.premerge.runAttempt = 0 }, proof => { delete proof.premerge.snapshotRevision },
+    proof => { proof.premerge.url = 'https://example.invalid/forged' },
+  ]) {
+    const changed = clone(validation)
+    change(changed)
+    assert.throws(() => validateSource({ ...request, validation: changed }))
+  }
+  assert.throws(() => validateSource({ ...request, event: { workflow_run: { ...run, conclusion: 'failure' } } }),
+    'provenance must never replace official publication authority')
+  const body = receiptBody(makeReceipt({ ciRun: run.html_url, validation }))
+  assert.ok(body.includes(`Main publication CI: ${run.html_url}`))
+  assert.ok(body.includes(`Full pre-merge acceptance: ${validation.premerge.url}`))
+  assert.ok(body.includes(`tested snapshot ${validation.premerge.snapshotRevision}`))
+  assert.doesNotMatch(body, /Validated release CI:/)
 })
 
 test('date sequence advances beyond crate versions, tags and draft reservations in UTC', () => {
@@ -843,6 +969,8 @@ test('interrupted initial frontend upload can recover before any crate, while pa
     assets: [Buffer.from('old partial manifest'), null], readAsset: async (asset) => asset,
     writeFiles: async () => { throw new Error('Should replace initial assets') },
     saveReceipt: async () => { calls.push('atomic-body') }, upload: async () => { calls.push('upload') } }
+  await assert.rejects(() => preserveFrontend({ ...options, sealed: true }), /sealed frontend assets/)
+  assert.deepEqual(calls, [], 'Even an empty crate closure cannot replace frontend bytes after fan-out')
   await preserveFrontend(options)
   assert.deepEqual(calls, ['atomic-body', 'upload'])
   assert.deepEqual(receipt.frontendBytes, options.stagedBytes)
@@ -855,15 +983,18 @@ test('interrupted initial frontend upload can recover before any crate, while pa
 test('complete publication keeps canonical main CI authority and authenticates empty-association evidence', () => {
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
   const automatic = workflow.split('  automatic:\n')[1]
-  const preflight = automatic.split('      - uses: actions/checkout')[0]
+  const loader = automatic.split('      - uses: actions/checkout')[0]
+  assert.match(loader, /contents\/scripts\/main-release-admission\.py\?ref=/)
+  assert.match(loader, /hashlib\.sha256\(body\)\.hexdigest\(\) == expected/)
+  const preflight = fs.readFileSync('scripts/main-release-admission.py', 'utf8')
   assert.match(preflight, /assert event_name == "workflow_run"/)
   assert.match(preflight, /run = event\["workflow_run"\]/)
   assert.match(preflight, /source = run\["head_sha"\]/)
   assert.doesNotMatch(preflight, /matches\[0\]|--method=GET|accepted_ci_run/)
-  assert.match(preflight, /assert pre\.get\("pull_requests"\) == \[\]/)
+  assert.match(preflight, /assert binds_pr\(pre\) or pre\.get\("pull_requests"\) == \[\]/)
   assert.match(preflight, /hashlib\.sha256\(raw\)\.hexdigest\(\) in REVIEWED_PRODUCERS/)
   assert.match(preflight, /suite\["app"\]\["databaseId"\] == 15368/)
-  assert.match(preflight, /actions\/runs\/\{pre\['id'\]\}\/attempts\/\{attempt\}\/jobs/)
+  assert.match(preflight, /actions\/runs\/\{pre\['id'\]\}\/attempts\/\{actual\}\/jobs/)
   assert.match(preflight, /--allow-escape-sequences/)
   assert.match(preflight, /assert len\(records\) == 1/)
   assert.match(preflight, /tested\["parents"\]\] == \[base, head\]/)
@@ -913,9 +1044,10 @@ test('trusted manual publication and automatic receipts share a queue while dry 
   assert.ok(automatic.indexOf('Authorize the exact source') < automatic.indexOf('uses: actions/checkout'))
   assert.ok(automatic.indexOf('Verify checkout matches') < automatic.indexOf('node scripts/'))
   assert.doesNotMatch(automatic, /inputs\.version/)
-  assert.doesNotMatch(automatic, /workflow_dispatch|inputs\.complete_release|accepted_ci_run|SOURCE_VALIDATION/)
+  assert.doesNotMatch(automatic, /workflow_dispatch|inputs\.complete_release|accepted_ci_run/)
+  assert.match(automatic, /SOURCE_VALIDATION: \$\{\{ steps.source.outputs.validation \}\}/)
   for (const name of ['BAMBOO_RELEASE_TOKEN', 'BAMBOO_RELEASE_SIGNING_KEY']) {
-    assert.equal(automatic.split(`secrets.${name}`).length - 1, 2)
+    assert.equal(automatic.split(`secrets.${name}`).length - 1, 3, 'Preparation plus signed crate resume and publication share existing authority')
   }
   assert.doesNotMatch(workflow, /VERSION="\$\{\{ github.event.inputs.version/)
   const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8')
@@ -939,8 +1071,9 @@ test('automatic publication grants only job-local Actions reads for its CI proof
     '      contents: write\n      actions: read\n      checks: write\n',
   ]) assert.throws(() => verify(invalid))
   assert.match(automatic, /GH_TOKEN: \$\{\{ github\.token \}\}/)
-  assert.match(automatic, /actions\/runs\/\{/)
-  assert.match(automatic, /actions\/jobs\/\{job_id\}\/logs/)
+  const admission = fs.readFileSync('scripts/main-release-admission.py', 'utf8')
+  assert.match(admission, /actions\/runs\/\{/)
+  assert.match(admission, /actions\/jobs\/\{job_id\}\/logs/)
 })
 
 test('the real manual version resolver has no signing or API dependency and never emits invalid output', (t) => {
@@ -976,8 +1109,10 @@ test('the real manual version resolver has no signing or API dependency and neve
 })
 
 function workflowPython(name, filename = '.github/workflows/publish-crate.yml') {
-  return fs.readFileSync(filename, 'utf8').split(`      - name: ${name}`)[1]
-    .split("          python3 - <<'PY'\n")[1].split('\n          PY')[0]
+  const step = fs.readFileSync(filename, 'utf8').split(`      - name: ${name}`)[1]
+  const match = step.match(/          python3 - <<'(PY(?:THON)?)'\n([\s\S]*?)\n          \1\n/)
+  assert.ok(match, `missing Python body: ${name}`)
+  return match[2]
     .split('\n').map((line) => line.replace(/^ {10}/, '')).join('\n')
 }
 
@@ -1190,14 +1325,37 @@ test('automatic inline bootstrap requires actual normal merge and CI evidence wi
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t, workflowPython('Authorize the exact source before checkout'))
 })
 
-test('reviewed CI v2 preserves source admission and matches the current complete definition', async (t) => {
+test('reviewed historical CI v2 preserves source admission', async (t) => {
   const v1 = fs.readFileSync('scripts/tests/fixtures/main-authority-ci-v1.yml', 'utf8')
   const v2 = fs.readFileSync('scripts/tests/fixtures/main-authority-ci-v2.yml', 'utf8')
-  assert.equal(v2, fs.readFileSync('.github/workflows/ci.yml', 'utf8'))
   const sourceJob = (definition) => definition.split('  validation-source:\n')[1].split('\n  quick-checks:')[0]
   assert.equal(sourceJob(v2), sourceJob(v1))
   assert.notEqual(sha256(v1), sha256(v2))
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t, workflowPython('Authorize the exact source before checkout'), 'v2')
+})
+
+test('current admission pins the complete workflow and helper without a circular hash', () => {
+  const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8')
+  const publisher = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+  const helper = fs.readFileSync('scripts/main-release-admission.py', 'utf8')
+  const pin = /ADMISSION_HELPER_SHA256: "([0-9a-f]{64})"/g
+  assert.deepEqual([...ci.matchAll(pin)].map(match => match[1]), [sha256(helper)])
+  assert.deepEqual([...publisher.matchAll(pin)].map(match => match[1]), [sha256(helper)])
+  const normalized = ci.replace(pin, 'ADMISSION_HELPER_SHA256: "<PINNED_ADMISSION_HELPER>"')
+  assert.ok(helper.includes(`CURRENT_PRODUCER = "${sha256(normalized)}"`))
+  assert.equal(workflowPython('Authenticate completed release acceptance before checkout', '.github/workflows/ci.yml'),
+    workflowPython('Authorize the exact source before checkout'))
+  assert.match(helper, /final executable must be rebuilt for source=/)
+})
+
+test('lightweight main CI retains independently authenticated complete release evidence', async (t) => {
+  await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
+    workflowPython('Authorize the exact source before checkout'), 'v3')
+})
+
+test('main-push admission executes the same pinned verifier with read-only authority', async (t) => {
+  await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
+    workflowPython('Authenticate completed release acceptance before checkout', '.github/workflows/ci.yml'), 'v3', 'main')
 })
 
 test('temporary manifest stamping uses exact internal dependency versions and real package versions', (t) => {

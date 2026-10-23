@@ -123,6 +123,11 @@ if (args[0] === 'api' && route?.endsWith('/branches/main')) {
     const second = await controller.plan(context)
     assert.equal(second.release.id, 42)
     assert.deepEqual(second.receipt, initial)
+    const preparedIdentity = { repository: 'bigduu/Bamboo-agent', sourceRevision: source, sourceTree: source,
+      workflowRevision: 'b'.repeat(40), runId: '100', runAttempt: 1, version, ciRun: context.ciRun }
+    const preparation = controller.createPreparation(second, preparedIdentity, 2)
+    const resumed = await controller.resumePrepared(context, preparation, { ...preparedIdentity, runAttempt: 2 }, 2)
+    assert.deepEqual(resumed.receipt, initial)
     state = JSON.parse(fs.readFileSync(stateFile))
     assert.equal(state.uploads.length, 1, 'Existing original attachments are restored, not overwritten')
     assert.equal(state.patches.length, 1)
@@ -144,6 +149,10 @@ if (args[0] === 'api' && route?.endsWith('/branches/main')) {
     assert.equal(receipt.version, version)
     assert.deepEqual(receipt.identity, initial.identity)
     assert.deepEqual(receipt.packageChecksums, {'bamboo-agent': 'd'.repeat(64)})
+    const completed = await controller.resumePrepared(context, preparation, { ...preparedIdentity, runAttempt: 3 }, 2)
+    assert.equal(completed.receipt.completed, true, 'A failed-only rerun reads completed crate progress from the original reservation')
+    assert.deepEqual(completed.receipt.packageChecksums, receipt.packageChecksums)
+    assert.deepEqual(JSON.parse(fs.readFileSync(stateFile)), state, 'Resuming a sealed completed release performs no writes')
     // The real API adapters must recheck authority after planning, not cache it.
     state.main = 'b'.repeat(40)
     fs.writeFileSync(stateFile, JSON.stringify(state))

@@ -1,0 +1,37 @@
+name: Source-bound grouped tests
+description: Compile inventories, run one crate block, or verify every latest block receipt.
+inputs:
+  command:
+    description: build, run or summary
+    required: true
+  directory:
+    description: Owned evidence directory under target
+    required: true
+  profile:
+    description: Explicit Cargo input profile for build
+    required: false
+  plan-id:
+    description: Exact same-run compile plan artifact ID
+    required: false
+  plan-key:
+    description: Expected compile plan SHA-256
+    required: false
+  block-id:
+    description: One inventoried crate block
+    required: false
+outputs:
+  plan_id:
+    description: Immutable plan artifact ID
+  plan_key:
+    description: Source and input-bound plan digest
+  blocks:
+    description: Complete libtest matrix
+  docs:
+    description: Complete doctest matrix
+  has_docs:
+    description: Whether the profile contains executable doctests
+  node:
+    description: Actual controller Node version
+runs:
+  using: node24
+  main: index.cjs

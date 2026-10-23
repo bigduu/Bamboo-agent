@@ -22,6 +22,7 @@ function script(step) {
 }
 function assertRouting(source) {
   assertSharedBuild(source);
+  assertMainAdmission(source);
   const quick = job(source, "quick-checks");
   assert.match(quick, /^    name: Quick Checks$/m);
   assert.match(quick, /^    if: github.event_name == 'pull_request' && github.base_ref == 'dev'$/m);
@@ -30,13 +31,15 @@ function assertRouting(source) {
   assert.doesNotMatch(quick, /cargo (build|test|check|clippy)|continue-on-error|--test-skip/);
   const full = job(source, "test");
   assert.match(full, /^    name: Test$/m);
-  assert.match(full, /^    needs: validation-source$/m);
+  assert.match(full, /^    needs: \[validation-source, main-release-admission, test-build, test-blocks, test-doctests, test-ssh-build, test-ssh\]$/m);
   assert.match(full, /^    if: always\(\) && !cancelled\(\)$/m);
   assert.match(full, /- name: Require validation admission\n        env:\n          SOURCE_RESULT: \$\{\{ needs.validation-source.result \}\}\n          FULL_VALIDATION: \$\{\{ needs.validation-source.outputs.full \}\}/);
   assert.match(full, /test "\$SOURCE_RESULT" = success/);
   assert.match(full, /\*\) exit 1 ;;/);
-  for (const command of ["cargo build --locked", "cargo test --locked --no-run", "cargo test --locked --no-fail-fast"]) assert.ok(full.includes(`        run: ${command}\n`));
-  for (const id of ["msrv", "tls-fixture-test", "tool-event-recorder-e2e", "e2e-test", "lint", "build", "docs", "security", "deny"]) {
+  assert.ok(full.includes("        run: cargo build --locked\n"));
+  assert.match(full, /command: summary/);
+  assert.doesNotMatch(full, /run: cargo test/);
+  for (const id of ["msrv", "tls-fixture-test", "tool-event-recorder-e2e", "lint", "build", "docs", "security", "deny"]) {
     const block = job(source, id);
     assert.match(block, /^    needs: validation-source$/m);
     assert.ok(block.includes("needs.validation-source.outputs.full == 'true'"));
@@ -50,7 +53,7 @@ function assertRouting(source) {
   assert.match(source, /group:.*inputs.snapshot_sha/);
 }
 
-test("required Test compiles dev while only snapshots/main run full validation", () => {
+test("required Test compiles dev, validates snapshots fully and authenticates main admission", () => {
   assertRouting(ci);
   for (const [from, to] of [
     ["name: Quick Checks", "name: Test"],
@@ -58,7 +61,7 @@ test("required Test compiles dev while only snapshots/main run full validation",
     ["if: always() && !cancelled()", "if: needs.validation-source.outputs.full == 'true'"],
     ['test "$SOURCE_RESULT" = success', 'true # ignored source result'],
     ["if: needs.validation-source.outputs.full == 'true'", "if: true"],
-    ["        run: cargo test --locked --no-fail-fast\n", "        continue-on-error: true\n        run: cargo test --locked --no-fail-fast\n"],
+    ["        run: cargo build --locked\n", "        continue-on-error: true\n        run: cargo build --locked\n"],
   ]) assert.throws(() => assertRouting(ci.replace(from, to)), `reject ${to}`);
 });
 
@@ -75,9 +78,11 @@ test("snapshot controller executes positive and fail-closed routing cases", (t) 
       GITHUB_REF: "refs/heads/dev", GITHUB_BASE_REF: "", GITHUB_OUTPUT: output, ...overrides } });
     return { ...result, output: fs.readFileSync(output, "utf8") };
   };
-  for (const overrides of [ {}, { GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "main" }, { GITHUB_EVENT_NAME: "push", GITHUB_REF: "refs/heads/main" } ]) {
+  for (const overrides of [ {}, { GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "main" } ]) {
     const result = run(overrides); assert.equal(result.status, 0, result.stderr); assert.equal(result.output, "full=true\n");
   }
+  const main = run({ GITHUB_EVENT_NAME: "push", GITHUB_REF: "refs/heads/main" });
+  assert.equal(main.status, 0); assert.equal(main.output, "full=false\n");
   const dev = run({ GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev" });
   assert.equal(dev.status, 0); assert.equal(dev.output, "full=false\n");
   for (const overrides of [
@@ -119,6 +124,35 @@ test("frontend source acceptance leaves ordinary dev admission but retains exact
 test("publication still requires the actual successful same-repository main push CI", () => {
   assert.match(publisher, /workflow_run:\n    workflows: \[CI\]/);
   for (const condition of ["github.event.workflow_run.event == 'push'", "github.event.workflow_run.conclusion == 'success'", "github.event.workflow_run.head_branch == 'main'", "github.event.workflow_run.head_repository.full_name == github.repository"]) assert.ok(publisher.includes(condition));
+});
+
+function assertMainAdmission(source) {
+  const admission = job(source, "main-release-admission");
+  assert.match(admission, /name: Main Release Admission/);
+  assert.match(admission, /needs: validation-source/);
+  assert.match(admission, /if: always\(\) && !cancelled\(\) && github.event_name == 'push' && github.ref == 'refs\/heads\/main'/);
+  assert.match(admission, /permissions:\n      contents: read\n      actions: read/);
+  assert.match(admission, /ADMISSION_MODE: main/);
+  assert.doesNotMatch(admission, /actions\/checkout|contents: write|cargo |secrets\./);
+  const full = job(source, "test");
+  assert.match(full, /MAIN_ADMISSION_RESULT: \$\{\{ needs.main-release-admission.result \}\}/);
+  assert.match(full, /test "\$MAIN_ADMISSION_RESULT" = success/);
+  const [, admissionStep, ...sourceSteps] = full.split(/(?=^      - )/m);
+  assert.match(admissionStep, /name: Require validation admission/);
+  for (const step of sourceSteps) {
+    assert.match(step, /^        if: (?:needs.validation-source.outputs.full == 'true'|(?:always\(\) && |failure\(\) && )?github.event_name != 'push'|github.event_name == 'pull_request' && github.base_ref == 'dev')$/m,
+      "main must perform admission only, without checkout, compilation or duplicate tests");
+  }
+}
+
+test("main Test reports real admission while the full suite remains on pre-merge/manual sources", () => {
+  assertMainAdmission(ci);
+  for (const [from, to] of [
+    ["ADMISSION_MODE: main", "ADMISSION_MODE: publication"],
+    ['test "$MAIN_ADMISSION_RESULT" = success', 'true'],
+    ["if: github.event_name != 'push'", "if: always()"],
+    ["contents: read\n      actions: read", "contents: write\n      actions: read"],
+  ]) assert.throws(() => assertMainAdmission(ci.replace(from, to)));
 });
 
 test("source guards propagate Git inspection errors and reject dirty or mismatched sources", (t) => {
@@ -166,15 +200,15 @@ function assertSharedBuild(source) {
   const [settings, ...steps] = build.split(/(?=^      - )/m);
   assert.match(settings, /^    name: Test$/m);
   assert.match(settings, /^    if: always\(\) && !cancelled\(\)$/m);
-  assert.match(settings, /^    needs: validation-source$/m);
+  assert.match(settings, /^    needs: \[validation-source, main-release-admission, test-build, test-blocks, test-doctests, test-ssh-build, test-ssh\]$/m);
   assert.ok(settings.includes("timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"));
   assert.doesNotMatch(settings, /^    continue-on-error:/m);
   const cargo = steps.filter((step) => step.startsWith("      - name: Build locked Rust workspace\n"));
   assert.equal(cargo.length, 1);
-  assert.equal(cargo[0].trimEnd(), "      - name: Build locked Rust workspace\n        run: cargo build --locked");
+  assert.equal(cargo[0].trimEnd(), "      - name: Build locked Rust workspace\n        if: github.event_name == 'pull_request' && github.base_ref == 'dev'\n        run: cargo build --locked");
   assert.doesNotMatch(build, /continue-on-error:|\|\| true|\|\| exit 0/);
   assert.doesNotMatch(build, /^          ref:/m, "retain the actual event merge source");
-  for (const name of ["Test CI workflow policy", "Check formatting", "Compile locked Rust test targets", "Test locked Rust workspace"]) {
+  for (const name of ["Test CI workflow policy", "Check formatting", "Require every default block and doctest result"]) {
     const step = steps.find((item) => item.startsWith(`      - name: ${name}\n`));
     assert.ok(step);
     assert.match(step, /^        if: needs.validation-source.outputs.full == 'true'$/m, `${name} must not become a dev merge gate`);
@@ -193,26 +227,27 @@ test("one required Test honestly compiles dev without imposing auxiliary checks 
     ["run: cargo build --locked", "run: cargo build --locked || true"],
     ["run: cargo build --locked", "continue-on-error: true\n        run: cargo build --locked"],
     ["run: cargo build --locked", "if: false\n        run: cargo build --locked"],
-    ["needs: validation-source", "needs: quick-checks"],
+    ["needs: [validation-source, main-release-admission, test-build, test-blocks, test-doctests, test-ssh-build, test-ssh]", "needs: quick-checks"],
     ["name: Test CI workflow policy\n        if: needs.validation-source.outputs.full == 'true'", "name: Test CI workflow policy"],
     ["name: Check formatting\n        if: needs.validation-source.outputs.full == 'true'", "name: Check formatting"],
-    ["name: Compile locked Rust test targets\n        if: needs.validation-source.outputs.full == 'true'", "name: Compile locked Rust test targets"],
-    ["name: Test locked Rust workspace\n        if: needs.validation-source.outputs.full == 'true'", "name: Test locked Rust workspace"],
+    ["name: Require every default block and doctest result\n        if: needs.validation-source.outputs.full == 'true'", "name: Require every default block and doctest result"],
   ]) assert.throws(() => assertSharedBuild(ci.replace(from, to)), `reject ${to}`);
 });
 
 test("required Test admission accepts only the matching successful dev/full source proof", () => {
   const shell = script(job(ci, "test").split("      - uses:")[0]);
   const run = (overrides = {}) => spawnSync("bash", ["-c", shell], { encoding: "utf8", env: { ...process.env,
-    SOURCE_RESULT: "success", FULL_VALIDATION: "false", GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev", GITHUB_REF: "refs/pull/1/merge", ...overrides } });
+    SOURCE_RESULT: "success", FULL_VALIDATION: "false", MAIN_ADMISSION_RESULT: "success", GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev", GITHUB_REF: "refs/pull/1/merge", ...overrides } });
   for (const overrides of [{}, { GITHUB_BASE_REF: "main", FULL_VALIDATION: "true" },
     { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", FULL_VALIDATION: "true" },
-    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", FULL_VALIDATION: "true" }]) assert.equal(run(overrides).status, 0);
+    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", FULL_VALIDATION: "false" }]) assert.equal(run(overrides).status, 0);
   for (const overrides of [
     { FULL_VALIDATION: "true" }, { FULL_VALIDATION: "" }, { FULL_VALIDATION: "unknown" },
     { GITHUB_BASE_REF: "main" }, { GITHUB_BASE_REF: "integration/batch" },
     { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "" },
     { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/dev", FULL_VALIDATION: "true" },
+    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", FULL_VALIDATION: "true" },
+    ...["failure", "cancelled", "skipped", "", "unknown"].map(MAIN_ADMISSION_RESULT => ({ GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", MAIN_ADMISSION_RESULT })),
     { GITHUB_EVENT_NAME: "pull_request_target" }, { GITHUB_EVENT_NAME: "unknown" },
   ]) assert.notEqual(run(overrides).status, 0);
   for (const result of ["failure", "cancelled", "skipped", "", "unknown"]) {
