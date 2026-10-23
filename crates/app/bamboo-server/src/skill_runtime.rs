@@ -324,7 +324,8 @@ impl Policy {
     // No other policy or uncommitted Source change is accepted here.
     fn check_ordinary_session(&self, session: &Session) -> Result<bool, ToolError> {
         self.check_execution_identity(session)?;
-        let tightened = self.permission_mode == SessionPermissionMode::Bypass
+        let tightened = !self.orchestration_only
+            && self.permission_mode == SessionPermissionMode::Bypass
             && permission_mode(session) == SessionPermissionMode::Default;
         if (!tightened && permission_mode(session) != self.permission_mode)
             || session
@@ -543,7 +544,22 @@ impl NativeRun {
         }
         Ok(())
     }
+    async fn check_durable_session(&self) -> Result<(), ToolError> {
+        let binding = self.source.binding()?;
+        let session = self
+            .policy
+            .state
+            .storage
+            .load_session(&self.policy.session_id)
+            .await
+            .map_err(|e| denied(&e.to_string()))?
+            .ok_or_else(|| denied("Native Session disappeared"))?;
+        binding.check_session(session).await
+    }
     async fn check_ordinary_durable_session(&self) -> Result<(), ToolError> {
+        if self.policy.orchestration_only {
+            return self.check_durable_session().await;
+        }
         let session = self
             .policy
             .state
