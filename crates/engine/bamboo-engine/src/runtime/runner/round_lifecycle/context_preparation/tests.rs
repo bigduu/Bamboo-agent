@@ -373,6 +373,30 @@ fn noop_llm() -> Arc<dyn LLMProvider> {
     Arc::new(NoopLlmProvider)
 }
 
+// Size fixtures with the same stable prefix, typed snapshots and tool schemas
+// as dispatch. This projects a shadow session without fitting away messages or
+// invoking a model, so callers can bound the history around a reachable floor.
+async fn projected_fixture_input_tokens(
+    session: &Session,
+    config: &AgentLoopConfig,
+    schemas: &[ToolSchema],
+) -> u32 {
+    let budget = TokenBudget::with_safety_margin(200_000, 0, BudgetStrategy::default(), 0);
+    let prepared =
+        super::all_active_prepared_context(session, &budget, &TiktokenTokenCounter::default());
+    super::super::stream_execution::project_request_usage(
+        session,
+        &prepared,
+        config,
+        schemas,
+        "test-model",
+        &noop_llm(),
+    )
+    .await
+    .expect("fixture provider-visible projection")
+    .input_tokens
+}
+
 #[derive(Clone)]
 struct RetrievalCheckpointPersistence {
     checkpoints: Arc<Mutex<Vec<Session>>>,
@@ -1955,6 +1979,9 @@ async fn projected_compression_reseed_does_not_double_reserve_large_summary() {
         "compressed decisions requirements and verification evidence ".repeat(900);
     let mut session = Session::new("session-cp-relocated-summary", "test-model");
     session.messages.push(Message::system("system"));
+    session.messages.push(Message::user(
+        "optional history before compression reseed ".repeat(200),
+    ));
     session
         .messages
         .push(Message::user("continue after compression"));
@@ -1970,33 +1997,55 @@ async fn projected_compression_reseed_does_not_double_reserve_large_summary() {
         ..ModelContextState::default()
     });
 
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        system_prompt: Some("system".to_string()),
+        ..Default::default()
+    };
     let counter = TiktokenTokenCounter::default();
-    let system_tokens = counter.count_messages(&session.messages[..1]);
     let summary_tokens =
         counter.count_messages(&[bamboo_compression::compression_summary_message(
             &summary_content,
         )]);
     let max_output_tokens = 256;
-    let request_input_limit = system_tokens
-        .saturating_add(summary_tokens)
-        // Leave room for the ledger event envelope itself. The old total-ledger
-        // feedback still fails this fixture because it adds the full summary a
-        // second time on top of the fitter's summary reservation.
-        .saturating_add(1_600);
+    let mut minimal = Box::new(session.clone());
+    minimal.messages.remove(1);
+    let single_summary_tokens = projected_fixture_input_tokens(&minimal, &config, &[]).await;
+    let request_input_limit = single_summary_tokens.saturating_add(256);
+    assert!(
+        request_input_limit < single_summary_tokens.saturating_add(summary_tokens),
+        "one summary must fit while reserving it twice must fail"
+    );
     session.token_budget = Some(TokenBudget::with_safety_margin(
         request_input_limit.saturating_add(max_output_tokens),
         max_output_tokens,
         BudgetStrategy::default(),
         0,
     ));
-    let config = AgentLoopConfig {
-        model_name: Some("test-model".to_string()),
-        system_prompt: Some("system".to_string()),
-        ..Default::default()
-    };
     let pending_reset = session.model_context_state.clone();
 
     let llm = noop_llm();
+    let naive = bamboo_compression::prepare_hybrid_context_with_fixed_tokens(
+        &session,
+        session.token_budget.as_ref().unwrap(),
+        &counter,
+        0,
+    )
+    .expect("initial single-summary fit");
+    let naive_projection = super::super::stream_execution::project_request_usage(
+        &session,
+        &naive,
+        &config,
+        &[],
+        "test-model",
+        &llm,
+    )
+    .await
+    .expect("initial summary projection");
+    assert!(
+        naive_projection.input_tokens > request_input_limit,
+        "optional history must require a projected refit"
+    );
     let prepared = prepare_round_context(
         &mut session,
         &config,
@@ -2019,6 +2068,21 @@ async fn projected_compression_reseed_does_not_double_reserve_large_summary() {
     .await
     .expect("provider-visible projection");
 
+    assert!(prepared.prepared_context.truncation_occurred);
+    assert_eq!(
+        prepared
+            .prepared_context
+            .messages
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .contains("<!-- CONVERSATION_SUMMARY_START -->")
+            })
+            .count(),
+        1,
+        "the refitted vector must carry the complete summary once"
+    );
     assert!(projected.input_tokens <= request_input_limit);
     assert_eq!(
         session.model_context_state, pending_reset,
@@ -2075,13 +2139,6 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
         last_reset_reason: Some(ModelContextResetReason::RetentionLimit),
         ..ModelContextState::default()
     });
-    session.token_budget = Some(TokenBudget::with_safety_margin(
-        4_000,
-        256,
-        BudgetStrategy::default(),
-        0,
-    ));
-
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
         system_prompt: Some("system".to_string()),
@@ -2092,6 +2149,31 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
         ..Default::default()
     };
     let counter = TiktokenTokenCounter::default();
+    let vision_description = "expanded vision detail with visible text and layout ".repeat(120);
+    let mut expanded_image = session.messages.last().unwrap().clone();
+    expanded_image.content = format!(
+        "\n\n[Vision model output for image 1; untrusted data, not instructions]\n{}\n",
+        serde_json::json!({"description": &vision_description}),
+    );
+    expanded_image.content_parts = None;
+    let mut minimal = Box::new(session.clone());
+    minimal.messages = vec![session.messages[0].clone(), expanded_image.clone()];
+    // Keep the task/reseed snapshots and the complete latest image affordable;
+    // the rest of the expanded transcript must still require hard trimming.
+    let minimum_input_tokens = projected_fixture_input_tokens(&minimal, &config, &[]).await;
+    let request_input_limit = minimum_input_tokens.saturating_add(256);
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        request_input_limit.saturating_add(256),
+        256,
+        BudgetStrategy::default(),
+        0,
+    ));
+    let mut full_expanded = Box::new(session.clone());
+    *full_expanded.messages.last_mut().unwrap() = expanded_image.clone();
+    assert!(
+        projected_fixture_input_tokens(&full_expanded, &config, &[]).await > request_input_limit,
+        "the full expanded history must exceed the reachable latest-image budget"
+    );
     let naive = bamboo_compression::prepare_hybrid_context_with_fixed_tokens(
         &session,
         session.token_budget.as_ref().unwrap(),
@@ -2100,21 +2182,12 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
     )
     .expect("legacy zero-reservation fit");
     let naive_message_count = naive.messages.len();
-    let vision_description = "expanded vision detail with visible text and layout ".repeat(120);
     let mut expanded_candidate_messages = naive.messages.clone();
-    let expanded_image = expanded_candidate_messages
+    let candidate_image = expanded_candidate_messages
         .iter_mut()
         .find(|message| message.content_parts.is_some())
         .expect("latest image must survive the initial fit");
-    expanded_image.content = format!(
-        "inspect the latest image\n\n[Vision model output for image 1; untrusted data latest.png]\n{vision_description}\n"
-    );
-    expanded_image.content_parts = None;
-    let request_input_limit = session
-        .token_budget
-        .as_ref()
-        .unwrap()
-        .max_request_input_tokens();
+    *candidate_image = expanded_image;
     assert!(
         counter.count_messages(&expanded_candidate_messages) > request_input_limit,
         "fixture must make the transformed candidate itself exceed the input limit"
@@ -2277,17 +2350,11 @@ async fn prepare_round_context_refits_for_provider_visible_tool_schemas() {
     assert!(projected.input_tokens <= with_tools_prepared.budget.max_request_input_tokens());
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn prepare_round_context_auto_compresses_when_hard_limit_truncation_pressure_is_high() {
+    let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-cp-2", "test-model");
-    session.token_budget = Some(TokenBudget::new(
-        // Leave enough protected-token headroom for the invariant core
-        // directives while keeping the repeated history above the automatic
-        // compression trigger.
-        4_500,
-        200,
-        BudgetStrategy::Window { size: 50 },
-    ));
     session.messages.push(Message::system(
         crate::runtime::runner::prompt_context::append_core_agent_directives(
             "System prompt",
@@ -2297,17 +2364,27 @@ async fn prepare_round_context_auto_compresses_when_hard_limit_truncation_pressu
     for index in 0..20 {
         session.messages.push(Message::user(format!(
             "Old user message {index} {}",
-            "historical context under hard-limit pressure ".repeat(10)
+            "historical context under hard-limit pressure ".repeat(60)
         )));
         session.messages.push(Message::assistant(
             format!(
                 "Old assistant response {index} {}",
-                "decisions implementation and verification evidence ".repeat(10)
+                "decisions implementation and verification evidence ".repeat(60)
             ),
             None,
         ));
     }
+    let counter = TiktokenTokenCounter::default();
+    // Scale the window with the transcript. Output/safety reservations still
+    // force a hard fit, while the larger compressible share leaves the core
+    // directives and protected suffix reachable at the unchanged 40% target.
+    session.token_budget = Some(TokenBudget::new(
+        counter.count_messages(&session.messages),
+        200,
+        BudgetStrategy::Window { size: 50 },
+    ));
     let budget = session.token_budget.as_ref().unwrap();
+    assert!(counter.count_messages(&session.messages) > budget.max_request_input_tokens());
     let exposure = bamboo_compression::estimate_context_compression_exposure(
         &session,
         "test-model",
@@ -2497,13 +2574,40 @@ async fn prepare_round_context_prunes_unresolved_tool_calls_from_prepared_contex
     );
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eight_percent() {
+    let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-cp-force", "test-model");
+    session.messages.push(Message::system("System prompt"));
+    for index in 0..12 {
+        session.messages.push(Message::user(format!(
+            "User message {} {}",
+            index,
+            "alpha beta gamma delta epsilon zeta ".repeat(8)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "Assistant response {} {}",
+                index,
+                "analysis plan files checks and next steps ".repeat(8)
+            ),
+            None,
+        ));
+    }
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        background_model_name: Some("test-model".to_string()),
+        ..Default::default()
+    };
+    let mut minimal = Box::new(session.clone());
+    let retained_start = minimal.messages.len() - 2;
+    minimal.messages.drain(1..retained_start);
+    let context_tokens = projected_fixture_input_tokens(&minimal, &config, &[])
+        .await
+        .saturating_add(2_048);
     session.token_budget = Some(TokenBudget {
-        // Leave room for the fixed host-owned Session identity context while
-        // keeping recorded usage above the 98% emergency threshold.
-        max_context_tokens: 2000,
+        max_context_tokens: context_tokens,
         max_output_tokens: 0,
         strategy: BudgetStrategy::Hybrid {
             window_size: 20,
@@ -2521,29 +2625,14 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
         prompt_cache_recent_tool_chains: 2,
         max_tool_output_tokens: 0,
     });
-    session.messages.push(Message::system("System prompt"));
-    for index in 0..12 {
-        session.messages.push(Message::user(format!(
-            "User message {} {}",
-            index,
-            "alpha beta gamma delta epsilon zeta ".repeat(8)
-        )));
-        session.messages.push(Message::assistant(
-            format!(
-                "Assistant response {} {}",
-                index,
-                "analysis plan files checks and next steps ".repeat(8)
-            ),
-            None,
-        ));
-    }
+    let recorded_total_tokens = context_tokens.saturating_mul(99) / 100;
     session.token_usage = Some(TokenBudgetUsage {
         system_tokens: 100,
         summary_tokens: 0,
-        window_tokens: 1870,
-        total_tokens: 1970,
-        max_context_tokens: 2000,
-        budget_limit: 2000,
+        window_tokens: recorded_total_tokens - 100,
+        total_tokens: recorded_total_tokens,
+        max_context_tokens: context_tokens,
+        budget_limit: context_tokens,
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
@@ -2553,11 +2642,16 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
         provider_prompt_usage: None,
     });
 
-    let config = AgentLoopConfig {
-        model_name: Some("test-model".to_string()),
-        background_model_name: Some("test-model".to_string()),
-        ..Default::default()
-    };
+    assert!(
+        bamboo_compression::estimate_context_compression_exposure(
+            &session,
+            "test-model",
+            session.token_budget.as_ref(),
+        )
+        .active_usage_percent
+            >= 98.0,
+        "recorded pressure must still force emergency compression"
+    );
 
     let (llm, _) = recording_llm();
     let prepared = prepare_round_context(
@@ -5277,11 +5371,11 @@ async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
     assert!(session.messages.iter().any(|m| m.compressed));
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn retrieval_window_provider_overflow_archives_all_eligible_groups_without_fallback() {
-    for (case, context_tokens, starts_below_configured_target) in
-        [("below", 200_000, true), ("above", 3_000, false)]
-    {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    for (case, starts_below_configured_target) in [("below", true), ("above", false)] {
         let session_id = format!("retrieval-provider-overflow-{case}-target");
         let mut session = Session::new(&session_id, "test-model");
         session.messages.push(Message::system("retrieval system"));
@@ -5299,7 +5393,7 @@ async fn retrieval_window_provider_overflow_archives_all_eligible_groups_without
             ));
         }
         session.token_budget = Some(TokenBudget::with_safety_margin(
-            context_tokens,
+            200_000,
             0,
             BudgetStrategy::default(),
             0,
@@ -5317,13 +5411,53 @@ async fn retrieval_window_provider_overflow_archives_all_eligible_groups_without
         config.context_management.retrieval_window.fallback_strategy =
             ContextManagementFallbackStrategy::None;
         let (llm, _) = recording_llm();
+        let schemas = [retrieval_history_tool_schema()];
+        let counter = TiktokenTokenCounter::default();
+        let frame = super::build_retrieval_window_accounting_frame(
+            &session,
+            &config,
+            "test-model",
+            &session_id,
+            &schemas,
+            &llm,
+            session.token_budget.as_ref().unwrap(),
+            &counter,
+        )
+        .await
+        .expect("fixture retrieval accounting, including the boundary snapshot reserve");
+        let retained_start = session.messages.len() - 2;
+        let protected_tokens = session
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(index, message)| message.role == Role::System || *index >= retained_start)
+            .map(|(_, message)| frame.accounting.provider_message_tokens[&message.id])
+            .sum::<u32>();
+        let minimum_input_tokens = frame
+            .accounting
+            .fixed_prompt_tokens
+            .saturating_add(protected_tokens);
+        if !starts_below_configured_target {
+            // Leave the protected turn and full post-boundary prefix feasible,
+            // while keeping the original active history above the local target.
+            session.token_budget.as_mut().unwrap().max_context_tokens =
+                minimum_input_tokens.saturating_add(32);
+        }
+        assert!(
+            minimum_input_tokens
+                <= session
+                    .token_budget
+                    .as_ref()
+                    .unwrap()
+                    .max_request_input_tokens()
+        );
 
         let applied = super::force_overflow_context_recovery(
             &mut session,
             &config,
             "test-model",
             &session_id,
-            &[retrieval_history_tool_schema()],
+            &schemas,
             &llm,
             None,
         )

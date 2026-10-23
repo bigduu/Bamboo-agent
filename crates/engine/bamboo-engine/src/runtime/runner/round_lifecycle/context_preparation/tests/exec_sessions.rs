@@ -422,9 +422,28 @@ async fn exec_handles_survive_hard_history_trimming_without_summary() {
     let completion = Arc::new(CompletionRecorder::default());
     let (handle, args, result) = start_gated_shell(owner, &gate, completion.clone()).await;
     let mut session = shell_history(owner, &args, &result);
-    session.token_budget.as_mut().unwrap().max_context_tokens = 4_000;
     let config = AgentLoopConfig::default();
     let schemas = shell_schemas();
+    let mut minimal = Box::new(session.clone());
+    minimal
+        .messages
+        .retain(|message| message.role != Role::Tool && message.tool_calls.is_none());
+    // Include the actual live handle snapshot and both provider-visible schemas.
+    // A small history allowance must still exclude the oversized tool chain.
+    let request_floor = projected_fixture_input_tokens(&minimal, &config, &schemas).await;
+    let budget = session.token_budget.as_mut().unwrap();
+    budget.max_context_tokens = request_floor
+        .saturating_add(256)
+        .saturating_add(budget.max_output_tokens);
+    assert!(
+        TiktokenTokenCounter::default().count_messages(&session.messages)
+            > session
+                .token_budget
+                .as_ref()
+                .unwrap()
+                .max_request_input_tokens(),
+        "the full tool chain must still require hard history trimming"
+    );
     let prepared = prepare_round_context(
         &mut session,
         &config,
