@@ -154,6 +154,20 @@ function validateReceipt(receipt, identity, crates, version = receipt?.version) 
   return receipt
 }
 
+// Preserve original signed acceptance when the same main CI is rerun.
+function assertAdmissionCompatibility(recorded, current) {
+  if (recorded === undefined && current === undefined) return true
+  assert.ok(recorded && current, 'Both original and current source admission records are required')
+  const previous = recorded.ciRun?.run_attempt, latest = current.ciRun?.run_attempt
+  assert.ok(Number.isSafeInteger(previous) && previous >= 1 &&
+    Number.isSafeInteger(latest) && latest >= previous, 'Source admission main CI attempt must not move backwards')
+  // Only a rerun of the same main CI may advance. Source, premerge runtime
+  // acceptance and every other field remain identical to the signed original.
+  assert.deepEqual({ ...recorded, ciRun: { ...recorded.ciRun, run_attempt: latest } }, current,
+    'Source admission changed beyond the same main CI run attempt')
+  return true
+}
+
 function nextVersion(versions, now = new Date(), occupiedVersions = []) {
   const prefix = `${now.getUTCFullYear()}.${now.getUTCMonth() + 1}.`
   let maximum = 0n
@@ -719,5 +733,5 @@ module.exports = { assertVersion, assertManualVersion, validateSource, validateR
   plan, publish, makeContext, makeRecoveryContext, assertCurrentMain, currentMainWrite, sha256, githubArgs, receiptBody, readBodyReceipt,
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
-  verifyRegistrySource, highestStableVersion, spawnCommand, command }
+  verifyRegistrySource, highestStableVersion, spawnCommand, command, assertAdmissionCompatibility }
 if (require.main === module) main().catch((error) => { console.error(error); process.exitCode = 1 })

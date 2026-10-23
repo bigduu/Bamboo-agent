@@ -9,7 +9,7 @@ const { assertVersion, assertManualVersion, validateSource, validateReceipt, nex
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend,
   shouldMakeLatest, gitIsAncestor, canonicalJson, signReceipt, authenticateReceipt,
   readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration, verifyRegistrySource, highestStableVersion,
-  command, spawnCommand, assertCurrentMain, currentMainWrite } = require('./crate-release.cjs')
+  command, spawnCommand, assertCurrentMain, currentMainWrite, assertAdmissionCompatibility } = require('./crate-release.cjs')
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 const sourceRevision = 'a'.repeat(40)
@@ -68,6 +68,27 @@ function fixture(extra = {}) {
 const completedReceipt = (version, revision) => makeReceipt({ version,
   identity: { ...clone(identity), sourceRevision: revision }, completed: true,
   packageChecksums: Object.fromEntries(crates.map((crate) => [crate, checksum])) })
+
+test('original signed admission tolerates only a later attempt of the identical main CI run', () => {
+  const recorded = { schemaVersion: 1, sourceRevision, ciRun: { id: 100, run_attempt: 1, html_url: 'fixture/main/100' },
+    premerge: { runId: 90, runAttempt: 1, snapshotRevision: '1'.repeat(40) } }
+  const current = { ...clone(recorded), ciRun: { ...recorded.ciRun, run_attempt: 2 } }
+  const originalBytes = JSON.stringify(signReceipt({ validation: recorded }, signingKey))
+  assert.equal(assertAdmissionCompatibility(recorded, current), true)
+  assert.equal(assertAdmissionCompatibility(undefined, undefined), true)
+  assert.equal(JSON.stringify(signReceipt({ validation: recorded }, signingKey)), originalBytes,
+    'Original signed fields remain immutable')
+  for (const value of [undefined, { ...current, ciRun: { ...current.ciRun, run_attempt: 0 } },
+    { ...current, ciRun: { ...current.ciRun, run_attempt: '2' } },
+    { ...current, ciRun: { ...current.ciRun, id: 101 } },
+    { ...current, sourceRevision: '2'.repeat(40) },
+    { ...current, premerge: { ...current.premerge, runId: 91 } },
+    { ...current, premerge: { ...current.premerge, runAttempt: 2 } },
+    { ...current, premerge: { ...current.premerge, snapshotRevision: '2'.repeat(40) } },
+  ]) assert.throws(() => assertAdmissionCompatibility(recorded, value))
+  assert.throws(() => assertAdmissionCompatibility(current, recorded))
+  assert.throws(() => assertAdmissionCompatibility(undefined, current))
+})
 
 test('automatic release accepts only the exact successful same-repository main push CI', () => {
   const base = { eventName: 'workflow_run', repository: identity.repository, sourceRevision,
