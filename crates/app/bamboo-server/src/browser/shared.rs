@@ -701,7 +701,7 @@ pub(super) struct SharedManager {
 }
 
 impl SharedManager {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(super) async fn test_core(&self) -> Option<Arc<BrowserSession>> {
         self.runtime
             .lock()

@@ -169,7 +169,7 @@ test('shared download arbitration preserves per-chat page and byte ownership', a
   assert.equal(results[0].status, 'fulfilled', JSON.stringify(results.map(result =>
     ({ status: result.status, code: result.reason?.code, message: result.reason?.message }))));
   assert.equal(results[1].status, 'rejected');
-  assert.equal(results[1].reason.code, 'browser_download_busy');
+  assert.equal(results[1].reason.code, 'browser_busy');
   assert.equal(Buffer.from(results[0].value.data_base64, 'base64').toString(), 'synthetic shared download');
   assert.equal((await a.state()).active_tab_id, aState.active_tab_id);
   assert.equal((await b.state()).active_tab_id, bState.active_tab_id);

@@ -5,6 +5,8 @@
 mod concurrent_drain_tests;
 mod launch_admission;
 #[cfg(test)]
+mod lease_free_retirement_tests;
+#[cfg(test)]
 mod persistence_tests;
 #[cfg(test)]
 mod platform_mode_tests;
