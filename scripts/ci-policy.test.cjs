@@ -740,7 +740,11 @@ test("this frozen batch cannot save cache on source, integration, promotion or m
   assert.ok(actor.includes(cacheSaveIf("github.event_name == 'pull_request' && github.base_ref == 'dev'")))
   assert.match(docs, /cache-on-failure: true\n          save-if: \$\{\{ env\.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' \}\}/u)
   const publisher = readFileSync(".github/workflows/publish-crate.yml", "utf8")
-  assert.doesNotMatch(publisher, /(?:swatinem\/rust-cache|actions\/cache)@|\bcache-to:/u)
+  const nativePublisher = publisher.split('  executables:\n')[1].split('  publish-executables:\n')[0]
+  assert.match(nativePublisher, /uses: Swatinem\/rust-cache@[0-9a-f]{40}/u)
+  assert.match(nativePublisher, /cache-workspace-crates: false/u)
+  assert.match(nativePublisher, /save-if: \$\{\{ steps\.cache_policy\.outputs\.save == 'true' \}\}/u)
+  assert.doesNotMatch(publisher.replace(nativePublisher, ''), /(?:[Ss]watinem\/rust-cache|actions\/cache)@|\bcache-to:/u)
 })
 const frontendHead = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
 const frontendJobs = (source) => {

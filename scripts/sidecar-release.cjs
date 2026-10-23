@@ -6,7 +6,8 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
 const { assertVersion, validateSource, readBodyReceipt, validateReceipt,
-  readAuthenticatedReceipt, assertSigningConfiguration, assertCurrentMain, currentMainWrite, signReceipt, authenticateReceipt, spawnCommand } = require('./crate-release.cjs')
+  readAuthenticatedReceipt, assertSigningConfiguration, assertCurrentMain, currentMainWrite, signReceipt, authenticateReceipt,
+  validatePreparation, assertAdmissionCompatibility, spawnCommand } = require('./crate-release.cjs')
 
 const REPOSITORY = 'bigduu/Bamboo-agent'
 const MANIFEST = 'bamboo-sidecars-v2.json'
@@ -315,11 +316,38 @@ function publishedRelease(identity, { signingKey, signingKeyDigest, request = gh
   assert.equal(receipt.automatic, true)
   assert.equal(receipt.completed, true)
   assert.equal(receipt.ciRun, identity.ciRun)
-  if (identity.validation) assert.deepEqual(receipt.validation, identity.validation)
+  if (identity.validation) assertAdmissionCompatibility(receipt.validation, identity.validation)
   assert.ok(receipt.crates.includes('bamboo-agent'))
   assert.ok(Array.isArray(release.assets))
   assert.equal(new Set(release.assets.map((asset) => asset.name)).size, release.assets.length)
   return { release, receipt }
+}
+
+function preparedFrontend(identity, { preparation, contractVersion, inputDirectory }) {
+  // The controller emits this signed snapshot through its own job output.
+  // Read-only native workers cannot rely on draft Release visibility. Transport
+  // only the two preserved frontend files and verify against the independent
+  // output; neither a signing key nor GitHub publication credentials are needed.
+  validatePreparation(preparation, identity, contractVersion)
+  const directory = fs.lstatSync(inputDirectory)
+  assert.ok(directory.isDirectory() && !directory.isSymbolicLink())
+  const receipt = preparation.receipt
+  const expected = [
+    ['frontend-manifest.json', receipt.frontendBytes.manifestSha256, 1024 * 1024],
+    ['lotus-frontend.zip', receipt.frontendBytes.archiveSha256, 256 * 1024 * 1024],
+  ]
+  assert.deepEqual(fs.readdirSync(inputDirectory).sort(), expected.map(([name]) => name).sort(),
+    'Preparation transport must contain exactly the preserved frontend files')
+  const files = expected.map(([name, digest, maximum]) => {
+    const file = path.join(inputDirectory, name)
+    const info = fileIdentity(file, maximum)
+    assert.equal(info.sha256, digest, 'Transported frontend differs from the independent preparation output')
+    const bytes = fs.readFileSync(file)
+    assert.equal(bytes.length, info.sizeBytes)
+    assert.equal(sha256(bytes), digest)
+    return { name, bytes }
+  })
+  return { receipt, files }
 }
 
 function assetBytes(asset, maximum) {
@@ -333,7 +361,7 @@ function assetBytes(asset, maximum) {
 
 function validateBuildReceipt(receipt, identity, target) {
   assert.equal(receipt?.schemaVersion, 1)
-  if (identity.validation) assert.deepEqual(receipt.validation, identity.validation)
+  if (identity.validation) assertAdmissionCompatibility(receipt.validation, identity.validation)
   for (const key of ['repository', 'version', 'sourceRevision', 'sourceTree', 'workflowRevision', 'runId', 'ciRun']) {
     assert.equal(receipt[key], identity[key], `Executable build provenance mismatch: ${key}`)
   }
@@ -433,7 +461,7 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
   const bytes = await readAsset(checkpoint, 1024 * 1024)
   assert.ok(bytes.length <= 1024 * 1024)
   const proof = authenticateReceipt(JSON.parse(bytes), signingKey)
-  if (identity.validation) assert.deepEqual(proof.validation, identity.validation)
+  if (identity.validation) assertAdmissionCompatibility(proof.validation, identity.validation)
   assert.equal(proof.schemaVersion, contract.version)
   assert.equal(proof.kind, contract.kind)
   for (const key of ['repository', 'version', 'sourceRevision', 'sourceTree', 'ciRun']) {
@@ -446,7 +474,8 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
   // The caller already revalidates current protected-main promotion; a later
   // dispatch must not relabel the immutable checkpoint as its own fresh build.
   const originalBuildIdentity = { ...identity, workflowRevision: proof.workflowRevision,
-    runId: proof.runId, runAttempt: proof.runAttempt }
+    runId: proof.runId, runAttempt: proof.runAttempt,
+    ...(proof.validation ? { validation: proof.validation } : {}) }
   assert.deepEqual(proof.builds?.map((item) => item.target), contract.targets)
   for (const item of proof.builds) {
     validateBuildReceipt(item, originalBuildIdentity, item.target)
@@ -568,6 +597,6 @@ async function main() {
 module.exports = { REPOSITORY, MANIFEST, HOST_ASSET, PROVENANCE, TARGETS, LEGACY_TARGETS, HOST_FILES, MAX_BINARY, MAX_HOST,
   contractForVersion, sourceContractVersion, boundSourceContract,
   artifactName, targetOutputKey, sha256, fileIdentity, createBrowserHost, createManifest, manifestBytes, validateManifestV1, validateManifestV2,
-  binaryArchitecture, execute, git, workflowIdentity, publishedRelease, assetBytes,
+  binaryArchitecture, execute, git, workflowIdentity, publishedRelease, preparedFrontend, assetBytes,
   validateBuildReceipt, expectedBuildBindings, assembleRelease, recoverPublishedRelease, publishAssets }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })
