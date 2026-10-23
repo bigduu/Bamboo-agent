@@ -128,6 +128,7 @@ struct Host {
     child: Option<std::process::Child>,
     base: String,
     cut: PathBuf,
+    log: PathBuf,
 }
 
 impl Host {
@@ -135,7 +136,8 @@ impl Host {
         let id = uuid::Uuid::new_v4();
         let ready = home.join(format!("fixture-ready-{id}.json"));
         let cut = home.join(format!("fixture-claimed-{id}.json"));
-        let log = std::fs::File::create(home.join(format!("fixture-host-{id}.log"))).unwrap();
+        let log_path = home.join(format!("fixture-host-{id}.log"));
+        let log = std::fs::File::create(&log_path).unwrap();
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--ignored",
@@ -159,6 +161,7 @@ impl Host {
             child: Some(child),
             base: String::new(),
             cut,
+            log: log_path,
         };
         host.base = tokio::time::timeout(WAIT, async {
             loop {
@@ -199,6 +202,67 @@ impl Drop for Host {
             let _ = child.wait();
         }
     }
+}
+
+fn recovery_diagnostics(home: &Path, host: &mut Host, provider_calls: usize) -> String {
+    let directory = home.join("sessions").join(ROOT);
+    let mut state = serde_json::Map::new();
+    state.insert("now".into(), json!(Utc::now()));
+    state.insert("provider_calls".into(), json!(provider_calls));
+    state.insert(
+        "host_exit".into(),
+        json!(host
+            .child
+            .as_mut()
+            .map(|child| format!("{:?}", child.try_wait()))),
+    );
+    for name in ["session.json", "actor-authority.json"] {
+        let value = std::fs::read(directory.join(name))
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                serde_json::from_slice::<Value>(&bytes).map_err(|error| error.to_string())
+            });
+        state.insert(name.into(), match value {
+            Ok(value) if name == "session.json" => json!({
+                "metadata":value["metadata"],
+                "version":value["version"],
+                "messages":value["messages"].as_array().map(|messages| messages.iter().map(|message| json!({
+                    "id":message["id"], "role":message["role"],
+                    "content":message["content"].as_str().map(|text| text.chars().take(512).collect::<String>())
+                })).collect::<Vec<_>>())
+            }),
+            Ok(value) => value,
+            Err(error) => json!({"read_error":error}),
+        });
+    }
+    for name in ["inbox/cur", "inbox/new", "inbox/admitted"] {
+        let files = std::fs::read_dir(directory.join(name)).map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        });
+        state.insert(
+            name.into(),
+            match files {
+                Ok(files) => json!(files),
+                Err(error) => json!({"read_error":error.to_string()}),
+            },
+        );
+    }
+    let log = std::fs::read_to_string(&host.log).unwrap_or_else(|error| error.to_string());
+    let log_tail = log
+        .chars()
+        .rev()
+        .take(16384)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!(
+        "synthetic recovery state: {}\nHost B log tail:\n{log_tail}",
+        Value::Object(state)
+    )
 }
 
 // This is a test executable's entrypoint, never a production environment hook.
@@ -373,6 +437,13 @@ async fn claimed_owned_input_survives_real_host_process_loss_and_restarts_once()
             .unwrap();
     let a_activation = a_owner.activation.unwrap();
     assert!(input_expiry <= a_activation.lease_expires_at);
+    eprintln!(
+        "synthetic restart claim: now={} input_expiry={} root_expiry={} attempt={}",
+        Utc::now(),
+        input_expiry,
+        a_activation.lease_expires_at,
+        a_activation.attempt
+    );
     let main: Session =
         serde_json::from_slice(&std::fs::read(directory.join("session.json")).unwrap()).unwrap();
     assert!(!main.messages.iter().any(|message| message.id == ID));
@@ -402,7 +473,12 @@ async fn claimed_owned_input_survives_real_host_process_loss_and_restarts_once()
         }
     })
     .await
-    .expect("B recovers after actual Root and Inbox lease expiry");
+    .unwrap_or_else(|error| {
+        panic!(
+            "B recovers after actual Root and Inbox lease expiry: {error:?}\n{}",
+            recovery_diagnostics(&home, &mut b, probe.calls.load(Ordering::SeqCst))
+        )
+    });
     let canonical = SessionStoreV2::new(home.clone())
         .await
         .unwrap()
