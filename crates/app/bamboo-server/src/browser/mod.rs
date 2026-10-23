@@ -741,14 +741,9 @@ impl BrowserSession {
             command.env("BAMBOO_BROWSER_LAUNCH_ATTEMPT", attempt.to_string());
         }
         let startup_deadline = Instant::now() + BROWSER_COMMAND_DEADLINE;
-        let child = match lifecycle.spawn_child(&mut command) {
-            Ok(child) => child,
-            Err(error) => {
-                // No child or launch permission exists and no new marker was
-                // created. Never clear a pre-existing launch generation here.
-                return Err(error);
-            }
-        };
+        // A spawn failure has no child, permission or newly created marker.
+        // Never clear a pre-existing launch generation on that error.
+        let child = lifecycle.spawn_child(&mut command)?;
         let session = if let Some(attempt) = attempt {
             let admitted = launch_admission::admit(
                 child,

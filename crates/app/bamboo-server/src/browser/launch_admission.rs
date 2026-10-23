@@ -88,6 +88,13 @@ struct BootstrapOwner {
     native_writer_possible: bool,
 }
 
+impl BootstrapOwner {
+    fn mark_native_writer_possible(&mut self) {
+        // Monotonic state transition, also consumed by Drop on early errors.
+        self.native_writer_possible = true;
+    }
+}
+
 impl Drop for BootstrapOwner {
     fn drop(&mut self) {
         let Some(mut child) = self.child.take() else {
@@ -167,11 +174,11 @@ pub(super) fn admit(
         .ok_or_else(unavailable)?;
         if !valid_ready(&ready, attempt) || !reader.buffer().is_empty() {
             // A host violating the bootstrap contract is not a proven safe failure.
-            owner.native_writer_possible = true;
+            owner.mark_native_writer_possible();
             return Err(unavailable());
         }
         lifecycle.ensure_writer_admission()?;
-        owner.native_writer_possible = true;
+        owner.mark_native_writer_possible();
         let generation = owner.lease.as_mut().unwrap().begin_launch()?.to_owned();
         let mut grant = PREFIX.to_vec();
         grant.extend(
@@ -377,5 +384,49 @@ mod tests {
         assert!(scratch_path.is_dir());
         assert!(profile::acquire_shared(&profiles).is_err());
         drop(session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalid_ready_then_exit_zero_still_quarantines_the_unknown_contract() {
+        use std::process::Stdio;
+
+        let root = tempfile::tempdir().unwrap();
+        let profiles = root.path().join("profiles");
+        let lease = profile::acquire_shared(&profiles).unwrap();
+        let control = lease.path.clone();
+        let scratch = tempfile::tempdir_in(root.path()).unwrap();
+        let scratch_path = scratch.path().to_path_buf();
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("printf '{}\\n'; exit 0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let lifecycle = BrowserLifecycle::default();
+        let result = admit(
+            command.spawn().unwrap(),
+            lease,
+            scratch,
+            &lifecycle,
+            uuid::Uuid::new_v4(),
+            Instant::now() + super::super::BROWSER_COMMAND_DEADLINE,
+        )
+        .await;
+        assert!(result.is_err());
+        let owners = lifecycle.owners.lock().unwrap().clone();
+        for owner in owners {
+            tokio::time::timeout(super::super::BROWSER_REAP_DEADLINE, owner.wait())
+                .await
+                .unwrap();
+            assert!(owner.is_quarantined());
+        }
+        assert!(control
+            .join(".bamboo-profile-writer-exit-unconfirmed")
+            .is_file());
+        assert!(scratch_path.is_dir());
+        assert!(profile::acquire_shared(&profiles).is_err());
     }
 }
