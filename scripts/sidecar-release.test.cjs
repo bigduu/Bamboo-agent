@@ -709,6 +709,8 @@ test('workflow retains successful-CI authority and binds its native matrix to th
   const crates = source.split('  publish-crates:\n')[1].split('  executables:\n')[0]
   assert.doesNotMatch(preparation, /crate-release\.cjs" publish|crate-release-lock\.py stamp/)
   assert.match(crates, /needs: automatic/)
+  assert.ok(crates.includes('SOURCE_VALIDATION: ${{ needs.automatic.outputs.source_validation }}'))
+  assert.doesNotMatch(crates, /steps\.source\./, 'The crate worker must inherit preparation evidence across jobs')
   assert.doesNotMatch(crates, /needs:.*executables|crate-release\.cjs" plan/)
   assert.match(crates, /crate-release\.cjs" resume/)
   assert.ok(crates.indexOf('crate-release.cjs" resume') < crates.indexOf('crate-release-lock.py stamp'))

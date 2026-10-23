@@ -42,7 +42,7 @@ const job = (id) => {
 }
 
 const comprehensiveOnly =
-  "if: github.event_name != 'pull_request' || github.base_ref == 'main'"
+  "if: needs.validation-source.outputs.full == 'true'"
 
 function assertCargoFailureCollection(source) {
   const commands = [...source.matchAll(/(?:run: )?cargo test --locked([^\n]*)/gu)]
@@ -189,7 +189,7 @@ test("main-push validation remains reachable by the existing automatic publisher
   )
   assert.match(
     testJob,
-    /- name: Setup Node\.js\n        uses: actions\/setup-node@v7\n        with:\n          node-version: lts\/\*/u,
+    /- name: Setup Node\.js\n        if: github.event_name != 'push'\n        uses: actions\/setup-node@v7\n        with:\n          node-version: lts\/\*/u,
     "Node must be installed before Rust hook tests on dev pull requests",
   )
 
@@ -239,7 +239,7 @@ test("locked Rust test compilation has a separate budget before the complete sui
     previousIndex = index
 
     assert.doesNotMatch(step, /^        continue-on-error:/mu)
-    if (name === "Build locked Rust workspace") assert.doesNotMatch(step, /^        if:/mu)
+    if (name === "Build locked Rust workspace") assert.match(step, /^        if: github.event_name != 'push'$/mu)
     else assert.match(step, /^        if: needs\.validation-source\.outputs\.full == 'true'$/mu)
     assert.deepEqual(
       [...step.matchAll(/^        run: (.*)$/gmu)].map((match) => match[1]),
@@ -420,7 +420,7 @@ test("frozen promotion bootstrap is read-only and leaves merge-tree validation i
   assert.match(bootstrap, /opener\.open\(request, timeout=30\)/u)
   // No source checkout is pinned over the PR's synthetic merge result.
   for (const id of ["test", "lint", "e2e-test", "build"]) {
-    assert.match(job(id), /- uses: actions\/checkout@v7\n\n/u)
+    assert.match(job(id), /- uses: actions\/checkout@v7\n(?:        if: github.event_name != 'push'\n)?\n/u)
   }
   for (const context of ["Promotion Source", "Test", "Lint", "E2E Tests", "Build (${{ matrix.os }})"]) {
     assert.ok(workflow.includes(`name: ${context}\n`), `retain required context: ${context}`)

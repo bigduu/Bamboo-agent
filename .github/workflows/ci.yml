@@ -9,12 +9,12 @@ on:
         description: Exact 40-character SHA of the selected ref to validate as one frozen batch
         required: true
         type: string
-  # Protected main-push CI supplies the existing automatic publication authority.
+  # Main-push CI authenticates pre-merge acceptance for automatic publication.
   pull_request:
     branches: [ dev, main ]
 
 # Queue every main push for its own release gate; supersede iterative PR/manual
-# validation independently. Promotion builds still fan out to three platforms.
+# validation independently. Full promotion validation still covers three platforms.
 concurrency:
   group: ci-${{ github.event_name }}-${{ (github.event_name == 'workflow_dispatch' && inputs.snapshot_sha) || github.event.pull_request.number || github.ref }}
   # Every main merge needs a completed CI gate before its own publication.
@@ -69,12 +69,56 @@ jobs:
               ;;
             push)
               test "$GITHUB_REF" = refs/heads/main
-              full=true
               ;;
             *) exit 1 ;;
           esac
           printf 'Event source: %s; full validation: %s\n' "$GITHUB_SHA" "$full"
           printf 'full=%s\n' "$full" >> "$GITHUB_OUTPUT"
+
+  main-release-admission:
+    name: Main Release Admission
+    needs: validation-source
+    if: always() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Authenticate completed release acceptance before checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RESULT: ${{ needs.validation-source.result }}
+          FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
+          ADMISSION_MODE: main
+          ADMISSION_HELPER_SHA256: "e4fce79b854a8a3012462fc5489349a8ba3f0fcc8f9e78a1e7975bbbef3ec806"
+        run: |
+          python3 - <<'PYTHON'
+          import base64
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          assert repository == "bigduu/Bamboo-agent"
+          revision = os.environ["GITHUB_WORKFLOW_SHA"]
+          expected = os.environ["ADMISSION_HELPER_SHA256"]
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          assert re.fullmatch(r"[0-9a-f]{64}", expected)
+          # Fixed-origin GET only, before any source checkout or credential-bearing code.
+          response = json.loads(subprocess.check_output(
+              ["gh", "api", "--hostname", "github.com",
+               f"repos/{repository}/contents/scripts/main-release-admission.py?ref={revision}"],
+              text=True, timeout=30))
+          assert response["encoding"] == "base64" and len(response["content"]) <= 180000
+          body = base64.b64decode(response["content"], validate=False)
+          assert len(body) <= 128000 and hashlib.sha256(body).hexdigest() == expected, "Unknown admission verifier"
+          exec(compile(body, "pinned-main-release-admission", "exec"), {
+              "__name__": "__main__", "ADMISSION_SCRIPT_SHA256": expected,
+          })
+          PYTHON
 
   quick-checks:
     name: Quick Checks
@@ -190,7 +234,7 @@ jobs:
 
   test:
     name: Test
-    needs: validation-source
+    needs: [validation-source, main-release-admission]
     # A source-gate failure must fail required Test, never turn it into a skip.
     if: always() && !cancelled()
     runs-on: ubuntu-latest
@@ -200,19 +244,25 @@ jobs:
         env:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
+          MAIN_ADMISSION_RESULT: ${{ needs.main-release-admission.result }}
         shell: bash
         run: |
           set -euo pipefail
           test "$SOURCE_RESULT" = success
           case "$GITHUB_EVENT_NAME:${GITHUB_BASE_REF:-}:$FULL_VALIDATION" in
             pull_request:dev:false|pull_request:main:true|workflow_dispatch::true) ;;
-            push::true) test "$GITHUB_REF" = refs/heads/main ;;
+            push::false)
+              test "$GITHUB_REF" = refs/heads/main
+              test "$MAIN_ADMISSION_RESULT" = success
+              ;;
             *) exit 1 ;;
           esac
 
       - uses: actions/checkout@v7
+        if: github.event_name != 'push'
 
       - name: Require the exact clean event source
+        if: github.event_name != 'push'
         shell: bash
         run: |
           set -euo pipefail
@@ -223,6 +273,7 @@ jobs:
           sha256sum Cargo.lock
 
       - name: Setup Node.js
+        if: github.event_name != 'push'
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
@@ -236,11 +287,11 @@ jobs:
         run: node --test scripts/supervisor-native-acceptance.test.cjs
 
       - name: Test frontend artifact and release policies
-        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        if: needs.validation-source.outputs.full == 'true'
         run: node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
 
       - name: Stage frontend package
-        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        if: needs.validation-source.outputs.full == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -248,11 +299,13 @@ jobs:
           node -e "for (const file of ['crates/app/bamboo-server/frontend_package/lotus-frontend.zip', 'crates/app/bamboo-server/frontend_package/frontend-manifest.json']) require('node:fs').accessSync(file)"
 
       - name: Install Rust
+        if: github.event_name != 'push'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
       - name: Record the full validation toolchain
+        if: github.event_name != 'push'
         run: |
           rustc --version --verbose
           cargo --version --verbose
@@ -262,6 +315,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Rust cache
+        if: github.event_name != 'push'
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-test-${{ runner.os }}
@@ -269,7 +323,7 @@ jobs:
           save-if: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'dev')) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Verify published server crate owns the frontend package
-        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        if: needs.validation-source.outputs.full == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -286,6 +340,7 @@ jobs:
           done
 
       - name: Build locked Rust workspace
+        if: github.event_name != 'push'
         run: cargo build --locked
 
       - name: Compile locked Rust test targets
@@ -305,7 +360,7 @@ jobs:
           RUST_MIN_STACK: "8388608"
 
       - name: Preserve failed synthetic Ticket fixture evidence
-        if: failure()
+        if: failure() && github.event_name != 'push'
         uses: actions/upload-artifact@v7
         with:
           name: ticket-fixture-failure-${{ github.run_id }}-${{ github.run_attempt }}
@@ -319,19 +374,19 @@ jobs:
           retention-days: 7
 
       - name: Build examples
-        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        if: needs.validation-source.outputs.full == 'true'
         # Compile-only (no network/config needed): guards `examples/*.rs` —
         # and the README SDK snippet each one's doc comment mirrors — against
         # drifting from the real API (bamboo-agent#255).
         run: cargo build --locked --examples
 
       - name: Run real SSH/SFTP transport test
-        if: github.event_name != 'pull_request' || github.base_ref == 'main'
+        if: needs.validation-source.outputs.full == 'true'
         timeout-minutes: 10
         run: scripts/run-russh-live.sh
 
       - name: Require the exact clean source after full validation
-        if: always()
+        if: always() && github.event_name != 'push'
         shell: bash
         run: |
           set -euo pipefail
