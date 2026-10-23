@@ -223,14 +223,19 @@ fn recovery_diagnostics(home: &Path, host: &mut Host, provider_calls: usize) -> 
                 serde_json::from_slice::<Value>(&bytes).map_err(|error| error.to_string())
             });
         state.insert(name.into(), match value {
-            Ok(value) if name == "session.json" => json!({
+                Ok(value) if name == "session.json" => {
+                    let canonical = serde_json::from_value::<Session>(value.clone()).ok();
+                    json!({
+                "last_run_status":canonical.as_ref().and_then(Session::last_run_status),
+                "last_run_error":canonical.as_ref().and_then(Session::last_run_error),
                 "metadata":value["metadata"],
                 "version":value["version"],
                 "messages":value["messages"].as_array().map(|messages| messages.iter().map(|message| json!({
                     "id":message["id"], "role":message["role"],
                     "content":message["content"].as_str().map(|text| text.chars().take(512).collect::<String>())
                 })).collect::<Vec<_>>())
-            }),
+            })
+                }
             Ok(value) => value,
             Err(error) => json!({"read_error":error}),
         });
@@ -272,6 +277,11 @@ async fn host_fixture_subprocess_entry() {
     let Some(home) = std::env::var_os("BAMBOO_OWNED_RESTART_FIXTURE_HOME") else {
         return;
     };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("bamboo_server=info,bamboo_engine=info,bamboo_storage=info")
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .try_init();
     let home = PathBuf::from(home);
     let ready = PathBuf::from(std::env::var_os("BAMBOO_OWNED_RESTART_FIXTURE_READY").unwrap());
     let cut = PathBuf::from(std::env::var_os("BAMBOO_OWNED_RESTART_FIXTURE_CUT").unwrap());
