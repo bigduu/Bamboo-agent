@@ -33,6 +33,7 @@ pub(super) fn valid_handshake(
     value: &Value,
     generation: Option<&str>,
     bounded_storage: bool,
+    ephemeral_clean: bool,
 ) -> bool {
     value.get("protocol_version").and_then(Value::as_u64) == Some(2)
         && generation.is_some_and(valid_handle)
@@ -42,7 +43,15 @@ pub(super) fn valid_handshake(
             .and_then(Value::as_str)
             .is_some_and(valid_handle)
         && value.get("scope_count").and_then(Value::as_u64) == Some(0)
-        && value.get("profile_modes") == Some(&json!(["shared", "clean"]))
+        && value.get("profile_modes")
+            == Some(&if ephemeral_clean {
+                json!(["clean"])
+            } else {
+                json!(["shared", "clean"])
+            })
+        && (!ephemeral_clean
+            || value.get("storage_boundary")
+                == Some(&json!({"provider":"ephemeral_clean_v1","persistent":false})))
         && (!bounded_storage
             || value.get("storage_boundary")
                 == Some(&json!({
@@ -58,17 +67,17 @@ fn production_readiness_requires_exact_bounded_storage_capability() {
     let generation = "a".repeat(24);
     let mut value = json!({"protocol_version":2,"host_generation":generation,
         "browser_instance_id":"b".repeat(24),"scope_count":0,"profile_modes":["shared","clean"]});
-    assert!(valid_handshake(&value, Some(&generation), false));
-    assert!(!valid_handshake(&value, Some(&generation), true));
+    assert!(valid_handshake(&value, Some(&generation), false, false));
+    assert!(!valid_handshake(&value, Some(&generation), true, false));
     value["storage_boundary"] = json!({"provider":"mac_apfs_fixed_v1",
         "image_bytes":536_870_912,"quota_bytes":402_653_184,"native_root_tracking":1,
         "native_group":"host_inherited_v1"});
-    assert!(valid_handshake(&value, Some(&generation), true));
+    assert!(valid_handshake(&value, Some(&generation), true, false));
     value["storage_boundary"]["quota_bytes"] = json!(402_653_185);
-    assert!(!valid_handshake(&value, Some(&generation), true));
+    assert!(!valid_handshake(&value, Some(&generation), true, false));
     value["storage_boundary"]["quota_bytes"] = json!(402_653_184);
     value["storage_boundary"]["all_descendants_proven"] = json!(true);
-    assert!(!valid_handshake(&value, Some(&generation), true));
+    assert!(!valid_handshake(&value, Some(&generation), true, false));
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,8 +148,15 @@ impl SharedRuntime {
         root: &std::path::Path,
         lifecycle: &BrowserLifecycle,
     ) -> Result<Arc<Self>, BrowserError> {
-        let lease = profile::acquire_shared(root)?;
-        let core = BrowserSession::spawn_protocol(Some(lease), lifecycle, true).await?;
+        // Temporary clean contexts never open or import the durable account.
+        // Chat leases still fence canonical deletion/reset; the physical host
+        // retains the dev temporary-directory/reaper ownership path.
+        let lease = if lifecycle.ephemeral_clean {
+            None
+        } else {
+            Some(profile::acquire_shared(root)?)
+        };
+        let core = BrowserSession::spawn_protocol(lease, lifecycle, true).await?;
         let generation = core
             .handshake_generation
             .lock()
@@ -788,6 +804,7 @@ impl SharedManager {
             let _ = chat.close().await;
             self.remove_if_same(id, &chat);
         }
+        let mode = lifecycle.new_profile_mode(requested)?;
         lifecycle.ensure_writer_admission()?;
         let lease = profile::acquire_chat(root, id)?;
         let mut runtime = self.runtime.lock().await;
@@ -805,7 +822,7 @@ impl SharedManager {
         let chat = Arc::new(SharedChat {
             runtime: owned.clone(),
             owner: Owner::new(),
-            mode: requested.unwrap_or_default(),
+            mode,
             lease: Mutex::new(Some(lease)),
             alive: AtomicBool::new(true),
             closed: AtomicBool::new(false),

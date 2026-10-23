@@ -8,7 +8,7 @@ use bamboo_agent_core::tools::{
 };
 use serde_json::{json, Value};
 
-use crate::browser::{BrowserError, BrowserManager};
+use crate::browser::{BrowserError, BrowserManager, BrowserProfileMode};
 
 pub struct BrowserTool {
     browser: Arc<BrowserManager>,
@@ -25,6 +25,20 @@ fn text_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, ToolError> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ToolError::InvalidArguments(format!("browser requires nonempty {name}")))
+}
+
+fn profile_mode_arg(args: &Value) -> Result<Option<BrowserProfileMode>, ToolError> {
+    let Some(value) = args.get("profile_mode") else {
+        return Ok(None);
+    };
+    if args.get("action").and_then(Value::as_str) != Some("tabs") {
+        return Err(ToolError::InvalidArguments(
+            "browser profile_mode is only accepted with tabs".into(),
+        ));
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|_| ToolError::InvalidArguments("profile_mode must be shared or clean".into()))
 }
 
 fn tab_id_arg(args: &Value) -> Result<&str, ToolError> {
@@ -374,6 +388,7 @@ impl Tool for BrowserTool {
             "type":"object",
             "properties": {
                 "action":{"type":"string","enum":["tabs","new_tab","activate_tab","close_tab","navigate","history","viewport","snapshot","click","click_at","hover","drag","fill","select_option","set_file_input","type","press","key","scroll","download","screenshot","dialog_respond"]},
+                "profile_mode":{"type":"string","enum":["shared","clean"],"description":"Optional with tabs only: explicitly open shared or clean. Omit to preserve an active scope/default. An active scope must be closed in the workbench before switching; unsupported shared never becomes clean automatically."},
                 "tab_id":{"type":"string","description":"Opaque tab ID from tabs/state; required for activate_tab and close_tab"},
                 "dialog_id":{"type":"string","description":"Opaque pending_dialog ID from this chat; required for dialog_respond"},
                 "accept":{"type":"boolean","description":"Accept or dismiss the exact pending JavaScript dialog"},
@@ -471,7 +486,11 @@ impl Tool for BrowserTool {
                 ToolError::InvalidArguments("invalid browser in-memory file input".into())
             })?;
         }
-        let state = self.browser.open(session_id).await.map_err(browser_error)?;
+        let state = self
+            .browser
+            .open_with_mode(session_id, profile_mode_arg(&args)?)
+            .await
+            .map_err(browser_error)?;
         let epoch = args
             .get("expected_epoch")
             .and_then(Value::as_u64)
@@ -560,6 +579,31 @@ impl Tool for BrowserTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_mode_is_explicit_strict_and_only_accepted_with_tabs() {
+        assert_eq!(profile_mode_arg(&json!({"action":"tabs"})).unwrap(), None);
+        for (value, mode) in [
+            ("clean", BrowserProfileMode::Clean),
+            ("shared", BrowserProfileMode::Shared),
+        ] {
+            assert_eq!(
+                profile_mode_arg(&json!({"action":"tabs","profile_mode":value})).unwrap(),
+                Some(mode)
+            );
+        }
+        for value in [Value::Null, json!(true), json!("unknown"), json!(1)] {
+            assert!(profile_mode_arg(&json!({"action":"tabs","profile_mode":value})).is_err());
+        }
+        for action in ["navigate", "download", "set_file_input", "new_tab"] {
+            assert!(profile_mode_arg(&json!({"action":action,"profile_mode":"clean"})).is_err());
+        }
+        let tool = BrowserTool::new(Arc::new(BrowserManager::default()));
+        assert_eq!(
+            tool.parameters_schema()["properties"]["profile_mode"]["enum"],
+            json!(["shared", "clean"])
+        );
+    }
 
     #[test]
     fn browser_tool_advertises_existing_host_controls_as_mutating_actions() {

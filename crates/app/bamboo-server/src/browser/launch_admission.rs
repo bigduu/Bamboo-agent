@@ -58,6 +58,18 @@ pub(super) fn verify_host(path: &Path) -> Result<std::fs::File, BrowserError> {
     Ok(file)
 }
 
+/// A compatibility marker, not a permission or storage-containment proof.
+pub(super) fn verify_clean_host(path: &Path) -> Result<std::fs::File, BrowserError> {
+    const HEADER: &[u8] = b"// BAMBOO_BROWSER_EPHEMERAL_CLEAN_V1\n";
+    let mut file = verify_host(path)?;
+    let mut header = vec![0; HEADER.len()];
+    file.read_exact(&mut header).map_err(|_| unavailable())?;
+    if header != HEADER {
+        return Err(unavailable());
+    }
+    Ok(file)
+}
+
 fn valid_ready(line: &[u8], attempt: uuid::Uuid) -> bool {
     if line.len() > MAX_FRAME_BYTES {
         return false;

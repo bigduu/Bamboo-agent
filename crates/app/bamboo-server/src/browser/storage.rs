@@ -237,8 +237,13 @@ mod tests {
         // never create/attach an image when ordinary unit tests are selected.
         std::fs::write(home.join("browser-storage-v1"), b"synthetic preserve").unwrap();
         let outcome = manager.open("new-production-storage-admission").await;
+        let prefix = if cfg!(any(target_os = "linux", target_os = "windows")) {
+            "browser_shared_profile_unsupported"
+        } else {
+            "browser_storage_"
+        };
         assert!(matches!(outcome, Err(BrowserError::Unavailable(reason))
-            if reason.starts_with("browser_storage_")));
+            if reason.starts_with(prefix)));
         assert!(manager.lifecycle.owners.lock().unwrap().is_empty());
         assert_eq!(
             std::fs::read(home.join("browser-storage-v1")).unwrap(),

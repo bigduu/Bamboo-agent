@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // BAMBOO_BROWSER_STORAGE_INSPECTION_V1
 // BAMBOO_BROWSER_LAUNCH_ADMISSION_V1
+// BAMBOO_BROWSER_EPHEMERAL_CLEAN_V1
 // One host owns the account browser; chats own pages and optional clean contexts.
 // Bamboo is the only client: newline-delimited JSON over stdio never exposes a CDP port.
 // Load Playwright only inside main, after installing native child tracking.
@@ -308,7 +309,41 @@ function storageOperationError(cause, origin) {
   return storageUnavailable(reason, cause);
 }
 
+function ephemeralCleanSettings(environment, readers = {}) {
+  const platform = readers.platform || process.platform;
+  if (!['linux', 'win32'].includes(platform)) {
+    throw storageUnavailable('browser_ephemeral_clean_provider_unsupported');
+  }
+  try {
+    assert.equal(environment.BAMBOO_BROWSER_HOST_PROTOCOL, '2');
+    assert.equal(environment.BAMBOO_BROWSER_EPHEMERAL_CLEAN, '1');
+    // This is a separate temporary provider, never an escape from a failed
+    // account/quota admission or a way to import persistent storage.
+    for (const name of Object.keys(environment)) {
+      if (name.startsWith('BAMBOO_BROWSER_PROFILE_') || name.startsWith('BAMBOO_BROWSER_STORAGE_') ||
+          name === 'BAMBOO_BROWSER_LAUNCH_ATTEMPT') assert.equal(environment[name], undefined);
+    }
+    const scratch = environment.BAMBOO_BROWSER_DOWNLOAD_ROOT;
+    const paths = platform === 'win32' ? path.win32 : path.posix;
+    assert.ok(typeof scratch === 'string' && !scratch.includes('\0') &&
+      paths.isAbsolute(scratch) && paths.normalize(scratch) === scratch);
+    for (const name of ['TMPDIR', 'TEMP', 'TMP']) assert.equal(environment[name], scratch);
+    const stat = (readers.filesystem || nativeFs).lstatSync(scratch);
+    assert.ok(stat.isDirectory() && !stat.isSymbolicLink());
+    if (platform !== 'win32') {
+      assert.equal(stat.uid, readers.uid ?? process.getuid?.());
+      assert.equal(stat.mode & 0o777, 0o700);
+    }
+    return { cleanOnly: true, scratch, profile: null };
+  } catch (cause) {
+    throw storageUnavailable('browser_ephemeral_clean_configuration_invalid', cause);
+  }
+}
+
 function productionStorageSettings(environment = process.env, readers = {}, prelaunch = false) {
+  if (environment.BAMBOO_BROWSER_EPHEMERAL_CLEAN !== undefined) {
+    return ephemeralCleanSettings(environment, readers);
+  }
   if (environment.BAMBOO_BROWSER_HOST_PROTOCOL !== '2' &&
       !environment.BAMBOO_BROWSER_STORAGE_DATA_ROOT) return null;
   if ((readers.platform || process.platform) !== 'darwin') {
@@ -393,6 +428,10 @@ function productionStorageSettings(environment = process.env, readers = {}, prel
 // authorization proof. Preflight is read-only; no native roots or profile
 // writers may be constructed before the parent's durable-fence grant.
 async function prepareNativeLaunch(environment = process.env, input = process.stdin, output = process.stdout) {
+  if (environment.BAMBOO_BROWSER_EPHEMERAL_CLEAN !== undefined) {
+    productionStorageSettings(environment, {}, true);
+    return null;
+  }
   if (environment.BAMBOO_BROWSER_HOST_PROTOCOL !== '2' &&
       !environment.BAMBOO_BROWSER_STORAGE_DATA_ROOT) return null;
   const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -3770,7 +3809,7 @@ function createChatScope({ id, generation, profileMode, context, downloadDir,
 
 // The private stdio v2 protocol multiplexes chat owners; it is not a public
 // authentication channel. Rust binds opaque scope handles to canonical chats.
-function createHostRuntime({ browser, sharedContext, downloadCdp, contextOptions }) {
+function createHostRuntime({ browser, sharedContext, downloadCdp, contextOptions, cleanOnly = false }) {
   const hostGeneration = randomBytes(12).toString('hex');
   const instanceId = randomBytes(12).toString('hex');
   const entries = new Map();
@@ -3937,6 +3976,9 @@ function createHostRuntime({ browser, sharedContext, downloadCdp, contextOptions
       }
       return entry.promise;
     }
+    if (cleanOnly && args.profile_mode !== 'clean') {
+      throw storageUnavailable('browser_shared_profile_unsupported');
+    }
     if (spentGenerations.has(scopeKey(request))) throw closed();
     if (entries.size >= 16 || spentGenerations.size >= 1024) throw error('browser_scope_busy', 'browser scope capacity unavailable');
     entry = { generation: request.scope_generation, profileMode: args.profile_mode || 'shared', closing: false };
@@ -3970,9 +4012,10 @@ function createHostRuntime({ browser, sharedContext, downloadCdp, contextOptions
   }
   async function handle(request) {
     if (request.action === 'runtime_state') return { protocol_version: 2, host_generation: hostGeneration,
-      browser_instance_id: instanceId, scope_count: entries.size, profile_modes: ['shared', 'clean'],
-      storage_boundary: hostStorageSettings ? { provider: 'mac_apfs_fixed_v1', image_bytes: IMAGE_BYTES,
-        quota_bytes: QUOTA_BYTES, native_root_tracking: 1, native_group: 'host_inherited_v1' } : null };
+      browser_instance_id: instanceId, scope_count: entries.size, profile_modes: cleanOnly ? ['clean'] : ['shared', 'clean'],
+      storage_boundary: cleanOnly ? { provider: 'ephemeral_clean_v1', persistent: false } :
+        hostStorageSettings ? { provider: 'mac_apfs_fixed_v1', image_bytes: IMAGE_BYTES,
+          quota_bytes: QUOTA_BYTES, native_root_tracking: 1, native_group: 'host_inherited_v1' } : null };
     if (stopping) throw error('browser_unavailable', 'browser runtime stopping');
     if (request.version !== 2 || request.host_generation !== hostGeneration ||
         !validHandle(request.scope_id) || !validHandle(request.scope_generation)) {
@@ -4107,7 +4150,7 @@ async function main() {
     ...(process.env.BAMBOO_BROWSER_EXECUTABLE ? { executablePath: process.env.BAMBOO_BROWSER_EXECUTABLE } : {}) };
   const contextOptions = { viewport: { width: 1000, height: 720 }, deviceScaleFactor: 1,
     acceptDownloads: true, serviceWorkers: 'block' };
-  const managedGroup = hostStorageSettings ? verifyOwnedHostGroup() : false;
+  const managedGroup = hostStorageSettings && !hostStorageSettings.cleanOnly ? verifyOwnedHostGroup() : false;
   nativeRoots = createNativeRootTracker(require('node:child_process'), profileDirectory, { managedGroup });
   if (profileDirectory) {
     context = await nativeRoots.launch(() => {
@@ -4122,8 +4165,8 @@ async function main() {
     context.on('response', scheduleProfileCheckpoint);
     profileInterval = setInterval(scheduleProfileCheckpoint, 5000); profileInterval.unref();
   } else {
-    // Explicit standalone/test hosts may omit persistence; production's shared
-    // account runtime always receives its one stable leased profile directory.
+    // Standalone hosts and the explicit Linux/Windows clean-only provider use
+    // Playwright's temporary profile. They never import the account context.
     browser = await nativeRoots.launch(() => {
       const { chromium } = require('playwright-core');
       return chromium.launch(launchOptions);
@@ -4137,7 +4180,8 @@ async function main() {
   if (!profileDirectory && ids.length !== 1) throw profileError();
   await downloadCdp.send('Browser.setDownloadBehavior', { behavior: 'deny', eventsEnabled: true,
     ...(downloadContextId ? { browserContextId: downloadContextId } : {}) });
-  hostRuntime = createHostRuntime({ browser, sharedContext: context, downloadCdp, contextOptions });
+  hostRuntime = createHostRuntime({ browser, sharedContext: context, downloadCdp, contextOptions,
+    cleanOnly: hostStorageSettings?.cleanOnly === true });
   const v2 = process.env.BAMBOO_BROWSER_HOST_PROTOCOL === '2';
   const legacy = { scope_id: '0'.repeat(24), scope_generation: '0'.repeat(24), host_generation: hostRuntime.generation, version: 2 };
   if (!v2) await hostRuntime.handle({ ...legacy, action: 'scope_open', args: {} });

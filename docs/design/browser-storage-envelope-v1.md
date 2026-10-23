@@ -12,8 +12,9 @@ evidence; neither is a passing product acceptance.
 The remaining merge assessment concerns those actual behaviors, not merely
 whether an old finding is outdated. No production migration or all-writer
 containment acceptance follows from Node tests, and a successful compile-only
-CI check is not a full Rust test run. Windows/Linux production admission remains
-explicitly unsupported; clean mode does not bypass that refusal.
+CI check is not a full Rust test run. The later compatibility source restores
+explicit temporary clean on Windows/Linux without APFS or a persistent profile;
+shared remains unsupported. The new source's Rust/native acceptance is pending.
 
 ## What changed with shared mode
 
@@ -76,7 +77,14 @@ identity through the canonical inspector and rejects inconsistent environment,
 control or scratch paths. Readiness must advertise the exact fixed-storage
 capability, so an older v2 host cannot silently ignore the boundary. A missing
 Mac provider returns `browser_storage_provider_not_ready`; unqualified Windows
-or Linux implementations return `browser_storage_provider_unsupported`.
+or Linux persistent implementations return `browser_storage_provider_unsupported`.
+The separate explicit clean provider advertises only `clean`, validates its
+owned temporary path, and never accepts persistent/profile settings. The native
+parent rejects shared before creating a chat directory or host. It uses the
+existing v2 scope routing and clean contexts in one temporary Chromium instance,
+not an unbounded persistent-account fallback. A new compatibility marker and
+exact readiness check reject old hosts before use. This provider makes no
+hard-quota or all-descendant-exit claim; its platform runtime checks remain open.
 The default Mac shared path now includes first-use creation and clean-reboot
 reattachment in source. It no longer depends on a manually prepared mount.
 Preparation runs in a blocking worker that owns the actual account/reset lease,

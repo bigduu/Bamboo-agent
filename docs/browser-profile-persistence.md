@@ -64,10 +64,16 @@ that every Chromium writer exited. The macOS source now selects a fixed
 536870912-byte backing image with a 402653184-byte APFS volume quota for the
 account profile and its writable runtime paths. That implementation still needs
 source-matched first-use and normal-restart acceptance; the earlier quota
-experiment alone does not qualify it. Windows/Linux production admission
-currently refuses with `browser_storage_provider_unsupported`, including clean
-mode, rather than selecting an unbounded fallback. These platforms are not
-qualified by the successful macOS component tests.
+experiment alone does not qualify it. The compatibility candidate restores an
+explicit `clean` temporary provider on Windows/Linux, using the existing owned
+scratch/reaper path and one physical browser per manager. Its scopes own fresh
+independent contexts. It passes no durable profile or native-storage settings,
+and readiness advertises only `clean` with `persistent:false`. Shared or a fresh
+omitted mode returns an explicit unsupported error; it never silently becomes
+clean. `tabs` in the agent tool can explicitly request `profile_mode:"clean"`,
+after which automatic opens preserve that active mode. macOS still uses its
+bounded account provider for both modes. New Rust and native Windows/Linux
+acceptance remain pending; synthetic Node checks do not qualify those runtimes.
 
 Only the original leased owner may clear its launch fence after confirmed
 shutdown. A new process refuses an old active or unknown-writer fence; there is

@@ -6,6 +6,8 @@ mod concurrent_drain_tests;
 mod launch_admission;
 #[cfg(test)]
 mod persistence_tests;
+#[cfg(test)]
+mod platform_mode_tests;
 mod profile;
 mod shared;
 mod storage;
@@ -143,6 +145,7 @@ pub struct BrowserManager {
 #[derive(Default)]
 struct BrowserLifecycle {
     bounded_storage: bool,
+    ephemeral_clean: bool,
     stopping: AtomicBool,
     reset_epoch: AtomicU64,
     opens: tokio::sync::RwLock<()>,
@@ -154,6 +157,36 @@ struct BrowserLifecycle {
 }
 
 impl BrowserLifecycle {
+    fn for_platform(platform: &str) -> Self {
+        let ephemeral_clean = matches!(platform, "linux" | "windows");
+        Self {
+            bounded_storage: !ephemeral_clean,
+            ephemeral_clean,
+            ..Self::default()
+        }
+    }
+
+    fn new_profile_mode(
+        &self,
+        requested: Option<BrowserProfileMode>,
+    ) -> Result<BrowserProfileMode, BrowserError> {
+        let mode = requested.unwrap_or_default();
+        if self.ephemeral_clean && mode != BrowserProfileMode::Clean {
+            return Err(BrowserError::Unavailable(
+                "browser_shared_profile_unsupported: request clean explicitly".into(),
+            ));
+        }
+        Ok(mode)
+    }
+
+    fn configure_profile(&self, command: &mut Command, profile: Option<&std::path::Path>) {
+        if self.ephemeral_clean {
+            command.env("BAMBOO_BROWSER_EPHEMERAL_CLEAN", "1");
+        } else if let Some(profile) = profile {
+            command.env("BAMBOO_BROWSER_PROFILE_DIR", profile);
+        }
+    }
+
     fn ensure_writer_admission(&self) -> Result<(), BrowserError> {
         if self.unconfirmed_writers.load(Ordering::Acquire) {
             return Err(BrowserError::Unavailable(
@@ -632,7 +665,7 @@ fn create_host_temporary_directory(
     let mut temporary = tempfile::Builder::new();
     temporary.prefix("bamboo-browser-session-");
     #[cfg(unix)]
-    if parent.is_some() {
+    {
         use std::os::unix::fs::PermissionsExt;
 
         // Set permissions at creation; never chmod an existing directory.
@@ -665,9 +698,15 @@ impl BrowserSession {
         } else {
             None
         };
+        let _verified_clean_host = if lifecycle.ephemeral_clean {
+            Some(launch_admission::verify_clean_host(&script)?)
+        } else {
+            None
+        };
         #[cfg(test)]
         let script = if shared
             && !lifecycle.bounded_storage
+            && !lifecycle.ephemeral_clean
             && std::env::var_os("BAMBOO_BROWSER_HOST_SCRIPT").is_none()
         {
             // Explicit component fixture: real pages/EOF, mocked quota only.
@@ -689,9 +728,10 @@ impl BrowserSession {
         if shared {
             command.env("BAMBOO_BROWSER_HOST_PROTOCOL", "2");
         }
-        if let Some(lease) = &profile_lease {
-            command.env("BAMBOO_BROWSER_PROFILE_DIR", &lease.path);
-        }
+        lifecycle.configure_profile(
+            &mut command,
+            profile_lease.as_ref().map(|lease| lease.path.as_path()),
+        );
         if lifecycle.bounded_storage {
             let mut lease = profile_lease.take().ok_or_else(|| {
                 BrowserError::Unavailable("browser_storage_control_invalid".into())
@@ -786,6 +826,7 @@ impl BrowserSession {
                 &readiness,
                 generation.as_deref(),
                 lifecycle.bounded_storage,
+                lifecycle.ephemeral_clean,
             )
         {
             let _ = session.begin_retirement("incompatible shared browser host");
@@ -2458,12 +2499,13 @@ impl BrowserManager {
     /// Production supplies a data-directory-owned root. Default managers used
     /// by isolated protocol tests retain their explicitly ephemeral behavior.
     pub fn with_profile_root(root: PathBuf) -> Self {
+        Self::with_profile_root_for_platform(root, std::env::consts::OS)
+    }
+
+    fn with_profile_root_for_platform(root: PathBuf, platform: &str) -> Self {
         Self {
             profile_root: Some(Arc::new(root)),
-            lifecycle: Arc::new(BrowserLifecycle {
-                bounded_storage: true,
-                ..BrowserLifecycle::default()
-            }),
+            lifecycle: Arc::new(BrowserLifecycle::for_platform(platform)),
             ..Self::default()
         }
     }
