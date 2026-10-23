@@ -75,6 +75,7 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
         .or_else(|| started["ids"]["a"].as_str())
         .unwrap()
         .to_owned();
+    eprintln!("unknown-file fixture phase: waiting for held Worker provider");
     tokio::time::timeout(Duration::from_secs(60), async {
         while f.probe.held.load(Ordering::SeqCst) != 1 {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -97,6 +98,7 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
     let pid = pids[0];
     assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
     f.probe.release.notify_waiters();
+    eprintln!("unknown-file fixture phase: waiting for first stopped outcome_unknown");
     let inspect = json!({"ids":[work],"depth":0,"sections":["assignments","submissions"],"budget_bytes":65536,"fixed_commit":null});
     let view = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
@@ -110,6 +112,7 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
     })
     .await
     .unwrap();
+    eprintln!("unknown-file fixture phase: stopped outcome_unknown observed");
     assert_ne!(
         unsafe { libc::kill(pid as i32, 0) },
         0,
@@ -231,7 +234,9 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
         "plan/ack/replay never rewrite"
     );
     let calls = f.probe.calls.load(Ordering::SeqCst);
+    eprintln!("unknown-file fixture phase: before reconciled Host restart");
     f.restart().await;
+    eprintln!("unknown-file fixture phase: reconciled Host ready, before inspect");
     let reconciled = post(&f.client, &f.base, "/tickets/inspect", &inspect).await;
     assert_eq!(reconciled["data"][0]["ticket"]["state"], "blocked");
     assert_eq!(reconciled["data"][0]["ticket"]["paused"], true);
@@ -266,6 +271,7 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
     .await;
     let admitted = post(&f.client, &f.base, "/tickets/dispatch", &next).await;
     assert_eq!(admitted["errors"], json!([]), "{admitted}");
+    eprintln!("unknown-file fixture phase: explicit retry dispatched, waiting submitted");
     let completed = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             let view = post(&f.client, &f.base, "/tickets/inspect", &inspect).await;
@@ -277,6 +283,7 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
     })
     .await
     .unwrap();
+    eprintln!("unknown-file fixture phase: explicit retry submitted");
     assert_eq!(completed["data"][0]["ticket"]["generation"], 2);
     let submission = completed["data"][0]["submissions"]
         .as_array()
@@ -290,7 +297,9 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
         {"op":"accept","work_id":work,"submission_id":submission["id"],"evidence":["Verified generation 2 exact managed code"]}
     ])).await;
     post(&f.client, &f.base, "/tickets/update", &accept).await;
+    eprintln!("unknown-file fixture phase: before accepted Host restart");
     f.restart().await;
+    eprintln!("unknown-file fixture phase: accepted Host ready, before inspect");
     let accepted = post(&f.client, &f.base, "/tickets/inspect", &inspect).await;
     assert_eq!(accepted["data"][0]["ticket"]["state"], "accepted");
     assert_eq!(accepted["data"][0]["ticket"]["generation"], 2);
