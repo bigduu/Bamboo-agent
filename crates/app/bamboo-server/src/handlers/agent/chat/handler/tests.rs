@@ -3336,24 +3336,76 @@ mod optional_model_e2e {
     async fn runner_reserved_during_typed_chat_rejects_commit_without_mutation() {
         let state = new_state().await;
         let session_id = "workflow-reserved-before-commit";
-        seed_active_instruction_workflow(&state, session_id, "plan").await;
-        let mut before = state
-            .storage
-            .load_session(session_id)
-            .await
-            .expect("load seeded session")
-            .expect("seeded session");
-        // This race changes the Workflow, not the Workspace. Resolve the
-        // fixture's initial default before reserving the concurrent runner so
-        // the request does not also retain the Source-scope runners read lock.
+        // Keep the entire race in one actual canonical Workspace. Pinning in
+        // None and adding a default afterward changes the catalog/activation
+        // scope before the request can reach its Workflow commit barrier.
+        let workspace = tempdir().expect("owned Workflow-only Workspace");
+        let workspace_path = workspace.path().canonicalize().unwrap();
+        let mut before = Session::new(session_id, "test-model");
+        before.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
+            &workspace_path,
+        ));
         state
             .project_context_resolver
             .refresh_session_prompt_read_only(&mut before)
             .await
-            .expect("seed the fixture's canonical default Workspace");
+            .expect("seed the fixture's canonical Workspace");
+        let store = state
+            .skill_manager
+            .store()
+            .skill_store_for_workspace(&workspace_path)
+            .await
+            .expect("fixture Workspace store");
+        let catalog = store.skill_catalog_snapshot().await;
+        let plan = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "plan" && entry.winner)
+            .expect("builtin instruction Workflow")
+            .clone();
+        let selection = bamboo_skills::WorkflowSelection {
+            id: plan.id.clone(),
+            source: plan.source,
+            revision: plan.revision,
+            args: serde_json::json!({}),
+        };
+        let ids = [plan.id.clone()];
+        let activation = state
+            .skill_manager
+            .resolve_and_pin_activation_in_workspace_with_mode_and_budget(
+                &workspace_path,
+                session_id,
+                &std::collections::BTreeSet::new(),
+                Some(&ids),
+                None,
+                None,
+                bamboo_skills::DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+            )
+            .await
+            .expect("pin the initial authority in the same Workspace");
+        let snapshot = store
+            .export_activation_snapshot(session_id)
+            .await
+            .expect("canonical Workspace activation snapshot");
+        before.metadata.insert(
+            bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY.to_string(),
+            serde_json::to_string(&selection).unwrap(),
+        );
+        bamboo_skills::persist_explicit_workflow_candidate(
+            &mut before.metadata,
+            &selection,
+            &activation,
+            &snapshot,
+        )
+        .expect("persist exact initial authority");
+        bamboo_skills::record_loaded_workflow_activation(
+            &mut before.metadata,
+            "plan",
+            "sha256:plan".to_string(),
+        )
+        .unwrap();
         state.save_and_cache_session(&mut before).await;
         let expected_workflow_metadata = workflow_runtime_metadata(&before);
-        let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
         let review = catalog
             .entries
             .iter()
@@ -3390,10 +3442,11 @@ mod optional_model_e2e {
         let reached_permit = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
             tokio::select! {
                 permit = &mut reached => permit.expect("workflow commit barrier remains open"),
-                early = &mut response => panic!(
-                    "typed chat completed before the commit barrier: {}",
-                    early.status()
-                ),
+                early = &mut response => {
+                    let status = early.status();
+                    let body: Value = test::read_body_json(early).await;
+                    panic!("typed chat completed before the commit barrier: {status}; {body}");
+                },
             }
         })
         .await
@@ -3435,7 +3488,7 @@ mod optional_model_e2e {
             .all(|message| !matches!(message.role, bamboo_agent_core::Role::User)));
         let live = state
             .skill_manager
-            .pinned_activation_for_workspace(session_id, None)
+            .pinned_activation_for_workspace(session_id, Some(workspace_path.as_path()))
             .await
             .expect("inspect canonical activation")
             .expect("existing activation remains pinned");
