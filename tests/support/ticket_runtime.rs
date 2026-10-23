@@ -13,9 +13,28 @@ use std::{
 // Coordinate that startup window, while leaving ready Hosts/tests concurrent.
 static HOST_STARTUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-pub struct Host(pub Child, u64);
+pub struct Host(pub Child, u64, std::path::PathBuf);
 impl Drop for Host {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            use std::io::{Read, Seek, SeekFrom};
+            let pid = self.0.id();
+            let status = self.0.try_wait();
+            eprintln!("synthetic Ticket Host before panic teardown: pid={pid} exit={status:?}");
+            let tail = (|| -> std::io::Result<String> {
+                let mut file = std::fs::File::open(&self.2)?;
+                let length = file.metadata()?.len();
+                let start = self.1.max(length.saturating_sub(16 * 1024)).min(length);
+                file.seek(SeekFrom::Start(start))?;
+                let mut bytes = Vec::new();
+                file.take(16 * 1024).read_to_end(&mut bytes)?;
+                Ok(String::from_utf8_lossy(&bytes).into_owned())
+            })();
+            match tail {
+                Ok(tail) => eprintln!("synthetic current-launch Host log tail:\n{tail}"),
+                Err(error) => eprintln!("synthetic Host log unavailable: {error}"),
+            }
+        }
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -57,7 +76,7 @@ pub fn start_with_fault(data: &Path, port: u16, fault: Option<(&str, &str)>) -> 
     if let Ok(path) = std::env::var("BAMBOO_TICKET_FIXTURE_STATIC_DIR") {
         process.arg("--static-dir").arg(path);
     }
-    Host(process.spawn().unwrap(), log_start)
+    Host(process.spawn().unwrap(), log_start, data.join("host.log"))
 }
 
 pub async fn get(client: &reqwest::Client, base: &str, path: &str) -> Value {
@@ -74,7 +93,7 @@ pub async fn post(client: &reqwest::Client, base: &str, path: &str, request: &Va
         .json(request)
         .send()
         .await
-        .unwrap();
+        .unwrap_or_else(|error| panic!("POST {path} transport failed before response: {error:?}"));
     let status = response.status();
     let body = response.text().await.unwrap();
     assert!(status.is_success(), "POST {path}: {status} {body}");
