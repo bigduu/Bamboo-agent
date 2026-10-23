@@ -10,10 +10,13 @@ executable's version, health endpoints, static asset bytes and SPA fallback.
 
 Publication retains the successful same-repository main-push CI prerequisite,
 the protected-source authorization, the existing version allocator and crate
-validation, and the single `bamboo-crate-publication` queue. The executable jobs
-run after that allocator has completed the official crate Release. They stamp
-all local crates with its existing version, reject external dependency lock
-changes, restore the exact frontend assets preserved in that Release, and build
+validation, and the single `bamboo-crate-publication` queue. One authenticated
+preparation reserves the source/version/frontend and transports its preserved
+frontend manifest and ZIP before fan-out. Crate publication and the executable
+jobs then run concurrently. Native workers verify the two bounded regular files
+against the preparation's independent hash output, without draft-Release API
+access or publication credentials. They stamp all local crates with that reserved
+version, reject external dependency lock changes, and build
 the standard release executable once on each native runner selected by the
 accepted source contract. New v2 releases have these three targets:
 
@@ -55,6 +58,13 @@ replacement uploads. An interrupted final upload can reuse identical assets;
 a conflicting asset blocks publication. The manifest uploads last. A public
 crate Release without this manifest is not a complete desktop binary release.
 
+The final job depends on both the completed crate publisher and the native
+matrix. Native completion cannot finalize a failed crate closure. Preparation
+transport is selected by its original successful attempt, so failed-only reruns
+can retain earlier native and preparation results. The crate worker checks fresh
+signed progress for the same reservation and cannot replace its sealed frontend.
+See [CI and publication flow](ci-publication-flow.md) for all phase contracts.
+
 The final publisher authenticates its executable provenance with the existing
 protected signing key before uploading that checkpoint. If a full workflow
 rerun rebuilds different bytes after the checkpoint was published, it verifies
@@ -71,6 +81,14 @@ named GitHub job output. The final job verifies downloaded bytes against those
 independent outputs, so replacing both a transported binary and its receipt
 cannot supply a new accepted identity. Missing platform output bindings fail
 closed. This uses the existing job-output channel and publisher permissions.
+
+Dependency caching uses the actual runner-temp target directory and a
+source-profile/producer/target namespace, plus rust-cache's toolchain and Cargo
+input keys. Before the build, remove restored workspace binaries, fingerprints
+and build-script outputs while retaining compatible third-party dependencies.
+The current build must regenerate and verify its embedded frontend evidence.
+Historical v1 and frozen restore-only releases do not write new caches. A cache
+hit does not change compiler flags, wrapper restrictions or final asset identity.
 
 The new manifest schema is version 2. `version` is the allocated version without
 `v`, and `sourceRevision` is the complete accepted Git SHA. `artifacts` contains

@@ -32,6 +32,11 @@ that evidence on the actual main merge, then publish that source. A successful
 lightweight main admission is evidence reuse, not another full test run. Never
 replace dev compilation or release acceptance with skipped/stub checks, or
 substitute another commit's binary for a versioned release build.
+After one authenticated version/frontend preparation, crate publication and
+the source-selected native matrix run concurrently. Native workers consume
+hash-bound same-run frontend transport without publication credentials. Only
+the final publisher joins completed crates and all required native receipts;
+parallel builds never create another allocator or publication queue.
 
 ## Pull Request Review
 

@@ -153,6 +153,14 @@ Name one release owner to cut, validate and promote each frozen candidate.
 Inventory any moving `dev → main` PR, preserve its independent work and evidence,
 then close or replace it with the recorded frozen release's PR.
 
+Within the one publisher run, reserve the exact source/version/frontend before
+fan-out. Crate publication and required native builds then execute concurrently
+in separate outputs. Native tasks use the original preparation attempt's sealed
+frontend transport and independent hash bindings. Final publication waits for
+both the complete verified crate closure and every required native receipt.
+Reuse compatible dependencies, but rebuild workspace/generated outputs for the
+actual source and version; caches cannot establish artifact acceptance.
+
 Keep one Bamboo publisher. Coordinate Bodhi/Zenith/Homebrew consumption after
 the actual published version/source is verified. Frozen version/source tags
 stay immutable. Do not create parallel publishers or expand credentials,

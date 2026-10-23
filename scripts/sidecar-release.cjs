@@ -6,7 +6,8 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
 const { assertVersion, validateSource, readBodyReceipt, validateReceipt,
-  readAuthenticatedReceipt, assertSigningConfiguration, assertCurrentMain, currentMainWrite, signReceipt, authenticateReceipt, assertAdmissionCompatibility, spawnCommand } = require('./crate-release.cjs')
+  readAuthenticatedReceipt, assertSigningConfiguration, assertCurrentMain, currentMainWrite, signReceipt, authenticateReceipt,
+  validatePreparation, assertAdmissionCompatibility, spawnCommand } = require('./crate-release.cjs')
 
 const REPOSITORY = 'bigduu/Bamboo-agent'
 const MANIFEST = 'bamboo-sidecars-v2.json'
@@ -322,6 +323,33 @@ function publishedRelease(identity, { signingKey, signingKeyDigest, request = gh
   return { release, receipt }
 }
 
+function preparedFrontend(identity, { preparation, contractVersion, inputDirectory }) {
+  // The controller emits this signed snapshot through its own job output.
+  // Read-only native workers cannot rely on draft Release visibility. Transport
+  // only the two preserved frontend files and verify against the independent
+  // output; neither a signing key nor GitHub publication credentials are needed.
+  validatePreparation(preparation, identity, contractVersion)
+  const directory = fs.lstatSync(inputDirectory)
+  assert.ok(directory.isDirectory() && !directory.isSymbolicLink())
+  const receipt = preparation.receipt
+  const expected = [
+    ['frontend-manifest.json', receipt.frontendBytes.manifestSha256, 1024 * 1024],
+    ['lotus-frontend.zip', receipt.frontendBytes.archiveSha256, 256 * 1024 * 1024],
+  ]
+  assert.deepEqual(fs.readdirSync(inputDirectory).sort(), expected.map(([name]) => name).sort(),
+    'Preparation transport must contain exactly the preserved frontend files')
+  const files = expected.map(([name, digest, maximum]) => {
+    const file = path.join(inputDirectory, name)
+    const info = fileIdentity(file, maximum)
+    assert.equal(info.sha256, digest, 'Transported frontend differs from the independent preparation output')
+    const bytes = fs.readFileSync(file)
+    assert.equal(bytes.length, info.sizeBytes)
+    assert.equal(sha256(bytes), digest)
+    return { name, bytes }
+  })
+  return { receipt, files }
+}
+
 function assetBytes(asset, maximum) {
   assert.ok(Number.isSafeInteger(asset.id) && asset.id > 0)
   assert.ok(Number.isSafeInteger(asset.size) && asset.size > 0 && asset.size <= maximum)
@@ -569,6 +597,6 @@ async function main() {
 module.exports = { REPOSITORY, MANIFEST, HOST_ASSET, PROVENANCE, TARGETS, LEGACY_TARGETS, HOST_FILES, MAX_BINARY, MAX_HOST,
   contractForVersion, sourceContractVersion, boundSourceContract,
   artifactName, targetOutputKey, sha256, fileIdentity, createBrowserHost, createManifest, manifestBytes, validateManifestV1, validateManifestV2,
-  binaryArchitecture, execute, git, workflowIdentity, publishedRelease, assetBytes,
+  binaryArchitecture, execute, git, workflowIdentity, publishedRelease, preparedFrontend, assetBytes,
   validateBuildReceipt, expectedBuildBindings, assembleRelease, recoverPublishedRelease, publishAssets }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })

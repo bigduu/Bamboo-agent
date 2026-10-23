@@ -168,6 +168,71 @@ function assertAdmissionCompatibility(recorded, current) {
   return true
 }
 
+function validatePreparation(preparation, identity, contractVersion) {
+  assert.equal(preparation?.schemaVersion, 1)
+  assert.equal(preparation.kind, 'bamboo-release-preparation/v1')
+  assert.ok(contractVersion === 1 || contractVersion === 2)
+  assert.equal(preparation.contractVersion, contractVersion)
+  for (const key of ['repository', 'sourceRevision', 'sourceTree', 'workflowRevision', 'runId']) {
+    assert.equal(preparation[key], identity[key], `Release preparation mismatch: ${key}`)
+  }
+  for (const key of ['sourceRevision', 'sourceTree', 'workflowRevision']) assert.match(preparation[key], SHA)
+  assert.match(preparation.runId, /^[1-9][0-9]*$/)
+  assert.ok(Number.isSafeInteger(preparation.runAttempt) && preparation.runAttempt >= 1 &&
+    preparation.runAttempt <= identity.runAttempt, 'Preparation must belong to this run or an earlier successful attempt')
+  assert.ok(Number.isSafeInteger(preparation.releaseId) && preparation.releaseId > 0)
+  const receipt = preparation.receipt
+  validateReceipt(receipt, receipt?.identity, receipt?.crates, identity.version)
+  assert.equal(receipt.identity.repository, identity.repository)
+  assert.equal(receipt.identity.sourceRevision, identity.sourceRevision)
+  assert.equal(receipt.automatic, true)
+  assert.equal(receipt.ciRun, identity.ciRun)
+  assertAdmissionCompatibility(receipt.validation, identity.validation)
+  assert.ok(receipt.crates.includes('bamboo-agent'))
+  assert.equal(receipt.authentication?.schemaVersion, 1)
+  assert.equal(receipt.authentication.algorithm, 'hmac-sha256')
+  assert.deepEqual(Object.keys(receipt.authentication).sort(), ['algorithm', 'mac', 'schemaVersion'])
+  assert.match(receipt.authentication.mac, DIGEST, 'Preparation requires the existing signed reservation')
+  return preparation
+}
+
+function createPreparation({ release, receipt }, identity, contractVersion) {
+  assert.equal(release.tag_name, `v${identity.version}`)
+  assert.equal(release.target_commitish, identity.sourceRevision)
+  return validatePreparation({ schemaVersion: 1, kind: 'bamboo-release-preparation/v1',
+    repository: identity.repository, sourceRevision: identity.sourceRevision, sourceTree: identity.sourceTree,
+    workflowRevision: identity.workflowRevision, runId: identity.runId, runAttempt: identity.runAttempt,
+    contractVersion, releaseId: release.id, receipt: JSON.parse(JSON.stringify(receipt)) }, identity, contractVersion)
+}
+
+async function resumePrepared(context, preparation, identity, contractVersion) {
+  validatePreparation(preparation, identity, contractVersion)
+  await context.assertCurrentMain()
+  context.assertSigningKey()
+  context.verifyReceipt(preparation.receipt)
+  validateReceipt(preparation.receipt, context.identity, context.crates, identity.version)
+  const release = (await context.releases()).find((entry) => entry.id === preparation.releaseId)
+  assert.ok(release, 'Prepared Release disappeared; never allocate a replacement during fan-out')
+  assert.equal(release.tag_name, `v${identity.version}`)
+  assert.equal(release.target_commitish, identity.sourceRevision)
+  const receipt = await context.readReceipt(release, { required: true })
+  validateReceipt(receipt, context.identity, context.crates, identity.version)
+  assert.equal(receipt.automatic, true)
+  assert.equal(receipt.ciRun, preparation.receipt.ciRun)
+  assert.deepEqual(receipt.validation, preparation.receipt.validation)
+  assert.deepEqual(receipt.frontendBytes, preparation.receipt.frontendBytes, 'Prepared frontend bytes changed')
+  assert.ok(release.draft || receipt.completed, 'Public release has incomplete provenance')
+  for (const [name, checksum] of Object.entries(preparation.receipt.packageChecksums)) {
+    assert.equal(receipt.packageChecksums[name], checksum, 'Previously prepared package checksum changed')
+  }
+  if (preparation.receipt.completed) assert.equal(receipt.completed, true)
+  await context.ensureTag(release, receipt)
+  // Preparation sealed these bytes before either worker started. Missing assets
+  // now fail closed rather than allowing the crate worker to race native readers.
+  await context.ensureFrontend(release, receipt, { sealed: true })
+  return { release, receipt }
+}
+
 function nextVersion(versions, now = new Date(), occupiedVersions = []) {
   const prefix = `${now.getUTCFullYear()}.${now.getUTCMonth() + 1}.`
   let maximum = 0n
@@ -507,7 +572,7 @@ function verifyPreservedFrontend(staged, restored) {
   }
 }
 
-async function preserveFrontend({ receipt, stagedBytes, assets, readAsset, verifyFiles, writeFiles, saveReceipt, upload }) {
+async function preserveFrontend({ receipt, stagedBytes, assets, readAsset, verifyFiles, writeFiles, saveReceipt, upload, sealed = false }) {
   if (assets.every(Boolean)) {
     const bytes = await Promise.all(assets.map(readAsset))
     if (sha256(bytes[0]) === receipt.frontendBytes.manifestSha256 &&
@@ -517,6 +582,7 @@ async function preserveFrontend({ receipt, stagedBytes, assets, readAsset, verif
       return
     }
   }
+  assert.equal(sealed, false, 'Prepared release has lost or changed its sealed frontend assets')
   assert.deepEqual(receipt.packageChecksums, {}, 'Partial release has lost or changed its preserved frontend assets')
   // Only before the first package is reserved can interrupted initial asset
   // uploads adopt freshly staged bytes of the same verified immutable bundle.
@@ -665,11 +731,11 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
       fs.writeFileSync(receiptFile, `${JSON.stringify(receipt, null, 2)}\n`)
       await write(() => github(repository, `releases/${release.id}`, { tag_name: `v${receipt.version}`, body: receiptBody(receipt) }, 'PATCH'))
     },
-    ensureFrontend: async (release, receipt) => {
+    ensureFrontend: async (release, receipt, { sealed = false } = {}) => {
       const current = github(repository, `releases/${release.id}`)
       const names = ['frontend-manifest.json', 'lotus-frontend.zip']
       const assets = names.map((name) => current.assets.find((asset) => asset.name === name))
-      await preserveFrontend({ receipt, stagedBytes: frontendBytes, assets,
+      await preserveFrontend({ receipt, stagedBytes: frontendBytes, assets, sealed,
         readAsset: async (asset) => command(['gh', 'api', `repos/${repository}/releases/assets/${asset.id}`,
           '-H', 'Accept: application/octet-stream'], { encoding: null }),
         verifyFiles: async (bytes) => verifyPreservedFrontend(stagedFrontend, bytes),
@@ -718,8 +784,18 @@ async function main() {
     const result = await plan(context)
     const version = result.receipt.version
     fs.writeFileSync(context.receiptFile, `${JSON.stringify(result.receipt, null, 2)}\n`)
-    fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\nreceipt_file=${context.receiptFile}\n`)
+    context.verifyReceipt(result.receipt)
+    const identity = preparationIdentity(context, version)
+    const prepared = createPreparation(result, identity, Number(process.env.BAMBOO_EXECUTABLE_CONTRACT_VERSION))
+    const output = JSON.stringify(prepared)
+    assert.ok(Buffer.byteLength(output) <= 64 * 1024, 'Release preparation exceeds its job-output bound')
+    fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\nreceipt_file=${context.receiptFile}\nprepared_release=${output}\n`)
     console.log(`Resolved automatic main release: ${version}`)
+  } else if (process.argv[2] === 'resume') {
+    const prepared = JSON.parse(process.env.PREPARED_RELEASE)
+    const result = await resumePrepared(context, prepared, preparationIdentity(context, process.env.TARGET_VERSION),
+      Number(process.env.BAMBOO_EXECUTABLE_CONTRACT_VERSION))
+    fs.writeFileSync(context.receiptFile, `${JSON.stringify(result.receipt, null, 2)}\n`)
   } else {
     assert.equal(process.argv[2], 'publish')
     const receipt = JSON.parse(fs.readFileSync(context.receiptFile, 'utf8'))
@@ -729,9 +805,16 @@ async function main() {
   }
 }
 
+function preparationIdentity(context, version, env = process.env) {
+  return { ...context.identity, version, sourceTree: command(['git', 'rev-parse', 'HEAD^{tree}']).trim(),
+    workflowRevision: env.GITHUB_WORKFLOW_SHA, runId: env.GITHUB_RUN_ID, runAttempt: Number(env.GITHUB_RUN_ATTEMPT),
+    ciRun: context.ciRun, ...(context.validation ? { validation: context.validation } : {}) }
+}
+
 module.exports = { assertVersion, assertManualVersion, validateSource, validateReceipt, nextVersion, selectVersion,
   plan, publish, makeContext, makeRecoveryContext, assertCurrentMain, currentMainWrite, sha256, githubArgs, receiptBody, readBodyReceipt,
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
-  verifyRegistrySource, highestStableVersion, spawnCommand, command, assertAdmissionCompatibility }
+  verifyRegistrySource, highestStableVersion, spawnCommand, command, createPreparation, validatePreparation, resumePrepared,
+  assertAdmissionCompatibility }
 if (require.main === module) main().catch((error) => { console.error(error); process.exitCode = 1 })

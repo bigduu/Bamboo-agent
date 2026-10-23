@@ -12,9 +12,21 @@ for cuts, original-source repairs, protected admission and credentials.
 | Development admission | A bounded PR to `dev`; its owner | Required `Test` compiles the locked workspace; affected local tests, regression coverage and current review pass. |
 | Frozen release acceptance | Same-repository `release/<cut-SHA>` PR to `main`; one release owner | Full tests, all-feature checks, lint, security and Linux/macOS/Windows acceptance pass on the actual PR merge source. The frontend workflow separately validates the original release head. |
 | Main admission | Normal release merge pushes `main`; CI | Authenticate the completed release acceptance against the actual ordered merge parents, reviewed release tree, source ancestry and original job attempts. |
-| Publication preparation | Successful main-push CI; the canonical publisher | Independently authenticate source/evidence, reserve one version and preserve its exact frontend bytes. |
-| Crate publication | The existing isolated Cargo publisher | Stamp disposable manifests, publish in dependency order, then verify registry checksums, source and embedded frontend. |
-| Native assets | Source-selected native runners and final publisher | Build the actual versioned main source, verify native receipts and upload immutable assets. The final manifest signals complete binary availability. |
+| Publication preparation | Successful main-push CI; the canonical publisher | Independently authenticate source/evidence, reserve one version and transport its exact sealed frontend bytes. |
+| Crate publication | Isolated Cargo publisher, concurrent with native builds | Resume the same reservation, stamp disposable manifests, publish in dependency order, then verify registry checksums, source and embedded frontend. |
+| Native builds | Source-selected native runners, concurrent with crate publication | Verify prepared frontend transport and build the actual versioned main source without publication credentials. |
+| Final assets | The existing final publisher, after both branches succeed | Authenticate completed crates and all required native receipts, then verify immutable uploads. The final manifest signals complete binary availability. |
+
+```mermaid
+flowchart TD
+  dev[Reviewed dev admission] --> frozen[Full frozen release acceptance]
+  frozen --> main[Normal main merge and lightweight admission]
+  main --> prepare[One signed version and sealed frontend preparation]
+  prepare --> crates[Publish and verify crate closure]
+  prepare --> native[Build required native targets]
+  crates --> final[Verify both branches and publish final manifest]
+  native --> final
+```
 
 The full Rust suite belongs to frozen release acceptance. Main admission is a
 real verification gate that reuses that result; it is not a claim that tests ran
@@ -94,6 +106,35 @@ x64. Historical v1 sources retain their four-platform contract, including macOS
 Intel. The accepted source selects the contract; a dispatch or retry cannot
 remove a target. See [Shared Bamboo executables](shared-executable-assets.md).
 
+### Parallel execution and cache boundaries
+
+`automatic` authenticates the main source, reserves the signed identity, and
+uploads `bamboo-prepared-frontend-attempt-<preparation-attempt>`. The independent
+`prepared_release` job output binds the original attempt, same run/controller,
+Release ID, source/tree, version, frontend hashes and selected platform contract.
+The transport itself grants no authority.
+
+After preparation succeeds, `publish-crates` and `executables` both depend only
+on `automatic` and run concurrently. The crate worker authenticates fresh signed
+progress for that exact reservation without calling the allocator again. It
+cannot replace sealed frontend assets once workers have started. Native workers
+validate exactly two bounded regular frontend files, reject extras or symlinks,
+and verify the independent hashes before building. They need no draft-Release
+API access, signing key or publication token.
+
+`publish-executables` joins `automatic`, `publish-crates` and `executables`.
+It still authenticates the completed public crate receipt and all required
+native outputs before publishing the final manifest. Failure in either branch
+cannot advertise a complete binary release.
+
+Native caches map `RUNNER_TEMP/bamboo-executable-target`. Cache compatibility
+includes the source profile, producer contract and target, together with the
+action's Rust toolchain, environment and Cargo input keys. Restore dependencies,
+then evict workspace executables, fingerprints and generated build outputs so
+the actual source/version regenerates its embedded frontend evidence. Preserve
+the source's compiler/profile/wrapper restrictions. Historical v1 and frozen
+restore-only sources do not write these caches.
+
 Crate readiness and binary readiness are separate. A public crate Release is
 insufficient for desktop consumption until every asset required by its source
 contract and the final manifest have been uploaded and verified. Downstream
@@ -106,6 +147,12 @@ consumers pin the actual version, source and hashes after that point.
 - Prefer failed-job reruns when supported, retaining successful native outputs
   and their actual attempt numbers. A full rerun must respect existing signed
   checkpoints and immutable asset identities.
+- Select frontend transport using the successful preparation's original attempt,
+  not the retrying job's current attempt. Native transport retention is bounded;
+  missing expired inputs require the normal verified rebuild route.
+- If the same main CI run is retried, fresh admission may advance only that
+  run's attempt while preserving all source and pre-merge bindings. Keep original
+  signed reservation/checkpoint attempts intact; never relabel them as new work.
 - After an uncertain upload, read back the exact remote identity before retrying.
   Existing identical bytes may be reused; conflicting bytes stop publication.
 - Complete only missing authorized assets. Never replace an uploaded asset,
@@ -147,3 +194,8 @@ macOS Intel. New v2 releases have three targets. Compare each source contract
 separately and retain exact source/run/attempt/platform details when measuring
 the new workflow. These timings explain the optimization; they do not claim a
 measured speedup for an unpublished candidate.
+
+Parallel execution changes the post-preparation critical path from approximately
+`crate duration + slowest native duration` to their maximum, plus preparation,
+runner waiting and finalization. Measure the real run; this is the scheduling
+model, not a promised duration or percentage improvement.

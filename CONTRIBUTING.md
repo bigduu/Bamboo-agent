@@ -411,6 +411,22 @@ SHA and, for bamboo-server, original embedded frontend bytes. Only the complete
 verified closure becomes a public GitHub Release. Reruns reuse the matching
 source/frontend reservation; completed reruns verify without republishing.
 
+After this single reservation, the crate publisher and source-selected native
+matrix run concurrently. Preparation uploads exactly the preserved frontend
+manifest and ZIP as same-run transport; its independent job output binds the
+signed identity, hashes and original preparation attempt. Native workers verify
+these files without reading a private draft or receiving publication credentials.
+The crate worker authenticates the original reservation and resumes its fixed
+version without reallocating or replacing sealed frontend assets. Final asset
+publication waits for both the completed crate closure and all required native
+results. A public crate Release alone does not establish binary availability.
+
+Native dependency caches map the real runner-temp Cargo target directory and
+bind source profile, toolchain, lockfile, producer contract and target. Restored
+workspace binaries, fingerprints and generated frontend outputs are evicted
+before the formal build. Historical v1 and frozen restore-only sources cannot
+write these caches. Compiler/profile/wrapper restrictions remain intact.
+
 Authenticated reservations and registry versions advance the full-u64 allocator;
 unsigned names only occupy candidates. Verified registry/source ancestry prevents
 stale sources overtaking newer versions or GitHub latest, even after Release
@@ -516,6 +532,9 @@ Bamboo uses GitHub Actions for continuous integration and publishing:
   the policy active. PR cache cleanup remains scoped to that same-repository PR.
 - **CodeQL** (`.github/workflows/codeql.yml`) -- Runs the Actions, JavaScript/TypeScript, Python, and Rust analyses for pull requests into `main`, pushes to `main`, and explicit manual dispatches. Routine `dev` activity does not run CodeQL.
 - **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes successful main CI source commits to crates.io and GitHub Releases with verified same-source recovery. Manual/Zenith dispatches retain explicit versions, the exact locked frontend and `dry_run`.
+  One authenticated preparation feeds concurrent crate publication and native
+  builds; final publication joins both results. See the [phase guide](docs/releases/ci-publication-flow.md)
+  for identity, transport, cache and retry requirements.
   Its Cargo PATH entrypoint, including metadata invoked from Python, runs the
   digest-pinned official Rust 1.99.0 Bookworm image. Docker failure is fatal;
   publication never falls back to host Cargo. The entrypoint needs Node,
