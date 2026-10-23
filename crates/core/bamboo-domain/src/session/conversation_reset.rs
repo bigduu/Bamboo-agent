@@ -362,6 +362,7 @@ pub fn prepare_conversation_reset(
     candidate.prompt_snapshot = None;
     candidate.metadata.remove("runtime.plugin_hook_contexts");
     for key in [
+        "runtime_prompt_snapshot",
         "runtime_prompt_composer_version",
         "runtime_prompt_component_flags",
         "runtime_prompt_component_lengths",

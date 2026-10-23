@@ -10,9 +10,12 @@ Server's shared Base tool surface and the SDK's defaults-backed delivery
 assembly now install `CanonicalSessionSendAdapter`. Root, Child and nested
 Child share that Server registration. Explicit SDK tools/default-executor
 policies keep their existing precedence. `session_history` has no send action.
-No ordinary cross-Root grant is issued: Ordinary/Child delivery stays same-tree;
-the real original Supervisor retains its own attached followup route. The
-adapter's Supervisor queue-only/omitted intent blocker is unchanged.
+Assembly installs no actual grant. The integrated [finite Host sender](host-session-peer-send.md)
+selects an installed SendPeer token for every caller role and requires explicit
+QueueOnly or TriggerTurn intent. Only never-installed Host absence selects the
+ordinary same-tree or real Supervisor followup route. The legacy Supervisor
+route still rejects queue-only/omitted intent; installed, denied, stale, revoked
+or unsupported Host scope never falls through to that legacy authority.
 
 ## One permission evaluation
 

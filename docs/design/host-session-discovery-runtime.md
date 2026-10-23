@@ -42,13 +42,13 @@ completion is claimed. It adds no history to another Session.
 
 ## Runtime and compatibility boundary
 
-Server Root and SDK defaults use the new `host_routed` viewer. SDK defaults also
-register the exact filtered `session_history_current` tool. Explicit SDK
-tools/no-tools/default-executor choices retain precedence. Base/Child surface
-and native ceiling integration remain with their separate owner. The existing
-ordinary Ultra orchestration allowlist still blocks `session_history`; this
-slice does not claim that model path is enabled before the surface owner's
-change.
+The integrated Server common Base/Root and defaults-backed SDK assembly use
+the `host_routed` viewer and exact filtered `session_history_current` instance.
+Explicit SDK tools/no-tools/default-executor choices retain precedence. The
+[in-process framework integration](local-child-framework-session-tools.md) also
+supplies concrete instance proofs to ordinary non-strict Child and ordinary
+Ultra surfaces. Those paths retain their live, permission, readonly, disabled
+and Host scope gates; strict/profile/IPC boundaries remain separate.
 
 Every routed list/inspect uses the router. The ordinary Root viewer's legacy
 global listing/search and known-ID peer raw history, metadata, compressed cache

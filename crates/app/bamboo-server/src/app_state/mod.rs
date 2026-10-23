@@ -284,6 +284,10 @@ pub struct AppState {
     /// test AppStates from resolving through a sibling state's config/root.
     pub(crate) workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
 
+    /// Execution-local Source handoff coordination. It observes existing
+    /// reservations and Actor authority; it creates no execution admission.
+    pub(crate) workspace_handoffs: Arc<crate::skill_runtime::WorkspaceHandoffs>,
+
     /// Per-session write serialisation + metadata-merge persistence layer.
     ///
     /// Wraps the same [`Storage`] as `self.storage`, adding per-session

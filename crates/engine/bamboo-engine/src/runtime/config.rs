@@ -344,6 +344,16 @@ pub trait SkillExecutionHost: Send + Sync {
         current: Option<&crate::runtime::managers::lifecycle::BoundedInputRequestBatch>,
     ) -> Result<(), bamboo_agent_core::AgentError>;
 
+    /// Adopt only a scope transition already committed by this registered Host.
+    /// Ordinary canonical drift is not authorization to renew a Source.
+    async fn refresh_runtime_scope(
+        &self,
+        _session: &mut bamboo_agent_core::Session,
+        _execution_id: &str,
+    ) -> Result<(), bamboo_agent_core::AgentError> {
+        Ok(())
+    }
+
     async fn render_skill_prompt(
         &self,
         session: &bamboo_agent_core::Session,
@@ -355,6 +365,21 @@ pub trait SkillExecutionHost: Send + Sync {
 
 /// Compatibility name for the default SDK host.
 pub use SkillExecutionHost as SdkSkillExecutionHost;
+
+/// Execution-local Host bridge for an already committed Workspace transaction.
+/// It carries no Skill policy and cannot activate or replace an execution owner.
+#[async_trait::async_trait]
+pub trait WorkspaceExecutionHost: Send + Sync {
+    async fn refresh_runtime_scope(
+        &self,
+        session: &mut bamboo_agent_core::Session,
+        execution_id: &str,
+        persistence: &Arc<dyn bamboo_domain::RuntimeSessionPersistence>,
+    ) -> Result<(), bamboo_agent_core::AgentError>;
+
+    /// Close this execution's observation before a successor may be dispatched.
+    fn finish(&self);
+}
 
 /// One bounded, explicitly supplied input observation. This carries caller data,
 /// never proof of currentness, a Source grant, or permission to invoke a Skill.
@@ -850,6 +875,7 @@ pub struct AgentLoopConfig {
     /// Untrusted inputs supplied by this startup call, never inferred.
     pub(crate) initial_untrusted_inputs: Option<UntrustedExecutionInputs>,
     pub(crate) sdk_skill_execution_host: Option<Arc<dyn SdkSkillExecutionHost>>,
+    pub(crate) workspace_execution_host: Option<Arc<dyn WorkspaceExecutionHost>>,
     pub(crate) additional_tool_schemas: Vec<ToolSchema>,
     pub(crate) tool_registry: Arc<ToolRegistry>,
     pub(crate) skill_manager: Option<Arc<SkillManager>>,
@@ -1083,6 +1109,7 @@ impl Default for AgentLoopConfig {
             selected_skill_mode: None,
             initial_untrusted_inputs: None,
             sdk_skill_execution_host: None,
+            workspace_execution_host: None,
             additional_tool_schemas: Vec::new(),
             tool_registry: Arc::new(ToolRegistry::new()),
             skill_manager: None,

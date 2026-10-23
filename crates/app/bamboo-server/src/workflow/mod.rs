@@ -10,7 +10,9 @@
 mod loader;
 mod run;
 
-pub(crate) use run::{public_workflow_event, public_workflow_snapshot};
+pub(crate) use run::{
+    public_workflow_event, public_workflow_snapshot, WorkflowWorkspaceScopeGuard,
+};
 pub use run::{WorkflowRunAccess, WorkflowRunTool};
 
 #[cfg(test)]

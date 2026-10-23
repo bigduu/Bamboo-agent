@@ -1194,6 +1194,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bamboo-orchestration"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "bamboo-domain",
+ "bamboo-tickets",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "bamboo-permission"
 version = "0.0.0"
 dependencies = [
@@ -1328,6 +1342,7 @@ dependencies = [
  "bamboo-memory",
  "bamboo-metrics",
  "bamboo-notification",
+ "bamboo-orchestration",
  "bamboo-plugin",
  "bamboo-plugin-protocol",
  "bamboo-projects",

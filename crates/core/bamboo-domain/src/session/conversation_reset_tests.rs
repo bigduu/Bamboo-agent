@@ -255,6 +255,29 @@ fn reset_preparation_purges_old_payload_and_preserves_identity_scope_and_unfinis
 }
 
 #[test]
+fn reset_preparation_purges_a_legacy_only_prompt_snapshot() {
+    for supervisor in [false, true] {
+        let mut original = source(supervisor);
+        let snapshot = original.prompt_snapshot.take().unwrap();
+        let legacy = serde_json::to_string(&snapshot).unwrap();
+        assert!(legacy.contains(OLD));
+        original
+            .metadata
+            .insert("runtime_prompt_snapshot".into(), legacy.clone());
+        let before = serde_json::to_value(&original).unwrap();
+
+        let candidate = prepared(&original);
+        let after = &candidate.proposed_session;
+        assert!(after.prompt_snapshot.is_none());
+        assert!(!after.metadata.contains_key("runtime_prompt_snapshot"));
+        assert!(!serde_json::to_string(after).unwrap().contains(OLD));
+        assert_eq!(serde_json::to_value(&original).unwrap(), before);
+        assert!(original.prompt_snapshot.is_none());
+        assert_eq!(original.metadata["runtime_prompt_snapshot"], legacy);
+    }
+}
+
+#[test]
 fn reset_replay_recovers_one_exact_receipt_and_does_not_reset_newer_messages() {
     let original = source(true);
     let request = request(&original, 0);

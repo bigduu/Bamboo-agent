@@ -85,12 +85,14 @@ impl Session {
 
     pub fn set_last_run_error(&mut self, value: impl Into<String>) {
         let value = value.into();
+        self.retain_llm_request_diagnostic_for_error(&value);
         self.runtime_metadata_mut().last_run_error = Some(value.clone());
         self.metadata
             .insert(keys::LAST_RUN_ERROR.to_string(), value);
     }
 
     pub fn clear_last_run_error(&mut self) {
+        self.clear_llm_request_diagnostic();
         if let Some(rm) = self.runtime_metadata.as_mut() {
             rm.last_run_error = None;
         }

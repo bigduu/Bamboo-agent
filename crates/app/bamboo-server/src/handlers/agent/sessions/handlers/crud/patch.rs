@@ -258,6 +258,7 @@ pub async fn patch_session(
         };
         let guard = state.persistence.acquire_lock(&session_id).await;
         if is_session_running(&state, &session_id).await
+            || state.workflow_runs.scope_change_is_blocked(&session_id)
             || crate::handlers::agent::events::execute_startup_is_in_flight(
                 state.as_ref(),
                 &session_id,

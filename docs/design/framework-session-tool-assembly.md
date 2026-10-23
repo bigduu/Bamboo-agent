@@ -36,10 +36,11 @@ fresh/retained contract.
 Tool installation is not a scope or security configuration change. Every read
 still requires B3's original-caller and final Host read authority. Root creation
 still requires the installed caller port's exact Project/workspace scope and
-canonical writer. The App caller port currently refuses installed Host create
-scope if its create-purpose first-input adapter is unconfigured, before Root
-reservation or publication. That missing final adapter remains a blocker; this
-assembly does not claim ordinary creation has completed end to end.
+canonical writer. The integrated App caller port now supplies the canonical
+create-purpose first-input adapter through the same SessionMessenger/Inbox plane.
+An unavailable backend still refuses at its final boundary; a scope observation
+is not a grant. SDK Root creation still needs its explicit trusted caller port.
+Source wiring does not establish end-to-end runtime success.
 
 SDK messaging still requires explicit `session_delivery` for one coherent
 Inbox/activation/messenger plane. This slice does not invent an Inbox, active
@@ -48,16 +49,15 @@ Delivery-backed defaults retain their existing scoped sender, one native send
 permission evaluation and durable receipt semantics. Configless reads confer
 no create/send grant, and accepted input is not task completion.
 
-The immutable native eight-tool ceiling is unchanged. Base registration is not
-proof that a restricted local Child can call these tools. In particular,
-ordinary non-strict `LocalChildTools` currently derives names from its inner
-catalog and its exact check still uses the old generic resolver. B4b must
-replace that path for framework Session capabilities with explicitly installed
-Host instance proofs and the fresh/retained exact selector, preserving strict,
-read-only, named-profile, disabled and live-owner boundaries. Admission of the
-combined capability work depends on that closure; this slice cannot be used as
-evidence that every Child or ordinary Ultra model surface is enabled. Process
-IPC requires its own authenticated bridge and remains separate.
+The integrated [B4b in-process path](local-child-framework-session-tools.md)
+now retains concrete Host instance proofs through the complete outer permission
+chain and uses the fresh/retained exact selector. Ordinary non-strict Child and
+ordinary Ultra model surfaces can use those installed ports subject to their
+existing live, permission, disabled and final scope checks. Readonly/Plan Child
+execution receives only the two readers. Strict, named-profile and Ticket paths
+receive no added ports; the immutable native eight-tool ceiling is unchanged.
+Process IPC still requires its separate authenticated bridge. Neither names nor
+Base registration alone establish this instance authority or runtime acceptance.
 
 ## Validation status
 
@@ -76,4 +76,4 @@ source assertions are permitted in this window. **Cargo, compilation, Clippy,
 and all Rust fixture execution remain UNRUN.** No provider/account session,
 actual grant/security change, user-history clear, deployment or cache copy was
 performed. Keep the stacked PR Draft until the required compilation, affected
-runtime cases, B4b boundary and current-head/base review are satisfied.
+runtime cases and current-head/base review are satisfied.

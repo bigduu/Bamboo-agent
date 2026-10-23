@@ -51,6 +51,8 @@ pub(super) fn build_base_tools(
         Arc<dyn bamboo_server_tools::session_control::root_creation::SessionRootCreatePort>,
     >,
     diagnostics: Arc<crate::tools::diagnostics::DiagnosticsSource>,
+    workspace_scope_guard: Arc<dyn bamboo_server_tools::project_tools::WorkspaceScopeGuard>,
+    workspace_handoff_hook: Arc<dyn bamboo_server_tools::project_tools::WorkspaceHandoffHook>,
 ) -> (
     Arc<dyn ToolExecutor>,
     Arc<dyn bamboo_engine::external_agents::runtime::NativeToolCeilingSource>,
@@ -99,7 +101,9 @@ pub(super) fn build_base_tools(
             session_repo.clone(),
             project_store.clone(),
             workspace_resolver.clone(),
-        ),
+        )
+        .with_scope_guard(workspace_scope_guard)
+        .with_handoff_hook(workspace_handoff_hook),
     );
     let with_workspace: Arc<dyn ToolExecutor> =
         Arc::new(crate::tools::OverlayToolExecutor::new(base, workspace_tool));
@@ -380,6 +384,7 @@ pub(super) fn build_root_tools(
     fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,
     project_store: Arc<bamboo_projects::ProjectStore>,
     workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
+    browser: Arc<crate::browser::BrowserManager>,
     parent_request_replies: Arc<dyn bamboo_server_tools::ParentRequestReplyPort>,
 ) -> (
     Arc<dyn ToolExecutor>,
@@ -387,6 +392,7 @@ pub(super) fn build_root_tools(
 ) {
     // Shared adapter for the unified child session tool.
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
+        browser: Some(browser),
         session_store: session_store.clone(),
         storage: storage.clone(),
         persistence: persistence.clone(),

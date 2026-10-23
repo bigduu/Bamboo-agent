@@ -69,6 +69,11 @@ impl BambooDiagnosticsTool {
             "observed_at":chrono::Utc::now(),
             "config":config,
             "memory":memory,
+            "llm_initial_requests":{
+                "availability":"bounded_process_local",
+                "events":bamboo_llm::retry::recent_initial_request_diagnostics(session_id),
+                "limits":"latest 12 current-session events from a 128-event process buffer; restart or eviction loses evidence; run ID unavailable at provider boundary",
+            },
             "limits":{
                 "active_probes":"not_performed",
                 "cross_subsystem_snapshot":"not_atomic",
@@ -174,7 +179,7 @@ impl Tool for BambooDiagnosticsTool {
         "bamboo_diagnostics"
     }
     fn description(&self) -> &str {
-        "Read allowlisted local Bamboo configuration health/revisions and the current session's cached memory-injection status/counts. No active probes, file/config/credential reads, repairs or reloads. Missing evidence is unknown; cached counts do not prove a model received or used memory. Consult the version-bound bamboo-manual for interpretation. Takes no arguments."
+        "Read allowlisted local Bamboo configuration health/revisions and the current session's cached memory-injection status/counts and bounded content-free initial LLM request diagnostics. No active probes, file/config/credential reads, repairs or reloads. Missing evidence is unknown; cached counts do not prove a model received or used memory. Consult the version-bound bamboo-manual for interpretation. Takes no arguments."
     }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{},"additionalProperties":false})
@@ -301,6 +306,14 @@ mod tests {
             .as_str()
             .is_some_and(|hash| hash.len() == 64));
         assert_eq!(output["memory"]["session_topic_count"], 3);
+        assert_eq!(
+            output["llm_initial_requests"]["availability"],
+            "bounded_process_local"
+        );
+        assert!(output["llm_initial_requests"]["events"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         assert_eq!(output["config"]["providers"]["revision"], 7);
         assert_eq!(
             output["config"]["application"]["desired_vs_applied"],
