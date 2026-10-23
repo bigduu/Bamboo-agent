@@ -77,13 +77,16 @@ test('original signed admission tolerates only a later attempt of the identical 
   const recorded = { schemaVersion: 1, sourceRevision, ciRun: { id: 100, run_attempt: 1, html_url: 'fixture/main/100' },
     premerge: { runId: 90, runAttempt: 1, snapshotRevision: '1'.repeat(40) } }
   const current = { ...clone(recorded), ciRun: { ...recorded.ciRun, run_attempt: 2 } }
+  const originalBytes = JSON.stringify(signReceipt({ validation: recorded }, signingKey))
   assert.equal(assertAdmissionCompatibility(recorded, current), true)
   assert.equal(assertAdmissionCompatibility(undefined, undefined), true)
-  assert.equal(recorded.ciRun.run_attempt, 1, 'Original signed fields remain immutable')
+  assert.equal(JSON.stringify(signReceipt({ validation: recorded }, signingKey)), originalBytes,
+    'Original signed fields remain immutable')
   for (const value of [undefined, { ...current, ciRun: { ...current.ciRun, run_attempt: 0 } },
     { ...current, ciRun: { ...current.ciRun, run_attempt: '2' } },
     { ...current, ciRun: { ...current.ciRun, id: 101 } },
     { ...current, sourceRevision: '2'.repeat(40) },
+    { ...current, premerge: { ...current.premerge, runId: 91 } },
     { ...current, premerge: { ...current.premerge, runAttempt: 2 } },
     { ...current, premerge: { ...current.premerge, snapshotRevision: '2'.repeat(40) } },
   ]) assert.throws(() => assertAdmissionCompatibility(recorded, value))

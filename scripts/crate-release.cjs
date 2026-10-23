@@ -154,8 +154,7 @@ function validateReceipt(receipt, identity, crates, version = receipt?.version) 
   return receipt
 }
 
-// This snapshot travels through the trusted preparation job's output channel,
-// independently of artifact transports and the concurrently changing Release body.
+// Preserve original signed acceptance when the same main CI is rerun.
 function assertAdmissionCompatibility(recorded, current) {
   if (recorded === undefined && current === undefined) return true
   assert.ok(recorded && current, 'Both original and current source admission records are required')
