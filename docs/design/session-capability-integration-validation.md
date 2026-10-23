@@ -63,6 +63,46 @@ review remain separate admission gates. This native window does not admit any
 Draft or publish a release. A finding or source repair produces a new candidate
 and an explicit affected revalidation record.
 
+## Copy rollback review supplement
+
+The `8c7a3130` union completed the full eleven-target build. Its native
+selection guard then stopped before executing any test: two Engine response
+cases used `respond::tests` instead of the actual `receipt_persistence_tests`
+module. The corrected v5 manifest preserves all 278 function identities; its
+full binary catalog is list-only evidence. Actual execution remains **0/278**.
+The Rust window was returned for release priority before further execution.
+
+PR #2187's copy-rollback P2 adds a separate source repair. A rollback first
+retains the existing Main/runtime identity and zero-generation checks, durably
+hides the canonical index row, and moves the directory to the transaction UUID
+staging path. It synchronizes both rename parents and persists `.deleting`
+before recursively removing staging. That phase never revisits canonical data
+or removes an index row by ID, so a new Session at that ID survives a retry.
+Same-UUID marker bodies must agree; `.deleting` wins over lower phases and is
+deactivated last. A failed durable index hide retains the complete target and
+recovery marker.
+
+The next source-bound plan must preserve the original 278 cases and add all six
+affected cases below, for 284 planned cases (259 library and 25 integration).
+Their source presence is not an executed result; the repair has no native or
+crash-recovery acceptance yet.
+
+| Fixture | Source |
+| --- | --- |
+| `copy_rollback_deleting_resumes_after_partial_staging_cleanup` | `v2/conversation_generation_tests.rs`, new |
+| `copy_rollback_deleting_preserves_a_recreated_target_and_wins_over_siblings` | same, new |
+| `copy_rollback_prepared_staging_preserves_a_foreign_canonical` | same, new |
+| `copy_rollback_unmarked_partial_canonical_refuses_without_mutation` | same, new |
+| `a_retained_copy_rollback_marker_cannot_remove_a_reset_root` | same, updated real marker/EX guards |
+| `copy_session_rolls_back_directory_when_index_publish_fails` | `v2.rs`, updated durable-hide refusal/reopen |
+
+Unmarked legacy partial canonical data still lacks ownership evidence and is
+retained with a refusal. V1 journals also lack an original birth witness for an
+intact zero-generation target; this repair does not resolve that historical
+ambiguity. Older binaries do not recognize `.deleting`; downgrade and mixed
+version recovery are unqualified. These source changes do not implement C2 or
+clear any real Session.
+
 ## Separate C2 source is not admitted
 
 M1 contains generation consumers and C4a's retained outer JoinHandles and

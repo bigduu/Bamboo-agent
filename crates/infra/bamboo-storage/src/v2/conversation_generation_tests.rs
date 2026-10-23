@@ -794,11 +794,26 @@ async fn a_retained_copy_rollback_marker_cannot_remove_a_reset_root() {
         source_id: "old-copy-source".into(),
         target_id: fixture.canonical.id.clone(),
     };
+    let marker = fixture
+        .store
+        .write_session_copy_journal(&journal)
+        .await
+        .unwrap();
     let before = fixture.files().await;
+    let lifecycle = fixture
+        .store
+        .lock_session_lifecycle_exclusive()
+        .await
+        .unwrap();
+    let runtime_task = fixture
+        .store
+        .lock_runtime_task_transaction_exclusive()
+        .await
+        .unwrap();
     assert_conflict(
         fixture
             .store
-            .rollback_session_copy_transaction(&journal)
+            .rollback_session_copy_transaction(&marker, &journal)
             .await
             .unwrap_err(),
     );
@@ -808,6 +823,11 @@ async fn a_retained_copy_rollback_marker_cannot_remove_a_reset_root() {
         .sessions_root_dir()
         .join(&fixture.canonical.id)
         .is_dir());
+    assert!(marker.is_file());
+    assert!(!marker.with_extension("deleting").exists());
+    assert!(!fixture.store.session_copy_staging_dir(&journal).exists());
+    drop(runtime_task);
+    drop(lifecycle);
     fixture.finish().await;
 }
 
@@ -998,4 +1018,239 @@ async fn child_wait_cannot_adopt_or_append_from_a_previous_conversation() {
     assert_eq!(serde_json::to_value(&updated).unwrap(), before_updated);
     assert!(!published.load(Ordering::SeqCst));
     fixture.finish().await;
+}
+
+// Copy rollback fixtures exercise the production phase boundary and an actual
+// store reopen. Every file belongs to a fresh synthetic TempDir.
+async fn copy_rollback_fixture() -> (
+    TempDir,
+    SessionStoreV2,
+    SessionCopyTransactionJournal,
+    PathBuf,
+) {
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let mut source = Session::new("rollback-source", "model");
+    source.add_message(Message::user("synthetic copy payload"));
+    store.save_session(&source).await.unwrap();
+    let copied = store
+        .copy_session(&source.id, "rollback-target")
+        .await
+        .unwrap()
+        .unwrap();
+    let journal = SessionCopyTransactionJournal {
+        version: SESSION_COPY_TRANSACTION_VERSION,
+        transaction_id: Uuid::new_v4().to_string(),
+        source_id: source.id,
+        target_id: copied.id,
+    };
+    let marker = store.write_session_copy_journal(&journal).await.unwrap();
+    (home, store, journal, marker)
+}
+
+async fn prepare_copy_rollback_phase(
+    store: &SessionStoreV2,
+    marker: &Path,
+    journal: &SessionCopyTransactionJournal,
+) -> PathBuf {
+    let _lifecycle = store.lock_session_lifecycle_exclusive().await.unwrap();
+    let _runtime_task = store
+        .lock_runtime_task_transaction_exclusive()
+        .await
+        .unwrap();
+    store
+        .prepare_session_copy_rollback_deletion(marker, journal)
+        .await
+        .unwrap()
+}
+
+async fn copy_target_files(store: &SessionStoreV2, id: &str) -> [Vec<u8>; 3] {
+    let target = store.sessions_root_dir().join(id);
+    [
+        fs::read(target.join("session.json")).await.unwrap(),
+        fs::read(target.join(RUNTIME_SIDECAR_FILE)).await.unwrap(),
+        fs::read(store.index_path()).await.unwrap(),
+    ]
+}
+
+#[tokio::test]
+async fn copy_rollback_deleting_resumes_after_partial_staging_cleanup() {
+    let (home, store, journal, marker) = copy_rollback_fixture().await;
+    let staging = prepare_copy_rollback_phase(&store, &marker, &journal).await;
+    assert!(!store.sessions_root_dir().join(&journal.target_id).exists());
+    assert!(store.get_index_entry(&journal.target_id).await.is_none());
+    assert!(marker.with_extension("deleting").is_file());
+    fs::write(staging.join("remaining-payload"), b"not yet removed")
+        .await
+        .unwrap();
+    // Model interruption after remove_dir_all has removed both identity files.
+    fs::remove_file(staging.join("session.json")).await.unwrap();
+    fs::remove_file(staging.join(RUNTIME_SIDECAR_FILE))
+        .await
+        .unwrap();
+    store.flush_search_index().await;
+    drop(store);
+
+    let reopened = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert!(!staging.exists());
+    assert!(!reopened
+        .sessions_root_dir()
+        .join(&journal.target_id)
+        .exists());
+    assert!(reopened.get_index_entry(&journal.target_id).await.is_none());
+    assert!(reopened
+        .session_copy_journal_paths()
+        .await
+        .unwrap()
+        .is_empty());
+    reopened.flush_search_index().await;
+    drop(reopened);
+    home.close().unwrap();
+}
+
+#[tokio::test]
+async fn copy_rollback_deleting_preserves_a_recreated_target_and_wins_over_siblings() {
+    let (home, store, journal, marker) = copy_rollback_fixture().await;
+    let staging = prepare_copy_rollback_phase(&store, &marker, &journal).await;
+    fs::remove_dir_all(&staging).await.unwrap();
+    sync_parent_directory_entry(&staging).await.unwrap();
+    // Recursive cleanup finished, but the durable Deleting marker remains.
+    // Generic saves can legally reuse this absent canonical ID between retries.
+    let mut foreign = Session::new(&journal.target_id, "different-model");
+    foreign.created_at += chrono::Duration::seconds(1);
+    foreign.add_message(Message::user("new independent Root must survive"));
+    store.save_session(&foreign).await.unwrap();
+    let before = copy_target_files(&store, &journal.target_id).await;
+    let body = serde_json::to_vec(&journal).unwrap();
+    for extension in ["json", "committing", "committed"] {
+        durable_atomic_write(&marker.with_extension(extension), &body)
+            .await
+            .unwrap();
+    }
+    store.flush_search_index().await;
+    drop(store);
+
+    let reopened = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert_eq!(
+        copy_target_files(&reopened, &journal.target_id).await,
+        before
+    );
+    assert!(reopened.get_index_entry(&journal.target_id).await.is_some());
+    assert!(reopened
+        .session_copy_journal_paths()
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(!staging.exists());
+    reopened.flush_search_index().await;
+    drop(reopened);
+    let again = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert_eq!(copy_target_files(&again, &journal.target_id).await, before);
+    assert!(again.session_copy_journal_paths().await.unwrap().is_empty());
+    again.flush_search_index().await;
+    drop(again);
+    home.close().unwrap();
+}
+
+#[tokio::test]
+async fn copy_rollback_prepared_staging_preserves_a_foreign_canonical() {
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    let journal = SessionCopyTransactionJournal {
+        version: SESSION_COPY_TRANSACTION_VERSION,
+        transaction_id: Uuid::new_v4().to_string(),
+        source_id: "prepublication-source".into(),
+        target_id: "prepublication-target".into(),
+    };
+    let marker = store.write_session_copy_journal(&journal).await.unwrap();
+    let staging = store.session_copy_staging_dir(&journal);
+    fs::create_dir(&staging).await.unwrap();
+    fs::write(staging.join("partial-copy"), b"unpublished")
+        .await
+        .unwrap();
+    let mut foreign = Session::new(&journal.target_id, "independent-model");
+    foreign.add_message(Message::user("foreign canonical history"));
+    store.save_session(&foreign).await.unwrap();
+    let before = copy_target_files(&store, &journal.target_id).await;
+    store.flush_search_index().await;
+    drop(store);
+
+    let reopened = SessionStoreV2::new(home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert_eq!(
+        copy_target_files(&reopened, &journal.target_id).await,
+        before
+    );
+    assert!(reopened.get_index_entry(&journal.target_id).await.is_some());
+    assert!(!staging.exists());
+    assert!(!marker.exists());
+    assert!(reopened
+        .session_copy_journal_paths()
+        .await
+        .unwrap()
+        .is_empty());
+    reopened.flush_search_index().await;
+    drop(reopened);
+    home.close().unwrap();
+}
+
+#[tokio::test]
+async fn copy_rollback_unmarked_partial_canonical_refuses_without_mutation() {
+    for missing in [
+        vec!["session.json"],
+        vec![RUNTIME_SIDECAR_FILE],
+        vec!["session.json", RUNTIME_SIDECAR_FILE],
+    ] {
+        let (home, store, journal, marker) = copy_rollback_fixture().await;
+        let target = store.sessions_root_dir().join(&journal.target_id);
+        for filename in &missing {
+            fs::remove_file(target.join(filename)).await.unwrap();
+        }
+        fs::write(
+            target.join("remaining-payload"),
+            b"legacy incomplete cleanup",
+        )
+        .await
+        .unwrap();
+        let before = [
+            fs::read(target.join("session.json")).await.ok(),
+            fs::read(target.join(RUNTIME_SIDECAR_FILE)).await.ok(),
+            fs::read(store.index_path()).await.ok(),
+            fs::read(&marker).await.ok(),
+        ];
+        store.flush_search_index().await;
+        drop(store);
+
+        assert!(SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .is_err());
+        assert_eq!(
+            [
+                fs::read(target.join("session.json")).await.ok(),
+                fs::read(target.join(RUNTIME_SIDECAR_FILE)).await.ok(),
+                fs::read(home.path().join("sessions.json")).await.ok(),
+                fs::read(&marker).await.ok(),
+            ],
+            before,
+            "legacy partial canonical must remain untouched: {missing:?}"
+        );
+        assert!(target.join("remaining-payload").is_file());
+        assert!(!marker.with_extension("deleting").exists());
+        assert!(!home
+            .path()
+            .join(format!(".session-copy-{}", journal.transaction_id))
+            .exists());
+        home.close().unwrap();
+    }
 }

@@ -395,7 +395,7 @@ struct RuntimeTaskTransactionJournal {
     second: TaskControlPlaneUndo,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionCopyTransactionJournal {
     version: u32,
     transaction_id: String,
@@ -421,11 +421,14 @@ impl RuntimeTaskJournalMarkerState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SessionCopyJournalMarkerState {
     Prepared,
     Committing,
     Committed,
+    // The payload is transaction-owned staging. This phase must never revisit
+    // the canonical ID, even when staging cleanup already completed.
+    Deleting,
 }
 
 impl SessionCopyJournalMarkerState {
@@ -434,6 +437,7 @@ impl SessionCopyJournalMarkerState {
             Some("json") => Some(Self::Prepared),
             Some("committing") => Some(Self::Committing),
             Some("committed") => Some(Self::Committed),
+            Some("deleting") => Some(Self::Deleting),
             _ => None,
         }
     }
@@ -4093,7 +4097,9 @@ impl SessionStoreV2 {
         &self,
         journal: &SessionCopyTransactionJournal,
     ) -> io::Result<()> {
-        for extension in ["json", "committing", "committed"] {
+        // Remove the irreversible decision last. A failed lower-state cleanup
+        // must leave Deleting dominant over every surviving sibling marker.
+        for extension in ["json", "committing", "committed", "deleting"] {
             let path = self
                 .session_copy_transaction_dir()
                 .join(format!("{}.{}", journal.transaction_id, extension));
@@ -4106,16 +4112,70 @@ impl SessionStoreV2 {
         Ok(())
     }
 
-    async fn rollback_session_copy_transaction(
+    /// Establish the durable, staging-only deletion phase under lifecycle EX
+    /// then Task EX. Keeping this separate from recursive cleanup also lets a
+    /// synthetic fixture stop at the actual production crash boundary.
+    async fn prepare_session_copy_rollback_deletion(
         &self,
+        marker_path: &Path,
         journal: &SessionCopyTransactionJournal,
-    ) -> io::Result<()> {
-        // Copy can only publish a new zero-generation Root. A retained legacy
-        // rollback marker cannot own a target that has since been reset. Check
-        // before hiding it in the index or deleting any canonical directory.
+    ) -> io::Result<PathBuf> {
+        let state = SessionCopyJournalMarkerState::from_path(marker_path).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid copy rollback marker")
+        })?;
+        if state == SessionCopyJournalMarkerState::Committed {
+            return Err(other_io_error("copy rollback decision is not durable"));
+        }
+        if !Self::runtime_task_recovery_real_file(marker_path).await?
+            || &self.read_session_copy_journal(marker_path).await? != journal
+        {
+            return Err(other_io_error("copy rollback marker identity changed"));
+        }
+        let staging_dir = self.session_copy_staging_dir(journal);
+        let staging_exists = match fs::symlink_metadata(&staging_dir).await {
+            Ok(metadata) if metadata.file_type().is_dir() => true,
+            Ok(_) => {
+                return Err(other_io_error(
+                    "copy rollback staging is not a real directory",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        let deleting = marker_path.with_extension("deleting");
+        if state == SessionCopyJournalMarkerState::Deleting {
+            // No canonical/index lookup here: a live writer may have created a
+            // different Root at the same ID after the previous attempt ended.
+            sync_parent_directory_entry(&deleting).await?;
+            return Ok(staging_dir);
+        }
+        match fs::symlink_metadata(&deleting).await {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                if &self.read_session_copy_journal(&deleting).await? != journal {
+                    return Err(other_io_error(
+                        "copy rollback deleting marker identity changed",
+                    ));
+                }
+                sync_parent_directory_entry(&deleting).await?;
+                return Ok(staging_dir);
+            }
+            Ok(_) => {
+                return Err(other_io_error(
+                    "copy rollback deleting marker is not a real file",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
         let target_dir = self.sessions_dir.join(&journal.target_id);
-        match fs::symlink_metadata(&target_dir).await {
+        let mut target_created_at = None;
+        let target_exists = match fs::symlink_metadata(&target_dir).await {
+            Ok(_) if staging_exists => true,
             Ok(metadata) if metadata.file_type().is_dir() => {
+                // V1 has no original birth witness. Preserve its existing
+                // zero-generation compatibility, never infer ownership from an
+                // incomplete pair, and never act on a reset Root.
                 let main_path = target_dir.join("session.json");
                 let runtime_path = target_dir.join(RUNTIME_SIDECAR_FILE);
                 for path in [&main_path, &runtime_path] {
@@ -4136,55 +4196,95 @@ impl SessionStoreV2 {
                 reject_incompatible_session_write(&side)?;
                 reject_conversation_generation_change(&main, &side)?;
                 conversation_task_undo::check_legacy_zero_target(&main)?;
+                target_created_at = Some(main.created_at);
+                true
             }
             Ok(_) => {
                 return Err(other_io_error(
                     "copy rollback target is not a real directory",
                 ))
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        if !staging_exists {
+            // Failure to durably hide a verified target stops before rename or
+            // deletion. An in-memory-only removal is not a recovery boundary.
+            self.update_index(|index| {
+                if let Some(entry) = index.sessions.get(&journal.target_id) {
+                    let canonical = entry.kind == SessionKind::Root
+                        && entry.rel_path == Self::root_rel_path(&journal.target_id)
+                        && (entry.root_session_id.is_empty()
+                            || entry.root_session_id == journal.target_id);
+                    if target_exists
+                        && (!canonical
+                            || target_created_at.is_some_and(|birth| birth != entry.created_at))
+                    {
+                        return Err(other_io_error(
+                            "copy rollback target index identity changed",
+                        ));
+                    }
+                    if canonical {
+                        index.sessions.remove(&journal.target_id);
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+            if target_exists {
+                // The UUID staging path was absent under lifecycle EX + Task
+                // EX. Never overwrite existing staging; that branch above owns
+                // only its payload and preserves any current canonical Root.
+                atomic_rename(&target_dir, &staging_dir).await?;
+            }
+        } else if !target_exists {
+            // Prepared staging also covers a prepublication failure or a crash
+            // between target rename and phase publication. Only an absent
+            // canonical Root permits removal of its stale canonical index row.
+            self.update_index(|index| {
+                let stale = index.sessions.get(&journal.target_id).is_some_and(|entry| {
+                    entry.kind == SessionKind::Root
+                        && entry.rel_path == Self::root_rel_path(&journal.target_id)
+                        && entry.root_session_id == journal.target_id
+                });
+                if stale {
+                    index.sessions.remove(&journal.target_id);
+                }
+                Ok(())
+            })
+            .await?;
+        }
+        // These directories have different parents: sessions/ and BAMBOO_HOME.
+        // A retry must also complete either sync left uncertain by a prior move.
+        sync_parent_directory_entry(&target_dir).await?;
+        sync_parent_directory_entry(&staging_dir).await?;
+        atomic_rename(marker_path, &deleting).await?;
+        sync_parent_directory_entry(&deleting).await?;
+        if target_exists && !staging_exists {
+            self.search_index_queue.enqueue_delete(
+                &journal.target_id,
+                target_dir.join(SEARCH_INDEX_REVISION_FILE),
+            );
+        }
+        Ok(staging_dir)
+    }
+
+    async fn rollback_session_copy_transaction(
+        &self,
+        marker_path: &Path,
+        journal: &SessionCopyTransactionJournal,
+    ) -> io::Result<()> {
+        let staging_dir = self
+            .prepare_session_copy_rollback_deletion(marker_path, journal)
+            .await?;
+        // The durable Deleting marker owns only this UUID staging path. Partial
+        // recursive cleanup can remove Main/runtime without losing ownership.
+        match fs::remove_dir_all(&staging_dir).await {
+            Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        // Hide the target first. If cleanup later fails, the retained marker
-        // makes startup retry before the store becomes available.
-        let mut errors = Vec::new();
-        if let Err(error) = self
-            .update_index(|index| {
-                index.sessions.remove(&journal.target_id);
-                Ok(())
-            })
-            .await
-        {
-            errors.push(format!("index cleanup: {error}"));
-            // The durable index could not be rewritten, but readers of this
-            // still-live store must not retain a target whose directory is
-            // about to be removed. The journal keeps cross-process recovery
-            // retryable; this in-memory removal closes the local visibility gap.
-            self.index.write().await.sessions.remove(&journal.target_id);
-        }
-        let revision_path = target_dir.join(SEARCH_INDEX_REVISION_FILE);
-        let staging_dir = self.session_copy_staging_dir(journal);
-        for path in [&target_dir, &staging_dir] {
-            match fs::remove_dir_all(path).await {
-                Ok(()) => {
-                    if let Err(error) = sync_parent_directory_entry(path).await {
-                        errors.push(format!("sync cleanup {}: {error}", path.display()));
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => errors.push(format!("remove {}: {error}", path.display())),
-            }
-        }
-        self.search_index_queue
-            .enqueue_delete(&journal.target_id, revision_path);
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(other_io_error(format!(
-                "session copy rollback incomplete: {}",
-                errors.join("; ")
-            )))
-        }
+        sync_parent_directory_entry(&staging_dir).await
     }
 
     async fn recover_session_copy_journal(
@@ -4233,15 +4333,38 @@ impl SessionStoreV2 {
             self.search_index_queue
                 .enqueue_upsert(&target, revision_path, revision);
         } else {
-            self.rollback_session_copy_transaction(journal).await?;
+            self.rollback_session_copy_transaction(path, journal)
+                .await?;
         }
-        durable_deactivate_recovery_marker(path).await
+        self.remove_session_copy_journal_family(journal).await
     }
 
     async fn recover_all_session_copy_transactions_locked(&self) -> io::Result<()> {
+        let mut families: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for path in self.session_copy_journal_paths().await? {
-            let journal = self.read_session_copy_journal(&path).await?;
-            self.recover_session_copy_journal(&path, &journal).await?;
+            let id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| other_io_error("invalid session copy journal name"))?
+                .to_string();
+            families.entry(id).or_default().push(path);
+        }
+        let mut families: Vec<_> = families.into_iter().collect();
+        families.sort_by(|first, second| first.0.cmp(&second.0));
+        for (_, mut paths) in families {
+            paths.sort_by_key(|path| SessionCopyJournalMarkerState::from_path(path));
+            let selected = paths.last().expect("nonempty copy journal family");
+            let journal = self.read_session_copy_journal(selected).await?;
+            // Validate all same-UUID records before any action. Deleting wins
+            // over a stale Committed marker and is deactivated only after every
+            // lower-state sibling, so retries never return to the canonical ID.
+            for path in &paths {
+                if self.read_session_copy_journal(path).await? != journal {
+                    return Err(other_io_error("conflicting session copy journal family"));
+                }
+            }
+            self.recover_session_copy_journal(selected, &journal)
+                .await?;
         }
         // A previous marker deactivation may have completed its rename to an
         // inert tombstone but failed the directory sync. Lifecycle mutations
@@ -5514,10 +5637,11 @@ impl SessionStoreV2 {
         // durably move that decision back to a rollback state. Otherwise a
         // partial cleanup could leave a committed marker pointing at a removed
         // target and make every subsequent startup fail closed forever.
+        let mut rollback_marker = marker_path.to_path_buf();
         if SessionCopyJournalMarkerState::from_path(marker_path)
             == Some(SessionCopyJournalMarkerState::Committed)
         {
-            let rollback_marker = marker_path.with_extension("committing");
+            rollback_marker = marker_path.with_extension("committing");
             if let Err(error) = async {
                 atomic_rename(marker_path, &rollback_marker).await?;
                 sync_parent_directory_entry(&rollback_marker).await
@@ -5529,7 +5653,10 @@ impl SessionStoreV2 {
                 )));
             }
         }
-        match self.rollback_session_copy_transaction(journal).await {
+        match self
+            .rollback_session_copy_transaction(&rollback_marker, journal)
+            .await
+        {
             Ok(()) => match self.remove_session_copy_journal_family(journal).await {
                 Ok(()) => Err(io::Error::new(
                     primary_kind,
@@ -10740,27 +10867,42 @@ mod tests {
 
     #[tokio::test]
     async fn copy_session_rolls_back_directory_when_index_publish_fails() -> io::Result<()> {
-        let (storage, _temp_dir) = create_temp_storage().await?;
+        let (storage, temp_dir) = create_temp_storage().await?;
         let source = Session::new("copy-source", "model");
         storage.save_session(&source).await?;
+        let before_index = fs::read(storage.index_path()).await?;
 
-        // Force the copy to fail after its fully-written staging directory has
-        // been renamed, but before a visible index entry can be committed.
+        // Publication and durable index hiding both fail. Rollback must retain
+        // the complete target and its marker, rather than deleting behind an
+        // index whose durable update was not acknowledged.
         fs::write(storage.index_path(), b"{not valid json").await?;
         let error = storage
             .copy_session(&source.id, "copy-root")
             .await
             .expect_err("corrupt index must fail publication");
         assert!(error.to_string().contains("invalid sessions.json"));
+        assert!(error.to_string().contains("recovery required"));
         assert!(storage.get_index_entry("copy-root").await.is_none());
-        assert!(!storage.sessions_root_dir().join("copy-root").exists());
+        let target = storage.sessions_root_dir().join("copy-root");
+        assert!(target.join("session.json").is_file());
+        assert!(target.join(RUNTIME_SIDECAR_FILE).is_file());
         assert_eq!(storage.session_copy_journal_paths().await?.len(), 1);
-        let mut home_entries = fs::read_dir(storage.bamboo_home_dir()).await?;
+
+        // Repair only this fixture's deliberately damaged index. A real store
+        // reopen must then drive the retained rollback through Deleting.
+        fs::write(storage.index_path(), before_index).await?;
+        storage.flush_search_index().await;
+        drop(storage);
+        let reopened = SessionStoreV2::new(temp_dir.path().to_path_buf()).await?;
+        assert!(reopened.get_index_entry("copy-root").await.is_none());
+        assert!(!target.exists());
+        assert!(reopened.session_copy_journal_paths().await?.is_empty());
+        let mut home_entries = fs::read_dir(reopened.bamboo_home_dir()).await?;
         while let Some(entry) = home_entries.next_entry().await? {
             let name = entry.file_name().to_string_lossy().into_owned();
             assert!(
                 !name.starts_with(".session-copy-") || name == SESSION_COPY_TRANSACTION_DIR,
-                "staging directory leaked after rollback: {name}"
+                "staging directory leaked after recovery: {name}"
             );
         }
         Ok(())
