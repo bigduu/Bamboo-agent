@@ -65,6 +65,7 @@ fn fixture_ready_is_not_readable_until_complete_json_is_published() {
 
 struct Probe {
     home: PathBuf,
+    workspace: PathBuf,
     calls: AtomicUsize,
 }
 
@@ -84,6 +85,21 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         assert_eq!(count, 1, "one provider-visible typed input after recovery");
         let store = Arc::new(SessionStoreV2::new(probe.home.clone()).await.unwrap());
         let canonical = store.load_session(ROOT).await.unwrap().unwrap();
+        let workspace = canonical.workspace_path_meta().unwrap();
+        assert_eq!(
+            Path::new(&workspace).canonicalize().unwrap(),
+            probe.workspace.canonicalize().unwrap(),
+            "the actual provider must see the prepared canonical Workspace"
+        );
+        let has_tool = |name: &str| {
+            body["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool["function"]["name"] == name))
+        };
+        assert!(
+            has_tool("skills_list") && has_tool("skills_read"),
+            "recovery must retain the registered finite Source surface"
+        );
         assert_eq!(
             canonical
                 .messages
@@ -356,11 +372,26 @@ async fn deliver(client: &reqwest::Client, host: &Host) {
 
 #[actix_web::test]
 async fn claimed_owned_input_survives_real_host_process_loss_and_restarts_once() {
+    assert_owned_input_restart(false).await;
+}
+
+#[actix_web::test]
+async fn claimed_owned_restart_preserves_canonical_workspace_over_stale_legacy_path() {
+    assert_owned_input_restart(true).await;
+}
+
+async fn assert_owned_input_restart(canonical_workspace: bool) {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("data");
     std::fs::create_dir_all(&home).unwrap();
+    let workspace = home.join("workspaces").join(if canonical_workspace {
+        "canonical-existing"
+    } else {
+        ROOT
+    });
     let probe = web::Data::new(Probe {
         home: home.clone(),
+        workspace: workspace.clone(),
         calls: AtomicUsize::new(0),
     });
     let factory_probe = probe.clone();
@@ -398,6 +429,16 @@ async fn claimed_owned_input_survives_real_host_process_loss_and_restarts_once()
     .unwrap();
     let original = SessionStoreV2::new(home.clone()).await.unwrap();
     let mut root = Session::new(ROOT, "owned-root");
+    if canonical_workspace {
+        std::fs::create_dir_all(&workspace).unwrap();
+        root.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+        let stale = home.join("workspaces/stale-legacy");
+        std::fs::create_dir_all(&stale).unwrap();
+        root.workspace = Some(stale.to_string_lossy().into_owned());
+    } else {
+        assert!(root.workspace_path_meta().is_none());
+        assert!(root.workspace.is_none());
+    }
     root.add_message(bamboo_domain::Message::user("original Root transcript"));
     original.save_session(&root).await.unwrap();
     drop(original);
@@ -496,6 +537,13 @@ async fn claimed_owned_input_survives_real_host_process_loss_and_restarts_once()
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(
+        Path::new(&canonical.workspace_path_meta().unwrap())
+            .canonicalize()
+            .unwrap(),
+        workspace.canonicalize().unwrap(),
+        "the completed checkpoint must preserve the same canonical Workspace"
+    );
     assert_eq!(
         canonical
             .messages

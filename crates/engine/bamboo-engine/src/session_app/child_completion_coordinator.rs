@@ -1974,6 +1974,24 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let (agent, root_tools) = if let Some(adapter) = adapter {
+            // A registered Root producer freezes its finite Source here.
+            // Resolve the existing execution context first, while the exact
+            // Actor reservation is held. Otherwise an initially unassigned
+            // Root acquires its default Workspace in the first round after
+            // Source binding, and correctly fails its own scope fence before
+            // reaching the provider. This grants no Workspace change to a
+            // bound Source; later refreshes still validate the frozen scope.
+            if session.kind == SessionKind::Root {
+                if let Err(error) = self
+                    .agent
+                    .prepare_external_session_for_execution(&mut session)
+                    .await
+                {
+                    tracing::error!(%session_id, %error, "Root resume context preparation rejected before Source binding");
+                    execution_reservation.abandon().await;
+                    return;
+                }
+            }
             match adapter(
                 self.agent.clone(),
                 &session,
