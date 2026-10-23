@@ -26,6 +26,7 @@ members = [
     "crates/infra/bamboo-analytics",
     # Engine — core logic
     "crates/engine/bamboo-engine",
+    "crates/engine/bamboo-orchestration",
     "crates/engine/bamboo-tools",
     # App — executables + entry points
     "crates/app/bamboo-server",
@@ -71,6 +72,7 @@ default-members = [
     "crates/infra/bamboo-subagent",
     # Engine — core logic
     "crates/engine/bamboo-engine",
+    "crates/engine/bamboo-orchestration",
     "crates/engine/bamboo-tools",
     # App — executables + entry points
     "crates/app/bamboo-server",

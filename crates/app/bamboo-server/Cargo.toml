@@ -30,6 +30,7 @@ zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
 tempfile = "3"
 # Workspace crates
 bamboo-engine = { path = "../../engine/bamboo-engine" }
+bamboo-orchestration = { path = "../../engine/bamboo-orchestration" }
 bamboo-tickets = { path = "../../infra/bamboo-tickets" }
 bamboo-memory = { path = "../../infra/bamboo-memory" }
 bamboo-compression = { path = "../../infra/bamboo-compression" }

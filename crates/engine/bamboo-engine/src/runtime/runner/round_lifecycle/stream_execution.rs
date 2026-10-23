@@ -1578,6 +1578,16 @@ pub(super) async fn execute_llm_stream(
         .await
         .and_then(|result| {
             result.map_err(|error| {
+                if matches!(error, bamboo_llm::provider::LLMError::RequestFailed(_)) {
+                    if let Some(diagnostic) = http_retry_observer
+                        .terminal_diagnostic()
+                        .filter(|d| d.matches_error_message(&error.to_string()))
+                    {
+                        // The existing terminal Session checkpoint carries this
+                        // safe receipt. No provider error text enters the DTO.
+                        session.record_llm_request_diagnostic(diagnostic);
+                    }
+                }
                 if matches!(
                     error,
                     bamboo_llm::provider::LLMError::RequestFailed(_)

@@ -233,33 +233,42 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             "error": crate::error::error_value(error.to_string())
         }));
     }
-    let native_binding = if ready.native_main && crate::skill_runtime::registered_main(&session) {
-        match crate::skill_runtime::bind_execution(
+    // Both adapters bind before startup publication. Workspace-only Legacy
+    // adoption does not install a Skill host or opt this run into Native mode.
+    let binding = if ready.native_main && crate::skill_runtime::registered_main(&session) {
+        crate::skill_runtime::bind_execution(
             state.clone(),
             &session,
             &execution_reservation,
             state.tools_for(crate::tools::ToolSurface::Root),
-        ) {
-            Ok(binding) => Some(binding),
-            Err(error) => {
-                execution_reservation.abandon().await;
-                super::fail_reserved_pending_startup(
-                    state,
-                    session_id,
-                    ready.startup_turn_id.as_deref(),
-                    &error.to_string(),
-                    ready.admission_reservation,
-                    ready.startup_guard,
-                )
-                .await;
-                return HttpResponse::ServiceUnavailable().json(serde_json::json!({
-                    "status": "rejected", "session_id": session_id,
-                    "error": crate::error::error_value(error.to_string())
-                }));
-            }
-        }
+        )
+        .map(Some)
+    } else if crate::skill_runtime::ordinary_main(&session) {
+        state
+            .workspace_handoffs
+            .bind_legacy_execution(&state.agent, &session, &execution_reservation)
+            .map(|agent| Some((agent, state.tools_for(crate::tools::ToolSurface::Root))))
     } else {
-        None
+        Ok(None)
+    };
+    let native_binding = match binding {
+        Ok(binding) => binding,
+        Err(error) => {
+            execution_reservation.abandon().await;
+            super::fail_reserved_pending_startup(
+                state,
+                session_id,
+                ready.startup_turn_id.as_deref(),
+                &error.to_string(),
+                ready.admission_reservation,
+                ready.startup_guard,
+            )
+            .await;
+            return HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "status": "rejected", "session_id": session_id,
+                "error": crate::error::error_value(error.to_string())
+            }));
+        }
     };
     let execution_persistence = execution_reservation.execution_persistence();
 

@@ -48,6 +48,8 @@ pub(super) fn build_base_tools(
     memory_store: bamboo_memory::memory_store::MemoryStore,
     session_messenger: Arc<bamboo_engine::SessionMessenger>,
     diagnostics: Arc<crate::tools::diagnostics::DiagnosticsSource>,
+    workspace_scope_guard: Arc<dyn bamboo_server_tools::project_tools::WorkspaceScopeGuard>,
+    workspace_handoff_hook: Arc<dyn bamboo_server_tools::project_tools::WorkspaceHandoffHook>,
 ) -> (
     Arc<dyn ToolExecutor>,
     Arc<dyn bamboo_engine::external_agents::runtime::NativeToolCeilingSource>,
@@ -96,7 +98,9 @@ pub(super) fn build_base_tools(
             session_repo.clone(),
             project_store.clone(),
             workspace_resolver.clone(),
-        ),
+        )
+        .with_scope_guard(workspace_scope_guard)
+        .with_handoff_hook(workspace_handoff_hook),
     );
     let with_workspace: Arc<dyn ToolExecutor> =
         Arc::new(crate::tools::OverlayToolExecutor::new(base, workspace_tool));
