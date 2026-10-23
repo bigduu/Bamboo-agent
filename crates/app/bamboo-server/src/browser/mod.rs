@@ -353,7 +353,7 @@ impl Drop for BrowserSession {
             return;
         }
         let lease = self.profile_lease.get_mut().unwrap().take();
-        let graceful = lease.is_some()
+        let graceful = (lease.is_some() || self.retiring.load(Ordering::Acquire))
             && !self.kill_issued.load(Ordering::Acquire)
             && !self.reaped.load(Ordering::Acquire);
         if !graceful && !self.clean_host_exit.load(Ordering::Acquire) {
@@ -1119,8 +1119,10 @@ impl BrowserSession {
     fn begin_retirement(&self, reason: &'static str) -> Result<(), BrowserError> {
         if let Some(lease) = self.profile_lease.lock().unwrap().as_ref() {
             lease.begin_close()?;
-            self.retiring.store(true, Ordering::Release);
         }
+        // EOF retirement belongs to every owned host. Only durable profiles
+        // need a close marker; a clean temporary host has no such lease.
+        self.retiring.store(true, Ordering::Release);
         self.mark_dead(reason);
         Ok(())
     }
@@ -1175,7 +1177,7 @@ impl BrowserSession {
                         .lock()
                         .unwrap()
                         .as_ref()
-                        .is_some_and(|lease| lease.finish_close().is_ok());
+                        .is_none_or(|lease| lease.finish_close().is_ok());
                     self.close_confirmed.store(confirmed, Ordering::Release);
                 }
                 self.cleanup_temp_dir().await;
@@ -1222,7 +1224,7 @@ impl BrowserSession {
                         .lock()
                         .unwrap()
                         .as_ref()
-                        .is_some_and(|lease| lease.finish_close().is_ok());
+                        .is_none_or(|lease| lease.finish_close().is_ok());
                 self.close_confirmed.store(confirmed, Ordering::Release);
                 if clean {
                     self.cleanup_temp_dir().await;
