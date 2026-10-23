@@ -3,9 +3,9 @@
 
 #[cfg(all(test, unix))]
 mod concurrent_drain_tests;
+mod launch_admission;
 #[cfg(test)]
 mod persistence_tests;
-mod launch_admission;
 mod profile;
 mod shared;
 mod storage;
@@ -404,16 +404,11 @@ impl BrowserReaper {
         let mut killed = false;
         let clean = loop {
             if let Ok(Some(status)) = self.child.lock().unwrap().try_wait() {
-                let group_gone = managed_group_exit_confirmed(
-                    self.group_exit_required,
-                    self.process_group,
-                );
+                let group_gone =
+                    managed_group_exit_confirmed(self.group_exit_required, self.process_group);
                 break self.clean_host_exit
                     || (self.native_launch_unadmitted && group_gone)
-                    || (self.graceful
-                        && !killed
-                        && status.success()
-                        && group_gone);
+                    || (self.graceful && !killed && status.success() && group_gone);
             }
             if !killed && Instant::now() >= deadline {
                 if !self.native_launch_unadmitted {
@@ -739,7 +734,9 @@ impl BrowserSession {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        let attempt = verified_admission_host.as_ref().map(|_| uuid::Uuid::new_v4());
+        let attempt = verified_admission_host
+            .as_ref()
+            .map(|_| uuid::Uuid::new_v4());
         if let Some(attempt) = attempt {
             command.env("BAMBOO_BROWSER_LAUNCH_ATTEMPT", attempt.to_string());
         }

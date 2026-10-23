@@ -96,7 +96,9 @@ impl Drop for BootstrapOwner {
         let process_group = child.id().and_then(|id| i32::try_from(id).ok());
         let lease = self.lease.take();
         let marked = !self.native_writer_possible
-            || lease.as_ref().is_some_and(|lease| lease.begin_close().is_ok());
+            || lease
+                .as_ref()
+                .is_some_and(|lease| lease.begin_close().is_ok());
         let can_detach = lease.is_none() || marked;
         let resources = BrowserReaper {
             stdin: child.stdin.take(),
@@ -140,8 +142,20 @@ pub(super) fn admit(
         native_writer_possible: false,
     };
     async move {
-        let mut stdin = owner.child.as_mut().unwrap().stdin.take().ok_or_else(unavailable)?;
-        let stdout = owner.child.as_mut().unwrap().stdout.take().ok_or_else(unavailable)?;
+        let mut stdin = owner
+            .child
+            .as_mut()
+            .unwrap()
+            .stdin
+            .take()
+            .ok_or_else(unavailable)?;
+        let stdout = owner
+            .child
+            .as_mut()
+            .unwrap()
+            .stdout
+            .take()
+            .ok_or_else(unavailable)?;
         let mut reader = BufReader::new(stdout);
         let ready = tokio::time::timeout(
             deadline.saturating_duration_since(Instant::now()),
@@ -160,10 +174,13 @@ pub(super) fn admit(
         owner.native_writer_possible = true;
         let generation = owner.lease.as_mut().unwrap().begin_launch()?.to_owned();
         let mut grant = PREFIX.to_vec();
-        grant.extend(serde_json::to_vec(&serde_json::json!({
-            "kind": "bamboo_browser_launch_grant", "version": 1,
-            "attempt_id": attempt, "launch_generation": generation,
-        })).map_err(|_| unavailable())?);
+        grant.extend(
+            serde_json::to_vec(&serde_json::json!({
+                "kind": "bamboo_browser_launch_grant", "version": 1,
+                "attempt_id": attempt, "launch_generation": generation,
+            }))
+            .map_err(|_| unavailable())?,
+        );
         grant.push(b'\n');
         tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
             stdin.write_all(&grant).await?;
@@ -196,8 +213,15 @@ mod tests {
         let line = format!("BAMBOO_BROWSER_LAUNCH_V1 {{\"kind\":\"bamboo_browser_launch_ready\",\"version\":1,\"attempt_id\":\"{attempt}\"}}\n");
         assert!(valid_ready(line.as_bytes(), attempt));
         assert!(!valid_ready(line.as_bytes(), uuid::Uuid::new_v4()));
-        assert!(!valid_ready(line.replace("\"version\":1", "\"version\":2").as_bytes(), attempt));
-        assert!(!valid_ready(line.replace("\"version\":1", "\"version\":1,\"confirmed\":true").as_bytes(), attempt));
+        assert!(!valid_ready(
+            line.replace("\"version\":1", "\"version\":2").as_bytes(),
+            attempt
+        ));
+        assert!(!valid_ready(
+            line.replace("\"version\":1", "\"version\":1,\"confirmed\":true")
+                .as_bytes(),
+            attempt
+        ));
         assert!(!valid_ready(&vec![b'x'; MAX_FRAME_BYTES + 1], attempt));
     }
 
@@ -205,7 +229,11 @@ mod tests {
     fn older_host_is_rejected_before_bootstrap() {
         let root = tempfile::tempdir().unwrap();
         let script = root.path().join("host.cjs");
-        std::fs::write(&script, b"#!/usr/bin/env node\n// BAMBOO_BROWSER_STORAGE_INSPECTION_V1\n").unwrap();
+        std::fs::write(
+            &script,
+            b"#!/usr/bin/env node\n// BAMBOO_BROWSER_STORAGE_INSPECTION_V1\n",
+        )
+        .unwrap();
         assert!(verify_host(&script).is_err());
     }
 
@@ -221,15 +249,27 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let path = scratch.path().to_path_buf();
         let mut command = tokio::process::Command::new("/bin/cat");
-        command.stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).process_group(0);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
         let lifecycle = BrowserLifecycle::default();
-        let pending = admit(command.spawn().unwrap(), lease, scratch, &lifecycle,
-            uuid::Uuid::new_v4(), Instant::now() + super::super::BROWSER_COMMAND_DEADLINE);
+        let pending = admit(
+            command.spawn().unwrap(),
+            lease,
+            scratch,
+            &lifecycle,
+            uuid::Uuid::new_v4(),
+            Instant::now() + super::super::BROWSER_COMMAND_DEADLINE,
+        );
         drop(pending); // Intentionally never polled.
         let owners = lifecycle.owners.lock().unwrap().clone();
         assert_eq!(owners.len(), 1);
         for owner in owners {
-            tokio::time::timeout(super::super::BROWSER_REAP_DEADLINE, owner.wait()).await.unwrap();
+            tokio::time::timeout(super::super::BROWSER_REAP_DEADLINE, owner.wait())
+                .await
+                .unwrap();
             assert!(!owner.is_quarantined());
         }
         assert!(!path.exists());
@@ -248,17 +288,33 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let path = scratch.path().to_path_buf();
         let mut command = tokio::process::Command::new("/bin/sh");
-        command.arg("-c").arg("exit 1").stdin(Stdio::piped()).stdout(Stdio::piped()).process_group(0);
+        command
+            .arg("-c")
+            .arg("exit 1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0);
         let lifecycle = BrowserLifecycle::default();
-        let result = admit(command.spawn().unwrap(), lease, scratch, &lifecycle,
-            uuid::Uuid::new_v4(), Instant::now() + super::super::BROWSER_COMMAND_DEADLINE).await;
+        let result = admit(
+            command.spawn().unwrap(),
+            lease,
+            scratch,
+            &lifecycle,
+            uuid::Uuid::new_v4(),
+            Instant::now() + super::super::BROWSER_COMMAND_DEADLINE,
+        )
+        .await;
         assert!(result.is_err());
         let owners = lifecycle.owners.lock().unwrap().clone();
         for owner in owners {
-            tokio::time::timeout(super::super::BROWSER_REAP_DEADLINE, owner.wait()).await.unwrap();
+            tokio::time::timeout(super::super::BROWSER_REAP_DEADLINE, owner.wait())
+                .await
+                .unwrap();
             assert!(!owner.is_quarantined());
         }
-        assert!(!lifecycle.unconfirmed_writers.load(super::super::Ordering::Acquire));
+        assert!(!lifecycle
+            .unconfirmed_writers
+            .load(super::super::Ordering::Acquire));
         assert!(!path.exists());
         assert_eq!(std::fs::read_dir(&control).unwrap().count(), 1);
         assert!(profile::acquire_shared(&profiles).is_ok());
@@ -278,18 +334,46 @@ mod tests {
         let attempt = uuid::Uuid::new_v4();
         let ready = format!("BAMBOO_BROWSER_LAUNCH_V1 {{\"kind\":\"bamboo_browser_launch_ready\",\"version\":1,\"attempt_id\":\"{attempt}\"}}");
         let mut command = tokio::process::Command::new("/bin/sh");
-        command.arg("-c").arg(format!("printf '%s\\n' '{ready}'; IFS= read -r grant; exit 1"))
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).kill_on_drop(true).process_group(0);
-        let lifecycle = BrowserLifecycle { bounded_storage: true, ..BrowserLifecycle::default() };
-        let admitted = admit(command.spawn().unwrap(), lease, scratch, &lifecycle, attempt,
-            Instant::now() + super::super::BROWSER_COMMAND_DEADLINE).await.unwrap();
+        command
+            .arg("-c")
+            .arg(format!(
+                "printf '%s\\n' '{ready}'; IFS= read -r grant; exit 1"
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let lifecycle = BrowserLifecycle {
+            bounded_storage: true,
+            ..BrowserLifecycle::default()
+        };
+        let admitted = admit(
+            command.spawn().unwrap(),
+            lease,
+            scratch,
+            &lifecycle,
+            attempt,
+            Instant::now() + super::super::BROWSER_COMMAND_DEADLINE,
+        )
+        .await
+        .unwrap();
         let cleanup = admitted.cleanup.clone();
-        let session = super::super::BrowserSession::from_child_owned(admitted.child,
-            Some(admitted.scratch), &lifecycle, Some(admitted.lease), Some(admitted.cleanup)).unwrap();
-        tokio::time::timeout(super::super::BROWSER_CLOSE_DEADLINE, cleanup.wait()).await.unwrap();
+        let session = super::super::BrowserSession::from_child_owned(
+            admitted.child,
+            Some(admitted.scratch),
+            &lifecycle,
+            Some(admitted.lease),
+            Some(admitted.cleanup),
+        )
+        .unwrap();
+        tokio::time::timeout(super::super::BROWSER_CLOSE_DEADLINE, cleanup.wait())
+            .await
+            .unwrap();
         assert!(cleanup.is_quarantined());
         assert!(control.join(".bamboo-profile-launch-active-v1").is_file());
-        assert!(control.join(".bamboo-profile-writer-exit-unconfirmed").is_file());
+        assert!(control
+            .join(".bamboo-profile-writer-exit-unconfirmed")
+            .is_file());
         assert!(scratch_path.is_dir());
         assert!(profile::acquire_shared(&profiles).is_err());
         drop(session);
