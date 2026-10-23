@@ -605,7 +605,11 @@ async fn aborted_creation_keeps_tree_publication_and_scope_locked_until_physical
     job.abort();
     assert!(job.await.unwrap_err().is_cancelled());
     let mut revoke = Box::pin(store.revoke_host_session_scope(&caller.id, 1));
-    assert!(futures::poll!(revoke.as_mut()).is_pending());
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(revoke.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
     for path in [
         home.path().join(SESSION_LIFECYCLE_LOCK_FILE),
         home.path().join(RUNTIME_TASK_TRANSACTION_LOCK_FILE),
