@@ -2,8 +2,11 @@
 
 This handoff covers the M1 union of the preserved `f2d2fd20` capability work,
 the legacy prompt-snapshot repair and C1 clear diagnostics, plus the admitted
-Workspace handoff interfaces. Its exact SHA/tree is recorded in the accompanying
-source freeze. Compilation and native execution of this union remain **UNRUN**.
+Workspace handoff interfaces. The frozen `6f9fb840b1fd2f0ec1529e45272541479216b1db`
+(tree `d9e61c76ce7e408bc2c455b2757d519a891ec866`) compiled all twelve targets
+successfully, then executed all 293 planned native cases: **283 passed, 10 failed,
+0 ignored, 0 unrun**. This is a RED result. The follow-up fixture repairs below
+have not been compiled or executed; these older results do not admit them.
 The prior `991e264e` compile ended with SDK fixture UUID dependency errors and
 ran zero tests; the preserved M1 dependency repair is not a passing result.
 The previous Rust window was released. The parent must explicitly transfer a
@@ -146,8 +149,64 @@ integration targets; no additional build is started without a new window.
 - `collector::batch_tests::failed_ordinary_and_special_commands_do_not_discard_accepted_suffix`
 - All three `handlers::agent::actor_snapshot::tests` gateway cases in the Windows job.
 
-The repair's compilation, all 293 local native cases, and a fresh Windows run
-are **UNRUN**. Previous source receipts cannot admit this changed source.
+The exact `6f9fb840` twelve-target compilation subsequently passed with exit 0
+and validation exit 0 at 14:48:30 UTC on 2026-10-23, in 2264.640 seconds,
+source clean before and after. Receipt SHA256:
+`36b589c4a45c6a9841bba23d3adaabc0d8db8799eb5f33f421fb95acb63bc028`;
+log SHA256:
+`2229e5b0a9566aa54880e93d79a0b011d354c3bbd552be24a99b163ec4fd06f1`.
+The same head's Windows actor job passed all 41 selected cases. Local execution
+was deferred for release priority, then resumed from those existing artifacts
+without another Cargo command.
+
+## Complete native RED and fixture contract repair
+
+The original v7 manifest selected exactly 268 library and 25 integration cases.
+The first failing library selector stopped after 16P/1F; the first failing
+integration selector stopped after 1P/1F. A disjoint continuation selected only
+the remaining 251 library and 23 integration cases, obtaining 244P/7F and
+22P/1F respectively. Every selector accounted for its complete final native
+summary. The union has 293 unique executed cases, with no duplicates, omissions,
+extra cases or ignored cases. All four wrappers exited 1. No partial run or
+zero-selection result is counted as passing.
+
+The frozen source remained unchanged through all four runs. Aggregate RED
+receipt SHA256:
+`94941681fe605c01eb3984b31d41946a6b97d49a6a084615120956a94dc990ff`.
+The Rust window was formally returned at 16:33:59 UTC after a fresh empty
+Rust/linker/Session-fixture process check, with no queued heavy work. Return
+receipt SHA256:
+`167716e9d1578ce169038c0b63f8d64349dd0e858aa958676fc3db5ac8692bdd`.
+
+Ten failures exposed fixture expectations that had not followed the integrated
+contracts. This follow-up changes tests, not production authority:
+
+- Four Storage/scoped-send tests must advance a Root's metadata revision when
+  changing its already persisted Project. The recreated-birth first-input case
+  likewise restores its Project using the next revision; final original caller,
+  reserved-target, generation and retained physical-lock assertions remain.
+- The discovery Child must receive the same explicit Project before its first
+  save. Child construction does not infer that Host scope, and a published Child
+  must not be rebound afterward.
+- The stacked overlay fixture must expect fresh Root creation for all supported
+  Session versions and refuse a missing Root owner without entering `SubAgent`.
+  Actual application dispatch must bind the Session before evaluating aliases.
+- The SDK canonical orchestration set now includes the common `session_history`.
+  The test verifies its actual framework instance and preserves the exact
+  registered-intersection/provider-schema and Skill-denial assertions.
+- A Host-recorded approval keeps its exact original owner even if a new custom
+  registration shadows its spelling. The SDK test verifies that owner's single
+  authorized execution, independent fresh-custom permission, and an explicit
+  old typed/no-Host-record mismatch refusal without execution.
+- A latest-Session Server/Connect resume after a tool-authority revision change
+  refuses the stale original caller before clearing its pending markers. Tests
+  preserve the operation/request/receipt and verify zero execution, zero new
+  provider calls and no restored once grant. The separate SDK stale-snapshot
+  path still checks its later current-posture terminal refusal.
+
+These fixture changes are source-only and **UNRUN**. A new exact-source build,
+affected native verification, current-head CI and clean head/base review are
+still required. They do not implement or validate C2 reset.
 
 ## Separate C2 source is not admitted
 

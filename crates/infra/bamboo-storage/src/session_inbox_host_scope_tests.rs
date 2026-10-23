@@ -126,10 +126,12 @@ async fn final_send_checks_canonical_project_metadata_birth_and_complete_ancesto
         match changed {
             "caller-project" => {
                 caller.set_project_id_meta("changed-project");
+                caller.metadata_version = caller.metadata_version.checked_add(1).unwrap();
                 store.save_session(&caller).await.unwrap();
             }
             "target-project" => {
                 target.set_project_id_meta("changed-project");
+                target.metadata_version = target.metadata_version.checked_add(1).unwrap();
                 store.save_session(&target).await.unwrap();
             }
             "target-metadata" => {
@@ -244,6 +246,7 @@ fn physical_retention(scoped: bool) {
     let (caller, target, token) = f.runtime.block_on(async {
         let mut target = f.store.load_session("target").await.unwrap().unwrap();
         target.set_project_id_meta("target-project");
+        target.metadata_version = target.metadata_version.checked_add(1).unwrap();
         f.store.save_session(&target).await.unwrap();
         let mut caller = if scoped {
             Session::new("host-caller", "model")

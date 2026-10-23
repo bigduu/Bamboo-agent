@@ -152,7 +152,9 @@ fn result(outcome: ToolOutcome) -> Value {
 #[tokio::test]
 async fn installed_host_scope_serves_root_child_and_supervisor_without_role_impersonation() {
     let fixture = Fixture::new().await;
-    let child = Session::new_child_of("short-child", &fixture.caller, "model", "temporary work");
+    let mut child =
+        Session::new_child_of("short-child", &fixture.caller, "model", "temporary work");
+    child.set_project_id_meta(fixture.caller.project_id_meta().unwrap());
     fixture.store.save_session(&child).await.unwrap();
     let supervisor = fixture.supervisor().await;
     for (caller, ancestors) in [

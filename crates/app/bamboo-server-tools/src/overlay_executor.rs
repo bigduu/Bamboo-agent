@@ -1399,19 +1399,15 @@ mod tests {
     #[derive(Clone)]
     struct VersionedOwnerBase {
         installed: bool,
-        version: Option<u32>,
         entered: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
     #[async_trait]
     impl ToolExecutor for VersionedOwnerBase {
         fn for_session(
             &self,
-            session: &bamboo_domain::Session,
+            _session: &bamboo_domain::Session,
         ) -> Option<std::sync::Arc<dyn ToolExecutor>> {
-            Some(std::sync::Arc::new(Self {
-                version: session.session_version,
-                ..self.clone()
-            }))
+            Some(std::sync::Arc::new(self.clone()))
         }
         async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
             if !self.owns_exact_tool(&call.function.name) {
@@ -1425,7 +1421,7 @@ mod tests {
         }
         fn list_tools(&self) -> Vec<ToolSchema> {
             let mut schemas = vec![NamedOverlayTool("SubAgent").to_schema()];
-            if self.installed && self.version == Some(2) {
+            if self.installed {
                 schemas.push(NamedOverlayTool("spawn_session").to_schema());
             }
             schemas
@@ -1451,7 +1447,6 @@ mod tests {
                 let base: std::sync::Arc<dyn ToolExecutor> =
                     std::sync::Arc::new(VersionedOwnerBase {
                         installed,
-                        version: None,
                         entered: entered.clone(),
                     });
                 let first: std::sync::Arc<dyn ToolExecutor> = std::sync::Arc::new(
@@ -1471,31 +1466,28 @@ mod tests {
                     let result = bound
                         .execute_with_context_outcome(&call, ToolExecutionContext::none(&call.id))
                         .await;
-                    if version == Some(2) && !installed {
+                    assert_eq!(call, original);
+                    if !installed {
                         assert!(result.is_err());
                         continue;
                     }
                     let ToolOutcome::Completed(result) = result.unwrap() else {
                         panic!("completed owner result")
                     };
-                    let expected = if version == Some(2) {
-                        "spawn_session"
-                    } else {
-                        "SubAgent"
-                    };
-                    assert_eq!(result.result, expected);
-                    assert_eq!(call, original);
-                    assert_eq!(
-                        bound.call_parallel_classification(&call).1,
-                        version != Some(2)
-                    );
+                    assert_eq!(result.result, "spawn_session");
+                    let (mutability, parallel) = bound.call_parallel_classification(&call);
+                    assert!(matches!(
+                        mutability,
+                        bamboo_agent_core::ToolMutability::Mutating
+                    ));
+                    assert!(!parallel);
                 }
-                assert!(entered.lock().unwrap().iter().all(|name| name
-                    == if version == Some(2) {
-                        "spawn_session"
-                    } else {
-                        "SubAgent"
-                    }));
+                let entered = entered.lock().unwrap();
+                if installed {
+                    assert_eq!(entered.as_slice(), ["spawn_session"; 3]);
+                } else {
+                    assert!(entered.is_empty());
+                }
             }
         }
     }

@@ -1194,15 +1194,19 @@ mod session_message_assembly_tests {
             }};
             let mut ctx = ToolExecutionContext::none(&call.id);
             ctx.session_id = Some(&caller.id);
+            let bound = tools.for_session(&caller).expect("actual Session binding");
             let error = with_executing_session_caller(
                 Some(Arc::new(bamboo_domain::SessionCallerReference::from(
                     &caller,
                 ))),
-                tools.execute_with_context(&call, ctx),
+                bound.execute_with_context(&call, ctx),
             )
             .await
             .unwrap_err();
-            assert!(error.to_string().contains("scope_unavailable"));
+            assert!(
+                error.to_string().contains("scope_unavailable"),
+                "{surface:?}: {error}"
+            );
         }
         // This tests the stored application surfaces. LocalChildTools still
         // needs its separate Host framework proof; no native ceiling is widened.

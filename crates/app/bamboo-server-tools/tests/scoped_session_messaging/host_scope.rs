@@ -183,6 +183,7 @@ async fn send_only_cross_root_works_for_root_child_and_supervisor_without_inspec
     let f = Fixture::new().await;
     let mut target = f.new_root("explicit-other-root").await;
     target.set_project_id_meta("explicit-other-project");
+    target.metadata_version = target.metadata_version.checked_add(1).unwrap();
     f.store.save_session(&target).await.unwrap();
     let supervisor = f.supervisor(&[]).await;
     for (caller, ancestors) in [

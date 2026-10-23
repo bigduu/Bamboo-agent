@@ -213,6 +213,7 @@ async fn current_permit_caller_and_reserved_target_are_rechecked_even_on_receipt
             if let Some(workspace) = observed.workspace_path_meta() {
                 recreated.set_workspace_path_meta(workspace);
             }
+            recreated.metadata_version = recreated.metadata_version.checked_add(1).unwrap();
             store.save_session(&recreated).await.unwrap();
         } else {
             let mut changed = if change.starts_with("caller-") {
@@ -222,7 +223,10 @@ async fn current_permit_caller_and_reserved_target_are_rechecked_even_on_receipt
             };
             match change {
                 "caller-metadata" | "target-metadata" => changed.metadata_version += 1,
-                "target-project" => changed.set_project_id_meta("changed-project"),
+                "target-project" => {
+                    changed.set_project_id_meta("changed-project");
+                    changed.metadata_version = changed.metadata_version.checked_add(1).unwrap();
+                }
                 "target-workspace" => changed.set_workspace_path_meta("/changed-workspace"),
                 _ => unreachable!(),
             }

@@ -1002,7 +1002,21 @@ async fn sdk_defaults_ultra_keeps_exact_registered_authority_intersection_and_de
         .iter()
         .map(|name| (*name).to_owned())
         .collect::<BTreeSet<_>>();
-    assert_eq!(canonical.len(), 17);
+    assert_eq!(canonical.len(), 18);
+    assert!(canonical.contains("session_history"));
+    let tools = agent.inner.default_tools();
+    let history = tools
+        .framework_session_tool_for_exact("session_history")
+        .expect("defaults must install the actual common history instance");
+    assert_eq!(
+        history.kind(),
+        bamboo_agent_core::tools::FrameworkSessionToolKind::History
+    );
+    assert!(history.is_current());
+    assert!(Arc::ptr_eq(
+        &history.instance(),
+        &tools.tool_instance_for_exact("session_history").unwrap()
+    ));
     let expected = agent
         .inner
         .default_tools()

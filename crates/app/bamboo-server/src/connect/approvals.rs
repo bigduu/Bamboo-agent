@@ -1227,8 +1227,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_resume_consumes_approved_call_after_root_tool_tightening() {
-        use crate::app_state::resume_adapter::supervisor_tests::{Fixture, CALL};
+    async fn connect_resume_preserves_approved_call_after_root_tool_revision_changes() {
+        use crate::app_state::resume_adapter::supervisor_tests::Fixture;
         let fixture = Box::pin(Fixture::ordinary_root_pending()).await;
         fixture.prepare_workspace_catalog().await;
         let handoff = fixture.ordinary_root_approval_handoff().await;
@@ -1253,16 +1253,9 @@ mod tests {
             outcome,
             bamboo_engine::session_app::types::ResumeOutcome::Started { .. }
         ));
-        fixture.settled(0, false).await;
-        let saved = fixture.reload().await;
-        let result = saved
-            .messages
-            .iter()
-            .rev()
-            .find(|message| message.tool_call_id.as_deref() == Some(CALL))
-            .unwrap();
-        assert_eq!(result.tool_success, Some(false));
-        assert!(result.content.contains("Root orchestration policy blocked"));
+        fixture
+            .settled_with_retained_revision_mismatch(&session)
+            .await;
     }
 
     #[tokio::test]
