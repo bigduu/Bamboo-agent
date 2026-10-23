@@ -2,9 +2,7 @@
 //! no model, worker wait, or second placement policy runs in this adapter.
 use std::sync::Arc;
 
-use bamboo_engine::session_app::child_session::{
-    create_ticket_child_action, ChildSessionPort, CreateChildInput,
-};
+use bamboo_engine::session_app::child_session::{create_ticket_child_action, CreateChildInput};
 use bamboo_engine::ticket_runtime::{self, DispatchObservation, TICKET_DISPATCH_KEY};
 use bamboo_engine::ticket_worker_plan::tickets::{
     Authority, DispatchSpec, Error, Principal, Result, TicketService,
@@ -19,9 +17,15 @@ pub struct TicketDispatchPolicy {
     pub enabled: bool,
     pub worker_role: String,
     pub workspace: String,
+    pub max_rounds: Option<u32>,
+    pub admission_fence: Option<bamboo_orchestration::ReadyAdmissionFence>,
 }
 
 impl ChildSessionAdapter {
+    pub(crate) fn supports_native_ticket_budget(&self) -> bool {
+        self.scheduler.supports_native_ticket_budget()
+    }
+
     pub async fn query_ticket_dispatch(
         &self,
         service: &TicketService,
@@ -39,8 +43,18 @@ impl ChildSessionAdapter {
         key: &str,
         spec: &DispatchSpec,
         policy: &TicketDispatchPolicy,
+        preflight: futures::future::BoxFuture<'_, std::result::Result<(), String>>,
     ) -> Result<DispatchObservation> {
-        let dispatch = ticket_runtime::dispatch_binding(&service, key, spec)?;
+        let mut dispatch = ticket_runtime::dispatch_binding(&service, key, spec)?;
+        if policy.max_rounds == Some(0) {
+            return Err(Error::InvalidTransition("zero Host round ceiling".into()));
+        }
+        if policy.max_rounds.is_some() && !self.supports_native_ticket_budget() {
+            return Err(Error::ScopeDenied(
+                "Ready Work requires the assembled native Tokio backend".into(),
+            ));
+        }
+        dispatch.max_rounds = policy.max_rounds;
         let (binding, parent) = ticket_runtime::verified_scope_binding(
             self.storage.as_ref(),
             &dispatch.binding.supervisor_session_id,
@@ -62,6 +76,18 @@ impl ChildSessionAdapter {
         self.scheduler.set_ticket_service(Some(service.clone()));
         let child_id = ticket_runtime::ticket_child_id(key);
         let guard = self.scheduler.lock_child_launch(&child_id).await;
+        if let (Some(cap), Some(child)) = (
+            policy.max_rounds,
+            self.storage.load_runtime_control_plane(&child_id).await?,
+        ) {
+            let canonical = ticket_runtime::read_dispatch(&child)?
+                .ok_or_else(|| Error::ScopeDenied("canonical dispatch ceiling missing".into()))?;
+            if canonical.max_rounds.is_none_or(|old| old == 0 || old > cap) {
+                return Err(Error::ScopeDenied(
+                    "pending dispatch does not retain the Host round ceiling".into(),
+                ));
+            }
+        }
         match self.query_ticket_dispatch(&service, key, spec).await? {
             DispatchObservation::Missing => {
                 ticket_runtime::require_dispatch_permission(&service, &dispatch)?;
@@ -83,6 +109,9 @@ impl ChildSessionAdapter {
                     TICKET_DISPATCH_KEY.into(),
                     serde_json::to_string(&dispatch)?,
                 );
+                if let Some(fence) = &policy.admission_fence {
+                    fence.check()?;
+                }
                 create_ticket_child_action(
                     self,
                     CreateChildInput {
@@ -129,7 +158,22 @@ impl ChildSessionAdapter {
         // The scheduler obtains this same guard for its exact-generation
         // reservation. Release before enqueue and retain the durable generation.
         drop(guard);
-        self.admit_child_run(&parent, &child, None)
+        if let Some(fence) = &policy.admission_fence {
+            fence.check()?;
+        }
+        let live_fence = policy.admission_fence.clone();
+        let admission_service = service.clone();
+        let admission_dispatch = dispatch.clone();
+        let admission_check = move || {
+            if let Some(fence) = &live_fence {
+                fence.check().map_err(|error| error.to_string())?;
+            }
+            // Bounded canonical in-memory facts only; no Host I/O or await is
+            // allowed inside this final check and the queue send.
+            ticket_runtime::require_dispatch_permission(&admission_service, &admission_dispatch)
+                .map_err(|error| error.to_string())
+        };
+        self.admit_child_run_revalidated(&parent, &child, None, Some(&admission_check), preflight)
             .await
             .map_err(|e| Error::AuthorityUnavailable(e.to_string()))?;
         self.query_ticket_dispatch(&service, key, spec).await

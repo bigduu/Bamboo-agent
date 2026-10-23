@@ -51,6 +51,8 @@ pub struct AgentRuntime {
     pub(crate) inherited_child_wait_captured: bool,
     pub(crate) sdk_skill_execution_host:
         Option<Arc<dyn crate::runtime::config::SdkSkillExecutionHost>>,
+    pub(crate) workspace_execution_host:
+        Option<Arc<dyn crate::runtime::config::WorkspaceExecutionHost>>,
     pub session_inbox: Option<Arc<dyn SessionInboxPort>>,
     pub activation_router: Option<Arc<SessionActivationRouter>>,
     pub session_messenger: Option<Arc<SessionMessenger>>,
@@ -242,6 +244,7 @@ impl AgentRuntimeBuilder {
         Ok(AgentRuntime {
             inherited_child_wait_captured: false,
             sdk_skill_execution_host: None,
+            workspace_execution_host: None,
             storage: self.storage.ok_or_else(|| format_missing("storage"))?,
             persistence: self
                 .persistence
@@ -779,6 +782,17 @@ impl AgentRuntime {
         req: ExecuteRequest,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
+        struct WorkspaceFinish(Option<Arc<dyn crate::runtime::config::WorkspaceExecutionHost>>);
+        impl Drop for WorkspaceFinish {
+            fn drop(&mut self) {
+                if let Some(host) = &self.0 {
+                    host.finish();
+                }
+            }
+        }
+        // Even an admission refusal closes only this captured bridge. Do not
+        // retain an apparently live Weak entry across router finalization.
+        let _workspace_finish = WorkspaceFinish(self.workspace_execution_host.clone());
         session
             .check_execution_compatibility()
             .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
@@ -952,6 +966,7 @@ impl AgentRuntime {
             selected_skill_mode,
             initial_untrusted_inputs: inputs,
             sdk_skill_execution_host: self.sdk_skill_execution_host.clone(),
+            workspace_execution_host: self.workspace_execution_host.clone(),
             skill_manager: Some(self.skill_manager.clone()),
             project_context_resolver: self.project_context_resolver.clone(),
             skip_initial_user_message: true,

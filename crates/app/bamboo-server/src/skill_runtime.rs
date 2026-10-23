@@ -31,9 +31,14 @@ use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, RwLock as SyncRwLock,
+    Arc, RwLock as SyncRwLock, Weak,
 };
 use tokio_util::sync::CancellationToken;
+
+#[path = "skill_runtime_workspace_handoff.rs"]
+mod workspace_handoff;
+pub(crate) use workspace_handoff::WorkspaceHandoffs;
+use workspace_handoff::{NativeSource, SourceBinding};
 
 const METADATA_TOKENS: usize = 2_000;
 // Producer page ceiling, further narrowed by the actual dispatch cap.
@@ -123,6 +128,7 @@ pub(crate) struct ServerMainSkillProducer {
         Option<bamboo_engine::session_app::child_completion_coordinator::RootToolSurfaceObserver>,
     runners:
         Option<Arc<tokio::sync::RwLock<std::collections::HashMap<String, crate::AgentRunner>>>>,
+    workspace_handoffs: Option<Arc<WorkspaceHandoffs>>,
 }
 impl ServerMainSkillProducer {
     pub(crate) fn new(
@@ -144,6 +150,7 @@ impl ServerMainSkillProducer {
             tool_factory,
             root_observer: None,
             runners: None,
+            workspace_handoffs: None,
         }
     }
     pub(crate) fn with_runners(
@@ -160,6 +167,10 @@ impl ServerMainSkillProducer {
         self.root_observer = Some(observer);
         self
     }
+    pub(crate) fn with_workspace_handoffs(mut self, handoffs: Arc<WorkspaceHandoffs>) -> Self {
+        self.workspace_handoffs = Some(handoffs);
+        self
+    }
     fn from_state(state: &AppState) -> Self {
         Self::new(
             state.skill_manager.clone(),
@@ -171,6 +182,7 @@ impl ServerMainSkillProducer {
             state.tool_factory.clone(),
         )
         .with_runners(state.agent_runners.clone())
+        .with_workspace_handoffs(state.workspace_handoffs.clone())
     }
     fn tools_for(&self, surface: ToolSurface) -> Arc<dyn ToolExecutor> {
         self.tool_factory.get(surface)
@@ -196,6 +208,7 @@ impl ServerMainSkillProducer {
     }
 }
 
+#[derive(Clone)]
 struct Policy {
     state: Arc<ServerMainSkillProducer>,
     base: Arc<dyn ToolExecutor>,
@@ -420,6 +433,9 @@ struct NativeRun {
     live: AtomicBool,
     epoch: AtomicU64,
     current: SyncRwLock<RunState>,
+    root_writer: Option<bamboo_domain::RootActorRuntimeWrite>,
+    persistence: Option<Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
+    source: NativeSource,
 }
 impl NativeRun {
     fn revoke(&self) {
@@ -457,6 +473,7 @@ impl NativeRun {
         }) {
             return Err(denied("Native runner identity changed"));
         }
+        drop(runners);
         if let Some(observer) = self.policy.state.root_observer.as_ref() {
             let current = tokio::select! { biased;
                 _ = self.cancel.cancelled() => return Err(denied("Native surface check was cancelled")),
@@ -475,6 +492,7 @@ impl NativeRun {
         Ok(epoch)
     }
     async fn check_durable_session(&self) -> Result<(), ToolError> {
+        let binding = self.source.binding()?;
         let session = self
             .policy
             .state
@@ -483,7 +501,7 @@ impl NativeRun {
             .await
             .map_err(|e| denied(&e.to_string()))?
             .ok_or_else(|| denied("Native Session disappeared"))?;
-        self.policy.check_session(&session)
+        binding.check_session(session).await
     }
     fn caller(&self, ctx: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
         let epoch = self.check_live()?;
@@ -552,8 +570,14 @@ impl NativeRun {
                 .cost(usage)
                 .saturating_add(1),
         );
+        let generation = self.source.binding()?.generation;
         let caller = SkillCatalogCaller {
-            caller_id: format!("native-main:{}:{execution_id}", self.reservation_id),
+            // Source generation is independent of Q's per-round epoch. A
+            // return to an earlier path must never revive an old page handle.
+            caller_id: format!(
+                "native-main:{}:{execution_id}:source:{generation}",
+                self.reservation_id
+            ),
             session_id: self.policy.session_id.clone(),
             input_id,
             ceiling: self.policy.ceiling.clone(),
@@ -567,10 +591,6 @@ impl NativeRun {
             return Err(denied("Native caller changed during resolution"));
         }
         Ok(caller)
-    }
-    fn catalog(self: &Arc<Self>) -> SkillsListTool {
-        self.policy
-            .catalog(Arc::new(NativeResolver { run: self.clone() }))
     }
 }
 fn is_user(record: &ProjectedInputRequest) -> bool {
@@ -594,18 +614,34 @@ struct Phase {
 tokio::task_local! { static NATIVE_PHASE: Phase; }
 
 struct NativeResolver {
-    run: Arc<NativeRun>,
+    run: Weak<NativeRun>,
+    policy: Arc<Policy>,
+    generation: u64,
 }
 #[async_trait]
 impl SkillCatalogCallerResolver for NativeResolver {
     async fn resolve(&self, ctx: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
-        self.run.check_owner().await?;
-        let caller = self.run.caller(ctx)?;
+        let run = self
+            .run
+            .upgrade()
+            .ok_or_else(|| denied("Native Source owner disappeared"))?;
+        run.source.check_generation(self.generation)?;
+        run.check_owner().await?;
+        let caller = run.caller(ctx)?;
         // Direct durable read, never cache/owner reentry. The Reader also
         // validates current canonical Source scope and Config for each page.
-        self.run.check_durable_session().await?;
-        self.run.check_owner().await?;
-        let current = self.run.caller(ctx)?;
+        let session = run
+            .policy
+            .state
+            .storage
+            .load_session(&run.policy.session_id)
+            .await
+            .map_err(|error| denied(&error.to_string()))?
+            .ok_or_else(|| denied("Native Session disappeared"))?;
+        workspace_handoff::check_session(self.policy.clone(), session).await?;
+        run.check_owner().await?;
+        run.source.check_generation(self.generation)?;
+        let current = run.caller(ctx)?;
         if current.caller_id != caller.caller_id || current.input_id != caller.input_id {
             return Err(denied("Native input changed during Session validation"));
         }
@@ -618,6 +654,16 @@ struct NativeHost {
 }
 #[async_trait]
 impl SkillExecutionHost for NativeHost {
+    async fn refresh_runtime_scope(
+        &self,
+        session: &mut Session,
+        execution_id: &str,
+    ) -> Result<(), AgentError> {
+        self.run
+            .refresh_workspace_scope(session, execution_id)
+            .await
+            .map_err(engine_error)
+    }
     fn observe_current_inputs(
         &self,
         session_id: &str,
@@ -658,6 +704,7 @@ impl SkillExecutionHost for NativeHost {
         session: &Session,
         execution_id: &str,
     ) -> Result<String, AgentError> {
+        let _source = self.run.source.read().await;
         self.run
             .policy
             .check_execution_session(session)
@@ -701,7 +748,10 @@ impl SkillExecutionHost for NativeHost {
                 async {
                     let render = self
                         .run
-                        .catalog()
+                        .source
+                        .binding()
+                        .map_err(engine_error)?
+                        .catalog
                         .render_catalog(&ctx)
                         .await
                         .map_err(engine_error)?;
@@ -723,6 +773,9 @@ impl SkillExecutionHost for NativeHost {
     }
     fn finish(&self, _: &str, _: &str) {
         self.run.revoke();
+        if let Some(handoffs) = &self.run.policy.state.workspace_handoffs {
+            handoffs.unregister(&self.run);
+        }
     }
 }
 
@@ -770,14 +823,17 @@ fn bind_registered_execution(
             current_input_id: None,
             epoch: 0,
         }),
+        root_writer: reservation.root_actor_writer(),
+        persistence: reservation.execution_persistence(),
+        source: NativeSource::new(session),
     });
     run.check_live()?;
-    let tools =
-        Arc::new(OverlayToolExecutor::new(base, Arc::new(run.catalog()))) as Arc<dyn ToolExecutor>;
-    let tools = Arc::new(OverlayToolExecutor::new(
-        tools,
-        Arc::new(SkillsReadTool::new(run.catalog())),
-    )) as Arc<dyn ToolExecutor>;
+    let binding = SourceBinding::new(&run, run.policy.clone(), 0);
+    let tools = binding.tools.clone();
+    run.source.install_initial(binding)?;
+    if let Some(handoffs) = &run.policy.state.workspace_handoffs {
+        handoffs.register(&run)?;
+    }
     let agent =
         Arc::new(agent.with_skill_execution_host(Arc::new(NativeHost { run: run.clone() })));
     let tools = Arc::new(NativeExecutor { run, tools });
@@ -805,11 +861,38 @@ impl NativeExecutor {
         if matches!(name, "load_skill" | "read_skill_resource") {
             return Err(denied("Native finite Skills use the scoped Reader"));
         }
+        if name.eq_ignore_ascii_case("Workspace") {
+            return Err(denied(
+                "Native Workspace mutation requires the actual Host setter",
+            ));
+        }
+        let source = self.run.source.read().await;
+        let binding = self.run.source.binding()?;
         if !matches!(name, "skills_list" | "skills_read") {
-            return self
+            self.run.check_owner().await?;
+            self.run.check_durable_session().await?;
+            let outcome = binding
                 .tools
                 .execute_exact_with_context_outcome(call, name, ctx)
                 .await;
+            drop(source);
+            // The actual delegated future is finished. Test Host operations
+            // must remain outside any future Source read/admission guard.
+            #[cfg(all(test, unix))]
+            let completed = match &outcome {
+                Ok(ToolOutcome::Completed(result))
+                    if result.display_preference.as_deref() == Some("request_permissions") =>
+                {
+                    None
+                }
+                Ok(ToolOutcome::Completed(result)) => Some(result.success),
+                _ => None,
+            };
+            #[cfg(all(test, unix))]
+            if let Some(success) = completed {
+                tests::workspace_after_completed_call(self, call, name, ctx, success).await;
+            }
+            return outcome;
         }
         if ctx.session_id != Some(self.run.policy.session_id.as_str())
             || ctx.tool_call_id != call.id
@@ -820,7 +903,13 @@ impl NativeExecutor {
         let result = tokio::select! { biased;
             _ = self.run.cancel.cancelled() => Err(denied("Native Skill dispatch was cancelled")),
             result = NATIVE_PHASE.scope(Phase { run: self.run.clone(), purpose: Purpose::Dispatch, call_id: call.id.clone().into() },
-                self.tools.execute_exact_with_context_outcome(call, name, ctx)) => result,
+                async {
+                    #[cfg(all(test, unix))]
+                    if let Some(outcome) = tests::workspace_retained_reader_call(&binding.tools, call, name, ctx).await {
+                        return outcome;
+                    }
+                    binding.tools.execute_exact_with_context_outcome(call, name, ctx).await
+                }) => result,
         };
         if self.run.check_owner().await? != epoch {
             return Err(denied("Native Skill dispatch owner changed"));
@@ -852,7 +941,22 @@ impl ToolExecutor for NativeExecutor {
             self.tools.owns_exact_tool(name)
         }) {
             Some(name) => self.dispatch(call, &name, ctx).await,
-            None => self.tools.execute_with_context_outcome(call, ctx).await,
+            None => {
+                if call.function.name.eq_ignore_ascii_case("Workspace") {
+                    return Err(denied(
+                        "Native Workspace mutation requires the actual Host setter",
+                    ));
+                }
+                let _source = self.run.source.read().await;
+                self.run.check_owner().await?;
+                self.run.check_durable_session().await?;
+                self.run
+                    .source
+                    .binding()?
+                    .tools
+                    .execute_with_context_outcome(call, ctx)
+                    .await
+            }
         }
     }
     async fn execute_exact_with_context_outcome(

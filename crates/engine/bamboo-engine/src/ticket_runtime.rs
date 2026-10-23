@@ -25,6 +25,9 @@ pub struct TicketDispatchBinding {
     pub spec_hash: String,
     pub assignment_id: String,
     pub binding: ScopeBinding,
+    /// Immutable Host request ceiling, retained in canonical Child metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<u32>,
     pub receipt: Option<RuntimeReceipt>,
     pub receipt_created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -102,6 +105,7 @@ pub fn dispatch_binding(
         spec_hash,
         assignment_id: spec.assignment_id.clone(),
         binding: snapshot.binding,
+        max_rounds: None,
         receipt: None,
         receipt_created_at: None,
     })
@@ -231,6 +235,7 @@ pub async fn query_dispatch(
     let mut comparable = actual.clone();
     comparable.receipt = None;
     comparable.receipt_created_at = None;
+    comparable.max_rounds = None;
     if comparable != expected
         || child.kind != SessionKind::Child
         || child.parent_session_id.as_deref() != Some(&binding.supervisor_session_id)

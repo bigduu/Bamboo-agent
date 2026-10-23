@@ -48,3 +48,6 @@ pub use visible_messages::{
     VisibleAssistantMessage, VisibleMessageEvent, VisibleMessageEventKind, VisibleMessageSnapshot,
     VisibleMessageStream,
 };
+
+/// Log-only identifiers and redaction for execution/Workspace diagnostics.
+pub mod workspace_diagnostics;

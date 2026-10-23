@@ -108,6 +108,9 @@ pub struct SessionSummary {
     pub last_run_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run_error: Option<String>,
+    /// Detail-only receipt from the same canonical Session/error/run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_diagnostic: Option<bamboo_domain::LlmRequestDiagnostic>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<bamboo_agent_core::TokenBudgetUsage>,
     /// SubAgent profile id mirrored from `session.metadata["subagent_type"]`.
@@ -241,6 +244,7 @@ impl SessionSummary {
             is_running,
             last_run_status: entry.last_run_status,
             last_run_error: entry.last_run_error,
+            last_run_diagnostic: None,
             token_usage: entry.token_usage,
             subagent_type: entry.subagent_type,
             lifecycle: entry.lifecycle,
@@ -706,6 +710,7 @@ mod tests {
             is_running: false,
             last_run_status: None,
             last_run_error: None,
+            last_run_diagnostic: None,
             token_usage: None,
             subagent_type: None,
             lifecycle: None,
@@ -763,6 +768,7 @@ mod tests {
             is_running: false,
             last_run_status: Some("success".to_string()),
             last_run_error: None,
+            last_run_diagnostic: None,
             token_usage: None,
             subagent_type: None,
             lifecycle: None,
@@ -907,6 +913,7 @@ mod tests {
             is_running: false,
             last_run_status: None,
             last_run_error: None,
+            last_run_diagnostic: None,
             token_usage: None,
             subagent_type: None,
             lifecycle: None,
