@@ -68,66 +68,38 @@ test('earlier CI cannot cover runtime, lockfile, Rust manifest or renamed-source
   assert.throws(() => validateDispatch(event, validation, sha, tree))
 })
 
-function runActualPreflight(scenario) {
+function automaticBootstrap() {
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
-  const source = workflow.split('  automatic:\n')[1].match(/python3 - <<'PY'\n([\s\S]*?)\n          PY/)[1]
-  return spawnSync('python3', ['-B', '-c', String.raw`
-import json, os, subprocess, sys, tempfile, textwrap
-from pathlib import Path
-request = json.load(sys.stdin)
-scenario = request['scenario']
-repo = 'bigduu/Bamboo-agent'
-source, controller, tip, release_head = [c * 40 for c in 'adfe']
-run = {'name': 'CI', 'event': 'push', 'conclusion': 'success', 'head_branch': 'main',
-       'head_sha': source, 'repository': {'full_name': repo}, 'head_repository': {'full_name': repo}}
-for name, key, value in [('failed', 'conclusion', 'failure'), ('cancelled', 'conclusion', 'cancelled'),
-                         ('release_pr', 'event', 'pull_request'), ('non_main', 'head_branch', 'dev'),
-                         ('other_workflow', 'name', 'Unrelated CI')]:
-    if scenario == name: run[key] = value
-if scenario == 'foreign_repository': run['repository']['full_name'] = 'other/repository'
-if scenario == 'fork': run['head_repository']['full_name'] = 'other/repository'
-api_calls = []
-def transport(argv, *, text):
-    assert text is True and argv[:2] == ['gh', 'api'] and len(argv) == 3
-    route = argv[2].removeprefix('repos/' + repo + '/')
-    api_calls.append(route)
-    if route in ('branches/dev', 'branches/main'):
-        name = route.split('/')[1]
-        return json.dumps({'name': name, 'protected': scenario != 'unprotected_' + name,
-                           'commit': {'sha': tip}})
-    if route.startswith('compare/'):
-        earlier, later = route.removeprefix('compare/').split('...')
-        bad = (scenario == 'unrelated_source' and earlier == source) or (
-               scenario == 'unrelated_controller' and earlier == controller)
-        return json.dumps({'status': 'diverged' if bad else 'ahead',
-                           'merge_base_commit': {'sha': '0' * 40 if bad else earlier}})
-    raise RuntimeError('Unexpected API route: ' + route)
-subprocess.check_output = transport
-with tempfile.TemporaryDirectory(prefix='bamboo-main-publication-preflight-') as directory:
-    root = Path(directory)
-    event = {'workflow_run': run}
-    event_name = 'workflow_run'
-    if scenario.startswith('manual'):
-        event_name = 'workflow_dispatch'
-        event = {'sender': {'login': 'bigduu'}, 'inputs': {'complete_release': 'true', 'dry_run': 'false',
-                 'expected_source_sha': release_head, 'accepted_ci_run': '123'}}
-    (root / 'event').write_text(json.dumps(event))
-    ref = 'refs/heads/main' if scenario != 'untrusted_ref' else 'refs/heads/topic'
-    os.environ.update(GITHUB_REPOSITORY=repo, GITHUB_EVENT_NAME=event_name, GITHUB_ACTOR='bigduu',
-        GITHUB_TRIGGERING_ACTOR='bigduu', GITHUB_EVENT_PATH=str(root / 'event'), GITHUB_WORKFLOW_SHA=controller,
-        GITHUB_SHA=controller, GITHUB_REF=ref,
-        GITHUB_REF_PROTECTED='false' if scenario == 'unprotected_workflow_ref' else 'true',
-        GITHUB_WORKFLOW_REF=repo + '/.github/workflows/publish-crate.yml@' + ref,
-        GITHUB_OUTPUT=str(root / 'output'), GITHUB_ENV=str(root / 'env'))
-    try:
-        exec(textwrap.dedent(request['source']), {})
-    except BaseException:
-        print(json.dumps({'apiCalls': api_calls, 'outputCreated': (root / 'output').exists()}))
-        raise
-    print(json.dumps({'output': (root / 'output').read_text(), 'envCreated': (root / 'env').exists(),
-                      'apiCalls': api_calls}))
-`], { input: JSON.stringify({ source, scenario }), encoding: 'utf8',
-    env: { PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: '1' } })
+  const step = workflow.split('      - name: Authorize the exact source before checkout\n')[1].split('\n      - ')[0]
+  const match = step.match(/python3 - <<'([A-Z]+)'\n([\s\S]*?)\n          \1/)
+  assert.ok(match, 'Select the named authority step, never an unrelated later Python version step')
+  return match[2].split('\n').map(line => line.replace(/^ {10}/, '')).join('\n')
+}
+async function runActualPreflight(t, scenario) {
+  return require('./tests/main-authority-bootstrap-fixture.cjs').verify(t, automaticBootstrap(), 'v3', 'publication', {
+    exercise: ({run, base}) => {
+      const environment = {}, change = input => {
+        const delivered = input.event.workflow_run, server = input.routes['actions/runs/111']
+        const set = (key, value) => { delivered[key] = value; server[key] = value }
+        if (scenario.startsWith('manual')) {
+          input.event = {sender: {login: 'bigduu'}, inputs: {complete_release: 'true', dry_run: 'false', expected_source_sha: 'e'.repeat(40), accepted_ci_run: '123'}}
+          environment.GITHUB_EVENT_NAME = 'workflow_dispatch'
+        } else if (scenario === 'failed' || scenario === 'cancelled') set('conclusion', scenario === 'failed' ? 'failure' : 'cancelled')
+        else if (scenario === 'release_pr') set('event', 'pull_request')
+        else if (scenario === 'non_main') set('head_branch', 'dev')
+        else if (scenario === 'other_workflow') set('name', 'Unrelated CI')
+        else if (scenario === 'foreign_repository') { delivered.repository.full_name = 'other/repository'; server.repository.full_name = 'other/repository' }
+        else if (scenario === 'fork') { delivered.head_repository.full_name = 'other/repository'; server.head_repository.full_name = 'other/repository' }
+        else if (scenario === 'unprotected_main') input.routes['branches/main'].protected = false
+        else if (scenario === 'unprotected_dev') input.routes['branches/dev'].protected = false
+        else if (scenario === 'untrusted_ref') environment.GITHUB_REF = 'refs/heads/topic'
+        else if (scenario === 'unprotected_workflow_ref') environment.GITHUB_REF_PROTECTED = 'false'
+        else if (scenario === 'unrelated_source' || scenario === 'unrelated_controller') input.routes['branches/dev'].commit.sha = base
+        else throw new Error('Unknown authority fixture scenario: ' + scenario)
+      }
+      return run(change, environment)
+    },
+  })
 }
 
 test('complete automatic publication has one route and never accepts the experimental manual authority', () => {
@@ -137,7 +109,10 @@ test('complete automatic publication has one route and never accepts the experim
   assert.match(condition, /github\.event_name == 'workflow_run'/)
   assert.doesNotMatch(condition, /workflow_dispatch|inputs\./)
   assert.doesNotMatch(workflow.split('\npermissions:')[0], /complete_release|accepted_ci_run/)
-  assert.doesNotMatch(workflow, /accepted_ci_run|SOURCE_VALIDATION/)
+  assert.doesNotMatch(workflow, /accepted_ci_run/)
+  assert.doesNotMatch(workflow.split('\npermissions:')[0], /SOURCE_VALIDATION/)
+  assert.doesNotMatch(workflow, /SOURCE_VALIDATION: \$\{\{ (?:inputs|github\.event\.inputs)\./)
+  assert.match(workflow, /SOURCE_VALIDATION: \$\{\{ needs\.automatic\.outputs\.source_validation \}\}/)
   assert.ok(workflow.includes("if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && !fromJSON(toJSON(github.event.inputs)).complete_release"))
   assert.ok(workflow.includes("if: github.event_name == 'workflow_dispatch' && inputs.dry_run && !fromJSON(toJSON(github.event.inputs)).complete_release"))
   // Existing guarded crate-only manual/dry-run modes do not call the complete publisher.
@@ -146,34 +121,37 @@ test('complete automatic publication has one route and never accepts the experim
 })
 
 test('actual automatic preflight selects the successful main merge, never the separate release head', async (t) => {
-  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
-  const source = workflow.split('  automatic:\n')[1].match(/python3 - <<'PY'\n([\s\S]*?)\n          PY/)[1]
-    .split('\n').map(line => line.replace(/^ {10}/, '')).join('\n')
+  const source = automaticBootstrap()
   assert.doesNotMatch(source, /GITHUB_ENV/, 'Source authorization must not write environment state')
   // Use the existing real Git merge/CI transport fixture for the current dev
   // controller contract, including advanced dev and exact main output checks.
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t, source, 'v2')
 })
 
-test('actual manual complete dispatch fails before API or output even with owner and accepted-CI inputs', () => {
+test('actual manual complete dispatch stops after the pinned loader, before CI proof or authority output', async t => {
   for (const scenario of ['manual_release_head', 'manual_changed_base']) {
-    const result = runActualPreflight(scenario)
+    const result = await runActualPreflight(t, scenario)
     assert.notEqual(result.status, 0)
     assert.match(result.stderr, /AssertionError/)
-    const emitted = JSON.parse(result.stdout.trim().split('\n').at(-1))
-    assert.deepEqual(emitted.apiCalls, [], 'No promotion/review summary can become alternate publication authority')
-    assert.equal(emitted.outputCreated, false)
+    assert.match(result.calls, /^contents\/scripts\/main-release-admission\.py\?ref=[0-9a-f]{40}\n$/,
+      'Only the pinned read-only verifier lookup may occur; no CI/release authority is queried')
+    assert.equal(result.output, '')
   }
 })
 
-test('actual automatic preflight preserves CI, protected history and workflow-ref rejection boundaries', () => {
+test('actual automatic preflight preserves CI, protected history and workflow-ref rejection boundaries', async t => {
   for (const scenario of ['failed', 'cancelled', 'release_pr', 'non_main', 'other_workflow',
     'foreign_repository', 'fork', 'unprotected_main', 'unprotected_dev', 'untrusted_ref',
     'unprotected_workflow_ref', 'unrelated_source', 'unrelated_controller']) {
-    const result = runActualPreflight(scenario)
-    assert.notEqual(result.status, 0, `${scenario} must not authorize publication`)
-    assert.match(result.stderr, /AssertionError/, result.stderr)
-    assert.equal(JSON.parse(result.stdout.trim().split('\n').at(-1)).outputCreated, false)
+    const result = await runActualPreflight(t, scenario)
+    if (scenario === 'unprotected_main') {
+      assert.equal(result.status, 0, result.stderr)
+      assert.match(result.output, /^revision=/)
+    } else {
+      assert.notEqual(result.status, 0, `${scenario} must not authorize publication`)
+      assert.match(result.stderr, /AssertionError/, result.stderr)
+      assert.equal(result.output, '')
+    }
   }
 })
 

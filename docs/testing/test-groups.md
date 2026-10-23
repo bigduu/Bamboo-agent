@@ -1,9 +1,9 @@
 # Local grouped Rust tests
 
-This opt-in local controller reduces the scope of a retry. It changes no CI
-triggers, required checks, release admission, protection, or automatic frequency.
-The current release and its resource window take precedence. Do not start the
-compile/run commands below until the owner has returned that window.
+This local controller reduces the scope of a retry and supplies the shared
+routing/list/count checks for [CI test blocks](ci-test-blocks.md). CI subdivides
+each crate and target independently with a ten-minute cap; local thematic groups
+are not the CI matrix. Follow the current owner of a shared build window.
 
 `scripts/test-groups.cjs` uses Node 18+ standard library and existing Cargo/libtest.
 Its Cargo JSON, executable hash, `--list` and runtime count checks follow the
@@ -25,6 +25,7 @@ Do not copy `target` or race another writer of that target.
 | `all-features` | `cargo test --locked --all-features --lib --tests --no-run` | Separate E2E feature selection, includes required `test-utils` targets |
 | `storage-standalone` | `cargo test --locked -p bamboo-storage --lib --no-run` | Retains standalone features; server-unified `storage/test-utils` is different evidence |
 | `macos-server-dev` | `cargo test --locked --profile dev -p bamboo-server --all-features --lib --no-run` | macOS only; rejects `__eh_frame section too large` in compilation diagnostics |
+| `ssh-live` | `cargo test --locked -p bamboo-broker --test russh_live --no-run` | Original standalone real SSH input, separately selected in its owned Docker fixture |
 
 The ordinary default-member set excludes analytics and tool-event-recorder.
 Profiles never silently replace that set with `--workspace`. The compile step

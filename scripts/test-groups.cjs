@@ -45,7 +45,7 @@ function syncText(command, args, cwd) {
   if (result.error || result.status !== 0) fail(`Cannot inspect ${command}: ${result.error?.message || result.stderr}`);
   return result.stdout.trim();
 }
-function identity(root, config = CONFIG) {
+function identity(root, config = CONFIG, mode = 'local') {
   root = fs.realpathSync(root);
   if (syncText('git', ['status', '--porcelain', '--untracked-files=all'], root)) fail('Source must be clean, including untracked files');
   const environment = Object.fromEntries(Object.entries(process.env)
@@ -57,11 +57,18 @@ function identity(root, config = CONFIG) {
   }
   const cargoConfig = [...new Set(cargoHomes.flatMap(directory => ['config', 'config.toml'].map(name => path.join(directory, name))))]
     .sort().map(filename => ({ path: filename, sha256: fs.existsSync(filename) ? fileHash(fs.realpathSync(filename)) : null }));
-  return {
+  const source = {
     root, sha: syncText('git', ['rev-parse', 'HEAD'], root), tree: syncText('git', ['rev-parse', 'HEAD^{tree}'], root),
     platform: process.platform, arch: process.arch, osRelease: os.release(), hostHash: digest(os.hostname()),
     node: process.version, environmentHash: digest(environment), cargoConfig, configHash: digest(config), runnerHash: fileHash(__filename),
   };
+  if (mode === 'ci') {
+    if (process.env.GITHUB_ACTIONS !== 'true' || source.sha !== process.env.GITHUB_SHA) fail('CI identity requires the exact Actions event checkout');
+    delete source.hostHash; delete source.osRelease;
+    source.environmentHash = digest(Object.fromEntries(Object.entries(environment).filter(([key]) => /^(CARGO_|RUST|BAMBOO_FRONTEND_|LOTUS_)/.test(key))));
+    source.ci = Object.fromEntries(['GITHUB_REPOSITORY', 'GITHUB_RUN_ID', 'GITHUB_WORKFLOW_REF', 'GITHUB_WORKFLOW_SHA', 'GITHUB_EVENT_NAME', 'GITHUB_REF', 'GITHUB_BASE_REF', 'RUNNER_OS', 'RUNNER_ARCH', 'ImageOS', 'ImageVersion'].map(key => [key, process.env[key] || '']));
+  } else if (mode !== 'local') fail('Unknown identity mode');
+  return source;
 }
 function validateConfig(config) {
   if (config.schemaVersion !== 1 || !config.groups[config.fallbackGroup]) fail('Invalid test group configuration');
@@ -216,6 +223,7 @@ function metadataTargets(metadata, profile, units) {
     const enabled = new Set(profile.allFeatures ? Object.keys(pkg.features) : units.filter(u => u.package_id === pkg.id).flatMap(u => u.features));
     for (const target of pkg.targets) {
       if (!target.test || !target.kind.some(k => profile.kinds.includes(k))) continue;
+      if (profile.targetNames && !profile.targetNames.includes(target.name)) continue;
       const required = target['required-features'] || target.required_features || [];
       const item = { packageId: pkg.id, package: pkg.name, target: target.name, kind: target.kind, manifest: pkg.manifest_path };
       if (required.some(feature => !enabled.has(feature))) excluded.push({ ...item, reason: 'required-features disabled', required });
@@ -266,7 +274,9 @@ function artifactRecords(metadata, profile, output, root) {
   const files = [...new Set(units.flatMap(u => [u.executable, ...(u.filenames || []).filter(f => /\.(dll|dylib|so(?:\.\d+)*)$/.test(f))]).filter(Boolean))];
   const linkedPaths = scripts.flatMap(s => s.linked_paths || []).map(p => p.replace(/^(native|dependency|crate|framework|all)=/, ''));
   const directories = [...new Set([...files.map(f => path.dirname(f)), ...linkedPaths])];
-  return { targets, excluded, files, directories };
+  return { targets, excluded, files, directories,
+    dependencyFiles: [...new Set(units.flatMap(u => u.filenames || []))],
+    buildOutputs: [...new Set(scripts.map(s => s.out_dir).filter(Boolean))] };
 }
 function runtimeEnv(manifest, target) {
   const dirs = manifest.dynamicDirectories;
@@ -279,15 +289,15 @@ function runtimeEnv(manifest, target) {
 function assertManifest(manifest, root, config = CONFIG) {
   const { inputKey, ...body } = manifest;
   if (manifest.schemaVersion !== 1 || digest(body) !== inputKey) fail('Invalid artifact manifest/cache identity');
-  if (canonical(identity(root, config)) !== canonical(manifest.identity)) fail('Source, host, environment or runner inputs changed; compile a new profile receipt');
+  if (canonical(identity(root, config, manifest.identityMode || 'local')) !== canonical(manifest.identity)) fail('Source, host, environment or runner inputs changed; compile a new profile receipt');
   for (const artifact of manifest.artifacts) verifyArtifact(artifact);
 }
-async function compile(root, evidence, profileName, { config = CONFIG, execute = processRun } = {}) {
+async function compile(root, evidence, profileName, { config = CONFIG, execute = processRun, identityMode = 'local' } = {}) {
   validateConfig(config);
   const profile = config.profiles[profileName];
   if (!profile) fail(`Unknown build profile: ${profileName}`);
   if (profile.platform && process.platform !== profile.platform) fail(`Profile requires ${profile.platform}`);
-  const source = identity(root, config);
+  const source = identity(root, config, identityMode);
   fs.mkdirSync(path.dirname(evidence), { recursive: true });
   fs.mkdirSync(evidence); // Never overwrite another compilation or failed evidence.
   const steps = [];
@@ -309,8 +319,9 @@ async function compile(root, evidence, profileName, { config = CONFIG, execute =
     const toolFiles = ['rustc', 'cargo'].map(name => path.join(sysroot, 'bin', name + (process.platform === 'win32' ? '.exe' : '')));
     const directories = [...new Set([...records.directories, targetLibdir])];
     const files = [...new Set([...records.files, ...toolFiles, ...dynamicFiles(directories)])].sort();
-    const manifest = { schemaVersion: 1, identity: source, profileName, buildProfile: profile, cargoArgs: args, toolchain: { rustc, cargo },
+    const manifest = { schemaVersion: 1, identityMode, identity: source, profileName, buildProfile: profile, cargoArgs: args, toolchain: { rustc, cargo, sysroot },
       runtimeEnv: config.runtimeEnv, dynamicDirectories: directories, artifacts: files.map(p => ({ path: p, sha256: fileHash(p) })),
+      dependencyFiles: records.dependencyFiles, buildOutputs: records.buildOutputs,
       targets: records.targets, excludedTargets: records.excluded, notCovered: config.notCovered };
     for (const [index, target] of manifest.targets.entries()) {
       const runList = async (suffix, flags) => {
@@ -476,5 +487,5 @@ async function main(argv) {
   process.exitCode = (result.listOnly ? result.listResults.every(r => r.status === 'listed') : result.results.every(r => r.status === 'passed')) ? 0 : 1;
 }
 module.exports = { CONFIG, canonical, digest, fileHash, identity, validateConfig, route, parseList, equalNames, parseCounts, partition, plan, selectGroups,
-  processRun, metadataTargets, cargoArtifacts, artifactRecords, assertManifest, compile, groupKey, aggregate, runGroups, argumentsFor };
+  processRun, checked, reportProcess, runtimeEnv, verifySelection, writeJSON, readJSON, metadataTargets, cargoArtifacts, artifactRecords, assertManifest, compile, groupKey, aggregate, runGroups, argumentsFor };
 if (require.main === module) main(process.argv.slice(2)).catch(e => { console.error(e.message); process.exitCode = 1; });

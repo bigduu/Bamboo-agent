@@ -100,12 +100,89 @@ FULL = (
 )
 
 PLATFORMS = ("Build (ubuntu-latest)", "Build (macos-latest)", "Build (windows-latest)")
+GROUPED_JOBS = {}
+GROUPED_PLANS = {}
+
+def grouped_records(job, marker):
+    log = subprocess.check_output(
+        ["gh", "api", "--hostname", "github.com", "--allow-escape-sequences",
+         f"repos/{repository}/actions/jobs/{job['id']}/logs"], timeout=30)
+    assert len(log) <= 1048576, "Grouped job log exceeds bound"
+    pattern = rf"^\d{{4}}-\d\d-\d\dT\S+Z {marker} ([A-Za-z0-9+/=]+)$"
+    return [json.loads(base64.b64decode(match.group(1), validate=True))
+            for line in log.decode("utf-8").splitlines()
+            if (match := re.fullmatch(pattern, line))]
+
+def grouped_jobs(ci, jobs):
+    plans, names = [], set()
+    for label, profile in (("Test", "default"), ("E2E", "all-features"), ("Test SSH", "ssh-live")):
+        builds = [job for job in jobs if job["name"] == label + " Build"]
+        assert len(builds) == 1, "Missing or ambiguous grouped build"
+        build = builds[0]
+        assert build["status"] == "completed" and build["conclusion"] == "success"
+        records = grouped_records(build, "GROUPED_TEST_PLAN")
+        assert len(records) == 1, "Missing or duplicate compiled inventory"
+        plan = records[0]
+        assert plan["schema"] == "bamboo-ci-test-plan/v1" and plan["profile"] == profile
+        assert plan["producerAttempt"] == build["run_attempt"]
+        assert re.fullmatch(SHA, plan["sha"]) and plan["tree"] == commit["tree"]["sha"]
+        assert re.fullmatch(r"[0-9a-f]{64}", plan["planKey"])
+        assert type(plan["planId"]) is int and plan["planId"] > 0
+        assert 1 <= len(plan["blocks"]) <= 512 and plan["inventory"] > 0
+        assert plan["packages"] == sorted(set(block["package"] for block in plan["blocks"] if block["kind"] != "doctest"))
+        assert sum(block["count"] for block in plan["blocks"] if block["kind"] != "doctest") == plan["inventory"]
+        assert sum(block["count"] for block in plan["blocks"] if block["kind"] == "doctest") == plan["doctests"]
+        assert profile == "default" or plan["doctests"] == 0
+        names.add(label + " Build")
+        for block in plan["blocks"]:
+            assert re.fullmatch(r"[A-Za-z0-9-]{1,128}", block["id"])
+            assert re.fullmatch(r"[a-z0-9][a-z0-9-]*", block["package"])
+            assert block["kind"] in ({"ssh"} if profile == "ssh-live" else {"libtest", "doctest"})
+            assert type(block["count"]) is int and block["count"] > 0
+            assert type(block["ignored"]) is int and 0 <= block["ignored"] <= block["count"]
+            assert block["timeoutSeconds"] == 600
+            name = "Test SSH" if profile == "ssh-live" else f"{label} {'Doctest' if block['kind'] == 'doctest' else 'Block'} ({block['id']})"
+            assert name not in names, "Duplicate compiled CI block"
+            names.add(name)
+            found = [job for job in jobs if job["name"] == name]
+            assert len(found) == 1, f"Missing or ambiguous compiled CI block: {name}"
+            job = found[0]
+            records = grouped_records(job, "GROUPED_TEST_RESULT")
+            assert len(records) == 1, "Missing or duplicate block result"
+            result = records[0]
+            assert result["schema"] == "bamboo-ci-test-result/v1"
+            assert result["planKey"] == plan["planKey"] and result["block"] == block["id"]
+            assert result["package"] == block["package"] and result["profile"] == profile
+            assert result["sha"] == plan["sha"] and result["sourceTree"] == plan["tree"]
+            assert build["run_attempt"] <= result["attempt"] == job["run_attempt"] <= ci["run_attempt"]
+            assert result["status"] == "passed" and result["exitCode"] == 0 and not result.get("error")
+            assert result["expected"] == block["count"] and result["timeoutSeconds"] == 600
+            assert 0 <= result["testDurationMs"] <= 600000
+            assert result["counts"] == {"passed": block["count"] - block["ignored"], "failed": 0, "ignored": block["ignored"]}
+        plans.append(plan)
+    actual = {job["name"] for job in jobs if re.match(r"^(?:Test|E2E) (?:Block|Doctest) \(", job["name"]) or job["name"] == "Test SSH"}
+    assert actual == names - {"Test Build", "E2E Build", "Test SSH Build"}, "Unexpected or missing inventory shard"
+    for summary_name, profiles in (("Test", {"default", "ssh-live"}), ("E2E Tests", {"all-features"})):
+        found = [job for job in jobs if job["name"] == summary_name]
+        assert len(found) == 1
+        records = grouped_records(found[0], "GROUPED_TEST_SUMMARY")
+        assert len(records) == len(profiles) and {item["profile"] for item in records} == profiles
+        for record in records:
+            plan = next(item for item in plans if item["profile"] == record["profile"])
+            assert record["planKey"] == plan["planKey"] and record["sha"] == plan["sha"] and record["tree"] == plan["tree"]
+            assert record["status"] == "passed" and record["blocks"] == len(plan["blocks"])
+            assert record["inventory"] == plan["inventory"] and record["doctests"] == plan["doctests"]
+            ignored = sum(block["ignored"] for block in plan["blocks"])
+            assert record["counts"] == {"passed": plan["inventory"] + plan["doctests"] - ignored, "failed": 0, "ignored": ignored}
+    GROUPED_JOBS[ci["id"]], GROUPED_PLANS[ci["id"]] = names, plans
+    return tuple(sorted(names))
 
 def full_jobs(ci, promotion=False, before=None):
     # latest is intentionally per job: failed-only reruns retain the successful
     # jobs from earlier attempts. Do not invent an all-jobs-same-attempt rule.
     jobs = pages(f"actions/runs/{ci['id']}/jobs?filter=latest", "jobs")
-    for name in FULL + (PLATFORMS + ("Promotion Source",) if promotion else ()):
+    grouped = grouped_jobs(ci, jobs) if promotion and producer_definition(ci["head_sha"]) == "grouped" else ()
+    for name in FULL + (PLATFORMS + ("Promotion Source",) if promotion else ()) + grouped:
         found = [job for job in jobs if job["name"] == name]
         assert len(found) == 1, f"Missing or ambiguous full CI job: {name}"
         job = found[0]
@@ -180,7 +257,11 @@ REVIEWED_PRODUCERS = frozenset((PRODUCER_V1, PRODUCER_V2))
 # by a sentinel. Then independently authenticate the actual helper bytes below.
 # This breaks the workflow -> helper -> workflow hash cycle, without excluding
 # a job, global environment, trigger, command or permission from review.
-CURRENT_PRODUCER = "3c3af3e002a8abb341db0bb4020f29491ed32208b0b0953ebb6ed2b289c4390c"
+CURRENT_PRODUCER = "aa775e0e206b5511c244d4207cd53ca30fe4aff0bb3b5275bc97e40f4b6b7dea"
+# Preserve the already-reviewed admission producer with its original helper.
+# It has no shard jobs; it cannot satisfy the new grouped producer contract.
+LEGACY_ADMISSION_PRODUCER = "3c3af3e002a8abb341db0bb4020f29491ed32208b0b0953ebb6ed2b289c4390c"
+LEGACY_ADMISSION_HELPER = "e4fce79b854a8a3012462fc5489349a8ba3f0fcc8f9e78a1e7975bbbef3ec806"
 PIN = rb'ADMISSION_HELPER_SHA256: "([0-9a-f]{64})"'
 NORMALIZED_PIN = b'ADMISSION_HELPER_SHA256: "<PINNED_ADMISSION_HELPER>"'
 SUITE_QUERY = ("query($suite:ID!){node(id:$suite){... on CheckSuite{databaseId "
@@ -196,13 +277,15 @@ def producer_definition(revision):
     if hashlib.sha256(raw).hexdigest() in REVIEWED_PRODUCERS:
         return "full"
     pins = re.findall(PIN, raw)
-    assert len(pins) == 1 and pins[0].decode() == ADMISSION_SCRIPT_SHA256, "Unknown admission helper pin"
-    assert hashlib.sha256(re.sub(PIN, NORMALIZED_PIN, raw)).hexdigest() == CURRENT_PRODUCER, "Unknown source-admission producer"
+    normalized = hashlib.sha256(re.sub(PIN, NORMALIZED_PIN, raw)).hexdigest()
+    assert normalized in {CURRENT_PRODUCER, LEGACY_ADMISSION_PRODUCER}, "Unknown source-admission producer"
+    expected_helper = ADMISSION_SCRIPT_SHA256 if normalized == CURRENT_PRODUCER else LEGACY_ADMISSION_HELPER
+    assert len(pins) == 1 and pins[0].decode() == expected_helper, "Unknown admission helper pin"
     helper = api(f"contents/scripts/main-release-admission.py?ref={revision}")
     assert helper["encoding"] == "base64" and len(helper["content"]) <= 180000
     body = base64.b64decode(helper["content"], validate=False)
-    assert len(body) <= 128000 and hashlib.sha256(body).hexdigest() == ADMISSION_SCRIPT_SHA256, "Admission helper bytes changed"
-    return "admission"
+    assert len(body) <= 128000 and hashlib.sha256(body).hexdigest() == expected_helper, "Admission helper bytes changed"
+    return "grouped" if normalized == CURRENT_PRODUCER else "admission"
 
 def executed_definition(pre, revision):
     """Bind the real check suite to the immutable executed workflow definition."""
@@ -242,7 +325,7 @@ def snapshot_binding(pre, jobs):
     # jobs retained by a failed-only rerun. One request per distinct attempt.
     attempts = {}
     for gate in jobs:
-        if gate["name"] not in FULL + PLATFORMS + ("Promotion Source",):
+        if gate["name"] not in FULL + PLATFORMS + ("Promotion Source",) and gate["name"] not in GROUPED_JOBS.get(pre["id"], set()):
             continue
         actual = gate["run_attempt"]
         if actual not in attempts:
@@ -265,6 +348,7 @@ def snapshot_binding(pre, jobs):
     match = re.fullmatch(r"\d{4}-\d\d-\d\dT\S+Z Event source: (" + SHA + r"); full validation: true", records[0])
     assert match, "Malformed or non-full source admission"
     snapshot = match.group(1)
+    assert all(plan["sha"] == snapshot for plan in GROUPED_PLANS.get(pre["id"], [])), "Grouped build used another snapshot"
     tested = api(f"git/commits/{snapshot}")
     assert tested["sha"] == snapshot
     assert [parent["sha"] for parent in tested["parents"]] == [base, head], "Tested merge has wrong head/base"
@@ -280,10 +364,12 @@ if ci is not None:
     if not admissions:
         # Preserve the historical publisher contract: a legacy main CI must
         # have genuinely completed the full suite. A skipped stub never counts.
+        assert producer_definition(source) == "full", "Admission producers require the real main admission job"
         full_jobs(ci)
     else:
         light_main = True
-        assert len(admissions) == 1 and executed_definition(ci, source) == "admission"
+        contract = executed_definition(ci, source)
+        assert len(admissions) == 1 and contract in {"admission", "grouped"}
         for name in ("Validation Source", "Main Release Admission", "Test"):
             found = [job for job in main_jobs if job["name"] == name]
             assert len(found) == 1
@@ -300,6 +386,9 @@ if ci is not None:
         # full acceptance: the separate pre-merge proof below requires real jobs.
         skipped = ["Quick Checks", "Promotion Source", "E2E Tests", "Lint", "MSRV (Rust 1.95)",
                    "Security Audit", "cargo-deny (licenses/bans/advisories/sources)", "Documentation"]
+        if contract == "grouped":
+            skipped.extend(["Test Build", "E2E Build", "Test SSH Build", "Test SSH",
+                            "Test Block (${{ matrix.id }})", "E2E Block (${{ matrix.id }})", "Test Doctest (${{ matrix.id }})"])
         for label, platforms in (("TLS Fixture", ("macos-latest", "windows-latest")),
                                  ("ToolEvent Recorder E2E", ("ubuntu-latest", "macos-latest", "windows-latest")),
                                  ("Build", ("ubuntu-latest", "macos-latest", "windows-latest"))):
@@ -313,7 +402,7 @@ if ci is not None:
             assert len(found) == 1 and found[0]["status"] == "completed" and found[0]["conclusion"] == "skipped", name
         assert len(main_jobs) == len(skipped) + 3, "Unexpected main CI jobs"
 else:
-    assert producer_definition(source) == "admission"
+    assert producer_definition(source) in {"admission", "grouped"}
 
 def latest_premerge():
     runs = pages(f"actions/workflows/ci.yml/runs?event=pull_request&head_sha={head}", "workflow_runs")
@@ -351,7 +440,7 @@ print(f"Accepted normal main merge source={source} tree={commit['tree']['sha']} 
       f"release_CI={pre['id']} release_attempt={pre['run_attempt']} tested_snapshot={tested_snapshot} controller={workflow_source}")
 print("Authenticated full pre-merge job attempts: " + ", ".join(
     f"{job['name']}={job['id']}@{job['run_attempt']}" for job in jobs
-    if job["name"] in FULL + PLATFORMS + ("Promotion Source",)))
+    if job["name"] in FULL + PLATFORMS + ("Promotion Source",) or job["name"] in GROUPED_JOBS.get(pre["id"], set())))
 print(f"Acceptance covers tested inputs; final executable must be rebuilt for source={source} and its release version")
 with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
     stream.write(f"revision={source}\n")
