@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "profiles": {
+    "default": {
+      "cargoArgs": [],
+      "packages": "default-members",
+      "kinds": ["lib", "bin", "test"],
+      "allFeatures": false,
+      "description": "Existing Test default-members/default-features libtest targets; doctests are separate."
+    },
+    "all-features": {
+      "cargoArgs": ["--all-features", "--lib", "--tests"],
+      "packages": "default-members",
+      "kinds": ["lib", "bin", "test"],
+      "allFeatures": true,
+      "description": "Existing E2E all-features lib/tests input, including server/env_cache_isolation."
+    },
+    "storage-standalone": {
+      "cargoArgs": ["-p", "bamboo-storage", "--lib"],
+      "packages": ["bamboo-storage"],
+      "kinds": ["lib"],
+      "allFeatures": false,
+      "description": "Standalone storage features; never replace with server-unified storage/test-utils."
+    },
+    "macos-server-dev": {
+      "cargoArgs": ["--profile", "dev", "-p", "bamboo-server", "--all-features", "--lib"],
+      "packages": ["bamboo-server"],
+      "kinds": ["lib"],
+      "allFeatures": true,
+      "platform": "darwin",
+      "rejectCompileDiagnostic": "__eh_frame section too large",
+      "description": "Existing macOS optimized dev-profile/all-features server lib input and linker-warning contract."
+    }
+  },
+  "runtimeEnv": {"RUST_MIN_STACK": "8388608"},
+  "groups": {
+    "config-credentials": {"timeoutSeconds": 900},
+    "llm-retry": {"timeoutSeconds": 900},
+    "engine-compression": {"timeoutSeconds": 1800},
+    "session-permissions": {"timeoutSeconds": 1800},
+    "frontend-resources": {"timeoutSeconds": 600},
+    "restart-takeover": {"timeoutSeconds": 2700, "expensive": true},
+    "cross-process": {"timeoutSeconds": 2700, "expensive": true},
+    "browser": {"timeoutSeconds": 2700, "expensive": true},
+    "platform": {"timeoutSeconds": 2700, "expensive": true},
+    "other": {"timeoutSeconds": 2700}
+  },
+  "routes": [
+    {"priority": 10, "group": "restart-takeover", "kind": "test", "targetRegex": "^(ordinary_root_owned_inbox_restart|patrol_restart|child_owner_replacement|ticket_runtime_lifecycle|local_legacy_idle_resume|startup_sidecar_actor_fence)$"},
+    {"priority": 10, "group": "cross-process", "package": "bamboo-config", "testRegex": "^credential_migration::share_transaction::tests::native::"},
+    {"priority": 10, "group": "browser", "kind": "test", "targetRegex": "^(sprint_browser_fixture|ticket_browser_fixture)$"},
+    {"priority": 15, "group": "platform", "testRegex": "(^|::)(windows|macos|darwin)(::|_)|^server::tls::tests::|^local_task_resources::|^v2::actor_snapshot_windows_tests::|^v2::actor_directory::tests::|^handlers::agent::actor_snapshot::tests::"},
+    {"priority": 20, "group": "cross-process", "kind": "test", "targetRegex": "^(e2e_subprocess|bus_e2e|broker_deploy_e2e|deploy_agent_tool_e2e|remote_broker_activation|scoped_broker_worker|subagent_worker_e2e|subagent_actor_via_server|supervisor_native_stdio|ordinary_actor_mvp|ordinary_root_actor_writer|local_zero_tool_actor|local_parent_question_actor|ticket_live_host|ticket_live_worker|ticket_offline_host|ticket_offline_runtime|ticket_runtime_mvp|ticket_supervisor_acceptance|required_child_context_packet|child_ordinary_effort|child_creation_identity|native_tool_ceiling|ticket_runtime_files|ticket_runtime_publication|ticket_worker_questions|ticket_user_ingress)$"},
+    {"priority": 20, "group": "frontend-resources", "kind": "test", "targetRegex": "^(frontend_build_contract|frontend_packaging)$"},
+    {"priority": 20, "group": "browser", "testRegex": "(^|::)(browser|browser_host|browser_runtime)(::|_)"},
+    {"priority": 30, "group": "config-credentials", "package": "bamboo-config"},
+    {"priority": 30, "group": "config-credentials", "kind": "test", "targetRegex": "^(config_comprehensive|encryption_tests|provider_instance_default_disable|named_profile_application|env_cache_isolation)$"},
+    {"priority": 30, "group": "llm-retry", "package": "bamboo-llm"},
+    {"priority": 30, "group": "llm-retry", "kind": "test", "targetRegex": "^(provider_integration|provider_runtime_admission)$"},
+    {"priority": 30, "group": "frontend-resources", "package": "bamboo-server", "testRegex": "^services::frontend_package::"},
+    {"priority": 30, "group": "session-permissions", "package": "bamboo-engine", "testRegex": "^(session_app|session_activation|session_cache|session_messaging|session_repository)::|permission|approval"},
+    {"priority": 30, "group": "session-permissions", "package": "bamboo-permission"},
+    {"priority": 30, "group": "session-permissions", "package": "bamboo-storage"},
+    {"priority": 30, "group": "session-permissions", "package": "bamboo-server", "testRegex": "permission|approval|^handlers::agent::sessions::|^app_state::session_"},
+    {"priority": 30, "group": "session-permissions", "kind": "test", "targetRegex": "^(session_inspector_tool|session_index_token_usage|ordinary_root_inbox_lifecycle|root_parent_outcome_writer|chat_workspace_provider_isolation|create_session_workspace_provider_isolation)$"},
+    {"priority": 40, "group": "engine-compression", "package": "bamboo-engine"},
+    {"priority": 40, "group": "engine-compression", "package": "bamboo-compression"},
+    {"priority": 40, "group": "engine-compression", "kind": "test", "targetRegex": "^(compact_subagent_facade|skill_output_budget)$"}
+  ],
+  "fallbackGroup": "other",
+  "notCovered": [
+    "Doctests: bare cargo test also runs rustdoc; --no-run JSON has no doctest artifacts. Run existing doc-test validation separately.",
+    "Other feature/profile selections, excluded workspace members (analytics, tool-event-recorder), examples, Clippy and formatting.",
+    "Other operating systems/architectures and the existing 41-case actor-windows-native acceptance contract.",
+    "External Node policy suites, real SSH/SFTP, actual browser UI acceptance, packaging, installation and publication checks.",
+    "Ignored tests keep libtest's default skip behavior unless only/include is explicitly selected."
+  ]
+}
