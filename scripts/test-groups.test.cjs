@@ -40,7 +40,7 @@ function fixture(t, profileName = 'default') {
     record('bamboo-server', 'empty_platform_target', [], ['test']),
   ];
   samples[0].tests[1].ignored = true;
-  const marker = path.join(base, 'fail-llm');
+  const marker = path.join(base, 'fail-llm'), timeoutMarker = path.join(base, 'hang-llm');
   const packages = [...new Set(samples.map(s => s.package))].map(name => {
     const packageDir = name === 'bamboo-config' ? root : path.join(root, 'target', name); fs.mkdirSync(packageDir, { recursive: true });
     const manifest_path = path.join(packageDir, 'Cargo.toml');
@@ -64,10 +64,15 @@ if (args.includes('--list')) {
   if (process.env.CARGO_MANIFEST_DIR !== process.cwd() || process.env.CARGO_PKG_NAME !== ${JSON.stringify(sample.package)} || process.env.RUST_MIN_STACK !== '8388608') process.exit(91);
   const ignored = selected.filter(t => t.ignored && !args.includes('--ignored') && !args.includes('--include-ignored')).length;
   const failed = ${sample.package === 'bamboo-llm'} && fs.existsSync(${JSON.stringify(marker)}) ? 1 : 0;
+  if (${sample.package === 'bamboo-llm'} && fs.existsSync(${JSON.stringify(timeoutMarker)})) {
+    console.log('fixture waiting for the controller deadline');
+    setTimeout(() => {}, 60000);
+  } else {
   console.log('running ' + selected.length + ' tests');
   console.error('fixture stderr retained');
   console.log('test result: ' + (failed ? 'FAILED' : 'ok') + '. ' + (selected.length - ignored - failed) + ' passed; ' + failed + ' failed; ' + ignored + ' ignored; 0 measured; ' + (tests.length - selected.length) + ' filtered out; finished in 0.01s');
   process.exitCode = failed ? 7 : 0;
+  }
 }
 `;
     fs.writeFileSync(executable, body); fs.chmodSync(executable, 0o755);
@@ -91,7 +96,7 @@ if (args.includes('--list')) {
     fs.writeFileSync(options.log + '.stdout.log', stdout, { flag: 'wx' }); fs.writeFileSync(options.log + '.stderr.log', '', { flag: 'wx' });
     return { command, args, cwd: options.cwd, log: options.log, exitCode: 0, signal: null, timedOut: false, interrupted: false, error: null, durationMs: 1, stdout, stderr: '' };
   };
-  return { root, evidence, config, marker, packages, units, calls, execute, app, dylib,
+  return { root, evidence, config, marker, timeoutMarker, packages, units, calls, execute, app, dylib,
     prepare: () => r.compile(root, evidence, profileName, { config, execute }) };
 }
 
@@ -283,10 +288,13 @@ test('changed --list names fail before runtime and retain list exit/log evidence
 });
 
 test('group timeout fails its receipt and the following independent groups still run', async t => {
-  const f = fixture(t); f.config.groups['llm-retry'].timeoutSeconds = 0.001; await f.prepare();
+  const f = fixture(t); f.config.groups['llm-retry'].timeoutSeconds = 5; await f.prepare();
+  fs.writeFileSync(f.timeoutMarker, 'hang the synthetic LLM process until its group deadline');
   const run = await r.runGroups(f.root, f.evidence, ['llm-retry', 'frontend-resources'], { config: f.config });
   assert.equal(run.summary.groups['llm-retry'].status, 'failed');
   assert(run.summary.groups['llm-retry'].processes.some(p => p.timedOut));
+  const timeout = run.summary.groups['llm-retry'].processes.find(p => p.timedOut);
+  assert.match(fs.readFileSync(timeout.log + '.stdout.log', 'utf8'), /fixture waiting for the controller deadline/);
   assert.equal(run.summary.groups['frontend-resources'].status, 'passed');
   assert.equal(run.summary.completeWithinProfile, false);
 });
