@@ -986,3 +986,181 @@ pub(super) async fn workspace_after_completed_call(
 ) {
     workspace_handoff::after_completed_call(executor, call, name, ctx, success).await;
 }
+
+struct PermissionTighteningProvider {
+    inner: Arc<SkillsProvider>,
+    control: tokio::sync::mpsc::UnboundedSender<(
+        SessionPermissionMode,
+        tokio::sync::oneshot::Sender<()>,
+    )>,
+    stage: AtomicU64,
+    retained_call: Mutex<Option<ToolCall>>,
+    denials: Mutex<Vec<String>>,
+}
+impl PermissionTighteningProvider {
+    async fn patch_mode(&self, mode: SessionPermissionMode) {
+        let (reply, committed) = tokio::sync::oneshot::channel();
+        self.control.send((mode, reply)).unwrap();
+        committed.await.unwrap();
+    }
+    fn record_denial(&self, messages: &[Message]) {
+        let call = self.retained_call.lock().unwrap().clone().unwrap();
+        let result = messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(call.id.as_str()))
+            .expect("the attempted retained page has a durable tool result");
+        assert_eq!(result.tool_success, Some(false));
+        self.denials.lock().unwrap().push(result.content.clone());
+    }
+}
+#[async_trait]
+impl LLMProvider for PermissionTighteningProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let chunks = match self.stage.load(Ordering::Acquire) {
+            0 => {
+                let warm = self.inner.has_warm_page(messages);
+                let chunks = self.inner.next(messages, tools);
+                if warm {
+                    let call = chunks
+                        .iter()
+                        .find_map(|chunk| match chunk {
+                            LLMChunk::ToolCalls(calls) => calls.first().cloned(),
+                            _ => None,
+                        })
+                        .expect("the next real Reader page is ready");
+                    assert_eq!(call.function.name, "skills_read");
+                    *self.retained_call.lock().unwrap() = Some(call);
+                    self.patch_mode(SessionPermissionMode::Default).await;
+                    self.stage.store(1, Ordering::Release);
+                }
+                chunks
+            }
+            1 => {
+                self.record_denial(messages);
+                assert!(tools.iter().all(|tool| !matches!(
+                    tool.function.name.as_str(),
+                    "skills_list" | "skills_read"
+                )));
+                self.patch_mode(SessionPermissionMode::Bypass).await;
+                let mut call = self.retained_call.lock().unwrap().clone().unwrap();
+                call.id.push_str("-after-restoring-bypass");
+                *self.retained_call.lock().unwrap() = Some(call.clone());
+                self.stage.store(2, Ordering::Release);
+                vec![LLMChunk::ToolCalls(vec![call]), LLMChunk::Done]
+            }
+            2 => {
+                self.record_denial(messages);
+                assert!(tools.iter().all(|tool| !matches!(
+                    tool.function.name.as_str(),
+                    "skills_list" | "skills_read"
+                )));
+                self.stage.store(3, Ordering::Release);
+                vec![
+                    LLMChunk::Token("Revoked Skill unavailable; ordinary fallback".into()),
+                    LLMChunk::Done,
+                ]
+            }
+            _ => panic!("the revoked Reader must not start another provider request"),
+        };
+        Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+    }
+}
+
+#[actix_web::test]
+async fn native_http_permission_tightening_revokes_warm_reader_without_revival() {
+    let _proof = HTTP_PROOF.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    write_skill(home.path(), "native-proof", true);
+    let (control, mut commands) = tokio::sync::mpsc::unbounded_channel();
+    let provider = Arc::new(PermissionTighteningProvider {
+        inner: provider(home.path(), 4096, false),
+        control,
+        stage: AtomicU64::new(0),
+        retained_call: Mutex::default(),
+        denials: Mutex::default(),
+    });
+    let state = state(home.path(), provider.clone()).await;
+    let id = "native-reader-permission-tightening";
+    seed(&state, id).await;
+    let (status, receipt) = http(
+        &state,
+        "/api/v1/chat",
+        json!({
+            "session_id":id, "message":"Inspect proof", "workspace_path":home.path(),
+            "permission_mode":"bypass"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{receipt}");
+    let (status, body) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let terminal = done(&state, id);
+    tokio::pin!(terminal);
+    let mut changes = Vec::new();
+    let terminal = loop {
+        tokio::select! {
+            terminal = &mut terminal => break terminal,
+            command = commands.recv() => {
+                let (mode, reply) = command.unwrap();
+                let canonical = state.storage.load_session(id).await.unwrap().unwrap();
+                let app = test::init_service(App::new().app_data(state.clone()).configure(crate::configure_routes)).await;
+                let request = test::TestRequest::patch()
+                    .uri(&format!("/api/v1/sessions/{id}"))
+                    .peer_addr("127.0.0.1:5700".parse().unwrap())
+                    .insert_header(("If-Match", canonical.metadata_version.to_string()))
+                    .set_json(json!({"permission_mode":mode.as_str()}))
+                    .to_request();
+                let response = test::call_service(&app, request).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                changes.push(mode);
+                reply.send(()).unwrap();
+            }
+        }
+    };
+    assert!(matches!(terminal, AgentStatus::Completed), "{terminal:?}");
+    assert_eq!(
+        changes,
+        vec![
+            SessionPermissionMode::Default,
+            SessionPermissionMode::Bypass
+        ]
+    );
+    assert_eq!(provider.stage.load(Ordering::Acquire), 3);
+    {
+        let denials = provider.denials.lock().unwrap();
+        assert_eq!(denials.len(), 2);
+        assert!(
+            denials[0].contains("Native Session permission policy changed"),
+            "{denials:?}"
+        );
+        let trace = provider.inner.trace.lock().unwrap();
+        assert_eq!(trace.main_pages, 1);
+        assert!(trace.eof.is_empty() && !trace.task_started && !trace.task_completed);
+    }
+    let canonical = state.storage.load_session(id).await.unwrap().unwrap();
+    assert_eq!(
+        canonical
+            .messages
+            .iter()
+            .filter(|message| message.id == receipt["message_id"].as_str().unwrap())
+            .count(),
+        1
+    );
+    assert_eq!(permission_mode(&canonical), SessionPermissionMode::Bypass);
+    assert_eq!(state.session_inbox.inspect(id).await.unwrap().pending, 0);
+    assert!(state
+        .session_inbox
+        .was_admitted(
+            id,
+            &bamboo_domain::SessionMessageId::parse(receipt["message_id"].as_str().unwrap())
+                .unwrap()
+        )
+        .await
+        .unwrap());
+}
