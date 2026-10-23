@@ -2,9 +2,11 @@ use std::sync::Arc;
 
 use bamboo_agent_core::AgentEvent;
 use chrono::{DateTime, Duration, Utc};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
-use crate::storage::{MetricsMutation, MetricsStorage, ToolCallCompletion, MAX_METRICS_BATCH_SIZE};
+use crate::storage::{
+    MetricsError, MetricsMutation, MetricsStorage, ToolCallCompletion, MAX_METRICS_BATCH_SIZE,
+};
 use crate::types::{
     ForwardTokenDetails, PromptMemoryExposureObservation, RoundStatus, SessionStatus, TokenUsage,
 };
@@ -27,6 +29,11 @@ enum CollectorCommand {
     },
     Prune {
         cutoff: DateTime<Utc>,
+    },
+    ReconcileStartup {
+        active_session_ids: Vec<String>,
+        awaiting_response_session_ids: Vec<String>,
+        completion: oneshot::Sender<Result<(), MetricsError>>,
     },
 }
 
@@ -61,9 +68,10 @@ impl MetricsCollector {
         // Do not abort the consumer on owner release: closing the producers
         // lets it finish initialization and drain accepted commands in order.
         let consumer = tokio::spawn(async move {
-            if let Err(error) = storage.init().await {
+            let initialization_error = storage.init().await.err().map(|error| {
                 tracing::error!("metrics storage initialization failed: {}", error);
-            }
+                error.to_string()
+            });
 
             let mut buffer = Vec::with_capacity(MAX_METRICS_BATCH_SIZE);
             loop {
@@ -105,6 +113,29 @@ impl MetricsCollector {
                         }
                         CollectorCommand::Prune { cutoff } => {
                             storage.prune_rounds_before(cutoff).await.map(|_| ())
+                        }
+                        CollectorCommand::ReconcileStartup {
+                            active_session_ids,
+                            awaiting_response_session_ids,
+                            completion,
+                        } => {
+                            let result = match initialization_error.as_ref() {
+                                Some(error) => Err(MetricsError::Task(format!(
+                                    "metrics collector initialization failed: {error}"
+                                ))),
+                                None => {
+                                    storage
+                                        .reconcile_stale_executions(
+                                            &active_session_ids,
+                                            &awaiting_response_session_ids,
+                                        )
+                                        .await
+                                }
+                            };
+                            // A caller dropping its receipt must not cancel an
+                            // accepted database operation or discard the suffix.
+                            let _ = completion.send(result);
+                            Ok(())
                         }
                         CollectorCommand::Mutation(_) => {
                             unreachable!("ordinary mutations handled above")
@@ -152,6 +183,30 @@ impl MetricsCollector {
                 error
             ),
         }
+    }
+
+    pub(crate) async fn reconcile_startup(
+        &self,
+        active_session_ids: &[String],
+        awaiting_response_session_ids: &[String],
+    ) -> Result<(), MetricsError> {
+        let (completion, receipt) = oneshot::channel();
+        self.tx
+            .send(CollectorCommand::ReconcileStartup {
+                active_session_ids: active_session_ids.to_vec(),
+                awaiting_response_session_ids: awaiting_response_session_ids.to_vec(),
+                completion,
+            })
+            .map_err(|_| {
+                MetricsError::Task(
+                    "metrics collector unavailable before startup reconciliation".to_owned(),
+                )
+            })?;
+        receipt.await.map_err(|_| {
+            MetricsError::Task(
+                "metrics collector stopped before startup reconciliation completed".to_owned(),
+            )
+        })?
     }
 
     pub fn session_started(

@@ -103,6 +103,52 @@ ambiguity. Older binaries do not recognize `.deleting`; downgrade and mixed
 version recovery are unqualified. These source changes do not implement C2 or
 clear any real Session.
 
+## Windows startup metrics repair remains unrun
+
+On PR head `9bf7bd5fc1e3870f42c2bdaf42e9f4b10f67b74f`, the native
+Windows job compiled and verified all 41 selected cases. Its checkout was PR
+merge `361b75de4c113a9252cacec77357119b1be6ff82`, whose tree is exactly the
+head tree `72e52a1da9429a84f8adf254f8d93f32a6bad3ae`. Execution produced nine
+snapshot passes, two gateway passes and one gateway failure; the subsequent
+29 cases were not executed. Artifact `12499637097` has SHA256
+`2a0bc18528d804f3ed5a326e7ea047d831e740adc52ab8ca1fe6132d51512ff3`.
+The failing gateway could not construct AppState: startup metrics reconciliation
+returned SQLite `locking protocol`. It had not replaced the witness store or
+written any corrupt authority input. This is not a copy-rollback assertion
+failure, nor a passing result for the separate 284-case local plan.
+
+The service initialized storage and then spawned a collector which initialized
+the same database again. Its retention scheduler immediately queued a prune,
+while AppState directly opened another connection for startup reconciliation.
+The source repair sends reconciliation through that existing collector FIFO
+and waits for its actual result. Initialization, preceding mutations, retention
+and reconciliation use the same consumer, while initialization and channel
+failure still return an error. Dropping a reconciliation receipt does not cancel
+accepted database work. Standalone collector initialization, initial retention,
+and owner-release drain semantics remain in place. No sleep, retry, weaker
+SQLite isolation or gateway fixture exemption is introduced. The retained log
+does not identify the failing SQL statement; this confirmed ordering gap is
+not proof of the Windows failure's only cause.
+
+Two new real-storage fixtures cover an uninitialized collector with queued
+observations and a startup initialization I/O failure. Both keep their TempDir
+alive until the real consumer releases its storage. The next bounded plan must
+retain all prior 284 cases, add these two fixtures, the four existing collector
+regressions below and the three gateway fixtures (293 unique cases). Compiling
+the metrics unit fixtures adds one library target, for nine libraries and three
+integration targets; no additional build is started without a new window.
+
+- `metrics_service::tests::startup_reconciliation_waits_for_initialization_and_accepted_prefix`
+- `metrics_service::tests::startup_reconciliation_reports_collector_initialization_failure`
+- `collector::tests::final_owner_drop_before_initialization_drains_normal_and_prune_commands_in_order`
+- `collector::tests::remaining_clone_keeps_collection_and_periodic_retention_alive`
+- `collector::batch_tests::singleton_barriers_preserve_fifo_across_segments_and_retention_cascades`
+- `collector::batch_tests::failed_ordinary_and_special_commands_do_not_discard_accepted_suffix`
+- All three `handlers::agent::actor_snapshot::tests` gateway cases in the Windows job.
+
+The repair's compilation, all 293 local native cases, and a fresh Windows run
+are **UNRUN**. Previous source receipts cannot admit this changed source.
+
 ## Separate C2 source is not admitted
 
 M1 contains generation consumers and C4a's retained outer JoinHandles and
