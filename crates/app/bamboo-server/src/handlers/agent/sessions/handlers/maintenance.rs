@@ -9,6 +9,41 @@ use bamboo_storage::{CleanupFailure, CleanupMode, CleanupResult};
 
 use super::super::types::{CleanupRequest, SessionSummary};
 
+fn clear_authority_conflict(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported
+        && error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+}
+
+fn clear_blocked_response(session_id: &str, error: &std::io::Error) -> HttpResponse {
+    HttpResponse::Conflict().json(serde_json::json!({
+        "error": {
+            "type": "api_error",
+            "code": "session_clear_authority_conflict",
+            "message": format!("Session history clear is blocked by its current authority: {error}. Reload the session before deciding what to do next."),
+        },
+        "session_id": session_id,
+        "status": "blocked",
+        "refresh_required": true,
+        "retryable": false,
+    }))
+}
+
+fn clear_unknown_response(session_id: &str, message: impl std::fmt::Display) -> HttpResponse {
+    HttpResponse::InternalServerError().json(serde_json::json!({
+        "error": {
+            "type": "api_error",
+            "code": "session_clear_outcome_unknown",
+            "message": format!("Session history clear outcome could not be confirmed: {message}. Reload the session before any further action; do not automatically retry clear."),
+        },
+        "session_id": session_id,
+        "status": "outcome_unknown",
+        "refresh_required": true,
+        "retryable": false,
+    }))
+}
+
 /// `POST /api/v1/sessions/{session_id}/clear`
 pub async fn clear_session(
     state: web::Data<AppState>,
@@ -35,17 +70,22 @@ pub async fn clear_session(
     let cleared = match state.session_store.clear_session(&session_id).await {
         Ok(cleared) => cleared,
         Err(error) => {
-            // Another process may publish a future contract after preflight.
-            // Present its precise report, without classifying arbitrary IO or
-            // Actor authority errors as compatibility conflicts.
-            if let Ok(Some(canonical)) = state.storage.load_session(&session_id).await {
-                if let Some(conflict) = SessionSummary::execution_conflict(&canonical) {
-                    return Ok(conflict);
+            if clear_authority_conflict(&error) {
+                // Another process may publish a future contract after preflight.
+                // Preserve that precise refusal. Other typed authority refusals
+                // (including activated/unknown Actor context) remain blocked.
+                if let Ok(Some(canonical)) = state.storage.load_session(&session_id).await {
+                    if let Some(conflict) = SessionSummary::execution_conflict(&canonical) {
+                        return Ok(conflict);
+                    }
                 }
+                return Ok(clear_blocked_response(&session_id, &error));
             }
-            return Err(crate::error::json_internal_server_error(format!(
-                "Failed to clear session: {error}"
-            )));
+            // Clear removes attachments and publishes multiple files. An I/O
+            // error does not prove that none of those steps executed. Evict the
+            // old observation and leave success/feed publication untouched.
+            state.sessions.remove(&session_id);
+            return Ok(clear_unknown_response(&session_id, error));
         }
     };
 
@@ -67,20 +107,16 @@ pub async fn clear_session(
     // pre-clear transcript authoritative in memory. A successful reload below
     // immediately installs the replacement.
     state.sessions.remove(&session_id);
-    let cleared_session = state
-        .session_store
-        .load_session(&session_id)
-        .await
-        .map_err(|error| {
-            crate::error::json_internal_server_error(format!(
-                "Failed to reload cleared session: {error}"
-            ))
-        })?
-        .ok_or_else(|| {
-            crate::error::json_internal_server_error(
-                "Cleared session disappeared before cache publication",
-            )
-        })?;
+    let cleared_session = match state.session_store.load_session(&session_id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return Ok(clear_unknown_response(
+                &session_id,
+                "cleared session disappeared before cache publication",
+            ));
+        }
+        Err(error) => return Ok(clear_unknown_response(&session_id, error)),
+    };
     state.sessions.insert(
         session_id.clone(),
         std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(cleared_session)),
@@ -100,6 +136,10 @@ pub async fn clear_session(
         "session_id": session_id
     })))
 }
+
+#[cfg(test)]
+#[path = "maintenance_clear_tests.rs"]
+mod clear_tests;
 
 async fn load_session_from_state_or_storage(
     state: &AppState,
