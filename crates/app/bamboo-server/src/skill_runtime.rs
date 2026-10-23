@@ -278,7 +278,7 @@ impl Policy {
         }
         Ok(())
     }
-    fn check_execution_session(&self, session: &Session) -> Result<(), ToolError> {
+    fn check_execution_identity(&self, session: &Session) -> Result<(), ToolError> {
         self.check()?;
         if session.id != self.session_id || !registered_main(session) {
             return Err(denied("Native Main identity changed"));
@@ -288,6 +288,10 @@ impl Policy {
         {
             return Err(denied("Native Root tool authority revision changed"));
         }
+        Ok(())
+    }
+    fn check_execution_session(&self, session: &Session) -> Result<(), ToolError> {
+        self.check_execution_identity(session)?;
         if permission_mode(session) != self.permission_mode
             || session
                 .agent_runtime_state
@@ -304,12 +308,38 @@ impl Policy {
     }
     fn check_session(&self, session: &Session) -> Result<(), ToolError> {
         self.check_execution_session(session)?;
+        self.check_source_scope(session)
+    }
+    fn check_source_scope(&self, session: &Session) -> Result<(), ToolError> {
         if workspace_identity(session)? != self.workspace
             || session.project_id_meta() != self.project
         {
             return Err(denied("Native canonical Session Source scope changed"));
         }
         Ok(())
+    }
+    // An already owned ordinary tool still uses the engine's freshly loaded
+    // permission gate. Removing bypass revokes this run's finite Skill grant;
+    // it must not prevent that gate from parking a Write for approval.
+    // No other policy or uncommitted Source change is accepted here.
+    fn check_ordinary_session(&self, session: &Session) -> Result<bool, ToolError> {
+        self.check_execution_identity(session)?;
+        let tightened = self.permission_mode == SessionPermissionMode::Bypass
+            && permission_mode(session) == SessionPermissionMode::Default;
+        if (!tightened && permission_mode(session) != self.permission_mode)
+            || session
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|s| s.plan_mode.is_some())
+                != self.plan
+        {
+            return Err(denied("Native Session permission policy changed"));
+        }
+        if ceiling(session)? != self.ceiling || mode(session) != self.mode {
+            return Err(denied("Native Session Skill restriction changed"));
+        }
+        self.check_source_scope(session)?;
+        Ok(tightened)
     }
     fn catalog(&self, resolver: Arc<dyn SkillCatalogCallerResolver>) -> SkillsListTool {
         SkillsListTool::new(
@@ -431,6 +461,7 @@ struct NativeRun {
     reservation_id: String,
     cancel: CancellationToken,
     live: AtomicBool,
+    skills_revoked: AtomicBool,
     epoch: AtomicU64,
     current: SyncRwLock<RunState>,
     root_writer: Option<bamboo_domain::RootActorRuntimeWrite>,
@@ -491,8 +522,28 @@ impl NativeRun {
         }
         Ok(epoch)
     }
-    async fn check_durable_session(&self) -> Result<(), ToolError> {
-        let binding = self.source.binding()?;
+    fn check_skills_active(&self) -> Result<(), ToolError> {
+        if self.skills_revoked.load(Ordering::Acquire) {
+            return Err(denied(
+                "Native Skill authority was revoked by Session permission tightening",
+            ));
+        }
+        Ok(())
+    }
+    async fn check_ordinary_runtime_session(&self, session: Session) -> Result<(), ToolError> {
+        if self
+            .source
+            .binding()?
+            .check_ordinary_session(session)
+            .await?
+        {
+            // Sticky for this exact execution. Returning to bypass must not
+            // revive a retained Reader or its page cursor.
+            self.skills_revoked.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+    async fn check_ordinary_durable_session(&self) -> Result<(), ToolError> {
         let session = self
             .policy
             .state
@@ -501,9 +552,10 @@ impl NativeRun {
             .await
             .map_err(|e| denied(&e.to_string()))?
             .ok_or_else(|| denied("Native Session disappeared"))?;
-        binding.check_session(session).await
+        self.check_ordinary_runtime_session(session).await
     }
     fn caller(&self, ctx: &ToolCtx) -> Result<SkillCatalogCaller, ToolError> {
+        self.check_skills_active()?;
         let epoch = self.check_live()?;
         let purpose = NATIVE_PHASE
             .try_with(|phase| {
@@ -638,6 +690,13 @@ impl SkillCatalogCallerResolver for NativeResolver {
             .await
             .map_err(|error| denied(&error.to_string()))?
             .ok_or_else(|| denied("Native Session disappeared"))?;
+        if self.policy.permission_mode == SessionPermissionMode::Bypass
+            && permission_mode(&session) == SessionPermissionMode::Default
+        {
+            // Retain the strict Reader rejection below, and make its observed
+            // revocation sticky even if the Host later restores bypass.
+            run.skills_revoked.store(true, Ordering::Release);
+        }
         workspace_handoff::check_session(self.policy.clone(), session).await?;
         run.check_owner().await?;
         run.source.check_generation(self.generation)?;
@@ -706,8 +765,8 @@ impl SkillExecutionHost for NativeHost {
     ) -> Result<String, AgentError> {
         let _source = self.run.source.read().await;
         self.run
-            .policy
-            .check_execution_session(session)
+            .check_ordinary_runtime_session(session.clone())
+            .await
             .map_err(engine_error)?;
         let has_input = {
             let current = self
@@ -726,13 +785,13 @@ impl SkillExecutionHost for NativeHost {
         let mut ctx = ToolCtx::none(format!("native-metadata:{execution_id}"));
         ctx.session_id = Some(session.id.clone().into());
         let epoch = self.run.check_owner().await.map_err(engine_error)?;
-        if self.run.policy.orchestration_only {
-            // Ultra has no Skill authority. Validate its actual durable owner
-            // without resolving a Source publication or rendering Skill bytes.
-            self.run
-                .check_durable_session()
-                .await
-                .map_err(engine_error)?;
+        self.run
+            .check_ordinary_durable_session()
+            .await
+            .map_err(engine_error)?;
+        if self.run.policy.orchestration_only || self.run.skills_revoked.load(Ordering::Acquire) {
+            // Ultra and a permission-revoked finite grant publish no Skill
+            // bytes. Ordinary tools retain their current permission gate.
             if self.run.check_owner().await.map_err(engine_error)? != epoch {
                 return Err(engine_error(denied("Native metadata owner changed")));
             }
@@ -753,8 +812,23 @@ impl SkillExecutionHost for NativeHost {
                         .map_err(engine_error)?
                         .catalog
                         .render_catalog(&ctx)
-                        .await
-                        .map_err(engine_error)?;
+                        .await;
+                    let render = match render {
+                        Ok(render) => render,
+                        Err(error) => {
+                            // Tightening can race the metadata read. Recheck the
+                            // complete ordinary scope before omitting revoked
+                            // Skills; all other failures still propagate.
+                            self.run
+                                .check_ordinary_durable_session()
+                                .await
+                                .map_err(engine_error)?;
+                            if self.run.skills_revoked.load(Ordering::Acquire) {
+                                return Ok(String::new());
+                            }
+                            return Err(engine_error(error));
+                        }
+                    };
                     if render.included_count == 0 {
                         return Ok(String::new());
                     }
@@ -817,6 +891,7 @@ fn bind_registered_execution(
         reservation_id: reservation.run_id().into(),
         cancel: reservation.cancel_token().clone(),
         live: AtomicBool::new(true),
+        skills_revoked: AtomicBool::new(false),
         epoch: AtomicU64::new(0),
         current: SyncRwLock::new(RunState {
             execution_id: None,
@@ -870,7 +945,7 @@ impl NativeExecutor {
         let binding = self.run.source.binding()?;
         if !matches!(name, "skills_list" | "skills_read") {
             self.run.check_owner().await?;
-            self.run.check_durable_session().await?;
+            self.run.check_ordinary_durable_session().await?;
             let outcome = binding
                 .tools
                 .execute_exact_with_context_outcome(call, name, ctx)
@@ -894,6 +969,7 @@ impl NativeExecutor {
             }
             return outcome;
         }
+        self.run.check_skills_active()?;
         if ctx.session_id != Some(self.run.policy.session_id.as_str())
             || ctx.tool_call_id != call.id
         {
@@ -949,7 +1025,7 @@ impl ToolExecutor for NativeExecutor {
                 }
                 let _source = self.run.source.read().await;
                 self.run.check_owner().await?;
-                self.run.check_durable_session().await?;
+                self.run.check_ordinary_durable_session().await?;
                 self.run
                     .source
                     .binding()?
@@ -1003,8 +1079,12 @@ impl ToolExecutor for NativeExecutor {
                 !matches!(
                     tool.function.name.as_str(),
                     "load_skill" | "read_skill_resource"
-                ) && (!self.run.policy.orchestration_only
-                    || bamboo_domain::orchestration_only_allows_execution_name(&tool.function.name))
+                ) && (!self.run.skills_revoked.load(Ordering::Acquire)
+                    || !matches!(tool.function.name.as_str(), "skills_list" | "skills_read"))
+                    && (!self.run.policy.orchestration_only
+                        || bamboo_domain::orchestration_only_allows_execution_name(
+                            &tool.function.name,
+                        ))
             })
             .collect()
     }
