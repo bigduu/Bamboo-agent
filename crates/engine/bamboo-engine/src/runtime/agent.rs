@@ -104,6 +104,17 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Bind Workspace adoption to this execution without opting into Skill mode.
+    #[doc(hidden)]
+    pub fn with_workspace_execution_host(
+        &self,
+        host: Arc<dyn crate::runtime::config::WorkspaceExecutionHost>,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.workspace_execution_host = Some(host);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Run the genuine portable submission hook before F and append. No old
     /// metadata receipt may skip this new submission's hook.
     #[doc(hidden)]

@@ -17,6 +17,7 @@ pub mod guidance;
 pub mod health;
 pub mod history;
 pub mod ledger;
+pub(crate) mod llm_diagnostics;
 pub mod mcp;
 pub mod messages;
 pub mod metrics;

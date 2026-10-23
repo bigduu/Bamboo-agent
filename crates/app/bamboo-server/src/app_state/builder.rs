@@ -235,6 +235,39 @@ impl AppState {
         provider: Arc<dyn LLMProvider>,
     ) -> Result<Self, AppError> {
         let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
+        Self::new_with_provider_and_memory_store(bamboo_home_dir, config, provider, memory_store)
+            .await
+    }
+
+    /// Preserve the genuine legacy Inbox consumer while injecting a local
+    /// provider. Only the existing recovery switch differs from normal setup.
+    #[cfg(test)]
+    pub(crate) async fn new_with_provider_for_legacy_ingress_test(
+        bamboo_home_dir: PathBuf,
+        config: Config,
+        provider: Arc<dyn LLMProvider>,
+    ) -> Result<Self, AppError> {
+        let memory_store = default_app_state_memory_store(&bamboo_home_dir)?;
+        Self::new_with_provider_and_facade(
+            bamboo_home_dir,
+            config,
+            provider,
+            false,
+            None,
+            Arc::new(NoopToolEventPublisher),
+            memory_store,
+            false,
+        )
+        .await
+    }
+
+    /// Inject both provider and memory explicitly for isolated Host embeddings.
+    pub async fn new_with_provider_and_memory_store(
+        bamboo_home_dir: PathBuf,
+        config: Config,
+        provider: Arc<dyn LLMProvider>,
+        memory_store: bamboo_memory::memory_store::MemoryStore,
+    ) -> Result<Self, AppError> {
         Self::new_with_provider_and_facade(
             bamboo_home_dir,
             config,
@@ -569,6 +602,12 @@ impl AppState {
         })?;
 
         let diagnostics = Arc::new(crate::tools::diagnostics::DiagnosticsSource::default());
+        let workflow_workspace_scope_guard =
+            Arc::new(crate::workflow::WorkflowWorkspaceScopeGuard::default());
+        let workspace_handoffs = Arc::new(
+            crate::skill_runtime::WorkspaceHandoffs::new(storage.clone(), agent_runners.clone())
+                .with_actor_directory(session_store.clone()),
+        );
         let (base_tools, native_tool_ceiling, builtin_permission_executor) = build_base_tools(
             config.clone(),
             permission_checker.clone(),
@@ -589,6 +628,8 @@ impl AppState {
             memory_store.clone(),
             session_messenger.clone(),
             diagnostics.clone(),
+            workflow_workspace_scope_guard.clone(),
+            workspace_handoffs.clone(),
         );
 
         // The workflow engine executes against the base tool surface. The
@@ -602,7 +643,11 @@ impl AppState {
             permission_checker.permission_config(),
         )
         .await
-        .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
+        .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?
+        .with_project_scope(project_store.clone(), workspace_resolver.clone());
+        workflow_workspace_scope_guard
+            .bind(&workflow_runs)
+            .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
 
         // Idle-evict completed runners together with their paired session event
         // senders (issue #346). Spawned here (not next to `agent_runners`) so it
@@ -1141,6 +1186,9 @@ impl AppState {
             messenger: session_messenger.clone(),
             account: account_sink.clone(),
         });
+        let browser = Arc::new(crate::browser::BrowserManager::with_profile_root(
+            data_dir.join("browser-profiles"),
+        ));
         let (tools, canonical_subagent_tool) = build_root_tools(
             tools_with_task.clone(),
             builtin_permission_executor,
@@ -1162,6 +1210,7 @@ impl AppState {
             fabric_deployer.clone(),
             project_store.clone(),
             workspace_resolver.clone(),
+            browser.clone(),
             parent_approval_reviewer,
         );
         external_runner.set_canonical_subagent_tool(Some(canonical_subagent_tool));
@@ -1171,7 +1220,6 @@ impl AppState {
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(
             crate::tools::OverlayToolExecutor::new(tools, workflow_run_tool),
         );
-        let browser = Arc::new(crate::browser::BrowserManager::default());
         let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
             Arc::new(crate::tools::OverlayToolExecutor::new(
                 tools,
@@ -1218,6 +1266,7 @@ impl AppState {
             tool_factory.clone(),
         )
         .with_runners(agent_runners.clone())
+        .with_workspace_handoffs(workspace_handoffs.clone())
         .with_root_observer(child_completion_coordinator.root_tool_surface_observer());
         child_completion_coordinator.set_reserved_root_execution_adapter(Arc::new(
             move |agent, session, reservation, tools| {
@@ -1308,6 +1357,7 @@ impl AppState {
         // and a fresh wait-slot map suffices. `Arc<ChildSessionAdapter>` doubles
         // as `Arc<dyn GuardianSpawner>`.
         let child_adapter = Arc::new(crate::tools::ChildSessionAdapter {
+            browser: Some(browser.clone()),
             session_store: session_store.clone(),
             storage: storage.clone(),
             persistence: persistence.clone(),
@@ -1329,6 +1379,7 @@ impl AppState {
         let guardian_spawner: Arc<dyn bamboo_engine::GuardianSpawner> = child_adapter.clone();
         tickets.bind_adapter(child_adapter.clone());
         tickets.bind_messenger(session_messenger.clone());
+        tickets.spawn_ready_worker(mcp_proxy_shutdown.clone());
         // Wire the spawner into the completion coordinator too, so a resumed run
         // can re-spawn a guardian to re-review a fix after a reject verdict.
         child_completion_coordinator
@@ -1434,6 +1485,7 @@ impl AppState {
             project_store,
             project_context_resolver,
             workspace_resolver,
+            workspace_handoffs,
             session_repo,
             persistence,
             session_inbox,

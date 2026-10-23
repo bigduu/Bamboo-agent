@@ -31,7 +31,6 @@ use super::session_events::get_or_create_event_sender;
 use super::AppState;
 use crate::handlers::agent::execute::runtime::spawn_event_forwarder_with_root_actor;
 use crate::handlers::agent::execute::runtime::SpawnAgentExecution;
-use crate::handlers::agent::execute::spawn_agent_execution;
 
 /// Newtype wrapper that implements `ResumeExecutionPort`.
 ///
@@ -127,6 +126,31 @@ impl ResumeExecutionPort for AppStateResumeRef {
             execution_reservation.abandon().await;
             return;
         }
+
+        // Prepare the same execution-local Workspace bridge before response
+        // publication or approved-tool replay can produce side effects.
+        let workspace_agent = match self.0.workspace_handoffs.bind_legacy_execution(
+            &self.0.agent,
+            &session,
+            &execution_reservation,
+        ) {
+            Ok(agent) => agent,
+            Err(error) => {
+                tracing::warn!(%session_id, %error,
+                    "Root resume Workspace binding rejected before execution");
+                execution_reservation.abandon().await;
+                return;
+            }
+        };
+        let execution_binding = Some((
+            workspace_agent,
+            self.0
+                .tools_for(if session.kind == bamboo_agent_core::SessionKind::Child {
+                    crate::tools::ToolSurface::Child
+                } else {
+                    crate::tools::ToolSurface::Root
+                }),
+        ));
 
         let config_snapshot = self.0.config.read().await.clone();
         let model = session.model.clone();
@@ -293,7 +317,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 // the synchronous handoff to the spawned runner; the runner's
                 // first checkpoint durably acknowledges takeover.
                 consume_pending_clarification_resume(&mut session);
-                spawn_agent_execution(SpawnAgentExecution {
+                SpawnAgentExecution {
                     state: state.clone(),
                     session_id,
                     session,
@@ -314,7 +338,8 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     // Resume has no per-request override channel; the
                     // config-level default (issue #221) still applies.
                     run_budget: None,
-                });
+                }
+                .spawn_with_native_inputs(None, execution_binding);
                 return;
             }
             Some(id) => id,
@@ -634,7 +659,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
             }
 
             consume_pending_clarification_resume(&mut session);
-            spawn_agent_execution(SpawnAgentExecution {
+            SpawnAgentExecution {
                 state: state.clone(),
                 session_id,
                 session,
@@ -655,7 +680,8 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 // Resume has no per-request override channel; the
                 // config-level default (issue #221) still applies.
                 run_budget: None,
-            });
+            }
+            .spawn_with_native_inputs(None, execution_binding);
         });
     }
 }
