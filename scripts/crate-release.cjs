@@ -106,6 +106,30 @@ function validateSource({ eventName, event, repository, sourceRevision, sourceTr
   assert.equal(run?.head_repository?.full_name, repository)
   assert.equal(run?.repository?.full_name, repository)
   assert.equal(sourceRevision, run?.head_sha, 'Release source must equal the successful main CI commit')
+  if (validation !== undefined) {
+    assert.equal(validation?.schemaVersion, 1)
+    assert.equal(validation.kind, 'bamboo-main-release-admission/v1')
+    assert.equal(validation.repository, repository)
+    assert.equal(validation.sourceRevision, sourceRevision)
+    assert.match(sourceTree, SHA)
+    assert.equal(validation.sourceTree, sourceTree, 'Admission tree differs from publication checkout')
+    for (const key of ['cutRevision', 'releaseHead', 'baseRevision']) assert.match(validation[key], SHA)
+    assert.ok(Number.isSafeInteger(validation.releasePr) && validation.releasePr > 0)
+    for (const key of ['id', 'run_attempt', 'name', 'event', 'head_sha', 'head_branch', 'conclusion']) {
+      assert.deepEqual(validation.ciRun?.[key], run[key], 'Admission must retain the actual successful main CI identity')
+    }
+    assert.ok(Number.isSafeInteger(run.id) && run.id > 0 && Number.isSafeInteger(run.run_attempt) && run.run_attempt > 0)
+    assert.equal(validation.ciRun.status, 'completed')
+    assert.equal(validation.ciRun.repository?.full_name, repository)
+    assert.equal(validation.ciRun.head_repository?.full_name, repository)
+    assert.equal(validation.ciRun.html_url, `https://github.com/${repository}/actions/runs/${run.id}`)
+    const pre = validation.premerge
+    for (const key of ['runId', 'runAttempt', 'workflowId', 'checkSuiteId']) {
+      assert.ok(Number.isSafeInteger(pre?.[key]) && pre[key] > 0, 'Missing full pre-merge CI identity')
+    }
+    assert.match(pre.snapshotRevision, SHA)
+    assert.equal(pre.url, `https://github.com/${repository}/actions/runs/${pre.runId}`)
+  }
   return true
 }
 
@@ -128,6 +152,20 @@ function validateReceipt(receipt, identity, crates, version = receipt?.version) 
       'Completed release must record every package checksum')
   }
   return receipt
+}
+
+// Preserve original signed acceptance when the same main CI is rerun.
+function assertAdmissionCompatibility(recorded, current) {
+  if (recorded === undefined && current === undefined) return true
+  assert.ok(recorded && current, 'Both original and current source admission records are required')
+  const previous = recorded.ciRun?.run_attempt, latest = current.ciRun?.run_attempt
+  assert.ok(Number.isSafeInteger(previous) && previous >= 1 &&
+    Number.isSafeInteger(latest) && latest >= previous, 'Source admission main CI attempt must not move backwards')
+  // Only a rerun of the same main CI may advance. Source, premerge runtime
+  // acceptance and every other field remain identical to the signed original.
+  assert.deepEqual({ ...recorded, ciRun: { ...recorded.ciRun, run_attempt: latest } }, current,
+    'Source admission changed beyond the same main CI run attempt')
+  return true
 }
 
 function nextVersion(versions, now = new Date(), occupiedVersions = []) {
@@ -403,7 +441,9 @@ function receiptBody(receipt) {
   return `${receipt.completed ? 'Published' : 'Reserved'} Bamboo ${receipt.version}.\n\n` +
     `Source: [${sourceRevision}](https://github.com/${repository}/commit/${sourceRevision})\n\n` +
     `Frontend: ${frontend.packageName}@${frontend.packageVersion}\n\n` +
-    (receipt.ciRun ? `Validated release CI: ${receipt.ciRun}\n\n` : '') +
+    (receipt.ciRun ? `Main publication CI: ${receipt.ciRun}\n\n` : '') +
+    (receipt.validation ? `Full pre-merge acceptance: ${receipt.validation.premerge.url} ` +
+      `(attempt ${receipt.validation.premerge.runAttempt}, tested snapshot ${receipt.validation.premerge.snapshotRevision}).\n\n` : '') +
     'Provenance binds the source, preserved frontend bytes and each crate checksum.\n\n' +
     `<!-- bamboo-release-provenance\n${JSON.stringify(receipt)}\n-->`
 }
@@ -693,5 +733,5 @@ module.exports = { assertVersion, assertManualVersion, validateSource, validateR
   plan, publish, makeContext, makeRecoveryContext, assertCurrentMain, currentMainWrite, sha256, githubArgs, receiptBody, readBodyReceipt,
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
-  verifyRegistrySource, highestStableVersion, spawnCommand, command }
+  verifyRegistrySource, highestStableVersion, spawnCommand, command, assertAdmissionCompatibility }
 if (require.main === module) main().catch((error) => { console.error(error); process.exitCode = 1 })

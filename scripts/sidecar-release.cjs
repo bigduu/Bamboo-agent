@@ -6,7 +6,7 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
 const { assertVersion, validateSource, readBodyReceipt, validateReceipt,
-  readAuthenticatedReceipt, assertSigningConfiguration, assertCurrentMain, currentMainWrite, signReceipt, authenticateReceipt, spawnCommand } = require('./crate-release.cjs')
+  readAuthenticatedReceipt, assertSigningConfiguration, assertCurrentMain, currentMainWrite, signReceipt, authenticateReceipt, assertAdmissionCompatibility, spawnCommand } = require('./crate-release.cjs')
 
 const REPOSITORY = 'bigduu/Bamboo-agent'
 const MANIFEST = 'bamboo-sidecars-v2.json'
@@ -315,7 +315,7 @@ function publishedRelease(identity, { signingKey, signingKeyDigest, request = gh
   assert.equal(receipt.automatic, true)
   assert.equal(receipt.completed, true)
   assert.equal(receipt.ciRun, identity.ciRun)
-  if (identity.validation) assert.deepEqual(receipt.validation, identity.validation)
+  if (identity.validation) assertAdmissionCompatibility(receipt.validation, identity.validation)
   assert.ok(receipt.crates.includes('bamboo-agent'))
   assert.ok(Array.isArray(release.assets))
   assert.equal(new Set(release.assets.map((asset) => asset.name)).size, release.assets.length)
@@ -333,7 +333,7 @@ function assetBytes(asset, maximum) {
 
 function validateBuildReceipt(receipt, identity, target) {
   assert.equal(receipt?.schemaVersion, 1)
-  if (identity.validation) assert.deepEqual(receipt.validation, identity.validation)
+  if (identity.validation) assertAdmissionCompatibility(receipt.validation, identity.validation)
   for (const key of ['repository', 'version', 'sourceRevision', 'sourceTree', 'workflowRevision', 'runId', 'ciRun']) {
     assert.equal(receipt[key], identity[key], `Executable build provenance mismatch: ${key}`)
   }
@@ -433,7 +433,7 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
   const bytes = await readAsset(checkpoint, 1024 * 1024)
   assert.ok(bytes.length <= 1024 * 1024)
   const proof = authenticateReceipt(JSON.parse(bytes), signingKey)
-  if (identity.validation) assert.deepEqual(proof.validation, identity.validation)
+  if (identity.validation) assertAdmissionCompatibility(proof.validation, identity.validation)
   assert.equal(proof.schemaVersion, contract.version)
   assert.equal(proof.kind, contract.kind)
   for (const key of ['repository', 'version', 'sourceRevision', 'sourceTree', 'ciRun']) {
@@ -446,7 +446,8 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
   // The caller already revalidates current protected-main promotion; a later
   // dispatch must not relabel the immutable checkpoint as its own fresh build.
   const originalBuildIdentity = { ...identity, workflowRevision: proof.workflowRevision,
-    runId: proof.runId, runAttempt: proof.runAttempt }
+    runId: proof.runId, runAttempt: proof.runAttempt,
+    ...(proof.validation ? { validation: proof.validation } : {}) }
   assert.deepEqual(proof.builds?.map((item) => item.target), contract.targets)
   for (const item of proof.builds) {
     validateBuildReceipt(item, originalBuildIdentity, item.target)

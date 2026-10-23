@@ -332,6 +332,26 @@ test('build provenance permits same-run earlier attempts, rejects other source/r
   assert.throws(() => release.assembleRelease(value))
 })
 
+test('native build receipts preserve original admission across later attempts of the same main CI', (t) => {
+  const value = inputs(t), original = clone(value.receipts[0])
+  const recorded = { schemaVersion: 1, sourceRevision: identity.sourceRevision,
+    ciRun: { id: 90, run_attempt: 1 }, premerge: { runId: 80, runAttempt: 1, snapshotRevision: '8'.repeat(40) } }
+  original.validation = clone(recorded)
+  const bytes = JSON.stringify(original)
+  const current = { ...clone(recorded), ciRun: { ...recorded.ciRun, run_attempt: 2 } }
+  release.validateBuildReceipt(original, { ...identity, validation: current }, original.target)
+  assert.equal(JSON.stringify(original), bytes, 'Build receipt fields must remain bound to their original admission')
+  for (const mutate of [
+    value => { value.ciRun.id++ }, value => { value.sourceRevision = '7'.repeat(40) },
+    value => { value.premerge.snapshotRevision = '9'.repeat(40) }, value => { value.ciRun.run_attempt = 0 },
+  ]) {
+    const changed = clone(current); mutate(changed)
+    assert.throws(() => release.validateBuildReceipt(original, { ...identity, validation: changed }, original.target))
+  }
+  const later = { ...clone(original), validation: current }
+  assert.throws(() => release.validateBuildReceipt(later, { ...identity, validation: recorded }, later.target))
+})
+
 test('official publication requires a completed authenticated same-source crate Release and its immutable direct tag', () => {
   const signingKey = 'a'.repeat(64), signingKeyDigest = release.sha256(Buffer.from(signingKey, 'hex'))
   const receipt = signReceipt({ schemaVersion: 1, identity: { repository: identity.repository,
@@ -343,6 +363,26 @@ test('official publication requires a completed authenticated same-source crate 
   const originalTag = { object: { type: 'commit', sha: identity.sourceRevision } }
   const request = (value, tag) => (route) => JSON.stringify(route.startsWith('releases/') ? value : tag)
   release.publishedRelease(identity, { signingKey, signingKeyDigest, request: request(original, originalTag) })
+  const recorded = { schemaVersion: 1, sourceRevision: identity.sourceRevision,
+    ciRun: { id: 90, run_attempt: 1 }, premerge: { runId: 80, runAttempt: 1, snapshotRevision: '8'.repeat(40) } }
+  const current = { ...clone(recorded), ciRun: { ...recorded.ciRun, run_attempt: 2 } }
+  const signedOriginal = { ...original, body: receiptBody(signReceipt({ ...clone(receipt), validation: recorded }, signingKey)) }
+  const signedBytes = signedOriginal.body
+  release.publishedRelease({ ...identity, validation: current }, { signingKey, signingKeyDigest, request: request(signedOriginal, originalTag) })
+  assert.equal(signedOriginal.body, signedBytes, 'A later admission attempt must not replace signed reservation bytes')
+  for (const mutate of [
+    value => { value.ciRun.id++ }, value => { value.sourceRevision = '7'.repeat(40) },
+    value => { value.premerge.runId++ }, value => { value.premerge.runAttempt++ },
+    value => { value.premerge.snapshotRevision = '9'.repeat(40) }, value => { value.ciRun.run_attempt = 0 },
+  ]) {
+    const changed = clone(current); mutate(changed)
+    assert.throws(() => release.publishedRelease({ ...identity, validation: changed }, {
+      signingKey, signingKeyDigest, request: request(signedOriginal, originalTag),
+    }))
+  }
+  release.publishedRelease(identity, {
+    signingKey, signingKeyDigest, request: request(signedOriginal, originalTag),
+  }) // Historical callers retain their existing omitted-validation contract.
   for (const mutate of [
     (r, t) => { t.object.sha = '8'.repeat(40) }, (r, t) => { t.object.type = 'tag' },
     (r) => { r.draft = true }, (r) => { r.target_commitish = 'main' },
@@ -517,6 +557,48 @@ test('a full workflow rerun recovers the authenticated original bytes and upload
     readAsset: (asset) => value.stored.get(asset.name), listAssets: assets,
     upload: (file) => { uploads.push(path.basename(file)); value.stored.set(path.basename(file), fs.readFileSync(file)) } })
   assert.deepEqual(uploads, [release.MANIFEST])
+})
+
+test('same-main CI reruns recover original signed native admission and reject changed premerge evidence', async (t) => {
+  const value = publishingFixture(t)
+  const recorded = { schemaVersion: 1, sourceRevision: identity.sourceRevision,
+    ciRun: { id: 90, run_attempt: 1 }, premerge: { runId: 80, runAttempt: 1, snapshotRevision: '8'.repeat(40) } }
+  const proofFile = path.join(value.outputDirectory, release.PROVENANCE)
+  const proof = JSON.parse(fs.readFileSync(proofFile))
+  proof.validation = recorded
+  for (const build of proof.builds) build.validation = clone(recorded)
+  signReceipt(proof, signingKey)
+  fs.writeFileSync(proofFile, JSON.stringify(proof))
+  for (const name of fs.readdirSync(value.outputDirectory)) value.stored.set(name, fs.readFileSync(path.join(value.outputDirectory, name)))
+  const originalBytes = fs.readFileSync(proofFile)
+  const current = { ...clone(recorded), ciRun: { ...recorded.ciRun, run_attempt: 2 } }
+  const outputDirectory = path.join(value.root, 'same-main-rerun'); fs.mkdirSync(outputDirectory)
+  const recovery = { identity: { ...identity, validation: current }, sourceRoot: value.sourceRoot,
+    outputDirectory, frontendBytes, signingKey, release: { assets: [...value.stored.keys()].map(name => ({ name })) },
+    readAsset: asset => value.stored.get(asset.name) }
+  await release.recoverPublishedRelease(recovery)
+  assert.deepEqual(fs.readFileSync(path.join(outputDirectory, release.PROVENANCE)), originalBytes,
+    'Recovery must retain the exact authenticated checkpoint bytes')
+  const original = JSON.parse(fs.readFileSync(path.join(outputDirectory, release.PROVENANCE)))
+  assert.deepEqual(original.validation, recorded)
+  assert.ok(original.builds.every(build => build.validation.ciRun.run_attempt === 1))
+  for (const mutate of [
+    value => { value.ciRun.id++ }, value => { value.sourceRevision = '7'.repeat(40) },
+    value => { value.premerge.runId++ }, value => { value.premerge.runAttempt++ },
+    value => { value.premerge.snapshotRevision = '9'.repeat(40) }, value => { value.ciRun.run_attempt = 0 },
+  ]) {
+    const changed = clone(current); mutate(changed)
+    await assert.rejects(() => release.recoverPublishedRelease({ ...recovery,
+      identity: { ...identity, validation: changed }, outputDirectory: path.join(value.root, 'rejected-rerun') }))
+  }
+  // The signed checkpoint remains bound to the original admission. A nested
+  // build must not silently acquire the newer dispatch's admission identity.
+  const inconsistent = clone(proof)
+  inconsistent.builds[0].validation = clone(current)
+  signReceipt(inconsistent, signingKey)
+  value.stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(inconsistent)))
+  await assert.rejects(() => release.recoverPublishedRelease({ ...recovery,
+    outputDirectory: path.join(value.root, 'inconsistent-build') }), /must not move backwards/)
 })
 
 test('recovery rejects unsigned/tampered/foreign checkpoints, missing assets and corrupt bytes without any release writes', async (t) => {

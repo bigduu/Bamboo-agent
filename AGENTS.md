@@ -26,6 +26,12 @@ protection configuration and never bypass current gates. Normal direct pushes
 must be fast-forward and satisfy the same evidence and checks; never force push.
 Use the authoritative
 [Release Process](./CONTRIBUTING.md#release-process) for cuts, repairs and publication.
+The [CI and publication flow](./docs/releases/ci-publication-flow.md) records
+the phase contracts: validate the frozen release before merge, authenticate
+that evidence on the actual main merge, then publish that source. A successful
+lightweight main admission is evidence reuse, not another full test run. Never
+replace dev compilation or release acceptance with skipped/stub checks, or
+substitute another commit's binary for a versioned release build.
 
 ## Pull Request Review
 
