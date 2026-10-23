@@ -595,6 +595,10 @@ pub struct Fixture {
 pub fn fixture_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        // Fault/provider waits and offline CLI work can outlive the Host's
+        // idle keep-alive. Match the existing ordinary-Root fixture clients:
+        // each control request gets a fresh connection, without a retry.
+        .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(15))
         .build()
         .unwrap()
