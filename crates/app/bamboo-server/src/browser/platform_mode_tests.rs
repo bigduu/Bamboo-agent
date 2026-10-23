@@ -60,10 +60,9 @@ fn temporary_clean_command_does_not_pass_account_profile_or_native_storage_setti
         command.env("BAMBOO_BROWSER_PROFILE_DIR", "synthetic-never-import");
         command.env("BAMBOO_BROWSER_STORAGE_DATA_ROOT", "synthetic-never-open");
         restrict_host_environment(&mut command);
-        manager.lifecycle.configure_profile(
-            &mut command,
-            Some(std::path::Path::new("ignored-account")),
-        );
+        manager
+            .lifecycle
+            .configure_profile(&mut command, Some(std::path::Path::new("ignored-account")));
         let values: HashMap<_, _> = command.as_std().get_envs().collect();
         assert_eq!(
             values.get(std::ffi::OsStr::new("BAMBOO_BROWSER_EPHEMERAL_CLEAN")),
@@ -86,13 +85,33 @@ fn clean_readiness_cannot_claim_account_sharing_or_native_quota() {
     let mut value = json!({"protocol_version":2,"host_generation":generation,
         "browser_instance_id":"b".repeat(24),"scope_count":0,"profile_modes":["clean"],
         "storage_boundary":{"provider":"ephemeral_clean_v1","persistent":false}});
-    assert!(shared::valid_handshake(&value, Some(&generation), false, true));
-    assert!(!shared::valid_handshake(&value, Some(&generation), true, true));
+    assert!(shared::valid_handshake(
+        &value,
+        Some(&generation),
+        false,
+        true
+    ));
+    assert!(!shared::valid_handshake(
+        &value,
+        Some(&generation),
+        true,
+        true
+    ));
     value["profile_modes"] = json!(["shared", "clean"]);
-    assert!(!shared::valid_handshake(&value, Some(&generation), false, true));
+    assert!(!shared::valid_handshake(
+        &value,
+        Some(&generation),
+        false,
+        true
+    ));
     value["profile_modes"] = json!(["clean"]);
     value["storage_boundary"]["persistent"] = json!(true);
-    assert!(!shared::valid_handshake(&value, Some(&generation), false, true));
+    assert!(!shared::valid_handshake(
+        &value,
+        Some(&generation),
+        false,
+        true
+    ));
 }
 
 #[test]
@@ -117,8 +136,10 @@ async fn unsupported_shared_refuses_before_a_chat_directory_or_host_is_created()
         let profile = root.path().join(platform);
         let manager = BrowserManager::with_profile_root_for_platform(profile.clone(), platform);
         for mode in [None, Some(BrowserProfileMode::Shared)] {
-            assert!(matches!(manager.open_with_mode("synthetic-chat", mode).await,
-                Err(BrowserError::Unavailable(reason)) if reason.starts_with("browser_shared_profile_unsupported")));
+            assert!(
+                matches!(manager.open_with_mode("synthetic-chat", mode).await,
+                Err(BrowserError::Unavailable(reason)) if reason.starts_with("browser_shared_profile_unsupported"))
+            );
         }
         assert!(!profile.exists());
         assert!(manager.lifecycle.owners.lock().unwrap().is_empty());
