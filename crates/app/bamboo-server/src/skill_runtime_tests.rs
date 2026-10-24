@@ -987,6 +987,43 @@ pub(super) async fn workspace_after_completed_call(
     workspace_handoff::after_completed_call(executor, call, name, ctx, success).await;
 }
 
+async fn patch_reader_fixture_permission(
+    state: &web::Data<AppState>,
+    id: &str,
+    expected: SessionPermissionMode,
+    mode: SessionPermissionMode,
+) {
+    let canonical = state.storage.load_session(id).await.unwrap().unwrap();
+    assert_eq!(
+        permission_mode(&canonical),
+        expected,
+        "actual initial permission posture"
+    );
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(crate::configure_routes),
+    )
+    .await;
+    let request = test::TestRequest::patch()
+        .uri(&format!("/api/v1/sessions/{id}"))
+        .peer_addr("127.0.0.1:5700".parse().unwrap())
+        .insert_header(("If-Match", canonical.metadata_version.to_string()))
+        .set_json(json!({"permission_mode":mode.as_str()}))
+        .to_request();
+    let response = test::call_service(&app, request).await;
+    let status = response.status();
+    let body: Value = test::read_body_json(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let saved = state.storage.load_session(id).await.unwrap().unwrap();
+    assert_eq!(
+        permission_mode(&saved),
+        mode,
+        "canonical PATCH receipt: {body}"
+    );
+    assert_eq!(saved.metadata_version, canonical.metadata_version + 1);
+}
+
 struct PermissionTighteningProvider {
     inner: Arc<SkillsProvider>,
     control: tokio::sync::mpsc::UnboundedSender<(
@@ -1009,7 +1046,14 @@ impl PermissionTighteningProvider {
             .iter()
             .find(|message| message.tool_call_id.as_deref() == Some(call.id.as_str()))
             .expect("the attempted retained page has a durable tool result");
-        assert_eq!(result.tool_success, Some(false));
+        assert_eq!(
+            result.tool_success,
+            Some(false),
+            "stage={} call={} result={}",
+            self.stage.load(Ordering::Acquire),
+            call.id,
+            result.content
+        );
         self.denials.lock().unwrap().push(result.content.clone());
     }
 }
@@ -1098,6 +1142,16 @@ async fn native_http_permission_tightening_revokes_warm_reader_without_revival()
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{receipt}");
+    // Chat payload permissions are input data for this already seeded Root.
+    // Establish the actual canonical posture through its normal control plane
+    // before binding the finite Reader; Default -> Default is no revocation.
+    patch_reader_fixture_permission(
+        &state,
+        id,
+        SessionPermissionMode::Default,
+        SessionPermissionMode::Bypass,
+    )
+    .await;
     let (status, body) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     let terminal = done(&state, id);
@@ -1108,16 +1162,12 @@ async fn native_http_permission_tightening_revokes_warm_reader_without_revival()
             terminal = &mut terminal => break terminal,
             command = commands.recv() => {
                 let (mode, reply) = command.unwrap();
-                let canonical = state.storage.load_session(id).await.unwrap().unwrap();
-                let app = test::init_service(App::new().app_data(state.clone()).configure(crate::configure_routes)).await;
-                let request = test::TestRequest::patch()
-                    .uri(&format!("/api/v1/sessions/{id}"))
-                    .peer_addr("127.0.0.1:5700".parse().unwrap())
-                    .insert_header(("If-Match", canonical.metadata_version.to_string()))
-                    .set_json(json!({"permission_mode":mode.as_str()}))
-                    .to_request();
-                let response = test::call_service(&app, request).await;
-                assert_eq!(response.status(), StatusCode::OK);
+                let expected = if mode == SessionPermissionMode::Default {
+                    SessionPermissionMode::Bypass
+                } else {
+                    SessionPermissionMode::Default
+                };
+                patch_reader_fixture_permission(&state, id, expected, mode).await;
                 changes.push(mode);
                 reply.send(()).unwrap();
             }
