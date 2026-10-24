@@ -1365,10 +1365,10 @@ test('real 274-block E2E inventory is authenticated across both matrices and eve
         assert.equal(plan.blocks.reduce((n, b) => n + b.ignored, 0), 38)
         assert.deepEqual([1, 2].map(f => plan.blocks.filter(b => b.matrixFamily === f).length), [137, 137])
         const good = run(); assert.equal(good.status, 0, good.stderr)
-        assert.match(good.calls, /actions\/runs\/222\/jobs\?filter=latest&per_page=100&page=3/)
+        assert.match(good.calls, /actions\/runs\/222\/jobs\?filter=latest&per_page=10&page=30/)
         const secondName = blockName(plan, plan.blocks.find(b => b.matrixFamily === 2))
         const fifteenMinutes = run(x => {
-          const job = x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs.find(j => j.name === secondName)
+          const job = x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.find(j => j.name === secondName)
           const route = x.routes[`actions/jobs/${job.id}/logs`]
           const record = JSON.parse(Buffer.from(route.raw.trim().split(' ').at(-1), 'base64'))
           record.testDurationMs = 900000
@@ -1380,7 +1380,7 @@ test('real 274-block E2E inventory is authenticated across both matrices and eve
           jobs => jobs.push({...jobs.find(j => j.name === secondName), id: 999999}),
           jobs => { jobs.find(j => j.name === secondName).conclusion = 'skipped' },
         ]) {
-          const bad = run(x => mutate(x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs))
+          const bad = run(x => mutate(x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs))
           assert.notEqual(bad.status, 0, 'a missing, duplicate or skipped second-family block must fail admission')
         }
       },
@@ -1395,6 +1395,85 @@ test('historical grouped CI retains independently authenticated complete release
 test('native crate CI retains independently authenticated complete release evidence', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
     workflowPython('Authorize the exact source before checkout'), 'v4')
+})
+
+test('job pagination retains its bounded capacity and leaves other API routes unchanged', () => {
+  const result = spawnSync('python3', ['-c', `
+import ast, pathlib, re
+source = ast.parse(pathlib.Path('scripts/main-release-admission.py').read_text())
+function = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == 'pages')
+for route, field, size, limit in [
+    ('actions/runs/222/jobs?filter=latest', 'jobs', 10, 200),
+    ('actions/runs/222/attempts/1/jobs', 'jobs', 10, 200),
+    ('commits/source/pulls', None, 100, 10),
+    ('actions/workflows/ci.yml/runs?event=pull_request', 'workflow_runs', 100, 10),
+]:
+    for total in [size * limit - 1, size * limit]:
+        calls = []
+        def api(request):
+            page = len(calls) + 1
+            assert request == route + ('&' if '?' in route else '?') + f'per_page={size}&page={page}'
+            calls.append(request)
+            rows = list(range((page - 1) * size, min(page * size, total)))
+            return {field: rows} if field else rows
+        namespace = {'api': api, 're': re}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), '<production-pages>', 'exec'), namespace)
+        try:
+            rows = namespace['pages'](route, field)
+        except AssertionError as error:
+            assert total == size * limit and str(error) == 'Publication proof exceeds the bounded API page limit'
+        else:
+            assert total == size * limit - 1 and rows == list(range(total))
+        assert len(calls) == limit
+`], {encoding: 'utf8', timeout: 30000})
+  assert.equal(result.status, 0, result.stderr)
+})
+
+test('eighty native CI jobs require every latest and original-attempt page', async (t) => {
+  await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
+    workflowPython('Authorize the exact source before checkout'), 'v4', 'publication', {
+      exercise: async ({run}) => {
+        const latest = 'actions/runs/222/jobs?filter=latest&per_page=10&page=1'
+        const attempt = 'actions/runs/222/attempts/1/jobs?per_page=10&page=1'
+        const paged = (change = () => {}) => input => {
+          for (const route of [latest, attempt]) {
+            const jobs = input.routes[route].jobs
+            jobs.unshift(...['Quick Checks', 'Main Release Admission'].map((name, index) => ({
+              ...jobs[0], id: 99000 + index, name, conclusion: 'skipped',
+            })))
+            assert.ok(jobs.length >= 80)
+          }
+          change(input)
+        }
+        await t.test('all pages are aggregated with ten jobs per request', () => {
+          const result = run(paged())
+          assert.equal(result.status, 0, result.stderr)
+          for (const route of [latest, attempt]) assert.ok(result.calls.includes(route.replace(/&page=1$/, '&page=9')))
+          assert.doesNotMatch(result.calls, /\/jobs\?[^\n]*per_page=100/)
+          assert.match(result.calls, /\/pulls\?per_page=100&page=1/)
+          assert.match(result.calls, /\/runs\?event=pull_request[^\n]*per_page=100&page=1/)
+        })
+        for (const route of [latest, attempt]) await t.test(`later page transport failure rejects ${route}`, () => {
+          const failedRoute = route.replace(/&page=1$/, '&page=8')
+          const result = run(paged(), {FIXTURE_API_FAILURE_ROUTE: failedRoute})
+          assert.notEqual(result.status, 0)
+          assert.equal(result.output, '')
+          assert.equal(result.calls.trim().split('\n').filter(call => call === failedRoute).length, 1)
+        })
+        for (const [name, route, change] of [
+          ['missing later job', latest, jobs => jobs.pop()],
+          ['duplicate on a later page', latest, jobs => jobs.push({...jobs.at(-1)})],
+          ['failed later job', latest, jobs => { jobs.at(-1).conclusion = 'failure' }],
+          ['missing original-attempt membership', attempt, jobs => jobs.pop()],
+          ['duplicate original-attempt membership', attempt, jobs => jobs.push({...jobs.at(-1)})],
+        ]) await t.test(name, () => {
+          const result = run(paged(input => change(input.routes[route].jobs)))
+          assert.notEqual(result.status, 0, name)
+          assert.equal(result.output, '')
+          assert.ok(result.calls.includes(route.replace(/&page=1$/, '&page=8')))
+        })
+      },
+    })
 })
 
 test('main-push admission executes the same pinned verifier with read-only authority', async (t) => {
