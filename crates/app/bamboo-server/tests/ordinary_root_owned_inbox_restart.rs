@@ -65,6 +65,7 @@ fn fixture_ready_is_not_readable_until_complete_json_is_published() {
 
 struct Probe {
     home: PathBuf,
+    workspace: PathBuf,
     calls: AtomicUsize,
 }
 
@@ -84,6 +85,21 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         assert_eq!(count, 1, "one provider-visible typed input after recovery");
         let store = Arc::new(SessionStoreV2::new(probe.home.clone()).await.unwrap());
         let canonical = store.load_session(ROOT).await.unwrap().unwrap();
+        let workspace = canonical.workspace_path_meta().unwrap();
+        assert_eq!(
+            Path::new(&workspace).canonicalize().unwrap(),
+            probe.workspace.canonicalize().unwrap(),
+            "the actual provider must see the prepared canonical Workspace"
+        );
+        let has_tool = |name: &str| {
+            body["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool["function"]["name"] == name))
+        };
+        assert!(
+            has_tool("skills_list") && has_tool("skills_read"),
+            "recovery must retain the registered finite Source surface"
+        );
         assert_eq!(
             canonical
                 .messages
@@ -128,6 +144,7 @@ struct Host {
     child: Option<std::process::Child>,
     base: String,
     cut: PathBuf,
+    log: PathBuf,
 }
 
 impl Host {
@@ -135,7 +152,8 @@ impl Host {
         let id = uuid::Uuid::new_v4();
         let ready = home.join(format!("fixture-ready-{id}.json"));
         let cut = home.join(format!("fixture-claimed-{id}.json"));
-        let log = std::fs::File::create(home.join(format!("fixture-host-{id}.log"))).unwrap();
+        let log_path = home.join(format!("fixture-host-{id}.log"));
+        let log = std::fs::File::create(&log_path).unwrap();
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--ignored",
@@ -159,6 +177,7 @@ impl Host {
             child: Some(child),
             base: String::new(),
             cut,
+            log: log_path,
         };
         host.base = tokio::time::timeout(WAIT, async {
             loop {
@@ -201,6 +220,72 @@ impl Drop for Host {
     }
 }
 
+fn recovery_diagnostics(home: &Path, host: &mut Host, provider_calls: usize) -> String {
+    let directory = home.join("sessions").join(ROOT);
+    let mut state = serde_json::Map::new();
+    state.insert("now".into(), json!(Utc::now()));
+    state.insert("provider_calls".into(), json!(provider_calls));
+    state.insert(
+        "host_exit".into(),
+        json!(host
+            .child
+            .as_mut()
+            .map(|child| format!("{:?}", child.try_wait()))),
+    );
+    for name in ["session.json", "actor-authority.json"] {
+        let value = std::fs::read(directory.join(name))
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                serde_json::from_slice::<Value>(&bytes).map_err(|error| error.to_string())
+            });
+        state.insert(name.into(), match value {
+                Ok(value) if name == "session.json" => {
+                    let canonical = serde_json::from_value::<Session>(value.clone()).ok();
+                    json!({
+                "last_run_status":canonical.as_ref().and_then(Session::last_run_status),
+                "last_run_error":canonical.as_ref().and_then(Session::last_run_error),
+                "metadata":value["metadata"],
+                "version":value["version"],
+                "messages":value["messages"].as_array().map(|messages| messages.iter().map(|message| json!({
+                    "id":message["id"], "role":message["role"],
+                    "content":message["content"].as_str().map(|text| text.chars().take(512).collect::<String>())
+                })).collect::<Vec<_>>())
+            })
+                }
+            Ok(value) => value,
+            Err(error) => json!({"read_error":error}),
+        });
+    }
+    for name in ["inbox/cur", "inbox/new", "inbox/admitted"] {
+        let files = std::fs::read_dir(directory.join(name)).map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        });
+        state.insert(
+            name.into(),
+            match files {
+                Ok(files) => json!(files),
+                Err(error) => json!({"read_error":error.to_string()}),
+            },
+        );
+    }
+    let log = std::fs::read_to_string(&host.log).unwrap_or_else(|error| error.to_string());
+    let log_tail = log
+        .chars()
+        .rev()
+        .take(16384)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!(
+        "synthetic recovery state: {}\nHost B log tail:\n{log_tail}",
+        Value::Object(state)
+    )
+}
+
 // This is a test executable's entrypoint, never a production environment hook.
 #[actix_web::test]
 #[ignore = "invoked only by the parent fixture in its isolated data root"]
@@ -208,6 +293,11 @@ async fn host_fixture_subprocess_entry() {
     let Some(home) = std::env::var_os("BAMBOO_OWNED_RESTART_FIXTURE_HOME") else {
         return;
     };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("bamboo_server=info,bamboo_engine=info,bamboo_storage=info")
+        .with_ansi(false)
+        .with_writer(std::io::stderr)
+        .try_init();
     let home = PathBuf::from(home);
     let ready = PathBuf::from(std::env::var_os("BAMBOO_OWNED_RESTART_FIXTURE_READY").unwrap());
     let cut = PathBuf::from(std::env::var_os("BAMBOO_OWNED_RESTART_FIXTURE_CUT").unwrap());
@@ -282,11 +372,26 @@ async fn deliver(client: &reqwest::Client, host: &Host) {
 
 #[actix_web::test]
 async fn claimed_owned_input_survives_real_host_process_loss_and_restarts_once() {
+    assert_owned_input_restart(false).await;
+}
+
+#[actix_web::test]
+async fn claimed_owned_restart_preserves_canonical_workspace_over_stale_legacy_path() {
+    assert_owned_input_restart(true).await;
+}
+
+async fn assert_owned_input_restart(canonical_workspace: bool) {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("data");
     std::fs::create_dir_all(&home).unwrap();
+    let workspace = home.join("workspaces").join(if canonical_workspace {
+        "canonical-existing"
+    } else {
+        ROOT
+    });
     let probe = web::Data::new(Probe {
         home: home.clone(),
+        workspace: workspace.clone(),
         calls: AtomicUsize::new(0),
     });
     let factory_probe = probe.clone();
@@ -324,6 +429,16 @@ async fn claimed_owned_input_survives_real_host_process_loss_and_restarts_once()
     .unwrap();
     let original = SessionStoreV2::new(home.clone()).await.unwrap();
     let mut root = Session::new(ROOT, "owned-root");
+    if canonical_workspace {
+        std::fs::create_dir_all(&workspace).unwrap();
+        root.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+        let stale = home.join("workspaces/stale-legacy");
+        std::fs::create_dir_all(&stale).unwrap();
+        root.workspace = Some(stale.to_string_lossy().into_owned());
+    } else {
+        assert!(root.workspace_path_meta().is_none());
+        assert!(root.workspace.is_none());
+    }
     root.add_message(bamboo_domain::Message::user("original Root transcript"));
     original.save_session(&root).await.unwrap();
     drop(original);
@@ -373,6 +488,13 @@ async fn claimed_owned_input_survives_real_host_process_loss_and_restarts_once()
             .unwrap();
     let a_activation = a_owner.activation.unwrap();
     assert!(input_expiry <= a_activation.lease_expires_at);
+    eprintln!(
+        "synthetic restart claim: now={} input_expiry={} root_expiry={} attempt={}",
+        Utc::now(),
+        input_expiry,
+        a_activation.lease_expires_at,
+        a_activation.attempt
+    );
     let main: Session =
         serde_json::from_slice(&std::fs::read(directory.join("session.json")).unwrap()).unwrap();
     assert!(!main.messages.iter().any(|message| message.id == ID));
@@ -402,7 +524,12 @@ async fn claimed_owned_input_survives_real_host_process_loss_and_restarts_once()
         }
     })
     .await
-    .expect("B recovers after actual Root and Inbox lease expiry");
+    .unwrap_or_else(|error| {
+        panic!(
+            "B recovers after actual Root and Inbox lease expiry: {error:?}\n{}",
+            recovery_diagnostics(&home, &mut b, probe.calls.load(Ordering::SeqCst))
+        )
+    });
     let canonical = SessionStoreV2::new(home.clone())
         .await
         .unwrap()
@@ -410,6 +537,13 @@ async fn claimed_owned_input_survives_real_host_process_loss_and_restarts_once()
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(
+        Path::new(&canonical.workspace_path_meta().unwrap())
+            .canonicalize()
+            .unwrap(),
+        workspace.canonicalize().unwrap(),
+        "the completed checkpoint must preserve the same canonical Workspace"
+    );
     assert_eq!(
         canonical
             .messages

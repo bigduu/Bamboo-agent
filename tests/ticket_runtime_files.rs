@@ -8,6 +8,104 @@ use fixture::{command, post, Fixture};
 use serde_json::json;
 use std::{path::Path, process::Command, sync::atomic::Ordering, time::Duration};
 
+#[actix_web::test]
+async fn inspect_uses_fresh_connection_after_idle_peer_close_without_retry() {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::{atomic::AtomicUsize, mpsc, Arc};
+
+    fn accept(listener: &TcpListener) -> std::io::Result<TcpStream> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match listener.accept() {
+                Ok((peer, _)) => {
+                    peer.set_nonblocking(false)?;
+                    return Ok(peer);
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    fn reply(peer: &mut TcpStream, expected: &str, body: &str) -> std::io::Result<()> {
+        peer.set_read_timeout(Some(Duration::from_secs(3)))?;
+        peer.set_write_timeout(Some(Duration::from_secs(3)))?;
+        let mut head = Vec::new();
+        let mut byte = [0];
+        while !head.ends_with(b"\r\n\r\n") {
+            peer.read_exact(&mut byte)?;
+            head.push(byte[0]);
+            assert!(head.len() < 8192, "bounded fixture request head");
+        }
+        assert!(head.starts_with(expected.as_bytes()), "request line");
+        let length = String::from_utf8_lossy(&head)
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map_or(0, |(_, length)| length.trim().parse::<usize>().unwrap());
+        assert!(length < 8192, "bounded fixture request body");
+        peer.read_exact(&mut vec![0; length])?;
+        write!(
+            peer,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+            body.len()
+        )?;
+        peer.flush()
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}/api/v1", listener.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server_calls = calls.clone();
+    let (close, close_requested) = mpsc::channel();
+    let (closed, idle_closed) = mpsc::channel();
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let mut first = accept(&listener)?;
+        reply(
+            &mut first,
+            "GET /api/v1/health HTTP/1.1\r\n",
+            r#"{"ready":true}"#,
+        )?;
+        close_requested
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap();
+        let _ = first.shutdown(Shutdown::Both);
+        closed.send(()).unwrap();
+        let mut second = accept(&listener)?;
+        server_calls.fetch_add(1, Ordering::SeqCst);
+        reply(
+            &mut second,
+            "POST /api/v1/tickets/inspect HTTP/1.1\r\n",
+            r#"{"data":[]}"#,
+        )
+    });
+    let client = fixture::fixture_http_client();
+    assert_eq!(fixture::get(&client, &base, "/health").await["ready"], true);
+    close.send(()).unwrap();
+    // As in the existing ordinary-Root transport regression, hold this
+    // current-thread reactor until the live service has closed its idle peer.
+    idle_closed.recv_timeout(Duration::from_secs(3)).unwrap();
+    let response = client
+        .post(format!("{base}/tickets/inspect"))
+        .json(&json!({"ids": ["fixture-work"]}))
+        .send()
+        .await;
+    let response = match response {
+        Ok(response) => response.text().await,
+        Err(error) => Err(error),
+    };
+    let served = server.join().unwrap();
+    assert!(response.is_ok(), "inspect after idle close: {response:?}");
+    assert_eq!(response.unwrap(), r#"{"data":[]}"#);
+    served.expect("the same live service accepted the fresh connection");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one inspect, no retry");
+}
+
 #[cfg(feature = "ticket-runtime-fixtures")]
 #[actix_web::test]
 async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewriting_or_acceptance()
@@ -75,6 +173,7 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
         .or_else(|| started["ids"]["a"].as_str())
         .unwrap()
         .to_owned();
+    eprintln!("unknown-file fixture phase: waiting for held Worker provider");
     tokio::time::timeout(Duration::from_secs(60), async {
         while f.probe.held.load(Ordering::SeqCst) != 1 {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -97,6 +196,7 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
     let pid = pids[0];
     assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
     f.probe.release.notify_waiters();
+    eprintln!("unknown-file fixture phase: waiting for first stopped outcome_unknown");
     let inspect = json!({"ids":[work],"depth":0,"sections":["assignments","submissions"],"budget_bytes":65536,"fixed_commit":null});
     let view = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
@@ -110,6 +210,7 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
     })
     .await
     .unwrap();
+    eprintln!("unknown-file fixture phase: stopped outcome_unknown observed");
     assert_ne!(
         unsafe { libc::kill(pid as i32, 0) },
         0,
@@ -231,7 +332,9 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
         "plan/ack/replay never rewrite"
     );
     let calls = f.probe.calls.load(Ordering::SeqCst);
+    eprintln!("unknown-file fixture phase: before reconciled Host restart");
     f.restart().await;
+    eprintln!("unknown-file fixture phase: reconciled Host ready, before inspect");
     let reconciled = post(&f.client, &f.base, "/tickets/inspect", &inspect).await;
     assert_eq!(reconciled["data"][0]["ticket"]["state"], "blocked");
     assert_eq!(reconciled["data"][0]["ticket"]["paused"], true);
@@ -266,6 +369,7 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
     .await;
     let admitted = post(&f.client, &f.base, "/tickets/dispatch", &next).await;
     assert_eq!(admitted["errors"], json!([]), "{admitted}");
+    eprintln!("unknown-file fixture phase: explicit retry dispatched, waiting submitted");
     let completed = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             let view = post(&f.client, &f.base, "/tickets/inspect", &inspect).await;
@@ -277,6 +381,7 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
     })
     .await
     .unwrap();
+    eprintln!("unknown-file fixture phase: explicit retry submitted");
     assert_eq!(completed["data"][0]["ticket"]["generation"], 2);
     let submission = completed["data"][0]["submissions"]
         .as_array()
@@ -290,7 +395,9 @@ async fn actual_stopped_native_unknown_file_is_reconciled_offline_without_rewrit
         {"op":"accept","work_id":work,"submission_id":submission["id"],"evidence":["Verified generation 2 exact managed code"]}
     ])).await;
     post(&f.client, &f.base, "/tickets/update", &accept).await;
+    eprintln!("unknown-file fixture phase: before accepted Host restart");
     f.restart().await;
+    eprintln!("unknown-file fixture phase: accepted Host ready, before inspect");
     let accepted = post(&f.client, &f.base, "/tickets/inspect", &inspect).await;
     assert_eq!(accepted["data"][0]["ticket"]["state"], "accepted");
     assert_eq!(accepted["data"][0]["ticket"]["generation"], 2);
