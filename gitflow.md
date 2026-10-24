@@ -70,8 +70,11 @@ Manual `CI` and frontend acceptance require `snapshot_sha` to equal the dispatch
 source's full lowercase 40-character SHA; a mismatch fails closed. See the
 [fixed-snapshot entrypoint](./CONTRIBUTING.md#validate-a-fixed-snapshot).
 
-Run the complete release suite and platform matrix through the fixed candidate's
-required main promotion checks, recording the actual tested merge SHA/tree.
+Run the complete release suite and native platform-test matrix through the fixed
+candidate's required main promotion checks, recording the actual tested merge SHA/tree.
+Release CI preserves the native tests but does not build optimized release
+executables. The automatic main publisher builds each required executable once
+from the admitted main commit and reserved version/frontend identity.
 Preserve the separate frontend-head contract; reuse evidence only when all source
 and build/test inputs are equivalent. Do not add a second full run merely because
 an entrypoint has a different name. Only this passing, reviewed candidate may

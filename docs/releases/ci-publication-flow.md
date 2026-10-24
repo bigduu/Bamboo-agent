@@ -10,11 +10,11 @@ for cuts, original-source repairs, protected admission and credentials.
 | Phase | Trigger and owner | Required result |
 | --- | --- | --- |
 | Development admission | A bounded PR to `dev`; its owner | Required `Test` compiles the locked workspace; affected local tests, regression coverage and current review pass. |
-| Frozen release acceptance | Same-repository `release/<cut-SHA>` PR to `main`; one release owner | Full tests, all-feature checks, lint, security and Linux/macOS/Windows acceptance pass on the actual PR merge source. The frontend workflow separately validates the original release head. |
+| Frozen release acceptance | Same-repository `release/<cut-SHA>` PR to `main`; one release owner | Full tests, all-feature checks, lint, security and Linux/macOS/Windows native tests pass on the actual PR merge source. The frontend workflow separately validates the original release head. |
 | Main admission | Normal release merge pushes `main`; CI | Authenticate the completed release acceptance against the actual ordered merge parents, reviewed release tree, source ancestry and original job attempts. |
 | Publication preparation | Successful main-push CI; the canonical publisher | Independently authenticate source/evidence, reserve one version and transport its exact sealed frontend bytes. |
 | Crate publication | Isolated Cargo publisher, concurrent with native builds | Resume the same reservation, stamp disposable manifests, publish in dependency order, then verify registry checksums, source and embedded frontend. |
-| Native builds | Source-selected native runners, concurrent with crate publication | Verify prepared frontend transport and build the actual versioned main source without publication credentials. |
+| Native builds | Source-selected native runners, concurrent with crate publication | Verify prepared frontend transport and perform the release executable build of the actual versioned main source without publication credentials. |
 | Final assets | The existing final publisher, after both branches succeed | Authenticate completed crates and all required native receipts, then verify immutable uploads. The final manifest signals complete binary availability. |
 
 ```mermaid
@@ -32,6 +32,12 @@ The full Rust suite belongs to frozen release acceptance. Main admission is a
 real verification gate that reuses that result; it is not a claim that tests ran
 again on main. A missing or failed proof stops publication. A successful dev
 compile does not establish release acceptance.
+
+The release PR's three `Platform Tests` jobs retain native Supervisor, portable
+Skill and frontend contract coverage. They do not run `cargo build --release`.
+The three optimized executable builds happen only in the automatic main
+publisher, after the actual main source, version and frontend bytes are bound.
+Historical producers keep their original build-job acceptance requirements.
 
 Keep required check names stable. Do not use empty success jobs, synthesized
 statuses, `[skip ci]`, or workflow-level path filters to bypass required gates.

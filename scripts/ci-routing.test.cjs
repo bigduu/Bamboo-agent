@@ -47,6 +47,8 @@ function assertRouting(source) {
     // Do not pin a PR full gate to the head instead of the actual merge result.
     assert.doesNotMatch(block, /^          ref:/m);
   }
+  assert.match(job(source, "build"), /^    name: Platform Tests \(\$\{\{ matrix\.os \}\}\)$/m);
+  assert.doesNotMatch(source, /cargo build[^\n]*--release/);
   assert.doesNotMatch(source, /continue-on-error:|paths-ignore:/);
   assert.match(source, /queue: .*github.event_name == 'push'.*refs\/heads\/main.*'max'/);
   assert.match(source, /cancel-in-progress: .*github.event_name != 'push'.*refs\/heads\/main/);
@@ -57,6 +59,8 @@ test("required Test compiles dev, validates snapshots fully and authenticates ma
   assertRouting(ci);
   for (const [from, to] of [
     ["name: Quick Checks", "name: Test"],
+    ["name: Platform Tests (${{ matrix.os }})", "name: Build (${{ matrix.os }})"],
+    ["run: cargo test --locked --no-fail-fast -p bamboo-skills progressive::source_tests -- --test-threads=1", "run: cargo build --release --verbose"],
     ["run: cargo fmt --all -- --check", "run: cargo test --locked --no-fail-fast"],
     ["if: always() && !cancelled()", "if: needs.validation-source.outputs.full == 'true'"],
     ['test "$SOURCE_RESULT" = success', 'true # ignored source result'],
