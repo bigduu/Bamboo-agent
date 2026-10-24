@@ -148,7 +148,7 @@ def grouped_jobs(ci, jobs, before=None):
             assert block["kind"] in ({"ssh"} if profile == "ssh-live" else {"libtest", "doctest"})
             assert type(block["count"]) is int and block["count"] > 0
             assert type(block["ignored"]) is int and 0 <= block["ignored"] <= block["count"]
-            assert block["timeoutSeconds"] == 600
+            assert block["timeoutSeconds"] == 1200
             family = " 2" if block["matrixFamily"] == 2 else ""
             name = "Test SSH" if profile == "ssh-live" else f"{label} {'Doctest' if block['kind'] == 'doctest' else 'Block' + family} ({block['id']})"
             assert name not in names, "Duplicate compiled CI block"
@@ -165,8 +165,8 @@ def grouped_jobs(ci, jobs, before=None):
             assert result["sha"] == plan["sha"] and result["sourceTree"] == plan["tree"]
             assert build["run_attempt"] <= result["attempt"] == job["run_attempt"] <= ci["run_attempt"]
             assert result["status"] == "passed" and result["exitCode"] == 0 and not result.get("error")
-            assert result["expected"] == block["count"] and result["timeoutSeconds"] == 600
-            assert 0 <= result["testDurationMs"] <= 600000
+            assert result["expected"] == block["count"] and result["timeoutSeconds"] == 1200
+            assert 0 <= result["testDurationMs"] <= 1200000
             assert result["counts"] == {"passed": block["count"] - block["ignored"], "failed": 0, "ignored": block["ignored"]}
         if profile != "ssh-live" and not any(block["matrixFamily"] == 2 for block in runtime):
             name = label + " Block 2 (${{ matrix.id }})"
@@ -277,7 +277,7 @@ REVIEWED_PRODUCERS = frozenset((PRODUCER_V1, PRODUCER_V2))
 # by a sentinel. Then independently authenticate the actual helper bytes below.
 # This breaks the workflow -> helper -> workflow hash cycle, without excluding
 # a job, global environment, trigger, command or permission from review.
-CURRENT_PRODUCER = "425829a6b9a3c5f1b49d4de5bb4c70e22a390c1ab2d3b4fcb1af57dffb49262a"
+CURRENT_PRODUCER = "f77f63ee2873eed949e13afef13f6eb948d775654b9d5e7b8fbb654907045619"
 # Preserve the already-reviewed admission producer with its original helper.
 # It has no shard jobs; it cannot satisfy the new grouped producer contract.
 LEGACY_ADMISSION_PRODUCER = "3c3af3e002a8abb341db0bb4020f29491ed32208b0b0953ebb6ed2b289c4390c"

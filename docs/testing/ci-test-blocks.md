@@ -10,9 +10,9 @@ another full suite. This change sets no new automatic trigger frequency.
 
 | Lane | Build job | Exact original selection | Runtime |
 | --- | --- | --- | --- |
-| Test | `Test Build` | default-members, default features, `cargo test --locked --no-run` | one crate/target/topic/name shard per `Test Block` |
+| Test | `Test Build` | default-members, default features, `cargo test --locked --no-run` | one crate per `Test Block`, with bounded target/name selections |
 | Doctests | the same `Test Build` | actual Cargo rustdoc invocations and dependency graph | one crate per `Test Doctest` |
-| E2E | `E2E Build` | default-members, `--all-features --lib --tests` | one crate/target/topic/name shard per `E2E Block` |
+| E2E | `E2E Build` | default-members, `--all-features --lib --tests` | one crate per `E2E Block`, with bounded target/name selections |
 | Real SSH | `Test SSH Build` | standalone `-p bamboo-broker --test russh_live` | `Test SSH`, original Docker/SSH/SFTP fixture and explicit ignored test |
 
 Default and all-feature evidence is independent. In particular, the server's
@@ -26,13 +26,20 @@ retained. Recorder runtime tests retain their separate three-platform jobs.
 
 The build controller compares Cargo metadata with every emitted test artifact,
 then inventories all test names and ignored names from the actual executables.
-It checks that blocks cover every name exactly once. Every block contains one
-crate and one Cargo target. Library topics split into sorted inventories of at
-most 128 names; integration targets split at 16 names. The ten thematic routes
-remain useful inside a crate; they do not combine multiple crates into a job.
+It checks that blocks cover every name exactly once. Every block contains
+exactly one crate. Ordinary library topics split at 256 names and ordinary integration
+targets at 32 names. Existing expensive restart, cross-process, browser and
+platform routes retain their smaller 128/16-name selections and stay separate.
+Within one crate and one non-expensive topic, integration chunks of at most
+eight cases may share a block: at most four chunks and 32 cases in total. Each
+target keeps its own executable, environment and strict preflight list. Case
+identity includes the target, so identical names in different binaries remain
+distinct. These are stable inventory heuristics; no unmeasured runtime is
+promised to fit. The hard deadline still fails overruns.
+
 Each Test/E2E lane spreads its complete runtime inventory evenly across two
 matrix job families. Each matrix contains at most 256 independently timed jobs;
-the lane supports up to 512 runtime blocks, without combining crates or targets.
+the lane supports up to 512 runtime blocks, without combining different crates.
 Both families run at most one block concurrently, retaining two active blocks
 per lane. Doctests retain their separate matrix with a 256-job limit. Crates with
 zero matched tests, ambiguous routes and capacity overflow fail the build with
@@ -51,9 +58,9 @@ dependency files and generated build outputs. It compiles doctest snippets as
 rustdoc requires, without asking Cargo to rebuild the workspace. Empty doctest
 targets remain recorded in the plan and are not counted as executed tests.
 
-## Ten-minute execution limit
+## Twenty-minute execution limit
 
-Every block job has `timeout-minutes: 10` and starts its cumulative clock before
+Every block job has `timeout-minutes: 20` and starts its cumulative clock before
 checkout/setup. The controller uses the remaining budget and reserves 45 seconds
 for evidence upload. Each actual child process receives a hard timer bounded by
 that same deadline, including preflight lists and every test command. Splitting
@@ -62,7 +69,7 @@ Matrices use `fail-fast: false`; one failure does not cancel other blocks.
 
 Results report build preparation, test preparation and test execution times
 separately. A passing child exit alone is insufficient: names, executed/ignored
-counts, process exits/signals and the 600-second ceiling must agree. Normal
+counts, process exits/signals and the 1200-second ceiling must agree. Normal
 ignored tests retain their original skip semantics and are counted separately.
 The real SSH test alone retains its explicit ignored selection and prerequisite
 fixture. There is no automatic retry, new ignore, or weakened assertion.
@@ -138,7 +145,11 @@ The compressed fixture `scripts/tests/fixtures/grouped-inventory-46b52ce8.json.g
 captures the actual all-feature inventory from run `40048666734`, attempt 1,
 artifact `12542483784`: 159 targets, 30 crates, 12,397 listed cases (38 ignored),
 and 274 blocks. Its metadata file records hashes and provenance. Controller
-fixtures replay all names into two 137-job matrices; publisher fixtures verify
-the exact three-page job set and reject missing, repeated or skipped planned
-blocks. This fixture proves inventory routing and evidence checks, not runtime
+fixtures replay the same 12,397 cases into 171 blocks (86+85). The default
+inventory independently replays 12,380 cases into 170 blocks (85+85), with its
+139 doctests (114 ignored) in 14 additional crate blocks. All 30 crates remain
+covered. The historical 274-block layout remains a capacity/pagination fixture
+for both matrix families; publisher fixtures verify its complete three-page
+job set and reject missing, repeated or skipped planned blocks. This fixture
+proves inventory routing and evidence checks, not runtime
 success for that source or any later source.

@@ -25,7 +25,11 @@ outputs:
   plan_key:
     description: Source and input-bound plan digest
   blocks:
-    description: Complete libtest matrix
+    description: First runtime matrix family
+  blocks_2:
+    description: Second runtime matrix family
+  has_blocks_2:
+    description: Whether the second family has planned blocks
   docs:
     description: Complete doctest matrix
   has_docs:

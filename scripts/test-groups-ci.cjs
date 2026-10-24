@@ -7,7 +7,7 @@ const {spawnSync} = require('node:child_process');
 const r = require('./test-groups.cjs');
 const ROOT = path.resolve(__dirname, '..');
 const fail = message => { throw new Error(message); };
-const MAX_SECONDS = 600;
+const MAX_SECONDS = 1200;
 const MATRIX_LIMIT = 256;
 const RUNTIME_FAMILIES = 2;
 const PACKAGE = /^[a-z0-9][a-z0-9-]*$/;
@@ -39,14 +39,43 @@ function blockId(pkg, target, topic, index, names) {
   return `${pkg}-${target}-${topic}-${index}`.replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 105) + '-' + r.digest(names).slice(0, 10);
 }
 function inventoryKeys(manifest) { return manifest.targets.flatMap(t => t.tests.map(test => `${t.id}\0${test.name}`)).sort(); }
+function targetIds(block) { return [...new Set((block.commands || []).map(command => command.targetId))]; }
+function coalesceSmallBlocks(blocks, manifest) {
+  const result = [], candidates = new Map(), targets = new Map(manifest.targets.map(t => [t.id, t]));
+  for (const block of blocks) {
+    const target = targets.get(block.targetId);
+    if (block.kind !== 'libtest' || !target.kind.includes('test') || block.names.length > 8 || r.CONFIG.groups[block.topic].expensive) result.push(block);
+    else { const key = block.package + '\0' + block.topic; if (!candidates.has(key)) candidates.set(key, []); candidates.get(key).push(block); }
+  }
+  for (const members of candidates.values()) {
+    members.sort((a, b) => { const x = a.target + '\0' + a.names[0], y = b.target + '\0' + b.names[0]; return x < y ? -1 : x > y ? 1 : 0; });
+    let batch = [], index = 0;
+    const flush = () => {
+      if (!batch.length) return;
+      if (batch.length === 1) result.push(batch[0]);
+      else {
+        const first = batch[0], commands = batch.flatMap(b => b.commands);
+        if (commands.some(c => targets.get(c.targetId)?.package !== first.package)) fail('A block cannot mix crates');
+        const keys = commands.flatMap(c => c.names.map(name => c.targetId + '\0' + name)).sort();
+        result.push({...first, id: blockId(first.package, 'small-targets', first.topic, index, keys),
+          target: 'small-targets', targetId: null, commands, names: commands.flatMap(c => c.names)});
+      }
+      batch = []; index++;
+    };
+    for (const block of members) { if (batch.length === 4 || batch.reduce((n, b) => n + b.names.length, 0) + block.names.length > 32) flush(); batch.push(block); }
+    flush();
+  }
+  return result;
+}
 function makeBlocks(manifest, docs = []) {
-  const blocks = [];
+  let blocks = [];
   for (const target of manifest.targets) {
     const topics = {};
     for (const test of target.tests) (topics[r.route(target, test.name)] ||= []).push(test.name);
     for (const [topic, names] of Object.entries(topics)) {
       names.sort();
-      const size = target.kind.includes('test') ? 16 : 128;
+      const expensive = r.CONFIG.groups[topic].expensive;
+      const size = target.kind.includes('test') ? (expensive ? 16 : 32) : (expensive ? 128 : 256);
       for (let start = 0; start < names.length; start += size) {
         const chosen = names.slice(start, start + size), index = start / size;
         const commands = r.partition(target, chosen).map(command => ({...command, targetId: target.id,
@@ -57,7 +86,8 @@ function makeBlocks(manifest, docs = []) {
       }
     }
   }
-  const selected = blocks.flatMap(b => b.names.map(name => `${b.targetId}\0${name}`)).sort();
+  blocks = coalesceSmallBlocks(blocks, manifest);
+  const selected = blocks.flatMap(b => b.commands.flatMap(c => c.names.map(name => `${c.targetId}\0${name}`))).sort();
   r.equalNames(selected, inventoryKeys(manifest));
   if (new Set(selected).size !== selected.length) fail('Duplicate CI inventory selection');
   const packages = [...new Set(manifest.targets.map(t => t.package))];
@@ -88,7 +118,7 @@ function validatePlan(plan) {
   if (r.digest({...plan.manifest, inputKey: undefined}) !== plan.manifest.inputKey) fail('Compiler manifest digest mismatch');
   const expected = makeBlocks(plan.manifest, plan.docs);
   if (r.canonical(expected) !== r.canonical(plan.blocks)) fail('Missing, duplicated or modified CI inventory block');
-  if (plan.blocks.some(block => !PACKAGE.test(block.package) || block.timeoutSeconds !== MAX_SECONDS)) fail('Every block must retain one crate and a 600-second maximum');
+  if (plan.blocks.some(block => !PACKAGE.test(block.package) || block.timeoutSeconds !== MAX_SECONDS)) fail('Every block must retain one crate and a 1200-second maximum');
 }
 function assertSource(plan) {
   validatePlan(plan);
@@ -201,8 +231,8 @@ async function restoreBundle(record, directory, label, client) {
 }
 function verifyRuntimeFiles(plan, block) {
   const testFiles = new Set(plan.manifest.targets.map(t => t.executable));
-  const selected = plan.manifest.targets.find(t => t.id === block.targetId)?.executable;
-  for (const file of plan.manifest.artifacts.filter(a => !testFiles.has(a.path) || a.path === selected))
+  const ids = new Set(targetIds(block)), selected = new Set(plan.manifest.targets.filter(t => ids.has(t.id)).map(t => t.executable));
+  for (const file of plan.manifest.artifacts.filter(a => !testFiles.has(a.path) || selected.has(a.path)))
     if (r.fileHash(file.path) !== file.sha256) fail(`Runtime input bytes changed: ${file.path}`);
   if (block.kind === 'doctest') {
     const doc = plan.docs.find(d => d.id === block.docId);
@@ -228,7 +258,7 @@ async function executeBlock(plan, block, directory, deadline, execute = r.proces
     timeoutSeconds: MAX_SECONDS, preparationDurationMs: Math.max(0, started - Number(process.env.BAMBOO_BLOCK_STARTED_AT || started / 1000) * 1000),
     counts: {passed: 0, failed: 0, ignored: 0}, processes: []};
   const invoke = async (label, executable, args, cwd, env) => {
-    if (Date.now() >= deadline) fail('Block exceeded its cumulative 10-minute budget');
+    if (Date.now() >= deadline) fail('Block exceeded its cumulative 20-minute budget');
     const p = await execute(executable, args, {cwd, env, timeoutMs: deadline - Date.now(), log: path.join(directory, label)});
     result.processes.push(r.reportProcess(p)); return p;
   };
@@ -243,13 +273,14 @@ async function executeBlock(plan, block, directory, deadline, execute = r.proces
       if (result.counts.ignored !== doc.ignoredNames.length) fail('Doctest ignored semantics changed');
       if (result.counts.failed) fail('Doctest failure');
     } else {
-      const target = plan.manifest.targets.find(t => t.id === block.targetId), env = r.runtimeEnv(plan.manifest, target);
       for (const [index, command] of block.commands.entries()) {
+        const target = plan.manifest.targets.find(t => t.id === command.targetId), env = r.runtimeEnv(plan.manifest, target);
         const args = [...command.args, ...(block.kind === 'ssh' ? ['--ignored'] : [])];
         const listed = await invoke(`list-${index}`, target.executable, [...args, '--list', '--color=never'], target.cwd, env);
         r.equalNames(r.parseList(r.checked(listed)), command.names);
       }
       for (const [index, command] of block.commands.entries()) {
+        const target = plan.manifest.targets.find(t => t.id === command.targetId), env = r.runtimeEnv(plan.manifest, target);
         const p = block.kind === 'ssh'
           ? await invoke(`run-${index}`, 'bash', [path.join(ROOT, 'scripts/run-russh-live.sh')], ROOT, {...env, BAMBOO_RUSSH_TEST_EXECUTABLE: target.executable})
           : await invoke(`run-${index}`, target.executable, [...command.args, '--format=pretty', '--color=never'], target.cwd, env);
@@ -262,7 +293,7 @@ async function executeBlock(plan, block, directory, deadline, execute = r.proces
     if (!result.error) { result.status = 'passed'; result.exitCode = 0; }
   } catch (e) { result.error = e.message; }
   result.testDurationMs = Date.now() - started;
-  if (result.testDurationMs > MAX_SECONDS * 1000) { result.status = 'failed'; result.exitCode = 1; result.error = 'Block exceeded 600 seconds'; }
+  if (result.testDurationMs > MAX_SECONDS * 1000) { result.status = 'failed'; result.exitCode = 1; result.error = 'Block exceeded 1200 seconds'; }
   write(path.join(directory, 'result.json'), result); return result;
 }
 async function run(id, key, blockId, directory, client) {
@@ -270,12 +301,14 @@ async function run(id, key, blockId, directory, client) {
   const plan = await downloadPlan(id, key, directory, client), block = plan.blocks.find(b => b.id === blockId);
   if (!block || !block.names.length) fail('Unknown or empty CI block');
   await restoreBundle(plan.support, directory, 'support', client);
-  await restoreBundle(block.kind === 'doctest' ? plan.docBundle : plan.targetBundles[block.targetId], directory, 'target', client);
+  if (block.kind === 'doctest') await restoreBundle(plan.docBundle, directory, 'target', client);
+  else for (const [index, id] of targetIds(block).entries()) await restoreBundle(plan.targetBundles[id], directory, 'target-' + index, client);
   const logs = path.join(directory, 'logs'); fs.mkdirSync(logs);
   const epoch = Number(process.env.BAMBOO_BLOCK_STARTED_AT) * 1000;
   if (!Number.isFinite(epoch) || epoch <= 0) fail('Block job start timestamp is required');
-  // Include preparation in the 10-minute job budget; reserve 45s to retain evidence.
-  const result = await executeBlock(plan, block, logs, Math.min(epoch + 555000, Date.now() + 555000));
+  // Include preparation in the 20-minute job budget; reserve 45s to retain evidence.
+  const budget = (MAX_SECONDS - 45) * 1000;
+  const result = await executeBlock(plan, block, logs, Math.min(epoch + budget, Date.now() + budget));
   const name = `${plan.prefix}-result-${block.id}-attempt-${process.env.GITHUB_RUN_ATTEMPT}`;
   const saved = await client.uploadArtifact(name, filesUnder(logs), logs, {retentionDays: 7, compressionLevel: 6});
   if (!Number.isSafeInteger(saved.id) || saved.id <= 0) fail('Result upload has no immutable artifact ID');
@@ -356,5 +389,5 @@ async function main(argv) {
   if (command === 'run') return run(args[0], args[1], args[2], path.resolve(args[3]), client);
   return summary(args[0], args[1], path.resolve(args[2]), client);
 }
-module.exports = {main, makeBlocks, matrixBlocks, emptyMatrixJobs, validatePlan, blockId, inventoryKeys, docCounts, selectJobResults, jobName, executeBlock, pack, unpack};
+module.exports = {main, makeBlocks, matrixBlocks, emptyMatrixJobs, targetIds, validatePlan, blockId, inventoryKeys, docCounts, selectJobResults, jobName, executeBlock, pack, unpack};
 if (require.main === module) main(process.argv.slice(2)).catch(e => { console.error(e.message); process.exitCode = 1; });

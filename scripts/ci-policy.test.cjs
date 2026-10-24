@@ -212,7 +212,7 @@ test("main-push validation remains reachable by the existing automatic publisher
   assert.match(contributing, /for changed behavior, recording exact source, commands and results/u)
 })
 
-test("locked test builds are separate from source-bound ten-minute crate blocks", () => {
+test("locked test builds are separate from source-bound twenty-minute crate blocks", () => {
   for (const [id, profile] of [["test-build", "default"], ["e2e-build", "all-features"], ["test-ssh-build", "ssh-live"]]) {
     const source = job(id)
     assert.match(source, /timeout-minutes: 75/u)
@@ -221,7 +221,7 @@ test("locked test builds are separate from source-bound ten-minute crate blocks"
   }
   for (const id of ["test-blocks", "test-blocks-2", "e2e-blocks", "e2e-blocks-2", "test-doctests", "test-ssh"]) {
     const source = job(id)
-    assert.match(source, /timeout-minutes: 10/u)
+    assert.match(source, /timeout-minutes: 20/u)
     assert.doesNotMatch(source, /cargo (test|build)|continue-on-error:/u)
     assert.match(source, /BAMBOO_BLOCK_STARTED_AT/u)
     if (id !== "test-ssh") assert.match(source, /fail-fast: false/u)
@@ -240,7 +240,7 @@ test("locked test builds are separate from source-bound ten-minute crate blocks"
   assert.equal(config.profiles["all-features"].packages, "default-members")
   assert.deepEqual(config.profiles["storage-standalone"].cargoArgs, ["-p", "bamboo-storage", "--lib"])
   const controller = readFileSync("scripts/test-groups-ci.cjs", "utf8")
-  assert.match(controller, /const MAX_SECONDS = 600/u)
+  assert.match(controller, /const MAX_SECONDS = 1200/u)
   assert.match(controller, /r\.compile\(ROOT, directory, profile, \{identityMode: 'ci'\}\)/u)
   assert.match(controller, /timeoutMs: deadline - Date\.now\(\)/u)
   assert.match(controller, /r\.equalNames\(selected, inventoryKeys\(manifest\)\)/u)
