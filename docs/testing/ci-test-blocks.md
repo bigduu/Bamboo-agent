@@ -30,8 +30,18 @@ It checks that blocks cover every name exactly once. Every block contains one
 crate and one Cargo target. Library topics split into sorted inventories of at
 most 128 names; integration targets split at 16 names. The ten thematic routes
 remain useful inside a crate; they do not combine multiple crates into a job.
-Crates with zero matched tests, ambiguous routes and matrix overflow fail the
-build, with the inventory available for diagnosis. Nothing is silently omitted.
+Each Test/E2E lane spreads its complete runtime inventory evenly across two
+matrix job families. Each matrix contains at most 256 independently timed jobs;
+the lane supports up to 512 runtime blocks, without combining crates or targets.
+Both families run at most one block concurrently, retaining two active blocks
+per lane. Doctests retain their separate matrix with a 256-job limit. Crates with
+zero matched tests, ambiguous routes and capacity overflow fail the build with
+the complete diagnostic inventory. Nothing is silently omitted.
+
+The second family may be skipped only when the authenticated plan contains zero
+blocks for it. That structural skip contributes no coverage or passing count;
+the aggregate and publisher require every planned block in both families to
+finish successfully. The original Test/E2E aggregate names remain unchanged.
 
 Doctest inventory uses a `RUSTDOC` wrapper only in the build job. Cargo supplies
 the original argv, working directory, package environment, features and extern
@@ -80,6 +90,13 @@ storage upgrade or implicit rebuild in a block. Recompile on changed inputs or
 expired transport, then validate the new plan. No cross-SHA, cross-profile,
 cross-platform or cross-run equivalence is assumed.
 
+A failure before executable transport is uploaded leaves compiler/list logs and
+inventory diagnostics, rather than reusable executable bytes. Replaying those
+inventories needs no compilation, but cannot run the tests. GitHub reruns retain
+the original workflow/source definition, so a workflow repair cannot be injected
+into an old run. Preserve its independent results and caches; validate a repaired
+source with its exact-input artifacts without relabeling earlier results.
+
 ## Reruns, aggregates and publication
 
 Use GitHub's **Re-run failed jobs** or rerun one failed block. Successful blocks
@@ -116,3 +133,12 @@ node --test scripts/crate-release.test.cjs scripts/release-source.test.cjs
 Real Cargo inventory, artifact handoff and runtime evidence belongs to the first
 grouped full CI run on the final selected source. Controller fixtures do not
 claim that run already happened.
+
+The compressed fixture `scripts/tests/fixtures/grouped-inventory-46b52ce8.json.gz`
+captures the actual all-feature inventory from run `40048666734`, attempt 1,
+artifact `12542483784`: 159 targets, 30 crates, 12,397 listed cases (38 ignored),
+and 274 blocks. Its metadata file records hashes and provenance. Controller
+fixtures replay all names into two 137-job matrices; publisher fixtures verify
+the exact three-page job set and reject missing, repeated or skipped planned
+blocks. This fixture proves inventory routing and evidence checks, not runtime
+success for that source or any later source.

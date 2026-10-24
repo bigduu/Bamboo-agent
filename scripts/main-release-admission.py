@@ -54,7 +54,8 @@ def api(route):
 
 def pages(route, field=None):
     result = []
-    for page in range(1, 11):
+    page_limit = 20 if re.search(r"/jobs(?:\?|$)", route) else 10
+    for page in range(1, page_limit + 1):
         data = api(f"{route}{'&' if '?' in route else '?'}per_page=100&page={page}")
         rows = data[field] if field else data
         assert isinstance(rows, list) and len(rows) <= 100
@@ -113,8 +114,8 @@ def grouped_records(job, marker):
             for line in log.decode("utf-8").splitlines()
             if (match := re.fullmatch(pattern, line))]
 
-def grouped_jobs(ci, jobs):
-    plans, names = [], set()
+def grouped_jobs(ci, jobs, before=None):
+    plans, names, empty_names = [], set(), set()
     for label, profile in (("Test", "default"), ("E2E", "all-features"), ("Test SSH", "ssh-live")):
         builds = [job for job in jobs if job["name"] == label + " Build"]
         assert len(builds) == 1, "Missing or ambiguous grouped build"
@@ -128,7 +129,14 @@ def grouped_jobs(ci, jobs):
         assert re.fullmatch(SHA, plan["sha"]) and plan["tree"] == commit["tree"]["sha"]
         assert re.fullmatch(r"[0-9a-f]{64}", plan["planKey"])
         assert type(plan["planId"]) is int and plan["planId"] > 0
-        assert 1 <= len(plan["blocks"]) <= 512 and plan["inventory"] > 0
+        runtime = [block for block in plan["blocks"] if block["kind"] != "doctest"]
+        docs = [block for block in plan["blocks"] if block["kind"] == "doctest"]
+        assert 1 <= len(runtime) <= 512 and len(docs) <= 256 and plan["inventory"] > 0
+        split = (len(runtime) + 1) // 2
+        assert all(type(block["matrixFamily"]) is int and block["matrixFamily"] == (1 if index < split else 2)
+                   for index, block in enumerate(runtime)), "Matrix family differs from complete compiled inventory"
+        assert all(type(block["matrixFamily"]) is int and block["matrixFamily"] == 1 for block in docs)
+        assert all(sum(block["matrixFamily"] == family for block in runtime) <= 256 for family in (1, 2))
         assert plan["packages"] == sorted(set(block["package"] for block in plan["blocks"] if block["kind"] != "doctest"))
         assert sum(block["count"] for block in plan["blocks"] if block["kind"] != "doctest") == plan["inventory"]
         assert sum(block["count"] for block in plan["blocks"] if block["kind"] == "doctest") == plan["doctests"]
@@ -141,7 +149,8 @@ def grouped_jobs(ci, jobs):
             assert type(block["count"]) is int and block["count"] > 0
             assert type(block["ignored"]) is int and 0 <= block["ignored"] <= block["count"]
             assert block["timeoutSeconds"] == 600
-            name = "Test SSH" if profile == "ssh-live" else f"{label} {'Doctest' if block['kind'] == 'doctest' else 'Block'} ({block['id']})"
+            family = " 2" if block["matrixFamily"] == 2 else ""
+            name = "Test SSH" if profile == "ssh-live" else f"{label} {'Doctest' if block['kind'] == 'doctest' else 'Block' + family} ({block['id']})"
             assert name not in names, "Duplicate compiled CI block"
             names.add(name)
             found = [job for job in jobs if job["name"] == name]
@@ -159,9 +168,20 @@ def grouped_jobs(ci, jobs):
             assert result["expected"] == block["count"] and result["timeoutSeconds"] == 600
             assert 0 <= result["testDurationMs"] <= 600000
             assert result["counts"] == {"passed": block["count"] - block["ignored"], "failed": 0, "ignored": block["ignored"]}
+        if profile != "ssh-live" and not any(block["matrixFamily"] == 2 for block in runtime):
+            name = label + " Block 2 (${{ matrix.id }})"
+            found = [job for job in jobs if job["name"] == name]
+            assert len(found) == 1, "Missing or ambiguous empty matrix family"
+            empty = found[0]
+            assert empty["status"] == "completed" and empty["conclusion"] == "skipped", "Only an empty family may skip"
+            assert empty["run_id"] == ci["id"] and empty["head_sha"] == ci["head_sha"] and empty["head_branch"] == ci["head_branch"]
+            assert type(empty["run_attempt"]) is int and build["run_attempt"] <= empty["run_attempt"] <= ci["run_attempt"]
+            if before is not None:
+                assert instant(empty["completed_at"]) < before, "Empty-family job must finish before merge"
+            empty_names.add(name)
         plans.append(plan)
-    actual = {job["name"] for job in jobs if re.match(r"^(?:Test|E2E) (?:Block|Doctest) \(", job["name"]) or job["name"] == "Test SSH"}
-    assert actual == names - {"Test Build", "E2E Build", "Test SSH Build"}, "Unexpected or missing inventory shard"
+    actual = {job["name"] for job in jobs if re.match(r"^(?:Test|E2E) (?:Block(?: [0-9]+)?|Doctest) \(", job["name"]) or job["name"] == "Test SSH"}
+    assert actual == (names | empty_names) - {"Test Build", "E2E Build", "Test SSH Build"}, "Unexpected or missing inventory shard"
     for summary_name, profiles in (("Test", {"default", "ssh-live"}), ("E2E Tests", {"all-features"})):
         found = [job for job in jobs if job["name"] == summary_name]
         assert len(found) == 1
@@ -174,14 +194,14 @@ def grouped_jobs(ci, jobs):
             assert record["inventory"] == plan["inventory"] and record["doctests"] == plan["doctests"]
             ignored = sum(block["ignored"] for block in plan["blocks"])
             assert record["counts"] == {"passed": plan["inventory"] + plan["doctests"] - ignored, "failed": 0, "ignored": ignored}
-    GROUPED_JOBS[ci["id"]], GROUPED_PLANS[ci["id"]] = names, plans
+    GROUPED_JOBS[ci["id"]], GROUPED_PLANS[ci["id"]] = names | empty_names, plans
     return tuple(sorted(names))
 
 def full_jobs(ci, promotion=False, before=None):
     # latest is intentionally per job: failed-only reruns retain the successful
     # jobs from earlier attempts. Do not invent an all-jobs-same-attempt rule.
     jobs = pages(f"actions/runs/{ci['id']}/jobs?filter=latest", "jobs")
-    grouped = grouped_jobs(ci, jobs) if promotion and producer_definition(ci["head_sha"]) == "grouped" else ()
+    grouped = grouped_jobs(ci, jobs, before) if promotion and producer_definition(ci["head_sha"]) == "grouped" else ()
     for name in FULL + (PLATFORMS + ("Promotion Source",) if promotion else ()) + grouped:
         found = [job for job in jobs if job["name"] == name]
         assert len(found) == 1, f"Missing or ambiguous full CI job: {name}"
@@ -257,7 +277,7 @@ REVIEWED_PRODUCERS = frozenset((PRODUCER_V1, PRODUCER_V2))
 # by a sentinel. Then independently authenticate the actual helper bytes below.
 # This breaks the workflow -> helper -> workflow hash cycle, without excluding
 # a job, global environment, trigger, command or permission from review.
-CURRENT_PRODUCER = "99a869c4a744a9d307563a43bd4c7781a1bf893b97cb9f4666a4238bde6cd5c0"
+CURRENT_PRODUCER = "425829a6b9a3c5f1b49d4de5bb4c70e22a390c1ab2d3b4fcb1af57dffb49262a"
 # Preserve the already-reviewed admission producer with its original helper.
 # It has no shard jobs; it cannot satisfy the new grouped producer contract.
 LEGACY_ADMISSION_PRODUCER = "3c3af3e002a8abb341db0bb4020f29491ed32208b0b0953ebb6ed2b289c4390c"
@@ -388,7 +408,8 @@ if ci is not None:
                    "Security Audit", "cargo-deny (licenses/bans/advisories/sources)", "Documentation"]
         if contract == "grouped":
             skipped.extend(["Test Build", "E2E Build", "Test SSH Build", "Test SSH",
-                            "Test Block (${{ matrix.id }})", "E2E Block (${{ matrix.id }})", "Test Doctest (${{ matrix.id }})"])
+                            "Test Block (${{ matrix.id }})", "E2E Block (${{ matrix.id }})", "Test Doctest (${{ matrix.id }})",
+                            "Test Block 2 (${{ matrix.id }})", "E2E Block 2 (${{ matrix.id }})"])
         for label, platforms in (("TLS Fixture", ("macos-latest", "windows-latest")),
                                  ("ToolEvent Recorder E2E", ("ubuntu-latest", "macos-latest", "windows-latest")),
                                  ("Build", ("ubuntu-latest", "macos-latest", "windows-latest"))):

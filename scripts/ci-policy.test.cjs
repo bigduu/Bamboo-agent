@@ -219,7 +219,7 @@ test("locked test builds are separate from source-bound ten-minute crate blocks"
     assert.ok(source.includes(`profile: ${profile}`))
     assert.doesNotMatch(source, /continue-on-error:/u)
   }
-  for (const id of ["test-blocks", "e2e-blocks", "test-doctests", "test-ssh"]) {
+  for (const id of ["test-blocks", "test-blocks-2", "e2e-blocks", "e2e-blocks-2", "test-doctests", "test-ssh"]) {
     const source = job(id)
     assert.match(source, /timeout-minutes: 10/u)
     assert.doesNotMatch(source, /cargo (test|build)|continue-on-error:/u)
@@ -227,6 +227,13 @@ test("locked test builds are separate from source-bound ten-minute crate blocks"
     if (id !== "test-ssh") assert.match(source, /fail-fast: false/u)
   }
   const config = JSON.parse(readFileSync("scripts/test-groups.json", "utf8"))
+  for (const id of ["test-blocks", "test-blocks-2", "e2e-blocks", "e2e-blocks-2"]) {
+    assert.match(job(id), /max-parallel: 1/u)
+  }
+  for (const [id, build] of [["test-blocks-2", "test-build"], ["e2e-blocks-2", "e2e-build"]]) {
+    assert.ok(job(id).includes(`needs.${build}.outputs.has_blocks_2 == 'true'`))
+    assert.ok(job(id).includes(`matrix: \${{ fromJSON(needs.${build}.outputs.blocks_2) }}`))
+  }
   assert.deepEqual(config.profiles.default.cargoArgs, [])
   assert.deepEqual(config.profiles["all-features"].cargoArgs, ["--all-features", "--lib", "--tests"])
   assert.equal(config.profiles.default.packages, "default-members")
@@ -311,7 +318,7 @@ test("all-feature E2E blocks retain the workspace stack and exact feature graph"
   assert.match(job("e2e-build"), /profile: all-features/u)
   assert.match(job("e2e-blocks"), /needs: \[validation-source, e2e-build\]/u)
   assert.match(job("e2e-blocks"), /command: run/u)
-  assert.match(job("e2e-test"), /needs: \[validation-source, e2e-build, e2e-blocks\]/u)
+  assert.match(job("e2e-test"), /needs: \[validation-source, e2e-build, e2e-blocks, e2e-blocks-2\]/u)
   assert.match(job("e2e-test"), /always\(\) && !cancelled\(\)/u)
 })
 

@@ -31,7 +31,7 @@ function assertRouting(source) {
   assert.doesNotMatch(quick, /cargo (build|test|check|clippy)|continue-on-error|--test-skip/);
   const full = job(source, "test");
   assert.match(full, /^    name: Test$/m);
-  assert.match(full, /^    needs: \[validation-source, main-release-admission, test-build, test-blocks, test-doctests, test-ssh-build, test-ssh\]$/m);
+  assert.match(full, /^    needs: \[validation-source, main-release-admission, test-build, test-blocks, test-blocks-2, test-doctests, test-ssh-build, test-ssh\]$/m);
   assert.match(full, /^    if: always\(\) && !cancelled\(\)$/m);
   assert.match(full, /- name: Require validation admission\n        env:\n          SOURCE_RESULT: \$\{\{ needs.validation-source.result \}\}\n          FULL_VALIDATION: \$\{\{ needs.validation-source.outputs.full \}\}/);
   assert.match(full, /test "\$SOURCE_RESULT" = success/);
@@ -200,7 +200,7 @@ function assertSharedBuild(source) {
   const [settings, ...steps] = build.split(/(?=^      - )/m);
   assert.match(settings, /^    name: Test$/m);
   assert.match(settings, /^    if: always\(\) && !cancelled\(\)$/m);
-  assert.match(settings, /^    needs: \[validation-source, main-release-admission, test-build, test-blocks, test-doctests, test-ssh-build, test-ssh\]$/m);
+  assert.match(settings, /^    needs: \[validation-source, main-release-admission, test-build, test-blocks, test-blocks-2, test-doctests, test-ssh-build, test-ssh\]$/m);
   assert.ok(settings.includes("timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"));
   assert.doesNotMatch(settings, /^    continue-on-error:/m);
   const cargo = steps.filter((step) => step.startsWith("      - name: Build locked Rust workspace\n"));
@@ -227,7 +227,7 @@ test("one required Test honestly compiles dev without imposing auxiliary checks 
     ["run: cargo build --locked", "run: cargo build --locked || true"],
     ["run: cargo build --locked", "continue-on-error: true\n        run: cargo build --locked"],
     ["run: cargo build --locked", "if: false\n        run: cargo build --locked"],
-    ["needs: [validation-source, main-release-admission, test-build, test-blocks, test-doctests, test-ssh-build, test-ssh]", "needs: quick-checks"],
+    ["needs: [validation-source, main-release-admission, test-build, test-blocks, test-blocks-2, test-doctests, test-ssh-build, test-ssh]", "needs: quick-checks"],
     ["name: Test CI workflow policy\n        if: needs.validation-source.outputs.full == 'true'", "name: Test CI workflow policy"],
     ["name: Check formatting\n        if: needs.validation-source.outputs.full == 'true'", "name: Check formatting"],
     ["name: Require every default block and doctest result\n        if: needs.validation-source.outputs.full == 'true'", "name: Require every default block and doctest result"],
