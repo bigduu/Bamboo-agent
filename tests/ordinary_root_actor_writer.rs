@@ -778,7 +778,7 @@ async fn pause_boundary_rejects_a_real_conflicting_file_lock() {
     };
     let rejected = host
         .stop_clear_of_file_locks(&[(lock_path.clone(), false)], |blocked| {
-            assert_eq!(blocked, [lock_path.clone()]);
+            assert_eq!(blocked, std::slice::from_ref(&lock_path));
             drop(held.take());
         })
         .await
@@ -883,23 +883,57 @@ async fn surviving_root_writer_rejects_old_output_after_real_host_lease_reclaim(
         b_account_frames[1]["event"]["type"],
         "session_history_committed"
     );
-    fixture.a.signal("-CONT");
+    // Queue the held answer and DONE before A can resume and close its stream.
+    // The flag proves mock SSE enqueue, not that A consumed or published text.
     fixture.probe.release_a.send_replace(true);
-    tokio::time::timeout(WAIT,async {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            fixture.a.alive();
+            if fixture.probe.a_response_sent.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "mock must enqueue the old answer and DONE while A is paused; A={}; B={}",
+            fixture.a.tail(),
+            fixture.b.tail()
+        )
+    });
+    fixture.a.signal("-CONT");
+    tokio::time::timeout(WAIT, async {
         loop {
             fixture.a.alive();
             let log = std::fs::read_to_string(&fixture.a.log).unwrap_or_default();
-            let observed_output = events.events.lock().unwrap().iter().any(|event|
-                event["type"] == "token" && event["content"].as_str().is_some_and(|text|text.contains(OLD_REPLY)));
+            let (observed_output, authority_interrupted) = {
+                let observed = events.events.lock().unwrap();
+                (
+                    observed.iter().any(|event| {
+                        event["type"] == "token"
+                            && event["content"].as_str().is_some_and(|text| text.contains(OLD_REPLY))
+                    }),
+                    observed.iter().any(|event| {
+                        event["type"] == "error"
+                            && event["message"].as_str().is_some_and(|text| text.contains("actor_authority_conflict"))
+                    }),
+                )
+            };
             let rejected_save = log.lines().any(|line| {
                 let line = line.to_lowercase();
                 line.contains("failed to save session") && (line.contains("fence") || line.contains("actor"))
                     && (line.contains("stale") || line.contains("expired"))
             });
-            if fixture.probe.a_response_sent.load(Ordering::SeqCst) && observed_output && rejected_save { break; }
+            // A guarded runtime event may fence and cancel A before the queued
+            // answer becomes a live token. Both paths must reject its final save.
+            if (observed_output || authority_interrupted) && rejected_save {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-    }).await.unwrap_or_else(|_| panic!("A must consume the released output and reject its final authority save, not merely time out; events={:?}; A={}; B={}",events.events.lock().unwrap(),fixture.a.tail(),fixture.b.tail()));
+    }).await.unwrap_or_else(|_| panic!("A must reach old output or explicit authority interruption and reject its final authority save; events={:?}; A={}; B={}",events.events.lock().unwrap(),fixture.a.tail(),fixture.b.tail()));
     tokio::time::timeout(WAIT, async {
         loop {
             let active: Value = fixture
