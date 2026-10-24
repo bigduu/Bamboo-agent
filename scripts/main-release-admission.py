@@ -309,6 +309,8 @@ CURRENT_PRODUCER = "b8e4760f405745ab787f94373908efe9055c4eb1bfa848bdedbc7e3bd2b6
 # The previous native crate producer also required three optimized Build jobs.
 LEGACY_CRATE_PRODUCER = "4fc5b81c53b931118c5c248bbdcffa212fe8dde0fa810c70365bd2cc33c142b7"
 LEGACY_CRATE_HELPER = "c567d1f41fe70acc23bd5f4a64b1d7048c6edbd667a1d2fc12f0f5e4c7ba0529"
+# Actual main 3488eb9b used this verifier before the pagination-only repair.
+LEGACY_MAIN_CRATE_HELPER = "3c34f4125129fbeea199e7a826b29cb523593b513df32cc2479ebe5e8a010e68"
 # Retain the original grouped producer and its exact helper for queued runs.
 LEGACY_GROUPED_PRODUCER = "f77f63ee2873eed949e13afef13f6eb948d775654b9d5e7b8fbb654907045619"
 LEGACY_GROUPED_HELPER = "8b6678f9ea2a28b6d9af6b200d894198f6bb1e754b5d54650cc496197ba78a7e"
@@ -333,11 +335,12 @@ def producer_definition(revision):
     pins = re.findall(PIN, raw)
     normalized = hashlib.sha256(re.sub(PIN, NORMALIZED_PIN, raw)).hexdigest()
     assert normalized in {CURRENT_PRODUCER, LEGACY_CRATE_PRODUCER, LEGACY_GROUPED_PRODUCER, LEGACY_ADMISSION_PRODUCER}, "Unknown source-admission producer"
-    expected_helper = {CURRENT_PRODUCER: ADMISSION_SCRIPT_SHA256,
-                       LEGACY_CRATE_PRODUCER: LEGACY_CRATE_HELPER,
-                       LEGACY_GROUPED_PRODUCER: LEGACY_GROUPED_HELPER,
-                       LEGACY_ADMISSION_PRODUCER: LEGACY_ADMISSION_HELPER}[normalized]
-    assert len(pins) == 1 and pins[0].decode() == expected_helper, "Unknown admission helper pin"
+    expected_helpers = {CURRENT_PRODUCER: {ADMISSION_SCRIPT_SHA256},
+                        LEGACY_CRATE_PRODUCER: {LEGACY_MAIN_CRATE_HELPER, LEGACY_CRATE_HELPER},
+                        LEGACY_GROUPED_PRODUCER: {LEGACY_GROUPED_HELPER},
+                        LEGACY_ADMISSION_PRODUCER: {LEGACY_ADMISSION_HELPER}}[normalized]
+    assert len(pins) == 1 and pins[0].decode() in expected_helpers, "Unknown admission helper pin"
+    expected_helper = pins[0].decode()
     helper = api(f"contents/scripts/main-release-admission.py?ref={revision}")
     assert helper["encoding"] == "base64" and len(helper["content"]) <= 180000
     body = base64.b64decode(helper["content"], validate=False)
