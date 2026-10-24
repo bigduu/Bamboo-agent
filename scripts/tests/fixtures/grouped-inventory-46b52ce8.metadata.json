@@ -1,0 +1,20 @@
+{
+  "schema": "bamboo-ci-inventory-fixture/v1",
+  "source": "46b52ce8abfd20a7917f82c6ebdf54781a7b11d0",
+  "tree": "03a6178ef5cc1d51dbd35cc77a64aa22bcf42864",
+  "workflowRun": 40048666734,
+  "attempt": 1,
+  "artifactId": 12542483784,
+  "profile": "all-features",
+  "expected": {
+    "targets": 159,
+    "packages": 30,
+    "tests": 12397,
+    "ignored": 38,
+    "blocks": 274
+  },
+  "compressed_sha256": "efa4553008e494ab8fdfff671020e426b9972b1d450cfb81a34c297e5e25ba16",
+  "uncompressed_sha256": "c844f0a64a1673b4c6619470ea3bcac13c89c3e7f4a12b9826563cf249f23393",
+  "inventory_sha256": "4be6dd13bfb721818ed7824b091a7c7c0523372ab6a141ff81ae688342dd7c58",
+  "scope": "Actual compile/list inventory only; no runtime success is claimed. Host paths, compiler environment and binaries are omitted."
+}

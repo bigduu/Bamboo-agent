@@ -7,6 +7,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const zlib = require('node:zlib');
 const r = require('./test-groups.cjs');
 const ci = require('./test-groups-ci.cjs');
 const copy = value => JSON.parse(JSON.stringify(value));
@@ -57,9 +58,51 @@ test('zero-test crates and matrix overflow fail instead of omitting or skipping 
   const plan = fixture(), zero = copy(plan.manifest); zero.targets[0].tests = [];
   assert.throws(() => ci.makeBlocks(zero), /zero tests/);
   const overflow = copy(plan.manifest);
-  overflow.targets = Array.from({length: 257}, (_, i) => ({...copy(plan.manifest.targets[0]), id: 'target-' + i, target: 'target_' + i,
+  overflow.targets = Array.from({length: 513}, (_, i) => ({...copy(plan.manifest.targets[0]), id: 'target-' + i, target: 'target_' + i,
     tests: [{name: 'case', ignored: false}]}));
-  assert.throws(() => ci.makeBlocks(overflow), /matrix exceeds/);
+  assert.throws(() => ci.makeBlocks(overflow), /matrix family capacity/);
+});
+test('real 274-block Cargo inventory spans two matrices with no omitted or repeated cases', t => {
+  actions(t);
+  const actual = JSON.parse(zlib.gunzipSync(fs.readFileSync('scripts/tests/fixtures/grouped-inventory-46b52ce8.json.gz')));
+  const manifest = {profileName: actual.profileName, identity: {sha: actual.source, tree: actual.tree}, targets: actual.targets};
+  manifest.inputKey = r.digest(manifest);
+  const blocks = ci.makeBlocks(manifest), plan = {schema: 'bamboo-ci-test-plan/v1', manifest, docs: [], producerAttempt: 1, blocks};
+  plan.planKey = r.digest(plan); ci.validatePlan(plan);
+  assert.equal(blocks.length, 274); assert.equal(new Set(blocks.map(b => b.package)).size, 30);
+  assert.equal(blocks.reduce((n, b) => n + b.names.length, 0), 12397);
+  assert.equal(blocks.reduce((n, b) => n + b.commands.reduce((a, c) => a + c.ignored, 0), 0), 38);
+  const matrices = [ci.matrixBlocks(blocks, 1), ci.matrixBlocks(blocks, 2)];
+  assert.deepEqual(matrices.map(m => m.include.length), [137, 137]);
+  assert.deepEqual(matrices.flatMap(m => m.include.map(b => b.id)).sort(), blocks.map(b => b.id).sort());
+  const {jobs, results} = receipts(plan); assert.equal(ci.selectJobResults(plan, jobs, results).inventory, 12397);
+  const second = jobs.findIndex(j => j.name.startsWith('E2E Block 2 ('));
+  assert(second >= 0);
+  assert.throws(() => ci.selectJobResults(plan, jobs.filter((_, i) => i !== second), results), /Missing\/ambiguous/);
+  assert.throws(() => ci.selectJobResults(plan, [...jobs, jobs[second]], results), /ambiguous/);
+  const skipped = copy(jobs); skipped[second].conclusion = 'skipped';
+  assert.throws(() => ci.selectJobResults(plan, skipped, results), /Failed, skipped/);
+});
+test('only a declared zero-block second matrix may be skipped', t => {
+  actions(t); const plan = fixture();
+  plan.manifest.targets = [copy(plan.manifest.targets[0])]; plan.manifest.targets[0].tests = [plan.manifest.targets[0].tests[0]];
+  plan.manifest.inputKey = r.digest({...plan.manifest, inputKey: undefined});
+  plan.docs = []; plan.blocks = ci.makeBlocks(plan.manifest); plan.planKey = r.digest({...plan, planKey: undefined});
+  const {jobs, results} = receipts(plan), name = ci.emptyMatrixJobs(plan)[0];
+  assert.equal(name, 'Test Block 2 (${{ matrix.id }})');
+  assert.throws(() => ci.selectJobResults(plan, jobs, results), /explicitly empty/);
+  jobs.push({name, run_id: 77, run_attempt: 1, status: 'completed', conclusion: 'skipped'});
+  assert.equal(ci.selectJobResults(plan, jobs, results).blocks, 1);
+  for (const conclusion of ['success', 'failure', 'cancelled']) {
+    const changed = copy(jobs); changed.at(-1).conclusion = conclusion;
+    assert.throws(() => ci.selectJobResults(plan, changed, results), /explicitly empty/);
+  }
+});
+test('an unavailable upstream compile plan fails before artifact or runtime access', async t => {
+  const previous = process.env.GITHUB_ACTIONS; process.env.GITHUB_ACTIONS = 'true';
+  t.after(() => { if (previous === undefined) delete process.env.GITHUB_ACTIONS; else process.env.GITHUB_ACTIONS = previous; });
+  await assert.rejects(ci.main(['summary', '', '', 'target/no-plan']), /Upstream build did not publish/);
+  await assert.rejects(ci.main(['run', '0', 'bad', 'block', 'target/no-plan']), /Upstream build did not publish/);
 });
 test('same-run mixed attempts retain successes and require the actual latest attempt per block', t => {
   actions(t); const plan = fixture(), {jobs, results} = receipts(plan);
@@ -106,7 +149,7 @@ test('CI jobs keep runtime Cargo-free, independent build inputs and non-cancelli
     const tail = workflow.split(`\n  ${id}:\n`)[1]; assert(tail, id);
     return tail.split(/\n  [a-z][a-z0-9-]*:\n/)[0];
   }
-  for (const id of ['test-blocks', 'e2e-blocks', 'test-doctests', 'test-ssh']) {
+  for (const id of ['test-blocks', 'test-blocks-2', 'e2e-blocks', 'e2e-blocks-2', 'test-doctests', 'test-ssh']) {
     const source = job(id); assert.match(source, /timeout-minutes: 10/);
     assert.doesNotMatch(source, /cargo (test|build)|continue-on-error/);
     assert.match(source, /BAMBOO_BLOCK_STARTED_AT/); assert.match(source, /command: run/);

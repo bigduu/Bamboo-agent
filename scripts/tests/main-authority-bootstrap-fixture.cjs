@@ -80,11 +80,26 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
   ].map((p, index) => ({...p, schema: 'bamboo-ci-test-plan/v1', sha: snapshot,
     tree: git('rev-parse', `${source}^{tree}`), producerAttempt: 1, planId: 900 + index,
     planKey: createHash('sha256').update(p.profile).digest('hex')}))
+  if (options.inventoryFixture) {
+    const actual = JSON.parse(require('node:zlib').gunzipSync(fs.readFileSync(options.inventoryFixture)))
+    const blocks = require('../test-groups-ci.cjs').makeBlocks(actual)
+    Object.assign(plans[1], {inventory: 12397, packages: [...new Set(blocks.map(b => b.package))].sort(),
+      blocks: blocks.map(b => ({id: b.id, package: b.package, kind: b.kind, matrixFamily: b.matrixFamily,
+        count: b.names.length, ignored: b.commands.reduce((n, c) => n + c.ignored, 0), timeoutSeconds: b.timeoutSeconds}))})
+  }
+  for (const plan of plans) {
+    const runtime = plan.blocks.filter(b => b.kind !== 'doctest'), split = Math.ceil(runtime.length / 2)
+    runtime.forEach((b, i) => { b.matrixFamily = i < split ? 1 : 2 })
+    plan.blocks.filter(b => b.kind === 'doctest').forEach(b => { b.matrixFamily = 1 })
+  }
   const blockName = (plan, block) => plan.profile === 'ssh-live' ? 'Test SSH'
-    : `${plan.label} ${block.kind === 'doctest' ? 'Doctest' : 'Block'} (${block.id})`
-  const groupedNames = plans.flatMap(p => [p.label + ' Build', ...p.blocks.map(b => blockName(p, b))])
+    : `${plan.label} ${block.kind === 'doctest' ? 'Doctest' : 'Block' + (block.matrixFamily === 2 ? ' 2' : '')} (${block.id})`
+  const emptyNames = plans.filter(p => p.profile !== 'ssh-live' && !p.blocks.some(b => b.kind !== 'doctest' && b.matrixFamily === 2))
+    .map(p => p.label + ' Block 2 (${{ matrix.id }})')
+  const groupedNames = [...plans.flatMap(p => [p.label + ' Build', ...p.blocks.map(b => blockName(p, b))]), ...emptyNames]
   const mainSkipped = ['Test Build', 'E2E Build', 'Test SSH Build', 'Test SSH',
-    'Test Block (${{ matrix.id }})', 'E2E Block (${{ matrix.id }})', 'Test Doctest (${{ matrix.id }})']
+    'Test Block (${{ matrix.id }})', 'E2E Block (${{ matrix.id }})', 'Test Doctest (${{ matrix.id }})',
+    'Test Block 2 (${{ matrix.id }})', 'E2E Block 2 (${{ matrix.id }})']
   const jobs = (id, promotion) => ({ jobs: (!promotion && producer === 'v3'
     ? ['Validation Source', 'Test', 'Main Release Admission', 'Quick Checks', 'Promotion Source',
       'E2E Tests', 'Lint', 'MSRV (Rust 1.95)', 'Security Audit', 'cargo-deny (licenses/bans/advisories/sources)',
@@ -92,8 +107,8 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
     : [...FULL, ...(producer === 'v3' ? groupedNames : []), ...(promotion ? [...PLATFORMS, 'Promotion Source'] : [])]).map((name, i) => ({
     id: id * 100 + i, name, run_id: id, run_attempt: 1,
     head_sha: promotion ? head : source, head_branch: promotion ? release : 'main',
-    steps, status: 'completed', conclusion: !promotion && producer === 'v3'
-      && !['Validation Source', 'Test', 'Main Release Admission'].includes(name) ? 'skipped' : 'success',
+    steps, status: 'completed', conclusion: (promotion && producer === 'v3' && emptyNames.includes(name)) ||
+      (!promotion && producer === 'v3' && !['Validation Source', 'Test', 'Main Release Admission'].includes(name)) ? 'skipped' : 'success',
     completed_at: '2026-10-20T02:59:00Z' })) })
   const commitObject = (sha) => ({ sha, tree: { sha: git('rev-parse', `${sha}^{tree}`) },
     parents: git('show', '-s', '--format=%P', sha).split(' ').map(sha => ({ sha })) })
@@ -139,7 +154,8 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
       if (job.name === (plan.profile === 'all-features' ? 'E2E Tests' : 'Test')) raw += recordLog('GROUPED_TEST_SUMMARY', {
         planKey: plan.planKey, profile: plan.profile, sha: plan.sha, tree: plan.tree,
         inventory: plan.inventory, doctests: plan.doctests, blocks: plan.blocks.length, status: 'passed',
-        counts: {passed: plan.inventory + plan.doctests, failed: 0, ignored: 0}})
+        counts: {passed: plan.inventory + plan.doctests - plan.blocks.reduce((n, b) => n + b.ignored, 0),
+          failed: 0, ignored: plan.blocks.reduce((n, b) => n + b.ignored, 0)}})
     }
     if (raw) routes[`actions/jobs/${job.id}/logs`] = {raw}
   }
@@ -152,7 +168,7 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
   const bin = path.join(directory, 'bin')
   fs.mkdirSync(bin)
   fs.writeFileSync(path.join(bin, 'gh'), `#!/usr/bin/env python3
-import json, os, pathlib, subprocess, sys
+import json, os, pathlib, re, subprocess, sys
 if 'graphql' in sys.argv:
     # Only this fixed read query and the server-recorded suite ID are accepted.
     assert sys.argv[:5] == ['' + sys.argv[0], 'api', '--hostname', 'github.com', 'graphql']
@@ -179,10 +195,16 @@ if route.startswith('compare/'):
     print(json.dumps({'base_commit': {'sha': source}, 'merge_base_commit': {'sha': base},
       'status': 'identical' if source == target else 'ahead' if base == source else 'diverged'}))
 else:
-    assert route in rows, 'Unexpected route: ' + route
-    value = rows[route]
+    page = re.search(r'([?&])per_page=100&page=([0-9]+)$', route)
+    canonical = re.sub(r'page=[0-9]+$', 'page=1', route) if page else route
+    lookup = canonical if page and canonical in rows and isinstance(rows[canonical], dict) and 'jobs' in rows[canonical] else route
+    assert lookup in rows, 'Unexpected route: ' + route
+    value = rows[lookup]
     if isinstance(value, dict) and 'sequence' in value:
         value = value['sequence'][min(previous.count(route), len(value['sequence']) - 1)]
+    if page and isinstance(value, dict) and 'jobs' in value:
+        start = (int(page.group(2)) - 1) * 100
+        value = dict(value, jobs=value['jobs'][start:start + 100])
     print(value['raw'] if isinstance(value, dict) and 'raw' in value else json.dumps(value), end='\\n')
 `, { mode: 0o755 })
   const calls = path.join(directory, 'calls')
@@ -229,7 +251,7 @@ with patch('subprocess.check_output', output):
       FIXTURE_CALLS: calls, FIXTURE_ROUTES: routeFile, FIXTURE_REPOSITORY: directory, ...environment } })
     return { ...result, output: fs.readFileSync(output, 'utf8'), calls: fs.readFileSync(calls, 'utf8') }
   }
-  if (options.exercise) return options.exercise({run, base, source, head, controller})
+  if (options.exercise) return options.exercise({run, base, source, head, controller, plans, blockName})
   const empty = x => {
     x.routes['actions/runs/222'].pull_requests = []
     x.routes[`actions/workflows/ci.yml/runs?event=pull_request&head_sha=${head}&per_page=100&page=1`].workflow_runs[0].pull_requests = []

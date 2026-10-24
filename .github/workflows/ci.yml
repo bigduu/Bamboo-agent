@@ -93,7 +93,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "f533b31b001d3a261cf86369e2eebc464b343b21100066e04429ded192f8b1fc"
+          ADMISSION_HELPER_SHA256: "f0d12ee0b016d6403f448ee7d732706daeddbd83127c4e6a3c19535de3eed578"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -241,7 +241,7 @@ jobs:
       actions: read
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
-    needs: [validation-source, main-release-admission, test-build, test-blocks, test-doctests, test-ssh-build, test-ssh]
+    needs: [validation-source, main-release-admission, test-build, test-blocks, test-blocks-2, test-doctests, test-ssh-build, test-ssh]
     # A source-gate failure must fail required Test, never turn it into a skip.
     if: always() && !cancelled()
     runs-on: ubuntu-latest
@@ -413,6 +413,8 @@ jobs:
       plan_id: ${{ steps.compile.outputs.plan_id }}
       plan_key: ${{ steps.compile.outputs.plan_key }}
       blocks: ${{ steps.compile.outputs.blocks }}
+      blocks_2: ${{ steps.compile.outputs.blocks_2 }}
+      has_blocks_2: ${{ steps.compile.outputs.has_blocks_2 }}
       docs: ${{ steps.compile.outputs.docs }}
       has_docs: ${{ steps.compile.outputs.has_docs }}
       node: ${{ steps.compile.outputs.node }}
@@ -468,6 +470,8 @@ jobs:
       plan_id: ${{ steps.compile.outputs.plan_id }}
       plan_key: ${{ steps.compile.outputs.plan_key }}
       blocks: ${{ steps.compile.outputs.blocks }}
+      blocks_2: ${{ steps.compile.outputs.blocks_2 }}
+      has_blocks_2: ${{ steps.compile.outputs.has_blocks_2 }}
       docs: ${{ steps.compile.outputs.docs }}
       has_docs: ${{ steps.compile.outputs.has_docs }}
       node: ${{ steps.compile.outputs.node }}
@@ -566,8 +570,57 @@ jobs:
     timeout-minutes: 10
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix: ${{ fromJSON(needs.test-build.outputs.blocks) }}
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
+    steps:
+      - name: Start the cumulative block budget
+        shell: bash
+        run: echo "BAMBOO_BLOCK_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.test-build.outputs.node }}
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install artifact transport
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/ci-artifacts
+      - name: Execute one source-bound crate block
+        env:
+          PLAN_ID: ${{ needs.test-build.outputs.plan_id }}
+          PLAN_KEY: ${{ needs.test-build.outputs.plan_key }}
+          BLOCK_ID: ${{ matrix.id }}
+        uses: ./.github/actions/grouped-tests
+        with:
+          command: run
+          plan-id: ${{ env.PLAN_ID }}
+          plan-key: ${{ env.PLAN_KEY }}
+          block-id: ${{ env.BLOCK_ID }}
+          directory: target/ci-blocks/${{ matrix.id }}
+      - name: Preserve partial block failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: partial-default-${{ matrix.id }}-${{ github.run_attempt }}
+          path: |
+            target/ci-blocks/${{ matrix.id }}/logs/
+            /tmp/bamboo-1481-ticket-lifecycle-*/host/host.log
+            /tmp/bamboo-1481-ticket-lifecycle-*/host/question-readiness.json
+            /tmp/bamboo-1754-required-packet-*/host.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  test-blocks-2:
+    name: Test Block 2 (${{ matrix.id }})
+    needs: [validation-source, test-build]
+    if: needs.validation-source.outputs.full == 'true' && needs.test-build.result == 'success' && needs.test-build.outputs.has_blocks_2 == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.test-build.outputs.blocks_2) }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
     steps:
@@ -615,8 +668,57 @@ jobs:
     timeout-minutes: 10
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix: ${{ fromJSON(needs.e2e-build.outputs.blocks) }}
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-all-features
+    steps:
+      - name: Start the cumulative block budget
+        shell: bash
+        run: echo "BAMBOO_BLOCK_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.e2e-build.outputs.node }}
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install artifact transport
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/ci-artifacts
+      - name: Execute one source-bound crate block
+        env:
+          PLAN_ID: ${{ needs.e2e-build.outputs.plan_id }}
+          PLAN_KEY: ${{ needs.e2e-build.outputs.plan_key }}
+          BLOCK_ID: ${{ matrix.id }}
+        uses: ./.github/actions/grouped-tests
+        with:
+          command: run
+          plan-id: ${{ env.PLAN_ID }}
+          plan-key: ${{ env.PLAN_KEY }}
+          block-id: ${{ env.BLOCK_ID }}
+          directory: target/ci-blocks/${{ matrix.id }}
+      - name: Preserve partial block failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: partial-all-features-${{ matrix.id }}-${{ github.run_attempt }}
+          path: |
+            target/ci-blocks/${{ matrix.id }}/logs/
+            /tmp/bamboo-1481-ticket-lifecycle-*/host/host.log
+            /tmp/bamboo-1481-ticket-lifecycle-*/host/question-readiness.json
+            /tmp/bamboo-1754-required-packet-*/host.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  e2e-blocks-2:
+    name: E2E Block 2 (${{ matrix.id }})
+    needs: [validation-source, e2e-build]
+    if: needs.validation-source.outputs.full == 'true' && needs.e2e-build.result == 'success' && needs.e2e-build.outputs.has_blocks_2 == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.e2e-build.outputs.blocks_2) }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-all-features
     steps:
@@ -834,7 +936,7 @@ jobs:
 
   e2e-test:
     name: E2E Tests
-    needs: [validation-source, e2e-build, e2e-blocks]
+    needs: [validation-source, e2e-build, e2e-blocks, e2e-blocks-2]
     if: always() && !cancelled() && needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     permissions:
