@@ -93,7 +93,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "3c34f4125129fbeea199e7a826b29cb523593b513df32cc2479ebe5e8a010e68"
+          ADMISSION_HELPER_SHA256: "4b26870d8c3a978c9fab601182a8d4074ecfc3f12a3cb2840cde93e548cd0400"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -678,8 +678,8 @@ jobs:
             -A dead-code
 
   build:
-    name: Build (${{ matrix.os }})
-    # Integration work is validated on Linux. The release-grade platform
+    name: Platform Tests (${{ matrix.os }})
+    # Integration work is validated on Linux. The native platform test
     # matrix is reserved for this repository's frozen release branches to main;
     # workflow_dispatch remains an explicit escape hatch for manual validation.
     needs: validation-source
@@ -725,7 +725,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-build-${{ matrix.os }}
-          # Promotion builds do not run on main pushes; retain warm caches within
+          # Platform tests do not run on main pushes; retain warm caches within
           # a live promotion PR and permit manual runs on main to seed its base.
           save-if: ${{ ((github.event_name == 'pull_request' && github.base_ref == 'main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
@@ -737,9 +737,6 @@ jobs:
 
       - name: Verify portable Skill read Tool
         run: cargo test --locked --no-fail-fast -p bamboo-server-tools skill_runtime::catalog_tests -- --test-threads=1
-
-      - name: Build
-        run: cargo build --release --verbose
 
       - name: Verify portable frontend package contract
         if: runner.os != 'Linux'

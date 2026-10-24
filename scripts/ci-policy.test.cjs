@@ -281,28 +281,29 @@ test("promotion retains required checks without repeating platform coverage", ()
   assert.match(tls, /if: runner\.os == 'Windows'\n        run: cargo test --locked --no-fail-fast -p bamboo-server --lib server::tls::tests/u)
 
   const build = job("build")
-  assert.match(build, /name: Build \(\$\{\{ matrix\.os \}\}\)\n/u)
+  assert.match(build, /name: Platform Tests \(\$\{\{ matrix\.os \}\}\)\n/u)
   assert.match(build, /os: \[ubuntu-latest, macos-latest, windows-latest\]/u)
-  assert.match(build, /run: cargo build --release --verbose\n/u)
+  assert.doesNotMatch(workflow, /cargo build[^\n]*--release/u)
   const sourceStep = build.indexOf("- name: Verify portable Skill source publication")
   const selectedStep = build.indexOf("- name: Verify portable selected Skill source")
   const readToolStep = build.indexOf("- name: Verify portable Skill read Tool")
-  const releaseStep = build.indexOf("- name: Build\n")
-  assert.ok(sourceStep >= 0 && selectedStep > sourceStep && releaseStep > selectedStep)
+  const frontendStep = build.indexOf("- name: Verify portable frontend package contract")
+  assert.ok(sourceStep >= 0 && selectedStep > sourceStep && frontendStep > selectedStep)
+  assert.match(build, /run: cargo test --locked --no-fail-fast -p bamboo-skills progressive::source_tests -- --test-threads=1\n/u)
   assert.match(build, /run: cargo test --locked --no-fail-fast -p bamboo-skills progressive::read_tests -- --test-threads=1\n/u)
   assert.equal((workflow.match(/progressive::read_tests/gu) || []).length, 1)
-  assert.ok(readToolStep > selectedStep && readToolStep < releaseStep)
+  assert.ok(readToolStep > selectedStep && readToolStep < frontendStep)
   assert.match(build, /run: cargo test --locked --no-fail-fast -p bamboo-server-tools skill_runtime::catalog_tests -- --test-threads=1\n/u)
   assert.equal((workflow.match(/skill_runtime::catalog_tests/gu) || []).length, 1)
   assert.doesNotMatch(job("test"), /Verify portable Skill read Tool/u)
 
   assert.match(
     build,
-    /- name: Test frontend artifact and release policies\n        if: runner\.os != 'Linux'\n/u,
+    /- name: Test frontend artifact and release policies\n        if: runner\.os != 'Linux'\n        run: node --test scripts\/lotus-next-artifact.test.cjs scripts\/release-frontend-policy.test.cjs\n/u,
   )
   assert.match(
     build,
-    /- name: Verify portable frontend package contract\n        if: runner\.os != 'Linux'\n/u,
+    /- name: Verify portable frontend package contract\n        if: runner\.os != 'Linux'\n        run: cargo test --locked --no-fail-fast -p bamboo-server --test frontend_build_contract\n/u,
   )
 })
 
@@ -364,7 +365,7 @@ test("expensive validation jobs stay off dev pull requests", () => {
   }
 })
 
-test("main promotion and manual build policy stays intact", () => {
+test("main promotion and manual native platform test policy stays intact", () => {
   const promotion = job("promotion-source")
   assert.match(promotion, /github\.base_ref == 'main'/u)
   assert.match(promotion, /HEAD_REF.*github\.head_ref/u)
@@ -414,7 +415,7 @@ test("frozen promotion bootstrap is read-only and leaves merge-tree validation i
   for (const id of ["test", "test-crates", "e2e-crates", "test-ssh", "lint", "build"]) {
     assert.match(job(id), /- uses: actions\/checkout@v7\n(?:        if: github.event_name != 'push'\n)?/u)
   }
-  for (const context of ["Promotion Source", "Test", "Lint", "E2E Tests", "Build (${{ matrix.os }})"]) {
+  for (const context of ["Promotion Source", "Test", "Lint", "E2E Tests", "Platform Tests (${{ matrix.os }})"]) {
     assert.ok(workflow.includes(`name: ${context}\n`), `retain required context: ${context}`)
   }
   assert.match(contributing, /dev → release\/<40-character-cut-SHA> → main/u)
