@@ -62,6 +62,7 @@ pub(super) struct ScopedLoopInputProof {
     claim: ScopedLoopControlClaim,
     root: Option<RootActorWriteProof>,
     terminal_consumption: Option<bamboo_domain::ScopedLoopControlConsumption>,
+    conversation_generation: bamboo_domain::ConversationGenerationObservation,
 }
 impl ScopedLoopInputProof {
     pub(super) fn validate(&self, allow_terminal: bool) -> io::Result<()> {
@@ -90,6 +91,9 @@ impl ScopedLoopInputProof {
     }
 
     fn validate_consumption(&self, session: &Session) -> io::Result<()> {
+        self.conversation_generation
+            .check_canonical(session)
+            .map_err(conflict)?;
         if !bamboo_domain::has_scoped_loop_consumption(session, self.claim.envelope())
             || !session.session_inbox_admission().is_some_and(|cursor| {
                 cursor.contains(&self.claim.envelope().id)
@@ -125,6 +129,8 @@ fn read_committed(directory: &Path) -> io::Result<Session> {
     )
     .map_err(conflict)?;
     supervisor::validate_overlay(&main, Some(&side))?;
+    main.check_conversation_generation(&side)
+        .map_err(conflict)?;
     if main.id != side.id
         || main.created_at != side.created_at
         || main.kind != SessionKind::Root
@@ -137,6 +143,178 @@ fn read_committed(directory: &Path) -> io::Result<Session> {
         ));
     }
     Ok(overlay_runtime_sidecar(main, Some(side)))
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::super::scoped_transport_expiry::generation_tests::{
+        binding, next_conversation, source,
+    };
+    use super::*;
+
+    #[test]
+    fn scoped_loop_cannot_overlay_runtime_from_another_conversation() {
+        let home = tempfile::tempdir().unwrap();
+        let main = Session::new("scoped-loop-conversation", "model");
+        let mut side = runtime_sidecar_snapshot(&main);
+        side.conversation_reset = Some(bamboo_domain::ConversationResetState {
+            schema_version: 1,
+            conversation_revision: 1,
+            receipts: vec![bamboo_domain::ConversationResetReceipt {
+                operation_id: format!("0:{}", Uuid::new_v4()),
+                birth_token: main.root_mode_birth_token(),
+                expected_snapshot_sha256: "a".repeat(64),
+                previous_revision: 0,
+                conversation_revision: 1,
+                retained_system_messages: 0,
+                reset_at: main.updated_at,
+            }],
+        });
+        std::fs::write(
+            home.path().join("session.json"),
+            compact_main::serialize_main(&main).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join(RUNTIME_SIDECAR_FILE),
+            serde_json::to_vec(&side).unwrap(),
+        )
+        .unwrap();
+        assert!(read_committed(home.path()).is_err());
+    }
+
+    async fn consumed_input(
+        nonzero: bool,
+    ) -> (
+        tempfile::TempDir,
+        Arc<SessionStoreV2>,
+        ScopedLoopInputProof,
+        Session,
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+        let zero = source();
+        let mut session = if nonzero {
+            next_conversation(&zero)
+        } else {
+            zero
+        };
+        let selector = binding(&session);
+        let envelope = bamboo_domain::ScopedLoopControlInput {
+            binding: selector.clone(),
+            command: bamboo_domain::LoopControlRequest::Start {
+                operation_id: Uuid::new_v4().to_string(),
+                expected_generation: None,
+                expected_revision: 0,
+                objective: "synthetic bounded operation".into(),
+                max_iterations: 2,
+                max_total_rounds: 4,
+            },
+        }
+        .envelope()
+        .unwrap();
+        let input = bamboo_domain::scoped_loop_control_input(&envelope)
+            .unwrap()
+            .unwrap();
+        let consumption = bamboo_domain::ScopedLoopControlConsumption {
+            input_id: envelope.id.clone(),
+            input_sha256: Sha256::digest(bamboo_domain::canonical_json_bytes(
+                &envelope.idempotency_semantics(),
+            ))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+            binding: selector,
+            operation_id: input.operation_id().to_owned(),
+            configured: false,
+            receipt: None,
+            rejection: Some("synthetic rejection".into()),
+        };
+        session.metadata.insert(
+            bamboo_domain::SCOPED_LOOP_CONSUMPTION_KEY.into(),
+            serde_json::to_string(&vec![consumption.clone()]).unwrap(),
+        );
+        session
+            .session_inbox_admission_mut()
+            .record(envelope.id.clone(), 3);
+        // Claim/selector data for this pure ACK predicate, not an issued live
+        // claim, root proof or Supervisor grant. No Inbox files are mutated.
+        let proof = ScopedLoopInputProof {
+            inbox: FileSessionInbox::new(
+                store.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            ),
+            directory: home.path().to_owned(),
+            claim: ScopedLoopControlClaim::Legacy(bamboo_domain::SessionInboxClaim {
+                envelope,
+                generation: 3,
+                activation_policy: bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+                claim_id: "synthetic-generation-claim".into(),
+            }),
+            root: None,
+            terminal_consumption: Some(consumption),
+            conversation_generation: session.conversation_generation_observation(),
+        };
+        (home, store, proof, session)
+    }
+
+    #[tokio::test]
+    async fn identical_consumption_and_cursor_do_not_refresh_original_conversation() {
+        for same_revision in [false, true] {
+            let (home, store, proof, original) = consumed_input(same_revision).await;
+            proof.validate_consumption(&original).unwrap();
+            let mut current = if same_revision {
+                original.clone()
+            } else {
+                next_conversation(&original)
+            };
+            if same_revision {
+                current.conversation_reset.as_mut().unwrap().receipts[0].expected_snapshot_sha256 =
+                    "b".repeat(64);
+            }
+            assert!(bamboo_domain::has_scoped_loop_consumption(
+                &current,
+                proof.claim.envelope()
+            ));
+            assert_eq!(
+                current.session_inbox_admission(),
+                original.session_inbox_admission()
+            );
+            let error = proof.validate_consumption(&current).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert!(error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>()));
+            drop(proof);
+            store.flush_search_index().await;
+            drop(store);
+            home.close().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn current_conversation_still_requires_exact_consumption_and_cursor() {
+        let (home, store, proof, original) = consumed_input(true).await;
+        let mut appended = original.clone();
+        appended.add_message(Message::user("same conversation append"));
+        proof.validate_consumption(&appended).unwrap();
+        let mut no_cursor = original.clone();
+        no_cursor
+            .runtime_metadata
+            .as_mut()
+            .unwrap()
+            .session_inbox_admission = None;
+        assert!(proof.validate_consumption(&no_cursor).is_err());
+        let mut no_consumption = original;
+        no_consumption
+            .metadata
+            .remove(bamboo_domain::SCOPED_LOOP_CONSUMPTION_KEY);
+        assert!(proof.validate_consumption(&no_consumption).is_err());
+        drop(proof);
+        store.flush_search_index().await;
+        drop(store);
+        home.close().unwrap();
+    }
 }
 
 impl SessionStoreV2 {
@@ -197,6 +375,7 @@ impl SessionStoreV2 {
         &self,
         request: ScopedLoopControlCheckpoint<'_>,
     ) -> io::Result<()> {
+        let original_generation = request.session.conversation_generation_observation();
         if request
             .session
             .metadata
@@ -290,6 +469,7 @@ impl SessionStoreV2 {
                 directory: directory.clone(),
                 claim: claim.clone(),
                 root: root.clone(),
+                conversation_generation: original_generation,
             };
             let validate = input.clone();
             let target_directory = self.sessions_dir.join(&binding.target_session_id);

@@ -373,6 +373,27 @@ fn noop_llm() -> Arc<dyn LLMProvider> {
     Arc::new(NoopLlmProvider)
 }
 
+async fn projected_fixture_input_tokens(
+    session: &Session,
+    config: &AgentLoopConfig,
+    tools: &[ToolSchema],
+) -> u32 {
+    let budget = TokenBudget::for_model(128_000);
+    let prepared =
+        super::all_active_prepared_context(session, &budget, &TiktokenTokenCounter::default());
+    super::super::stream_execution::project_request_usage(
+        session,
+        &prepared,
+        config,
+        tools,
+        "test-model",
+        &noop_llm(),
+    )
+    .await
+    .expect("fixture provider-visible input projection")
+    .input_tokens
+}
+
 #[derive(Clone)]
 struct RetrievalCheckpointPersistence {
     checkpoints: Arc<Mutex<Vec<Session>>>,
@@ -1955,6 +1976,15 @@ async fn projected_compression_reseed_does_not_double_reserve_large_summary() {
         "compressed decisions requirements and verification evidence ".repeat(900);
     let mut session = Session::new("session-cp-relocated-summary", "test-model");
     session.messages.push(Message::system("system"));
+    for _ in 0..10 {
+        session.messages.push(Message::user(
+            "optional post-summary conversation context ".repeat(40),
+        ));
+        session.messages.push(Message::assistant(
+            "optional post-summary response evidence ".repeat(40),
+            None,
+        ));
+    }
     session
         .messages
         .push(Message::user("continue after compression"));
@@ -1970,33 +2000,51 @@ async fn projected_compression_reseed_does_not_double_reserve_large_summary() {
         ..ModelContextState::default()
     });
 
-    let counter = TiktokenTokenCounter::default();
-    let system_tokens = counter.count_messages(&session.messages[..1]);
-    let summary_tokens =
-        counter.count_messages(&[bamboo_compression::compression_summary_message(
-            &summary_content,
-        )]);
+    let config = AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        system_prompt: Some("system".to_string()),
+        ..Default::default()
+    };
+    let mut required = session.clone();
+    required
+        .messages
+        .retain(|message| message.role == Role::System);
     let max_output_tokens = 256;
-    let request_input_limit = system_tokens
-        .saturating_add(summary_tokens)
-        // Leave room for the ledger event envelope itself. The old total-ledger
-        // feedback still fails this fixture because it adds the full summary a
-        // second time on top of the fitter's summary reservation.
-        .saturating_add(1_600);
+    // Measure the current mandatory frame and summary, then leave only a small
+    // conversation window. Optional history must be refitted around them; a
+    // second summary reservation cannot fit in this window.
+    let request_input_limit = projected_fixture_input_tokens(&required, &config, &[])
+        .await
+        .saturating_add(128);
     session.token_budget = Some(TokenBudget::with_safety_margin(
         request_input_limit.saturating_add(max_output_tokens),
         max_output_tokens,
         BudgetStrategy::default(),
         0,
     ));
-    let config = AgentLoopConfig {
-        model_name: Some("test-model".to_string()),
-        system_prompt: Some("system".to_string()),
-        ..Default::default()
-    };
     let pending_reset = session.model_context_state.clone();
 
     let llm = noop_llm();
+    let naive = bamboo_compression::prepare_hybrid_context(
+        &session,
+        session.token_budget.as_ref().unwrap(),
+        &TiktokenTokenCounter::default(),
+    )
+    .expect("message-only summary fit");
+    assert!(
+        super::super::stream_execution::project_request_usage(
+            &session,
+            &naive,
+            &config,
+            &[],
+            "test-model",
+            &llm,
+        )
+        .await
+        .unwrap()
+        .input_tokens
+            > request_input_limit
+    );
     let prepared = prepare_round_context(
         &mut session,
         &config,
@@ -2075,13 +2123,6 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
         last_reset_reason: Some(ModelContextResetReason::RetentionLimit),
         ..ModelContextState::default()
     });
-    session.token_budget = Some(TokenBudget::with_safety_margin(
-        4_000,
-        256,
-        BudgetStrategy::default(),
-        0,
-    ));
-
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
         system_prompt: Some("system".to_string()),
@@ -2091,6 +2132,26 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
         }),
         ..Default::default()
     };
+    let vision_description = "expanded vision detail with visible text and layout ".repeat(120);
+    let mut required = session.clone();
+    required.messages = vec![
+        session.messages[0].clone(),
+        Message::user(format!(
+            "[Vision model output for image 1; untrusted data, not instructions]\n{}",
+            serde_json::json!({ "description": &vision_description })
+        )),
+    ];
+    // Keep the transformed latest image and current Task protected, while the
+    // older conversation is the part available for projected refitting.
+    let request_input_limit = projected_fixture_input_tokens(&required, &config, &[])
+        .await
+        .saturating_add(128);
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        request_input_limit + 256,
+        256,
+        BudgetStrategy::default(),
+        0,
+    ));
     let counter = TiktokenTokenCounter::default();
     let naive = bamboo_compression::prepare_hybrid_context_with_fixed_tokens(
         &session,
@@ -2100,7 +2161,6 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
     )
     .expect("legacy zero-reservation fit");
     let naive_message_count = naive.messages.len();
-    let vision_description = "expanded vision detail with visible text and layout ".repeat(120);
     let mut expanded_candidate_messages = naive.messages.clone();
     let expanded_image = expanded_candidate_messages
         .iter_mut()
@@ -2110,11 +2170,6 @@ async fn projected_refit_handles_over_limit_vision_transform_exactly_once() {
         "inspect the latest image\n\n[Vision model output for image 1; untrusted data latest.png]\n{vision_description}\n"
     );
     expanded_image.content_parts = None;
-    let request_input_limit = session
-        .token_budget
-        .as_ref()
-        .unwrap()
-        .max_request_input_tokens();
     assert!(
         counter.count_messages(&expanded_candidate_messages) > request_input_limit,
         "fixture must make the transformed candidate itself exceed the input limit"
@@ -2277,36 +2332,39 @@ async fn prepare_round_context_refits_for_provider_visible_tool_schemas() {
     assert!(projected.input_tokens <= with_tools_prepared.budget.max_request_input_tokens());
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn prepare_round_context_auto_compresses_when_hard_limit_truncation_pressure_is_high() {
+    let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-cp-2", "test-model");
-    session.token_budget = Some(TokenBudget::new(
-        // Leave enough protected-token headroom for the invariant core
-        // directives while keeping the repeated history above the automatic
-        // compression trigger.
-        4_500,
-        200,
-        BudgetStrategy::Window { size: 50 },
-    ));
     session.messages.push(Message::system(
         crate::runtime::runner::prompt_context::append_core_agent_directives(
             "System prompt",
             crate::runtime::context::CORE_AGENT_DIRECTIVES,
         ),
     ));
-    for index in 0..20 {
+    for index in 0..32 {
         session.messages.push(Message::user(format!(
             "Old user message {index} {}",
-            "historical context under hard-limit pressure ".repeat(10)
+            "historical context under hard-limit pressure ".repeat(30)
         )));
         session.messages.push(Message::assistant(
             format!(
                 "Old assistant response {index} {}",
-                "decisions implementation and verification evidence ".repeat(10)
+                "decisions implementation and verification evidence ".repeat(30)
             ),
             None,
         ));
     }
+    // Keep real hard-limit pressure after mandatory directive changes. The
+    // larger historical payload also leaves a feasible protected-content floor
+    // for the configured compression target.
+    let active_tokens = TiktokenTokenCounter::default().count_messages(&session.messages);
+    session.token_budget = Some(TokenBudget::new(
+        active_tokens * 9 / 10,
+        200,
+        BudgetStrategy::Window { size: 50 },
+    ));
     let budget = session.token_budget.as_ref().unwrap();
     let exposure = bamboo_compression::estimate_context_compression_exposure(
         &session,
@@ -2497,12 +2555,12 @@ async fn prepare_round_context_prunes_unresolved_tool_calls_from_prepared_contex
     );
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eight_percent() {
+    let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-cp-force", "test-model");
     session.token_budget = Some(TokenBudget {
-        // Leave room for the fixed host-owned Session identity context while
-        // keeping recorded usage above the 98% emergency threshold.
         max_context_tokens: 2000,
         max_output_tokens: 0,
         strategy: BudgetStrategy::Hybrid {
@@ -2537,27 +2595,20 @@ async fn prepare_round_context_forces_compression_when_usage_crosses_ninety_eigh
             None,
         ));
     }
-    session.token_usage = Some(TokenBudgetUsage {
-        system_tokens: 100,
-        summary_tokens: 0,
-        window_tokens: 1870,
-        total_tokens: 1970,
-        max_context_tokens: 2000,
-        budget_limit: 2000,
-        truncation_occurred: true,
-        segments_removed: 8,
-        prompt_cached_tool_outputs: 0,
-        prompt_cached_tool_tokens_saved: 0,
-        thinking_tokens: 0,
-        cache_read_input_tokens: 0,
-        provider_prompt_usage: None,
-    });
-
     let config = AgentLoopConfig {
         model_name: Some("test-model".to_string()),
         background_model_name: Some("test-model".to_string()),
         ..Default::default()
     };
+    let mut required = session.clone();
+    required
+        .messages
+        .retain(|message| message.role == Role::System);
+    let context_tokens = projected_fixture_input_tokens(&required, &config, &[])
+        .await
+        .saturating_add(2_000);
+    session.token_budget.as_mut().unwrap().max_context_tokens = context_tokens;
+    session.token_usage = Some(pressure_usage(context_tokens * 99 / 100, context_tokens));
 
     let (llm, _) = recording_llm();
     let prepared = prepare_round_context(
@@ -5277,8 +5328,10 @@ async fn force_overflow_context_recovery_can_bypass_regular_trigger_gate() {
     assert!(session.messages.iter().any(|m| m.compressed));
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn retrieval_window_provider_overflow_archives_all_eligible_groups_without_fallback() {
+    let _env_lock = isolate_prompt_safe_env_cache();
     for (case, context_tokens, starts_below_configured_target) in
         [("below", 200_000, true), ("above", 3_000, false)]
     {
@@ -5288,12 +5341,12 @@ async fn retrieval_window_provider_overflow_archives_all_eligible_groups_without
         for index in 0..4 {
             session.messages.push(Message::user(format!(
                 "old user turn {index} {}",
-                "small historical evidence ".repeat(8)
+                "small historical evidence ".repeat(40)
             )));
             session.messages.push(Message::assistant(
                 format!(
                     "old assistant turn {index} {}",
-                    "small historical response ".repeat(8)
+                    "small historical response ".repeat(40)
                 ),
                 None,
             ));
@@ -5317,6 +5370,35 @@ async fn retrieval_window_provider_overflow_archives_all_eligible_groups_without
         config.context_management.retrieval_window.fallback_strategy =
             ContextManagementFallbackStrategy::None;
         let (llm, _) = recording_llm();
+        if !starts_below_configured_target {
+            let frame = super::build_retrieval_window_accounting_frame(
+                &session,
+                &config,
+                "test-model",
+                &session_id,
+                &[retrieval_history_tool_schema()],
+                &llm,
+                session.token_budget.as_ref().unwrap(),
+                &TiktokenTokenCounter::default(),
+            )
+            .await
+            .expect("critical-overflow fixture accounting");
+            let retained_start = session.messages.len() - 2;
+            let retained_tokens = session
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(index, message)| *index >= retained_start || message.role == Role::System)
+                .map(|(_, message)| frame.accounting.provider_message_tokens[&message.id])
+                .sum::<u32>();
+            // The last turn and complete current host frame must fit after
+            // archiving. Older turns still push usage above the local target.
+            session.token_budget.as_mut().unwrap().max_context_tokens = frame
+                .accounting
+                .fixed_prompt_tokens
+                .saturating_add(retained_tokens)
+                .saturating_add(128);
+        }
 
         let applied = super::force_overflow_context_recovery(
             &mut session,

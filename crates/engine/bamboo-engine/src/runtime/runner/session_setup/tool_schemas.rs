@@ -1,5 +1,7 @@
 use crate::runtime::config::AgentLoopConfig;
-use bamboo_agent_core::tools::{ToolExecutor, ToolSchema};
+use bamboo_agent_core::tools::{
+    FrameworkSessionToolKind as SessionToolKind, ToolExecutor, ToolSchema,
+};
 use bamboo_agent_core::Session;
 use bamboo_domain::{
     resolve_disabled_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
@@ -153,17 +155,25 @@ fn resolve_catalog_with_activation(
     }
 
     tool_schemas.extend(config.additional_tool_schemas.clone());
-    // Config registries may be shared by old and new Sessions. Only an actually
-    // installed, version-bound Host port contributes the new Root schema.
-    if session.independent_root_spawn_contract() {
-        tool_schemas.retain(|schema| schema.function.name != "spawn_session");
-        tool_schemas.extend(
+    // Names, shared registries and contract strings cannot supply framework
+    // schemas. Use the concrete Host instance for every installed Session port.
+    let framework = SessionToolKind::ALL
+        .into_iter()
+        .filter_map(|kind| {
             tools
-                .list_tools()
-                .into_iter()
-                .filter(|schema| schema.function.name == "spawn_session"),
-        );
-    }
+                .framework_session_tool_for_exact(kind.execution_name())
+                .filter(|proof| proof.kind() == kind && proof.is_current())
+                .map(|proof| (kind.execution_name(), proof))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    tool_schemas.retain(|schema| {
+        let name = schema.function.name.as_str();
+        !framework.contains_key(name)
+            && name != "spawn_session"
+            && !((session.model_orchestration_only_enabled() || session.kind == SessionKind::Child)
+                && SessionToolKind::from_execution_name(name).is_some())
+    });
+    tool_schemas.extend(framework.values().map(|proof| proof.schema()));
 
     tool_schemas.sort_by(|left, right| left.function.name.cmp(&right.function.name));
     tool_schemas.dedup_by(|left, right| left.function.name == right.function.name);
@@ -210,7 +220,7 @@ fn resolve_catalog_with_activation(
         // The guide shortener also canonicalizes legacy aliases internally.
         // Keep the complete Root contract instead of turning its description
         // back into the old Child-spawn guide through that compatibility path.
-        if session.independent_root_spawn_contract() && schema.function.name == "spawn_session" {
+        if schema.function.name == "spawn_session" {
             continue;
         }
         let guide_name = identity.alias_fallback_name();
@@ -234,14 +244,6 @@ fn resolve_catalog_with_activation(
                 schema.function.description,
             );
         }
-        for schema in tool_schemas
-            .iter_mut()
-            .filter(|schema| schema.function.name == "session_history")
-        {
-            schema.function.description = "Bounded history/metadata readback for this Supervisor or an explicitly attached independent Root in its current valid Project/lifetime scope. Use read_messages/get_meta. Global list/search is not available; use session_history_current for current-turn paging.".into();
-            schema.function.parameters["properties"]["action"]["enum"] =
-                serde_json::json!(["read_messages", "get_meta"]);
-        }
     }
 
     let mut by_execution_name = std::collections::BTreeMap::<String, ClassifiedToolSchema>::new();
@@ -260,9 +262,7 @@ fn resolve_catalog_with_activation(
     let disabled_execution_names = disabled_tools
         .iter()
         .filter_map(|reference| {
-            if session.independent_root_spawn_contract()
-                && bamboo_domain::independent_root_spawn_reference(reference)
-            {
+            if bamboo_domain::independent_root_spawn_reference(reference) {
                 bamboo_domain::resolve_session_tool_reference(
                     session.session_version,
                     reference,
@@ -411,7 +411,12 @@ mod live_disabled_tests {
         }
     }
 
-    fn offered(config: &AgentLoopConfig, tools: &TwoTools, session: &Session, name: &str) -> bool {
+    fn offered(
+        config: &AgentLoopConfig,
+        tools: &dyn ToolExecutor,
+        session: &Session,
+        name: &str,
+    ) -> bool {
         resolve_available_tool_schemas_for_session(config, tools, session)
             .iter()
             .any(|s| s.function.name == name)
@@ -650,21 +655,29 @@ mod live_disabled_tests {
         ));
     }
     struct VersionedCatalog {
-        v2: bool,
+        root_installed: bool,
     }
     #[async_trait::async_trait]
     impl ToolExecutor for VersionedCatalog {
         async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
             unreachable!()
         }
-        fn for_session(&self, session: &Session) -> Option<Arc<dyn ToolExecutor>> {
+        fn for_session(&self, _session: &Session) -> Option<Arc<dyn ToolExecutor>> {
             Some(Arc::new(Self {
-                v2: session.independent_root_spawn_contract(),
+                root_installed: self.root_installed,
             }))
+        }
+        fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+            self.owns_exact_tool(name)
+                .then_some(self as &dyn ToolExecutor)
+        }
+        fn local_execution_contract(&self, name: &str) -> Option<&'static str> {
+            (self.root_installed && name == "spawn_session")
+                .then_some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
         }
         fn list_tools(&self) -> Vec<ToolSchema> {
             let mut names = vec!["SubAgent", "session_control", "work_dispatch"];
-            if self.v2 {
+            if self.root_installed {
                 names.push("spawn_session");
             }
             names
@@ -679,9 +692,75 @@ mod live_disabled_tests {
     }
 
     #[test]
-    fn versioned_spawn_catalog_keeps_root_schema_separate_and_native_disabled_exact() {
+    fn fresh_spawn_catalog_does_not_promote_opaque_or_custom_canonical_names() {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
-        let tools = VersionedCatalog { v2: false };
+        struct Unproven(bool);
+        #[async_trait::async_trait]
+        impl ToolExecutor for Unproven {
+            async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
+                unreachable!()
+            }
+            fn list_tools(&self) -> Vec<ToolSchema> {
+                vec![schema("spawn_session")]
+            }
+            fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+                (self.0 && name == "spawn_session").then_some(self as &dyn ToolExecutor)
+            }
+        }
+        for version in [None, Some(1), Some(2)] {
+            for concrete in [false, true] {
+                let mut session = Session::new("unproven-root-name", "model");
+                session.session_version = version;
+                assert!(!offered(
+                    &AgentLoopConfig::default(),
+                    &Unproven(concrete),
+                    &session,
+                    "spawn_session"
+                ));
+            }
+            for ultra in [false, true] {
+                for supervisor in [false, true] {
+                    let mut session = Session::new(
+                        if supervisor {
+                            DEFAULT_SUPERVISOR_SESSION_ID
+                        } else {
+                            "contract-only-root-name"
+                        },
+                        "model",
+                    );
+                    session.session_version = version;
+                    session.set_root_orchestration_only(ultra).unwrap();
+                    if supervisor {
+                        session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                            incarnation_id: uuid::Uuid::new_v4(),
+                        };
+                    }
+                    assert!(!offered(
+                        &AgentLoopConfig::default(),
+                        &VersionedCatalog {
+                            root_installed: true
+                        },
+                        &session,
+                        "spawn_session"
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_spawn_catalog_keeps_root_schema_separate_and_native_disabled_exact() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let tools = crate::session_app::approval_replay::framework_fixture::FixtureTools::new(&[
+            "SubAgent",
+            "session_control",
+            "work_dispatch",
+            "spawn_session",
+        ]);
+        let expected = tools
+            .framework_session_tool_for_exact("spawn_session")
+            .expect("actual fixture Host instance")
+            .schema();
         for version in [None, Some(1), Some(2)] {
             for ultra in [false, true] {
                 for supervisor in [false, true] {
@@ -701,31 +780,43 @@ mod live_disabled_tests {
                         };
                     }
                     let config = AgentLoopConfig::default();
-                    let schemas =
-                        resolve_available_tool_schemas_for_session(&config, &tools, &session);
+                    let schemas = resolve_available_tool_schemas_for_session(
+                        &config,
+                        tools.as_ref(),
+                        &session,
+                    );
                     let root = schemas.iter().find(|s| s.function.name == "spawn_session");
-                    assert_eq!(root.is_some(), version == Some(2) && supervisor);
+                    assert!(root.is_some());
                     if let Some(root) = root {
-                        assert_eq!(
-                            root.function.description,
-                            "actual spawn_session owner contract"
-                        );
+                        assert_eq!(root.function.description, expected.function.description);
+                        assert_eq!(root.function.parameters, expected.function.parameters);
                     }
                     for reference in ["spawn_session", "spawnSession", "default::spawn_session"] {
                         let config = AgentLoopConfig {
                             disabled_tools: BTreeSet::from([reference.to_owned()]),
                             ..Default::default()
                         };
-                        let schemas =
-                            resolve_available_tool_schemas_for_session(&config, &tools, &session);
-                        assert!(schemas.iter().all(|s| s.function.name != "spawn_session"));
-                        assert_eq!(
-                            schemas.iter().any(|s| s.function.name == "SubAgent"),
-                            version == Some(2)
+                        let schemas = resolve_available_tool_schemas_for_session(
+                            &config,
+                            tools.as_ref(),
+                            &session,
                         );
+                        assert!(schemas.iter().all(|s| s.function.name != "spawn_session"));
+                        assert!(schemas.iter().any(|s| s.function.name == "SubAgent"));
                     }
                 }
             }
         }
+        let session = Session::new("no-root-port", "model");
+        let mut config = AgentLoopConfig::default();
+        config.additional_tool_schemas.push(schema("spawn_session"));
+        assert!(!offered(
+            &config,
+            &VersionedCatalog {
+                root_installed: false
+            },
+            &session,
+            "spawn_session"
+        ));
     }
 }

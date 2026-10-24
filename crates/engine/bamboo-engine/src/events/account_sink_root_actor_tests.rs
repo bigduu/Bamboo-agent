@@ -120,6 +120,7 @@ impl Fixture {
         RootActorRuntimeWrite {
             fence: activation.fence(),
             created_at: self.root.created_at,
+            conversation_generation: self.root.conversation_generation_observation(),
         }
     }
 

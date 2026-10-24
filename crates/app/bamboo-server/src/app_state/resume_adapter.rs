@@ -15,8 +15,10 @@ use bamboo_engine::model_config_helper::{
     GOLD_CONFIG_METADATA_KEY,
 };
 use bamboo_engine::session_app::approval_replay::{
-    apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
-    repark_permission_replay, restore_permission_replay_authorization,
+    apply_permission_replay_result, find_permission_replay_target,
+    refresh_retained_approval_replay_posture, repark_permission_replay,
+    resolve_permission_replay_owner, restore_permission_replay_authorization,
+    restore_permission_replay_caller, restore_permission_replay_execution,
     validate_permission_replay_authority, ApprovalReplayDecision, PermissionReplayTarget,
 };
 use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
@@ -31,7 +33,6 @@ use super::session_events::get_or_create_event_sender;
 use super::AppState;
 use crate::handlers::agent::execute::runtime::spawn_event_forwarder_with_root_actor;
 use crate::handlers::agent::execute::runtime::SpawnAgentExecution;
-use crate::handlers::agent::execute::spawn_agent_execution;
 
 /// Newtype wrapper that implements `ResumeExecutionPort`.
 ///
@@ -127,6 +128,31 @@ impl ResumeExecutionPort for AppStateResumeRef {
             execution_reservation.abandon().await;
             return;
         }
+
+        // Prepare the same execution-local Workspace bridge before response
+        // publication or approved-tool replay can produce side effects.
+        let workspace_agent = match self.0.workspace_handoffs.bind_legacy_execution(
+            &self.0.agent,
+            &session,
+            &execution_reservation,
+        ) {
+            Ok(agent) => agent,
+            Err(error) => {
+                tracing::warn!(%session_id, %error,
+                    "Root resume Workspace binding rejected before execution");
+                execution_reservation.abandon().await;
+                return;
+            }
+        };
+        let execution_binding = Some((
+            workspace_agent,
+            self.0
+                .tools_for(if session.kind == bamboo_agent_core::SessionKind::Child {
+                    crate::tools::ToolSurface::Child
+                } else {
+                    crate::tools::ToolSurface::Root
+                }),
+        ));
 
         let config_snapshot = self.0.config.read().await.clone();
         let model = session.model.clone();
@@ -293,7 +319,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 // the synchronous handoff to the spawned runner; the runner's
                 // first checkpoint durably acknowledges takeover.
                 consume_pending_clarification_resume(&mut session);
-                spawn_agent_execution(SpawnAgentExecution {
+                SpawnAgentExecution {
                     state: state.clone(),
                     session_id,
                     session,
@@ -314,7 +340,8 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     // Resume has no per-request override channel; the
                     // config-level default (issue #221) still applies.
                     run_budget: None,
-                });
+                }
+                .spawn_with_native_inputs(None, execution_binding);
                 return;
             }
             Some(id) => id,
@@ -342,7 +369,17 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 let tool_name = tool_call.function.name.clone();
                 let executor = state.tools_for(crate::tools::ToolSurface::Root);
                 let executor = executor.for_session(&session).unwrap_or(executor);
-                let replay_owner = executor.resolve_reference_for_session(&session, &tool_name);
+                let replay_owner = match resolve_permission_replay_owner(
+                    &session,
+                    &replay_target,
+                    executor.as_ref(),
+                ) {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        tracing::error!(%session_id, %error, "retained permission operation refused; pending markers preserved");
+                        return;
+                    }
+                };
                 if replay_owner.is_none() && reexecute_request_generation.is_some() {
                     tracing::error!(%session_id, %tool_name, "approved replay has no registered execution owner; markers retained");
                     return;
@@ -358,16 +395,38 @@ impl ResumeExecutionPort for AppStateResumeRef {
                         return;
                     }
                 };
+                let executing_caller = match restore_permission_replay_caller(
+                    &session,
+                    &replay_target,
+                ) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        tracing::error!(%session_id, %error, "original caller replay binding failed closed; markers preserved");
+                        return;
+                    }
+                };
+                let retained_execution = match restore_permission_replay_execution(
+                    &session,
+                    &replay_target,
+                    replay_owner.as_deref().unwrap_or(&tool_name),
+                ) {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        tracing::error!(%session_id, %error, "retained contract refused; markers preserved");
+                        return;
+                    }
+                };
                 let configured_mode = state
                     .permission_checker
                     .permission_config()
                     .map(|config| config.mode())
                     .unwrap_or_default();
-                let decision = match refresh_approval_replay_posture(
+                let decision = match refresh_retained_approval_replay_posture(
                     state.storage.as_ref(),
                     &mut session,
                     configured_mode,
                     replay_owner.as_deref(),
+                    retained_execution.as_ref(),
                 )
                 .await
                 {
@@ -468,7 +527,11 @@ impl ResumeExecutionPort for AppStateResumeRef {
                             session.id.as_str(),
                             reexecute_tool_call_id.as_str(),
                             reexecute_request_generation.as_deref(),
-                            executor.execute_exact_with_context_outcome(
+                            bamboo_agent_core::tools::with_retained_tool_execution(
+                                retained_execution,
+                                bamboo_agent_core::tools::with_executing_session_caller(
+                                executing_caller.map(std::sync::Arc::new),
+                                executor.execute_exact_with_context_outcome(
                                     &tool_call,
                                     replay_owner,
                                 bamboo_agent_core::tools::ToolExecutionContext {
@@ -491,6 +554,8 @@ impl ResumeExecutionPort for AppStateResumeRef {
                                     bash_completion_sink: None,
                                     pre_parsed_args: None,
                                 },
+                                ),
+                                ),
                             ),
                         )
                         .await.map(bamboo_agent_core::tools::ToolOutcome::into_tool_result);
@@ -634,7 +699,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
             }
 
             consume_pending_clarification_resume(&mut session);
-            spawn_agent_execution(SpawnAgentExecution {
+            SpawnAgentExecution {
                 state: state.clone(),
                 session_id,
                 session,
@@ -655,7 +720,8 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 // Resume has no per-request override channel; the
                 // config-level default (issue #221) still applies.
                 run_budget: None,
-            });
+            }
+            .spawn_with_native_inputs(None, execution_binding);
         });
     }
 }

@@ -44,8 +44,11 @@ impl MetricsService {
             .map(|session| session.id)
             .collect::<Vec<_>>();
 
-        self.storage
-            .reconcile_stale_executions(active_session_ids, &awaiting_response_session_ids)
+        // The collector also initializes storage and immediately schedules
+        // retention. Reconciliation must share that FIFO and await its result,
+        // rather than opening a competing startup connection to the same DB.
+        self.collector
+            .reconcile_startup(active_session_ids, &awaiting_response_session_ids)
             .await
     }
 
@@ -206,6 +209,72 @@ mod tests {
 
     use super::*;
     use crate::{ForwardStatus, RoundStatus, SessionStatus, TokenUsage};
+
+    async fn wait_for_storage_release(storage: &std::sync::Weak<SqliteMetricsStorage>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while storage.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted collector work must finish before fixture cleanup");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_reconciliation_waits_for_initialization_and_accepted_prefix() {
+        let directory = tempdir().expect("metrics tempdir");
+        let path = directory.path().join("metrics.db");
+        let storage = Arc::new(SqliteMetricsStorage::new(&path));
+        let weak = Arc::downgrade(&storage);
+        let collector = MetricsCollector::spawn(storage.clone(), 90);
+        let now = Utc::now();
+
+        // Queue real observations before the worker can initialize its DB.
+        collector.session_started("stale", "model", now);
+        collector.round_started("stale-round", "stale", "model", now);
+        collector.session_message_count("stale", 7, now);
+        collector.session_started("active", "model", now);
+        let service = MetricsService { storage, collector };
+        service
+            .reconcile_startup_sessions(std::iter::empty::<Session>(), &["active".to_owned()])
+            .await
+            .expect("startup reconciliation receipt");
+
+        drop(service);
+        wait_for_storage_release(&weak).await;
+        let reopened = SqliteMetricsStorage::new(&path);
+        let stale = reopened.session_detail("stale").await.unwrap().unwrap();
+        assert_eq!(stale.session.status, SessionStatus::Completed);
+        assert_eq!(stale.session.message_count, 7);
+        assert_eq!(stale.rounds.len(), 1);
+        assert_eq!(stale.rounds[0].status, RoundStatus::Error);
+        let active = reopened.session_detail("active").await.unwrap().unwrap();
+        assert_eq!(active.session.status, SessionStatus::Running);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_reconciliation_reports_collector_initialization_failure() {
+        let directory = tempdir().expect("metrics tempdir");
+        let blocked_parent = directory.path().join("blocked-parent");
+        let original = b"fixture parent is a file";
+        std::fs::write(&blocked_parent, original).unwrap();
+        let storage = Arc::new(SqliteMetricsStorage::new(blocked_parent.join("metrics.db")));
+        let weak = Arc::downgrade(&storage);
+        let collector = MetricsCollector::spawn(storage.clone(), 90);
+        let service = MetricsService { storage, collector };
+        let error = service
+            .reconcile_startup_sessions(std::iter::empty::<Session>(), &[])
+            .await
+            .expect_err("initialization failure cannot produce a successful receipt");
+        assert!(matches!(&error, MetricsError::Task(_)));
+        assert!(error
+            .to_string()
+            .contains("metrics collector initialization failed"));
+
+        drop(service);
+        wait_for_storage_release(&weak).await;
+        assert_eq!(std::fs::read(blocked_parent).unwrap(), original);
+    }
 
     #[tokio::test]
     async fn forward_daily_preserves_endpoint_and_model_filters() {

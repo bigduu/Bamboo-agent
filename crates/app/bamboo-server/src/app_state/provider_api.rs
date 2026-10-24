@@ -72,7 +72,7 @@ impl AppState {
         }
     }
 
-    /// Shut down Child runtimes and MCP servers gracefully.
+    /// Shut down Child runtimes, MCP servers and owned browsers gracefully.
     ///
     /// Sends shutdown signals to all running MCP server processes
     /// and waits for them to terminate cleanly.
@@ -85,10 +85,12 @@ impl AppState {
         // Stop the supervised MCP proxy service (issue #47) so its reconnect
         // supervisor exits cleanly instead of looping after an intended stop.
         self.mcp_proxy_shutdown.cancel();
+        self.tickets.shutdown_ready_worker().await;
         if let Err(error) = self.external_child_runner.shutdown().await {
             tracing::warn!(%error, "Child runtime shutdown did not complete cleanly");
         }
         self.mcp_manager.shutdown_all().await;
+        self.browser.shutdown().await;
         tracing::info!("MCP servers shut down complete");
     }
 

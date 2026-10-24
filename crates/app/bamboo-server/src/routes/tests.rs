@@ -857,6 +857,7 @@ async fn bamboo_v1_routes_resolve_under_both_canonical_and_legacy_prefix() {
     let relative_paths = [
         "/commands",
         "/bamboo/workflows",
+        "/bamboo/workflow-definitions/example?target=user",
         "/sessions/session/workflow-runs",
         "/sessions/session/workflow-runs/example",
         "/bamboo/setup/status",
@@ -1042,9 +1043,17 @@ async fn workflow_run_routes_are_blocked_by_the_same_access_middleware() {
         ("GET", "/api/v1/sessions/session/workflow-runs"),
         ("GET", "/api/v1/sessions/session/workflow-runs/example"),
         ("POST", "/v1/sessions/session/workflow-runs/example/cancel"),
+        ("POST", "/api/v1/bamboo/workflow-definitions"),
+        ("POST", "/v1/bamboo/workflow-definitions/validate"),
+        (
+            "GET",
+            "/api/v1/bamboo/workflow-definitions/example?target=user",
+        ),
+        ("PUT", "/v1/bamboo/workflow-definitions/example"),
     ] {
         let req = match method {
             "POST" => test::TestRequest::post(),
+            "PUT" => test::TestRequest::put(),
             _ => test::TestRequest::get(),
         }
         .uri(uri)

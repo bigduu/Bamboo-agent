@@ -155,6 +155,7 @@ pub(crate) fn make_disabled_filter_resolver(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
     args.spawn_with_inputs(None);
 }
@@ -162,6 +163,7 @@ pub(crate) fn spawn_agent_execution(args: SpawnAgentExecution) {
 impl SpawnAgentExecution {
     /// Separate untrusted transport parameter; the existing argument layout and
     /// ordinary spawner remain compatible and default to absence.
+    #[cfg(test)]
     pub(crate) fn spawn_with_inputs(
         self,
         inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,

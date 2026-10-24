@@ -152,7 +152,7 @@ pub fn init_from_env() -> Result<TelemetryGuard, TelemetryError> {
 pub(super) fn build_provider(
     config: &TelemetryConfig,
 ) -> Result<SdkTracerProvider, TelemetryError> {
-    use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig};
+    use opentelemetry_otlp::{Protocol, RetryPolicy, WithExportConfig, WithHttpConfig};
     use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, Sampler};
     use opentelemetry_sdk::Resource;
 
@@ -184,10 +184,11 @@ pub(super) fn build_provider(
                 .ok_or(TelemetryError::InvalidConfiguration)?,
         )
         .with_timeout(Duration::from_secs(1))
+        .with_retry_policy(RetryPolicy::disabled())
         .build()
         .map_err(|_| TelemetryError::ExporterInitialization)?;
-    // No retry feature: one bounded attempt, then drop. A collector outage
-    // must not backpressure execution or grow an unbounded queue.
+    // Retries are disabled explicitly: one bounded attempt, then drop. Collector
+    // outages must not backpressure execution or grow an unbounded queue.
     let processor = BatchSpanProcessor::builder(exporter)
         .with_batch_config(
             BatchConfigBuilder::default()

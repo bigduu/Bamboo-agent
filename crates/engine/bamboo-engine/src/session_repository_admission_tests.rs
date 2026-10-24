@@ -255,6 +255,23 @@ struct FaultyRootAdmissionStorage {
     fault: &'static str,
 }
 
+fn changed_generation(mut session: Session) -> Session {
+    session.conversation_reset = Some(bamboo_domain::ConversationResetState {
+        schema_version: 1,
+        conversation_revision: 1,
+        receipts: vec![bamboo_domain::ConversationResetReceipt {
+            operation_id: format!("0:{}", uuid::Uuid::new_v4()),
+            birth_token: session.root_mode_birth_token(),
+            expected_snapshot_sha256: "a".repeat(64),
+            previous_revision: 0,
+            conversation_revision: 1,
+            retained_system_messages: 0,
+            reset_at: session.updated_at,
+        }],
+    });
+    session
+}
+
 #[async_trait::async_trait]
 impl Storage for FaultyRootAdmissionStorage {
     fn supports_root_actor_runtime_write(&self) -> bool {
@@ -270,7 +287,12 @@ impl Storage for FaultyRootAdmissionStorage {
         self.inner.load_root_authority(id).await
     }
     async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
-        self.inner.load_session(id).await
+        let loaded = self.inner.load_session(id).await?;
+        Ok(if self.fault == "generation" {
+            loaded.map(changed_generation)
+        } else {
+            loaded
+        })
     }
     async fn load_execution_admission_snapshot(
         &self,
@@ -294,6 +316,7 @@ impl Storage for FaultyRootAdmissionStorage {
             "id" => loaded.id = "another-root".into(),
             "birth" => loaded.created_at += chrono::Duration::seconds(1),
             "kind" => loaded.kind = bamboo_domain::SessionKind::Child,
+            "generation" => loaded = changed_generation(loaded),
             _ => unreachable!(),
         }
         Ok(Some(loaded))
@@ -302,7 +325,7 @@ impl Storage for FaultyRootAdmissionStorage {
 
 #[tokio::test]
 async fn bound_root_admission_rejects_changed_identity_and_read_failures() {
-    for fault in ["id", "birth", "kind", "absent", "io"] {
+    for fault in ["id", "birth", "kind", "generation", "absent", "io"] {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
         let root = Session::new("bound-root-admission-fault", "model");
@@ -336,6 +359,16 @@ async fn bound_root_admission_rejects_changed_identity_and_read_failures() {
         if fault == "io" {
             assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         } else {
+            assert!(error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
+        }
+        if fault == "generation" {
+            let error = binding
+                .persistence
+                .load_runtime_session(&root.id)
+                .await
+                .expect_err("bound runtime read cannot adopt another conversation");
             assert!(error
                 .get_ref()
                 .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));

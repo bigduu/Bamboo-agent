@@ -203,6 +203,11 @@ async fn workflow_catalog_session_without_workspace_uses_global_snapshot() {
             .expect("app state"),
     );
     let session = bamboo_agent_core::Session::new("global-session", "test-model");
+    state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("persist catalog session authority");
     state.sessions.insert(
         session.id.clone(),
         std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
@@ -519,6 +524,11 @@ async fn assigned_project_workflow_catalog_reports_workspace_then_project_source
     let mut session = bamboo_agent_core::Session::new("project-workflow-session", "test-model");
     session.set_project_id_meta(project.id.to_string());
     session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("persist catalog session authority");
     state.sessions.insert(
         session.id.clone(),
         std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
@@ -1219,6 +1229,11 @@ async fn global_workflow_create_update_delete_is_immediate_in_cached_session_vie
     let mut workspace_session =
         bamboo_agent_core::Session::new("workspace-cache-session", "test-model");
     workspace_session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state
+        .storage
+        .save_session(&workspace_session)
+        .await
+        .expect("persist catalog session authority");
     state.sessions.insert(
         workspace_session.id.clone(),
         std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(workspace_session)),
@@ -1227,6 +1242,11 @@ async fn global_workflow_create_update_delete_is_immediate_in_cached_session_vie
         bamboo_agent_core::Session::new("project-cache-session", "test-model");
     project_session.set_project_id_meta(project.id.to_string());
     project_session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state
+        .storage
+        .save_session(&project_session)
+        .await
+        .expect("persist catalog session authority");
     state.sessions.insert(
         project_session.id.clone(),
         std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(project_session)),

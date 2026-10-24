@@ -731,7 +731,7 @@ fn section_id(name: &str) -> Result<bamboo_config::SectionId, AppError> {
         .ok_or_else(|| AppError::BadRequest("unknown configuration section".to_string()))
 }
 
-fn map_mutation_error(error: ConfigSectionMutationError) -> AppError {
+pub(crate) fn map_mutation_error(error: ConfigSectionMutationError) -> AppError {
     match error {
         ConfigSectionMutationError::Store(ConfigStoreError::Conflict { expected, actual }) => {
             AppError::ConfigConflict { expected, actual }

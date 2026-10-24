@@ -780,11 +780,13 @@ async fn seed_task_undo(
         version: super::RUNTIME_TASK_TRANSACTION_VERSION,
         transaction_id: uuid::Uuid::new_v4().to_string(),
         first: TaskControlPlaneUndo {
+            conversation_witness: Some(super::TaskConversationWitness::capture(&child).unwrap()),
             session_id: child.id,
             task_list: child.task_list,
             task_list_version: "1".into(),
         },
         second: TaskControlPlaneUndo {
+            conversation_witness: Some(super::TaskConversationWitness::capture(&root).unwrap()),
             session_id: root.id,
             task_list: root.task_list,
             task_list_version: "1".into(),

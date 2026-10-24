@@ -92,6 +92,8 @@ mod actor_snapshot_tests;
 mod actor_snapshot_windows_tests;
 #[cfg(test)]
 mod actor_transcript_tests;
+#[cfg(test)]
+mod browser_cleanup_observation_tests;
 mod child_actor_runtime;
 #[cfg(test)]
 mod child_actor_runtime_tests;
@@ -101,6 +103,7 @@ mod child_project;
 mod compact_main;
 #[cfg(test)]
 mod compact_main_tests;
+mod conversation_task_undo;
 mod default_actor_context;
 mod host_registry;
 mod root_actor_input;
@@ -125,8 +128,13 @@ mod parent_question_checkpoint;
 mod startup_sidecar_tests;
 #[cfg(test)]
 mod task_publication_lifetime_tests;
+use conversation_task_undo::TaskConversationWitness;
 use default_actor_context::DefaultWriterGuards;
 pub(crate) use default_actor_context::DefaultWriterPhysicalGuards;
+#[cfg(test)]
+mod conversation_generation_tests;
+pub(crate) mod host_root_create;
+pub(crate) mod host_session_scope;
 mod root_context;
 #[cfg(test)]
 mod root_context_tests;
@@ -279,7 +287,7 @@ const RUNTIME_SIDECAR_FILE: &str = "runtime.json";
 /// Filenames are random UUIDs; untrusted session ids are never used as paths.
 const RUNTIME_TASK_TRANSACTION_DIR: &str = ".runtime-task-transactions";
 const RUNTIME_TASK_TRANSACTION_LOCK_FILE: &str = ".runtime-task-transactions.lock";
-const RUNTIME_TASK_TRANSACTION_VERSION: u32 = 1;
+const RUNTIME_TASK_TRANSACTION_VERSION: u32 = 2;
 /// Private rollback markers for crash-safe session copies. A live `.json`
 /// marker means the copy has not crossed its success boundary yet, so startup
 /// must remove every target projection before exposing the store.
@@ -375,6 +383,8 @@ struct TaskControlPlaneUndo {
     session_id: String,
     task_list: Option<TaskList>,
     task_list_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_witness: Option<TaskConversationWitness>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,7 +395,7 @@ struct RuntimeTaskTransactionJournal {
     second: TaskControlPlaneUndo,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionCopyTransactionJournal {
     version: u32,
     transaction_id: String,
@@ -411,11 +421,14 @@ impl RuntimeTaskJournalMarkerState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SessionCopyJournalMarkerState {
     Prepared,
     Committing,
     Committed,
+    // The payload is transaction-owned staging. This phase must never revisit
+    // the canonical ID, even when staging cleanup already completed.
+    Deleting,
 }
 
 impl SessionCopyJournalMarkerState {
@@ -424,6 +437,7 @@ impl SessionCopyJournalMarkerState {
             Some("json") => Some(Self::Prepared),
             Some("committing") => Some(Self::Committing),
             Some("committed") => Some(Self::Committed),
+            Some("deleting") => Some(Self::Deleting),
             _ => None,
         }
     }
@@ -586,7 +600,27 @@ fn reject_incompatible_session_write(session: &Session) -> io::Result<()> {
             io::ErrorKind::Unsupported,
             bamboo_domain::SessionAuthorityConflict(error.to_string()),
         )
+    })?;
+    session.validate_conversation_state().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            bamboo_domain::SessionAuthorityConflict(error.to_string()),
+        )
     })
+}
+
+fn reject_conversation_generation_change(
+    incoming: &Session,
+    canonical: &Session,
+) -> io::Result<()> {
+    incoming
+        .check_conversation_generation(canonical)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                bamboo_domain::SessionAuthorityConflict(error.to_string()),
+            )
+        })
 }
 
 fn reject_session_version_change(incoming: &Session, durable: &Session) -> io::Result<()> {
@@ -1434,6 +1468,8 @@ pub struct SessionStoreV2 {
     /// the dedicated fs2 file lock covers independent store instances and
     /// processes sharing this Bamboo home.
     runtime_task_transaction_gate: std::sync::Arc<RwLock<()>>,
+    /// Empty unless a trusted Host explicitly installs a finite caller scope.
+    host_scope_registry: crate::host_session_scope::HostSessionScopeRegistry,
     /// When true, ordinary control-plane access fails closed until the retained
     /// undo journal has restored both sides of an interrupted transaction.
     runtime_task_recovery_required: AtomicBool,
@@ -1531,6 +1567,7 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     copy.observed_runtime_session_version = None;
     copy.authority_identity = SessionAuthorityIdentity::Ordinary;
     copy.supervisor_management = None;
+    copy.conversation_reset = None;
     copy.id = new_id.to_string();
     copy.kind = SessionKind::Root;
     copy.parent_session_id = None;
@@ -1767,6 +1804,7 @@ impl SessionStoreV2 {
             persistence_metrics,
             session_lifecycle_lock: std::sync::Arc::new(RwLock::new(())),
             runtime_task_transaction_gate: std::sync::Arc::new(RwLock::new(())),
+            host_scope_registry: crate::host_session_scope::HostSessionScopeRegistry::default(),
             runtime_task_recovery_required: AtomicBool::new(false),
             #[cfg(test)]
             runtime_task_faults: std::sync::Mutex::new(Vec::new()),
@@ -2385,6 +2423,20 @@ impl SessionStoreV2 {
     /// order. This publication precedes every public tree write, so an
     /// interrupted operation creates at most an unnecessary gap.
     async fn bump_actor_tree_revision(&self, root: &Session) -> io::Result<()> {
+        let (path, bytes) = self.prepare_actor_tree_revision(root).await?;
+        durable_atomic_write(&path, &bytes).await
+    }
+
+    async fn bump_actor_tree_revision_with_default_writer(
+        &self,
+        root: &Session,
+        guards: &Arc<DefaultWriterGuards>,
+    ) -> io::Result<()> {
+        let (path, bytes) = self.prepare_actor_tree_revision(root).await?;
+        self.write_default_bytes(&path, bytes, guards).await
+    }
+
+    async fn prepare_actor_tree_revision(&self, root: &Session) -> io::Result<(PathBuf, Vec<u8>)> {
         if root.kind != SessionKind::Root
             || (!root.root_session_id.is_empty() && root.id != root.root_session_id)
         {
@@ -2428,7 +2480,7 @@ impl SessionStoreV2 {
         }
         marker.project_id = normalized_project_id(root);
         let bytes = serde_json::to_vec(&marker).map_err(io::Error::other)?;
-        durable_atomic_write(&path, &bytes).await
+        Ok((path, bytes))
     }
 
     /// For a Root that is still invisible in a staging directory. The marker
@@ -3595,6 +3647,7 @@ impl SessionStoreV2 {
                 ),
             ));
         }
+        reject_conversation_generation_change(current, &main)?;
 
         let runtime_path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let _ = Self::runtime_task_recovery_real_file(&runtime_path).await?;
@@ -3622,6 +3675,7 @@ impl SessionStoreV2 {
                 main.kind,
                 &main.root_session_id,
             )?;
+            reject_conversation_generation_change(sidecar, &main)?;
             if sidecar.parent_session_id != main.parent_session_id
                 || sidecar.parent_created_at != main.parent_created_at
             {
@@ -3686,7 +3740,7 @@ impl SessionStoreV2 {
         path: &Path,
         journal: &RuntimeTaskTransactionJournal,
     ) -> io::Result<()> {
-        if journal.version != RUNTIME_TASK_TRANSACTION_VERSION {
+        if !matches!(journal.version, 1 | RUNTIME_TASK_TRANSACTION_VERSION) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -3718,6 +3772,16 @@ impl SessionStoreV2 {
                 io::ErrorKind::InvalidData,
                 "runtime Task transaction journal pair is not lexically ordered",
             ));
+        }
+        for undo in [&journal.first, &journal.second] {
+            if (journal.version == RUNTIME_TASK_TRANSACTION_VERSION)
+                != undo.conversation_witness.is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Task journal version and conversation witness disagree",
+                ));
+            }
         }
         Ok(())
     }
@@ -3819,6 +3883,10 @@ impl SessionStoreV2 {
             ));
         };
         reject_incompatible_session_write(&current)?;
+        match undo.conversation_witness.as_ref() {
+            Some(witness) => witness.check_current(&current)?,
+            None => conversation_task_undo::check_legacy_zero_target(&current)?,
+        }
         current.task_list = undo.task_list.clone();
         current.set_task_list_version_meta(undo.task_list_version.clone());
         self.validate_runtime_task_recovery_write_target(&abs_dir, &current)
@@ -4029,7 +4097,9 @@ impl SessionStoreV2 {
         &self,
         journal: &SessionCopyTransactionJournal,
     ) -> io::Result<()> {
-        for extension in ["json", "committing", "committed"] {
+        // Remove the irreversible decision last. A failed lower-state cleanup
+        // must leave Deleting dominant over every surviving sibling marker.
+        for extension in ["json", "committing", "committed", "deleting"] {
             let path = self
                 .session_copy_transaction_dir()
                 .join(format!("{}.{}", journal.transaction_id, extension));
@@ -4042,51 +4112,179 @@ impl SessionStoreV2 {
         Ok(())
     }
 
-    async fn rollback_session_copy_transaction(
+    /// Establish the durable, staging-only deletion phase under lifecycle EX
+    /// then Task EX. Keeping this separate from recursive cleanup also lets a
+    /// synthetic fixture stop at the actual production crash boundary.
+    async fn prepare_session_copy_rollback_deletion(
         &self,
+        marker_path: &Path,
         journal: &SessionCopyTransactionJournal,
-    ) -> io::Result<()> {
-        // Hide the target first. If cleanup later fails, the retained marker
-        // makes startup retry before the store becomes available.
-        let mut errors = Vec::new();
-        if let Err(error) = self
-            .update_index(|index| {
-                index.sessions.remove(&journal.target_id);
-                Ok(())
-            })
-            .await
-        {
-            errors.push(format!("index cleanup: {error}"));
-            // The durable index could not be rewritten, but readers of this
-            // still-live store must not retain a target whose directory is
-            // about to be removed. The journal keeps cross-process recovery
-            // retryable; this in-memory removal closes the local visibility gap.
-            self.index.write().await.sessions.remove(&journal.target_id);
+    ) -> io::Result<PathBuf> {
+        let state = SessionCopyJournalMarkerState::from_path(marker_path).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid copy rollback marker")
+        })?;
+        if state == SessionCopyJournalMarkerState::Committed {
+            return Err(other_io_error("copy rollback decision is not durable"));
         }
-        let target_dir = self.sessions_dir.join(&journal.target_id);
-        let revision_path = target_dir.join(SEARCH_INDEX_REVISION_FILE);
+        if !Self::runtime_task_recovery_real_file(marker_path).await?
+            || &self.read_session_copy_journal(marker_path).await? != journal
+        {
+            return Err(other_io_error("copy rollback marker identity changed"));
+        }
         let staging_dir = self.session_copy_staging_dir(journal);
-        for path in [&target_dir, &staging_dir] {
-            match fs::remove_dir_all(path).await {
-                Ok(()) => {
-                    if let Err(error) = sync_parent_directory_entry(path).await {
-                        errors.push(format!("sync cleanup {}: {error}", path.display()));
+        let staging_exists = match fs::symlink_metadata(&staging_dir).await {
+            Ok(metadata) if metadata.file_type().is_dir() => true,
+            Ok(_) => {
+                return Err(other_io_error(
+                    "copy rollback staging is not a real directory",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        let deleting = marker_path.with_extension("deleting");
+        if state == SessionCopyJournalMarkerState::Deleting {
+            // No canonical/index lookup here: a live writer may have created a
+            // different Root at the same ID after the previous attempt ended.
+            sync_parent_directory_entry(&deleting).await?;
+            return Ok(staging_dir);
+        }
+        match fs::symlink_metadata(&deleting).await {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                if &self.read_session_copy_journal(&deleting).await? != journal {
+                    return Err(other_io_error(
+                        "copy rollback deleting marker identity changed",
+                    ));
+                }
+                sync_parent_directory_entry(&deleting).await?;
+                return Ok(staging_dir);
+            }
+            Ok(_) => {
+                return Err(other_io_error(
+                    "copy rollback deleting marker is not a real file",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let target_dir = self.sessions_dir.join(&journal.target_id);
+        let mut target_created_at = None;
+        let target_exists = match fs::symlink_metadata(&target_dir).await {
+            Ok(_) if staging_exists => true,
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                // V1 has no original birth witness. Preserve its existing
+                // zero-generation compatibility, never infer ownership from an
+                // incomplete pair, and never act on a reset Root.
+                let main_path = target_dir.join("session.json");
+                let runtime_path = target_dir.join(RUNTIME_SIDECAR_FILE);
+                for path in [&main_path, &runtime_path] {
+                    if !Self::runtime_task_recovery_real_file(path).await? {
+                        return Err(other_io_error("copy rollback target pair is unavailable"));
                     }
                 }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => errors.push(format!("remove {}: {error}", path.display())),
+                let raw = fs::read(&main_path).await?;
+                compact_main::validate_full_main(&raw)?;
+                let main: Session = serde_json::from_slice(&raw).map_err(io::Error::other)?;
+                let side = Self::read_runtime_sidecar_at(&runtime_path, &journal.target_id)
+                    .await?
+                    .ok_or_else(|| other_io_error("copy rollback target runtime is unavailable"))?;
+                if main.id != journal.target_id || main.kind != SessionKind::Root {
+                    return Err(other_io_error("copy rollback target identity changed"));
+                }
+                reject_incompatible_session_write(&main)?;
+                reject_incompatible_session_write(&side)?;
+                reject_conversation_generation_change(&main, &side)?;
+                conversation_task_undo::check_legacy_zero_target(&main)?;
+                target_created_at = Some(main.created_at);
+                true
             }
+            Ok(_) => {
+                return Err(other_io_error(
+                    "copy rollback target is not a real directory",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        if !staging_exists {
+            // Failure to durably hide a verified target stops before rename or
+            // deletion. An in-memory-only removal is not a recovery boundary.
+            self.update_index(|index| {
+                if let Some(entry) = index.sessions.get(&journal.target_id) {
+                    let canonical = entry.kind == SessionKind::Root
+                        && entry.rel_path == Self::root_rel_path(&journal.target_id)
+                        && (entry.root_session_id.is_empty()
+                            || entry.root_session_id == journal.target_id);
+                    if target_exists
+                        && (!canonical
+                            || target_created_at.is_some_and(|birth| birth != entry.created_at))
+                    {
+                        return Err(other_io_error(
+                            "copy rollback target index identity changed",
+                        ));
+                    }
+                    if canonical {
+                        index.sessions.remove(&journal.target_id);
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+            if target_exists {
+                // The UUID staging path was absent under lifecycle EX + Task
+                // EX. Never overwrite existing staging; that branch above owns
+                // only its payload and preserves any current canonical Root.
+                atomic_rename(&target_dir, &staging_dir).await?;
+            }
+        } else if !target_exists {
+            // Prepared staging also covers a prepublication failure or a crash
+            // between target rename and phase publication. Only an absent
+            // canonical Root permits removal of its stale canonical index row.
+            self.update_index(|index| {
+                let stale = index.sessions.get(&journal.target_id).is_some_and(|entry| {
+                    entry.kind == SessionKind::Root
+                        && entry.rel_path == Self::root_rel_path(&journal.target_id)
+                        && entry.root_session_id == journal.target_id
+                });
+                if stale {
+                    index.sessions.remove(&journal.target_id);
+                }
+                Ok(())
+            })
+            .await?;
         }
-        self.search_index_queue
-            .enqueue_delete(&journal.target_id, revision_path);
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(other_io_error(format!(
-                "session copy rollback incomplete: {}",
-                errors.join("; ")
-            )))
+        // These directories have different parents: sessions/ and BAMBOO_HOME.
+        // A retry must also complete either sync left uncertain by a prior move.
+        sync_parent_directory_entry(&target_dir).await?;
+        sync_parent_directory_entry(&staging_dir).await?;
+        atomic_rename(marker_path, &deleting).await?;
+        sync_parent_directory_entry(&deleting).await?;
+        if target_exists && !staging_exists {
+            self.search_index_queue.enqueue_delete(
+                &journal.target_id,
+                target_dir.join(SEARCH_INDEX_REVISION_FILE),
+            );
         }
+        Ok(staging_dir)
+    }
+
+    async fn rollback_session_copy_transaction(
+        &self,
+        marker_path: &Path,
+        journal: &SessionCopyTransactionJournal,
+    ) -> io::Result<()> {
+        let staging_dir = self
+            .prepare_session_copy_rollback_deletion(marker_path, journal)
+            .await?;
+        // The durable Deleting marker owns only this UUID staging path. Partial
+        // recursive cleanup can remove Main/runtime without losing ownership.
+        match fs::remove_dir_all(&staging_dir).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        sync_parent_directory_entry(&staging_dir).await
     }
 
     async fn recover_session_copy_journal(
@@ -4135,15 +4333,38 @@ impl SessionStoreV2 {
             self.search_index_queue
                 .enqueue_upsert(&target, revision_path, revision);
         } else {
-            self.rollback_session_copy_transaction(journal).await?;
+            self.rollback_session_copy_transaction(path, journal)
+                .await?;
         }
-        durable_deactivate_recovery_marker(path).await
+        self.remove_session_copy_journal_family(journal).await
     }
 
     async fn recover_all_session_copy_transactions_locked(&self) -> io::Result<()> {
+        let mut families: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for path in self.session_copy_journal_paths().await? {
-            let journal = self.read_session_copy_journal(&path).await?;
-            self.recover_session_copy_journal(&path, &journal).await?;
+            let id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| other_io_error("invalid session copy journal name"))?
+                .to_string();
+            families.entry(id).or_default().push(path);
+        }
+        let mut families: Vec<_> = families.into_iter().collect();
+        families.sort_by(|first, second| first.0.cmp(&second.0));
+        for (_, mut paths) in families {
+            paths.sort_by_key(|path| SessionCopyJournalMarkerState::from_path(path));
+            let selected = paths.last().expect("nonempty copy journal family");
+            let journal = self.read_session_copy_journal(selected).await?;
+            // Validate all same-UUID records before any action. Deleting wins
+            // over a stale Committed marker and is deactivated only after every
+            // lower-state sibling, so retries never return to the canonical ID.
+            for path in &paths {
+                if self.read_session_copy_journal(path).await? != journal {
+                    return Err(other_io_error("conflicting session copy journal family"));
+                }
+            }
+            self.recover_session_copy_journal(selected, &journal)
+                .await?;
         }
         // A previous marker deactivation may have completed its rename to an
         // inert tombstone but failed the directory sync. Lifecycle mutations
@@ -4267,7 +4488,8 @@ impl SessionStoreV2 {
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "Task target has no live Main")
             })?;
-        reject_incompatible_session_write(&durable)
+        reject_incompatible_session_write(&durable)?;
+        reject_conversation_generation_change(current, &durable)
     }
 
     async fn save_runtime_task_control_plane_if_matches(
@@ -4309,6 +4531,7 @@ impl SessionStoreV2 {
         self.validate_runtime_task_execution_contract(&current)
             .await?;
         self.validate_root_context_for_save(&current).await?;
+        reject_conversation_generation_change(original, &current)?;
         if current.authority_identity != original.authority_identity
             || current.supervisor_management != original.supervisor_management
             || !Self::runtime_task_owned_snapshot_matches(&current, original)?
@@ -4410,6 +4633,8 @@ impl SessionStoreV2 {
             .await?;
         self.validate_root_context_for_save(&current_first).await?;
         self.validate_root_context_for_save(&current_second).await?;
+        reject_conversation_generation_change(first_original, &current_first)?;
+        reject_conversation_generation_change(second_original, &current_second)?;
         if current_first.authority_identity != first_original.authority_identity
             || current_second.authority_identity != second_original.authority_identity
             || current_first.supervisor_management != first_original.supervisor_management
@@ -4457,11 +4682,13 @@ impl SessionStoreV2 {
             transaction_id,
             first: TaskControlPlaneUndo {
                 session_id: current_first.id.clone(),
+                conversation_witness: Some(TaskConversationWitness::capture(&current_first)?),
                 task_list: current_first.task_list.clone(),
                 task_list_version: first_version,
             },
             second: TaskControlPlaneUndo {
                 session_id: current_second.id.clone(),
+                conversation_witness: Some(TaskConversationWitness::capture(&current_second)?),
                 task_list: current_second.task_list.clone(),
                 task_list_version: second_version,
             },
@@ -5410,10 +5637,11 @@ impl SessionStoreV2 {
         // durably move that decision back to a rollback state. Otherwise a
         // partial cleanup could leave a committed marker pointing at a removed
         // target and make every subsequent startup fail closed forever.
+        let mut rollback_marker = marker_path.to_path_buf();
         if SessionCopyJournalMarkerState::from_path(marker_path)
             == Some(SessionCopyJournalMarkerState::Committed)
         {
-            let rollback_marker = marker_path.with_extension("committing");
+            rollback_marker = marker_path.with_extension("committing");
             if let Err(error) = async {
                 atomic_rename(marker_path, &rollback_marker).await?;
                 sync_parent_directory_entry(&rollback_marker).await
@@ -5425,7 +5653,10 @@ impl SessionStoreV2 {
                 )));
             }
         }
-        match self.rollback_session_copy_transaction(journal).await {
+        match self
+            .rollback_session_copy_transaction(&rollback_marker, journal)
+            .await
+        {
             Ok(()) => match self.remove_session_copy_journal_family(journal).await {
                 Ok(()) => Err(io::Error::new(
                     primary_kind,
@@ -5467,6 +5698,11 @@ impl SessionStoreV2 {
         reject_incompatible_session_write(&session)?;
         self.validate_root_context_for_save(&session).await?;
 
+        if session.conversation_reset.is_some() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, bamboo_domain::SessionAuthorityConflict(
+                "conversation generation requires a fenced reset transaction; legacy clear is unavailable".into(),
+            )));
+        }
         // Keep only the first System message if present; drop all other messages.
         let system_msg = session
             .messages
@@ -5495,6 +5731,18 @@ impl SessionStoreV2 {
     }
 
     pub async fn cleanup(&self, mode: CleanupMode, keep_pinned: bool) -> io::Result<CleanupResult> {
+        self.cleanup_with_progress(mode, keep_pinned)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// Preserve the actual locked batch on partial failure. Callers may then
+    /// confirm canonical absence and finish terminal resources for deleted IDs.
+    pub async fn cleanup_with_progress(
+        &self,
+        mode: CleanupMode,
+        keep_pinned: bool,
+    ) -> Result<CleanupResult, CleanupFailure> {
         let lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
         let guards = Arc::new(SessionDeletionGuards {
@@ -5585,6 +5833,9 @@ impl SessionStoreV2 {
         // Pre-compute full deleted id set for a truthful response payload.
         let mut deleted_ids = HashSet::<String>::new();
         for root_id in delete_root_ids.iter() {
+            // Legacy Roots may have an empty root_session_id in their index
+            // row. The selected Root itself is always part of its deletion.
+            deleted_ids.insert(root_id.clone());
             for e in entries.iter().filter(|e| e.root_session_id == *root_id) {
                 deleted_ids.insert(e.id.clone());
             }
@@ -5592,20 +5843,48 @@ impl SessionStoreV2 {
         for child_id in delete_child_ids.iter() {
             deleted_ids.insert(child_id.clone());
         }
-
-        // Apply deletions (roots first; they delete children implicitly).
-        for root_id in delete_root_ids.iter() {
-            let _ = self
-                .delete_session_recursive_locked(root_id, true, &guards)
-                .await?;
-        }
-        for child_id in delete_child_ids.iter() {
-            let _ = self
-                .delete_session_recursive_locked(child_id, true, &guards)
-                .await?;
+        // A Root removal unlinks the canonical children tree even if its
+        // rebuildable index omits a Child. Census before any batch deletion,
+        // under the same exclusive lifecycle guard as the physical removals.
+        for root_id in &delete_root_ids {
+            match self.canonical_root_child_ids(root_id).await {
+                Ok(children) => deleted_ids.extend(children),
+                Err(error) => {
+                    let mut candidate_session_ids: Vec<_> = deleted_ids.into_iter().collect();
+                    candidate_session_ids.sort();
+                    return Err(CleanupFailure {
+                        error,
+                        candidate_session_ids,
+                    });
+                }
+            }
         }
         let mut deleted_session_ids: Vec<String> = deleted_ids.into_iter().collect();
         deleted_session_ids.sort();
+
+        // Apply deletions (roots first; they delete children implicitly).
+        for root_id in delete_root_ids.iter() {
+            if let Err(error) = self
+                .delete_session_recursive_locked(root_id, true, &guards)
+                .await
+            {
+                return Err(CleanupFailure {
+                    error,
+                    candidate_session_ids: deleted_session_ids,
+                });
+            }
+        }
+        for child_id in delete_child_ids.iter() {
+            if let Err(error) = self
+                .delete_session_recursive_locked(child_id, true, &guards)
+                .await
+            {
+                return Err(CleanupFailure {
+                    error,
+                    candidate_session_ids: deleted_session_ids,
+                });
+            }
+        }
         Ok(CleanupResult {
             deleted_count: deleted_session_ids.len(),
             deleted_session_ids,
@@ -5621,58 +5900,92 @@ impl SessionStoreV2 {
     /// Root revocations remain canonical so surviving processes cannot restore
     /// their deleted snapshots after this reset.
     pub async fn dev_reset(&self) -> io::Result<()> {
-        let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
-        let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
-        self.recover_all_runtime_task_transactions_locked(&_runtime_task)
-            .await?;
-        self.recover_all_session_copy_transactions_locked().await?;
-
-        let deleted_search_sources = self
-            .index
-            .read()
+        self.dev_reset_with_progress()
             .await
-            .sessions
-            .values()
-            .map(|entry| {
-                (
-                    entry.id.clone(),
-                    self.abs_path_from_rel(&entry.rel_path)
-                        .join(SEARCH_INDEX_REVISION_FILE),
-                )
-            })
-            .collect::<Vec<_>>();
+            .map(|_| ())
+            .map_err(|failure| failure.error)
+    }
 
-        // Revoke canonical Roots before removing the tree, including Roots
-        // omitted by this process's stale index. Preserve the revocations
-        // outside sessions/: stale writers may survive this development reset.
-        let mut roots = fs::read_dir(&self.sessions_dir).await?;
-        while let Some(root) = roots.next_entry().await? {
-            if root.file_type().await?.is_dir() {
-                if let Some(id) = root.file_name().to_str() {
-                    self.revoke_root_lifetime(id).await?;
+    /// Return exact canonical cleanup candidates, preserving partial failure.
+    /// The legacy ioResult API keeps the same revocation/write boundary.
+    pub async fn dev_reset_with_progress(&self) -> Result<CleanupResult, CleanupFailure> {
+        let mut candidates = Vec::new();
+        let result: io::Result<()> = async {
+            let _lifecycle = self.lock_session_lifecycle_exclusive().await?;
+            let _runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
+            self.recover_all_runtime_task_transactions_locked(&_runtime_task)
+                .await?;
+            self.recover_all_session_copy_transactions_locked().await?;
+
+            let deleted_search_sources = self
+                .index
+                .read()
+                .await
+                .sessions
+                .values()
+                .map(|entry| {
+                    (
+                        entry.id.clone(),
+                        self.abs_path_from_rel(&entry.rel_path)
+                            .join(SEARCH_INDEX_REVISION_FILE),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            // Revoke canonical Roots before removing the tree, including Roots
+            // omitted by this process's stale index. Preserve the revocations
+            // outside sessions/: stale writers may survive this development reset.
+            match fs::read_dir(&self.sessions_dir).await {
+                Ok(mut roots) => {
+                    while let Some(root) = roots.next_entry().await? {
+                        if root.file_type().await?.is_dir() {
+                            if let Some(id) = root.file_name().to_str() {
+                                // Census actual canonical IDs under the same exclusive
+                                // lifecycle/Task guards, including unindexed Children.
+                                candidates.push(id.to_owned());
+                                candidates.extend(self.canonical_root_child_ids(id).await?);
+                                self.revoke_root_lifetime(id).await?;
+                            }
+                        }
+                    }
                 }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
-        }
-        match fs::remove_dir_all(&self.sessions_dir).await {
-            Ok(()) => sync_parent_directory_entry(&self.sessions_dir).await?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        fs::create_dir_all(&self.sessions_dir).await?;
-        sync_parent_directory_entry(&self.sessions_dir).await?;
+            match fs::remove_dir_all(&self.sessions_dir).await {
+                Ok(()) => sync_parent_directory_entry(&self.sessions_dir).await?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            fs::create_dir_all(&self.sessions_dir).await?;
+            sync_parent_directory_entry(&self.sessions_dir).await?;
 
-        // Reset through the same cross-process rebase/publish boundary as every
-        // other index mutation; dev reset must not race a stale direct writer.
-        self.update_index(|index| {
-            *index = SessionsIndex::empty();
+            // Reset through the same cross-process rebase/publish boundary as every
+            // other index mutation; dev reset must not race a stale direct writer.
+            self.update_index(|index| {
+                *index = SessionsIndex::empty();
+                Ok(())
+            })
+            .await?;
+            for (session_id, revision_path) in deleted_search_sources {
+                self.search_index_queue
+                    .enqueue_delete(&session_id, revision_path);
+            }
             Ok(())
-        })
-        .await?;
-        for (session_id, revision_path) in deleted_search_sources {
-            self.search_index_queue
-                .enqueue_delete(&session_id, revision_path);
         }
-        Ok(())
+        .await;
+        candidates.sort();
+        candidates.dedup();
+        match result {
+            Ok(()) => Ok(CleanupResult {
+                deleted_count: candidates.len(),
+                deleted_session_ids: candidates,
+            }),
+            Err(error) => Err(CleanupFailure {
+                error,
+                candidate_session_ids: candidates,
+            }),
+        }
     }
 
     /// Delete a session. If the session is a root, deletes its entire directory (and all child sessions).
@@ -5684,6 +5997,53 @@ impl SessionStoreV2 {
         session_id: &str,
         force: bool,
     ) -> io::Result<bool> {
+        self.delete_session_recursive_with_progress(session_id, force)
+            .await
+            .map(|result| result.deleted)
+            .map_err(|failure| failure.error)
+    }
+
+    // The caller holds lifecycle/Task exclusivity. Do not trust derived index
+    // rows to describe everything remove_dir_all will unlink below a Root.
+    async fn canonical_root_child_ids(&self, root_id: &str) -> io::Result<Vec<String>> {
+        validate_session_id(root_id)?;
+        let root = self.sessions_dir.join(root_id);
+        let children = root.join("children");
+        for directory in [&self.sessions_dir, &root, &children] {
+            match fs::symlink_metadata(directory).await {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => return Err(error),
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => {
+                    return Err(other_io_error(
+                        "canonical session tree is not a real directory",
+                    ))
+                }
+            }
+        }
+        let mut entries = fs::read_dir(children).await?;
+        let mut ids = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
+                let id = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| other_io_error("invalid canonical Child directory name"))?;
+                validate_session_id(&id)?;
+                ids.push(id);
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// Report the true locked subtree candidates, including children admitted
+    /// after a caller's preflight and children whose Root index row is absent.
+    pub async fn delete_session_recursive_with_progress(
+        &self,
+        session_id: &str,
+        force: bool,
+    ) -> Result<SessionDeletionResult, CleanupFailure> {
         let lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let runtime_task = self.lock_runtime_task_transaction_exclusive().await?;
         let guards = Arc::new(SessionDeletionGuards {
@@ -5693,8 +6053,41 @@ impl SessionStoreV2 {
         self.recover_all_runtime_task_transactions_locked(&guards.runtime_task)
             .await?;
         self.recover_all_session_copy_transactions_locked().await?;
-        self.delete_session_recursive_locked(session_id, force, &guards)
+        validate_session_id(session_id)?;
+        let mut candidate_session_ids: Vec<String> = self
+            .index
+            .read()
             .await
+            .sessions
+            .values()
+            .filter(|entry| entry.id == session_id || entry.root_session_id == session_id)
+            .map(|entry| entry.id.clone())
+            .collect();
+        candidate_session_ids.push(session_id.to_string());
+        match self.canonical_root_child_ids(session_id).await {
+            Ok(children) => candidate_session_ids.extend(children),
+            Err(error) => {
+                return Err(CleanupFailure {
+                    error,
+                    candidate_session_ids,
+                })
+            }
+        }
+        candidate_session_ids.sort();
+        candidate_session_ids.dedup();
+        match self
+            .delete_session_recursive_locked(session_id, force, &guards)
+            .await
+        {
+            Ok(deleted) => Ok(SessionDeletionResult {
+                deleted,
+                candidate_session_ids,
+            }),
+            Err(error) => Err(CleanupFailure {
+                error,
+                candidate_session_ids,
+            }),
+        }
     }
 
     async fn remove_child_directory(
@@ -5842,6 +6235,29 @@ pub enum CleanupMode {
 pub struct CleanupResult {
     pub deleted_count: usize,
     pub deleted_session_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct CleanupFailure {
+    pub error: io::Error,
+    /// Selected while holding the same lifecycle lock as the actual deletes.
+    /// These are candidates, not proof that every ID was removed.
+    pub candidate_session_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct SessionDeletionResult {
+    pub deleted: bool,
+    pub candidate_session_ids: Vec<String>,
+}
+
+impl From<io::Error> for CleanupFailure {
+    fn from(error: io::Error) -> Self {
+        Self {
+            error,
+            candidate_session_ids: Vec::new(),
+        }
+    }
 }
 
 /// Atomically write `bytes` to `path`: write a uniquely-named temp file in the
@@ -6291,6 +6707,7 @@ impl SessionStoreV2 {
             .await?
         {
             reject_incompatible_session_write(&durable)?;
+            reject_conversation_generation_change(session, &durable)?;
         }
         if let Some(previous) = Self::read_runtime_sidecar_at(
             &self.abs_path_from_rel(rel).join(RUNTIME_SIDECAR_FILE),
@@ -6299,6 +6716,7 @@ impl SessionStoreV2 {
         .await?
         {
             reject_incompatible_session_write(&previous)?;
+            reject_conversation_generation_change(session, &previous)?;
             // Runtime does not own Main's stamp. Legacy absence and v1 have
             // identical semantics; never turn this compatible pair into a
             // false conflict or rewrite Main from the runtime-only path.
@@ -6515,6 +6933,7 @@ impl SessionStoreV2 {
                 compact_main::validate_full_main(raw.as_bytes())?;
                 let durable: Session = serde_json::from_str(&raw)
                     .map_err(|error| other_io_error(format!("invalid session.json: {error}")))?;
+                reject_conversation_generation_change(session, &durable)?;
                 reject_session_version_change(session, &durable)?;
                 if let Some(mut previous_runtime) = Self::read_runtime_sidecar_at(
                     &current_main
@@ -6586,8 +7005,10 @@ impl SessionStoreV2 {
         } else {
             session.root_session_id.as_str()
         };
-        let tree = self.acquire_actor_tree_write_guard(root_id).await?;
-        guards.hold_tree(tree);
+        if !guards.retains_tree_for(root_id) {
+            let tree = self.acquire_actor_tree_write_guard(root_id).await?;
+            guards.hold_tree(tree);
+        }
         let title_observations = if manual_title {
             self.prepare_title_observations(session).await?
         } else {
@@ -6600,7 +7021,8 @@ impl SessionStoreV2 {
                 self.actor_tree_root_for_child_write(root_id).await?
             };
             if let Some(root) = root.as_ref() {
-                self.bump_actor_tree_revision(root).await?;
+                self.bump_actor_tree_revision_with_default_writer(root, guards)
+                    .await?;
             }
         }
 
@@ -6705,6 +7127,31 @@ impl SessionStoreV2 {
 
 #[async_trait::async_trait]
 impl Storage for SessionStoreV2 {
+    async fn find_host_session_scope(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+    ) -> io::Result<Option<bamboo_domain::HostSessionScopeToken>> {
+        self.host_scope_registry.lookup(caller).await
+    }
+
+    async fn list_host_scoped_targets(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &bamboo_domain::SessionCallerReference,
+    ) -> io::Result<Vec<bamboo_domain::HostSessionTargetScope>> {
+        self.list_host_scoped_targets_impl(token, caller).await
+    }
+
+    async fn load_host_scoped_target(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<Session> {
+        self.load_host_scoped_target_impl(token, caller, target_id)
+            .await
+    }
+
     async fn save_manual_title(&self, session: &Session) -> io::Result<()> {
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
@@ -7991,6 +8438,9 @@ mod tests {
             transaction_id,
             first: TaskControlPlaneUndo {
                 session_id: child_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&child_original).unwrap(),
+                ),
                 task_list: child_original.task_list.clone(),
                 task_list_version: child_original
                     .task_list_version_meta()
@@ -7998,6 +8448,9 @@ mod tests {
             },
             second: TaskControlPlaneUndo {
                 session_id: root_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&root_original).unwrap(),
+                ),
                 task_list: root_original.task_list.clone(),
                 task_list_version: root_original
                     .task_list_version_meta()
@@ -8217,6 +8670,9 @@ mod tests {
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
                 session_id: child_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&child_original).unwrap(),
+                ),
                 task_list: child_original.task_list.clone(),
                 task_list_version: child_original
                     .task_list_version_meta()
@@ -8224,6 +8680,9 @@ mod tests {
             },
             second: TaskControlPlaneUndo {
                 session_id: root_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&root_original).unwrap(),
+                ),
                 task_list: root_original.task_list.clone(),
                 task_list_version: root_original
                     .task_list_version_meta()
@@ -8282,6 +8741,9 @@ mod tests {
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
                 session_id: child_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&child_original).unwrap(),
+                ),
                 task_list: child_original.task_list.clone(),
                 task_list_version: child_original
                     .task_list_version_meta()
@@ -8289,6 +8751,9 @@ mod tests {
             },
             second: TaskControlPlaneUndo {
                 session_id: root_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&root_original).unwrap(),
+                ),
                 task_list: root_original.task_list.clone(),
                 task_list_version: root_original
                     .task_list_version_meta()
@@ -8344,6 +8809,9 @@ mod tests {
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
                 session_id: child_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&child_original).unwrap(),
+                ),
                 task_list: child_original.task_list.clone(),
                 task_list_version: child_original
                     .task_list_version_meta()
@@ -8351,6 +8819,9 @@ mod tests {
             },
             second: TaskControlPlaneUndo {
                 session_id: root_original.id.clone(),
+                conversation_witness: Some(
+                    TaskConversationWitness::capture(&root_original).unwrap(),
+                ),
                 task_list: root_original.task_list.clone(),
                 task_list_version: root_original
                     .task_list_version_meta()
@@ -10396,27 +10867,42 @@ mod tests {
 
     #[tokio::test]
     async fn copy_session_rolls_back_directory_when_index_publish_fails() -> io::Result<()> {
-        let (storage, _temp_dir) = create_temp_storage().await?;
+        let (storage, temp_dir) = create_temp_storage().await?;
         let source = Session::new("copy-source", "model");
         storage.save_session(&source).await?;
+        let before_index = fs::read(storage.index_path()).await?;
 
-        // Force the copy to fail after its fully-written staging directory has
-        // been renamed, but before a visible index entry can be committed.
+        // Publication and durable index hiding both fail. Rollback must retain
+        // the complete target and its marker, rather than deleting behind an
+        // index whose durable update was not acknowledged.
         fs::write(storage.index_path(), b"{not valid json").await?;
         let error = storage
             .copy_session(&source.id, "copy-root")
             .await
             .expect_err("corrupt index must fail publication");
         assert!(error.to_string().contains("invalid sessions.json"));
+        assert!(error.to_string().contains("recovery required"));
         assert!(storage.get_index_entry("copy-root").await.is_none());
-        assert!(!storage.sessions_root_dir().join("copy-root").exists());
+        let target = storage.sessions_root_dir().join("copy-root");
+        assert!(target.join("session.json").is_file());
+        assert!(target.join(RUNTIME_SIDECAR_FILE).is_file());
         assert_eq!(storage.session_copy_journal_paths().await?.len(), 1);
-        let mut home_entries = fs::read_dir(storage.bamboo_home_dir()).await?;
+
+        // Repair only this fixture's deliberately damaged index. A real store
+        // reopen must then drive the retained rollback through Deleting.
+        fs::write(storage.index_path(), before_index).await?;
+        storage.flush_search_index().await;
+        drop(storage);
+        let reopened = SessionStoreV2::new(temp_dir.path().to_path_buf()).await?;
+        assert!(reopened.get_index_entry("copy-root").await.is_none());
+        assert!(!target.exists());
+        assert!(reopened.session_copy_journal_paths().await?.is_empty());
+        let mut home_entries = fs::read_dir(reopened.bamboo_home_dir()).await?;
         while let Some(entry) = home_entries.next_entry().await? {
             let name = entry.file_name().to_string_lossy().into_owned();
             assert!(
                 !name.starts_with(".session-copy-") || name == SESSION_COPY_TRANSACTION_DIR,
-                "staging directory leaked after rollback: {name}"
+                "staging directory leaked after recovery: {name}"
             );
         }
         Ok(())

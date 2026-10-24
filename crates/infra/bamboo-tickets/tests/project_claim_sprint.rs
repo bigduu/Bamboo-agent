@@ -253,6 +253,7 @@ fn sprint_cas_shares_claim_fence_and_restart_keeps_pending_owner_and_context() {
                 include_cancelled: false,
                 include_archived: false,
                 sprint_filter: None,
+                overdue_as_of: None,
                 limit: 10,
                 cursor: None,
                 fixed_commit: None,

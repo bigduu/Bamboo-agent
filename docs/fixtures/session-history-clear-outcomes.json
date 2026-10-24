@@ -1,0 +1,68 @@
+{
+  "fixture_kind": "synthetic_contract_examples",
+  "route": "POST /api/v1/sessions/{session_id}/clear",
+  "request_body": null,
+  "cases": [
+    {
+      "name": "success_after_canonical_reload",
+      "http_status": 200,
+      "body": { "success": true, "session_id": "synthetic-session" }
+    },
+    {
+      "name": "typed_authority_refusal",
+      "http_status": 409,
+      "body": {
+        "error": {
+          "type": "api_error",
+          "code": "session_clear_authority_conflict",
+          "message": "Session history clear is blocked by its current authority: synthetic conflict. Reload the session before deciding what to do next."
+        },
+        "session_id": "synthetic-session",
+        "status": "blocked",
+        "refresh_required": true,
+        "retryable": false
+      }
+    },
+    {
+      "name": "unconfirmed_clear_or_reload",
+      "http_status": 500,
+      "body": {
+        "error": {
+          "type": "api_error",
+          "code": "session_clear_outcome_unknown",
+          "message": "Session history clear outcome could not be confirmed: synthetic I/O failure. Reload the session before any further action; do not automatically retry clear."
+        },
+        "session_id": "synthetic-session",
+        "status": "outcome_unknown",
+        "refresh_required": true,
+        "retryable": false
+      }
+    }
+  ],
+  "detail_readback": {
+    "route": "GET /api/v1/sessions/{session_id}",
+    "example_scope": "synthetic summary fragments for token_usage presence only; not complete or captured responses",
+    "current_producer_none_shape": "token_usage omitted by SessionSummary skip_serializing_if=Option::is_none; no handler normalization",
+    "consumer_rule": "accept omitted or null token_usage as no usage; reject every non-null usage value",
+    "cases": [
+      {
+        "name": "current_producer_omits_none",
+        "detail_fragment": { "session": { "id": "synthetic-session", "message_count": 0 } },
+        "usage_cleared": true
+      },
+      {
+        "name": "explicit_null_consumer_compatibility_only",
+        "detail_fragment": { "session": { "id": "synthetic-session", "message_count": 0, "token_usage": null } },
+        "usage_cleared": true
+      },
+      {
+        "name": "nonnull_usage_is_not_cleared",
+        "detail_fragment": { "session": { "id": "synthetic-session", "message_count": 0, "token_usage": { "total_tokens": 123 } } },
+        "usage_cleared": false
+      }
+    ]
+  },
+  "conversation_revision": "not_exposed_by_current_clear_endpoint",
+  "event": { "kind": "SessionCleared", "session_id": "synthetic-session" },
+  "full_conversation_reset": "separate_unimplemented_transaction_contract"
+}

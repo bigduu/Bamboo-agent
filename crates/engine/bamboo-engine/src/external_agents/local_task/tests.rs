@@ -18,6 +18,7 @@ const WAIT: Duration = Duration::from_secs(15);
 
 #[cfg(unix)]
 mod owned_bash_publication;
+mod writer_lifecycle;
 
 struct EmptyTools;
 #[async_trait]

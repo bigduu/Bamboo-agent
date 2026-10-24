@@ -379,6 +379,20 @@ impl Agent {
             durable
                 .check_execution_compatibility()
                 .map_err(|error| AgentError::Tool(error.to_string()))?;
+            session
+                .check_conversation_generation(&durable)
+                .map_err(|error| {
+                    AgentError::Tool(format!("session_conversation_changed: {error}"))
+                })?;
+        } else {
+            session.validate_conversation_state().map_err(|error| {
+                AgentError::Tool(format!("session_conversation_changed: {error}"))
+            })?;
+            if session.conversation_reset.is_some() {
+                return Err(AgentError::Tool(
+                    "session_conversation_changed: canonical conversation unavailable; reload required".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -547,7 +561,8 @@ impl Agent {
                 .await
             {
                 if matches!(&error, AgentError::Tool(message)
-                    if message.starts_with("session_execution_incompatible:"))
+                    if message.starts_with("session_execution_incompatible:")
+                        || message.starts_with("session_conversation_changed:"))
                 {
                     let _ = event_tx
                         .send(AgentEvent::Error {
@@ -653,9 +668,11 @@ impl Agent {
             {
                 // This admission refuses before Project preparation, replay or
                 // persistence. Restore borrowed producer input only for the
-                // compatibility refusal; retain other legacy error semantics.
+                // compatibility or conversation refusal; retain other legacy
+                // error semantics.
                 if matches!(&error, AgentError::Tool(message)
-                    if message.starts_with("session_execution_incompatible:"))
+                    if message.starts_with("session_execution_incompatible:")
+                        || message.starts_with("session_conversation_changed:"))
                 {
                     if let Some(snapshot) = preappend_snapshot {
                         *session = snapshot;

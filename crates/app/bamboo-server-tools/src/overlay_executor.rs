@@ -50,11 +50,26 @@ impl OverlayToolExecutor {
         args: &serde_json::Value,
         ctx: &ToolExecutionContext<'_>,
     ) -> Result<Option<ToolOutcome>, ToolError> {
-        if let Some(outcome) = self
-            .base
-            .check_permissions_for_resolved(call, self.overlay.name(), args, ctx)
-            .await?
+        let base_check =
+            self.base
+                .check_permissions_for_resolved(call, self.overlay.name(), args, ctx);
+        let selected_contract = self.local_execution_contract(self.overlay.name());
+        let outcome = if self.overlay.name() == "session_message"
+            && args.get("action").and_then(serde_json::Value::as_str) == Some("send")
+            && selected_contract
+                == Some(crate::session_message::SCOPED_SESSION_SEND_EXECUTION_CONTRACT)
         {
+            bamboo_tools::scoped_session_send_permission::with_framework_scoped_session_send_restriction(
+                call,
+                args,
+                selected_contract,
+                base_check,
+            )
+            .await?
+        } else {
+            base_check.await?
+        };
+        if let Some(outcome) = outcome {
             return Ok(Some(outcome));
         }
         match &self.additional_permission_gate {
@@ -127,11 +142,12 @@ impl OverlayToolExecutor {
             None => resolve_tool_reference_name(reference, contains),
         };
         if resolved.is_none()
-            && self.session_behavior_version == Some(Some(2))
+            && self.session_behavior_version.is_some()
             && bamboo_domain::independent_root_spawn_reference(reference)
         {
-            // Keep an unavailable v2 Root reference exact on the way down. Raw
-            // fallback would let a lower legacy executor reinterpret it as Child.
+            // A retained version is already bound, including None/v1. Keep an
+            // unresolved Root reference exact so raw fallback cannot reinterpret
+            // the bound invocation through a lower executor as a Child.
             return OverlayRoute::BaseExact("spawn_session".into());
         }
         match resolved {
@@ -294,6 +310,19 @@ impl ToolExecutor for OverlayToolExecutor {
         } else {
             self.base.exact_tool_owner(name)
         }
+    }
+
+    fn local_execution_contract(&self, name: &str) -> Option<&'static str> {
+        (name == self.overlay.name())
+            .then(|| self.overlay.execution_contract())
+            .flatten()
+    }
+
+    fn local_tool_instance(
+        &self,
+        name: &str,
+    ) -> Option<std::sync::Arc<dyn bamboo_agent_core::tools::Tool>> {
+        (name == self.overlay.name()).then(|| self.overlay.clone())
     }
 
     fn list_tools(&self) -> Vec<ToolSchema> {
@@ -1370,19 +1399,15 @@ mod tests {
     #[derive(Clone)]
     struct VersionedOwnerBase {
         installed: bool,
-        version: Option<u32>,
         entered: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
     #[async_trait]
     impl ToolExecutor for VersionedOwnerBase {
         fn for_session(
             &self,
-            session: &bamboo_domain::Session,
+            _session: &bamboo_domain::Session,
         ) -> Option<std::sync::Arc<dyn ToolExecutor>> {
-            Some(std::sync::Arc::new(Self {
-                version: session.session_version,
-                ..self.clone()
-            }))
+            Some(std::sync::Arc::new(self.clone()))
         }
         async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
             if !self.owns_exact_tool(&call.function.name) {
@@ -1396,7 +1421,7 @@ mod tests {
         }
         fn list_tools(&self) -> Vec<ToolSchema> {
             let mut schemas = vec![NamedOverlayTool("SubAgent").to_schema()];
-            if self.installed && self.version == Some(2) {
+            if self.installed {
                 schemas.push(NamedOverlayTool("spawn_session").to_schema());
             }
             schemas
@@ -1422,7 +1447,6 @@ mod tests {
                 let base: std::sync::Arc<dyn ToolExecutor> =
                     std::sync::Arc::new(VersionedOwnerBase {
                         installed,
-                        version: None,
                         entered: entered.clone(),
                     });
                 let first: std::sync::Arc<dyn ToolExecutor> = std::sync::Arc::new(
@@ -1442,32 +1466,71 @@ mod tests {
                     let result = bound
                         .execute_with_context_outcome(&call, ToolExecutionContext::none(&call.id))
                         .await;
-                    if version == Some(2) && !installed {
+                    assert_eq!(call, original);
+                    if !installed {
                         assert!(result.is_err());
                         continue;
                     }
                     let ToolOutcome::Completed(result) = result.unwrap() else {
                         panic!("completed owner result")
                     };
-                    let expected = if version == Some(2) {
-                        "spawn_session"
-                    } else {
-                        "SubAgent"
-                    };
-                    assert_eq!(result.result, expected);
-                    assert_eq!(call, original);
-                    assert_eq!(
-                        bound.call_parallel_classification(&call).1,
-                        version != Some(2)
-                    );
+                    assert_eq!(result.result, "spawn_session");
+                    let (mutability, parallel) = bound.call_parallel_classification(&call);
+                    assert!(matches!(
+                        mutability,
+                        bamboo_agent_core::ToolMutability::Mutating
+                    ));
+                    assert!(!parallel);
                 }
-                assert!(entered.lock().unwrap().iter().all(|name| name
-                    == if version == Some(2) {
-                        "spawn_session"
-                    } else {
-                        "SubAgent"
-                    }));
+                let entered = entered.lock().unwrap();
+                if installed {
+                    assert_eq!(entered.as_slice(), ["spawn_session"; 3]);
+                } else {
+                    assert!(entered.is_empty());
+                }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn bound_missing_root_reference_never_enters_a_raw_alias_child_fallback() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct LegacyAliasBase(std::sync::Arc<AtomicUsize>);
+        #[async_trait]
+        impl ToolExecutor for LegacyAliasBase {
+            fn for_session(
+                &self,
+                _session: &bamboo_domain::Session,
+            ) -> Option<std::sync::Arc<dyn ToolExecutor>> {
+                Some(std::sync::Arc::new(Self(self.0.clone())))
+            }
+            async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+                if call.function.name == "spawnSession" {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    return Ok(ToolResult::text(true, "legacy Child fallback"));
+                }
+                Err(ToolError::NotFound(call.function.name.clone()))
+            }
+            fn list_tools(&self) -> Vec<ToolSchema> {
+                Vec::new()
+            }
+        }
+        let entered = std::sync::Arc::new(AtomicUsize::new(0));
+        let tools = OverlayToolExecutor::new(
+            std::sync::Arc::new(LegacyAliasBase(entered.clone())),
+            std::sync::Arc::new(NamedOverlayTool("memory")),
+        );
+        let call = make_call("spawnSession");
+        for version in [None, Some(1), Some(2), Some(3)] {
+            let mut session = bamboo_domain::Session::new("bound-root", "model");
+            session.session_version = version;
+            let bound = tools.for_session(&session).unwrap();
+            assert!(bound.execute(&call).await.is_err());
+        }
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+        // Unbound Host compatibility is outside an already frozen invocation.
+        assert!(tools.execute(&call).await.is_ok());
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
     }
 }

@@ -956,3 +956,33 @@ mod receipt_run_tests;
 
 #[path = "skill_runtime_retry_tests.rs"]
 mod retry_tests;
+
+#[cfg(unix)]
+#[path = "skill_runtime_workspace_handoff_tests.rs"]
+mod workspace_handoff;
+
+#[cfg(unix)]
+pub(super) fn observe_workspace_reader(run: &Arc<NativeRun>, reader: &Arc<SkillsReadTool>) {
+    workspace_handoff::observe_reader(run, reader);
+}
+
+#[cfg(unix)]
+pub(super) async fn workspace_retained_reader_call(
+    tools: &Arc<dyn ToolExecutor>,
+    call: &ToolCall,
+    name: &str,
+    ctx: ToolExecutionContext<'_>,
+) -> Option<Result<ToolOutcome, ToolError>> {
+    workspace_handoff::retained_reader_call(tools, call, name, ctx).await
+}
+
+#[cfg(unix)]
+pub(super) async fn workspace_after_completed_call(
+    executor: &NativeExecutor,
+    call: &ToolCall,
+    name: &str,
+    ctx: ToolExecutionContext<'_>,
+    success: bool,
+) {
+    workspace_handoff::after_completed_call(executor, call, name, ctx, success).await;
+}

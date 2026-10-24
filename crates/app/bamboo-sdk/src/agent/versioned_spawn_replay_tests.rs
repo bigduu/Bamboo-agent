@@ -1,15 +1,19 @@
-//! Real SDK parking/typed decision/reopen with version-selected concrete owners.
+//! SDK fresh Root calls and historical exact-owner parking/decision/reopen.
 use super::*;
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 
 struct VersionedProbeTool {
     name: &'static str,
+    contract: Option<&'static str>,
     probe: Arc<Probe>,
 }
 #[async_trait]
 impl Tool for VersionedProbeTool {
     fn name(&self) -> &str {
         self.name
+    }
+    fn execution_contract(&self) -> Option<&'static str> {
+        self.contract
     }
     fn description(&self) -> &str {
         "record one approved scoped operation"
@@ -21,6 +25,11 @@ impl Tool for VersionedProbeTool {
         bamboo_agent_core::ToolClass::MUTATING_SERIAL
     }
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
+        assert!(
+            ctx.executing_caller_for(ctx.session_id().expect("real SDK caller"))
+                .is_some(),
+            "fresh and retained SDK invocation must carry the original host observation"
+        );
         self.probe.calls.lock().unwrap().push(Invocation {
             name: self.name.into(),
             arguments: args,
@@ -49,12 +58,8 @@ struct VersionedProbeSurface {
 }
 #[async_trait]
 impl ToolExecutor for VersionedProbeSurface {
-    fn for_session(&self, session: &Session) -> Option<Arc<dyn ToolExecutor>> {
-        Some(if session.independent_root_spawn_contract() {
-            self.independent.clone()
-        } else {
-            self.legacy.clone()
-        })
+    fn for_session(&self, _session: &Session) -> Option<Arc<dyn ToolExecutor>> {
+        Some(self.independent.clone())
     }
     async fn execute(&self, _: &ToolCall) -> Result<ToolResult, ToolError> {
         panic!("SDK must bind the Session tool contract before execution")
@@ -90,7 +95,99 @@ impl ToolExecutor for VersionedProbeRootPermissionGate {
     }
 }
 
+struct ProbeInstanceGuard;
+#[async_trait]
+impl bamboo_agent_core::tools::FrameworkSessionToolGuard for ProbeInstanceGuard {
+    async fn check(
+        &self,
+        _: bamboo_agent_core::tools::FrameworkSessionToolKind,
+        _: &ToolCall,
+        _: &Value,
+        _: &ToolCtx,
+    ) -> Result<(), ToolError> {
+        Ok(())
+    }
+}
+
+// This test Host explicitly constructs the exact concrete Arc. Names and the
+// contract string alone still supply no proof; production SDK admission uses
+// the shared typed factory and its live restriction guard instead.
+struct ProvenProbeInstance {
+    inner: Arc<dyn ToolExecutor>,
+    proof: bamboo_agent_core::tools::HostFrameworkSessionTool,
+}
+#[async_trait]
+impl ToolExecutor for ProvenProbeInstance {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        self.inner.execute(call).await
+    }
+    async fn execute_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        self.inner.execute_with_context_outcome(call, ctx).await
+    }
+    async fn execute_exact_with_context_outcome(
+        &self,
+        call: &ToolCall,
+        name: &str,
+        ctx: ToolExecutionContext<'_>,
+    ) -> Result<ToolOutcome, ToolError> {
+        self.inner
+            .execute_exact_with_context_outcome(call, name, ctx)
+            .await
+    }
+    async fn check_permissions_for_exact(
+        &self,
+        call: &ToolCall,
+        name: &str,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        self.inner
+            .check_permissions_for_exact(call, name, ctx)
+            .await
+    }
+    async fn check_permissions_for_resolved(
+        &self,
+        call: &ToolCall,
+        name: &str,
+        args: &Value,
+        ctx: &ToolExecutionContext<'_>,
+    ) -> Result<Option<ToolOutcome>, ToolError> {
+        self.inner
+            .check_permissions_for_resolved(call, name, args, ctx)
+            .await
+    }
+    fn list_tools(&self) -> Vec<ToolSchema> {
+        self.inner.list_tools()
+    }
+    fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+        (name == "spawn_session").then_some(self as &dyn ToolExecutor)
+    }
+    fn local_execution_contract(&self, name: &str) -> Option<&'static str> {
+        (name == "spawn_session")
+            .then(|| self.proof.execution_contract())
+            .flatten()
+    }
+    fn local_tool_instance(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        (name == "spawn_session").then(|| self.proof.instance())
+    }
+    fn local_framework_session_tool(
+        &self,
+        name: &str,
+    ) -> Option<bamboo_agent_core::tools::HostFrameworkSessionTool> {
+        (name == "spawn_session").then(|| self.proof.clone())
+    }
+}
+
 fn versioned_agent(fixture: &Fixture) -> (Arc<PermissionConfig>, Agent) {
+    versioned_agent_with_proof(fixture, true)
+}
+fn versioned_agent_with_proof(
+    fixture: &Fixture,
+    explicit_host_proof: bool,
+) -> (Arc<PermissionConfig>, Agent) {
     let config = Arc::new(PermissionConfig::new());
     config.set_ask_rules(["spawn_session".into(), "SubAgent".into()]);
     let make = |name| -> Arc<bamboo_tools::BuiltinToolExecutor> {
@@ -98,6 +195,7 @@ fn versioned_agent(fixture: &Fixture) -> (Arc<PermissionConfig>, Agent) {
         registry
             .register(VersionedProbeTool {
                 name,
+                contract: None,
                 probe: fixture.probe.clone(),
             })
             .unwrap();
@@ -109,16 +207,33 @@ fn versioned_agent(fixture: &Fixture) -> (Arc<PermissionConfig>, Agent) {
         )
     };
     let root_builtin = make("spawn_session");
-    let independent = Arc::new(
+    let root_instance = Arc::new(VersionedProbeTool {
+        name: "spawn_session",
+        contract: Some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1),
+        probe: fixture.probe.clone(),
+    });
+    let independent: Arc<dyn ToolExecutor> = Arc::new(
         bamboo_server_tools::overlay_executor::OverlayToolExecutor::new(
             root_builtin.clone(),
-            Arc::new(VersionedProbeTool {
-                name: "spawn_session",
-                probe: fixture.probe.clone(),
-            }),
+            root_instance.clone(),
         )
         .with_additional_permission_gate(Arc::new(VersionedProbeRootPermissionGate(root_builtin))),
     );
+    let independent = if explicit_host_proof {
+        let proof = bamboo_agent_core::tools::HostFrameworkSessionTool::from_host_instance(
+            bamboo_agent_core::tools::FrameworkSessionToolKind::SpawnRoot,
+            root_instance,
+            independent.clone(),
+            Arc::new(ProbeInstanceGuard),
+        )
+        .unwrap();
+        Arc::new(ProvenProbeInstance {
+            inner: independent,
+            proof,
+        }) as Arc<dyn ToolExecutor>
+    } else {
+        independent
+    };
     let surface = Arc::new(VersionedProbeSurface {
         legacy: make("SubAgent"),
         independent,
@@ -127,7 +242,43 @@ fn versioned_agent(fixture: &Fixture) -> (Arc<PermissionConfig>, Agent) {
     (config, agent)
 }
 
+#[tokio::test]
+async fn retained_sdk_root_with_same_named_contract_only_owner_stays_parked_without_once_restore() {
+    let fixture = Fixture::new().await;
+    let (pending, _) = versioned_pending(&fixture, Some(2)).await;
+    let request = current_request(&pending);
+    let mut approved = fixture.approve(&request).await;
+    let history = serde_json::to_value(&approved.messages).unwrap();
+    let marker = approved
+        .metadata
+        .get(PERMISSION_REEXECUTE_METADATA_KEY)
+        .cloned();
+    let (config, contract_only) = versioned_agent_with_proof(&fixture, false);
+    assert!(contract_only.run_session(&mut approved).await.is_err());
+    assert_eq!(serde_json::to_value(&approved.messages).unwrap(), history);
+    assert_eq!(
+        approved.metadata.get(PERMISSION_REEXECUTE_METADATA_KEY),
+        marker.as_ref()
+    );
+    assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+    assert!(!config.consume_once_for_generation(
+        &approved.id,
+        CALL,
+        &request.request_generation,
+        request.permission_type,
+        &request.resource
+    ));
+}
+
 async fn versioned_pending(fixture: &Fixture, version: Option<u32>) -> (Session, Value) {
+    pending_spawn_fixture(fixture, version, false).await
+}
+
+async fn pending_spawn_fixture(
+    fixture: &Fixture,
+    version: Option<u32>,
+    historical_child: bool,
+) -> (Session, Value) {
     let session = if version == Some(2) {
         let receipt = SupervisorSessionService::new(fixture.store.clone())
             .get_or_create_default("test-model")
@@ -140,7 +291,7 @@ async fn versioned_pending(fixture: &Fixture, version: Option<u32>) -> (Session,
         fixture.store.save_session(&session).await.unwrap();
         session
     };
-    let args = if version == Some(2) {
+    let args = if !historical_child {
         json!({"operation_id":"7d4fd839-3f5f-4e26-b587-a0d2cb5724cb", "expected_state_revision":1,
             "project_id":"explicit-project", "workspace_path":"/explicit/worker", "message":"bounded instruction"})
     } else {
@@ -150,11 +301,36 @@ async fn versioned_pending(fixture: &Fixture, version: Option<u32>) -> (Session,
         id: CALL.into(),
         tool_type: "function".into(),
         function: FunctionCall {
-            name: "default::spawnSession".into(),
+            name: if historical_child {
+                "SubAgent"
+            } else {
+                "default::spawnSession"
+            }
+            .into(),
             arguments: args.to_string(),
         },
     });
-    let (_, agent) = versioned_agent(fixture);
+    let agent = if historical_child {
+        let config = Arc::new(PermissionConfig::new());
+        config.set_ask_rules(["SubAgent".into()]);
+        let registry = bamboo_tools::ToolRegistry::new();
+        registry
+            .register(VersionedProbeTool {
+                name: "SubAgent",
+                contract: None,
+                probe: fixture.probe.clone(),
+            })
+            .unwrap();
+        let executor = Arc::new(
+            bamboo_tools::BuiltinToolExecutor::with_registry_and_permissions(
+                registry,
+                Arc::new(ConfigPermissionChecker::new(config.clone())),
+            ),
+        );
+        fixture.agent_with_executor(Some(config), executor, None)
+    } else {
+        versioned_agent(fixture).1
+    };
     let initial = events(agent.run_stream(session.clone(), "perform the explicit operation")).await;
     assert!(
         initial
@@ -163,7 +339,31 @@ async fn versioned_pending(fixture: &Fixture, version: Option<u32>) -> (Session,
         "{initial:?}"
     );
     assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
-    (fixture.reload(&session.id).await, args)
+    let mut pending = fixture.reload(&session.id).await;
+    if historical_child {
+        // Synthetic source for a pre-cutover pending call. Keep its old raw
+        // spelling/bytes and v1 Host record; never dispatch it as a fresh alias.
+        for message in &mut pending.messages {
+            if let Some(calls) = message.tool_calls.as_mut() {
+                for call in calls.iter_mut().filter(|call| call.id == CALL) {
+                    call.function.name = "default::spawnSession".into();
+                }
+            }
+            if let Some(record) = message.metadata.as_mut().and_then(|metadata| {
+                metadata.get_mut(bamboo_agent_core::tools::PENDING_TOOL_OPERATION_METADATA_KEY)
+            }) {
+                record["version"] = json!(1);
+                record["tool_call"]["function"]["name"] = json!("default::spawnSession");
+                record.as_object_mut().unwrap().remove("execution_contract");
+                record
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("execution_contract_known");
+            }
+        }
+        fixture.repo.save(&mut pending).await.unwrap();
+    }
+    (pending, args)
 }
 
 #[tokio::test]
@@ -172,11 +372,22 @@ async fn versioned_spawn_typed_replay_reopens_with_original_owner_and_no_reinter
         let mut fixture = Fixture::new().await;
         let (pending, args) = versioned_pending(&fixture, version).await;
         let request = current_request(&pending);
-        let expected = if version == Some(2) {
-            "spawn_session"
-        } else {
-            "SubAgent"
-        };
+        let record = pending
+            .messages
+            .iter()
+            .find_map(|message| {
+                message.metadata.as_ref().and_then(|metadata| {
+                    metadata.get(bamboo_agent_core::tools::PENDING_TOOL_OPERATION_METADATA_KEY)
+                })
+            })
+            .unwrap();
+        assert_eq!(record["version"], json!(2));
+        assert_eq!(record["execution_contract_known"], json!(true));
+        assert_eq!(
+            record["execution_contract"],
+            json!(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+        );
+        let expected = "spawn_session";
         assert_eq!(request.tool_name, expected);
         fixture.reopen_store().await;
         let (_, unanswered) = versioned_agent(&fixture);
@@ -277,6 +488,7 @@ async fn versioned_spawn_untyped_replay_without_root_port_never_enters_the_child
     let registry = bamboo_tools::ToolRegistry::new();
     registry
         .register(VersionedProbeTool {
+            contract: None,
             name: "SubAgent",
             probe: fixture.probe.clone(),
         })
@@ -284,10 +496,200 @@ async fn versioned_spawn_untyped_replay_without_root_port_never_enters_the_child
     let executor = std::sync::Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(registry));
     let agent = fixture.agent_with_executor(None, executor, None);
     let mut approved = agent.answer(&session.id, "Approve").await.unwrap().session;
-    agent.run_session(&mut approved).await.unwrap();
+    let history = serde_json::to_value(&approved.messages).unwrap();
+    let marker = approved
+        .metadata
+        .get(PERMISSION_REEXECUTE_METADATA_KEY)
+        .cloned();
+    let error = agent
+        .run_session(&mut approved)
+        .await
+        .expect_err("ambiguous historical spawn must remain parked");
+    assert!(
+        error.to_string().contains("no frozen owner/arguments"),
+        "{error}"
+    );
     assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
     assert!(fixture.probe.calls.lock().unwrap().is_empty());
-    assert!(approved.messages.iter().any(
-        |message| message.role == Role::Tool && message.content.contains("no longer available")
+    assert_eq!(serde_json::to_value(&approved.messages).unwrap(), history);
+    assert_eq!(
+        approved.metadata.get(PERMISSION_REEXECUTE_METADATA_KEY),
+        marker.as_ref()
+    );
+}
+
+#[tokio::test]
+async fn frozen_legacy_child_replay_keeps_its_owner_after_a_new_exact_alias_shadows_it() {
+    for version in [None, Some(1)] {
+        let mut fixture = Fixture::new().await;
+        let (pending, args) = pending_spawn_fixture(&fixture, version, true).await;
+        let request = current_request(&pending);
+        assert_eq!(request.tool_name, "SubAgent");
+        assert!(pending
+            .messages
+            .iter()
+            .any(
+                |message| message.metadata.as_ref().is_some_and(|metadata| metadata
+                    .get(bamboo_agent_core::tools::PENDING_TOOL_OPERATION_METADATA_KEY)
+                    .is_some())
+            ));
+        let approved = fixture.approve(&request).await;
+        fixture.reopen_store().await;
+        let config = Arc::new(PermissionConfig::new());
+        config.set_ask_rules(["SubAgent".into(), "spawnSession".into()]);
+        let registry = bamboo_tools::ToolRegistry::new();
+        for name in ["SubAgent", "spawnSession"] {
+            registry
+                .register(VersionedProbeTool {
+                    contract: None,
+                    name,
+                    probe: fixture.probe.clone(),
+                })
+                .unwrap();
+        }
+        let executor = Arc::new(
+            bamboo_tools::BuiltinToolExecutor::with_registry_and_permissions(
+                registry,
+                Arc::new(ConfigPermissionChecker::new(config.clone())),
+            ),
+        );
+        assert_eq!(
+            executor
+                .resolve_reference_for_session(&approved, "default::spawnSession")
+                .as_deref(),
+            Some("spawnSession")
+        );
+        let restarted = fixture.agent_with_executor(Some(config), executor, None);
+        let completed = events(restarted.resume_stream(approved)).await;
+        assert!(
+            !completed
+                .iter()
+                .any(|event| matches!(event, AgentEvent::NeedClarification { .. })),
+            "{completed:?}"
+        );
+        let calls = fixture.probe.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "SubAgent");
+        assert_eq!(calls[0].arguments, args);
+        assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn frozen_parked_arguments_cannot_be_replaced_before_sdk_replay() {
+    let fixture = Fixture::new().await;
+    let (pending, _) = versioned_pending(&fixture, None).await;
+    let request = current_request(&pending);
+    let mut approved = fixture.approve(&request).await;
+    let call = approved
+        .messages
+        .iter_mut()
+        .find_map(|message| {
+            message
+                .tool_calls
+                .as_mut()
+                .and_then(|calls| calls.iter_mut().find(|call| call.id == CALL))
+        })
+        .unwrap();
+    call.function.arguments =
+        json!({"action":"create", "prompt":"different unapproved operation"}).to_string();
+    let (config, agent) = versioned_agent(&fixture);
+    let error = agent
+        .run_session(&mut approved)
+        .await
+        .expect_err("frozen argument mutation must refuse before grant restoration");
+    assert!(
+        error.to_string().contains("pending operation binding"),
+        "{error}"
+    );
+    assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+    assert!(fixture.probe.calls.lock().unwrap().is_empty());
+    assert!(approved
+        .metadata
+        .contains_key(PERMISSION_REEXECUTE_METADATA_KEY));
+    assert!(!config.consume_once_for_generation(
+        &approved.id,
+        CALL,
+        &request.request_generation,
+        request.permission_type,
+        &request.resource
     ));
+}
+
+#[tokio::test]
+async fn malformed_or_unknown_root_contract_preserves_sdk_markers_and_unconsumed_approval() {
+    for case in [
+        "missing_contract",
+        "missing_known",
+        "unknown_owner",
+        "unsupported_id",
+        "old_v1_record",
+    ] {
+        let fixture = Fixture::new().await;
+        let (pending, _) = versioned_pending(&fixture, Some(2)).await;
+        let request = current_request(&pending);
+        let mut approved = fixture.approve(&request).await;
+        let record = approved
+            .messages
+            .iter_mut()
+            .find_map(|message| {
+                message.metadata.as_mut().and_then(|metadata| {
+                    metadata.get_mut(bamboo_agent_core::tools::PENDING_TOOL_OPERATION_METADATA_KEY)
+                })
+            })
+            .unwrap();
+        match case {
+            "missing_contract" => {
+                record.as_object_mut().unwrap().remove("execution_contract");
+            }
+            "missing_known" => {
+                record
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("execution_contract_known");
+            }
+            "unknown_owner" => {
+                record["execution_contract"] = Value::Null;
+                record["execution_contract_known"] = json!(false);
+            }
+            "unsupported_id" => record["execution_contract"] = json!("bamboo.spawn_root.future"),
+            "old_v1_record" => {
+                record["version"] = json!(1);
+                record.as_object_mut().unwrap().remove("execution_contract");
+                record
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("execution_contract_known");
+            }
+            _ => unreachable!(),
+        }
+        let history = serde_json::to_value(&approved.messages).unwrap();
+        let marker = approved
+            .metadata
+            .get(PERMISSION_REEXECUTE_METADATA_KEY)
+            .cloned();
+        let (config, agent) = versioned_agent(&fixture);
+        assert!(agent.run_session(&mut approved).await.is_err(), "{case}");
+        assert_eq!(
+            serde_json::to_value(&approved.messages).unwrap(),
+            history,
+            "{case}"
+        );
+        assert_eq!(
+            approved.metadata.get(PERMISSION_REEXECUTE_METADATA_KEY),
+            marker.as_ref(),
+            "{case}"
+        );
+        assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0, "{case}");
+        assert!(
+            !config.consume_once_for_generation(
+                &approved.id,
+                CALL,
+                &request.request_generation,
+                request.permission_type,
+                &request.resource
+            ),
+            "{case}"
+        );
+    }
 }

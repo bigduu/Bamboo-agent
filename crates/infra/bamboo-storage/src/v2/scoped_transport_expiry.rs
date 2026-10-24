@@ -49,6 +49,7 @@ impl ScopedTransportCensus {
             }
         }
         supervisor::validate_overlay(&main, Some(&side))?;
+        reject_conversation_generation_change(&main, &side)?;
         if main.id != side.id
             || main.created_at != side.created_at
             || main.kind != side.kind
@@ -160,9 +161,10 @@ impl ScopedTransportCensus {
     }
 
     pub(crate) fn check_current_live(&self, binding: &ScopedLoopControlBinding) -> io::Result<()> {
-        Self::read(&self.directory)?
-            .ok_or_else(|| io::Error::other("Loop current census disappeared"))?
-            .require_live_binding(binding)
+        let current = Self::read(&self.directory)?
+            .ok_or_else(|| io::Error::other("Loop current census disappeared"))?;
+        reject_conversation_generation_change(&self.session, &current.session)?;
+        current.require_live_binding(binding)
     }
 
     pub(crate) fn wrap_live_guard(
@@ -181,6 +183,7 @@ impl ScopedTransportCensus {
     pub(crate) fn require_same_snapshot(&self) -> io::Result<Self> {
         let current = Self::read(&self.directory)?
             .ok_or_else(|| io::Error::other("transport census disappeared"))?;
+        reject_conversation_generation_change(&self.session, &current.session)?;
         let projection = |session: &Session| {
             serde_json::to_value((
                 &session.id,
@@ -243,5 +246,220 @@ impl SessionStoreV2 {
     ) -> io::Result<Option<ScopedTransportCensus>> {
         validate_session_id(target)?;
         ScopedTransportCensus::read(&self.sessions_dir.join(target))
+    }
+}
+
+#[cfg(test)]
+pub(super) mod generation_tests {
+    use super::*;
+    use bamboo_domain::{AgentRuntimeState, LoopControlAction, SupervisorReference};
+    use std::collections::BTreeSet;
+
+    pub(in crate::v2) fn next_conversation(source: &Session) -> Session {
+        let mut current = source.clone();
+        current.conversation_reset = Some(bamboo_domain::ConversationResetState {
+            schema_version: 1,
+            conversation_revision: 1,
+            receipts: vec![bamboo_domain::ConversationResetReceipt {
+                operation_id: format!("0:{}", Uuid::new_v4()),
+                birth_token: source.root_mode_birth_token(),
+                expected_snapshot_sha256: "a".repeat(64),
+                previous_revision: 0,
+                conversation_revision: 1,
+                retained_system_messages: 0,
+                reset_at: source.updated_at,
+            }],
+        });
+        current
+    }
+
+    pub(in crate::v2) fn source() -> Session {
+        let mut session = Session::new("scoped-generation-target", "model");
+        session.set_project_id_meta("project-scoped-generation");
+        session.agent_runtime_state = Some(AgentRuntimeState {
+            execution_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        });
+        session
+    }
+
+    /// Selector data only; no live Supervisor grant or permission is installed.
+    pub(in crate::v2) fn binding(session: &Session) -> ScopedLoopControlBinding {
+        let binding = ScopedLoopControlBinding {
+            grant_id: Uuid::new_v4(),
+            supervisor: SupervisorReference {
+                session_id: DEFAULT_SUPERVISOR_SESSION_ID.into(),
+                incarnation_id: Uuid::new_v4(),
+            },
+            supervisor_tool_authority_revision: 1,
+            target_session_id: session.id.clone(),
+            target_created_at: session.created_at,
+            target_metadata_version: session.metadata_version,
+            target_project_id: session.project_id_meta().unwrap().parse().unwrap(),
+            link_revision: 1,
+            owner_run_id: "scoped-generation-run".into(),
+            execution_id: session
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .execution_id
+                .clone()
+                .unwrap(),
+            allowed_actions: BTreeSet::from([LoopControlAction::Start]),
+            max_iterations: 2,
+            max_total_rounds: 4,
+        };
+        binding.validate().unwrap();
+        binding
+    }
+
+    fn pair(directory: &Path, main: &Session, side: &Session) {
+        std::fs::write(
+            directory.join("session.json"),
+            compact_main::serialize_main(main).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.join(RUNTIME_SIDECAR_FILE),
+            serde_json::to_vec(&runtime_sidecar_snapshot(side)).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn conflict(error: io::Error) {
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>()));
+    }
+
+    #[test]
+    fn census_pair_rejects_different_or_invalid_conversation_before_overlay() {
+        let home = tempfile::tempdir().unwrap();
+        let original = source();
+        let current = next_conversation(&original);
+        pair(home.path(), &original, &current);
+        conflict(
+            ScopedTransportCensus::read(home.path())
+                .err()
+                .expect("mixed pair"),
+        );
+        let mut invalid = original.clone();
+        invalid.conversation_reset = Some(Default::default());
+        pair(home.path(), &original, &invalid);
+        conflict(
+            ScopedTransportCensus::read(home.path())
+                .err()
+                .expect("invalid pair"),
+        );
+        pair(home.path(), &current, &current);
+        assert!(ScopedTransportCensus::read(home.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn retained_census_never_refreshes_original_generation_from_current_pair() {
+        for same_revision in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let zero = source();
+            let original = if same_revision {
+                next_conversation(&zero)
+            } else {
+                zero.clone()
+            };
+            let selector = binding(&original);
+            pair(home.path(), &original, &original);
+            let retained = ScopedTransportCensus::read(home.path()).unwrap().unwrap();
+            let mut current = if same_revision {
+                original.clone()
+            } else {
+                next_conversation(&zero)
+            };
+            if same_revision {
+                current.conversation_reset.as_mut().unwrap().receipts[0].expected_snapshot_sha256 =
+                    "b".repeat(64);
+            }
+            pair(home.path(), &current, &current);
+            conflict(retained.check_current_live(&selector).unwrap_err());
+            conflict(
+                retained
+                    .require_same_snapshot()
+                    .err()
+                    .expect("old snapshot"),
+            );
+            assert_eq!(
+                retained.session.conversation_reset,
+                original.conversation_reset
+            );
+        }
+    }
+
+    #[derive(Default)]
+    struct DeliveryProbe {
+        matches: AtomicUsize,
+        notifications: AtomicUsize,
+    }
+    impl bamboo_domain::SessionRunDeliveryGuard for DeliveryProbe {
+        fn matches(&self, _: &str, _: DateTime<Utc>, _: &str) -> bool {
+            self.matches.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        fn notify_committed_delivery(&self, _: u64) -> bool {
+            self.notifications.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    #[test]
+    fn retained_delivery_does_not_delegate_or_notify_after_conversation_change() {
+        let home = tempfile::tempdir().unwrap();
+        let original = source();
+        let selector = binding(&original);
+        pair(home.path(), &original, &original);
+        let retained = ScopedTransportCensus::read(home.path()).unwrap().unwrap();
+        let probe = Arc::new(DeliveryProbe::default());
+        let guard = retained.wrap_live_guard(&selector, probe.clone()).unwrap();
+        let current = next_conversation(&original);
+        pair(home.path(), &current, &current);
+        assert!(!guard.matches(
+            &selector.target_session_id,
+            selector.target_created_at,
+            &selector.owner_run_id
+        ));
+        assert!(!guard.notify_committed_delivery(1));
+        assert_eq!(probe.matches.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.notifications.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn current_generation_keeps_unrelated_append_and_existing_delivery_contract() {
+        let home = tempfile::tempdir().unwrap();
+        let original = next_conversation(&source());
+        let selector = binding(&original);
+        pair(home.path(), &original, &original);
+        let retained = ScopedTransportCensus::read(home.path()).unwrap().unwrap();
+        let mut current = original.clone();
+        current.add_message(Message::user("same conversation append"));
+        current.pinned = true;
+        pair(home.path(), &current, &current);
+        retained.check_current_live(&selector).unwrap();
+        assert_eq!(
+            retained
+                .require_same_snapshot()
+                .unwrap()
+                .session
+                .messages
+                .len(),
+            1
+        );
+        let probe = Arc::new(DeliveryProbe::default());
+        let guard = retained.wrap_live_guard(&selector, probe.clone()).unwrap();
+        assert!(guard.matches(
+            &selector.target_session_id,
+            selector.target_created_at,
+            &selector.owner_run_id
+        ));
+        assert!(guard.notify_committed_delivery(1));
+        assert_eq!(probe.matches.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.notifications.load(Ordering::SeqCst), 1);
     }
 }

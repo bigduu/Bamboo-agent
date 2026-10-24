@@ -1,0 +1,33 @@
+{
+  "schema": "bamboo-ci-inventory-fixture/v1",
+  "source": "46b52ce8abfd20a7917f82c6ebdf54781a7b11d0",
+  "tree": "03a6178ef5cc1d51dbd35cc77a64aa22bcf42864",
+  "workflowRun": 40048666734,
+  "attempt": 1,
+  "artifactId": 12542483784,
+  "profile": "all-features",
+  "expected": {
+    "targets": 159,
+    "packages": 30,
+    "tests": 12397,
+    "ignored": 38,
+    "blocks": 274
+  },
+  "compressed_sha256": "d72664c4ac25634594b4492437d4dfbf2ea0b2cf3572126c8a57ba9c08be527f",
+  "uncompressed_sha256": "b53e2b95859483822cdf91f7e96e17a7e12f7ded6f92f1809367cce9c134e25b",
+  "inventory_sha256": "4be6dd13bfb721818ed7824b091a7c7c0523372ab6a141ff81ae688342dd7c58",
+  "scope": "Actual compile/list inventory only; no runtime success is claimed. Host paths, compiler environment and binaries are omitted.",
+  "historicalBlocks": 274,
+  "currentProjection": {
+    "timeoutSeconds": 1200,
+    "blocks": 171,
+    "matrices": [
+      86,
+      85
+    ],
+    "tests": 12397,
+    "ignored": 38,
+    "crates": 30,
+    "measuredRuntime": false
+  }
+}

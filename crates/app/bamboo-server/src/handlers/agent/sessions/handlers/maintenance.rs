@@ -5,9 +5,44 @@ use bamboo_agent_core::{Session, Storage};
 use bamboo_engine::auto_dream::{run_project_auto_dream_once_for_project, AutoDreamContext};
 use bamboo_engine::project_context::ProjectContextResolver;
 use bamboo_memory::memory_store::MemoryStore;
-use bamboo_storage::{CleanupMode, CleanupResult};
+use bamboo_storage::{CleanupFailure, CleanupMode, CleanupResult};
 
 use super::super::types::{CleanupRequest, SessionSummary};
+
+fn clear_authority_conflict(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported
+        && error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+}
+
+fn clear_blocked_response(session_id: &str, error: &std::io::Error) -> HttpResponse {
+    HttpResponse::Conflict().json(serde_json::json!({
+        "error": {
+            "type": "api_error",
+            "code": "session_clear_authority_conflict",
+            "message": format!("Session history clear is blocked by its current authority: {error}. Reload the session before deciding what to do next."),
+        },
+        "session_id": session_id,
+        "status": "blocked",
+        "refresh_required": true,
+        "retryable": false,
+    }))
+}
+
+fn clear_unknown_response(session_id: &str, message: impl std::fmt::Display) -> HttpResponse {
+    HttpResponse::InternalServerError().json(serde_json::json!({
+        "error": {
+            "type": "api_error",
+            "code": "session_clear_outcome_unknown",
+            "message": format!("Session history clear outcome could not be confirmed: {message}. Reload the session before any further action; do not automatically retry clear."),
+        },
+        "session_id": session_id,
+        "status": "outcome_unknown",
+        "refresh_required": true,
+        "retryable": false,
+    }))
+}
 
 /// `POST /api/v1/sessions/{session_id}/clear`
 pub async fn clear_session(
@@ -35,17 +70,22 @@ pub async fn clear_session(
     let cleared = match state.session_store.clear_session(&session_id).await {
         Ok(cleared) => cleared,
         Err(error) => {
-            // Another process may publish a future contract after preflight.
-            // Present its precise report, without classifying arbitrary IO or
-            // Actor authority errors as compatibility conflicts.
-            if let Ok(Some(canonical)) = state.storage.load_session(&session_id).await {
-                if let Some(conflict) = SessionSummary::execution_conflict(&canonical) {
-                    return Ok(conflict);
+            if clear_authority_conflict(&error) {
+                // Another process may publish a future contract after preflight.
+                // Preserve that precise refusal. Other typed authority refusals
+                // (including activated/unknown Actor context) remain blocked.
+                if let Ok(Some(canonical)) = state.storage.load_session(&session_id).await {
+                    if let Some(conflict) = SessionSummary::execution_conflict(&canonical) {
+                        return Ok(conflict);
+                    }
                 }
+                return Ok(clear_blocked_response(&session_id, &error));
             }
-            return Err(crate::error::json_internal_server_error(format!(
-                "Failed to clear session: {error}"
-            )));
+            // Clear removes attachments and publishes multiple files. An I/O
+            // error does not prove that none of those steps executed. Evict the
+            // old observation and leave success/feed publication untouched.
+            state.sessions.remove(&session_id);
+            return Ok(clear_unknown_response(&session_id, error));
         }
     };
 
@@ -67,20 +107,16 @@ pub async fn clear_session(
     // pre-clear transcript authoritative in memory. A successful reload below
     // immediately installs the replacement.
     state.sessions.remove(&session_id);
-    let cleared_session = state
-        .session_store
-        .load_session(&session_id)
-        .await
-        .map_err(|error| {
-            crate::error::json_internal_server_error(format!(
-                "Failed to reload cleared session: {error}"
-            ))
-        })?
-        .ok_or_else(|| {
-            crate::error::json_internal_server_error(
-                "Cleared session disappeared before cache publication",
-            )
-        })?;
+    let cleared_session = match state.session_store.load_session(&session_id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return Ok(clear_unknown_response(
+                &session_id,
+                "cleared session disappeared before cache publication",
+            ));
+        }
+        Err(error) => return Ok(clear_unknown_response(&session_id, error)),
+    };
     state.sessions.insert(
         session_id.clone(),
         std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(cleared_session)),
@@ -100,6 +136,10 @@ pub async fn clear_session(
         "session_id": session_id
     })))
 }
+
+#[cfg(test)]
+#[path = "maintenance_clear_tests.rs"]
+mod clear_tests;
 
 async fn load_session_from_state_or_storage(
     state: &AppState,
@@ -213,17 +253,100 @@ pub async fn cleanup_sessions(
         }
     };
 
-    let result: CleanupResult = state
-        .session_store
-        .cleanup(mode, req.keep_pinned)
+    let outcome = tokio::spawn(cleanup_owned(state, mode, req.keep_pinned))
         .await
-        .map_err(|error| {
-            crate::error::json_internal_server_error(format!("Cleanup failed: {error}"))
-        })?;
+        .map_err(|_| crate::error::json_internal_server_error("Session cleanup interrupted"))?;
+    if outcome.storage_error.is_some()
+        || !outcome.browser_cleanup_pending.is_empty()
+        || !outcome.unconfirmed_session_ids.is_empty()
+    {
+        return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": crate::error::error_value("Session cleanup incomplete. Check the reported session IDs before retrying deletion."),
+            "storage_cleanup_error": outcome.storage_error,
+            "deleted_count": outcome.deleted.deleted_count,
+            "deleted_session_ids": outcome.deleted.deleted_session_ids,
+            "browser_cleanup_pending_session_ids": outcome.browser_cleanup_pending,
+            "unconfirmed_session_ids": outcome.unconfirmed_session_ids
+        })));
+    }
+    Ok(HttpResponse::Ok().json(outcome.deleted))
+}
 
+struct CleanupOutcome {
+    deleted: CleanupResult,
+    browser_cleanup_pending: Vec<String>,
+    storage_error: Option<String>,
+    unconfirmed_session_ids: Vec<String>,
+}
+
+// The owned task includes storage deletion and every browser retirement, so a
+// disconnected HTTP caller cannot abandon profiles after storage has committed.
+async fn cleanup_owned(
+    state: web::Data<AppState>,
+    mode: CleanupMode,
+    keep_pinned: bool,
+) -> CleanupOutcome {
+    let result = state
+        .session_store
+        .cleanup_with_progress(mode, keep_pinned)
+        .await;
+    finish_cleanup(state, result).await
+}
+
+async fn finish_cleanup(
+    state: web::Data<AppState>,
+    result: std::result::Result<CleanupResult, CleanupFailure>,
+) -> CleanupOutcome {
+    let mut unconfirmed_session_ids = Vec::new();
+    let (candidates, storage_error) = match result {
+        Ok(result) => (result, None),
+        Err(failure) => {
+            tracing::warn!(error = %failure.error, "session cleanup partially failed; checking canonical deletions");
+            (
+                CleanupResult {
+                    deleted_count: failure.candidate_session_ids.len(),
+                    deleted_session_ids: failure.candidate_session_ids,
+                },
+                Some(failure.error.to_string()),
+            )
+        }
+    };
+    let mut deleted_session_ids = Vec::new();
+    for session_id in candidates.deleted_session_ids {
+        // Even a successful legacy result may only have removed an index row
+        // after a failed Child directory unlink. Never purge surviving state.
+        match state
+            .session_store
+            .session_is_canonically_absent(&session_id)
+            .await
+        {
+            Ok(true) => deleted_session_ids.push(session_id),
+            Ok(false) if storage_error.is_none() => unconfirmed_session_ids.push(session_id),
+            Ok(false) => {}
+            Err(_) => unconfirmed_session_ids.push(session_id),
+        }
+    }
+    deleted_session_ids.sort();
+    let result = CleanupResult {
+        deleted_count: deleted_session_ids.len(),
+        deleted_session_ids,
+    };
+
+    let mut browser_cleanup_pending = Vec::new();
     if !result.deleted_session_ids.is_empty() {
-        for session_id in &result.deleted_session_ids {
-            let _ = state.browser.retire(session_id).await;
+        let retirements = result
+            .deleted_session_ids
+            .iter()
+            .map(|id| state.browser.retire_deleted_session(id));
+        for (session_id, retirement) in result
+            .deleted_session_ids
+            .iter()
+            .zip(futures::future::join_all(retirements).await)
+        {
+            if let Err(error) = retirement {
+                tracing::warn!(%session_id, %error, "deleted session browser cleanup incomplete; retry deletion by ID");
+                browser_cleanup_pending.push(session_id.clone());
+            }
         }
         // Best-effort cancel any in-flight executions.
         {
@@ -269,7 +392,12 @@ pub async fn cleanup_sessions(
         }
     }
 
-    Ok(HttpResponse::Ok().json(result))
+    CleanupOutcome {
+        deleted: result,
+        browser_cleanup_pending,
+        storage_error,
+        unconfirmed_session_ids,
+    }
 }
 
 #[cfg(test)]
@@ -288,6 +416,186 @@ mod tests {
     use bamboo_agent_core::{ConversationSummary, Message};
     use bamboo_llm::Config;
     use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
+
+    #[tokio::test]
+    async fn bulk_cleanup_retires_a_legacy_root_with_empty_root_session_id() {
+        let home = tempdir().unwrap();
+        let state = web::Data::new(AppState::new(home.path().into()).await.unwrap());
+        let mut root = Session::new("legacy-profile-root", "model");
+        root.root_session_id.clear();
+        state.session_store.save_session(&root).await.unwrap();
+        assert!(state
+            .session_store
+            .get_index_entry(&root.id)
+            .await
+            .unwrap()
+            .root_session_id
+            .is_empty());
+        state.sessions.insert(
+            root.id.clone(),
+            Arc::new(bamboo_engine::SessionSnapshot::new(root.clone())),
+        );
+        let profile =
+            crate::browser::test_profile_directory(&home.path().join("browser-profiles"), &root.id);
+        std::fs::write(profile.join("Cookies"), b"synthetic legacy state").unwrap();
+        let outcome = cleanup_owned(state.clone(), CleanupMode::All, false).await;
+        assert!(state
+            .storage
+            .load_session(&root.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(outcome.deleted.deleted_session_ids, vec![root.id.clone()]);
+        assert_eq!(outcome.deleted.deleted_count, 1);
+        assert!(outcome.unconfirmed_session_ids.is_empty());
+        assert!(outcome.browser_cleanup_pending.is_empty());
+        assert!(!profile.exists());
+        assert!(!state.sessions.contains_key(&root.id));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_legacy_child_cleanup_does_not_purge_a_surviving_canonical_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempdir().unwrap();
+        let state = web::Data::new(AppState::new(home.path().into()).await.unwrap());
+        let root = Session::new("canonical-kept-root", "model");
+        let child = Session::new_child_of("canonical-kept-child", &root, "model", "child");
+        state.session_store.save_session(&root).await.unwrap();
+        state.session_store.save_session(&child).await.unwrap();
+        state.session_store.flush_search_index().await;
+        state.sessions.insert(
+            child.id.clone(),
+            Arc::new(bamboo_engine::SessionSnapshot::new(child.clone())),
+        );
+        let directory = home
+            .path()
+            .join("sessions")
+            .join(&root.id)
+            .join("children")
+            .join(&child.id);
+        let main = directory.join("session.json");
+        let before = std::fs::read(&main).unwrap();
+        let profile = crate::browser::test_profile_directory(
+            &home.path().join("browser-profiles"),
+            &child.id,
+        );
+        std::fs::write(profile.join("Cookies"), b"preserve synthetic state").unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let outcome = cleanup_owned(state.clone(), CleanupMode::Children, false).await;
+        if directory.exists() {
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(std::fs::read(&main).unwrap(), before);
+        assert_eq!(
+            std::fs::read(profile.join("Cookies")).unwrap(),
+            b"preserve synthetic state"
+        );
+        assert!(state.sessions.contains_key(&child.id));
+        assert!(outcome.deleted.deleted_session_ids.is_empty());
+        assert_eq!(outcome.unconfirmed_session_ids, vec![child.id]);
+    }
+
+    #[tokio::test]
+    async fn partial_storage_cleanup_still_purges_canonically_deleted_profiles_only() {
+        let directory = tempdir().unwrap();
+        let state = web::Data::new(AppState::new(directory.path().to_path_buf()).await.unwrap());
+        let deleted = Session::new("partial-browser-deleted", "model");
+        let kept = Session::new("partial-browser-kept", "model");
+        let profile_root = directory.path().join("browser-profiles");
+        let deleted_profile = crate::browser::test_profile_directory(&profile_root, &deleted.id);
+        let kept_profile = crate::browser::test_profile_directory(&profile_root, &kept.id);
+        for (session, profile) in [(&deleted, &deleted_profile), (&kept, &kept_profile)] {
+            state.session_store.save_session(session).await.unwrap();
+            std::fs::write(profile.join("Cookies"), b"synthetic state").unwrap();
+        }
+        // Reproduce storage's partial-commit boundary with a real canonical
+        // deletion followed by an injected later storage error. No browser
+        // cleanup has run, and the other canonical Session remains live.
+        assert!(state.storage.delete_session(&deleted.id).await.unwrap());
+        let outcome = finish_cleanup(
+            state.clone(),
+            Err(CleanupFailure {
+                error: std::io::Error::other("synthetic later cleanup failure"),
+                candidate_session_ids: vec![deleted.id.clone(), kept.id.clone()],
+            }),
+        )
+        .await;
+        assert_eq!(
+            outcome.deleted.deleted_session_ids,
+            vec![deleted.id.clone()]
+        );
+        assert!(outcome.storage_error.is_some());
+        assert!(outcome.browser_cleanup_pending.is_empty());
+        assert!(outcome.unconfirmed_session_ids.is_empty());
+        assert!(!deleted_profile.exists());
+        assert!(kept_profile.join("Cookies").exists());
+        assert!(state
+            .storage
+            .load_session(&kept.id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bulk_cleanup_reports_failed_profiles_continues_other_ids_and_allows_retry() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = tempdir().unwrap();
+        let state = web::Data::new(AppState::new(directory.path().to_path_buf()).await.unwrap());
+        let blocked = Session::new("cleanup-browser-blocked", "model");
+        let other = Session::new("cleanup-browser-other", "model");
+        let profile_root = directory.path().join("browser-profiles");
+        let blocked_profile = crate::browser::test_profile_directory(&profile_root, &blocked.id);
+        let other_profile = crate::browser::test_profile_directory(&profile_root, &other.id);
+        for (session, profile) in [(&blocked, &blocked_profile), (&other, &other_profile)] {
+            state.session_store.save_session(session).await.unwrap();
+            std::fs::write(profile.join("Cookies"), b"synthetic state").unwrap();
+        }
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(blocked_profile.join(".bamboo-profile.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+
+        let response = cleanup_sessions(
+            state.clone(),
+            web::Json(CleanupRequest {
+                mode: "all".into(),
+                keep_pinned: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["browser_cleanup_pending_session_ids"],
+            serde_json::json!([blocked.id.clone()])
+        );
+        for id in [&blocked.id, &other.id] {
+            assert!(body["deleted_session_ids"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(id)));
+            assert!(state.storage.load_session(id).await.unwrap().is_none());
+        }
+        assert!(blocked_profile.join("Cookies").exists());
+        assert!(!other_profile.exists());
+        drop(lock);
+        let retried = crate::handlers::agent::delete::handler(state, web::Path::from(blocked.id))
+            .await
+            .unwrap();
+        assert_eq!(retried.status(), StatusCode::NOT_FOUND);
+        assert!(!blocked_profile.exists());
+    }
 
     #[derive(Clone)]
     struct SequenceProvider {

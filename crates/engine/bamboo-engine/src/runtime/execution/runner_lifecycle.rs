@@ -21,6 +21,7 @@ use super::runner_state::{AgentRunner, AgentStatus};
 pub struct RunnerReservation {
     pub cancel_token: CancellationToken,
     pub run_id: String,
+    pub(super) physical_admission: Option<super::root_execution_lifetime::RootRunAdmission>,
 }
 
 /// Outcome of the shared reservation core.
@@ -94,21 +95,39 @@ async fn reserve_runner_inner(
     // registry. In particular, cancellation while waiting for the sender map
     // must not leave a `Running` slot with no task behind it.
     let mut senders_guard = senders.write().await;
-    if let Some(previous) = runners_guard.get(session_id) {
-        previous.event_publication.retire().await;
-    }
-    runners_guard.remove(session_id);
-
     let mut runner = AgentRunner::new();
     if let Some(identity) = identity {
         runner.run_id = identity.run_id;
         runner.cancel_token = identity.cancel_token;
     }
+    if let Some(previous) = runners_guard.get(session_id) {
+        runner.root_execution = previous.root_execution.clone();
+    }
+    // Serialize the last admission decision with an exact reset reservation.
+    // No Storage or target publication mutex is acquired here. This existing
+    // busy result cannot execute a new run, and is not a physical-idle claim.
+    let physical_admission = match runner.root_execution.admit(&runner.run_id) {
+        Ok(admission) => admission,
+        Err(_) => {
+            return ReserveOutcome::AlreadyRunning(
+                runners_guard
+                    .get(session_id)
+                    .map_or_else(|| runner.run_id.clone(), |previous| previous.run_id.clone()),
+            )
+        }
+    };
+    if let Some(previous) = runners_guard.get(session_id) {
+        previous.event_publication.retire().await;
+    }
+    runner.transfer_root_slot(runners_guard.get_mut(session_id));
+    runners_guard.remove(session_id);
+
     runner.status = AgentStatus::Running;
     runner.event_sender = event_sender.clone();
     let reservation = RunnerReservation {
         cancel_token: runner.cancel_token.clone(),
         run_id: runner.run_id.clone(),
+        physical_admission: Some(physical_admission),
     };
     runners_guard.insert(session_id.to_string(), runner);
 
@@ -158,6 +177,9 @@ pub async fn remove_runner_entry(
     session_id: &str,
 ) -> Option<AgentRunner> {
     if let Some(runner) = runners.get(session_id) {
+        if runner.root_reset_admission_reserved() {
+            return None;
+        }
         // Arm execution cancellation before the drain can suspend. Dropping a
         // delete/rollback future must not leave a live runner with a closed
         // event fence that a subsequent execute mistakes for healthy work.

@@ -164,6 +164,7 @@ fn request(session: &Session, fence: bamboo_domain::ActorActivationFence) -> Act
     ActorTranscriptAppend {
         fence,
         expected_created_at: session.created_at,
+        expected_conversation_generation: session.conversation_generation_observation(),
         expected_messages: session.messages.clone(),
         expected_provider_transcript: session.provider_transcript.clone(),
         messages: vec![message],

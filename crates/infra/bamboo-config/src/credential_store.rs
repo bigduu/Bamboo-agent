@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub(crate) mod share;
+
 use crate::config_store::{
     AtomicJsonStore, ConfigStoreError, ConfigStoreResult, SectionSourceKind, SectionStatus,
 };
@@ -2854,6 +2856,62 @@ impl CredentialStore {
             .collect())
     }
 
+    /// An import may replace only referenced provider/env entries and may
+    /// never clear an existing credential through omission.
+    pub(crate) fn validate_share_document_change(
+        original: &[u8],
+        candidate: &[u8],
+        allowed_refs: &BTreeSet<CredentialRef>,
+    ) -> ConfigStoreResult<u64> {
+        let original = Self::parse_transaction_document(original, true)?;
+        let candidate = Self::parse_transaction_document(candidate, false)?;
+        if original
+            .data
+            .entries
+            .keys()
+            .any(|reference| !candidate.data.entries.contains_key(reference))
+            || candidate.data.entries.iter().any(|(reference, entry)| {
+                original.data.entries.get(reference) != Some(entry)
+                    && (!allowed_refs.contains(reference) || is_internal_recovery_ref(reference))
+            })
+        {
+            return Err(ConfigStoreError::Validation(
+                "share import cannot clear or modify unrelated credentials".to_string(),
+            ));
+        }
+        let changed = original.data != candidate.data;
+        let expected = original
+            .revision
+            .checked_add(u64::from(changed))
+            .ok_or_else(|| {
+                ConfigStoreError::Validation("configuration revision counter exhausted".into())
+            })?;
+        if candidate.revision != expected {
+            return Err(ConfigStoreError::Validation(
+                "share credential candidate has an invalid revision".to_string(),
+            ));
+        }
+        Ok(candidate.revision)
+    }
+
+    /// Presence check for already-prepared encrypted share candidates. The
+    /// import planner separately validates plaintext using an initialized key;
+    /// journal recovery must never initialize keys or invoke discovery.
+    pub(crate) fn ensure_share_refs_present(
+        bytes: &[u8],
+        references: &BTreeSet<CredentialRef>,
+    ) -> ConfigStoreResult<()> {
+        let document = Self::parse_transaction_document(bytes, false)?;
+        if references.iter().any(|reference| {
+            is_internal_recovery_ref(reference) || !document.data.entries.contains_key(reference)
+        }) {
+            return Err(ConfigStoreError::Validation(
+                "share credential reference is unavailable".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn ensure_required_refs_in_bytes(
         bytes: &[u8],
         required_refs: &[String],
@@ -3492,11 +3550,6 @@ mod tests {
             .open(dir.path().join(".config-credential-migration.lock"))
             .unwrap();
         migration_lock.lock().unwrap();
-        std::fs::write(
-            dir.path().join("config-credential-migration.json"),
-            b"manifest-commit-window",
-        )
-        .unwrap();
         store
             .replace_unchecked(
                 reference.clone(),
@@ -3505,6 +3558,39 @@ mod tests {
                 1,
             )
             .unwrap();
+        // Model the pending window after its credential member is installed.
+        // Ordinary member access also validates manifests, so a non-JSON
+        // sentinel cannot represent a transaction that reached this point.
+        let transaction_id = uuid::Uuid::new_v4();
+        let stage_dir = format!(".config-credential-stage-v1-{transaction_id}");
+        let staged_credentials = std::fs::read(store.path()).unwrap();
+        std::fs::create_dir(dir.path().join(&stage_dir)).unwrap();
+        std::fs::write(
+            dir.path().join(&stage_dir).join("credentials.json"),
+            &staged_credentials,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config-credential-migration.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "transaction_id": transaction_id,
+                "stage_dir": stage_dir,
+                "state": "pending",
+                "files": [{
+                    "name": "credentials.json",
+                    "staged_name": "credentials.json",
+                    "sha256": hex::encode(Sha256::digest(&staged_credentials)),
+                    "sensitive": true
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(crate::ensure_provider_mcp_migration_ready(dir.path()).is_err());
+        assert!(!String::from_utf8(staged_credentials)
+            .unwrap()
+            .contains("new-transaction-secret"));
 
         let (started_tx, started_rx) = mpsc::channel();
         let (resolve_result_tx, resolve_result_rx) = mpsc::channel();

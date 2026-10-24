@@ -29,6 +29,7 @@ const SUCCESSOR_ID: &str = "ordinary-successor-input";
 const SUCCESSOR: &str = "ROOT_SUCCESSOR_INPUT: replace the cancelled execution.";
 const SUCCESSOR_REPLY: &str = "ROOT_SUCCESSOR_COMMITTED";
 const WRITE_CALL: &str = "root-write-after-permission-tightening";
+const RETRY_WRITE_CALL: &str = "root-write-with-current-permission";
 const RESTART_WAIT: &str = "ROOT_RESTART_WAIT: hold this provider boundary without delegating.";
 
 #[derive(Clone, Copy)]
@@ -162,10 +163,16 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     probe.late_response_emitted.store(true, Ordering::SeqCst);
                     (json!({"content":STALE_REPLY}), "stop")
                 }
-                Case::Permission if call == 0 => {
-                    released(&probe.release_root).await;
+                Case::Permission if call <= 1 => {
+                    if call == 0 {
+                        released(&probe.release_root).await;
+                    }
                     tool_call(
-                        WRITE_CALL,
+                        if call == 0 {
+                            WRITE_CALL
+                        } else {
+                            RETRY_WRITE_CALL
+                        },
                         "Write",
                         json!({"file_path":probe.workspace.join("permission-boundary.txt"),"content":"must require approval"}),
                     )
@@ -921,6 +928,18 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
             move |_| probe.root_ready.load(Ordering::SeqCst),
         )
         .await;
+    let authority_path = fixture
+        .data
+        .join("sessions")
+        .join(ROOT_ID)
+        .join("actor-authority.json");
+    let authority = || {
+        let entry: bamboo_domain::ActorDirectoryEntry =
+            serde_json::from_slice(&std::fs::read(&authority_path).unwrap()).unwrap();
+        entry.validate().unwrap();
+        entry
+    };
+    let original_run_id = authority().activation.unwrap().run_id;
     let version = fixture.canonical().await.metadata_version;
     let response = fixture
         .client
@@ -937,6 +956,83 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
     );
     fixture.probe.release_root.send_replace(true);
     let sentinel = fixture.probe.workspace.join("permission-boundary.txt");
+    // A Native execution freezes its permission policy. Tightening it revokes
+    // that owner; a fresh execution must bind the current policy before Write.
+    let revoked = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            assert!(!sentinel.exists(), "revoked owner must not perform Write");
+            let session = fixture.canonical().await;
+            if session.last_run_status().as_deref() == Some("error") {
+                break session;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("tightening revokes the original Native execution");
+    assert!(revoked
+        .last_run_error()
+        .is_some_and(|error| error.contains("Native Session permission policy changed")));
+    let original_user_ids: Vec<_> = revoked
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .map(|message| message.id.clone())
+        .collect();
+    fixture.admitted_once(INPUT_ID, INPUT).await;
+    // Runner status can become terminal before the Actor owner releases. Only
+    // an explicit busy refusal is safe to wait out; never retry a lost response.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let response = fixture
+                .client
+                .post(format!(
+                    "{}/sessions/{ROOT_ID}/messages/truncate",
+                    fixture.base
+                ))
+                .json(&json!({"mode":"error_retry"}))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value = response.json().await.unwrap();
+            if status == reqwest::StatusCode::OK {
+                break;
+            }
+            assert_eq!(
+                status,
+                reqwest::StatusCode::CONFLICT,
+                "Retry preparation: {body}"
+            );
+            assert!(
+                matches!(
+                    body["error"]["message"].as_str(),
+                    Some("Session is currently running" | "Session is running; wait before Retry")
+                ),
+                "Retry preparation: {body}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("revoked owner finishes releasing before Retry");
+    let response = fixture
+        .client
+        .post(format!("{}/execute/{ROOT_ID}", fixture.base))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::ACCEPTED,
+        "Retry execute: {}",
+        response.text().await.unwrap()
+    );
+    let response: Value = response.json().await.unwrap();
+    let retry_run_id = response["run_id"].as_str().unwrap();
+    assert_ne!(retry_run_id, original_run_id);
+    let sentinel = fixture.probe.workspace.join("permission-boundary.txt");
     let parked = fixture
         .wait(
             "next Write asks for approval after bypass is removed",
@@ -948,10 +1044,27 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
                 session
                     .pending_question
                     .as_ref()
-                    .is_some_and(|question| question.tool_call_id == WRITE_CALL)
+                    .is_some_and(|question| question.tool_call_id == RETRY_WRITE_CALL)
             },
         )
         .await;
+    assert_ne!(
+        authority().activation.as_ref().unwrap().run_id,
+        original_run_id
+    );
+    assert_eq!(
+        authority().activation.as_ref().unwrap().run_id,
+        retry_run_id
+    );
+    assert_eq!(
+        parked
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>(),
+        original_user_ids
+    );
     assert_eq!(
         parked
             .agent_runtime_state
@@ -964,7 +1077,7 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
         .messages
         .iter()
         .find(|message| {
-            message.role == Role::Tool && message.tool_call_id.as_deref() == Some(WRITE_CALL)
+            message.role == Role::Tool && message.tool_call_id.as_deref() == Some(RETRY_WRITE_CALL)
         })
         .expect("the attempted Write has a canonical permission result");
     let payload: Value = serde_json::from_str(&permission_result.content).unwrap();

@@ -695,6 +695,35 @@ impl Fixture {
         after
     }
 
+    pub(crate) async fn settled_with_retained_revision_mismatch(&self, before: &Session) {
+        let result_before = before
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+            .unwrap();
+        assert!(result_before
+            .metadata
+            .as_ref()
+            .unwrap()
+            .get(bamboo_agent_core::tools::PENDING_TOOL_OPERATION_METADATA_KEY)
+            .is_some());
+        self.settled(0, true).await;
+        let saved = self.reload().await;
+        let result_after = saved
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(result_after).unwrap(),
+            serde_json::to_value(result_before).unwrap(),
+            "caller revision rejection must retain the frozen operation, request and receipt"
+        );
+        assert_eq!(self.probe.provider_calls.load(Ordering::SeqCst), 1);
+    }
+
     async fn wait_for_idle(&self) {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
@@ -977,7 +1006,7 @@ async fn server_native_typed_supervisor_approval_fixture_replay_body() {
 }
 
 #[actix_web::test]
-async fn server_resume_consumes_approved_call_after_root_tool_tightening() {
+async fn server_resume_preserves_approved_call_after_root_tool_revision_changes() {
     let body = std::thread::Builder::new()
         .stack_size(8 * 1024 * 1024)
         .spawn(|| {
@@ -1005,16 +1034,9 @@ async fn server_resume_consumes_approved_call_after_root_tool_tightening() {
                     outcome,
                     bamboo_engine::session_app::types::ResumeOutcome::Started { .. }
                 ));
-                fixture.settled(0, false).await;
-                let saved = fixture.reload().await;
-                let result = saved
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|message| message.tool_call_id.as_deref() == Some(CALL))
-                    .unwrap();
-                assert_eq!(result.tool_success, Some(false));
-                assert!(result.content.contains("Root orchestration policy blocked"));
+                fixture
+                    .settled_with_retained_revision_mismatch(&session)
+                    .await;
             });
         })
         .expect("spawn test thread");

@@ -17,6 +17,7 @@ pub mod agent_spawn;
 pub mod child_completion;
 pub mod event_forwarder;
 pub mod event_publication;
+pub(crate) mod root_execution_lifetime;
 pub mod runner_lifecycle;
 pub mod runner_state;
 pub mod session_events;
@@ -48,3 +49,6 @@ pub use visible_messages::{
     VisibleAssistantMessage, VisibleMessageEvent, VisibleMessageEventKind, VisibleMessageSnapshot,
     VisibleMessageStream,
 };
+
+/// Log-only identifiers and redaction for execution/Workspace diagnostics.
+pub mod workspace_diagnostics;

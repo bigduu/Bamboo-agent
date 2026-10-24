@@ -2,9 +2,9 @@
 //!
 //! These functions compose the tool executor chain:
 //! ```text
-//! base_tools (builtin + MCP + memory + session messaging + skills + context controls + legacy self-only
-//!             session_history + exact self-only session_history_current)
-//!   └─> root_tools (base + Plan + SubAgent + scheduler + full legacy session_history)
+//! base_tools (builtin + MCP + memory + scoped session messaging + skills + context controls
+//!             + Host-routed session_history + current history + fresh independent Root spawn)
+//!   └─> root_tools (base + Plan + SubAgent + scheduler + Supervisor controls)
 //! ```
 
 use std::collections::HashMap;
@@ -47,7 +47,12 @@ pub(super) fn build_base_tools(
     tool_event_publisher: Arc<dyn ToolEventPublisher>,
     memory_store: bamboo_memory::memory_store::MemoryStore,
     session_messenger: Arc<bamboo_engine::SessionMessenger>,
+    root_creator: Option<
+        Arc<dyn bamboo_server_tools::session_control::root_creation::SessionRootCreatePort>,
+    >,
     diagnostics: Arc<crate::tools::diagnostics::DiagnosticsSource>,
+    workspace_scope_guard: Arc<dyn bamboo_server_tools::project_tools::WorkspaceScopeGuard>,
+    workspace_handoff_hook: Arc<dyn bamboo_server_tools::project_tools::WorkspaceHandoffHook>,
 ) -> (
     Arc<dyn ToolExecutor>,
     Arc<dyn bamboo_engine::external_agents::runtime::NativeToolCeilingSource>,
@@ -96,7 +101,9 @@ pub(super) fn build_base_tools(
             session_repo.clone(),
             project_store.clone(),
             workspace_resolver.clone(),
-        ),
+        )
+        .with_scope_guard(workspace_scope_guard)
+        .with_handoff_hook(workspace_handoff_hook),
     );
     let with_workspace: Arc<dyn ToolExecutor> =
         Arc::new(crate::tools::OverlayToolExecutor::new(base, workspace_tool));
@@ -123,12 +130,19 @@ pub(super) fn build_base_tools(
     ));
     // One logical-session delivery plane serves Root, Child, nested Child and
     // scheduled/headless executions through their shared Base tool surface.
-    let with_messages: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        with_memory,
-        Arc::new(bamboo_server_tools::SessionMessageTool::new(
-            session_messenger,
-        )),
-    ));
+    let scoped_sender = Arc::new(
+        bamboo_server_tools::scoped_session_messaging::CanonicalSessionSendAdapter::new(
+            storage.clone(),
+            session_messenger.clone(),
+        ),
+    );
+    let session_message_tool = Arc::new(
+        bamboo_server_tools::SessionMessageTool::new(session_messenger)
+            .with_scoped_sender(scoped_sender),
+    );
+    // The shared factory installs this exact typed instance once, after the
+    // other Base overlays. A second message overlay would nest its single
+    // native permission-evaluation scope and consume/obscure the receipt.
 
     // `ledger` sits in the base layer (not root-only) so headless reminder
     // sessions fired by the schedule manager can read and transition the very
@@ -140,7 +154,7 @@ pub(super) fn build_base_tools(
             .with_project_store(project_store.clone()),
     );
     let with_ledger: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        with_messages,
+        with_memory,
         ledger_tool,
     ));
 
@@ -177,7 +191,7 @@ pub(super) fn build_base_tools(
         notification_service,
         session_event_senders,
         session_watchers,
-        config,
+        config.clone(),
     ));
     let notify_tool = Arc::new(crate::tools::NotifyTool::new(notify_dispatcher));
     let with_notify: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
@@ -185,33 +199,25 @@ pub(super) fn build_base_tools(
         notify_tool,
     ));
 
-    // Preserve the legacy self-only name for Base/Child compatibility. Root
-    // replaces only this exact name with the full viewer below.
-    let self_history_tool = Arc::new(crate::tools::SessionInspectorTool::self_only(
-        session_store.clone(),
-        storage.clone(),
-    ));
-    let with_legacy_history: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(with_notify, self_history_tool),
-    );
-
-    // A distinct exact identity keeps the least-privilege schema Core under
-    // Progressive and StickyFallback loading. It is not an alias for the broad
-    // Root viewer and therefore cannot inherit cross-Session actions.
-    let current_history_tool = Arc::new(crate::tools::SessionInspectorTool::current(
-        session_store,
-        storage,
-    ));
     let base: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        with_legacy_history,
-        current_history_tool,
-    ));
-    let base: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        base,
+        with_notify,
         Arc::new(crate::tools::diagnostics::BambooDiagnosticsTool::new(
             diagnostics,
         )),
     ));
+    // One real assembly serves Agent defaults, schedules and the Base supplied
+    // to Child execution. LocalChildTools still applies its own immutable
+    // native ceiling; registration here does not widen that separate boundary.
+    let base =
+        bamboo_server_tools::framework_session_tools::assemble_framework_session_tools_with_message(
+            base,
+            builtin_executor.clone(),
+            session_store,
+            storage,
+            config,
+            root_creator,
+            Some(session_message_tool),
+        );
     let ceiling = Arc::new(HostNativeToolCeiling {
         builtin: builtin_executor.clone(),
         base: base.clone(),
@@ -356,7 +362,6 @@ impl bamboo_engine::external_agents::runtime::NativeToolCeilingSource for HostNa
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_root_tools(
     base_tools: Arc<dyn ToolExecutor>,
-    permission_executor: Arc<bamboo_tools::BuiltinToolExecutor>,
     schedule_store: Arc<ScheduleStore>,
     schedule_manager: Arc<ScheduleManager>,
     session_store: Arc<SessionStoreV2>,
@@ -379,6 +384,7 @@ pub(super) fn build_root_tools(
     fabric_deployer: Arc<bamboo_server_tools::FabricDeployer>,
     project_store: Arc<bamboo_projects::ProjectStore>,
     workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
+    browser: Arc<crate::browser::BrowserManager>,
     parent_request_replies: Arc<dyn bamboo_server_tools::ParentRequestReplyPort>,
 ) -> (
     Arc<dyn ToolExecutor>,
@@ -386,6 +392,7 @@ pub(super) fn build_root_tools(
 ) {
     // Shared adapter for the unified child session tool.
     let adapter = Arc::new(crate::tools::ChildSessionAdapter {
+        browser: Some(browser),
         session_store: session_store.clone(),
         storage: storage.clone(),
         persistence: persistence.clone(),
@@ -445,21 +452,11 @@ pub(super) fn build_root_tools(
         crate::tools::OverlayToolExecutor::new(tools_with_plan, schedule_tasks_tool),
     );
 
-    // Intentional same-name overlay replacement: Root keeps every privileged
-    // cross-session action while Base/Child expose only current-Session reads.
-    let spawn_creator = root_creator.clone();
-    let spawn_storage = storage.clone();
-    let spawn_config = config.clone();
-    let session_inspector_tool = Arc::new(crate::tools::SessionInspectorTool::new(
-        session_store.clone(),
-        storage,
-    ));
-    let tools_with_inspector: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(tools_with_schedule, session_inspector_tool),
-    );
+    // Session discovery and fresh Root creation already belong to the shared
+    // Base. The Supervisor control port keeps its separate legacy authority.
     let tools_with_control: Arc<dyn ToolExecutor> =
         Arc::new(crate::tools::OverlayToolExecutor::new(
-            tools_with_inspector,
+            tools_with_schedule,
             Arc::new(
                 bamboo_server_tools::SessionControlTool::new(session_messenger.clone())
                     .with_root_creator(root_creator),
@@ -506,22 +503,6 @@ pub(super) fn build_root_tools(
         }
         _ => tools_with_control,
     };
-    let spawn_session = Arc::new(
-        bamboo_server_tools::session_control::versioned::SpawnSessionTool::new(
-            spawn_creator,
-            spawn_storage.clone(),
-            spawn_config,
-            tools.clone(),
-        ),
-    );
-    let tools = Arc::new(
-        bamboo_server_tools::session_control::versioned::VersionedRootTools::new(
-            tools,
-            spawn_session,
-            spawn_storage,
-            permission_executor,
-        ),
-    );
     (tools, sub_agent_tool)
 }
 
@@ -810,6 +791,12 @@ mod session_message_assembly_tests {
         }
         let expected =
             bamboo_server_tools::SessionMessageTool::new(state.session_messenger.clone())
+                .with_scoped_sender(Arc::new(
+                    bamboo_server_tools::scoped_session_messaging::CanonicalSessionSendAdapter::new(
+                        state.storage.clone(),
+                        state.session_messenger.clone(),
+                    ),
+                ))
                 .to_schema();
         assert_eq!(
             bamboo_domain::capability_loading_class_for_reference("session_message"),
@@ -827,7 +814,26 @@ mod session_message_assembly_tests {
             (crate::tools::ToolSurface::WithTask, &child),
         ] {
             let tools = state.tools_for(surface);
+            for kind in bamboo_agent_core::tools::FrameworkSessionToolKind::ALL {
+                let proof = tools
+                    .framework_session_tool_for_exact(kind.execution_name())
+                    .unwrap();
+                assert_eq!(proof.kind(), kind);
+                assert!(Arc::ptr_eq(
+                    &proof.instance(),
+                    &tools
+                        .tool_instance_for_exact(kind.execution_name())
+                        .unwrap()
+                ));
+            }
             assert!(tools.owns_exact_tool("session_message"));
+            assert_eq!(
+                tools.execution_contract_for_exact("session_message"),
+                Some(bamboo_server_tools::session_message::SCOPED_SESSION_SEND_EXECUTION_CONTRACT)
+            );
+            assert!(tools
+                .execution_contract_for_exact("default::session_message")
+                .is_none());
             let schemas = tools.list_tools();
             let matching: Vec<_> = schemas
                 .iter()
@@ -874,6 +880,336 @@ mod session_message_assembly_tests {
             let inbox = state.session_inbox.inspect(&session.id).await.unwrap();
             assert_eq!(inbox.pending + inbox.claimed, 0);
         }
+    }
+
+    #[tokio::test]
+    async fn installed_scoped_send_requires_original_caller_and_retains_legacy_deny() {
+        use bamboo_agent_core::tools::with_executing_session_caller;
+        use bamboo_domain::SessionCallerReference;
+        use bamboo_tools::permission::{PermissionRule, PermissionType};
+
+        let home = tempfile::tempdir().unwrap();
+        let state = super::super::AppState::new_with_provider(
+            home.path().to_path_buf(),
+            Config::default(),
+            Arc::new(super::super::UnconfiguredProvider {
+                message: "no model in scoped send assembly".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let root = Session::new("installed-root", "model");
+        let source = Session::new_child_of("installed-source", &root, "model", "source");
+        let target = Session::new_child_of("installed-target", &root, "model", "target");
+        for session in [&root, &source, &target] {
+            state.storage.save_session(session).await.unwrap();
+        }
+        let tools = state.tools_for(crate::tools::ToolSurface::Base);
+        let config = state.permission_checker.permission_config().unwrap();
+        config.set_enabled(false);
+        let legacy_resource = format!("session_control followup {}", target.id);
+        config.add_rule(PermissionRule::new(
+            PermissionType::ExecuteCommand,
+            &legacy_resource,
+            false,
+        ));
+        let call = ToolCall {
+            id: "installed-original-send".into(), tool_type: "function".into(),
+            function: FunctionCall { name: "session_message".into(), arguments: json!({
+                "action":"send", "target_session_id":target.id, "operation_id":"installed-operation",
+                "message":"bounded assembly input", "delivery_intent":"queue_only",
+            }).to_string() },
+        };
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.session_id = Some(&source.id);
+        let error = with_executing_session_caller(
+            Some(Arc::new(SessionCallerReference::from(&source))),
+            tools.execute_with_context(&call, ctx),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("legacy followup policy"));
+        assert_eq!(
+            state
+                .session_inbox
+                .inspect(&target.id)
+                .await
+                .unwrap()
+                .generation,
+            0
+        );
+        assert!(config.remove_rule(PermissionType::ExecuteCommand, &legacy_resource));
+        let mut missing = ToolExecutionContext::none(&call.id);
+        missing.session_id = Some(&source.id);
+        assert!(tools
+            .execute_with_context(&call, missing)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("authority_unavailable"));
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.session_id = Some(&source.id);
+        let receipt = with_executing_session_caller(
+            Some(Arc::new(SessionCallerReference::from(&source))),
+            tools.execute_with_context(&call, ctx),
+        )
+        .await
+        .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&receipt.result).unwrap();
+        assert_eq!(receipt["admitted"], true);
+        assert_eq!(receipt["terminal"], "not_observed");
+        assert_eq!(
+            state
+                .session_inbox
+                .inspect(&target.id)
+                .await
+                .unwrap()
+                .generation,
+            1
+        );
+        assert!(state
+            .storage
+            .load_session(&target.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .messages
+            .is_empty());
+        // The actual Base has one message overlay, so native Ask reaches the
+        // caller and a generation-bound Once is consumed by one evaluation.
+        config.set_enabled(true);
+        config.set_ask_rules(["session_control".into()]);
+        config.add_rule(PermissionRule::new(
+            PermissionType::ExecuteCommand,
+            "session_message send",
+            true,
+        ));
+        let mut once = call.clone();
+        once.id = "installed-once-send".into();
+        let mut args: serde_json::Value = serde_json::from_str(&once.function.arguments).unwrap();
+        args["operation_id"] = json!("installed-once-operation");
+        once.function.arguments = args.to_string();
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let mut pending_ctx = ToolExecutionContext::none(&once.id);
+        pending_ctx.session_id = Some(&source.id);
+        pending_ctx.event_tx = Some(&tx);
+        let pending = tools
+            .execute_with_context(&once, pending_ctx)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&pending.result).unwrap();
+        let request: bamboo_tools::permission::PermissionRequest =
+            serde_json::from_value(payload["permission_request"].clone()).unwrap();
+        assert_eq!(request.tool_name, "session_message");
+        assert_eq!(request.resource, "session_message send");
+        assert_eq!(
+            state
+                .session_inbox
+                .inspect(&target.id)
+                .await
+                .unwrap()
+                .generation,
+            1
+        );
+        config
+            .grant_once_for_generation(
+                &source.id,
+                &once.id,
+                &request.request_generation,
+                PermissionType::ExecuteCommand,
+                request.resource.clone(),
+            )
+            .unwrap();
+        let mut replay = ToolExecutionContext::none(&once.id);
+        replay.session_id = Some(&source.id);
+        let receipt = bamboo_tools::permission::with_permission_replay_generation(
+            &source.id,
+            &once.id,
+            Some(&request.request_generation),
+            with_executing_session_caller(
+                Some(Arc::new(SessionCallerReference::from(&source))),
+                tools.execute_with_context(&once, replay),
+            ),
+        )
+        .await
+        .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&receipt.result).unwrap();
+        assert_eq!(receipt["admitted"], true);
+        assert_eq!(receipt["terminal"], "not_observed");
+        assert_eq!(
+            state
+                .session_inbox
+                .inspect(&target.id)
+                .await
+                .unwrap()
+                .generation,
+            2
+        );
+        assert!(!config.consume_once(
+            &source.id,
+            &once.id,
+            PermissionType::ExecuteCommand,
+            "session_message send"
+        ));
+    }
+
+    #[tokio::test]
+    async fn root_installed_history_routes_explicit_host_scope_without_opening_raw_peer_history() {
+        use bamboo_agent_core::tools::with_executing_session_caller;
+        use bamboo_domain::{
+            HostScopeSessionObservation, HostSessionRight, HostSessionScopeBinding,
+            HostSessionTargetScope, SessionCallerReference, HOST_SESSION_SCOPE_VERSION,
+        };
+
+        let home = tempfile::tempdir().unwrap();
+        let state = super::super::AppState::new_with_provider(
+            home.path().into(),
+            Config::default(),
+            Arc::new(super::super::UnconfiguredProvider {
+                message: "Host discovery must never call a model".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let caller = Session::new("installed-host-reader", "model");
+        let mut target = Session::new("installed-host-target", "model");
+        target.set_project_id_meta("explicit-target-project");
+        for session in [&caller, &target] {
+            state.storage.save_session(session).await.unwrap();
+        }
+        state
+            .session_store
+            .install_host_session_scope(
+                0,
+                HostSessionScopeBinding {
+                    schema_version: HOST_SESSION_SCOPE_VERSION,
+                    grant_id: uuid::Uuid::new_v4(),
+                    revision: 1,
+                    caller: HostScopeSessionObservation::capture(&caller, vec![]).unwrap(),
+                    targets: [(
+                        target.id.clone(),
+                        HostSessionTargetScope {
+                            observation: HostScopeSessionObservation::capture(&target, vec![])
+                                .unwrap(),
+                            rights: [HostSessionRight::ListMetadata].into(),
+                        },
+                    )]
+                    .into(),
+                    creates: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        for surface in [
+            crate::tools::ToolSurface::Base,
+            crate::tools::ToolSurface::Root,
+            crate::tools::ToolSurface::Child,
+            crate::tools::ToolSurface::WithTask,
+        ] {
+            let tools = state.tools_for(surface);
+            for (action, allowed) in [("list", true), ("get_meta", false)] {
+                let args = if action == "list" {
+                    json!({"action":"list"})
+                } else {
+                    json!({"action":action,"session_id":target.id})
+                };
+                let call = ToolCall {
+                    id: format!("installed-host-{action}"),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "session_history".into(),
+                        arguments: args.to_string(),
+                    },
+                };
+                let mut ctx = ToolExecutionContext::none(&call.id);
+                ctx.session_id = Some(&caller.id);
+                ctx.plan_read_only = true;
+                let observed = with_executing_session_caller(
+                    Some(Arc::new(SessionCallerReference::from(&caller))),
+                    tools.execute_with_context(&call, ctx),
+                )
+                .await;
+                if allowed {
+                    let page: serde_json::Value =
+                        serde_json::from_str(&observed.unwrap().result).unwrap();
+                    assert_eq!(page["sessions"][0]["session_id"], target.id);
+                    assert_eq!(page["sessions"][0]["authorization_revision"], 1);
+                } else {
+                    assert!(observed.is_err());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn base_defaults_and_schedule_surface_share_framework_instances_without_implicit_root_scope(
+    ) {
+        use bamboo_agent_core::tools::{
+            with_executing_session_caller, FRAMEWORK_ROOT_SPAWN_CONTRACT_V1,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let state = super::super::AppState::new_with_provider(
+            home.path().into(),
+            Config::default(),
+            Arc::new(super::super::UnconfiguredProvider {
+                message: "assembly must not call a model".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let base = state.tools_for(crate::tools::ToolSurface::Base);
+        assert!(Arc::ptr_eq(state.agent.default_tools(), &base));
+        let caller = Session::new("base-default-fresh-caller", "model");
+        state.storage.save_session(&caller).await.unwrap();
+        for surface in [
+            crate::tools::ToolSurface::Base,
+            crate::tools::ToolSurface::Root,
+            crate::tools::ToolSurface::Child,
+            crate::tools::ToolSurface::WithTask,
+        ] {
+            let tools = state.tools_for(surface);
+            for name in [
+                "session_history",
+                "session_history_current",
+                "spawn_session",
+                "session_message",
+            ] {
+                assert!(
+                    std::ptr::addr_eq(
+                        base.exact_tool_owner(name).unwrap(),
+                        tools.exact_tool_owner(name).unwrap()
+                    ),
+                    "shared actual owner {surface:?}/{name}"
+                );
+            }
+            assert_eq!(
+                tools.execution_contract_for_exact("spawn_session"),
+                Some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+            );
+            let call = ToolCall { id:format!("blocked-base-spawn-{surface:?}"), tool_type:"function".into(), function:FunctionCall {
+                name:"spawnSession".into(), arguments:json!({
+                    "operation_id":uuid::Uuid::new_v4(), "expected_state_revision":0,
+                    "project_id":"ungranted-project", "workspace_path":"/ungranted/workspace", "message":"must remain blocked"
+                }).to_string(),
+            }};
+            let mut ctx = ToolExecutionContext::none(&call.id);
+            ctx.session_id = Some(&caller.id);
+            let bound = tools.for_session(&caller).expect("actual Session binding");
+            let error = with_executing_session_caller(
+                Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+                    &caller,
+                ))),
+                bound.execute_with_context(&call, ctx),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("scope_unavailable"),
+                "{surface:?}: {error}"
+            );
+        }
+        // This tests the stored application surfaces. LocalChildTools still
+        // needs its separate Host framework proof; no native ceiling is widened.
     }
 }
 

@@ -1,5 +1,9 @@
 //! Bamboo engine — runtime, agent loop, and orchestration.
 
+// The lib-test harness checks Send through the complete guarded tool-dispatch
+// future. Its nested task-local scopes exceed the default trait recursion depth.
+#![cfg_attr(test, recursion_limit = "256")]
+
 pub mod app_context;
 pub mod auto_dream;
 mod auto_dream_privacy;

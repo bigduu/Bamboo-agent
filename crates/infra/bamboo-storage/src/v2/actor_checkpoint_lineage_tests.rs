@@ -37,6 +37,7 @@ impl Fixture {
             fence: self.fence.clone(),
             claim: self.claim.clone(),
             expected_created_at: current.created_at,
+            expected_conversation_generation: current.conversation_generation_observation(),
             expected_messages: current.messages.clone(),
             expected_provider_transcript: current.provider_transcript.clone(),
             expected_admission: current
@@ -49,6 +50,7 @@ impl Fixture {
         ActorTranscriptAppend {
             fence: self.fence.clone(),
             expected_created_at: self.current.created_at,
+            expected_conversation_generation: self.current.conversation_generation_observation(),
             expected_messages: self.current.messages.clone(),
             expected_provider_transcript: self.current.provider_transcript.clone(),
             messages: vec![Message::assistant("new output", None)],

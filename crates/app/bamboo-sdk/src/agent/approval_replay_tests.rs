@@ -810,15 +810,134 @@ async fn approved_alias_is_blocked_after_durable_root_tool_tightening() {
 
 #[tokio::test]
 async fn typed_alias_exact_custom_owner_cannot_borrow_exec_approval() {
-    let (fixture, mut pending, request) = Box::pin(alias_pending_fixture()).await;
+    let (fixture, pending, request) = Box::pin(alias_pending_fixture()).await;
+    let config = alias_config();
     let shadow =
-        fixture.registered_agent(alias_config(), &["exec_command", "default::exec_command"]);
+        fixture.registered_agent(config.clone(), &["exec_command", "default::exec_command"]);
     let before = fixture.probe.provider_calls.load(Ordering::SeqCst);
-    assert!(Box::pin(shadow.resume(&mut pending)).await.is_err());
-    let mut approved = Box::pin(fixture.approve(&request)).await;
-    assert!(Box::pin(shadow.resume(&mut approved)).await.is_err());
+    let pending_question = pending.pending_question.clone();
+    let result_before = serde_json::to_value(
+        pending
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(result_before["metadata"]
+        [bamboo_agent_core::tools::PENDING_TOOL_OPERATION_METADATA_KEY]
+        .is_object());
+    let waiting = events(shadow.resume_stream(pending)).await;
+    assert_eq!(waiting.len(), 1);
+    assert!(
+        matches!(&waiting[0], AgentEvent::NeedClarification { tool_name: Some(name), .. } if name == "default::exec_command")
+    );
+    let retained = fixture.reload(&request.session_id).await;
+    assert_eq!(
+        serde_json::to_value(&retained.pending_question).unwrap(),
+        serde_json::to_value(&pending_question).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(
+            retained
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+                .unwrap()
+        )
+        .unwrap(),
+        result_before
+    );
     assert!(fixture.probe.calls.lock().unwrap().is_empty());
     assert_eq!(fixture.probe.provider_calls.load(Ordering::SeqCst), before);
+
+    // A retained Host record freezes the original owner even if the fresh
+    // spelling now also has an exact custom registration.
+    let approved = Box::pin(fixture.approve(&request)).await;
+    let completed = events(shadow.resume_stream(approved)).await;
+    assert!(!completed.iter().any(|event| matches!(
+        event,
+        AgentEvent::Error { .. } | AgentEvent::NeedClarification { .. }
+    )));
+    {
+        let calls = fixture.probe.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "exec_command");
+        assert_eq!(calls[0].arguments, json!({"cmd": "current-command"}));
+        assert_eq!(
+            calls[0].generation.as_deref(),
+            Some(request.request_generation.as_str())
+        );
+    }
+    assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 1);
+    assert!(!config.consume_once_for_generation(
+        &request.session_id,
+        CALL,
+        &request.request_generation,
+        PermissionType::ExecuteCommand,
+        "current-command"
+    ));
+
+    // An explicitly old typed fixture has no Host owner record. Its current
+    // exact custom owner cannot borrow the old exec_command request/receipt.
+    let legacy_fixture = Fixture::new().await;
+    let (mut legacy, mut legacy_request) = parked("legacy-alias-owner", true);
+    legacy_request.tool_name = "exec_command".into();
+    legacy
+        .messages
+        .iter_mut()
+        .rev()
+        .find_map(|message| message.tool_calls.as_mut())
+        .unwrap()[0] = alias_call();
+    let legacy_result = legacy
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.tool_call_id.as_deref() == Some(CALL))
+        .unwrap();
+    assert!(legacy_result
+        .metadata
+        .as_ref()
+        .and_then(
+            |metadata| metadata.get(bamboo_agent_core::tools::PENDING_TOOL_OPERATION_METADATA_KEY)
+        )
+        .is_none());
+    legacy_result.content = waiting_result(&legacy_request).result;
+    legacy.pending_question.as_mut().unwrap().tool_name = "default::exec_command".into();
+    legacy_fixture.repo.save(&mut legacy).await.unwrap();
+    let legacy_shadow =
+        legacy_fixture.registered_agent(alias_config(), &["exec_command", "default::exec_command"]);
+    let pending_before = replay_state(&legacy);
+    let pending_error = Box::pin(legacy_shadow.resume(&mut legacy))
+        .await
+        .unwrap_err();
+    assert!(
+        pending_error
+            .to_string()
+            .contains("permission replay owner differs from the retained request"),
+        "{pending_error}"
+    );
+    assert_eq!(replay_state(&legacy), pending_before);
+    let mut approved = legacy_fixture.approve(&legacy_request).await;
+    let approved_before = replay_state(&approved);
+    let approved_error = Box::pin(legacy_shadow.resume(&mut approved))
+        .await
+        .unwrap_err();
+    assert!(
+        approved_error
+            .to_string()
+            .contains("permission replay owner differs from the retained request"),
+        "{approved_error}"
+    );
+    assert_eq!(replay_state(&approved), approved_before);
+    assert!(legacy_fixture.probe.calls.lock().unwrap().is_empty());
+    assert_eq!(legacy_fixture.probe.actions.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        legacy_fixture.probe.provider_calls.load(Ordering::SeqCst),
+        0
+    );
 
     // A fresh operation actually resolved to the exact custom registration
     // receives that custom tool's own typed request and can resume normally.
@@ -848,10 +967,10 @@ async fn typed_alias_exact_custom_owner_cannot_borrow_exec_approval() {
         AgentEvent::Error { .. } | AgentEvent::NeedClarification { .. }
     )));
     let calls = fixture.probe.calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].name, "default::exec_command");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].name, "default::exec_command");
     assert_eq!(
-        calls[0].generation.as_deref(),
+        calls[1].generation.as_deref(),
         Some(request.request_generation.as_str())
     );
 }

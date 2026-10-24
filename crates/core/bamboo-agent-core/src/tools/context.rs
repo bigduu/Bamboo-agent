@@ -14,13 +14,32 @@ use serde_json::Value;
 use crate::tools::{BashCompletionSink, ToolCall, ToolSchema};
 use crate::{AgentEvent, Session};
 use bamboo_domain::{
-    PermissionMode, SessionAuthorityIdentity, SessionKind, SupervisorReference,
-    DEFAULT_SUPERVISOR_SESSION_ID,
+    PermissionMode, SessionAuthorityIdentity, SessionCallerReference, SessionKind,
+    SupervisorReference, DEFAULT_SUPERVISOR_SESSION_ID,
 };
 use uuid::Uuid;
 
 tokio::task_local! {
     static ROOT_ACTOR_TOOL_WRITER: Option<bamboo_domain::RootActorRuntimeWrite>;
+    static EXECUTING_SESSION_CALLER: Option<Arc<SessionCallerReference>>;
+}
+
+/// Carry the observation captured by real dispatch, never an authorization.
+/// Owned tools snapshot it before a detached future can leave this task scope.
+/// An explicit `None` prevents an unrelated nested Host job inheriting a caller.
+pub async fn with_executing_session_caller<F: std::future::Future>(
+    caller: Option<Arc<SessionCallerReference>>,
+    dispatch: F,
+) -> F::Output {
+    EXECUTING_SESSION_CALLER.scope(caller, dispatch).await
+}
+
+fn executing_session_caller(session_id: Option<&str>) -> Option<Arc<SessionCallerReference>> {
+    EXECUTING_SESSION_CALLER
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .filter(|caller| Some(caller.session_id.as_str()) == session_id)
 }
 
 /// Scope the actual execution's capability across asynchronous tool dispatch.
@@ -465,6 +484,7 @@ impl<'a> ToolExecutionContext<'a> {
     pub fn to_tool_ctx(&self) -> crate::tools::ToolCtx {
         crate::tools::ToolCtx {
             session_id: self.session_id.map(Arc::from),
+            executing_caller: executing_session_caller(self.session_id),
             executing_supervisor: self
                 .executing_supervisor
                 .and_then(|observation| observation.for_caller(self.session_id)),
@@ -1259,5 +1279,96 @@ mod tests {
             }
             other => panic!("Expected ToolToken, got: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod caller_observation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn original_caller_survives_owned_handoff_for_each_role_and_version() {
+        for version in [None, Some(1), Some(2)] {
+            let mut root = Session::new("root", "model");
+            root.session_version = version;
+            let mut child = Session::new_child_of("child", &root, "model", "short task");
+            child.session_version = version;
+            let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+            supervisor.session_version = version;
+            supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: Uuid::new_v4(),
+            };
+            for mut session in [root, child, supervisor] {
+                let caller = Arc::new(SessionCallerReference::from(&session));
+                let borrowed = ToolExecutionContext {
+                    session_id: Some(&session.id),
+                    ..ToolExecutionContext::none("original")
+                };
+                let owned = with_executing_session_caller(Some(Arc::clone(&caller)), async {
+                    borrowed.to_tool_ctx()
+                })
+                .await;
+                // The dispatch scope has ended and the repository lifetime may
+                // have changed. Detached work keeps the original observation.
+                session.created_at += chrono::Duration::seconds(1);
+                assert!(!caller.matches_session(&session));
+                let id = session.id.clone();
+                let observed = tokio::spawn(async move {
+                    let same = owned.executing_caller_for(&id).unwrap().clone();
+                    assert!(ToolExecutionContext {
+                        session_id: Some(&id),
+                        ..ToolExecutionContext::none("unbound-host")
+                    }
+                    .to_tool_ctx()
+                    .executing_caller
+                    .is_none());
+                    same
+                })
+                .await
+                .unwrap();
+                assert_eq!(observed, *caller);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_scope_filters_mismatch_and_explicit_host_work_then_restores() {
+        let session = Session::new("original", "model");
+        let caller = Arc::new(SessionCallerReference::from(&session));
+        with_executing_session_caller(Some(Arc::clone(&caller)), async {
+            let original = ToolExecutionContext {
+                session_id: Some(&session.id),
+                ..ToolExecutionContext::none("same")
+            };
+            assert!(original
+                .to_tool_ctx()
+                .executing_caller_for(&session.id)
+                .is_some());
+            let mismatched = ToolExecutionContext {
+                session_id: Some("other"),
+                ..original
+            };
+            assert!(mismatched.to_tool_ctx().executing_caller.is_none());
+            assert!(ToolExecutionContext::none("synthetic")
+                .to_tool_ctx()
+                .executing_caller
+                .is_none());
+            with_executing_session_caller(None, async {
+                assert!(original.to_tool_ctx().executing_caller.is_none());
+            })
+            .await;
+            let mut owned = original.to_tool_ctx();
+            owned.session_id = Some(Arc::from("other"));
+            assert!(owned.executing_caller_for(&session.id).is_none());
+            assert!(owned.executing_caller_for("other").is_none());
+            assert_eq!(
+                original.to_tool_ctx().executing_caller.as_deref(),
+                Some(caller.as_ref())
+            );
+        })
+        .await;
+        assert!(crate::tools::ToolCtx::none("new-host")
+            .executing_caller
+            .is_none());
     }
 }

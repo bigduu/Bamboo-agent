@@ -112,6 +112,7 @@ fn adapter_with_storage(
     persistence: Arc<LockedSessionStore>,
 ) -> Arc<ChildSessionAdapter> {
     Arc::new(ChildSessionAdapter {
+        browser: None,
         session_store: store,
         storage,
         persistence,

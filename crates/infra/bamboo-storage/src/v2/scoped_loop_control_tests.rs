@@ -159,6 +159,7 @@ impl Fixture {
             Some(RootActorRuntimeWrite {
                 fence: activation.fence(),
                 created_at: target.created_at,
+                conversation_generation: target.conversation_generation_observation(),
             })
         } else {
             None
