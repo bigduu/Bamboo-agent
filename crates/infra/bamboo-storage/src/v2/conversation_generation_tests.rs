@@ -568,7 +568,11 @@ async fn raw_actor_input_refuses_a_stale_observation_before_admission_or_claim_a
         committed.session.conversation_reset,
         fixture.canonical.conversation_reset
     );
-    assert!(inbox
+    assert!(committed
+        .session
+        .session_inbox_admission()
+        .is_some_and(|cursor| cursor.contains(&envelope.id)));
+    assert!(!inbox
         .was_admitted(&fixture.canonical.id, &envelope.id)
         .await
         .unwrap());
@@ -576,6 +580,18 @@ async fn raw_actor_input_refuses_a_stale_observation_before_admission_or_claim_a
     assert_eq!(
         inbox.inspect(&fixture.canonical.id).await.unwrap().claimed,
         1
+    );
+    inbox
+        .ack_owned(&fixture.canonical.id, &claim, Utc::now())
+        .await
+        .unwrap();
+    assert!(inbox
+        .was_admitted(&fixture.canonical.id, &envelope.id)
+        .await
+        .unwrap());
+    assert_eq!(
+        inbox.inspect(&fixture.canonical.id).await.unwrap().claimed,
+        0
     );
     store.flush_search_index().await;
     drop(inbox);
@@ -647,7 +663,9 @@ async fn task_single_and_paired_cas_cannot_reinterpret_an_old_conversation_snaps
     let stale = runtime_sidecar_snapshot(&fixture.original);
     let mut stale_updated = stale.clone();
     let evaluated = super::tests::transaction_task_list(&fixture.original.id, "new Task state");
-    stale_updated.set_task_list(evaluated.clone());
+    // Task CAS accepts only Task fields. The convenience setter also changes
+    // updated_at and would reject the fixture before the generation fence.
+    stale_updated.task_list = Some(evaluated.clone());
     stale_updated.set_task_list_version_meta("1");
     let peer_original = fixture
         .store
@@ -656,7 +674,7 @@ async fn task_single_and_paired_cas_cannot_reinterpret_an_old_conversation_snaps
         .unwrap()
         .unwrap();
     let mut peer_updated = peer_original.clone();
-    peer_updated.set_task_list(evaluated);
+    peer_updated.task_list = Some(evaluated);
     peer_updated.set_task_list_version_meta("1");
     let before = fixture.files().await;
     assert_conflict(
@@ -692,7 +710,7 @@ async fn task_single_and_paired_cas_cannot_reinterpret_an_old_conversation_snaps
         .unwrap()
         .unwrap();
     let mut updated = current.clone();
-    updated.set_task_list(stale_updated.task_list.unwrap());
+    updated.task_list = stale_updated.task_list;
     updated.set_task_list_version_meta("1");
     assert!(fixture
         .store
