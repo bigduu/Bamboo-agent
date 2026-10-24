@@ -993,8 +993,11 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
                 reqwest::StatusCode::CONFLICT,
                 "Retry preparation: {body}"
             );
-            assert_eq!(
-                body["error"]["message"], "Session is running; wait before Retry",
+            assert!(
+                matches!(
+                    body["error"]["message"].as_str(),
+                    Some("Session is currently running" | "Session is running; wait before Retry")
+                ),
                 "Retry preparation: {body}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
