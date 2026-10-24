@@ -503,30 +503,40 @@ async fn supervisor_shared_validation_rejects_an_old_same_id_occurrence_without_
 }
 
 #[tokio::test]
-async fn supervisor_exact_custom_owner_and_builtin_alias_remain_distinct() {
-    let (fixture, pending, original) = Box::pin(protected_pending()).await;
-    let approved = fixture.approve(&current_request(&pending)).await;
-    events(
-        protected_agent_with(
-            &fixture,
-            management_config(),
-            &["session_control", "default::session_control"],
-            false,
-            None,
+async fn supervisor_retained_approval_keeps_its_exact_owner_after_alias_collision() {
+    for names in [
+        &["session_control", "default::session_control"][..],
+        &["default::session_control"][..],
+    ] {
+        let (fixture, pending, original) = Box::pin(protected_pending()).await;
+        let approved = fixture.approve(&current_request(&pending)).await;
+        events(
+            protected_agent_with(&fixture, management_config(), names, false, None)
+                .resume_stream(approved),
         )
-        .resume_stream(approved),
-    )
-    .await;
-    assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        SupervisorSessionService::new(fixture.store.clone())
-            .inspect_scope(&original)
-            .await
-            .unwrap()
-            .state_revision,
-        1
-    );
+        .await;
+        // The approval froze the canonical owner before the collision. Replay
+        // may execute that owner, but cannot fall back to the new exact alias.
+        let expected = usize::from(names.contains(&"session_control"));
+        assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), expected);
+        {
+            let calls = fixture.probe.calls.lock().unwrap();
+            assert_eq!(calls.len(), expected);
+            assert!(calls.iter().all(|call| call.name == "session_control"));
+        }
+        assert_eq!(
+            SupervisorSessionService::new(fixture.store.clone())
+                .inspect_scope(&original)
+                .await
+                .unwrap()
+                .state_revision,
+            1 + expected as u64
+        );
+    }
+}
 
+#[tokio::test]
+async fn supervisor_exact_custom_owner_cannot_enter_approval_as_a_builtin_alias() {
     for ultra in [false, true] {
         // A separately registered namespaced owner is not the canonical
         // management identity, and cannot enter approval as an alias shortcut.
