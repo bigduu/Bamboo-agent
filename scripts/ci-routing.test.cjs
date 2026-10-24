@@ -31,13 +31,13 @@ function assertRouting(source) {
   assert.doesNotMatch(quick, /cargo (build|test|check|clippy)|continue-on-error|--test-skip/);
   const full = job(source, "test");
   assert.match(full, /^    name: Test$/m);
-  assert.match(full, /^    needs: \[validation-source, main-release-admission, test-build, test-blocks, test-blocks-2, test-doctests, test-ssh-build, test-ssh\]$/m);
+  assert.match(full, /^    needs: \[validation-source, main-release-admission, test-crates, test-ssh\]$/m);
   assert.match(full, /^    if: always\(\) && !cancelled\(\)$/m);
   assert.match(full, /- name: Require validation admission\n        env:\n          SOURCE_RESULT: \$\{\{ needs.validation-source.result \}\}\n          FULL_VALIDATION: \$\{\{ needs.validation-source.outputs.full \}\}/);
   assert.match(full, /test "\$SOURCE_RESULT" = success/);
   assert.match(full, /\*\) exit 1 ;;/);
   assert.ok(full.includes("        run: cargo build --locked\n"));
-  assert.match(full, /command: summary/);
+  assert.match(full, /test "\$CRATE_RESULT" = success/);
   assert.doesNotMatch(full, /run: cargo test/);
   for (const id of ["msrv", "tls-fixture-test", "tool-event-recorder-e2e", "lint", "build", "docs", "security", "deny"]) {
     const block = job(source, id);
@@ -200,7 +200,7 @@ function assertSharedBuild(source) {
   const [settings, ...steps] = build.split(/(?=^      - )/m);
   assert.match(settings, /^    name: Test$/m);
   assert.match(settings, /^    if: always\(\) && !cancelled\(\)$/m);
-  assert.match(settings, /^    needs: \[validation-source, main-release-admission, test-build, test-blocks, test-blocks-2, test-doctests, test-ssh-build, test-ssh\]$/m);
+  assert.match(settings, /^    needs: \[validation-source, main-release-admission, test-crates, test-ssh\]$/m);
   assert.ok(settings.includes("timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"));
   assert.doesNotMatch(settings, /^    continue-on-error:/m);
   const cargo = steps.filter((step) => step.startsWith("      - name: Build locked Rust workspace\n"));
@@ -208,7 +208,7 @@ function assertSharedBuild(source) {
   assert.equal(cargo[0].trimEnd(), "      - name: Build locked Rust workspace\n        if: github.event_name == 'pull_request' && github.base_ref == 'dev'\n        run: cargo build --locked");
   assert.doesNotMatch(build, /continue-on-error:|\|\| true|\|\| exit 0/);
   assert.doesNotMatch(build, /^          ref:/m, "retain the actual event merge source");
-  for (const name of ["Test CI workflow policy", "Check formatting", "Require every default block and doctest result"]) {
+  for (const name of ["Test CI workflow policy", "Check formatting", "Require all crate tests and the SSH fixture"]) {
     const step = steps.find((item) => item.startsWith(`      - name: ${name}\n`));
     assert.ok(step);
     assert.match(step, /^        if: needs.validation-source.outputs.full == 'true'$/m, `${name} must not become a dev merge gate`);
@@ -227,10 +227,10 @@ test("one required Test honestly compiles dev without imposing auxiliary checks 
     ["run: cargo build --locked", "run: cargo build --locked || true"],
     ["run: cargo build --locked", "continue-on-error: true\n        run: cargo build --locked"],
     ["run: cargo build --locked", "if: false\n        run: cargo build --locked"],
-    ["needs: [validation-source, main-release-admission, test-build, test-blocks, test-blocks-2, test-doctests, test-ssh-build, test-ssh]", "needs: quick-checks"],
+    ["needs: [validation-source, main-release-admission, test-crates, test-ssh]", "needs: quick-checks"],
     ["name: Test CI workflow policy\n        if: needs.validation-source.outputs.full == 'true'", "name: Test CI workflow policy"],
     ["name: Check formatting\n        if: needs.validation-source.outputs.full == 'true'", "name: Check formatting"],
-    ["name: Require every default block and doctest result\n        if: needs.validation-source.outputs.full == 'true'", "name: Require every default block and doctest result"],
+    ["name: Require all crate tests and the SSH fixture\n        if: needs.validation-source.outputs.full == 'true'", "name: Require all crate tests and the SSH fixture"],
   ]) assert.throws(() => assertSharedBuild(ci.replace(from, to)), `reject ${to}`);
 });
 

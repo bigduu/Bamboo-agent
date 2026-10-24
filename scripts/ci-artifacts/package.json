@@ -1,6 +1,0 @@
-{
-  "name": "bamboo-ci-artifact-transport",
-  "private": true,
-  "type": "module",
-  "dependencies": {"@actions/artifact": "6.3.1"}
-}

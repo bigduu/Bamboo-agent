@@ -76,7 +76,7 @@ function automaticBootstrap() {
   return match[2].split('\n').map(line => line.replace(/^ {10}/, '')).join('\n')
 }
 async function runActualPreflight(t, scenario) {
-  return require('./tests/main-authority-bootstrap-fixture.cjs').verify(t, automaticBootstrap(), 'v3', 'publication', {
+  return require('./tests/main-authority-bootstrap-fixture.cjs').verify(t, automaticBootstrap(), 'v4', 'publication', {
     exercise: ({run, base}) => {
       const environment = {}, change = input => {
         const delivered = input.event.workflow_run, server = input.routes['actions/runs/111']

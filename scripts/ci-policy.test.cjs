@@ -175,18 +175,18 @@ test("main-push validation remains reachable by the existing automatic publisher
   assert.match(testJob, /runs-on: ubuntu-latest\n/u)
   assert.ok(testJob.includes("    timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"))
   assert.match(testJob, /run: cargo build --locked\n/u)
-  assert.match(job("test-build"), /command: build\n          profile: default/u)
-  assert.match(testJob, /command: summary/u)
+  assert.match(testJob, /test "\$CRATE_RESULT" = success/u)
+  assert.match(testJob, /test "\$SSH_RESULT" = success/u)
   assert.doesNotMatch(testJob, /run: cargo test/u)
   assert.match(
     testJob,
-    /- name: Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs scripts\/sidecar-release\.test\.cjs scripts\/test-groups\.test\.cjs scripts\/test-groups-ci\.test\.cjs\n/u,
+    /- name: Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs scripts\/sidecar-release\.test\.cjs scripts\/test-groups\.test\.cjs\n/u,
   )
   assert.match(
     testJob,
     /- name: Check formatting\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: cargo fmt --all -- --check\n/u,
   )
-  assert.ok(testJob.includes("node-version: ${{ needs.test-build.outputs.node || '24' }}"))
+  assert.ok(testJob.includes("node-version: '24'"))
   assert.ok(testJob.indexOf("- name: Setup Node.js") < testJob.indexOf("- name: Test CI workflow policy"))
 
   for (const name of [
@@ -201,8 +201,8 @@ test("main-push validation remains reachable by the existing automatic publisher
   }
 
   assert.doesNotMatch(testJob, /run: cargo test --locked --no-fail-fast --all-features/u)
-  assert.match(job("test-build"), /run: cargo build --locked --examples\n/u)
-  assert.match(job("test-ssh"), /command: run/u)
+  assert.match(job("test-crates"), /run: cargo test --locked --no-fail-fast -p "\$TEST_CRATE"\n/u)
+  assert.match(job("test-ssh"), /run: bash scripts\/run-russh-live\.sh/u)
 
   assert.match(
     contributing,
@@ -212,62 +212,56 @@ test("main-push validation remains reachable by the existing automatic publisher
   assert.match(contributing, /for changed behavior, recording exact source, commands and results/u)
 })
 
-test("locked test builds are separate from source-bound twenty-minute crate blocks", () => {
-  for (const [id, profile] of [["test-build", "default"], ["e2e-build", "all-features"], ["test-ssh-build", "ssh-live"]]) {
+function crateMatrix(source) {
+  const list = source.match(/      matrix:\n        crate:\n((?:          - [a-z0-9-]+\n)+)/u)
+  assert.ok(list, "native crate matrix is present")
+  return [...list[1].matchAll(/          - ([a-z0-9-]+)/gu)].map((match) => match[1])
+}
+
+test("native Test and E2E matrices cover every default workspace crate once", () => {
+  const manifest = readFileSync("Cargo.toml", "utf8")
+  const members = manifest.match(/^default-members = \[([\s\S]*?)^\]/mu)
+  assert.ok(members)
+  const packages = [...members[1].matchAll(/^\s*"([^"]+)"/gmu)].map((match) => {
+    const content = readFileSync(path.join(match[1], "Cargo.toml"), "utf8")
+    return content.match(/^\[package\]\nname = "([^"]+)"/mu)[1]
+  }).sort()
+  assert.ok(packages.length > 0)
+  for (const id of ["test-crates", "e2e-crates"]) {
     const source = job(id)
+    assert.deepEqual(crateMatrix(source).sort(), packages)
+    assert.match(source, /fail-fast: false/u)
     assert.match(source, /timeout-minutes: 75/u)
-    assert.ok(source.includes(`profile: ${profile}`))
-    assert.doesNotMatch(source, /continue-on-error:/u)
+    assert.ok(source.includes('TEST_CRATE: ${{ matrix.crate }}'))
+    assert.ok(source.includes(comprehensiveOnly))
+    assert.doesNotMatch(source, /max-parallel:|continue-on-error:|command: (build|run)|npm ci|--test-threads=1/u)
   }
-  for (const id of ["test-blocks", "test-blocks-2", "e2e-blocks", "e2e-blocks-2", "test-doctests", "test-ssh"]) {
-    const source = job(id)
-    assert.match(source, /timeout-minutes: 20/u)
-    assert.doesNotMatch(source, /cargo (test|build)|continue-on-error:/u)
-    assert.match(source, /BAMBOO_BLOCK_STARTED_AT/u)
-    if (id !== "test-ssh") assert.match(source, /fail-fast: false/u)
-  }
-  const config = JSON.parse(readFileSync("scripts/test-groups.json", "utf8"))
-  for (const id of ["test-blocks", "test-blocks-2", "e2e-blocks", "e2e-blocks-2"]) {
-    assert.match(job(id), /max-parallel: 1/u)
-  }
-  for (const [id, build] of [["test-blocks-2", "test-build"], ["e2e-blocks-2", "e2e-build"]]) {
-    assert.ok(job(id).includes(`needs.${build}.outputs.has_blocks_2 == 'true'`))
-    assert.ok(job(id).includes(`matrix: \${{ fromJSON(needs.${build}.outputs.blocks_2) }}`))
-  }
-  assert.deepEqual(config.profiles.default.cargoArgs, [])
-  assert.deepEqual(config.profiles["all-features"].cargoArgs, ["--all-features", "--lib", "--tests"])
-  assert.equal(config.profiles.default.packages, "default-members")
-  assert.equal(config.profiles["all-features"].packages, "default-members")
-  assert.deepEqual(config.profiles["storage-standalone"].cargoArgs, ["-p", "bamboo-storage", "--lib"])
-  const controller = readFileSync("scripts/test-groups-ci.cjs", "utf8")
-  assert.match(controller, /const MAX_SECONDS = 1200/u)
-  assert.match(controller, /r\.compile\(ROOT, directory, profile, \{identityMode: 'ci'\}\)/u)
-  assert.match(controller, /timeoutMs: deadline - Date\.now\(\)/u)
-  assert.match(controller, /r\.equalNames\(selected, inventoryKeys\(manifest\)\)/u)
-  assert.match(controller, /No tests were omitted|no tests were omitted/u)
+  assert.match(job("test-crates"), /run: cargo test --locked --no-fail-fast -p "\$TEST_CRATE"\n/u)
+  assert.match(job("e2e-crates"), /run: cargo test --locked --no-fail-fast -p "\$TEST_CRATE" --all-features --lib --tests\n/u)
+  assert.doesNotMatch(workflow, /test-build:|e2e-build:|test-blocks:|test-doctests:|grouped-tests|ci-artifacts|plan-id:/u)
 })
 
-test("every aggregate uses its build plan's exact Cargo target directory", () => {
-  const cargoTarget = (source) => source.match(/^      CARGO_TARGET_DIR: (.+)$/mu)?.[1]
-  const cases = [
-    ["test", "Require every default block and doctest result", "test-build"],
-    ["test", "Require the real standalone SSH result", "test-ssh-build"],
-    ["e2e-test", "Require every all-feature crate block", "e2e-build"],
-  ]
-  const validate = (aggregate, stepName, build) => {
-    const step = aggregate.split(`      - name: ${stepName}\n`)[1]?.split(/\n      - /u)[0]
-    assert.ok(step, `missing aggregate step: ${stepName}`)
-    const actual = step.match(/^          CARGO_TARGET_DIR: (.+)$/mu)?.[1] ?? cargoTarget(aggregate)
-    const expected = cargoTarget(job(build))
-    assert.ok(expected, `missing build target directory: ${build}`)
-    assert.equal(actual, expected, `${stepName} must retain its compiled plan environment`)
-    assert.ok(step.includes(`\${{ needs.${build}.outputs.plan_id }}`))
+test("native summaries reject failed, cancelled, skipped and missing crate results", () => {
+  for (const [id, stepName, variables] of [
+    ["test", "Require all crate tests and the SSH fixture", ["CRATE_RESULT", "SSH_RESULT"]],
+    ["e2e-test", "Require all E2E crate tests", ["CRATE_RESULT"]],
+  ]) {
+    const step = job(id).split(`      - name: ${stepName}\n`)[1]?.split(/\n      - /u)[0]
+    assert.ok(step)
+    const command = step.match(/        run: \|\n([\s\S]*)/u)?.[1].replace(/^          /gmu, "")
+      ?? step.match(/        run: ([^\n]+)/u)?.[1]
+    assert.ok(command)
+    const results = Object.fromEntries(variables.map((name) => [name, "success"]))
+    const run = (overrides = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", command], {
+      env: { ...process.env, ...results, ...overrides }, encoding: "utf8",
+    })
+    assert.equal(run().status, 0)
+    for (const variable of variables) {
+      for (const result of ["failure", "cancelled", "skipped", "", "unknown"]) {
+        assert.notEqual(run({ [variable]: result }).status, 0, `${id}: ${variable}=${result}`)
+      }
+    }
   }
-  for (const [aggregate, step, build] of cases) validate(job(aggregate), step, build)
-  const wrong = job("test").replace(
-    "          CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-ssh-live\n", "",
-  )
-  assert.throws(() => validate(wrong, cases[1][1], cases[1][2]), /compiled plan environment/u)
 })
 
 test("promotion retains required checks without repeating platform coverage", () => {
@@ -276,8 +270,8 @@ test("promotion retains required checks without repeating platform coverage", ()
 
   const e2e = job("e2e-test")
   assert.match(e2e, /name: E2E Tests\n/u)
-  assert.match(e2e, /command: summary/u)
-  assert.match(job("e2e-build"), /profile: all-features/u)
+  assert.match(e2e, /test "\$CRATE_RESULT" = success/u)
+  assert.match(job("e2e-crates"), /--all-features --lib --tests/u)
   assert.doesNotMatch(e2e, /cargo test/u)
   assert.doesNotMatch(workflow, /cargo test --test e2e_tests --all-features/u)
 
@@ -312,13 +306,10 @@ test("promotion retains required checks without repeating platform coverage", ()
   )
 })
 
-test("all-feature E2E blocks retain the workspace stack and exact feature graph", () => {
+test("all-feature E2E crates retain the workspace stack and required summary", () => {
   assert.match(workflow, /^  RUST_MIN_STACK: "8388608"$/mu)
-  assert.equal(require("./test-groups.cjs").CONFIG.runtimeEnv.RUST_MIN_STACK, "8388608")
-  assert.match(job("e2e-build"), /profile: all-features/u)
-  assert.match(job("e2e-blocks"), /needs: \[validation-source, e2e-build\]/u)
-  assert.match(job("e2e-blocks"), /command: run/u)
-  assert.match(job("e2e-test"), /needs: \[validation-source, e2e-build, e2e-blocks, e2e-blocks-2\]/u)
+  assert.match(job("e2e-crates"), /--all-features --lib --tests/u)
+  assert.match(job("e2e-test"), /needs: \[validation-source, e2e-crates\]/u)
   assert.match(job("e2e-test"), /always\(\) && !cancelled\(\)/u)
 })
 
@@ -330,9 +321,9 @@ test("ordinary PR caches remain reusable and frozen validation restores without 
     "msrv",
     "tls-fixture-test",
     "tool-event-recorder-e2e",
-    "e2e-build",
-    "test-build",
-    "test-ssh-build",
+    "e2e-crates",
+    "test-crates",
+    "test-ssh",
     "lint",
     "docs",
     "security",
@@ -420,7 +411,7 @@ test("frozen promotion bootstrap is read-only and leaves merge-tree validation i
   assert.match(bootstrap, /urllib\.request\.build_opener\(NoRedirect\(\)\)/u)
   assert.match(bootstrap, /opener\.open\(request, timeout=30\)/u)
   // No source checkout is pinned over the PR's synthetic merge result.
-  for (const id of ["test", "lint", "e2e-test", "build"]) {
+  for (const id of ["test", "test-crates", "e2e-crates", "test-ssh", "lint", "build"]) {
     assert.match(job(id), /- uses: actions\/checkout@v7\n(?:        if: github.event_name != 'push'\n)?/u)
   }
   for (const context of ["Promotion Source", "Test", "Lint", "E2E Tests", "Build (${{ matrix.os }})"]) {
