@@ -62,14 +62,19 @@ queue or auto-merge setting, determine its admission route.
 2. Create `release/<that-40-character-SHA>` normally at that exact commit. Keep
    dev open while the release owner validates this frozen candidate.
 3. Complete current-head/base review, the full promotion suite and the separate
-   original frontend-head contract. Record run URLs, actual tested source/tree,
-   toolchain, lockfile, features, profile and results.
+   original frontend-head contract: strict Clippy, the full locked build and the
+   three frontend packaging/build/runtime test targets. Backend test suites
+   belong to canonical CI. Record run URLs, actual tested source/tree, toolchain,
+   lockfile, features, profile and results.
 4. Use the normal two-parent release merge. Main admission authenticates that
    exact merge and its completed pre-merge evidence. Do not update the release
    with unrelated dev changes merely because dev advanced.
-5. For a necessary repair, follow the separate original fix `F` and protected-dev
-   integration `U` procedure in the Release Process. Neither one's evidence
-   substitutes for the other. Preserve the cut and original failure evidence.
+5. For a necessary repair, record original fix `F`'s exact SHA/tree, affected local
+   tests and independent Code and Security review. Preserve `F` through normal
+   protected-dev integration `U`, then fast-forward the release to `F`. Complete
+   the mandatory full CI on the final release PR; an extra manual full CI on `F`
+   is optional diagnosis, not a second mandatory full run. Keep each source's
+   evidence separate and preserve the cut and original failure evidence.
 
 The release head, PR synthetic merge, final main merge and workflow controller
 are separate Git identities. Equal trees alone do not make their binaries or
