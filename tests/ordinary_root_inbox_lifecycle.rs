@@ -969,42 +969,39 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
         .map(|message| message.id.clone())
         .collect();
     fixture.admitted_once(INPUT_ID, INPUT).await;
+    // Runner status can become terminal before the Actor owner releases. Only
+    // an explicit busy refusal is safe to wait out; never retry a lost response.
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let summary: Value = fixture
+            let response = fixture
                 .client
-                .get(format!("{}/sessions/{ROOT_ID}", fixture.base))
+                .post(format!(
+                    "{}/sessions/{ROOT_ID}/messages/truncate",
+                    fixture.base
+                ))
+                .json(&json!({"mode":"error_retry"}))
                 .send()
                 .await
-                .unwrap()
-                .error_for_status()
-                .unwrap()
-                .json()
-                .await
                 .unwrap();
-            if summary["session"]["is_running"] == false {
+            let status = response.status();
+            let body: Value = response.json().await.unwrap();
+            if status == reqwest::StatusCode::OK {
                 break;
             }
+            assert_eq!(
+                status,
+                reqwest::StatusCode::CONFLICT,
+                "Retry preparation: {body}"
+            );
+            assert_eq!(
+                body["error"]["message"], "Session is running; wait before Retry",
+                "Retry preparation: {body}"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .expect("revoked owner finishes releasing before Retry");
-    let response = fixture
-        .client
-        .post(format!(
-            "{}/sessions/{ROOT_ID}/messages/truncate",
-            fixture.base
-        ))
-        .json(&json!({"mode":"error_retry"}))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        response.status().is_success(),
-        "Retry preparation: {}",
-        response.text().await.unwrap()
-    );
     let response = fixture
         .client
         .post(format!("{}/execute/{ROOT_ID}", fixture.base))
