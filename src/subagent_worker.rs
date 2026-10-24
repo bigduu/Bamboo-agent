@@ -3406,6 +3406,7 @@ mod tests {
                 .checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
                     fence: actor.fence(),
                     expected_created_at: child.created_at,
+                    expected_conversation_generation: child.conversation_generation_observation(),
                     claim: claim.clone(),
                     expected_messages: child.messages.clone(),
                     expected_provider_transcript: child.provider_transcript.clone(),
@@ -3597,6 +3598,7 @@ mod tests {
                         let bytes = std::fs::read(&main).unwrap();
                         let already = inbox.checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
                             fence: replacement.fence(), expected_created_at: child.created_at, claim: new_claim.clone(),
+                            expected_conversation_generation: child.conversation_generation_observation(),
                             expected_messages: child.messages.clone(), expected_provider_transcript: child.provider_transcript.clone(),
                             expected_admission: child.session_inbox_admission().cloned(),
                         }).await.unwrap();

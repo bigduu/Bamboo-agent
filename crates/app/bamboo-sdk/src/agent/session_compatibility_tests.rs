@@ -1,6 +1,161 @@
 //! Public SDK API regressions; no real provider or physical tool is used.
 use super::*;
 
+fn next_conversation(source: &Session) -> Session {
+    let mut current = source.clone();
+    current.conversation_reset = Some(bamboo_domain::ConversationResetState {
+        schema_version: 1,
+        conversation_revision: 1,
+        receipts: vec![bamboo_domain::ConversationResetReceipt {
+            operation_id: "0:00000000-0000-4000-8000-000000000001".into(),
+            birth_token: source.root_mode_birth_token(),
+            expected_snapshot_sha256: "a".repeat(64),
+            previous_revision: 0,
+            conversation_revision: 1,
+            retained_system_messages: 0,
+            reset_at: source.updated_at,
+        }],
+    });
+    current
+}
+
+/// Supplies a canonical port response without publishing/resetting real data.
+struct ConversationRead {
+    original: Session,
+    canonical: Option<Session>,
+    change_after_first: bool,
+    reads: AtomicUsize,
+    writes: AtomicUsize,
+}
+
+#[async_trait]
+impl RuntimeSessionPersistence for ConversationRead {
+    async fn save_runtime_session(&self, _: &mut Session) -> std::io::Result<()> {
+        self.writes.fetch_add(1, Ordering::SeqCst);
+        Err(std::io::Error::other(
+            "unexpected conversation fixture write",
+        ))
+    }
+    async fn load_runtime_admission_snapshot(&self, _: &str) -> std::io::Result<Option<Session>> {
+        let read = self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(if self.change_after_first && read == 0 {
+            Some(self.original.clone())
+        } else {
+            self.canonical.clone()
+        })
+    }
+}
+
+#[tokio::test]
+async fn conversation_generation_sdk_public_paths_refuse_before_provider_or_actions() {
+    for mode in ["run", "session", "stream", "typed"] {
+        for missing in [false, true] {
+            let fixture = Fixture::new().await;
+            let zero = Session::new(format!("generation-sdk-{mode}-{missing}"), "test-model");
+            let mut session = if missing {
+                next_conversation(&zero)
+            } else {
+                zero.clone()
+            };
+            session.add_message(Message::user("retained caller history"));
+            let canonical = (!missing).then(|| next_conversation(&zero));
+            let read = Arc::new(ConversationRead {
+                original: session.clone(),
+                canonical,
+                change_after_first: false,
+                reads: AtomicUsize::new(0),
+                writes: AtomicUsize::new(0),
+            });
+            let mut agent = if mode == "typed" {
+                defaults_race_agent(&fixture).await
+            } else {
+                fixture.agent(None, false, false, None)
+            };
+            agent.inner = agent.inner.with_execution_persistence(read.clone());
+            let before = serde_json::to_value(&session).unwrap();
+            let error = match mode {
+                "run" => agent
+                    .run(&mut session, "must not append")
+                    .await
+                    .map_err(|e| e.to_string())
+                    .unwrap_err(),
+                "session" => agent
+                    .run_session(&mut session)
+                    .await
+                    .map_err(|e| e.to_string())
+                    .unwrap_err(),
+                "typed" => agent
+                    .run_with_skills(&mut session, SdkSkillInput::new("must not append", vec![]))
+                    .await
+                    .map_err(|e| e.to_string())
+                    .unwrap_err(),
+                "stream" => {
+                    let events =
+                        events(agent.run_stream(session.clone(), "must not execute")).await;
+                    assert_eq!(events.len(), 1);
+                    let AgentEvent::Error { message } = &events[0] else {
+                        panic!("expected explicit stream refusal")
+                    };
+                    message.clone()
+                }
+                _ => unreachable!(),
+            };
+            assert!(
+                error.contains("session_conversation_changed:"),
+                "{mode}: {error}"
+            );
+            assert_eq!(serde_json::to_value(&session).unwrap(), before);
+            assert_eq!(read.writes.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.probe.provider_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.probe.actions.load(Ordering::SeqCst), 0);
+            assert!(fixture.probe.calls.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn raced_conversation_admission_restores_sdk_borrowed_input_before_execution() {
+    for typed in [false, true] {
+        let fixture = Fixture::new().await;
+        let mut session = Session::new(format!("generation-sdk-race-{typed}"), "test-model");
+        session.add_message(Message::user("retained history"));
+        fixture.repo.save(&mut session).await.unwrap();
+        let read = Arc::new(ConversationRead {
+            original: session.clone(),
+            canonical: Some(next_conversation(&session)),
+            change_after_first: true,
+            reads: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+        });
+        let mut agent = if typed {
+            defaults_race_agent(&fixture).await
+        } else {
+            fixture.agent(None, false, false, None)
+        };
+        agent.inner = agent.inner.with_execution_persistence(read.clone());
+        let before_memory = serde_json::to_value(&session).unwrap();
+        let before_disk = durable_pair(&fixture, &session.id).await;
+        let error = if typed {
+            agent
+                .run_with_skills(&mut session, SdkSkillInput::new("borrowed input", vec![]))
+                .await
+                .map_err(|e| e.to_string())
+        } else {
+            agent
+                .run(&mut session, "borrowed input")
+                .await
+                .map_err(|e| e.to_string())
+        }
+        .unwrap_err();
+        assert!(error.contains("session_conversation_changed:"), "{error}");
+        assert_eq!(serde_json::to_value(&session).unwrap(), before_memory);
+        assert_eq!(durable_pair(&fixture, &session.id).await, before_disk);
+        assert_eq!(read.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.probe.provider_calls.load(Ordering::SeqCst), 0);
+        assert!(fixture.probe.calls.lock().unwrap().is_empty());
+    }
+}
+
 fn with_version(session: Session, version: Option<u32>) -> Session {
     let mut raw = serde_json::to_value(session).unwrap();
     match version {
@@ -236,6 +391,73 @@ impl AgentHook for CompatibilityHook {
     ) -> HookResult {
         self.0.fetch_add(1, Ordering::SeqCst);
         HookResult::Continue
+    }
+}
+
+#[tokio::test]
+async fn conversation_generation_raw_engine_refuses_before_hooks_provider_or_mutation() {
+    for explicit_inputs in [false, true] {
+        let fixture = Fixture::new().await;
+        let mut session = Session::new("generation-raw-engine", "test-model");
+        session.add_message(Message::user("original conversation"));
+        fixture.repo.save(&mut session).await.unwrap();
+        let read = Arc::new(ConversationRead {
+            original: session.clone(),
+            canonical: Some(next_conversation(&session)),
+            change_after_first: false,
+            reads: AtomicUsize::new(0),
+            writes: AtomicUsize::new(0),
+        });
+        let hooks_called = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Arc::new(CompatibilityHook(hooks_called.clone())));
+        let metrics = bamboo_metrics::MetricsCollector::spawn(
+            Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+                fixture.directory.path().join("generation-raw-metrics.db"),
+            )),
+            7,
+        );
+        let agent = RuntimeAgent::builder()
+            .storage(fixture.store.clone())
+            .persistence(read.clone())
+            .attachment_reader(fixture.store.clone())
+            .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))
+            .metrics_collector(metrics)
+            .config(Arc::new(tokio::sync::RwLock::new(
+                bamboo_llm::Config::default(),
+            )))
+            .provider(fixture.probe.clone())
+            .default_tools(Arc::new(RecordingExecutor {
+                probe: fixture.probe.clone(),
+                config: Arc::new(PermissionConfig::new()),
+                typed: false,
+                second_context: false,
+                action_log: fixture.directory.path().join("actions.log"),
+            }))
+            .hook_runner(Arc::new(hooks))
+            .build()
+            .unwrap();
+        let before_memory = serde_json::to_value(&session).unwrap();
+        let before_disk = durable_pair(&fixture, &session.id).await;
+        let (tx, _rx) = mpsc::channel(1024);
+        let request = ExecuteRequestBuilder::new("must not execute", tx, CancellationToken::new())
+            .model("test-model")
+            .build();
+        let result = if explicit_inputs {
+            agent.execute_with_inputs(&mut session, request, None).await
+        } else {
+            agent.execute(&mut session, request).await
+        };
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("session_conversation_changed:"));
+        assert_eq!(serde_json::to_value(&session).unwrap(), before_memory);
+        assert_eq!(durable_pair(&fixture, &session.id).await, before_disk);
+        assert_eq!(hooks_called.load(Ordering::SeqCst), 0);
+        assert_eq!(read.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.probe.provider_calls.load(Ordering::SeqCst), 0);
+        assert!(fixture.probe.calls.lock().unwrap().is_empty());
     }
 }
 

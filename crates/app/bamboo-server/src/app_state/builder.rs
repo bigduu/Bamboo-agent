@@ -601,6 +601,27 @@ impl AppState {
             ))
         })?;
 
+        // Build one creation service before shared tools. Both the generic
+        // caller port and Supervisor controls retain this same durable writer.
+        let project_context_resolver = Arc::new(
+            bamboo_engine::project_context::ProjectContextResolver::new_with_workspace_resolver(
+                Arc::new(crate::project_context::ProjectStoreContextSource::new(
+                    project_store.clone(),
+                )),
+                workspace_resolver.clone(),
+            ),
+        );
+        let root_creator = Arc::new(super::supervised_root_create::SupervisedRootCreator {
+            store: session_store.clone(),
+            operations: session_create_operations.clone(),
+            projects: project_store.clone(),
+            workspace: workspace_resolver.clone(),
+            project_context: project_context_resolver.clone(),
+            config: config.clone(),
+            repo: session_repo.clone(),
+            messenger: session_messenger.clone(),
+            account: account_sink.clone(),
+        });
         let diagnostics = Arc::new(crate::tools::diagnostics::DiagnosticsSource::default());
         let workflow_workspace_scope_guard =
             Arc::new(crate::workflow::WorkflowWorkspaceScopeGuard::default());
@@ -608,7 +629,7 @@ impl AppState {
             crate::skill_runtime::WorkspaceHandoffs::new(storage.clone(), agent_runners.clone())
                 .with_actor_directory(session_store.clone()),
         );
-        let (base_tools, native_tool_ceiling, builtin_permission_executor) = build_base_tools(
+        let (base_tools, native_tool_ceiling, _builtin_permission_executor) = build_base_tools(
             config.clone(),
             permission_checker.clone(),
             mcp_manager.clone(),
@@ -627,6 +648,7 @@ impl AppState {
             tool_event_publisher.clone(),
             memory_store.clone(),
             session_messenger.clone(),
+            Some(root_creator.caller_port()),
             diagnostics.clone(),
             workflow_workspace_scope_guard.clone(),
             workspace_handoffs.clone(),
@@ -726,14 +748,6 @@ impl AppState {
         // default_tools = base_tools (builtin + MCP + memory + skills) as a safe fallback.
         // Interactive execution paths pass an explicit tool surface override:
         // root sessions use ToolSurface::Root; child sessions use ToolSurface::Child.
-        let project_context_resolver = Arc::new(
-            bamboo_engine::project_context::ProjectContextResolver::new_with_workspace_resolver(
-                Arc::new(crate::project_context::ProjectStoreContextSource::new(
-                    project_store.clone(),
-                )),
-                workspace_resolver.clone(),
-            ),
-        );
         let mut agent_builder = bamboo_engine::Agent::builder()
             .storage(storage.clone())
             .persistence(Arc::new(session_repo.clone()))
@@ -1175,23 +1189,11 @@ impl AppState {
             None
         };
 
-        let root_creator = Arc::new(super::supervised_root_create::SupervisedRootCreator {
-            store: session_store.clone(),
-            operations: session_create_operations.clone(),
-            projects: project_store.clone(),
-            workspace: workspace_resolver.clone(),
-            project_context: project_context_resolver.clone(),
-            config: config.clone(),
-            repo: session_repo.clone(),
-            messenger: session_messenger.clone(),
-            account: account_sink.clone(),
-        });
         let browser = Arc::new(crate::browser::BrowserManager::with_profile_root(
             data_dir.join("browser-profiles"),
         ));
         let (tools, canonical_subagent_tool) = build_root_tools(
             tools_with_task.clone(),
-            builtin_permission_executor,
             schedule_store.clone(),
             schedule_manager.clone(),
             session_store.clone(),

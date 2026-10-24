@@ -40,8 +40,9 @@ pub(crate) struct StoredOperationError {
     pub http_status: u16,
 }
 
-/// Rebuildable outer receipt for the canonical Inbox's first instruction.
-/// It contains no input text, permission, prompt or authority grant.
+/// Outer receipt for the canonical Inbox's first instruction, reused by both
+/// Supervisor and finite Host Root creation. The legacy serialized field name
+/// stays compatible. It contains no input text, permission or authority grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SupervisedRootDelivery {
     pub receipt_id: String,
@@ -66,7 +67,9 @@ pub(crate) struct SessionCreateOperationRecord {
     pub updated_at: DateTime<Utc>,
     /// Pending reservations never expire: discarding one could let the same
     /// logical action allocate a second UUID after a long outage. Terminal
-    /// receipts receive a bounded expiry when they become terminal.
+    /// HTTP/Supervisor receipts receive a bounded expiry when terminal. Finite
+    /// Host Root operations explicitly retain their original reservation truth
+    /// across grant/conversation changes and leave this field absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
 }

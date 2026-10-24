@@ -198,6 +198,10 @@ pub struct AgentBuilder {
         SessionInboxLimits,
         Arc<bamboo_engine::SessionActivationRouter>,
     )>,
+    /// Trusted Host port, applied only to the SDK defaults tool assembly.
+    /// Presence installs no Project, workspace, target or creation grant.
+    session_root_creator:
+        Option<Arc<dyn bamboo_server_tools::session_control::root_creation::SessionRootCreatePort>>,
 }
 
 impl AgentBuilder {
@@ -226,6 +230,7 @@ impl AgentBuilder {
             project_store: None,
             project_sessions: None,
             session_delivery: None,
+            session_root_creator: None,
         }
     }
 
@@ -402,6 +407,10 @@ impl AgentBuilder {
     /// explicit at the call site. A fully injected
     /// [`default_tools`](Self::default_tools) executor owns its own permission
     /// behavior and is not wrapped by this setter.
+    /// The installed scoped Session sender requires a typed config even for an
+    /// unprompted posture: configure [`permission_mode`](Self::permission_mode)
+    /// to retain its legacy followup restrictions. A configless sender reports
+    /// unsupported instead of falling back to an ungated delivery path.
     ///
     /// Once gated, a tool call that needs approval suspends the run (a
     /// `NeedClarification`/`ToolApprovalRequested` event, session
@@ -484,6 +493,21 @@ impl AgentBuilder {
         limits: SessionInboxLimits,
     ) -> Self {
         self.session_delivery = Some((limits, activation_router));
+        self
+    }
+
+    /// Install the Host's caller-scoped independent Root creation port for
+    /// defaults assembled by [`with_defaults_for_data_dir`](Self::with_defaults_for_data_dir).
+    /// The Host must preserve final caller/Project/workspace/Inbox/idempotency
+    /// authority. A missing port reports an explicit blocker; it never spawns a
+    /// Child. Explicit tools/no-tools/default-executor selections still win.
+    pub fn session_root_creator(
+        mut self,
+        creator: Arc<
+            dyn bamboo_server_tools::session_control::root_creation::SessionRootCreatePort,
+        >,
+    ) -> Self {
+        self.session_root_creator = Some(creator);
         self
     }
 
@@ -696,6 +720,16 @@ impl AgentBuilder {
     /// `instruction` and `model` are carried onto the `Agent` for
     /// [`Agent::run`](super::Agent::run).
     pub fn build(mut self) -> Result<Agent, SdkError> {
+        if self.session_root_creator.is_some()
+            && self.session_store.is_none()
+            && self.tools.is_none()
+            && self.default_tools_override.is_none()
+        {
+            return Err(SdkError::Unsupported(
+                "session_root_creator requires with_defaults_for_data_dir for the canonical caller store"
+                    .into(),
+            ));
+        }
         let mut session_messenger = None;
         if let Some((limits, activation_router)) = self.session_delivery.take() {
             let session_store = self
@@ -715,11 +749,11 @@ impl AgentBuilder {
             let activation: Arc<dyn bamboo_domain::SessionActivationPort> =
                 activation_router.clone();
             let messenger = Arc::new(bamboo_engine::SessionMessenger::new(
-                sessions,
+                sessions.clone(),
                 inbox.clone(),
                 activation,
             ));
-            session_messenger = Some(messenger.clone());
+            session_messenger = Some((sessions, messenger.clone()));
             self.inner = self
                 .inner
                 .session_inbox(inbox)
@@ -788,10 +822,22 @@ impl AgentBuilder {
                     .register_tool(bamboo_server_tools::ProjectTool::new(sessions, projects))
                     .map_err(|error| SdkError::Build(error.to_string()))?;
             }
-            if let Some(messenger) = session_messenger {
+            let mut session_message_tool = None;
+            if let Some((sessions, messenger)) = session_messenger {
+                let tool = Arc::new(
+                        bamboo_server_tools::SessionMessageTool::new(messenger.clone())
+                            .with_scoped_sender(Arc::new(
+                                bamboo_server_tools::scoped_session_messaging::CanonicalSessionSendAdapter::new(
+                                    sessions,
+                                    messenger,
+                                ),
+                            )),
+                    );
                 builtin_tools
-                    .register_tool(bamboo_server_tools::SessionMessageTool::new(messenger))
+                    .registry()
+                    .register_shared(tool.clone())
                     .map_err(|error| SdkError::Build(error.to_string()))?;
+                session_message_tool = Some(tool);
             }
             if let (Some(manager), Some(sessions), Some(projects)) = (
                 self.assembled_skill_manager.clone(),
@@ -799,13 +845,32 @@ impl AgentBuilder {
                 self.project_store.clone(),
             ) {
                 sdk_skills = Some(Arc::new(super::skill_runtime::DefaultSdkSkills::new(
-                    manager, config, sessions, projects,
+                    manager,
+                    config.clone(),
+                    sessions,
+                    projects,
                 )));
             }
-            let builtin_tools: Arc<dyn ToolExecutor> = Arc::new(builtin_tools);
+            let builtin_tools = Arc::new(builtin_tools);
+            let builtin_base: Arc<dyn ToolExecutor> = builtin_tools.clone();
             let executor: Arc<dyn ToolExecutor> = match self.assembled_mcp_tools.take() {
-                Some(mcp_tools) => Arc::new(CompositeToolExecutor::new(builtin_tools, mcp_tools)),
-                None => builtin_tools,
+                Some(mcp_tools) => Arc::new(CompositeToolExecutor::new(builtin_base, mcp_tools)),
+                None => builtin_base,
+            };
+            let executor = match self.session_store.clone() {
+                Some(store) => {
+                    let storage: Arc<dyn bamboo_agent_core::storage::Storage> = store.clone();
+                    bamboo_server_tools::framework_session_tools::assemble_framework_session_tools_with_message(
+                        executor,
+                        builtin_tools,
+                        store,
+                        storage,
+                        config,
+                        self.session_root_creator.take(),
+                        session_message_tool,
+                    )
+                }
+                None => executor,
             };
             self.inner = self.inner.default_tools(executor);
         }
@@ -1703,6 +1768,299 @@ mod tests {
         assert!(
             matches!(error, super::SdkError::Unsupported(message) if message.contains("with_defaults_for_data_dir"))
         );
+    }
+
+    #[tokio::test]
+    async fn defaults_scoped_sender_retains_legacy_deny_and_original_caller_at_canonical_inbox() {
+        use bamboo_agent_core::tools::with_executing_session_caller;
+        use bamboo_agent_core::Session;
+        use bamboo_domain::{SessionCallerReference, SessionInboxPort};
+        use bamboo_tools::permission::{
+            ConfigPermissionChecker, PermissionConfig, PermissionRule, PermissionType,
+        };
+
+        let home = tempfile::tempdir().unwrap();
+        let config = Arc::new(PermissionConfig::new());
+        config.set_enabled(false);
+        let agent = AgentBuilder::new()
+            .provider(Arc::new(NeverCalledProvider))
+            .permission_checker(Arc::new(ConfigPermissionChecker::new(config.clone())))
+            .session_delivery(bamboo_engine::SessionActivationRouter::new())
+            .with_defaults_for_data_dir(home.path().to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let tools = agent.inner.default_tools();
+        assert_eq!(
+            tools.execution_contract_for_exact("session_message"),
+            Some(bamboo_server_tools::session_message::SCOPED_SESSION_SEND_EXECUTION_CONTRACT)
+        );
+        assert!(tools
+            .execution_contract_for_exact("default::session_message")
+            .is_none());
+        let root = Session::new("sdk-scoped-root", "model");
+        let source = Session::new_child_of("sdk-scoped-source", &root, "model", "source");
+        let target = Session::new_child_of("sdk-scoped-target", &root, "model", "target");
+        for session in [&root, &source, &target] {
+            agent.storage().save_session(session).await.unwrap();
+        }
+        let inbox = bamboo_storage::FileSessionInbox::new(
+            agent.session_store.as_ref().unwrap().clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+        let legacy_resource = format!("session_control followup {}", target.id);
+        config.add_rule(PermissionRule::new(
+            PermissionType::ExecuteCommand,
+            &legacy_resource,
+            false,
+        ));
+        let call = ToolCall { id:"sdk-scoped-send".into(), tool_type:"function".into(), function:FunctionCall {
+            name:"session_message".into(), arguments:serde_json::json!({
+                "action":"send", "target_session_id":target.id, "operation_id":"sdk-scoped-operation",
+                "message":"bounded SDK input", "delivery_intent":"queue_only",
+            }).to_string(),
+        }};
+        let error = with_executing_session_caller(
+            Some(Arc::new(SessionCallerReference::from(&source))),
+            tools.execute_with_context(&call, execution_context(&source.id, &call.id)),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("legacy followup policy"));
+        assert_eq!(inbox.inspect(&target.id).await.unwrap().generation, 0);
+        assert!(config.remove_rule(PermissionType::ExecuteCommand, &legacy_resource));
+        let error = tools
+            .execute_with_context(&call, execution_context(&source.id, &call.id))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("authority_unavailable"));
+        let receipt = with_executing_session_caller(
+            Some(Arc::new(SessionCallerReference::from(&source))),
+            tools.execute_with_context(&call, execution_context(&source.id, &call.id)),
+        )
+        .await
+        .unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&receipt.result).unwrap();
+        assert_eq!(receipt["admitted"], true);
+        assert_eq!(receipt["terminal"], "not_observed");
+        assert_eq!(inbox.inspect(&target.id).await.unwrap().generation, 1);
+        assert!(agent
+            .storage()
+            .load_session(&target.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .messages
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn defaults_host_discovery_uses_read_scope_with_configless_sdk_without_granting_raw_history(
+    ) {
+        use bamboo_agent_core::tools::with_executing_session_caller;
+        use bamboo_agent_core::Session;
+        use bamboo_domain::{
+            HostScopeSessionObservation, HostSessionRight, HostSessionScopeBinding,
+            HostSessionTargetScope, SessionCallerReference, HOST_SESSION_SCOPE_VERSION,
+        };
+
+        let home = tempfile::tempdir().unwrap();
+        let agent = AgentBuilder::new()
+            .provider(Arc::new(NeverCalledProvider))
+            .with_defaults_for_data_dir(home.path().into())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(agent.permission_checker.is_none());
+        let tools = agent.inner.default_tools();
+        assert!(tools.owns_exact_tool("session_history_current"));
+        let caller = Session::new("sdk-host-reader", "model");
+        let mut target = Session::new("sdk-host-target", "model");
+        target.set_project_id_meta("explicit-target-project");
+        for session in [&caller, &target] {
+            agent.storage().save_session(session).await.unwrap();
+        }
+        agent
+            .session_store
+            .as_ref()
+            .unwrap()
+            .install_host_session_scope(
+                0,
+                HostSessionScopeBinding {
+                    schema_version: HOST_SESSION_SCOPE_VERSION,
+                    grant_id: uuid::Uuid::new_v4(),
+                    revision: 1,
+                    caller: HostScopeSessionObservation::capture(&caller, vec![]).unwrap(),
+                    targets: [(
+                        target.id.clone(),
+                        HostSessionTargetScope {
+                            observation: HostScopeSessionObservation::capture(&target, vec![])
+                                .unwrap(),
+                            rights: [HostSessionRight::ListMetadata].into(),
+                        },
+                    )]
+                    .into(),
+                    creates: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        for (action, allowed) in [("list", true), ("read_messages", false)] {
+            let args = if action == "list" {
+                serde_json::json!({"action":"list"})
+            } else {
+                serde_json::json!({"action":action,"session_id":target.id})
+            };
+            let call = ToolCall {
+                id: format!("sdk-host-{action}"),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "session_history".into(),
+                    arguments: args.to_string(),
+                },
+            };
+            let observed = with_executing_session_caller(
+                Some(Arc::new(SessionCallerReference::from(&caller))),
+                tools.execute_with_context(&call, execution_context(&caller.id, &call.id)),
+            )
+            .await;
+            if allowed {
+                let page: serde_json::Value =
+                    serde_json::from_str(&observed.unwrap().result).unwrap();
+                assert_eq!(page["sessions"][0]["session_id"], target.id);
+            } else {
+                assert!(observed.is_err());
+            }
+        }
+    }
+
+    struct BlockedSdkRootPort(AtomicUsize);
+    #[async_trait]
+    impl bamboo_server_tools::session_control::root_creation::SessionRootCreatePort
+        for BlockedSdkRootPort
+    {
+        async fn scope(
+            &self,
+            _: &bamboo_domain::SessionCallerReference,
+        ) -> Result<ToolResult, ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::text(false, serde_json::json!({
+                "code":"host_root_first_input_unavailable", "message":"synthetic unconfigured first-input port"
+            }).to_string()))
+        }
+        async fn create(
+            &self,
+            _: &bamboo_domain::SessionCallerReference,
+            _: bamboo_server_tools::session_control::root_creation::SupervisedRootCreateRequest,
+        ) -> Result<ToolResult, ToolError> {
+            panic!("blocked scope must not start a Root writer")
+        }
+    }
+
+    #[tokio::test]
+    async fn defaults_install_fresh_root_tool_and_preserve_the_specific_host_port_blocker() {
+        use bamboo_agent_core::tools::{
+            with_executing_session_caller, FRAMEWORK_ROOT_SPAWN_CONTRACT_V1,
+        };
+        use bamboo_domain::{Session, SessionCallerReference};
+        for configured in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let port = Arc::new(BlockedSdkRootPort(AtomicUsize::new(0)));
+            let mut builder = AgentBuilder::new().provider(Arc::new(NeverCalledProvider));
+            if configured {
+                builder = builder.session_root_creator(port.clone());
+            }
+            let agent = builder
+                .with_defaults_for_data_dir(home.path().into())
+                .await
+                .unwrap()
+                .build()
+                .unwrap();
+            let tools = agent.inner.default_tools();
+            assert_eq!(
+                tools.execution_contract_for_exact("spawn_session"),
+                Some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+            );
+            assert!(
+                tools.owns_exact_tool("session_history")
+                    && tools.owns_exact_tool("session_history_current")
+            );
+            for kind in [
+                bamboo_agent_core::tools::FrameworkSessionToolKind::History,
+                bamboo_agent_core::tools::FrameworkSessionToolKind::CurrentHistory,
+                bamboo_agent_core::tools::FrameworkSessionToolKind::SpawnRoot,
+            ] {
+                let proof = tools
+                    .framework_session_tool_for_exact(kind.execution_name())
+                    .unwrap();
+                assert_eq!(proof.kind(), kind);
+                assert!(Arc::ptr_eq(
+                    &proof.instance(),
+                    &tools
+                        .tool_instance_for_exact(kind.execution_name())
+                        .unwrap()
+                ));
+            }
+            // No configured coherent delivery port means no synthetic send.
+            assert!(tools
+                .framework_session_tool_for_exact("session_message")
+                .is_none());
+            let mut caller = Session::new("sdk-default-root-caller", "model");
+            caller.session_version = None;
+            agent.storage().save_session(&caller).await.unwrap();
+            let call = ToolCall { id:"sdk-default-fresh-root".into(), tool_type:"function".into(), function:FunctionCall {
+                name:"spawnSession".into(), arguments:serde_json::json!({
+                    "operation_id":uuid::Uuid::new_v4(), "expected_state_revision":1,
+                    "project_id":"explicit-project", "workspace_path":"/explicit/host-bound", "message":"bounded instruction"
+                }).to_string(),
+            }};
+            let error = with_executing_session_caller(
+                Some(Arc::new(SessionCallerReference::from(&caller))),
+                tools.execute_with_context(&call, execution_context(&caller.id, &call.id)),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(if configured {
+                "host_root_first_input_unavailable"
+            } else {
+                "session_root_creator_unconfigured"
+            }));
+            assert_eq!(port.0.load(Ordering::SeqCst), usize::from(configured));
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_root_port_never_expands_explicit_sdk_tool_policy() {
+        for policy in 0..3 {
+            let home = tempfile::tempdir().unwrap();
+            let port = Arc::new(BlockedSdkRootPort(AtomicUsize::new(0)));
+            let builder = AgentBuilder::new()
+                .provider(Arc::new(NeverCalledProvider))
+                .session_root_creator(port.clone())
+                .with_defaults_for_data_dir(home.path().into())
+                .await
+                .unwrap();
+            let builder = match policy {
+                0 => builder.no_tools(),
+                1 => builder.tools(vec![]),
+                _ => builder.default_tools(Arc::new(
+                    bamboo_tools::BuiltinToolExecutor::with_registry(ToolRegistry::new()),
+                )),
+            };
+            let agent = builder.build().unwrap();
+            assert!(agent.inner.default_tools().list_tools().is_empty());
+            assert!(!agent.inner.default_tools().owns_exact_tool("spawn_session"));
+            assert!(bamboo_agent_core::tools::FrameworkSessionToolKind::ALL
+                .into_iter()
+                .all(|kind| agent
+                    .inner
+                    .default_tools()
+                    .framework_session_tool_for_exact(kind.execution_name())
+                    .is_none()));
+            assert_eq!(port.0.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]

@@ -31,8 +31,10 @@ use bamboo_engine::runtime::execution::agent_spawn::{
     spawn_session_execution, SessionExecutionArgs,
 };
 use bamboo_engine::session_app::approval_replay::{
-    apply_permission_replay_result, find_permission_replay_target, refresh_approval_replay_posture,
-    repark_permission_replay, restore_permission_replay_authorization,
+    apply_permission_replay_result, find_permission_replay_target,
+    refresh_retained_approval_replay_posture, repark_permission_replay,
+    resolve_permission_replay_owner, restore_permission_replay_authorization,
+    restore_permission_replay_caller, restore_permission_replay_execution,
     validate_permission_replay_authority, ApprovalReplayDecision, PermissionReplayTarget,
 };
 use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
@@ -786,7 +788,17 @@ impl ResumeExecutionPort for ConnectResumePort {
                 let tool_name = tool_call.function.name.clone();
                 let executor = ctx.tools.clone();
                 let executor = executor.for_session(&session).unwrap_or(executor);
-                let replay_owner = executor.resolve_reference_for_session(&session, &tool_name);
+                let replay_owner = match resolve_permission_replay_owner(
+                    &session,
+                    &replay_target,
+                    executor.as_ref(),
+                ) {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        tracing::error!(%session_id, %error, "retained permission operation refused; pending markers preserved");
+                        return;
+                    }
+                };
                 if replay_owner.is_none() && reexecute_request_generation.is_some() {
                     tracing::error!(%session_id, %tool_name, "connect approved replay has no registered execution owner; markers retained");
                     return;
@@ -802,16 +814,38 @@ impl ResumeExecutionPort for ConnectResumePort {
                         return;
                     }
                 };
+                let executing_caller = match restore_permission_replay_caller(
+                    &session,
+                    &replay_target,
+                ) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        tracing::error!(%session_id, %error, "original caller replay binding failed closed; markers preserved");
+                        return;
+                    }
+                };
+                let retained_execution = match restore_permission_replay_execution(
+                    &session,
+                    &replay_target,
+                    replay_owner.as_deref().unwrap_or(&tool_name),
+                ) {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        tracing::error!(%session_id, %error, "retained contract refused; markers preserved");
+                        return;
+                    }
+                };
                 let configured_mode = ctx
                     .permission_checker
                     .permission_config()
                     .map(|config| config.mode())
                     .unwrap_or_default();
-                let decision = match refresh_approval_replay_posture(
+                let decision = match refresh_retained_approval_replay_posture(
                     ctx.session_repo.storage().as_ref(),
                     &mut session,
                     configured_mode,
                     replay_owner.as_deref(),
+                    retained_execution.as_ref(),
                 )
                 .await
                 {
@@ -907,7 +941,11 @@ impl ResumeExecutionPort for ConnectResumePort {
                             session.id.as_str(),
                             reexecute_tool_call_id.as_str(),
                             reexecute_request_generation.as_deref(),
-                            executor.execute_exact_with_context_outcome(
+                            bamboo_agent_core::tools::with_retained_tool_execution(
+                                retained_execution,
+                                bamboo_agent_core::tools::with_executing_session_caller(
+                                executing_caller.map(std::sync::Arc::new),
+                                executor.execute_exact_with_context_outcome(
                                 &tool_call,
                                 replay_owner,
                                 ToolExecutionContext {
@@ -930,6 +968,8 @@ impl ResumeExecutionPort for ConnectResumePort {
                                     bash_completion_sink: None,
                                     pre_parsed_args: None,
                                 },
+                                ),
+                                ),
                             ),
                         )
                         .await.map(bamboo_agent_core::tools::ToolOutcome::into_tool_result);
@@ -1187,8 +1227,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_resume_consumes_approved_call_after_root_tool_tightening() {
-        use crate::app_state::resume_adapter::supervisor_tests::{Fixture, CALL};
+    async fn connect_resume_preserves_approved_call_after_root_tool_revision_changes() {
+        use crate::app_state::resume_adapter::supervisor_tests::Fixture;
         let fixture = Box::pin(Fixture::ordinary_root_pending()).await;
         fixture.prepare_workspace_catalog().await;
         let handoff = fixture.ordinary_root_approval_handoff().await;
@@ -1213,16 +1253,9 @@ mod tests {
             outcome,
             bamboo_engine::session_app::types::ResumeOutcome::Started { .. }
         ));
-        fixture.settled(0, false).await;
-        let saved = fixture.reload().await;
-        let result = saved
-            .messages
-            .iter()
-            .rev()
-            .find(|message| message.tool_call_id.as_deref() == Some(CALL))
-            .unwrap();
-        assert_eq!(result.tool_success, Some(false));
-        assert!(result.content.contains("Root orchestration policy blocked"));
+        fixture
+            .settled_with_retained_revision_mismatch(&session)
+            .await;
     }
 
     #[tokio::test]

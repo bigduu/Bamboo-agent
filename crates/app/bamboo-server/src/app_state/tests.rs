@@ -341,7 +341,7 @@ async fn root_catalog_keeps_only_current_history_in_the_core_functions() {
 }
 
 #[tokio::test]
-async fn child_tools_include_only_self_scoped_session_history() {
+async fn shared_base_history_keeps_host_scopes_separate_from_current_history() {
     let temp_dir = tempfile::tempdir().unwrap();
     let state = AppState::new(temp_dir.path().to_path_buf())
         .await
@@ -357,6 +357,7 @@ async fn child_tools_include_only_self_scoped_session_history() {
     assert!(names.contains("archive_context"));
     assert!(names.contains("session_history"));
     assert!(names.contains("session_history_current"));
+    assert!(names.contains("spawn_session"));
     assert!(!names.contains("session_control"));
     assert!(names.contains("memory"));
     assert!(names.contains("load_skill"));
@@ -367,13 +368,19 @@ async fn child_tools_include_only_self_scoped_session_history() {
         .iter()
         .find(|schema| schema.function.name == "session_history")
         .expect("Child history schema");
-    assert_eq!(
-        history.function.parameters["properties"]["action"]["enum"],
-        json!(["search_current", "read_current", "read_around"])
-    );
-    assert!(history.function.parameters["properties"]
-        .get("session_id")
-        .is_none());
+    let actions = history.function.parameters["properties"]["action"]["enum"]
+        .as_array()
+        .unwrap();
+    for action in [
+        "search_current",
+        "read_current",
+        "read_around",
+        "list",
+        "inspect",
+    ] {
+        assert!(actions.contains(&json!(action)));
+    }
+    assert!(!actions.contains(&json!("search")));
     let base_history = state
         .tools_for(ToolSurface::Base)
         .list_tools()
@@ -381,20 +388,20 @@ async fn child_tools_include_only_self_scoped_session_history() {
         .find(|schema| schema.function.name == "session_history")
         .expect("Base history schema");
     assert_eq!(
-        base_history.function.parameters["properties"]["action"]["enum"],
-        json!(["search_current", "read_current", "read_around"])
+        base_history.function.parameters, history.function.parameters,
+        "Base and its Child surface keep the same real Host-routed schema"
     );
-    assert!(base_history.function.parameters["properties"]
-        .get("session_id")
-        .is_none());
     let child_current_history = tools
         .iter()
         .find(|schema| schema.function.name == "session_history_current")
         .expect("Child current-history schema");
     assert_eq!(
-        child_current_history.function.parameters, history.function.parameters,
-        "the exact Core identity must expose only the same least-privilege schema"
+        child_current_history.function.parameters["properties"]["action"]["enum"],
+        json!(["search_current", "read_current", "read_around"])
     );
+    assert!(child_current_history.function.parameters["properties"]
+        .get("session_id")
+        .is_none());
     let base_current_history = state
         .tools_for(ToolSurface::Base)
         .list_tools()
@@ -403,7 +410,7 @@ async fn child_tools_include_only_self_scoped_session_history() {
         .expect("Base current-history schema");
     assert_eq!(
         base_current_history.function.parameters,
-        base_history.function.parameters
+        child_current_history.function.parameters
     );
     let mut child_session = Session::new("child-history-surface", "test-model");
     child_session.add_message(bamboo_agent_core::Message::user(
@@ -454,12 +461,34 @@ async fn child_tools_include_only_self_scoped_session_history() {
     let mut context = ToolExecutionContext::none(&legacy_search_call.id);
     context.session_id = Some(&child_session.id);
     assert!(
+        bamboo_agent_core::tools::with_executing_session_caller(
+            Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+                &child_session
+            ))),
+            state
+                .tools_for(ToolSurface::Child)
+                .execute_with_context(&legacy_search_call, context),
+        )
+        .await
+        .expect("routed history retains filtered self reads")
+        .success
+    );
+    let list = make_tool_call("session_history", json!({"action":"list"}));
+    let mut context = ToolExecutionContext::none(&list.id);
+    context.session_id = Some(&child_session.id);
+    let error = bamboo_agent_core::tools::with_executing_session_caller(
+        Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+            &child_session,
+        ))),
         state
             .tools_for(ToolSurface::Child)
-            .execute_with_context(&legacy_search_call, context)
-            .await
-            .expect("legacy self-history name remains compatible")
-            .success
+            .execute_with_context(&list, context),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("scope_required"),
+        "schema presence is no grant"
     );
 }
 

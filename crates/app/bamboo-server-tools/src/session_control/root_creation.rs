@@ -2,9 +2,10 @@
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ToolError, ToolResult};
-use bamboo_domain::{ProjectId, SupervisorReference};
+use bamboo_domain::{ProjectId, SessionCallerReference, Storage, SupervisorReference};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,15 +51,87 @@ pub trait SupervisedRootCreatePort: Send + Sync {
     ) -> Result<ToolResult, ToolError>;
 }
 
+/// Role-neutral Host seam. A caller reference identifies the original lifetime;
+/// the implementation must authorize its current Project/workspace scope and
+/// reuse the canonical Root/Inbox/idempotency writers. It is not a model grant.
+#[async_trait]
+pub trait SessionRootCreatePort: Send + Sync {
+    async fn scope(&self, caller: &SessionCallerReference) -> Result<ToolResult, ToolError>;
+    async fn create(
+        &self,
+        caller: &SessionCallerReference,
+        request: SupervisedRootCreateRequest,
+    ) -> Result<ToolResult, ToolError>;
+}
+
+/// Compatibility adapter for the currently installed Host authorization. Keep
+/// every existing singleton/scope/birth/Project/Inbox guard in the old writer.
+/// Other callers require a separately installed, scoped Host implementation.
+pub struct SupervisorRootCreateAdapter {
+    creator: Arc<dyn SupervisedRootCreatePort>,
+    storage: Arc<dyn Storage>,
+}
+
+impl SupervisorRootCreateAdapter {
+    pub fn new(creator: Arc<dyn SupervisedRootCreatePort>, storage: Arc<dyn Storage>) -> Self {
+        Self { creator, storage }
+    }
+
+    async fn authorize(
+        &self,
+        caller: &SessionCallerReference,
+    ) -> Result<SupervisorReference, ToolError> {
+        let canonical = self
+            .storage
+            .load_execution_admission_snapshot(&caller.session_id)
+            .await
+            .map_err(|error| {
+                ToolError::Execution(format!("Session Root authority read failed: {error}"))
+            })?
+            .ok_or_else(|| ToolError::Execution("Session Root caller is unavailable".into()))?;
+        canonical
+            .check_execution_compatibility()
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        if !caller.matches_session(&canonical) {
+            return Err(ToolError::Execution(
+                "Session Root caller lifetime or authority changed".into(),
+            ));
+        }
+        let incarnation_id = canonical.supervisor_incarnation_id().ok_or_else(|| {
+            ToolError::Execution("session_root_scope_unavailable: this Host has no Root creation grant adapter for the caller".into())
+        })?;
+        Ok(SupervisorReference {
+            session_id: canonical.id,
+            incarnation_id,
+        })
+    }
+}
+
+#[async_trait]
+impl SessionRootCreatePort for SupervisorRootCreateAdapter {
+    async fn scope(&self, caller: &SessionCallerReference) -> Result<ToolResult, ToolError> {
+        self.creator.scope(&self.authorize(caller).await?).await
+    }
+
+    async fn create(
+        &self,
+        caller: &SessionCallerReference,
+        request: SupervisedRootCreateRequest,
+    ) -> Result<ToolResult, ToolError> {
+        let supervisor = self.authorize(caller).await?;
+        self.creator.create(&supervisor, request).await
+    }
+}
+
 pub(super) fn request_schema() -> Value {
     json!({
         "type":"object", "additionalProperties":false,
         "properties": {
             "operation_id":{"type":"string", "format":"uuid", "description":"Fresh non-nil UUID for one creation. Reuse exactly this UUID and every request field after an uncertain response; never allocate another operation to recover it."},
             "expected_state_revision":{"type":"integer", "minimum":0, "description":"Exact management state_revision returned by scope. A new operation must reload scope after a conflict; exact retries keep the original request."},
-            "project_id":{"type":"string", "minLength":1, "description":"An explicit existing Project in the Supervisor's current Host-configured allowed_projects. Creation never grants another Project."},
-            "workspace_path":{"type":"string", "minLength":1, "maxLength":4096, "description":"Explicit existing workspace already bound to this Project by the Host; no inheritance from the Supervisor, path registration, or worktree creation."},
-            "message":{"type":"string", "minLength":1, "maxLength":16384, "description":"One explicit first instruction, at most 16 KiB UTF-8. No private Supervisor history is copied."},
+            "project_id":{"type":"string", "minLength":1, "description":"An explicit existing Project in the caller's current Host-configured creation scope. Creation never grants another Project."},
+            "workspace_path":{"type":"string", "minLength":1, "maxLength":4096, "description":"Explicit existing workspace already bound to this Project by the Host; no caller workspace inheritance, path registration, or worktree creation."},
+            "message":{"type":"string", "minLength":1, "maxLength":16384, "description":"One explicit first instruction, at most 16 KiB UTF-8. No private caller history is copied."},
             "title":{"type":["string","null"], "minLength":1, "maxLength":256}
         },
         "required":["operation_id","expected_state_revision","project_id","workspace_path","message"]

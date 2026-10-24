@@ -442,6 +442,14 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     /// storage implementation supplies the atomic variant.
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         if let Some(durable) = self.load_runtime_session(&session.id).await? {
+            session
+                .check_conversation_generation(&durable)
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        crate::SessionAuthorityConflict(error.to_string()),
+                    )
+                })?;
             append_missing_runtime_messages(session, &durable);
             merge_session_inbox_admission(session, &durable);
         }

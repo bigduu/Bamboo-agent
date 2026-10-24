@@ -33,6 +33,8 @@ impl CanonicalPair {
         let mut main: Session = actor_transcript::decode(&self.main).map_err(conflict)?;
         let mut runtime: Session = actor_transcript::decode(&self.runtime).map_err(conflict)?;
         supervisor::validate_overlay(&main, Some(&runtime)).map_err(conflict)?;
+        main.check_conversation_generation(&runtime)
+            .map_err(conflict)?;
         for session in [&mut main, &mut runtime] {
             if session.kind == SessionKind::Root && session.root_session_id.is_empty() {
                 session.root_session_id = session.id.clone();
@@ -51,6 +53,36 @@ impl CanonicalPair {
             return Err(conflict("canonical Session pair identity changed"));
         }
         Ok(overlay_runtime_sidecar(main, Some(runtime)))
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    #[test]
+    fn answer_cannot_overlay_new_generation_runtime_onto_old_parent_history() {
+        let mut main = Session::new("answer-generation-root", "model");
+        main.add_message(Message::user("old parent history"));
+        let mut runtime = runtime_sidecar_snapshot(&main);
+        runtime.conversation_reset = Some(bamboo_domain::ConversationResetState {
+            schema_version: 1,
+            conversation_revision: 1,
+            receipts: vec![bamboo_domain::ConversationResetReceipt {
+                operation_id: format!("0:{}", Uuid::new_v4()),
+                birth_token: main.root_mode_birth_token(),
+                expected_snapshot_sha256: "a".repeat(64),
+                previous_revision: 0,
+                conversation_revision: 1,
+                retained_system_messages: 0,
+                reset_at: main.updated_at,
+            }],
+        });
+        let pair = CanonicalPair {
+            main: compact_main::serialize_main(&main).unwrap(),
+            runtime: serde_json::to_vec(&runtime).unwrap(),
+        };
+        assert!(pair.session().is_err());
     }
 }
 
@@ -332,6 +364,7 @@ mod tests {
                     root_owner = Some(RootActorRuntimeWrite {
                         fence: activation.fence(),
                         created_at: parent.created_at,
+                        conversation_generation: parent.conversation_generation_observation(),
                     });
                 }
             }

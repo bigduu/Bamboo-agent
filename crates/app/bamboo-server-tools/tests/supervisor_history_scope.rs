@@ -144,7 +144,7 @@ async fn supervisor_history_scoped_readback_survives_modes_and_restart_and_denie
         assert!(tool
             .invoke(json!({"action":"list"}), context())
             .await
-            .is_err());
+            .is_ok());
         assert!(tool
             .invoke(json!({"action":"search","query":"history"}), context())
             .await

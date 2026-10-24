@@ -148,6 +148,15 @@ pub(crate) enum InboxAuthority {
     Peer {
         _guard: crate::v2::PeerDeliveryGuard,
     },
+    HostScoped {
+        _guard: crate::v2::host_session_scope::HostScopedDeliveryGuards,
+    },
+    HostCreation {
+        _guard: crate::v2::host_root_create::HostCreatedRootDeliveryGuards,
+    },
+    Unscoped {
+        _guard: crate::v2::host_session_scope::LegacySessionDeliveryGuards,
+    },
 }
 struct OwnedScope {
     _process: OwnedMutexGuard<()>,
@@ -602,15 +611,28 @@ impl FileSessionInbox {
             .await
     }
 
+    /// Hint/expiry reads and the physical writer must use the same retained
+    /// canonical address. A rebuildable global index cannot retarget a guard.
+    pub(super) async fn inbox_dir_with_authority(
+        &self,
+        target: &str,
+        authority: &InboxAuthority,
+    ) -> Result<PathBuf, SessionInboxError> {
+        match authority {
+            InboxAuthority::Peer { _guard } => Ok(_guard.inbox_dir.clone()),
+            InboxAuthority::HostScoped { _guard } => Ok(_guard.inbox_dir.clone()),
+            InboxAuthority::HostCreation { _guard } => Ok(_guard.inbox_dir.clone()),
+            InboxAuthority::Unscoped { _guard } => Ok(_guard.inbox_dir.clone()),
+            _ => self.inbox_dir(target).await,
+        }
+    }
+
     pub(crate) async fn filesystem_with_authority(
         &self,
         target: &str,
         authority: InboxAuthority,
     ) -> Result<(PathBuf, OwnedFilesystem), SessionInboxError> {
-        let dir = match &authority {
-            InboxAuthority::Peer { _guard } => _guard.inbox_dir.clone(),
-            _ => self.inbox_dir(target).await?,
-        };
+        let dir = self.inbox_dir_with_authority(target, &authority).await?;
         let process = self.lock_process(&dir).await;
         let scope = Arc::new(OwnedScope {
             _process: process,

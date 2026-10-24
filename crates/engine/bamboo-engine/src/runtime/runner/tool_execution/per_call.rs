@@ -12,7 +12,7 @@ use bamboo_agent_core::tools::{
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_domain::{
     AgentHookPoint, AgentRuntimeState, EffectiveCallableSet, HookPayload, HookResult,
-    HookToolOutcome,
+    HookToolOutcome, SessionCallerReference,
 };
 use bamboo_metrics::MetricsCollector;
 
@@ -93,6 +93,8 @@ pub(super) struct ToolExecutionOnlyContext<'a> {
     pub root_session_id: &'a str,
     /// Original executing lifetime captured before this call is handed off.
     pub executing_supervisor: Option<ExecutingSupervisorObservation>,
+    /// Role-neutral caller captured at the same admission boundary.
+    pub executing_caller: Option<&'a SessionCallerReference>,
     pub round_id: &'a str,
     pub round: usize,
     pub tools: &'a Arc<dyn ToolExecutor>,
@@ -167,7 +169,7 @@ pub(super) fn resolve_callable_for_session(
     callable: &EffectiveCallableSet,
     reference: &str,
 ) -> Option<String> {
-    if version == Some(2) && bamboo_domain::independent_root_spawn_reference(reference) {
+    if bamboo_domain::independent_root_spawn_reference(reference) {
         bamboo_domain::resolve_session_tool_reference(version, reference, |name| {
             callable.contains_execution_name(name)
         })
@@ -341,7 +343,11 @@ async fn execute_tool_call_only_with_execution_name(
 ) -> Result<ToolExecutionOutcome, AgentError> {
     let noninteractive = crate::runtime::loop_control::suspension::active(ctx.config);
     let control = ctx.config.loop_control.as_ref();
-    let dispatch = execute_tool_call_only_with_execution_name_inner(execution_name, ctx);
+    let caller = ctx.executing_caller.cloned().map(Arc::new);
+    let dispatch = bamboo_agent_core::tools::with_executing_session_caller(
+        caller,
+        execute_tool_call_only_with_execution_name_inner(execution_name, ctx),
+    );
     if let Some(control) = control {
         let (outcome, observation) =
             bamboo_agent_core::tools::observe_tool_suspension(noninteractive, dispatch).await;
@@ -369,6 +375,12 @@ async fn execute_tool_call_only_with_execution_name_inner(
     execution_name: &str,
     mut ctx: ToolExecutionOnlyContext<'_>,
 ) -> Result<ToolExecutionOutcome, AgentError> {
+    let execution = bamboo_agent_core::tools::RetainedToolExecution::capture(
+        ctx.tool_call,
+        execution_name,
+        ctx.tools.as_ref(),
+    )
+    .map_err(|error| AgentError::Tool(error.to_string()))?;
     // Recheck the resolved exact executor identity even if the provider cites a
     // stale schema or the round's EffectiveCallableSet predates live tightening.
     // Reject before ToolStart, hooks, replay handling, and executor entry.
@@ -379,10 +391,22 @@ async fn execute_tool_call_only_with_execution_name_inner(
     // not turn its spelling into a compatibility alias for another owner.
     let reference = ctx.tool_call.function.name.trim();
     let exact_owner_shadowed = reference != execution_name && ctx.tools.owns_exact_tool(reference);
-    let independent_root_denied = ctx.session_behavior_version == Some(2)
-        && execution_name == "spawn_session"
-        && !executing_supervisor;
-    if independent_root_denied
+    let session_kind =
+        bamboo_agent_core::tools::FrameworkSessionToolKind::from_execution_name(execution_name);
+    let executing_child = ctx.executing_caller.as_ref().map_or_else(
+        // Missing root IDs are valid in retained ordinary Root history. They
+        // do not turn an explicit Standard tool embedding into a Child port.
+        || !ctx.root_session_id.is_empty() && ctx.root_session_id != ctx.session_id,
+        |caller| caller.kind == bamboo_domain::SessionKind::Child,
+    );
+    let framework_unavailable = (execution_name == "spawn_session"
+        || ((ctx.root_orchestration_only || executing_supervisor || executing_child)
+            && session_kind.is_some()))
+        && !ctx
+            .tools
+            .framework_session_tool_for_exact(execution_name)
+            .is_some_and(|proof| Some(proof.kind()) == session_kind && proof.is_current());
+    if framework_unavailable
         || ((ctx.root_orchestration_only || executing_supervisor)
             && (exact_owner_shadowed
                 || !bamboo_domain::orchestration_only_allows_execution_name_for_supervisor(
@@ -405,7 +429,14 @@ async fn execute_tool_call_only_with_execution_name_inner(
             portable_tool: None,
             post_tool_hook_eligible: false,
             managed_running_violation: false,
-            result: Err(if executing_supervisor {
+            result: Err(if framework_unavailable {
+                let code = if execution_name == "spawn_session" {
+                    "session_root_port_unavailable"
+                } else {
+                    "session_framework_port_unavailable"
+                };
+                format!("{code}: {execution_name} requires an installed concrete Host instance; names/contracts grant no capability and no operation was started")
+            } else if executing_supervisor {
                 format!("supervisor_delegation_required: Tool '{}' is outside Supervisor orchestration authority. Delegate execution to an authorized worker. If unavailable or denied, report the actual recoverable blocker; do not self-execute or retry unchanged delegation indefinitely.", ctx.tool_call.function.name)
             } else {
                 format!(
@@ -792,8 +823,18 @@ async fn execute_tool_call_only_with_execution_name_inner(
 
     Ok(ToolExecutionOutcome {
         output_cap: Some(output_cap),
-        permission_replay_origin: ctx.executing_supervisor.map(|observation| {
-            PermissionReplayOrigin::new(observation, ctx.session_id, ctx.tool_call, execution_name)
+        permission_replay_origin: (ctx.executing_caller.is_some()
+            || ctx.executing_supervisor.is_some())
+        .then(|| {
+            PermissionReplayOrigin::new(
+                ctx.executing_caller.cloned(),
+                ctx.executing_supervisor,
+                ctx.session_id,
+                ctx.tool_call,
+                execution_name,
+                execution.execution_contract(),
+                execution.contract_known(),
+            )
         }),
         result: result.map_err(|error| error.to_string()),
         needs_human,
@@ -1168,7 +1209,10 @@ async fn apply_tool_execution_outcome_inner(
             &command,
             &ctx.tool_call.id,
             ctx.round,
-            outcome.permission_replay_origin.is_some(),
+            outcome
+                .permission_replay_origin
+                .as_ref()
+                .is_some_and(PermissionReplayOrigin::has_supervisor_observation),
             read_only,
             feedback_cap,
         )
@@ -1712,6 +1756,7 @@ mod task_progress_tests {
                         session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
+                        executing_caller: None,
                         executing_supervisor: None,
                         tool_call: &call,
                         event_tx: &event_tx,
@@ -2134,6 +2179,9 @@ mod hook_tests {
     struct NameRecordingExecutor {
         entered: Mutex<Vec<String>>,
         schemas: Vec<ToolSchema>,
+        root_provenance: Option<bool>,
+        framework: Arc<crate::session_app::approval_replay::framework_fixture::FixtureTools>,
+        framework_proof: bool,
     }
 
     impl NameRecordingExecutor {
@@ -2141,6 +2189,12 @@ mod hook_tests {
             Self {
                 entered: Mutex::new(Vec::new()),
                 schemas: schema_names.iter().copied().map(tool_schema).collect(),
+                root_provenance: Some(true),
+                framework:
+                    crate::session_app::approval_replay::framework_fixture::FixtureTools::new(
+                        schema_names,
+                    ),
+                framework_proof: true,
             }
         }
 
@@ -2164,6 +2218,32 @@ mod hook_tests {
 
         fn list_tools(&self) -> Vec<ToolSchema> {
             self.schemas.clone()
+        }
+        fn exact_tool_owner(&self, name: &str) -> Option<&dyn ToolExecutor> {
+            if name == "spawn_session" && self.root_provenance.is_none() {
+                return None;
+            }
+            self.owns_exact_tool(name)
+                .then_some(self as &dyn ToolExecutor)
+        }
+        fn local_execution_contract(&self, name: &str) -> Option<&'static str> {
+            (name == "spawn_session" && self.root_provenance == Some(true))
+                .then_some(bamboo_agent_core::tools::FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
+        }
+        fn local_tool_instance(
+            &self,
+            name: &str,
+        ) -> Option<Arc<dyn bamboo_agent_core::tools::Tool>> {
+            self.framework.local_tool_instance(name)
+        }
+        fn local_framework_session_tool(
+            &self,
+            name: &str,
+        ) -> Option<bamboo_agent_core::tools::HostFrameworkSessionTool> {
+            (self.framework_proof
+                && (name != "spawn_session" || self.root_provenance == Some(true)))
+            .then(|| self.framework.local_framework_session_tool(name))
+            .flatten()
         }
     }
 
@@ -2521,6 +2601,7 @@ mod hook_tests {
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
+                executing_caller: None,
                 executing_supervisor: None,
                 tool_call: call,
                 event_tx,
@@ -2709,6 +2790,7 @@ mod hook_tests {
                     session_behavior_version: None,
                     vision_support: true,
                     output_cap: cap,
+                    executing_caller: None,
                     executing_supervisor: None,
                     tool_call: &call,
                     event_tx: &event_tx,
@@ -2855,6 +2937,7 @@ mod hook_tests {
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
+                executing_caller: None,
                 executing_supervisor: None,
                 tool_call,
                 event_tx,
@@ -3024,6 +3107,7 @@ mod hook_tests {
                         session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
+                        executing_caller: None,
                         executing_supervisor: observation,
                         tool_call: &call,
                         event_tx: &tx,
@@ -3112,6 +3196,7 @@ mod hook_tests {
                         session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
+                        executing_caller: None,
                         executing_supervisor: observation,
                         tool_call: &call,
                         event_tx: &tx,
@@ -3266,6 +3351,7 @@ mod hook_tests {
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
+                executing_caller: None,
                 executing_supervisor: None,
                 tool_call: &unloaded_call,
                 event_tx: &event_tx,
@@ -3629,6 +3715,7 @@ mod hook_tests {
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
+                executing_caller: None,
                 executing_supervisor: None,
                 tool_call: &tool_call,
                 event_tx: &event_tx,
@@ -3697,6 +3784,7 @@ mod hook_tests {
             session_behavior_version: None,
             vision_support: true,
             output_cap: None,
+            executing_caller: None,
             executing_supervisor: None,
             tool_call: &tool_call,
             event_tx: &event_tx,
@@ -3780,6 +3868,7 @@ mod hook_tests {
             session_behavior_version: None,
             vision_support: true,
             output_cap: None,
+            executing_caller: None,
             executing_supervisor: None,
             tool_call: &tool_call,
             event_tx: &event_tx,
@@ -3839,6 +3928,7 @@ mod hook_tests {
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
+                executing_caller: None,
                 executing_supervisor: None,
                 tool_call: &tool_call,
                 event_tx: &event_tx,
@@ -4399,6 +4489,7 @@ mod hook_tests {
                             session_behavior_version: Some(2),
                             vision_support: true,
                             output_cap: None,
+                            executing_caller: None,
                             executing_supervisor:
                                 ExecutingSupervisorObservation::capture_from_executing_session(
                                     &session,
@@ -4638,6 +4729,7 @@ mod hook_tests {
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: Some(97),
+                executing_caller: None,
                 executing_supervisor: None,
                 tool_call: &tool_call,
                 event_tx: &event_tx,
@@ -4702,6 +4794,7 @@ mod hook_tests {
             session_behavior_version: None,
             vision_support: true,
             output_cap: None,
+            executing_caller: None,
             executing_supervisor: None,
             tool_call: &tool_call,
             event_tx: &event_tx,
@@ -4790,6 +4883,7 @@ mod hook_tests {
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
+                executing_caller: None,
                 executing_supervisor: None,
                 tool_call: call,
                 event_tx: &event_tx,
@@ -4969,7 +5063,46 @@ mod hook_tests {
         }
     }
     #[tokio::test]
-    async fn versioned_spawn_final_gate_matrix_has_no_child_fallback_or_ordinary_root_authority() {
+    async fn fresh_spawn_rejects_opaque_or_uncontracted_owner_before_toolstart() {
+        let callable = effective_callable_set(
+            &["spawn_session", "SubAgent"],
+            CapabilityLoadingMode::LegacyFullCatalog,
+            &[],
+        );
+        for provenance in [None, Some(false), Some(true)] {
+            for ultra in [false, true] {
+                let mut probe = NameRecordingExecutor::new(&["spawn_session", "SubAgent"]);
+                probe.root_provenance = provenance;
+                // Even an exact owner repeating the Root contract string
+                // cannot supply the missing concrete Host instance proof.
+                probe.framework_proof = false;
+                let concrete = Arc::new(probe);
+                let tools: Arc<dyn ToolExecutor> = concrete.clone();
+                let call = probe_call("spawn_session");
+                let (tx, mut rx) = mpsc::channel(64);
+                let result =
+                    execute_without_hooks_with_root_authority(&callable, &tools, &call, &tx, ultra)
+                        .await;
+                assert!(result
+                    .result
+                    .unwrap_err()
+                    .contains("session_root_port_unavailable"));
+                assert!(concrete.entered().is_empty());
+                assert!(std::iter::from_fn(|| rx.try_recv().ok())
+                    .all(|event| !matches!(event, AgentEvent::ToolStart { .. })));
+                let child = probe_call("SubAgent");
+                let result = execute_without_hooks_with_root_authority(
+                    &callable, &tools, &child, &tx, ultra,
+                )
+                .await;
+                assert!(result.result.is_ok());
+                assert_eq!(concrete.entered(), vec!["SubAgent"]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_spawn_dispatch_is_role_neutral_and_never_uses_child_alias() {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
         for version in [None, Some(1), Some(2)] {
             for ultra in [false, true] {
@@ -4992,17 +5125,18 @@ mod hook_tests {
                         session = Session::new_child_of("child", &session, "model", "worker");
                         session.session_version = version;
                     }
-                    let names: &[&str] = if version == Some(2) {
-                        &["spawn_session", "SubAgent"]
-                    } else {
-                        &["SubAgent"]
-                    };
+                    let names: &[&str] = &["spawn_session", "SubAgent"];
                     let callable = effective_callable_set(
                         names,
                         CapabilityLoadingMode::LegacyFullCatalog,
                         &[],
                     );
-                    for name in ["spawn_session", "spawnSession", "default::spawn_session"] {
+                    for name in [
+                        "spawn_session",
+                        "spawnSession",
+                        "default::spawn_session",
+                        "SubAgent",
+                    ] {
                         let concrete = Arc::new(NameRecordingExecutor::new(names));
                         let tools: Arc<dyn ToolExecutor> = concrete.clone();
                         let call = probe_call(name);
@@ -5014,6 +5148,7 @@ mod hook_tests {
                                 session_behavior_version: version,
                                 vision_support: true,
                                 output_cap: None,
+                                executing_caller: None,
                                 executing_supervisor:
                                     ExecutingSupervisorObservation::capture_from_executing_session(
                                         &session,
@@ -5036,17 +5171,17 @@ mod hook_tests {
                         )
                         .await
                         .unwrap();
-                        let allowed = version != Some(2) || identity == "supervisor";
+                        let allowed = true;
                         assert_eq!(
                             outcome.result.is_ok(),
                             allowed,
                             "{version:?}/{ultra}/{identity}/{name}"
                         );
                         assert_eq!(call, original, "history keeps the caller spelling");
-                        let selected = if version == Some(2) {
-                            "spawn_session"
-                        } else {
+                        let selected = if name == "SubAgent" {
                             "SubAgent"
+                        } else {
+                            "spawn_session"
                         };
                         assert_eq!(
                             concrete.entered(),
@@ -5065,6 +5200,59 @@ mod hook_tests {
                     }
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_standard_root_with_empty_root_id_keeps_explicit_nonframework_embedding() {
+        let names = [
+            "session_history",
+            "session_history_current",
+            "session_message",
+        ];
+        let callable =
+            effective_callable_set(&names, CapabilityLoadingMode::LegacyFullCatalog, &[]);
+        for original_caller in [false, true] {
+            let mut session = Session::new("legacy-standard-root", "model");
+            session.session_version = None;
+            session.root_session_id.clear();
+            let caller = bamboo_domain::SessionCallerReference::from(&session);
+            let mut concrete = NameRecordingExecutor::new(&names);
+            concrete.framework_proof = false;
+            let concrete = Arc::new(concrete);
+            let tools: Arc<dyn ToolExecutor> = concrete.clone();
+            for name in names {
+                let call = probe_call(name);
+                let (tx, _rx) = mpsc::channel(64);
+                let outcome = execute_model_requested_tool_call_only(
+                    &callable,
+                    ToolExecutionOnlyContext {
+                        session_behavior_version: None,
+                        vision_support: true,
+                        output_cap: None,
+                        executing_caller: original_caller.then_some(&caller),
+                        executing_supervisor: None,
+                        tool_call: &call,
+                        event_tx: &tx,
+                        metrics_collector: None,
+                        session_id: &session.id,
+                        root_session_id: &session.root_session_id,
+                        root_orchestration_only: false,
+                        round_id: "legacy-empty-root",
+                        round: 0,
+                        tools: &tools,
+                        config: &AgentLoopConfig::default(),
+                        hook_session: None,
+                        hook_runtime_state: None,
+                        session_flags: ToolExecutionSessionFlags::from_session(&session),
+                        available_tool_schemas: &[],
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(outcome.result.is_ok(), "{original_caller}/{name}");
+            }
+            assert_eq!(concrete.entered(), names);
         }
     }
 
@@ -5122,6 +5310,7 @@ mod hook_tests {
                     session_behavior_version: Some(2),
                     vision_support: true,
                     output_cap: None,
+                    executing_caller: None,
                     executing_supervisor:
                         ExecutingSupervisorObservation::capture_from_executing_session(&session),
                     tool_call: &call,

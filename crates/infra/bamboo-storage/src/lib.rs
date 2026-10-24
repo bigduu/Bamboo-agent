@@ -7,6 +7,7 @@
 //! - **merge_save_session**: Merge-aware session save with concurrent edit protection
 
 pub mod context_view;
+mod host_session_scope;
 pub mod jsonl;
 pub mod search_index;
 pub mod session_inbox;

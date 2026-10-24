@@ -5,9 +5,12 @@ pub mod actor_snapshot;
 pub mod admission;
 pub mod authority;
 pub mod budget_types;
+pub mod caller;
 pub mod compatibility;
 pub mod composition;
 pub mod context_block;
+pub mod conversation_generation;
+pub mod conversation_reset;
 pub mod hook_types;
 pub mod host_registry;
 pub mod inbox;
@@ -41,9 +44,12 @@ pub use authority::*;
 pub use budget_types::{
     BudgetStrategy, ProviderPromptUsage, TokenBudget, TokenBudgetUsage, TokenUsageBreakdown,
 };
+pub use caller::*;
 pub use compatibility::*;
 pub use composition::*;
 pub use context_block::*;
+pub use conversation_generation::*;
+pub use conversation_reset::*;
 pub use hook_types::*;
 pub use host_registry::*;
 pub use inbox::*;

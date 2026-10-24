@@ -168,6 +168,7 @@ mod tests {
             .invoke(
                 json!({"action": "unknown"}),
                 ToolCtx {
+                    executing_caller: None,
                     executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-1")),
                     tool_call_id: std::sync::Arc::from("tool_call_unknown"),
@@ -191,6 +192,7 @@ mod tests {
             .invoke(
                 json!({"action": "replace"}),
                 ToolCtx {
+                    executing_caller: None,
                     executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-1")),
                     tool_call_id: std::sync::Arc::from("tool_call_replace"),
@@ -220,6 +222,7 @@ mod tests {
             .invoke(
                 json!({"action": "append", "topic": "backend", "content": "API finalized"}),
                 ToolCtx {
+                    executing_caller: None,
                     executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-1")),
                     tool_call_id: std::sync::Arc::from("tool_call_append"),
@@ -246,6 +249,7 @@ mod tests {
             .invoke(
                 json!({"action": "read", "topic": "backend"}),
                 ToolCtx {
+                    executing_caller: None,
                     executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-1")),
                     tool_call_id: std::sync::Arc::from("tool_call_read"),
@@ -274,6 +278,7 @@ mod tests {
             .invoke(
                 json!({"action": "list_topics"}),
                 ToolCtx {
+                    executing_caller: None,
                     executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-1")),
                     tool_call_id: std::sync::Arc::from("tool_call_list"),
@@ -300,6 +305,7 @@ mod tests {
             .invoke(
                 json!({"action": "clear", "topic": "backend"}),
                 ToolCtx {
+                    executing_caller: None,
                     executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-1")),
                     tool_call_id: std::sync::Arc::from("tool_call_clear"),
@@ -332,6 +338,7 @@ mod tests {
         tool.invoke(
             json!({"action": "replace", "topic": "default", "content": long_content}),
             ToolCtx {
+                executing_caller: None,
                 executing_supervisor: None,
                 session_id: Some(std::sync::Arc::from("session-2")),
                 tool_call_id: std::sync::Arc::from("tool_call_replace_long"),
@@ -352,6 +359,7 @@ mod tests {
             .invoke(
                 json!({"action": "read", "topic": "default"}),
                 ToolCtx {
+                    executing_caller: None,
                     executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-2")),
                     tool_call_id: std::sync::Arc::from("tool_call_read_long"),
@@ -377,6 +385,7 @@ mod tests {
         tool.invoke(
             json!({"action": "replace", "topic": "limit", "content": "x".repeat(crate::tools::session_memory::MAX_SESSION_NOTE_CHARS - 1)}),
             ToolCtx {
+                executing_caller: None,
                 executing_supervisor: None,
                 session_id: Some(std::sync::Arc::from("session-3")),
                 tool_call_id: std::sync::Arc::from("tool_call_replace_limit"),
@@ -397,6 +406,7 @@ mod tests {
             .invoke(
                 json!({"action": "append", "topic": "limit", "content": "y"}),
                 ToolCtx {
+                    executing_caller: None,
                     executing_supervisor: None,
                     session_id: Some(std::sync::Arc::from("session-3")),
                     tool_call_id: std::sync::Arc::from("tool_call_append_limit"),

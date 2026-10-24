@@ -94,9 +94,11 @@ pub mod accumulator;
 pub mod agentic;
 pub mod bash_completion;
 pub mod context;
+pub mod execution_contract;
 pub mod executor;
 pub mod input_guard;
 mod output_cap_observation;
+pub mod pending_operation;
 pub mod registry;
 pub mod result_handler;
 pub mod smart_code_review;
@@ -114,10 +116,20 @@ pub use agentic::{
 };
 pub use bash_completion::{BashCompletionInfo, BashCompletionSink};
 pub use context::{
-    ExecutingSupervisorObservation, ToolExecutionContext, ToolExecutionSessionFlags,
+    with_executing_session_caller, ExecutingSupervisorObservation, ToolExecutionContext,
+    ToolExecutionSessionFlags,
 };
+pub use execution_contract::{
+    retained_tool_execution_for, retained_tool_execution_for_call, retained_tool_owner_lookup,
+    with_retained_tool_execution, RetainedToolExecution, FRAMEWORK_ROOT_SPAWN_CONTRACT_V1,
+};
+mod framework_session;
 pub use executor::{execute_tool_call, execute_tool_call_with_context, ToolError, ToolExecutor};
+pub use framework_session::{
+    FrameworkSessionToolGuard, FrameworkSessionToolKind, HostFrameworkSessionTool,
+};
 pub use output_cap_observation::{observed_tool_output_cap, scope_tool_output_cap};
+pub use pending_operation::{PendingToolOperation, PENDING_TOOL_OPERATION_METADATA_KEY};
 pub use registry::{
     global_registry, normalize_tool_name, RegistryError, SharedTool, Tool, ToolRegistry,
 };

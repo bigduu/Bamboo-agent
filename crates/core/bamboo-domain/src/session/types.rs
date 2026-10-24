@@ -796,6 +796,11 @@ pub struct Session {
     /// Trusted host-managed scope and links; ordinary constructors never inherit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor_management: Option<SupervisorManagementState>,
+    /// Canonical conversation-reset generation and bounded operation receipts.
+    /// Absence is the original zero generation. Only the separate fenced reset
+    /// transaction may advance it; ordinary writers preserve the exact ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_reset: Option<super::ConversationResetState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     /// Exact direct-parent birth captured at creation, never inferred on activation.
@@ -942,6 +947,7 @@ impl Session {
             kind: SessionKind::Root,
             authority_identity: SessionAuthorityIdentity::Ordinary,
             supervisor_management: None,
+            conversation_reset: None,
             parent_session_id: None,
             parent_created_at: None,
             root_session_id: id,
@@ -1039,6 +1045,7 @@ impl Session {
             kind: SessionKind::Child,
             authority_identity: SessionAuthorityIdentity::Ordinary,
             supervisor_management: None,
+            conversation_reset: None,
             parent_session_id: Some(parent_session_id),
             parent_created_at: None,
             root_session_id,

@@ -106,6 +106,9 @@ impl SessionRepository {
                 "Root identity changed before activation",
             ));
         }
+        session
+            .check_conversation_generation(&durable)
+            .map_err(root_actor_binding_error)?;
         let lease_duration = std::time::Duration::from_secs(15);
         let now = chrono::Utc::now();
         let claimed = directory
@@ -125,6 +128,7 @@ impl SessionRepository {
         let owner = bamboo_domain::RootActorRuntimeWrite {
             fence: claimed.fence(),
             created_at: durable.created_at,
+            conversation_generation: session.conversation_generation_observation(),
         };
         let bound = self.bind_root_response_writer(owner.clone())?;
         let live_owner = bound
@@ -1042,7 +1046,16 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 .validate_fence(&owner.fence, chrono::Utc::now())
                 .await
                 .map_err(root_actor_binding_error)?;
-            return self.storage.load_session(session_id).await;
+            let loaded = self.storage.load_session(session_id).await?;
+            let Some(snapshot) = loaded.as_ref() else {
+                return Err(root_actor_binding_error("bound Root no longer exists"));
+            };
+            validate_bound_root_snapshot(owner, snapshot)?;
+            directory
+                .validate_fence(&owner.fence, chrono::Utc::now())
+                .await
+                .map_err(root_actor_binding_error)?;
+            return Ok(loaded);
         }
         self.try_load(session_id).await
     }
@@ -1068,13 +1081,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             let Some(snapshot) = loaded.as_ref() else {
                 return Err(root_actor_binding_error("bound Root no longer exists"));
             };
-            if snapshot.id != owner.fence.actor_id
-                || snapshot.created_at != owner.created_at
-                || snapshot.kind != bamboo_domain::SessionKind::Root
-                || !snapshot.authority_identity.is_ordinary()
-            {
-                return Err(root_actor_binding_error("bound Root identity changed"));
-            }
+            validate_bound_root_snapshot(owner, snapshot)?;
             // A takeover or delete/rebirth during the full durable read cannot
             // release even a previously materialized snapshot to this owner.
             directory
@@ -2914,6 +2921,23 @@ mod tests {
             );
         }
     }
+}
+
+fn validate_bound_root_snapshot(
+    owner: &bamboo_domain::RootActorRuntimeWrite,
+    snapshot: &Session,
+) -> std::io::Result<()> {
+    if snapshot.id != owner.fence.actor_id
+        || snapshot.created_at != owner.created_at
+        || snapshot.kind != bamboo_domain::SessionKind::Root
+        || !snapshot.authority_identity.is_ordinary()
+    {
+        return Err(root_actor_binding_error("bound Root identity changed"));
+    }
+    owner
+        .conversation_generation
+        .check_canonical(snapshot)
+        .map_err(root_actor_binding_error)
 }
 
 fn root_actor_binding_error(reason: impl std::fmt::Display) -> std::io::Error {

@@ -12,16 +12,16 @@ use std::time::Instant;
 use bamboo_agent_core::storage::Storage;
 use bamboo_domain::{
     ActorSession, Session, SessionActivationDisposition, SessionActivationError,
-    SessionActivationPolicy, SessionActivationPort, SessionInboxError, SessionInboxPort,
-    SessionInboxReceipt, SessionMessageBody, SessionMessageContent, SessionMessageDeliveryIntent,
-    SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
-    SupervisorReference,
+    SessionActivationPolicy, SessionActivationPort, SessionCallerReference, SessionInboxError,
+    SessionInboxPort, SessionInboxReceipt, SessionMessageBody, SessionMessageContent,
+    SessionMessageDeliveryIntent, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
+    SessionMessageSource, SupervisorReference,
 };
 
 /// A followup is one bounded peer instruction, not a context export or file transfer.
 pub const MAX_SUPERVISOR_FOLLOWUP_BYTES: usize = 16 * 1024;
 
-pub const MAX_PEER_MESSAGE_BYTES: usize = 16 * 1024;
+pub const MAX_PEER_MESSAGE_BYTES: usize = bamboo_domain::MAX_SESSION_PEER_MESSAGE_BYTES;
 pub const MAX_PEER_TARGETS: usize = 128;
 pub const MAX_PEER_TARGET_RESULT_BYTES: usize = 32 * 1024;
 const MAX_PEER_TARGET_TITLE_BYTES: usize = 256;
@@ -345,6 +345,7 @@ impl SessionMessenger {
             operation_id,
             message,
             None,
+            None,
         )
         .await
         .map(SessionPeerDeliveryReceipt::into_legacy)
@@ -366,8 +367,180 @@ impl SessionMessenger {
             operation_id,
             message,
             Some(intent),
+            None,
         )
         .await
+    }
+
+    /// Canonical compatibility send from the original executing caller. The
+    /// final Inbox retains a never-installed Host namespace plus the existing
+    /// peer lifecycle/Project authority. An installed/revoked scope refuses
+    /// this fallback; use the explicitly scoped sender for that namespace.
+    pub async fn send_peer_observed(
+        &self,
+        caller: &SessionCallerReference,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        intent: Option<SessionMessageDeliveryIntent>,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
+        self.send_peer_delivery(
+            &caller.session_id,
+            target_session_id,
+            operation_id,
+            message,
+            intent,
+            Some(caller),
+        )
+        .await
+    }
+
+    /// One explicitly installed SendPeer grant, including independent Roots.
+    /// No inspect right or public target read is needed to build this bounded
+    /// envelope. The Inbox validates the original caller and token at its final
+    /// retained authority boundary; these binding bytes are observations only.
+    pub async fn send_host_scoped_peer(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &SessionCallerReference,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        intent: SessionMessageDeliveryIntent,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
+        Self::validate_peer_input(operation_id, message)?;
+        Self::validate_peer_session_id(target_session_id)?;
+        let unauthorized = || SessionMessengerError::Unauthorized {
+            source_session_id: caller.session_id.clone(),
+            target: target_session_id.into(),
+        };
+        if !token.binding().caller.identity.matches_caller(caller) {
+            return Err(unauthorized());
+        }
+        let target = &token
+            .binding()
+            .target(target_session_id, bamboo_domain::HostSessionRight::SendPeer)
+            .map_err(|_| unauthorized())?
+            .observation
+            .identity;
+        let identity = bamboo_domain::HostSessionPeerIdentity::for_caller(
+            caller,
+            &target.session_id,
+            target.created_at,
+            operation_id,
+        );
+        let envelope = Self::peer_envelope_for_ids(
+            &caller.session_id,
+            &target.session_id,
+            operation_id,
+            message,
+            identity.message_id,
+            identity.thread_id,
+            None,
+        );
+        let started = Instant::now();
+        let delivery = self
+            .inbox
+            .deliver_host_scoped_peer_message(token, caller, &envelope, intent)
+            .await
+            .map_err(|error| {
+                let error = SessionMessengerError::Inbox(error);
+                self.record_rejection(&error);
+                error
+            })?;
+        self.finish_peer_delivery(envelope, delivery, started, Some(intent))
+            .await
+    }
+
+    /// Admit the first input for one explicitly authorized Root creation. This
+    /// is not the SendPeer port: no target grant or relationship is inferred.
+    /// A known durable receipt survives a later activation failure unchanged.
+    pub async fn send_host_root_first_input(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &SessionCallerReference,
+        operation_id: uuid::Uuid,
+        reserved_root: &Session,
+        message: &str,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
+        let envelope =
+            Self::root_first_input_envelope(caller, operation_id, reserved_root, message)?;
+        let started = Instant::now();
+        let delivery = self
+            .inbox
+            .deliver_host_root_first_input(token, caller, operation_id, reserved_root, &envelope)
+            .await
+            .map_err(|error| {
+                let error = SessionMessengerError::Inbox(error);
+                self.record_rejection(&error);
+                error
+            })?;
+        self.finish_peer_delivery(
+            envelope,
+            delivery,
+            started,
+            Some(SessionMessageDeliveryIntent::TriggerTurn),
+        )
+        .await
+    }
+
+    /// Canonical generic-caller Supervisor creation keeps its old wire but
+    /// uses current pending state, unlike the independent legacy followup API.
+    pub async fn supervisor_root_first_input_observed(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &SupervisorReference,
+        operation_id: uuid::Uuid,
+        reserved_root: &Session,
+        message: &str,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
+        let envelope =
+            Self::root_first_input_envelope(caller, operation_id, reserved_root, message)?;
+        let started = Instant::now();
+        let delivery = self
+            .inbox
+            .deliver_unscoped_supervisor_root_first_input(
+                caller,
+                supervisor,
+                operation_id,
+                reserved_root,
+                &envelope,
+            )
+            .await
+            .map_err(|error| {
+                let error = SessionMessengerError::Inbox(error);
+                self.record_rejection(&error);
+                error
+            })?;
+        self.finish_peer_delivery(
+            envelope,
+            delivery,
+            started,
+            Some(SessionMessageDeliveryIntent::TriggerTurn),
+        )
+        .await
+    }
+
+    fn root_first_input_envelope(
+        caller: &SessionCallerReference,
+        operation_id: uuid::Uuid,
+        reserved_root: &Session,
+        message: &str,
+    ) -> Result<SessionMessageEnvelope, SessionMessengerError> {
+        let operation = operation_id.to_string();
+        Self::validate_peer_input(&operation, message)?;
+        let (id, thread) =
+            bamboo_domain::host_root_first_input_identity(caller, operation_id, reserved_root)
+                .map_err(|error| SessionMessengerError::InvalidEnvelope(error.into()))?;
+        Ok(Self::peer_envelope_for_ids(
+            &caller.session_id,
+            &reserved_root.id,
+            &operation,
+            message,
+            id,
+            thread,
+            None,
+        ))
     }
 
     /// Active-run-only peer input. The Inbox owns exact retry recovery and
@@ -429,9 +602,16 @@ impl SessionMessenger {
         operation_id: &str,
         message: &str,
         intent: Option<SessionMessageDeliveryIntent>,
+        original_caller: Option<&SessionCallerReference>,
     ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         Self::validate_peer_input(operation_id, message)?;
         let (caller, target) = self.peer_pair(caller_session_id, target_session_id).await?;
+        if original_caller.is_some_and(|original| !original.matches_session(&caller)) {
+            return Err(SessionMessengerError::Unauthorized {
+                source_session_id: caller_session_id.into(),
+                target: target_session_id.into(),
+            });
+        }
         let id = Self::peer_message_id(&caller, &target, operation_id);
         let envelope = Self::peer_envelope(
             &caller,
@@ -442,7 +622,7 @@ impl SessionMessenger {
             id.to_string(),
             None,
         );
-        self.send_peer_envelope(envelope, &caller, &target, None, intent)
+        self.send_peer_envelope(envelope, &caller, &target, None, intent, original_caller)
             .await
     }
 
@@ -555,7 +735,7 @@ impl SessionMessenger {
             thread,
             Some(original.id.clone()),
         );
-        self.send_peer_envelope(envelope, &caller, &target, Some(&original), intent)
+        self.send_peer_envelope(envelope, &caller, &target, Some(&original), intent, None)
             .await
     }
 
@@ -650,13 +830,12 @@ impl SessionMessenger {
     }
 
     fn peer_message_id(caller: &Session, target: &Session, operation_id: &str) -> SessionMessageId {
-        SessionMessageId::stable(
-            "session-peer-v1",
-            &serde_json::json!({
-                "source": caller.id, "source_birth": caller.created_at,
-                "target": target.id, "target_birth": target.created_at,
-                "operation_id": operation_id,
-            }),
+        bamboo_domain::session_peer_message_id(
+            &caller.id,
+            caller.created_at,
+            &target.id,
+            target.created_at,
+            operation_id,
         )
     }
 
@@ -670,16 +849,37 @@ impl SessionMessenger {
         thread_id: String,
         in_reply_to: Option<SessionMessageId>,
     ) -> SessionMessageEnvelope {
+        Self::peer_envelope_for_ids(
+            &caller.id,
+            &target.id,
+            operation_id,
+            message,
+            id,
+            Some(thread_id),
+            in_reply_to,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn peer_envelope_for_ids(
+        caller_id: &str,
+        target_id: &str,
+        operation_id: &str,
+        message: &str,
+        id: SessionMessageId,
+        thread_id: Option<String>,
+        in_reply_to: Option<SessionMessageId>,
+    ) -> SessionMessageEnvelope {
         SessionMessageEnvelope {
             id,
             source: SessionMessageSource::Session {
-                session_id: caller.id.clone(),
+                session_id: caller_id.into(),
             },
-            target_session_id: target.id.clone(),
+            target_session_id: target_id.into(),
             kind: SessionMessageKind::PeerMessage,
             body: SessionMessageBody::Content(SessionMessageContent::text(message)),
             created_at: chrono::Utc::now(),
-            thread_id: Some(thread_id),
+            thread_id,
             in_reply_to,
             attempt: None,
             correlation_id: Some(operation_id.into()),
@@ -693,6 +893,7 @@ impl SessionMessenger {
         target: &Session,
         reply_to: Option<&SessionMessageEnvelope>,
         intent: Option<SessionMessageDeliveryIntent>,
+        original_caller: Option<&SessionCallerReference>,
     ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         let started = Instant::now();
         let source = ActorSession::from_session(caller)
@@ -702,21 +903,29 @@ impl SessionMessenger {
         // These are the same births used for the stable message id. The inbox
         // must revalidate them under its retained lifecycle authority; a fresh
         // relationship read before generic delivery would still race rebirth.
-        let result = match intent {
-            Some(intent) => {
-                self.inbox
-                    .deliver_peer_message_with_intent(&envelope, &source, &target, reply_to, intent)
-                    .await
-            }
-            None => {
-                self.inbox
-                    .deliver_peer_message(&envelope, &source, &target, reply_to)
-                    .await
-                    .map(|delivery| bamboo_domain::SessionInboxDeliveryReceipt {
-                        delivery,
-                        // Preserve the historical peer activation contract.
-                        pending: true,
-                    })
+        let result = if let Some(original) = original_caller {
+            self.inbox
+                .deliver_unscoped_peer_message(original, &envelope, &source, &target, intent)
+                .await
+        } else {
+            match intent {
+                Some(intent) => {
+                    self.inbox
+                        .deliver_peer_message_with_intent(
+                            &envelope, &source, &target, reply_to, intent,
+                        )
+                        .await
+                }
+                None => {
+                    self.inbox
+                        .deliver_peer_message(&envelope, &source, &target, reply_to)
+                        .await
+                        .map(|delivery| bamboo_domain::SessionInboxDeliveryReceipt {
+                            delivery,
+                            // Preserve the historical peer activation contract.
+                            pending: true,
+                        })
+                }
             }
         };
         let delivery = match result {
@@ -727,6 +936,17 @@ impl SessionMessenger {
                 return Err(error);
             }
         };
+        self.finish_peer_delivery(envelope, delivery, started, intent)
+            .await
+    }
+
+    async fn finish_peer_delivery(
+        &self,
+        envelope: SessionMessageEnvelope,
+        delivery: bamboo_domain::SessionInboxDeliveryReceipt,
+        started: Instant,
+        intent: Option<SessionMessageDeliveryIntent>,
+    ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         let pending = delivery.pending;
         let admission = self.record_admission(envelope, delivery.delivery, started);
         // Exact explicit retries of ACKed/cancelled/dead deliveries cannot
@@ -932,6 +1152,44 @@ impl SessionMessenger {
         operation_id: &str,
         message: &str,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        self.supervisor_followup_delivery(
+            supervisor,
+            target_session_id,
+            operation_id,
+            message,
+            None,
+        )
+        .await
+    }
+
+    /// Canonical sender fallback only. Its Inbox holds a real never-installed
+    /// namespace guard and the complete original caller through admission.
+    pub async fn supervisor_followup_observed(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        self.supervisor_followup_delivery(
+            supervisor,
+            target_session_id,
+            operation_id,
+            message,
+            Some(caller),
+        )
+        .await
+    }
+
+    async fn supervisor_followup_delivery(
+        &self,
+        supervisor: &SupervisorReference,
+        target_session_id: &str,
+        operation_id: &str,
+        message: &str,
+        original_caller: Option<&SessionCallerReference>,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
         bamboo_domain::validate_supervisor_target_id(target_session_id)
             .map_err(|error| SessionMessengerError::InvalidEnvelope(error.to_string()))?;
         SessionMessageId::parse(operation_id)
@@ -942,13 +1200,10 @@ impl SessionMessenger {
             )));
         }
         let envelope = SessionMessageEnvelope {
-            id: SessionMessageId::stable(
-                "supervisor_followup",
-                &serde_json::json!({
-                    "supervisor": supervisor,
-                    "target_session_id": target_session_id,
-                    "operation_id": operation_id,
-                }),
+            id: bamboo_domain::supervisor_followup_message_id(
+                supervisor,
+                target_session_id,
+                operation_id,
             ),
             source: SessionMessageSource::Session {
                 session_id: supervisor.session_id.clone(),
@@ -963,15 +1218,23 @@ impl SessionMessenger {
             correlation_id: Some(operation_id.to_string()),
         };
         let started = Instant::now();
-        let delivery = self
-            .inbox
-            .deliver_supervisor_followup(supervisor, &envelope)
-            .await
-            .map_err(|error| {
-                let error = SessionMessengerError::Inbox(error);
-                self.record_rejection(&error);
-                error
-            })?;
+        let result = match original_caller {
+            Some(caller) => {
+                self.inbox
+                    .deliver_unscoped_supervisor_followup(caller, supervisor, &envelope)
+                    .await
+            }
+            None => {
+                self.inbox
+                    .deliver_supervisor_followup(supervisor, &envelope)
+                    .await
+            }
+        };
+        let delivery = result.map_err(|error| {
+            let error = SessionMessengerError::Inbox(error);
+            self.record_rejection(&error);
+            error
+        })?;
         let admission = self.record_admission(envelope, delivery, started);
         // Its specific-message RespectSpecificWait intent was published while
         // holding Supervisor authority. This grants no staged sibling prefix.

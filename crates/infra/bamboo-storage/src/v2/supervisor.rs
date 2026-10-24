@@ -156,6 +156,8 @@ struct MainIdentity {
     root_mode_transition_epoch: u64,
     #[serde(default)]
     root_mode_operations: Vec<RootModeOperationReceipt>,
+    #[serde(default)]
+    conversation_reset: Option<bamboo_domain::ConversationResetState>,
 }
 
 impl SessionStoreV2 {
@@ -181,6 +183,8 @@ impl SessionStoreV2 {
         compact_main::validate_full_main(&main_bytes)?;
         let main: Session = serde_json::from_slice(&main_bytes)
             .map_err(|_| invalid("invalid canonical session.json"))?;
+        main.check_conversation_generation(&side)
+            .map_err(|error| invalid(&error.to_string()))?;
         let main_root = if main.root_session_id.is_empty() {
             id
         } else {
@@ -236,6 +240,8 @@ impl SessionStoreV2 {
             serde_json::from_slice(&read_regular(&directory.join(RUNTIME_SIDECAR_FILE)).await?)
                 .map_err(|_| invalid("invalid canonical runtime.json"))?;
         validate_identity(&side)?;
+        side.validate_conversation_state()
+            .map_err(|error| invalid(&error.to_string()))?;
         let side_root = if matches!(side.authority_identity, SessionAuthorityIdentity::Ordinary)
             && side.root_session_id.is_empty()
         {
@@ -285,6 +291,7 @@ impl SessionStoreV2 {
                     && side.root_orchestration_only != main.root_orchestration_only)
                 || side.root_mode_transition_epoch != main.root_mode_transition_epoch
                 || side.root_mode_operations != main.root_mode_operations
+                || side.conversation_reset != main.conversation_reset
             {
                 return Err(invalid("canonical Root identity mismatch"));
             }

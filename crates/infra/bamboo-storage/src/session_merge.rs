@@ -355,6 +355,7 @@ pub(crate) fn reconcile_inherited_child_wait(
 ) -> std::io::Result<()> {
     inherited.validate_session(session)?;
     inherited.validate_session(latest)?;
+    ensure_conversation_generation_is_current(session, latest)?;
     let Some(incoming) = session.agent_runtime_state.as_mut() else {
         return Ok(());
     };
@@ -853,6 +854,7 @@ impl LockedSessionStore {
                     else {
                         return Err(error);
                     };
+                    ensure_conversation_generation_is_current(session, &durable)?;
                     adopt_durable_task_control_plane(session, &durable);
                 }
                 Err(error) => {
@@ -860,6 +862,7 @@ impl LockedSessionStore {
                         if let Some(durable) =
                             self.storage.load_runtime_control_plane(&session.id).await?
                         {
+                            ensure_conversation_generation_is_current(session, &durable)?;
                             adopt_durable_task_control_plane(session, &durable);
                         }
                     }
@@ -888,6 +891,7 @@ impl LockedSessionStore {
                     else {
                         return Err(error);
                     };
+                    ensure_conversation_generation_is_current(session, &durable)?;
                     adopt_durable_task_control_plane(session, &durable);
                 }
                 Err(error) => {
@@ -895,6 +899,7 @@ impl LockedSessionStore {
                         if let Some(durable) =
                             self.storage.load_runtime_control_plane(&session.id).await?
                         {
+                            ensure_conversation_generation_is_current(session, &durable)?;
                             adopt_durable_task_control_plane(session, &durable);
                         }
                     }
@@ -1033,6 +1038,7 @@ impl LockedSessionStore {
         let session = &mut candidate;
         if let Some(latest) = self.storage.load_runtime_control_plane(&session.id).await? {
             ensure_session_execution_compatible(&latest)?;
+            ensure_conversation_generation_is_current(session, &latest)?;
             apply_authoritative_metadata(session, &latest);
             // The control-plane sidecar carries `agent_runtime_state`, so a
             // concurrent mid-run bypass flip is here too — don't revert it. #540.
@@ -1359,6 +1365,7 @@ impl LockedSessionStore {
         let _guard = self.acquire_lock(&session.id).await;
         let mut committed = session.clone();
         if let Some(latest) = self.storage.load_runtime_control_plane(&session.id).await? {
+            ensure_conversation_generation_is_current(&committed, &latest)?;
             adopt_durable_model_context_state(&mut committed, &latest);
         }
         self.save_session_rebasing_task_conflicts(&mut committed)
@@ -1617,6 +1624,8 @@ impl LockedSessionStore {
         let latest = self.storage.load_session(&staged.id).await?;
 
         if let Some(latest) = latest.as_ref() {
+            ensure_conversation_generation_is_current(expected_base, latest)?;
+            ensure_conversation_generation_is_current(staged, latest)?;
             if !retrieval_window_base_matches(expected_base, latest)? {
                 *staged = rebase_retrieval_window_base(expected_base, latest);
                 apply_authoritative_metadata(staged, latest);
@@ -1651,6 +1660,8 @@ impl LockedSessionStore {
         let latest = self.storage.load_session(&staged.id).await?;
 
         if let Some(latest) = latest.as_ref() {
+            ensure_conversation_generation_is_current(expected_base, latest)?;
+            ensure_conversation_generation_is_current(staged, latest)?;
             if !retrieval_window_base_matches(expected_base, latest)? {
                 *staged = rebase_retrieval_window_base(expected_base, latest);
                 apply_authoritative_metadata(staged, latest);
@@ -1687,6 +1698,8 @@ impl LockedSessionStore {
         let latest = self.storage.load_session(&staged.id).await?;
 
         if let Some(latest) = latest.as_ref() {
+            ensure_conversation_generation_is_current(expected_base, latest)?;
+            ensure_conversation_generation_is_current(staged, latest)?;
             if !retrieval_window_base_matches(expected_base, latest)? {
                 *staged = latest.clone();
                 apply_authoritative_metadata(staged, latest);
@@ -1725,6 +1738,8 @@ impl LockedSessionStore {
         let latest = self.storage.load_session(&staged.id).await?;
 
         if let Some(latest) = latest.as_ref() {
+            ensure_conversation_generation_is_current(expected_base, latest)?;
+            ensure_conversation_generation_is_current(staged, latest)?;
             if !retrieval_window_base_matches(expected_base, latest)? {
                 *staged = latest.clone();
                 apply_authoritative_metadata(staged, latest);
@@ -1786,6 +1801,7 @@ impl LockedSessionStore {
         let latest = self.storage.load_session(&session.id).await?;
         if let Some(latest) = latest.as_ref() {
             ensure_session_execution_compatible(latest)?;
+            ensure_conversation_generation_is_current(session, latest)?;
         }
 
         // DIAGNOSTIC: merge_save_runtime overwrites the whole `messages` array
@@ -1885,6 +1901,7 @@ impl LockedSessionStore {
             // A warm worker constructs a fresh in-memory Session for each RunSpec.
             // Preserve the durable Child birth only after the new activation has
             // matched the immutable identity and Project under this write lock.
+            ensure_conversation_generation_is_current(session, &latest)?;
             if session.kind == bamboo_domain::SessionKind::Child {
                 if latest.kind != bamboo_domain::SessionKind::Child
                     || latest.id != session.id
@@ -2097,6 +2114,9 @@ impl LockedSessionStore {
     {
         let cached_candidate = load_cached();
         let durable = self.storage.load_session(session_id).await?;
+        if let (Some(cached), Some(durable)) = (cached_candidate.as_ref(), durable.as_ref()) {
+            ensure_conversation_generation_is_current(cached, durable)?;
+        }
         if let Some(cached) = cached_candidate.as_ref() {
             ensure_session_execution_compatible(cached)?;
         }
@@ -2508,6 +2528,7 @@ async fn merge_authoritative_metadata_into_stale(
     session: &mut Session,
 ) -> std::io::Result<()> {
     if let Some(latest) = storage.load_session(&session.id).await? {
+        ensure_conversation_generation_is_current(session, &latest)?;
         adopt_durable_consumed_clarification(session, &latest);
         apply_authoritative_metadata(session, &latest);
         bamboo_domain::restore_missing_admitted_inbox_messages(session, &latest);
@@ -2550,6 +2571,22 @@ fn adopt_fresher_durable_model_context_state(session: &mut Session, latest: &Ses
     }
 }
 
+/// Refuse before adopting metadata, native context or messages from a different
+/// conversation. Copying the canonical generation into stale history is unsafe.
+fn ensure_conversation_generation_is_current(
+    session: &Session,
+    latest: &Session,
+) -> std::io::Result<()> {
+    session
+        .check_conversation_generation(latest)
+        .map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                bamboo_domain::SessionAuthorityConflict(error.to_string()),
+            )
+        })
+}
+
 /// A provider-bound ledger checkpoint must never silently substitute a newer or
 /// conflicting disk ledger after the request body was prepared. Reject it so
 /// the engine can roll back the in-memory candidate and retry from a fresh
@@ -2558,6 +2595,7 @@ fn ensure_model_context_checkpoint_is_current(
     session: &Session,
     latest: &Session,
 ) -> std::io::Result<()> {
+    ensure_conversation_generation_is_current(session, latest)?;
     let stale_or_conflicting = match (
         session.model_context_state.as_ref(),
         latest.model_context_state.as_ref(),

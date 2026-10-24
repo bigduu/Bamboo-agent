@@ -471,6 +471,8 @@ mod tests {
                 lease_epoch: 1,
             },
             created_at: Utc::now(),
+            conversation_generation: bamboo_domain::Session::new("output-root", "model")
+                .conversation_generation_observation(),
         }
     }
     fn selected_receipt() -> bamboo_domain::SessionInboxReceipt {

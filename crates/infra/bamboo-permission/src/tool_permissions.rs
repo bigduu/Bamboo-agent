@@ -480,6 +480,34 @@ pub fn framework_root_spawn_permissions(
     )]))
 }
 
+/// Private legacy context used only to narrow the installed canonical sender.
+/// It is never the new invocation's request, approval or one-shot identity.
+pub fn framework_scoped_session_send_restriction(
+    args: &Value,
+) -> Result<(Value, PermissionContext), PermissionError> {
+    if required_string_arg(args, "action")? != "send" {
+        return Err(PermissionError::CheckFailed(
+            "scoped Session send restriction requires send".into(),
+        ));
+    }
+    let target = required_string_arg(args, "target_session_id")?;
+    bamboo_domain::validate_supervisor_target_id(target).map_err(|_| {
+        PermissionError::CheckFailed("scoped Session send requires a valid target".into())
+    })?;
+    let legacy_args = serde_json::json!({
+        "action": "followup",
+        "target_session_id": target,
+        "operation_id": required_string_arg(args, "operation_id")?,
+        "message": required_string_arg(args, "message")?,
+    });
+    let context = check_permissions("session_control", &legacy_args)?
+        .and_then(|mut contexts| (contexts.len() == 1).then(|| contexts.remove(0)))
+        .ok_or_else(|| {
+            PermissionError::CheckFailed("legacy Session followup restriction unavailable".into())
+        })?;
+    Ok((legacy_args, context))
+}
+
 pub fn check_permissions(
     tool_name: &str,
     args: &Value,

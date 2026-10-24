@@ -1,0 +1,52 @@
+{
+  "kind": "illustrative_wire_fixture_not_runtime_evidence",
+  "base": "d694346aa42a688f204bb8e9fd50e573790361a2",
+  "list": {
+    "request": {"action": "list", "limit": 1, "query": "project-a"},
+    "response": {
+      "caller_session_id": "fixture-supervisor",
+      "scope_revision": 3,
+      "sessions": [{
+        "session_id": "worker-a",
+        "project_id": "project-a",
+        "created_at": "2026-10-22T00:00:00Z",
+        "metadata_version": 0,
+        "link_revision": 2
+      }],
+      "next_cursor": "opaque-runtime-cursor-use-same-query-and-limit"
+    }
+  },
+  "inspect": {
+    "request": {"action": "inspect", "session_id": "worker-a", "max_chars": 8},
+    "response": {
+      "session_id": "worker-a",
+      "project_id": "project-a",
+      "created_at": "2026-10-22T00:00:00Z",
+      "source_updated_at": "2026-10-22T00:01:00Z",
+      "observed_at": "2026-10-22T00:02:00Z",
+      "metadata_version": 0,
+      "scope_revision": 3,
+      "title": "Fixture worker",
+      "last_persisted_status": "completed",
+      "has_pending_question": true,
+      "task_counts": {"pending": 1, "in_progress": 0, "completed": 1, "blocked": 0},
+      "latest_visible_assistant_excerpt": {"message_id": "fixture-visible-answer", "content": "结果🎋", "truncated": true},
+      "status_is_live": false,
+      "input_specific": false,
+      "completion_verified": false
+    }
+  },
+  "error_prefixes": [
+    "session_discovery_invalid_request",
+    "session_discovery_authority_required",
+    "session_discovery_authority_unavailable",
+    "session_discovery_cursor_stale"
+  ],
+  "blocked_requests": [
+    {"action": "list", "limit": 0},
+    {"action": "list", "limit": 21},
+    {"action": "list", "offset": 0},
+    {"action": "inspect", "session_id": "../escape"},
+    {"action": "inspect", "session_id": "worker-a", "max_chars": 8001}
+  ]
+}

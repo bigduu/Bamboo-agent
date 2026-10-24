@@ -80,6 +80,8 @@ async fn initial_release_batch_waits_for_every_owned_host_receipt() {
                     .checkpoint_actor_input(bamboo_storage::ActorInputCheckpoint {
                         fence: actor.fence(),
                         expected_created_at: child.created_at,
+                        expected_conversation_generation: child
+                            .conversation_generation_observation(),
                         claim: claim.clone(),
                         expected_messages: child.messages.clone(),
                         expected_provider_transcript: child.provider_transcript.clone(),

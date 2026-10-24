@@ -429,6 +429,7 @@ fn copy_input_request_value(value: &serde_json::Value) -> serde_json::Value {
 const PENDING_INJECTED_MESSAGES_KEY: &str = "pending_injected_messages";
 
 fn adopt_root_tool_authority(session: &mut Session, latest: &Session) -> Result<(), AgentError> {
+    check_conversation_readback(session, Some(latest))?;
     session
         .adopt_root_tool_authority_from(latest)
         .map_err(|error| {
@@ -436,6 +437,29 @@ fn adopt_root_tool_authority(session: &mut Session, latest: &Session) -> Result<
                 "authoritative Root tool authority refresh failed closed: {error}"
             ))
         })
+}
+
+/// Validate the original operation before adopting any canonical fields. A
+/// nonzero conversation requires an available canonical read; absence remains
+/// compatible only with an original zero-generation in-memory Session.
+pub(crate) fn check_conversation_readback(
+    original: &Session,
+    canonical: Option<&Session>,
+) -> Result<(), AgentError> {
+    let conflict =
+        |reason: String| AgentError::Tool(format!("session_conversation_changed: {reason}"));
+    original
+        .validate_conversation_state()
+        .map_err(|error| conflict(error.to_string()))?;
+    match canonical {
+        Some(canonical) => original
+            .check_conversation_generation(canonical)
+            .map_err(|error| conflict(error.to_string())),
+        None if original.conversation_reset.is_some() => Err(conflict(
+            "canonical conversation unavailable; reload required".into(),
+        )),
+        None => Ok(()),
+    }
 }
 
 fn ordinary_root_uses_tool_authority_proof(session: &Session) -> bool {
@@ -466,6 +490,7 @@ pub async fn ensure_initial_root_tool_authority(
                 "initial Root tool authority read failed closed: {error}"
             ))
         })?;
+    check_conversation_readback(session, latest.as_ref())?;
     if latest.is_none() {
         storage.save_session(session).await.map_err(|error| {
             AgentError::Tool(format!(
@@ -621,7 +646,7 @@ pub async fn refresh_tool_boundary_authorities(
     storage: Option<&Arc<dyn bamboo_agent_core::storage::Storage>>,
 ) -> Result<(), AgentError> {
     let Some(storage) = storage else {
-        return Ok(());
+        return check_conversation_readback(session, None);
     };
     let latest = storage
         .load_runtime_control_plane(&session.id)
@@ -637,6 +662,7 @@ pub async fn refresh_tool_boundary_authorities(
                     .to_string(),
             )
         })?;
+    check_conversation_readback(session, Some(&latest))?;
     let disk_mode = latest
         .agent_runtime_state
         .as_ref()
@@ -884,6 +910,10 @@ pub async fn migrate_legacy_pending_only(
             return LegacyPendingMigration::default();
         }
     };
+    if let Err(error) = check_conversation_readback(session, Some(&latest)) {
+        tracing::warn!(session_id = %session.id, %error, "legacy migration refused another conversation");
+        return LegacyPendingMigration::default();
+    }
     let Some(messages) = latest.pending_injected_messages() else {
         return LegacyPendingMigration::default();
     };
@@ -997,6 +1027,11 @@ async fn admit_session_inbox(
                     break;
                 }
             };
+            if let Err(error) = check_conversation_readback(session, Some(&durable)) {
+                tracing::warn!(session_id = %session.id, %error, "permanent receipt belongs to another conversation; leaving claim recoverable");
+                admission.admission_error = Some(error.to_string());
+                break;
+            }
             let Some(message) = durable
                 .messages
                 .iter()
@@ -1241,6 +1276,12 @@ async fn refresh_turn_boundary_inner(
         },
         None => None,
     };
+    if let Err(error) = check_conversation_readback(session, latest.as_ref()) {
+        return TurnBoundaryRefresh {
+            admission_error: Some(error.to_string()),
+            ..Default::default()
+        };
+    }
 
     // A disk copy with no runtime state carries no authoritative permission
     // mode — report `None` (unknown) so the caller leaves the live posture
@@ -3192,6 +3233,129 @@ mod tests {
         assert_eq!(refresh.merged, 0);
         assert_eq!(ack_count.load(Ordering::SeqCst), 0);
         assert_eq!(real_inbox.inspect(&running.id).await.unwrap().claimed, 1);
+    }
+
+    fn next_conversation(source: &Session) -> Session {
+        let mut current = source.clone();
+        current.conversation_reset = Some(bamboo_domain::ConversationResetState {
+            schema_version: 1,
+            conversation_revision: 1,
+            receipts: vec![bamboo_domain::ConversationResetReceipt {
+                operation_id: format!("0:{}", uuid::Uuid::new_v4()),
+                birth_token: source.root_mode_birth_token(),
+                expected_snapshot_sha256: "a".repeat(64),
+                previous_revision: 0,
+                conversation_revision: 1,
+                retained_system_messages: 0,
+                reset_at: source.updated_at,
+            }],
+        });
+        current
+    }
+
+    struct ConversationReadPersistence {
+        current: Session,
+        writes: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for ConversationReadPersistence {
+        async fn save_runtime_session(&self, _: &mut Session) -> std::io::Result<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("unexpected write"))
+        }
+        async fn load_runtime_session(&self, _: &str) -> std::io::Result<Option<Session>> {
+            Ok(Some(self.current.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_receipt_from_another_conversation_cannot_adopt_history_or_ack() {
+        let (_temp, store, _locked, real_inbox, mut running) =
+            durable_inbox_fixture("permanent-conversation").await;
+        let envelope =
+            SessionMessageEnvelope::user_input(&running.id, "different conversation input");
+        deliver_interrupt_eligible(&real_inbox, &envelope).await;
+        let mut current = next_conversation(&running);
+        current.add_message(envelope.to_provider_message().unwrap());
+        let read = Arc::new(ConversationReadPersistence {
+            current,
+            writes: AtomicUsize::new(0),
+        });
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = read.clone();
+        let ack_count = Arc::new(AtomicUsize::new(0));
+        let inbox: Arc<dyn SessionInboxPort> = Arc::new(ForcedPermanentReceiptInbox {
+            inner: real_inbox.clone(),
+            ack_count: ack_count.clone(),
+        });
+        let before = serde_json::to_value(&running).unwrap();
+        let storage: Arc<dyn Storage> = store.clone();
+        let refresh = refresh_turn_boundary_with_inbox(
+            &mut running,
+            Some(&storage),
+            Some(&persistence),
+            Some(&inbox),
+        )
+        .await;
+        assert_eq!(refresh.merged, 0);
+        assert!(refresh.committed_messages.is_empty());
+        assert!(refresh
+            .admission_error
+            .unwrap()
+            .contains("session_conversation_changed:"));
+        assert_eq!(ack_count.load(Ordering::SeqCst), 0);
+        assert_eq!(real_inbox.inspect(&running.id).await.unwrap().claimed, 1);
+        assert_eq!(read.writes.load(Ordering::SeqCst), 0);
+        assert_eq!(serde_json::to_value(&running).unwrap(), before);
+        assert_eq!(
+            serde_json::to_value(store.load_session(&running.id).await.unwrap().unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_refresh_cannot_adopt_authority_queue_or_inputs_from_another_conversation() {
+        let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+        let mut original = Session::new("refresh-conversation", "model");
+        original.add_message(Message::user("original history"));
+        let mut current = next_conversation(&original);
+        current.metadata.insert(
+            "pending_injected_messages".into(),
+            r#"[{"content":"new conversation queue"}]"#.into(),
+        );
+        storage.save_session(&current).await.unwrap();
+        let before = serde_json::to_value(&original).unwrap();
+        let mut runtime = AgentRuntimeState::new("original-operation");
+        let before_runtime = serde_json::to_value(&runtime).unwrap();
+        assert!(
+            refresh_tool_boundary_authorities(&mut original, &mut runtime, Some(&storage))
+                .await
+                .is_err()
+        );
+        assert!(
+            refresh_round_root_tool_authority(&mut original, Some(&storage))
+                .await
+                .is_err()
+        );
+        assert!(
+            ensure_initial_root_tool_authority(&mut original, Some(&storage))
+                .await
+                .is_err()
+        );
+        let refresh =
+            refresh_turn_boundary_with_inbox(&mut original, Some(&storage), None, None).await;
+        assert!(refresh
+            .admission_error
+            .unwrap()
+            .contains("session_conversation_changed:"));
+        assert_eq!(refresh.merged, 0);
+        assert!(refresh.disk_permission_mode.is_none());
+        assert_eq!(serde_json::to_value(&original).unwrap(), before);
+        assert_eq!(serde_json::to_value(&runtime).unwrap(), before_runtime);
+        assert_eq!(
+            serde_json::to_value(storage.load_session(&original.id).await.unwrap().unwrap())
+                .unwrap(),
+            serde_json::to_value(&current).unwrap()
+        );
     }
 
     #[tokio::test]
