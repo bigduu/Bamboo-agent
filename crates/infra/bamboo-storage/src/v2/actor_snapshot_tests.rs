@@ -1610,7 +1610,9 @@ async fn compact_main_malformed_unsupported_missing_and_tight_caps_fail_without_
         .windows(b"\"version\":1".len())
         .position(|w| w == b"\"version\":1")
         .unwrap();
-    unsupported[version + b"\"version\":".len()] = b'3';
+    unsupported[version + b"\"version\":".len()] = b'4';
+    let mut mismatched_v3 = raw.clone();
+    mismatched_v3[..compact_main::PREFIX_V3.len()].copy_from_slice(compact_main::PREFIX_V3);
     for (bytes, error) in [
         (bad_digit, Error::InconsistentAuthority),
         (huge, Error::BudgetExceeded),
@@ -1640,6 +1642,7 @@ async fn compact_main_malformed_unsupported_missing_and_tight_caps_fail_without_
             Error::InconsistentAuthority,
         ),
         (unsupported, Error::UnsupportedAuthority),
+        (mismatched_v3, Error::InconsistentAuthority),
         (b"{}".to_vec(), Error::UnsupportedAuthority),
         (
             serde_json::to_vec(&f.root).unwrap(),

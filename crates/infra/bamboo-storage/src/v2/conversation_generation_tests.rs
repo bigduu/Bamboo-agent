@@ -650,6 +650,32 @@ async fn retained_actor_projection_keeps_the_nonzero_ledger_in_its_checked_pair(
         "nonzero sidecar projection was silently erased: {result:?}"
     );
     assert_eq!(fixture.files().await, before);
+    // Recognizing v3 must not accept the same reset ledger under a historical
+    // frame version. Both Unix and Windows readers use this retained path.
+    let main_path = retained
+        .sessions_root_dir()
+        .join(&fixture.canonical.id)
+        .join("session.json");
+    let mut downgraded = before[0].as_ref().unwrap().clone();
+    downgraded[..compact_main::PREFIX_V2.len()].copy_from_slice(compact_main::PREFIX_V2);
+    fs::write(&main_path, downgraded).await.unwrap();
+    let damaged = fixture.files().await;
+    assert_eq!(
+        retained
+            .actor_subtree_snapshot(
+                bamboo_domain::ActorSnapshotPrincipal::host_owner(),
+                &fixture.canonical.id,
+                &fixture.canonical.id,
+                bamboo_domain::ActorSnapshotLimits::default(),
+            )
+            .await
+            .unwrap_err(),
+        bamboo_domain::ActorSnapshotError::InconsistentAuthority
+    );
+    assert_eq!(fixture.files().await, damaged);
+    fs::write(&main_path, before[0].as_ref().unwrap())
+        .await
+        .unwrap();
     retained.flush_search_index().await;
     drop(retained);
     fixture.finish().await;
