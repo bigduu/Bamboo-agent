@@ -16,10 +16,11 @@ const FULL = ['Validation Source', 'Test', 'E2E Tests', 'Lint',
 const PLATFORMS = ['Build (ubuntu-latest)', 'Build (macos-latest)', 'Build (windows-latest)']
 
 async function verify(t, bootstrap, producer = 'v1', mode = 'publication', options = {}) {
-  assert.match(producer, /^v[12345]$/)
+  assert.match(producer, /^v(?:[12345]|4-main-3488)$/)
   assert.ok(['publication', 'main'].includes(mode))
   const current = producer === 'v5', grouped = producer === 'v3'
-  const crates = producer === 'v4' || current, light = grouped || crates
+  const actualMain = producer === 'v4-main-3488'
+  const crates = producer === 'v4' || actualMain || current, light = grouped || crates
   const platformLabel = current ? 'Platform Tests' : 'Build'
   const platforms = PLATFORMS.map(name => name.replace('Build', platformLabel))
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-main-authority-'))
@@ -35,7 +36,7 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
     : path.join(__dirname, `fixtures/main-authority-ci-${producer}.yml`))
   const helper = fs.readFileSync('scripts/main-release-admission.py')
   const helperDigest = createHash('sha256').update(helper).digest('hex')
-  const producerHelper = grouped || producer === 'v4'
+  const producerHelper = grouped || (crates && !current)
     ? fs.readFileSync(path.join(__dirname, `fixtures/main-authority-admission-${producer}.py`)) : helper
   const producerHelperDigest = createHash('sha256').update(producerHelper).digest('hex')
   const cratePackages = crates ? [...definition.toString().split('  test-crates:\n')[1]
@@ -468,6 +469,29 @@ with patch('subprocess.check_output', output):
     negatives.push(['changed controller helper bytes', x => {
       x.routes[`contents/scripts/main-release-admission.py?ref=${mode === 'main' ? source : controller}`].content = Buffer.from('raise Exception("foreign controller")\n').toString('base64')
     }])
+    if (crates) {
+      const alternate = fs.readFileSync(path.join(__dirname,
+        `fixtures/main-authority-admission-${actualMain ? 'v4' : 'v4-main-3488'}.py`))
+      const alternateDigest = createHash('sha256').update(alternate).digest('hex')
+      if (!current) {
+        negatives.push(['approved sibling pin cannot authenticate unchanged verifier bytes', x =>
+          changeDefinition(x, text => text.replace(producerHelperDigest, alternateDigest))])
+        negatives.push(['approved pin cannot authenticate sibling verifier bytes', x => {
+          x.routes[`contents/scripts/main-release-admission.py?ref=${head}`].content = alternate.toString('base64')
+        }])
+      }
+      const foreignHelpers = current ? [alternate,
+        fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v4.py'))] : [helper]
+      for (const body of foreignHelpers) negatives.push(['verifier digest cannot cross its authenticated workflow family: ' +
+        createHash('sha256').update(body).digest('hex'), x => {
+        const digest = createHash('sha256').update(body).digest('hex')
+        changeDefinition(x, text => text.replace(producerHelperDigest, digest))
+        x.routes[`contents/scripts/main-release-admission.py?ref=${head}`].content = body.toString('base64')
+      }])
+      if (current) negatives.push(['unpublished prior current pin is not a historical producer', x =>
+        changeDefinition(x, text => text.replace(producerHelperDigest,
+          'cf8c4f01856f32da8fd5f3d824cbe367a458b8e38d4feac85107b84ab6f864ef'))])
+    }
     if (mode === 'publication') {
       negatives.push(['light main admission cannot hide a full test failure', x => {
         x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs.find(job => job.name === 'Lint').conclusion = 'failure'
