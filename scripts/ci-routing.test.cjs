@@ -31,13 +31,15 @@ function assertRouting(source) {
   assert.doesNotMatch(quick, /cargo (build|test|check|clippy)|continue-on-error|--test-skip/);
   const full = job(source, "test");
   assert.match(full, /^    name: Test$/m);
-  assert.match(full, /^    needs: \[validation-source, main-release-admission\]$/m);
+  assert.match(full, /^    needs: \[validation-source, main-release-admission, test-build, test-blocks, test-blocks-2, test-doctests, test-ssh-build, test-ssh\]$/m);
   assert.match(full, /^    if: always\(\) && !cancelled\(\)$/m);
   assert.match(full, /- name: Require validation admission\n        env:\n          SOURCE_RESULT: \$\{\{ needs.validation-source.result \}\}\n          FULL_VALIDATION: \$\{\{ needs.validation-source.outputs.full \}\}/);
   assert.match(full, /test "\$SOURCE_RESULT" = success/);
   assert.match(full, /\*\) exit 1 ;;/);
-  for (const command of ["cargo build --locked", "cargo test --locked --no-run", "cargo test --locked --no-fail-fast"]) assert.ok(full.includes(`        run: ${command}\n`));
-  for (const id of ["msrv", "tls-fixture-test", "tool-event-recorder-e2e", "e2e-test", "lint", "build", "docs", "security", "deny"]) {
+  assert.ok(full.includes("        run: cargo build --locked\n"));
+  assert.match(full, /command: summary/);
+  assert.doesNotMatch(full, /run: cargo test/);
+  for (const id of ["msrv", "tls-fixture-test", "tool-event-recorder-e2e", "lint", "build", "docs", "security", "deny"]) {
     const block = job(source, id);
     assert.match(block, /^    needs: validation-source$/m);
     assert.ok(block.includes("needs.validation-source.outputs.full == 'true'"));
@@ -59,7 +61,7 @@ test("required Test compiles dev, validates snapshots fully and authenticates ma
     ["if: always() && !cancelled()", "if: needs.validation-source.outputs.full == 'true'"],
     ['test "$SOURCE_RESULT" = success', 'true # ignored source result'],
     ["if: needs.validation-source.outputs.full == 'true'", "if: true"],
-    ["        run: cargo test --locked --no-fail-fast\n", "        continue-on-error: true\n        run: cargo test --locked --no-fail-fast\n"],
+    ["        run: cargo build --locked\n", "        continue-on-error: true\n        run: cargo build --locked\n"],
   ]) assert.throws(() => assertRouting(ci.replace(from, to)), `reject ${to}`);
 });
 
@@ -138,7 +140,7 @@ function assertMainAdmission(source) {
   const [, admissionStep, ...sourceSteps] = full.split(/(?=^      - )/m);
   assert.match(admissionStep, /name: Require validation admission/);
   for (const step of sourceSteps) {
-    assert.match(step, /^        if: (?:needs.validation-source.outputs.full == 'true'|(?:always\(\) && |failure\(\) && )?github.event_name != 'push')$/m,
+    assert.match(step, /^        if: (?:needs.validation-source.outputs.full == 'true'|(?:always\(\) && |failure\(\) && )?github.event_name != 'push'|github.event_name == 'pull_request' && github.base_ref == 'dev')$/m,
       "main must perform admission only, without checkout, compilation or duplicate tests");
   }
 }
@@ -198,15 +200,15 @@ function assertSharedBuild(source) {
   const [settings, ...steps] = build.split(/(?=^      - )/m);
   assert.match(settings, /^    name: Test$/m);
   assert.match(settings, /^    if: always\(\) && !cancelled\(\)$/m);
-  assert.match(settings, /^    needs: \[validation-source, main-release-admission\]$/m);
+  assert.match(settings, /^    needs: \[validation-source, main-release-admission, test-build, test-blocks, test-blocks-2, test-doctests, test-ssh-build, test-ssh\]$/m);
   assert.ok(settings.includes("timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"));
   assert.doesNotMatch(settings, /^    continue-on-error:/m);
   const cargo = steps.filter((step) => step.startsWith("      - name: Build locked Rust workspace\n"));
   assert.equal(cargo.length, 1);
-  assert.equal(cargo[0].trimEnd(), "      - name: Build locked Rust workspace\n        if: github.event_name != 'push'\n        run: cargo build --locked");
+  assert.equal(cargo[0].trimEnd(), "      - name: Build locked Rust workspace\n        if: github.event_name == 'pull_request' && github.base_ref == 'dev'\n        run: cargo build --locked");
   assert.doesNotMatch(build, /continue-on-error:|\|\| true|\|\| exit 0/);
   assert.doesNotMatch(build, /^          ref:/m, "retain the actual event merge source");
-  for (const name of ["Test CI workflow policy", "Check formatting", "Compile locked Rust test targets", "Test locked Rust workspace"]) {
+  for (const name of ["Test CI workflow policy", "Check formatting", "Require every default block and doctest result"]) {
     const step = steps.find((item) => item.startsWith(`      - name: ${name}\n`));
     assert.ok(step);
     assert.match(step, /^        if: needs.validation-source.outputs.full == 'true'$/m, `${name} must not become a dev merge gate`);
@@ -225,11 +227,10 @@ test("one required Test honestly compiles dev without imposing auxiliary checks 
     ["run: cargo build --locked", "run: cargo build --locked || true"],
     ["run: cargo build --locked", "continue-on-error: true\n        run: cargo build --locked"],
     ["run: cargo build --locked", "if: false\n        run: cargo build --locked"],
-    ["needs: [validation-source, main-release-admission]", "needs: quick-checks"],
+    ["needs: [validation-source, main-release-admission, test-build, test-blocks, test-blocks-2, test-doctests, test-ssh-build, test-ssh]", "needs: quick-checks"],
     ["name: Test CI workflow policy\n        if: needs.validation-source.outputs.full == 'true'", "name: Test CI workflow policy"],
     ["name: Check formatting\n        if: needs.validation-source.outputs.full == 'true'", "name: Check formatting"],
-    ["name: Compile locked Rust test targets\n        if: needs.validation-source.outputs.full == 'true'", "name: Compile locked Rust test targets"],
-    ["name: Test locked Rust workspace\n        if: needs.validation-source.outputs.full == 'true'", "name: Test locked Rust workspace"],
+    ["name: Require every default block and doctest result\n        if: needs.validation-source.outputs.full == 'true'", "name: Require every default block and doctest result"],
   ]) assert.throws(() => assertSharedBuild(ci.replace(from, to)), `reject ${to}`);
 });
 

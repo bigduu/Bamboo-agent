@@ -96,6 +96,10 @@ cargo test -- --nocapture
 cargo test test_bamboo_config_default
 ```
 
+For opt-in local groups, compile once per explicit input profile and retain
+independent group evidence with the [grouped test controller](docs/testing/test-groups.md).
+Its lightweight fixtures need only Node; it changes no CI or release gate.
+
 ### Code Style
 
 We follow standard Rust conventions:
