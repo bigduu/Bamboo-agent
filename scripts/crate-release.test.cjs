@@ -1018,6 +1018,13 @@ test('complete publication keeps canonical main CI authority and authenticates e
   assert.ok(preflight.includes(`LEGACY_CRATE_HELPER = "${sha256(crateHelper)}"`))
   assert.match(crates, /name: Build \(\$\{\{ matrix\.os \}\}\)/)
   assert.match(crates, /run: cargo build --release --verbose/)
+  const actualMain = fs.readFileSync('scripts/tests/fixtures/main-authority-ci-v4-main-3488.yml', 'utf8')
+  const actualMainHelper = fs.readFileSync('scripts/tests/fixtures/main-authority-admission-v4-main-3488.py')
+  assert.equal(sha256(actualMain), '4f38aa09a78e18d384da3b2f6809df54ef50066c72464c2515c6dda3dadd0cd9')
+  assert.equal(sha256(actualMainHelper), '3c34f4125129fbeea199e7a826b29cb523593b513df32cc2479ebe5e8a010e68')
+  assert.equal(actualMain.replace(/ADMISSION_HELPER_SHA256: "[0-9a-f]{64}"/,
+    'ADMISSION_HELPER_SHA256: "<PINNED_ADMISSION_HELPER>"'), crateNormalized)
+  assert.ok(preflight.includes(`LEGACY_MAIN_CRATE_HELPER = "${sha256(actualMainHelper)}"`))
 })
 
 test('trusted manual publication and automatic receipts share a queue while dry runs stay credential-free', () => {
@@ -1403,6 +1410,11 @@ test('historical grouped CI retains independently authenticated complete release
 test('historical native crate CI retains its original Build evidence', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
     workflowPython('Authorize the exact source before checkout'), 'v4')
+})
+
+test('actual main3488 native crate CI retains its original verifier and Build evidence', async (t) => {
+  await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
+    workflowPython('Authorize the exact source before checkout'), 'v4-main-3488')
 })
 
 test('current native crate CI requires independently authenticated Platform Tests', async (t) => {
