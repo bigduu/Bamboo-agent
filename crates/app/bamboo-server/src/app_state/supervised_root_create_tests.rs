@@ -5,10 +5,12 @@ use std::sync::Arc;
 use actix_web::{http::StatusCode, test, web, App};
 
 use bamboo_agent_core::tools::{
-    ExecutingSupervisorObservation, FunctionCall, ToolCall, ToolExecutionContext, ToolOutcome,
+    with_executing_session_caller, ExecutingSupervisorObservation, FunctionCall, ToolCall,
+    ToolError, ToolExecutionContext, ToolOutcome,
 };
 use bamboo_domain::{
-    RootModeOperationAction, RootModeOperationRequest, SessionKind, SupervisorReference,
+    RootModeOperationAction, RootModeOperationRequest, SessionCallerReference, SessionKind,
+    SupervisorReference,
 };
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
@@ -43,7 +45,11 @@ impl Fixture {
         );
         let workspace = home.path().join("workspaces").join("explicit-worker");
         std::fs::create_dir_all(&workspace).unwrap();
-        let workspace = workspace.to_string_lossy().into_owned();
+        let workspace = workspace
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let project = state
             .project_store
             .create_with_project_path("Explicit worker Project", None, &workspace, Vec::new())
@@ -151,6 +157,23 @@ impl Fixture {
     }
 
     async fn invoke_named(&self, name: &str, args: Value) -> Value {
+        let result = self
+            .dispatch_named(name, args, true)
+            .await
+            .expect("the Host must expose the independent Root creation operation");
+        let ToolOutcome::Completed(result) = result else {
+            panic!("expected bounded creation/delivery receipt");
+        };
+        assert!(result.success, "{}", result.result);
+        serde_json::from_str(&result.result).unwrap()
+    }
+
+    async fn dispatch_named(
+        &self,
+        name: &str,
+        args: Value,
+        observe_original_caller: bool,
+    ) -> Result<ToolOutcome, ToolError> {
         let executing = self
             .state
             .storage
@@ -176,15 +199,11 @@ impl Fixture {
         // The model loop binds this immutable registration contract immediately
         // after canonical Root authority admission; mirror that real boundary.
         let tools = tools.for_session(&executing).unwrap_or(tools);
-        let result = tools
-            .execute_with_context_outcome(&call, ctx)
-            .await
-            .expect("the Host must expose the independent Root creation operation");
-        let ToolOutcome::Completed(result) = result else {
-            panic!("expected bounded creation/delivery receipt");
-        };
-        assert!(result.success, "{}", result.result);
-        serde_json::from_str(&result.result).unwrap()
+        // Real dispatch captures this original caller before invoking a tool;
+        // a Supervisor observation alone cannot supply Root caller identity.
+        let caller =
+            observe_original_caller.then(|| Arc::new(SessionCallerReference::from(&executing)));
+        with_executing_session_caller(caller, tools.execute_with_context_outcome(&call, ctx)).await
     }
 }
 
@@ -270,6 +289,21 @@ async fn supervisor_ultra_creates_independent_root_and_retries_once() {
 async fn assert_v2_spawn_uses_root_port_in_both_modes(ultra: bool) {
     let f = Fixture::new(ultra).await;
     let request = f.request(uuid::Uuid::new_v4())["request"].clone();
+    let before = f.state.session_store.list_index_entries().await.len();
+    let Err(ToolError::Execution(reason)) = f
+        .dispatch_named("spawn_session", request.clone(), false)
+        .await
+    else {
+        panic!("Supervisor identity without the original Host caller must be refused");
+    };
+    assert_eq!(
+        reason,
+        "spawn_session requires the original Host-observed caller identity"
+    );
+    assert_eq!(
+        f.state.session_store.list_index_entries().await.len(),
+        before
+    );
     let created = f.invoke_named("spawn_session", request.clone()).await;
     assert_eq!(created["admitted"], true);
     let id = created["target_session_id"].as_str().unwrap();
@@ -296,6 +330,11 @@ async fn assert_v2_spawn_uses_root_port_in_both_modes(ultra: bool) {
     assert_eq!(
         f.state.session_inbox.inspect(id).await.unwrap().generation,
         1
+    );
+    assert_eq!(
+        f.state.session_store.list_index_entries().await.len(),
+        before + 1,
+        "denied caller and exact retries cannot create another Root"
     );
     let canonical = f
         .state
