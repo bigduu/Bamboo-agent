@@ -962,6 +962,12 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
         .last_run_error()
         .is_some_and(|error| error.contains("Native Session permission policy changed")));
     let original_run_id = revoked.agent_runtime_state.as_ref().unwrap().run_id.clone();
+    let original_user_ids: Vec<_> = revoked
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .map(|message| message.id.clone())
+        .collect();
     fixture.admitted_once(INPUT_ID, INPUT).await;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -976,7 +982,7 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
                 .json()
                 .await
                 .unwrap();
-            if summary["is_running"] == false {
+            if summary["session"]["is_running"] == false {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1031,6 +1037,15 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
     assert_ne!(
         parked.agent_runtime_state.as_ref().unwrap().run_id,
         original_run_id
+    );
+    assert_eq!(
+        parked
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>(),
+        original_user_ids
     );
     assert_eq!(
         parked
