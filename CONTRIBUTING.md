@@ -96,6 +96,9 @@ cargo test -- --nocapture
 cargo test test_bamboo_config_default
 ```
 
+Full GitHub CI runs [one Test and E2E job per crate](docs/testing/ci-test-blocks.md).
+Use GitHub's failed-job rerun to retry a crate independently.
+
 For opt-in local groups, compile once per explicit input profile and retain
 independent group evidence with the [grouped test controller](docs/testing/test-groups.md).
 Its lightweight fixtures need only Node; it changes no CI or release gate.

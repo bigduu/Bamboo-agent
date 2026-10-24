@@ -1004,6 +1004,12 @@ test('complete publication keeps canonical main CI authority and authenticates e
     assert.ok(preflight.includes(`PRODUCER_V${version} = "${sha256(producer)}"`))
   }
   assert.match(preflight, /REVIEWED_PRODUCERS = frozenset\(\(PRODUCER_V1, PRODUCER_V2\)\)/)
+  const grouped = fs.readFileSync('scripts/tests/fixtures/main-authority-ci-v3.yml', 'utf8')
+  const normalized = grouped.replace(/ADMISSION_HELPER_SHA256: "[0-9a-f]{64}"/,
+    'ADMISSION_HELPER_SHA256: "<PINNED_ADMISSION_HELPER>"')
+  const groupedHelper = fs.readFileSync('scripts/tests/fixtures/main-authority-admission-v3.py')
+  assert.ok(preflight.includes(`LEGACY_GROUPED_PRODUCER = "${sha256(normalized)}"`))
+  assert.ok(preflight.includes(`LEGACY_GROUPED_HELPER = "${sha256(groupedHelper)}"`))
 })
 
 test('trusted manual publication and automatic receipts share a queue while dry runs stay credential-free', () => {
@@ -1381,14 +1387,19 @@ test('real 274-block E2E inventory is authenticated across both matrices and eve
     })
 })
 
-test('lightweight main CI retains independently authenticated complete release evidence', async (t) => {
+test('historical grouped CI retains independently authenticated complete release evidence', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
     workflowPython('Authorize the exact source before checkout'), 'v3')
 })
 
+test('native crate CI retains independently authenticated complete release evidence', async (t) => {
+  await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
+    workflowPython('Authorize the exact source before checkout'), 'v4')
+})
+
 test('main-push admission executes the same pinned verifier with read-only authority', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
-    workflowPython('Authenticate completed release acceptance before checkout', '.github/workflows/ci.yml'), 'v3', 'main')
+    workflowPython('Authenticate completed release acceptance before checkout', '.github/workflows/ci.yml'), 'v4', 'main')
 })
 
 test('temporary manifest stamping uses exact internal dependency versions and real package versions', (t) => {

@@ -1,6 +1,5 @@
 # Rust
 /target/
-/scripts/ci-artifacts/node_modules/
 **/*.rs.bk
 
 # Vendored crates (host-side `cargo vendor` for offline docker builds; never

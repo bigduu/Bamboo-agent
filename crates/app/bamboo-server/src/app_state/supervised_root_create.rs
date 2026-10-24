@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 #[path = "supervised_root_create_authority.rs"]
 mod authority;
 use authority::CreationAuthority;
+#[cfg(test)]
 pub(super) use authority::HostRootFirstInputPort;
 
 use super::session_create_operations::{

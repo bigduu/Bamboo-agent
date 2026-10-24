@@ -3550,11 +3550,6 @@ mod tests {
             .open(dir.path().join(".config-credential-migration.lock"))
             .unwrap();
         migration_lock.lock().unwrap();
-        std::fs::write(
-            dir.path().join("config-credential-migration.json"),
-            b"manifest-commit-window",
-        )
-        .unwrap();
         store
             .replace_unchecked(
                 reference.clone(),
@@ -3563,6 +3558,39 @@ mod tests {
                 1,
             )
             .unwrap();
+        // Model the pending window after its credential member is installed.
+        // Ordinary member access also validates manifests, so a non-JSON
+        // sentinel cannot represent a transaction that reached this point.
+        let transaction_id = uuid::Uuid::new_v4();
+        let stage_dir = format!(".config-credential-stage-v1-{transaction_id}");
+        let staged_credentials = std::fs::read(store.path()).unwrap();
+        std::fs::create_dir(dir.path().join(&stage_dir)).unwrap();
+        std::fs::write(
+            dir.path().join(&stage_dir).join("credentials.json"),
+            &staged_credentials,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config-credential-migration.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "transaction_id": transaction_id,
+                "stage_dir": stage_dir,
+                "state": "pending",
+                "files": [{
+                    "name": "credentials.json",
+                    "staged_name": "credentials.json",
+                    "sha256": hex::encode(Sha256::digest(&staged_credentials)),
+                    "sensitive": true
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(crate::ensure_provider_mcp_migration_ready(dir.path()).is_err());
+        assert!(!String::from_utf8(staged_credentials)
+            .unwrap()
+            .contains("new-transaction-secret"));
 
         let (started_tx, started_rx) = mpsc::channel();
         let (resolve_result_tx, resolve_result_rx) = mpsc::channel();

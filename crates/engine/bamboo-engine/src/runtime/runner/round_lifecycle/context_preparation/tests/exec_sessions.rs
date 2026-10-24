@@ -422,9 +422,22 @@ async fn exec_handles_survive_hard_history_trimming_without_summary() {
     let completion = Arc::new(CompletionRecorder::default());
     let (handle, args, result) = start_gated_shell(owner, &gate, completion.clone()).await;
     let mut session = shell_history(owner, &args, &result);
-    session.token_budget.as_mut().unwrap().max_context_tokens = 4_000;
     let config = AgentLoopConfig::default();
     let schemas = shell_schemas();
+    let mut required = session.clone();
+    required
+        .messages
+        .retain(|message| message.role == Role::System);
+    let required_input = projected_fixture_input_tokens(&required, &config, &schemas).await;
+    let budget = session.token_budget.as_mut().unwrap();
+    // Fit the current mandatory prompt, schemas and live shell snapshot, with
+    // too little conversation space for the large original tool chain.
+    budget.max_context_tokens = required_input + budget.max_output_tokens + 128;
+    assert!(
+        TiktokenTokenCounter::default().count_messages(&session.messages)
+            > budget.max_request_input_tokens(),
+        "fixture must require hard history trimming"
+    );
     let prepared = prepare_round_context(
         &mut session,
         &config,

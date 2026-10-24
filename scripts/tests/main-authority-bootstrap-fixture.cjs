@@ -16,8 +16,9 @@ const FULL = ['Validation Source', 'Test', 'E2E Tests', 'Lint',
 const PLATFORMS = ['Build (ubuntu-latest)', 'Build (macos-latest)', 'Build (windows-latest)']
 
 async function verify(t, bootstrap, producer = 'v1', mode = 'publication', options = {}) {
-  assert.match(producer, /^v[123]$/)
+  assert.match(producer, /^v[1234]$/)
   assert.ok(['publication', 'main'].includes(mode))
+  const grouped = producer === 'v3', crates = producer === 'v4', light = grouped || crates
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-main-authority-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const git = (...args) => {
@@ -27,10 +28,15 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
   }
   git('init', '-q')
   // Frozen producer bytes, not an active workflow or a caller-authored receipt.
-  const definition = fs.readFileSync(producer === 'v3' ? '.github/workflows/ci.yml'
+  const definition = fs.readFileSync(crates ? '.github/workflows/ci.yml'
     : path.join(__dirname, `fixtures/main-authority-ci-${producer}.yml`))
   const helper = fs.readFileSync('scripts/main-release-admission.py')
   const helperDigest = createHash('sha256').update(helper).digest('hex')
+  const producerHelper = grouped ? fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v3.py')) : helper
+  const producerHelperDigest = createHash('sha256').update(producerHelper).digest('hex')
+  const cratePackages = crates ? [...definition.toString().split('  test-crates:\n')[1]
+    .split(/\n  [a-z0-9-]+:/)[0].matchAll(/^          - ([a-z0-9-]+)$/gm)].map(match => match[1]) : []
+  const crateNames = ['Test SSH', ...['Test', 'E2E'].flatMap(label => cratePackages.map(crate => `${label} (${crate})`))]
   fs.mkdirSync(path.join(directory, '.github/workflows'), { recursive: true })
   fs.writeFileSync(path.join(directory, '.github/workflows/ci.yml'), definition)
   git('add', '.github/workflows/ci.yml')
@@ -97,18 +103,22 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
   const emptyNames = plans.filter(p => p.profile !== 'ssh-live' && !p.blocks.some(b => b.kind !== 'doctest' && b.matrixFamily === 2))
     .map(p => p.label + ' Block 2 (${{ matrix.id }})')
   const groupedNames = [...plans.flatMap(p => [p.label + ' Build', ...p.blocks.map(b => blockName(p, b))]), ...emptyNames]
-  const mainSkipped = ['Test Build', 'E2E Build', 'Test SSH Build', 'Test SSH',
+  const mainSkipped = grouped ? ['Test Build', 'E2E Build', 'Test SSH Build', 'Test SSH',
     'Test Block (${{ matrix.id }})', 'E2E Block (${{ matrix.id }})', 'Test Doctest (${{ matrix.id }})',
     'Test Block 2 (${{ matrix.id }})', 'E2E Block 2 (${{ matrix.id }})']
-  const jobs = (id, promotion) => ({ jobs: (!promotion && producer === 'v3'
+    : ['Test SSH', 'Test (${{ matrix.crate }})', 'E2E (${{ matrix.crate }})']
+  const jobs = (id, promotion) => ({ jobs: (!promotion && light
     ? ['Validation Source', 'Test', 'Main Release Admission', 'Quick Checks', 'Promotion Source',
       'E2E Tests', 'Lint', 'MSRV (Rust 1.95)', 'Security Audit', 'cargo-deny (licenses/bans/advisories/sources)',
       'Documentation', 'TLS Fixture (${{ matrix.os }})', 'ToolEvent Recorder E2E (${{ matrix.os }})', 'Build (${{ matrix.os }})', ...mainSkipped]
-    : [...FULL, ...(producer === 'v3' ? groupedNames : []), ...(promotion ? [...PLATFORMS, 'Promotion Source'] : [])]).map((name, i) => ({
+    : [...FULL, ...(grouped ? groupedNames : crates ? crateNames : []), ...(promotion ? [...PLATFORMS, 'Promotion Source'] : [])]).map((name, i) => ({
     id: id * 100 + i, name, run_id: id, run_attempt: 1,
     head_sha: promotion ? head : source, head_branch: promotion ? release : 'main',
-    steps, status: 'completed', conclusion: (promotion && producer === 'v3' && emptyNames.includes(name)) ||
-      (!promotion && producer === 'v3' && !['Validation Source', 'Test', 'Main Release Admission'].includes(name)) ? 'skipped' : 'success',
+    steps: crates && promotion && crateNames.includes(name) ? ['Set up job', name === 'Test SSH' ? 'Run SSH fixture'
+      : name.startsWith('Test (') ? 'Test crate' : 'Run E2E crate tests', 'Complete job']
+      .map((name, i) => ({ name, number: i + 1, status: 'completed', conclusion: 'success' })) : steps,
+    status: 'completed', conclusion: (promotion && grouped && emptyNames.includes(name)) ||
+      (!promotion && light && !['Validation Source', 'Test', 'Main Release Admission'].includes(name)) ? 'skipped' : 'success',
     completed_at: '2026-10-20T02:59:00Z' })) })
   const commitObject = (sha) => ({ sha, tree: { sha: git('rev-parse', `${sha}^{tree}`) },
     parents: git('show', '-s', '--format=%P', sha).split(' ').map(sha => ({ sha })) })
@@ -128,7 +138,8 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
     [`contents/.github/workflows/ci.yml?ref=${snapshot}`]: { encoding: 'base64', content: definition.toString('base64') },
     [`contents/.github/workflows/ci.yml?ref=${source}`]: { encoding: 'base64', content: definition.toString('base64') },
     ...Object.fromEntries([controller, head, snapshot, source].map(sha => [
-      `contents/scripts/main-release-admission.py?ref=${sha}`, { encoding: 'base64', content: helper.toString('base64') }])),
+      `contents/scripts/main-release-admission.py?ref=${sha}`,
+      { encoding: 'base64', content: (sha === controller ? helper : producerHelper).toString('base64') }])),
     'actions/runs/111/attempts/1/jobs?per_page=100&page=1': jobs(111, false),
     'actions/runs/222/attempts/1/jobs?per_page=100&page=1': jobs(222, true),
     'actions/jobs/22200': jobs(222, true).jobs[0],
@@ -142,7 +153,7 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
     [`actions/workflows/ci.yml/runs?event=pull_request&head_sha=${head}&per_page=100&page=1`]: { workflow_runs: [pre] },
   }
   const recordLog = (marker, record) => `2026-10-20T02:58:00Z ${marker} ${Buffer.from(JSON.stringify(record)).toString('base64')}\n`
-  if (producer === 'v3') for (const job of jobs(222, true).jobs) {
+  if (grouped) for (const job of jobs(222, true).jobs) {
     let raw = ''
     for (const plan of plans) {
       if (job.name === plan.label + ' Build') raw += recordLog('GROUPED_TEST_PLAN', plan)
@@ -251,13 +262,15 @@ with patch('subprocess.check_output', output):
       FIXTURE_CALLS: calls, FIXTURE_ROUTES: routeFile, FIXTURE_REPOSITORY: directory, ...environment } })
     return { ...result, output: fs.readFileSync(output, 'utf8'), calls: fs.readFileSync(calls, 'utf8') }
   }
-  if (options.exercise) return options.exercise({run, base, source, head, controller, plans, blockName})
+  if (options.exercise) return options.exercise({run, base, source, head, controller, plans, blockName, cratePackages})
   const empty = x => {
     x.routes['actions/runs/222'].pull_requests = []
     x.routes[`actions/workflows/ci.yml/runs?event=pull_request&head_sha=${head}&per_page=100&page=1`].workflow_runs[0].pull_requests = []
   }
   const expandedSkipped = x => {
     const expand = list => list.flatMap(job => {
+      if (job.name.includes('${{ matrix.crate }}')) return cratePackages.map((crate, index) => ({
+        ...copy(job), id: job.id * 100 + index, name: job.name.replace('${{ matrix.crate }}', crate) }))
       if (!job.name.includes('${{ matrix.os }}')) return [job]
       const platforms = job.name.startsWith('TLS Fixture') ? ['macos-latest', 'windows-latest']
         : ['ubuntu-latest', 'macos-latest', 'windows-latest']
@@ -289,7 +302,7 @@ with patch('subprocess.check_output', output):
       x.routes['actions/runs/222/attempts/2/jobs?per_page=100&page=1'] = copy(x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'])
       x.routes['actions/jobs/22200'].run_attempt = 2
     }],
-    ...(producer === 'v3' ? [['failed shard alone can rerun while earlier build and shards remain valid', x => {
+    ...(grouped ? [['failed shard alone can rerun while earlier build and shards remain valid', x => {
       x.routes['actions/runs/222'].run_attempt = 2
       x.routes.graphql.data.node.workflowRun.runAttempt = 2
       const list = x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs
@@ -301,13 +314,22 @@ with patch('subprocess.check_output', output):
       const record = JSON.parse(Buffer.from(encoded, 'base64')); record.attempt = 2
       x.routes[route].raw = recordLog('GROUPED_TEST_RESULT', record)
     }]] : []),
-    ...(producer === 'v3' && mode === 'publication' ? [['complete expanded skipped matrices remain compatible', expandedSkipped]] : []),
-  ].filter(([name]) => !(producer === 'v3' && name === 'main push legitimately skips platform builds already checked before merge'))) await t.test(name, () => {
+    ...(crates ? [['failed crate alone can rerun while earlier successful crates remain valid', x => {
+      x.routes['actions/runs/222'].run_attempt = 2
+      x.routes.graphql.data.node.workflowRun.runAttempt = 2
+      const job = x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs.find(j => j.name.startsWith('Test ('))
+      job.run_attempt = 2
+      x.routes['actions/runs/222/attempts/2/jobs?per_page=100&page=1'] = {jobs: [copy(job)]}
+    }]] : []),
+    ...(light && mode === 'publication' ? [['complete expanded skipped matrices remain compatible', expandedSkipped]] : []),
+  ].filter(([name]) => !(light && name === 'main push legitimately skips platform builds already checked before merge'))) await t.test(name, () => {
     const result = run(change)
     assert.equal(result.status, 0, result.stderr)
+    if (crates) assert.deepEqual(result.calls.trim().split('\n').filter(route => route.endsWith('/logs')),
+      ['actions/jobs/22200/logs'], 'Native crate jobs need no grouped result logs or receipts')
     const output = result.output.trimEnd().split('\n')
     assert.equal(output[0], `revision=${source}`)
-    if (producer === 'v3' && mode === 'publication') {
+    if (light && mode === 'publication') {
       assert.equal(output.length, 2)
       assert.ok(output[1].startsWith('validation='))
       const proof = JSON.parse(output[1].slice('validation='.length))
@@ -368,10 +390,10 @@ with patch('subprocess.check_output', output):
       x.routes['actions/runs/222/attempts/2/jobs?per_page=100&page=1'] = { jobs: [] }
     }],
   ]
-  for (const name of producer === 'v3' ? ['Validation Source', 'Test', 'Main Release Admission'] : FULL) negatives.push([`main CI cannot skip ${name}`, x => {
+  for (const name of light ? ['Validation Source', 'Test', 'Main Release Admission'] : FULL) negatives.push([`main CI cannot skip ${name}`, x => {
     x.routes['actions/runs/111/jobs?filter=latest&per_page=100&page=1'].jobs.find(job => job.name === name).conclusion = 'skipped'
   }])
-  if (producer === 'v3') {
+  if (grouped) {
     const shard = jobs(222, true).jobs.find(j => j.name.startsWith('Test Block ('))
     const mutateShardRecord = (x, change) => {
       const route = `actions/jobs/${shard.id}/logs`
@@ -389,6 +411,34 @@ with patch('subprocess.check_output', output):
     negatives.push(['shard over twenty minutes cannot be admitted', x => mutateShardRecord(x, r => { r.testDurationMs = 1200001 })])
     negatives.push(['ignored cases cannot hide failed shard cases', x => mutateShardRecord(x, r => { r.counts.ignored = r.expected; r.counts.passed = 0 })])
     negatives.push(['shard has no source-bound count receipt', x => { x.routes[`actions/jobs/${shard.id}/logs`].raw = 'no result\n' }])
+  }
+  if (crates) {
+    const eachCrate = (x, change) => {
+      const list = x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs
+      change(list, list.find(job => job.name.startsWith('Test (')))
+    }
+    for (const conclusion of ['skipped', 'failure', 'cancelled']) negatives.push([`aggregate green cannot hide ${conclusion} crate`, x => {
+      eachCrate(x, (_, job) => { job.conclusion = conclusion })
+    }])
+    for (const [name, change] of [
+      ['missing crate', (list, job) => list.splice(list.indexOf(job), 1)],
+      ['duplicate crate', (list, job) => list.push({...copy(job), id: 999999})],
+      ['unexpected crate', (list, job) => list.push({...copy(job), id: 999999, name: 'Test (bamboo-foreign)'})],
+      ['wrong crate source', (_, job) => { job.head_sha = foreign }],
+      ['wrong crate run', (_, job) => { job.run_id++ }],
+      ['future crate attempt', (_, job) => { job.run_attempt = 2 }],
+      ['late crate completion', (_, job) => { job.completed_at = pull.merged_at }],
+      ['missing Cargo step', (_, job) => { job.steps.splice(1, 1) }],
+      ['skipped Cargo step', (_, job) => { job.steps[1].conclusion = 'skipped' }],
+      ['failed Cargo step', (_, job) => { job.steps[1].conclusion = 'failure' }],
+    ]) negatives.push([`${name} cannot hide behind green summaries`, x => eachCrate(x, change)])
+    for (const name of ['Test SSH', `E2E (${cratePackages.at(-1)})`]) {
+      negatives.push([`full acceptance requires successful ${name}`, x => {
+        x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs.find(job => job.name === name).conclusion = 'skipped'
+      }])
+    }
+  }
+  if (light) {
     const changeDefinition = (x, transform, revision = head) => {
       x.routes[`contents/.github/workflows/ci.yml?ref=${revision}`].content =
         Buffer.from(transform(definition.toString())).toString('base64')
@@ -396,9 +446,9 @@ with patch('subprocess.check_output', output):
     for (const [name, transform] of [
       ['changed required job command', text => text.replace('cargo test --locked --no-fail-fast', 'true')],
       ['changed trigger', text => text.replace('branches: [ dev, main ]', 'branches: [ dev ]')],
-      ['changed helper pin', text => text.replace(helperDigest, 'f'.repeat(64))],
-      ['duplicate helper pin', text => `${text}\n# ADMISSION_HELPER_SHA256: "${helperDigest}"\n`],
-      ['missing helper pin', text => text.replace(`ADMISSION_HELPER_SHA256: "${helperDigest}"`, 'REMOVED_PIN: true')],
+      ['changed helper pin', text => text.replace(producerHelperDigest, 'f'.repeat(64))],
+      ['duplicate helper pin', text => `${text}\n# ADMISSION_HELPER_SHA256: "${producerHelperDigest}"\n`],
+      ['missing helper pin', text => text.replace(`ADMISSION_HELPER_SHA256: "${producerHelperDigest}"`, 'REMOVED_PIN: true')],
     ]) negatives.push([name, x => changeDefinition(x, transform)])
     negatives.push(['changed immutable producer helper bytes', x => {
       x.routes[`contents/scripts/main-release-admission.py?ref=${head}`].content = Buffer.from('raise Exception("foreign helper")\n').toString('base64')

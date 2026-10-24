@@ -30,7 +30,7 @@ fn task_list_with_in_progress_item(session_id: &str, description: &str) -> TaskL
 }
 
 /// Regression test: tool calls executed inside the agent loop MUST receive a ToolExecutionContext
-/// with `session_id=Some(...)`. This is required by server-only tools like `spawn_session`.
+/// with `session_id=Some(...)`, including ordinary custom tools.
 #[tokio::test]
 async fn agent_loop_passes_session_id_into_tool_execution_context() {
     let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
@@ -64,8 +64,7 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
     #[async_trait]
     impl Tool for SessionIdRequiredTool {
         fn name(&self) -> &str {
-            // Use the exact name we rely on in production.
-            "spawn_session"
+            "session_context_probe"
         }
 
         fn description(&self) -> &str {
@@ -113,10 +112,10 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
         .build();
 
     let tool_call = bamboo_agent_core::tools::ToolCall {
-        id: "call_spawn".to_string(),
+        id: "call_context_probe".to_string(),
         tool_type: "function".to_string(),
         function: FunctionCall {
-            name: "spawn_session".to_string(),
+            name: "session_context_probe".to_string(),
             arguments: r#"{"goal":"do it"}"#.to_string(),
         },
     };
@@ -129,10 +128,6 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
     });
 
     let mut session = Session::new("session-ctx-test", "ignored");
-    // This pre-existing custom-tool probe retains its historical contract.
-    // v2 reserves this spelling for genuine Supervisor Root creation; that
-    // identity boundary is covered by the versioned_spawn dispatch matrix.
-    session.session_version = Some(1);
 
     let (event_tx, _event_rx) = mpsc::channel(64);
     let config = AgentLoopConfig {
@@ -177,7 +172,7 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
         .collect();
     assert_eq!(calls.len(), 2, "one span per actual provider request");
     assert_eq!(tools.len(), 1, "one span per actual tool dispatch");
-    assert_eq!(tools[0].name, "execute_tool spawn_session");
+    assert_eq!(tools[0].name, "execute_tool session_context_probe");
     for span in calls.into_iter().chain(tools) {
         assert_eq!(span.parent_span_id, agent.span_context.span_id());
         assert_eq!(span.span_context.trace_id(), agent.span_context.trace_id());
