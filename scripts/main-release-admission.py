@@ -103,9 +103,14 @@ FULL = (
 )
 
 PLATFORMS = ("Build (ubuntu-latest)", "Build (macos-latest)", "Build (windows-latest)")
+PLATFORM_TESTS = ("Platform Tests (ubuntu-latest)", "Platform Tests (macos-latest)", "Platform Tests (windows-latest)")
+PLATFORM_JOBS = {}
 TEST_JOBS = {}
 GROUPED_PLANS = {}
 CRATE_PACKAGES = {}
+
+def platform_jobs(revision):
+    return PLATFORM_JOBS.get(revision, PLATFORMS)
 
 def crate_jobs(ci, jobs):
     # The authenticated workflow itself owns the static Cargo package lists.
@@ -225,7 +230,7 @@ def full_jobs(ci, promotion=False, before=None):
     jobs = pages(f"actions/runs/{ci['id']}/jobs?filter=latest", "jobs")
     contract = producer_definition(ci["head_sha"]) if promotion else "full"
     tests = grouped_jobs(ci, jobs, before) if contract == "grouped" else crate_jobs(ci, jobs) if contract == "crates" else ()
-    for name in FULL + (PLATFORMS + ("Promotion Source",) if promotion else ()) + tests:
+    for name in FULL + (platform_jobs(ci["head_sha"]) + ("Promotion Source",) if promotion else ()) + tests:
         found = [job for job in jobs if job["name"] == name]
         assert len(found) == 1, f"Missing or ambiguous full CI job: {name}"
         job = found[0]
@@ -300,7 +305,10 @@ REVIEWED_PRODUCERS = frozenset((PRODUCER_V1, PRODUCER_V2))
 # by a sentinel. Then independently authenticate the actual helper bytes below.
 # This breaks the workflow -> helper -> workflow hash cycle, without excluding
 # a job, global environment, trigger, command or permission from review.
-CURRENT_PRODUCER = "4fc5b81c53b931118c5c248bbdcffa212fe8dde0fa810c70365bd2cc33c142b7"
+CURRENT_PRODUCER = "b8e4760f405745ab787f94373908efe9055c4eb1bfa848bdedbc7e3bd2b6c385"
+# The previous native crate producer also required three optimized Build jobs.
+LEGACY_CRATE_PRODUCER = "4fc5b81c53b931118c5c248bbdcffa212fe8dde0fa810c70365bd2cc33c142b7"
+LEGACY_CRATE_HELPER = "c567d1f41fe70acc23bd5f4a64b1d7048c6edbd667a1d2fc12f0f5e4c7ba0529"
 # Retain the original grouped producer and its exact helper for queued runs.
 LEGACY_GROUPED_PRODUCER = "f77f63ee2873eed949e13afef13f6eb948d775654b9d5e7b8fbb654907045619"
 LEGACY_GROUPED_HELPER = "8b6678f9ea2a28b6d9af6b200d894198f6bb1e754b5d54650cc496197ba78a7e"
@@ -324,8 +332,9 @@ def producer_definition(revision):
         return "full"
     pins = re.findall(PIN, raw)
     normalized = hashlib.sha256(re.sub(PIN, NORMALIZED_PIN, raw)).hexdigest()
-    assert normalized in {CURRENT_PRODUCER, LEGACY_GROUPED_PRODUCER, LEGACY_ADMISSION_PRODUCER}, "Unknown source-admission producer"
+    assert normalized in {CURRENT_PRODUCER, LEGACY_CRATE_PRODUCER, LEGACY_GROUPED_PRODUCER, LEGACY_ADMISSION_PRODUCER}, "Unknown source-admission producer"
     expected_helper = {CURRENT_PRODUCER: ADMISSION_SCRIPT_SHA256,
+                       LEGACY_CRATE_PRODUCER: LEGACY_CRATE_HELPER,
                        LEGACY_GROUPED_PRODUCER: LEGACY_GROUPED_HELPER,
                        LEGACY_ADMISSION_PRODUCER: LEGACY_ADMISSION_HELPER}[normalized]
     assert len(pins) == 1 and pins[0].decode() == expected_helper, "Unknown admission helper pin"
@@ -333,7 +342,7 @@ def producer_definition(revision):
     assert helper["encoding"] == "base64" and len(helper["content"]) <= 180000
     body = base64.b64decode(helper["content"], validate=False)
     assert len(body) <= 128000 and hashlib.sha256(body).hexdigest() == expected_helper, "Admission helper bytes changed"
-    if normalized == CURRENT_PRODUCER:
+    if normalized in {CURRENT_PRODUCER, LEGACY_CRATE_PRODUCER}:
         packages = {}
         for job, label in (("test-crates", "Test"), ("e2e-crates", "E2E")):
             block = re.search(rb"^  " + job.encode() + rb":\n(.*?)(?=^  [a-z0-9-]+:|\Z)", raw, re.M | re.S)
@@ -345,6 +354,7 @@ def producer_definition(revision):
             packages[label] = tuple(item.decode() for item in packages[label])
         assert packages["Test"] == packages["E2E"], "Default and E2E crate lists differ"
         CRATE_PACKAGES[revision] = packages
+        PLATFORM_JOBS[revision] = PLATFORM_TESTS if normalized == CURRENT_PRODUCER else PLATFORMS
         return "crates"
     return "grouped" if normalized == LEGACY_GROUPED_PRODUCER else "admission"
 
@@ -386,7 +396,7 @@ def snapshot_binding(pre, jobs):
     # jobs retained by a failed-only rerun. One request per distinct attempt.
     attempts = {}
     for gate in jobs:
-        if gate["name"] not in FULL + PLATFORMS + ("Promotion Source",) and gate["name"] not in TEST_JOBS.get(pre["id"], set()):
+        if gate["name"] not in FULL + platform_jobs(head) + ("Promotion Source",) and gate["name"] not in TEST_JOBS.get(pre["id"], set()):
             continue
         actual = gate["run_attempt"]
         if actual not in attempts:
@@ -453,7 +463,7 @@ if ci is not None:
                             "Test Block 2 (${{ matrix.id }})", "E2E Block 2 (${{ matrix.id }})"])
         matrices = [("TLS Fixture", "os", ("macos-latest", "windows-latest")),
                     ("ToolEvent Recorder E2E", "os", ("ubuntu-latest", "macos-latest", "windows-latest")),
-                    ("Build", "os", ("ubuntu-latest", "macos-latest", "windows-latest"))]
+                    ("Platform Tests" if platform_jobs(source) == PLATFORM_TESTS else "Build", "os", ("ubuntu-latest", "macos-latest", "windows-latest"))]
         if contract == "crates":
             skipped.append("Test SSH")
             matrices.extend((label, "crate", packages) for label, packages in CRATE_PACKAGES[source].items())
@@ -506,7 +516,7 @@ print(f"Accepted normal main merge source={source} tree={commit['tree']['sha']} 
       f"release_CI={pre['id']} release_attempt={pre['run_attempt']} tested_snapshot={tested_snapshot} controller={workflow_source}")
 print("Authenticated full pre-merge job attempts: " + ", ".join(
     f"{job['name']}={job['id']}@{job['run_attempt']}" for job in jobs
-    if job["name"] in FULL + PLATFORMS + ("Promotion Source",) or job["name"] in TEST_JOBS.get(pre["id"], set())))
+    if job["name"] in FULL + platform_jobs(head) + ("Promotion Source",) or job["name"] in TEST_JOBS.get(pre["id"], set())))
 print(f"Acceptance covers tested inputs; final executable must be rebuilt for source={source} and its release version")
 with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
     stream.write(f"revision={source}\n")

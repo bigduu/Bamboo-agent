@@ -1010,6 +1010,14 @@ test('complete publication keeps canonical main CI authority and authenticates e
   const groupedHelper = fs.readFileSync('scripts/tests/fixtures/main-authority-admission-v3.py')
   assert.ok(preflight.includes(`LEGACY_GROUPED_PRODUCER = "${sha256(normalized)}"`))
   assert.ok(preflight.includes(`LEGACY_GROUPED_HELPER = "${sha256(groupedHelper)}"`))
+  const crates = fs.readFileSync('scripts/tests/fixtures/main-authority-ci-v4.yml', 'utf8')
+  const crateHelper = fs.readFileSync('scripts/tests/fixtures/main-authority-admission-v4.py')
+  const crateNormalized = crates.replace(/ADMISSION_HELPER_SHA256: "[0-9a-f]{64}"/,
+    'ADMISSION_HELPER_SHA256: "<PINNED_ADMISSION_HELPER>"')
+  assert.ok(preflight.includes(`LEGACY_CRATE_PRODUCER = "${sha256(crateNormalized)}"`))
+  assert.ok(preflight.includes(`LEGACY_CRATE_HELPER = "${sha256(crateHelper)}"`))
+  assert.match(crates, /name: Build \(\$\{\{ matrix\.os \}\}\)/)
+  assert.match(crates, /run: cargo build --release --verbose/)
 })
 
 test('trusted manual publication and automatic receipts share a queue while dry runs stay credential-free', () => {
@@ -1392,9 +1400,14 @@ test('historical grouped CI retains independently authenticated complete release
     workflowPython('Authorize the exact source before checkout'), 'v3')
 })
 
-test('native crate CI retains independently authenticated complete release evidence', async (t) => {
+test('historical native crate CI retains its original Build evidence', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
     workflowPython('Authorize the exact source before checkout'), 'v4')
+})
+
+test('current native crate CI requires independently authenticated Platform Tests', async (t) => {
+  await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
+    workflowPython('Authorize the exact source before checkout'), 'v5')
 })
 
 test('job pagination retains its bounded capacity and leaves other API routes unchanged', () => {
@@ -1431,7 +1444,7 @@ for route, field, size, limit in [
 
 test('eighty native CI jobs require every latest and original-attempt page', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
-    workflowPython('Authorize the exact source before checkout'), 'v4', 'publication', {
+    workflowPython('Authorize the exact source before checkout'), 'v5', 'publication', {
       exercise: async ({run}) => {
         const latest = 'actions/runs/222/jobs?filter=latest&per_page=10&page=1'
         const attempt = 'actions/runs/222/attempts/1/jobs?per_page=10&page=1'
@@ -1478,7 +1491,7 @@ test('eighty native CI jobs require every latest and original-attempt page', asy
 
 test('main-push admission executes the same pinned verifier with read-only authority', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
-    workflowPython('Authenticate completed release acceptance before checkout', '.github/workflows/ci.yml'), 'v4', 'main')
+    workflowPython('Authenticate completed release acceptance before checkout', '.github/workflows/ci.yml'), 'v5', 'main')
 })
 
 test('temporary manifest stamping uses exact internal dependency versions and real package versions', (t) => {

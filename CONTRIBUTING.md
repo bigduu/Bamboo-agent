@@ -382,10 +382,14 @@ checkout, a fixed bootstrap verifies the successful same-repository main push CI
 source and protected-dev controller history. It binds the server-recorded merged
 release PR's exact head/base, two-parent merge and unchanged release-head tree,
 cut → release-head → protected-dev ancestry, successful full pre-merge release CI
-(including all three platform builds and Promotion Source), and successful main
-push admission. Main pushes reuse this authenticated pre-merge evidence rather
+(including all three `Platform Tests` jobs and Promotion Source), and successful
+main push admission. Main pushes reuse this authenticated pre-merge evidence rather
 than repeat the full Rust suite. Historical full main-CI evidence keeps its own
 contract; skipped jobs are never relabeled as executed full validation.
+Historical pre-merge producers retain their original platform-build requirements.
+Current release PRs preserve native platform tests without running an optimized
+executable build. The automatic main publisher alone builds the three versioned
+release executables after source admission and version/frontend preparation.
 Pre-merge jobs must complete strictly before the merge; failed-only reruns may
 retain earlier successful job attempts. Missing, ambiguous, stale or failed
 evidence stops before checkout or publication credentials. The main branch's
@@ -526,12 +530,15 @@ Bamboo uses GitHub Actions for continuous integration and publishing:
   `Quick Checks` (Node policy tests and Rust formatting). A compile pass does not
   replace the owner's
   pre-merge local affected-test and regression-coverage evidence. The same `Test`
-  check runs the complete build/test job for fixed-snapshot manual validation
+  check runs the complete test job for fixed-snapshot manual validation
   and frozen release PRs into `main`; dev mode does not execute
   the full suite. Release PRs and manual full-validation routes
   retain the comprehensive checks and all-feature `E2E Tests`. Same-repository
   frozen release PRs and manual full validation run the Linux/macOS/Windows
-  release-build matrix. Main pushes retain their CI/publication queue and
+  `Platform Tests` matrix, preserving the native Supervisor, portable Skill and
+  frontend contract checks. They do not run `cargo build --release`; versioned
+  executable builds belong to the automatic main publisher. Main pushes retain
+  their CI/publication queue and
   authenticate the complete pre-merge release evidence against the actual merge
   through lightweight admission; they do not repeat the full Rust suite.
   Required-check configuration is separate from these workflow triggers; verify
