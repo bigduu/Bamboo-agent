@@ -81,9 +81,12 @@ an entrypoint has a different name. Only this passing, reviewed candidate may
 promote to `main`. Dev compilation and focused local tests cannot replace
 release acceptance. A failed or incomplete release check blocks promotion.
 
-Keep necessary repairs within the recorded scope. Preserve original fix `F`,
-admit it to dev through integration `U` when needed, and separately validate the
-release source as specified in the
+Keep necessary repairs within the recorded scope. Record original fix `F`'s
+exact SHA/tree, affected local tests and independent Code and Security review.
+Preserve `F` through normal protected-dev integration `U` when needed, then
+fast-forward the release to `F` and complete the final release PR's full CI.
+An extra manual full CI on `F` is optional diagnosis, not a second mandatory
+full run. Follow the
 [release repair rules](./CONTRIBUTING.md#freeze-the-release-scope). Do not chase
 unrelated dev changes or substitute the broader `U` for the frozen release fix.
 

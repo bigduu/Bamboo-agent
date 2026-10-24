@@ -255,9 +255,10 @@ CI on a main PR tests its actual synthetic merge result. The frontend workflow
 also runs on main PRs and validates the exact PR head with its original
 source-cleanliness, artifact and strict Clippy contracts. Preserve the two source
 identities; evidence is reusable only if all relevant source and build/test
-inputs match. An initial cut does not require an additional manual full suite
-merely to repeat equivalent promotion validation. Repair `F` still requires the
-separate exact-source acceptance below.
+inputs match. The final release PR supplies the mandatory complete release CI,
+including after a repair `F`. An extra manual full CI on `F` is optional diagnosis,
+not a second mandatory full run. Preserve the separate exact-source repair
+evidence below.
 Ordinary dev PRs compile in CI but do not automatically run these full test suites.
 Existing path-scoped Windows/adapter checks retain their own triggers.
 
@@ -286,9 +287,10 @@ Existing path-scoped Windows/adapter checks retain their own triggers.
    they need not wait for the consumer or publication. After the producer's
    accepted publication identity and complete artifact hashes are verified,
    create the consumer's original head `F` from the frozen release. Apply the
-   full separate `F` release-source and `U` protected-dev integration procedure
-   in step 3, including exact-source review, Linux/macOS/Windows validation,
-   preserved ancestry and normal admission before fast-forwarding only to `F`.
+   separate `F` release-source and `U` protected-dev integration procedure
+   in step 3, including affected local tests, independent Code and Security
+   review, preserved ancestry and normal admission before fast-forwarding only
+   to `F`. Complete Linux/macOS/Windows validation on the final release PR.
    Record the verified artifact hashes in `F`'s receipt. A pending or failed
    producer/consumer gate blocks release promotion and publication, not ongoing
    development. Never pull unrelated `dev` work into the release; a changed
@@ -301,24 +303,27 @@ Existing path-scoped Windows/adapter checks retain their own triggers.
    record a new cut and scope on a new release branch.
 3. For a necessary release fix, branch from the frozen release head and keep
    the original fix head `F` within the recorded release scope. Record `F`'s
-   exact SHA/tree and bounded diff as the intended release target; independently
-   review and run the complete release-source gates on that exact `F`, including
-   full Linux/macOS/Windows coverage. Preserve `F` unchanged while admitting it
-   to protected `dev` (do not squash or rebase it into a different commit).
+   exact SHA/tree and bounded diff as the intended release target. Obtain
+   independent Code and Security review and run affected local tests on that
+   exact `F`. Preserve `F` unchanged while admitting it to protected `dev`
+   (do not squash or rebase it into a different commit).
    If `dev` has advanced, use a separate integration head `U` containing both
    `F` and the current protected `dev` head. Keep `U` up to date as strict branch
    protection requires, and submit it through normal current-head/base review
    and required checks. Record `U`'s exact SHA/tree, review/check receipts, and
    normal admission into `dev`, with exact `F` → `U` → accepted-`dev` ancestry.
-   Keep release-source and integration validation separate: `U`'s checks cannot
-   replace `F`'s complete release-source checks, and `F`'s checks cannot replace
-   `U`'s normal integration checks. Bind both receipts to their respective
+   Keep `F`'s local test/review evidence and `U`'s normal integration validation
+   separate. Neither replaces the final release PR's complete acceptance.
+   Bind both receipts to their respective
    SHA/tree, even if the two heads coincide when no dev update is needed.
    Only after both pass and `F` is admitted through `U`, fast-forward the release
    branch to the recorded original fix head `F`; never substitute `U` or its
    dev merge result for recorded `F`. Review must reject any other repair target,
    even if its ancestry gate passes. Do not merge unrelated `dev` work into the
    release. A changed `F` requires fresh source evidence and normal admission.
+   Run the complete release suite and Linux/macOS/Windows matrix on the final
+   release PR before promotion. An extra manual full CI on `F` is optional
+   diagnosis, not a second mandatory full run.
    Pending or failing release-source or required integration checks block this
    route; fix and rerun them, never change
    the cut to evade a gate. Only if existing branch rules cannot preserve exact

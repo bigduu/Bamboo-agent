@@ -554,7 +554,12 @@ test("frozen promotion bootstrap is read-only and leaves merge-tree validation i
   assert.match(contributing, /Release source and version tags are immutable/u)
   assert.match(contributing, /known pending frontend consumer awaits its immutable producer/u)
   assert.match(contributing, /Do not describe this known dependency as an unexpected fix/u)
-  assert.match(contributing, /full separate `F` release-source and `U` protected-dev integration procedure/u)
+  assert.match(contributing, /separate `F` release-source and `U` protected-dev integration procedure/u)
+  assert.match(contributing, /independent Code and Security review and run affected local tests on that\n   exact `F`/u)
+  assert.match(contributing, /Run the complete release suite and Linux\/macOS\/Windows matrix on the final\n   release PR before promotion/u)
+  for (const source of [contributing, readFileSync("gitflow.md", "utf8"), readFileSync("docs/releases/ci-publication-flow.md", "utf8")]) {
+    assert.match(source, /manual full CI on `F`[\s\S]*?optional diagnosis,[\s\S]*?not a second mandatory\s+full run/u)
+  }
   assert.match(contributing, /This exception changes ordering only, not gates,\n   protection, publication authority or the `Promotion Source` contract/u)
   assert.match(readFileSync("AGENTS.md", "utf8"), /CONTRIBUTING\.md#release-process/u)
 })
@@ -858,6 +863,11 @@ test("this frozen batch cannot save cache on source, integration, promotion or m
   assert.doesNotMatch(publisher.replace(nativePublisher, ''), /(?:[Ss]watinem\/rust-cache|actions\/cache)@|\bcache-to:/u)
 })
 const frontendHead = "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
+const frontendAcceptanceTargets = [
+  "-p bamboo-agent --test frontend_packaging",
+  "-p bamboo-server --test frontend_build_contract",
+  "-p bamboo-server --lib services::frontend_package::tests",
+]
 const frontendJobs = (source) => {
   const parts = source.replace(/\r\n/gu, "\n").split("\njobs:\n")
   assert.equal(parts.length, 2, "exactly one jobs block is required")
@@ -990,7 +1000,7 @@ function assertFrontendPolicy(source) {
     assert.deepEqual(names, [
       "Require the exact clean candidate source", "Setup Node.js", "Test original CI policy", "Install Rust",
       "Record and bind the actual Rust toolchain", "Check formatting",
-      ...(index === 0 ? ["Build locked Rust workspace"] : ["Compile locked Rust test targets", "Test locked Rust workspace"]),
+      ...(index === 0 ? ["Build locked Rust workspace"] : ["Compile locked frontend acceptance targets", "Test locked frontend acceptance targets"]),
       "Require source files to remain unchanged",
       "Require the exact clean source after execution",
     ])
@@ -1000,12 +1010,13 @@ function assertFrontendPolicy(source) {
       ["Test original CI policy", "node --test scripts/ci-policy.test.cjs"],
       ["Check formatting", "cargo fmt --all -- --check"],
       ...(index === 0 ? [["Build locked Rust workspace", "cargo build --locked"]] : [
-        ["Compile locked Rust test targets", "cargo test --locked --no-run", 15],
-        ["Test locked Rust workspace", "cargo test --locked --no-fail-fast", 45],
+        ["Compile locked frontend acceptance targets", frontendAcceptanceTargets.map(target => `cargo test --locked --no-run ${target}`).join("\n"), 15],
+        ["Test locked frontend acceptance targets", frontendAcceptanceTargets.map(target => `cargo test --locked --no-fail-fast ${target}`).join("\n"), 45],
       ]),
       ["Require source files to remain unchanged", "git diff --exit-code"],
     ]) {
-      assert.equal(frontendStep(frontendJob, name), `      - name: ${name}\n${timeout ? `        timeout-minutes: ${timeout}\n` : ""}        run: ${command}${timeout ? '\n        env:\n          RUST_MIN_STACK: "8388608"' : ""}`)
+      const run = timeout ? `|\n${command.split("\n").map(line => `          ${line}`).join("\n")}` : command
+      assert.equal(frontendStep(frontendJob, name), `      - name: ${name}\n${timeout ? `        timeout-minutes: ${timeout}\n` : ""}        run: ${run}${timeout ? '\n        env:\n          RUST_MIN_STACK: "8388608"' : ""}`)
     }
     assert.equal(frontendStep(frontendJob, "Require the exact clean source after execution"), [
       "      - name: Require the exact clean source after execution", "        if: always()", "        env:",
@@ -1045,7 +1056,7 @@ function assertFrontendPolicy(source) {
   }
 }
 
-test("frontend acceptance preserves both original command gates and actual-head identity", () => {
+test("frontend acceptance preserves the locked build, focused tests and actual-head identity", () => {
   assert.equal(require("node:fs").existsSync(".github/workflows/frontend-acceptance-recovery.yml"), false,
     "the unused fixed-source recovery controller must not coexist with the generic workflow")
   assertFrontendPolicy(frontendWorkflow)
@@ -1065,12 +1076,18 @@ test("frontend acceptance preserves both original command gates and actual-head 
     ["timeout-minutes: 45", "timeout-minutes: 60"],
     ["timeout-minutes: 15", "timeout-minutes: 30"],
     ["timeout-minutes: 75", "timeout-minutes: 45"],
-    ["name: Test locked Rust workspace\n        timeout-minutes: 45", "name: Test locked Rust workspace\n        timeout-minutes: 30"],
-    ["name: Test locked Rust workspace\n        timeout-minutes: 45", "name: Test locked Rust workspace\n        timeout-minutes: 60"],
+    ["name: Test locked frontend acceptance targets\n        timeout-minutes: 45", "name: Test locked frontend acceptance targets\n        timeout-minutes: 30"],
+    ["name: Test locked frontend acceptance targets\n        timeout-minutes: 45", "name: Test locked frontend acceptance targets\n        timeout-minutes: 60"],
     ["package-manager-cache: false", "package-manager-cache: true"],
     ["components: rustfmt\n", "toolchain: 1.99.0\n          components: rustfmt\n"],
     ["run: cargo build --locked", "run: true"],
-    ["run: cargo test --locked --no-fail-fast\n", "run: cargo test --locked --no-fail-fast -- --skip slow\n"],
+    ["cargo test --locked --no-run -p bamboo-agent --test frontend_packaging\n", "cargo test --locked --no-run\n"],
+    ["cargo test --locked --no-fail-fast -p bamboo-agent --test frontend_packaging\n", "cargo test --locked --no-fail-fast\n"],
+    ["--test frontend_packaging", "--test ordinary_root_actor_writer"],
+    ["--test frontend_build_contract", "--tests"],
+    ["--lib services::frontend_package::tests", "--lib"],
+    ["cargo test --locked --no-fail-fast -p bamboo-server --test frontend_build_contract", "cargo test --locked --no-fail-fast -p bamboo-server --test frontend_build_contract -- --skip slow"],
+    ["cargo test --locked --no-fail-fast -p bamboo-server --lib services::frontend_package::tests", "cargo test --locked --no-fail-fast -p bamboo-server --lib services::frontend_package::tests || true"],
     ['RUST_MIN_STACK: "8388608"', 'RUST_MIN_STACK: "16777216"'],
     ["run: git diff --exit-code", "run: true"],
     ["        if: always()\n", ""],
@@ -1081,13 +1098,35 @@ test("frontend acceptance preserves both original command gates and actual-head 
     ['test "$source_tree" = "$EXPECTED_TREE"', "true"],
     ['test "$source_sha" = "$BUILD_SOURCE_SHA"', "true"],
     ['test "$cargo_version" = "$BUILD_CARGO_VERSION"', "true"],
-    ["        run: cargo test --locked --no-run", "        continue-on-error: true\n        run: cargo test --locked --no-run"],
+    ["        run: |\n          cargo test --locked --no-run", "        continue-on-error: true\n        run: |\n          cargo test --locked --no-run"],
     ["    needs: build", "    if: always()\n    needs: build"],
     ["      - name: Check formatting", "      - uses: actions/cache@v4\n      - name: Check formatting"],
     ["      - name: Require source files to remain unchanged", "      - name: Reset source\n        run: git reset --hard\n      - name: Require source files to remain unchanged"],
   ]) {
     assert.ok(frontendWorkflow.includes(from), `mutation target exists: ${from}`)
     assert.throws(() => assertFrontendPolicy(frontendWorkflow.replace(from, to)), `reject unsafe frontend mutation: ${to}`)
+  }
+})
+
+test("frontend acceptance compile and test commands propagate each target failure", () => {
+  const frontendTest = frontendJobs(frontendWorkflow)[1]
+  for (const name of ["Compile locked frontend acceptance targets", "Test locked frontend acceptance targets"]) {
+    const script = frontendScript(frontendStep(frontendTest, name).split("\n        env:")[0])
+    for (const failAt of [0, 1, 2, 3]) {
+      // Use the runner's fail-fast shell with a function, never real Cargo.
+      const result = spawnSync("bash", ["-e", "-o", "pipefail", "-c", [
+        "calls=0",
+        "cargo() {",
+        "  calls=$((calls + 1))",
+        "  printf '%s\\n' \"$*\"",
+        "  if [[ $calls == $FAIL_AT ]]; then return 23; fi",
+        "  return 0",
+        "}",
+        script,
+      ].join("\n")], { encoding: "utf8", env: { ...process.env, FAIL_AT: String(failAt) } })
+      assert.equal(result.status, failAt ? 23 : 0, `${name}: failure at target ${failAt}; ${result.stderr}`)
+      assert.equal(result.stdout.trim().split("\n").length, failAt || 3, `${name}: stop at the failing target`)
+    }
   }
 })
 
