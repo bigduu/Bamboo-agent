@@ -21,8 +21,9 @@ const release = { ...implementation, TARGETS: testContract.targets,
   recoverPublishedRelease: value => implementation.recoverPublishedRelease({ contractVersion: testContractVersion, ...value }),
   publishAssets: value => implementation.publishAssets({ contractVersion: testContractVersion, ...value }),
 }
-const { nativeTarget, buildEnvironment, verifyBuildMessages, verifyStampedVersions } = require('./sidecar-build.cjs')
-const { signReceipt, receiptBody } = require('./crate-release.cjs')
+const { nativeTarget, buildEnvironment, verifyBuildMessages, verifyStampedVersions,
+  nativeCachePolicy, evictWorkspaceArtifacts } = require('./sidecar-build.cjs')
+const { signReceipt, receiptBody, createPreparation } = require('./crate-release.cjs')
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 const identity = { repository: release.REPOSITORY, version: '2026.10.123', sourceRevision: '1'.repeat(40),
@@ -332,6 +333,26 @@ test('build provenance permits same-run earlier attempts, rejects other source/r
   assert.throws(() => release.assembleRelease(value))
 })
 
+test('native build receipts preserve original admission across later attempts of the same main CI', (t) => {
+  const value = inputs(t), original = clone(value.receipts[0])
+  const recorded = { schemaVersion: 1, sourceRevision: identity.sourceRevision,
+    ciRun: { id: 90, run_attempt: 1 }, premerge: { runId: 80, runAttempt: 1, snapshotRevision: '8'.repeat(40) } }
+  original.validation = clone(recorded)
+  const bytes = JSON.stringify(original)
+  const current = { ...clone(recorded), ciRun: { ...recorded.ciRun, run_attempt: 2 } }
+  release.validateBuildReceipt(original, { ...identity, validation: current }, original.target)
+  assert.equal(JSON.stringify(original), bytes, 'Build receipt fields must remain bound to their original admission')
+  for (const mutate of [
+    value => { value.ciRun.id++ }, value => { value.sourceRevision = '7'.repeat(40) },
+    value => { value.premerge.snapshotRevision = '9'.repeat(40) }, value => { value.ciRun.run_attempt = 0 },
+  ]) {
+    const changed = clone(current); mutate(changed)
+    assert.throws(() => release.validateBuildReceipt(original, { ...identity, validation: changed }, original.target))
+  }
+  const later = { ...clone(original), validation: current }
+  assert.throws(() => release.validateBuildReceipt(later, { ...identity, validation: recorded }, later.target))
+})
+
 test('official publication requires a completed authenticated same-source crate Release and its immutable direct tag', () => {
   const signingKey = 'a'.repeat(64), signingKeyDigest = release.sha256(Buffer.from(signingKey, 'hex'))
   const receipt = signReceipt({ schemaVersion: 1, identity: { repository: identity.repository,
@@ -343,6 +364,26 @@ test('official publication requires a completed authenticated same-source crate 
   const originalTag = { object: { type: 'commit', sha: identity.sourceRevision } }
   const request = (value, tag) => (route) => JSON.stringify(route.startsWith('releases/') ? value : tag)
   release.publishedRelease(identity, { signingKey, signingKeyDigest, request: request(original, originalTag) })
+  const recorded = { schemaVersion: 1, sourceRevision: identity.sourceRevision,
+    ciRun: { id: 90, run_attempt: 1 }, premerge: { runId: 80, runAttempt: 1, snapshotRevision: '8'.repeat(40) } }
+  const current = { ...clone(recorded), ciRun: { ...recorded.ciRun, run_attempt: 2 } }
+  const signedOriginal = { ...original, body: receiptBody(signReceipt({ ...clone(receipt), validation: recorded }, signingKey)) }
+  const signedBytes = signedOriginal.body
+  release.publishedRelease({ ...identity, validation: current }, { signingKey, signingKeyDigest, request: request(signedOriginal, originalTag) })
+  assert.equal(signedOriginal.body, signedBytes, 'A later admission attempt must not replace signed reservation bytes')
+  for (const mutate of [
+    value => { value.ciRun.id++ }, value => { value.sourceRevision = '7'.repeat(40) },
+    value => { value.premerge.runId++ }, value => { value.premerge.runAttempt++ },
+    value => { value.premerge.snapshotRevision = '9'.repeat(40) }, value => { value.ciRun.run_attempt = 0 },
+  ]) {
+    const changed = clone(current); mutate(changed)
+    assert.throws(() => release.publishedRelease({ ...identity, validation: changed }, {
+      signingKey, signingKeyDigest, request: request(signedOriginal, originalTag),
+    }))
+  }
+  release.publishedRelease(identity, {
+    signingKey, signingKeyDigest, request: request(signedOriginal, originalTag),
+  }) // Historical callers retain their existing omitted-validation contract.
   for (const mutate of [
     (r, t) => { t.object.sha = '8'.repeat(40) }, (r, t) => { t.object.type = 'tag' },
     (r) => { r.draft = true }, (r) => { r.target_commitish = 'main' },
@@ -353,6 +394,101 @@ test('official publication requires a completed authenticated same-source crate 
   ]) {
     const value = clone(original), tag = clone(originalTag); mutate(value, tag)
     assert.throws(() => release.publishedRelease(identity, { signingKey, signingKeyDigest, request: request(value, tag) }))
+  }
+})
+
+test('native fan-out verifies original-attempt preparation transport before crates finish without draft access', (t) => {
+  const inputDirectory = temporary(t)
+  const manifest = Buffer.from('synthetic preserved manifest'), archive = Buffer.from('synthetic preserved archive')
+  fs.writeFileSync(path.join(inputDirectory, 'frontend-manifest.json'), manifest)
+  fs.writeFileSync(path.join(inputDirectory, 'lotus-frontend.zip'), archive)
+  const preparedBytes = { manifestSha256: release.sha256(manifest), archiveSha256: release.sha256(archive) }
+  const receipt = signReceipt({ schemaVersion: 1, identity: { repository: identity.repository,
+    sourceRevision: identity.sourceRevision, frontend: { packageName: '@bigduu/lotus-next', packageVersion: '2026.10.16' } },
+    version: identity.version, crates: ['bamboo-agent'], frontendBytes: preparedBytes, packageChecksums: {},
+    automatic: true, completed: false, ciRun: identity.ciRun }, signingKey)
+  const original = { id: 42, tag_name: `v${identity.version}`, target_commitish: identity.sourceRevision,
+    draft: true, prerelease: false, body: receiptBody(receipt), assets: [] }
+  const preparation = createPreparation({ release: original, receipt }, { ...identity, runAttempt: 1 }, testContractVersion)
+  const tag = { object: { type: 'commit', sha: identity.sourceRevision } }
+  const options = { preparation, contractVersion: testContractVersion, inputDirectory }
+  const restored = release.preparedFrontend(identity, options)
+  assert.deepEqual(restored.receipt, receipt)
+  assert.deepEqual(restored.files, [{ name: 'frontend-manifest.json', bytes: manifest }, { name: 'lotus-frontend.zip', bytes: archive }])
+  // No Release/body request or secret is supplied; crate progress cannot affect
+  // the preparation snapshot or force these workers to wait for publication.
+  original.draft = false; original.body = 'Concurrent mutable crate progress'
+  assert.deepEqual(release.preparedFrontend(identity, options).receipt, receipt)
+  original.draft = true
+  assert.throws(() => release.publishedRelease(identity, {
+    request: route => JSON.stringify(route.startsWith('releases/') ? original : tag),
+  }), /Crate publication must complete/)
+  fs.appendFileSync(path.join(inputDirectory, 'lotus-frontend.zip'), 'substituted bytes')
+  assert.throws(() => release.preparedFrontend(identity, options), /independent preparation output/)
+  fs.writeFileSync(path.join(inputDirectory, 'lotus-frontend.zip'), archive)
+  fs.writeFileSync(path.join(inputDirectory, 'extra'), 'unbound input')
+  assert.throws(() => release.preparedFrontend(identity, options), /exactly the preserved frontend/)
+  fs.rmSync(path.join(inputDirectory, 'extra'))
+  const otherRun = { ...identity, runId: '101' }
+  assert.throws(() => release.preparedFrontend(otherRun, options), /preparation mismatch: runId/)
+  if (process.platform !== 'win32') {
+    fs.rmSync(path.join(inputDirectory, 'lotus-frontend.zip'))
+    fs.symlinkSync(path.join(inputDirectory, 'frontend-manifest.json'), path.join(inputDirectory, 'lotus-frontend.zip'))
+    assert.throws(() => release.preparedFrontend(identity, options), /bounded regular release asset/)
+  }
+})
+
+test('native dependency cache maps the real runner-temp target and keeps historical/frozen publication restore-only', (t) => {
+  const root = temporary(t), temporaryRoot = path.join(root, 'runner-temp'), source = path.join(root, 'source')
+  fs.mkdirSync(source); fs.mkdirSync(path.join(source, 'scripts')); fs.mkdirSync(path.join(source, '.cargo'))
+  for (const name of ['Cargo.toml', 'Cargo.lock', 'scripts/sidecar-build.cjs', '.cargo/config.toml']) {
+    fs.writeFileSync(path.join(source, name), `synthetic ${name}`)
+  }
+  const value = { root: source, temporary: temporaryRoot, contractVersion: testContractVersion,
+    target: release.TARGETS[0], sourceParents: '8'.repeat(40) + ' ' + '9'.repeat(40), sourceMessage: 'ordinary release' }
+  const policy = nativeCachePolicy(value)
+  const [workspace, target] = policy.workspace.split(' -> ')
+  assert.equal(path.resolve(workspace, target), path.join(temporaryRoot, 'bamboo-executable-target'))
+  assert.equal(policy.save, !legacySuite)
+  assert.equal(nativeCachePolicy({ ...value, contractVersion: 1 }).save, false)
+  assert.equal(nativeCachePolicy({ ...value, sourceParents: 'dbafb74522794012fc8f0a61e761817b3913989a ' + '9'.repeat(40) }).save, false)
+  assert.equal(nativeCachePolicy({ ...value, sourceMessage: 'Merge release/da348a63f1d019a22df547c78575c500b6b1294e' }).save, false)
+  assert.equal(nativeCachePolicy({ ...value, cutRevision: 'da348a63f1d019a22df547c78575c500b6b1294e' }).save, false)
+  const originalKey = policy.key
+  for (const name of ['Cargo.toml', 'Cargo.lock', 'scripts/sidecar-build.cjs', '.cargo/config.toml']) {
+    fs.appendFileSync(path.join(source, name), 'changed')
+    assert.notEqual(nativeCachePolicy(value).key, originalKey)
+  }
+  assert.notEqual(nativeCachePolicy({ ...value, target: release.TARGETS.at(-1) }).key, nativeCachePolicy(value).key)
+})
+
+test('native cache eviction removes restored workspace binaries and embedded build outputs while keeping dependencies', (t) => {
+  const root = temporary(t), targetDirectory = path.join(root, 'target'), target = release.TARGETS[0]
+  const metadata = { workspace_members: ['agent', 'server'], packages: [
+    { id: 'agent', name: 'bamboo-agent', targets: [{ name: 'bamboo' }] },
+    { id: 'server', name: 'bamboo-server', targets: [{ name: 'bamboo_server' }] },
+    { id: 'dependency', name: 'serde', targets: [{ name: 'serde' }] },
+  ] }
+  const stale = [], dependency = []
+  for (const profile of ['release', `${target}/release`]) {
+    for (const name of ['bamboo', 'bamboo.d', 'deps/libbamboo_server-old.rlib',
+      '.fingerprint/bamboo-server-old/marker', 'build/bamboo-server-old/out/frontend_package_embedded.rs']) {
+      const file = path.join(targetDirectory, profile, name)
+      fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, 'stale workspace fixture'); stale.push(file)
+    }
+    for (const name of ['deps/libserde-old.rlib', '.fingerprint/serde-old/marker', 'build/serde-old/out/marker']) {
+      const file = path.join(targetDirectory, profile, name)
+      fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, 'dependency fixture'); dependency.push(file)
+    }
+  }
+  assert.ok(evictWorkspaceArtifacts(metadata, targetDirectory, target).length >= 10)
+  for (const file of stale) assert.equal(fs.existsSync(file), false)
+  for (const file of dependency) assert.equal(fs.readFileSync(file, 'utf8'), 'dependency fixture')
+  assert.deepEqual(evictWorkspaceArtifacts(metadata, targetDirectory, target), [])
+  if (process.platform !== 'win32') {
+    const link = path.join(root, 'unsafe-target')
+    fs.symlinkSync(targetDirectory, link)
+    assert.throws(() => evictWorkspaceArtifacts(metadata, link, target), /must not be a symlink/)
   }
 })
 
@@ -443,6 +579,31 @@ function publishingFixture(t) {
     upload: (file) => { const name = path.basename(file); uploads.push(name); stored.set(name, fs.readFileSync(file)) } } }
 }
 
+test('same-main CI reruns recover original signed native admission and reject changed premerge evidence', async (t) => {
+  const value = publishingFixture(t)
+  const recorded = { schemaVersion: 1, sourceRevision: identity.sourceRevision,
+    ciRun: { id: 90, run_attempt: 1 }, premerge: { runId: 80, runAttempt: 1, snapshotRevision: '8'.repeat(40) } }
+  const proofFile = path.join(value.outputDirectory, release.PROVENANCE)
+  const proof = JSON.parse(fs.readFileSync(proofFile))
+  proof.validation = recorded
+  for (const build of proof.builds) build.validation = clone(recorded)
+  signReceipt(proof, signingKey)
+  fs.writeFileSync(proofFile, JSON.stringify(proof))
+  for (const name of fs.readdirSync(value.outputDirectory)) value.stored.set(name, fs.readFileSync(path.join(value.outputDirectory, name)))
+  const current = { ...clone(recorded), ciRun: { ...recorded.ciRun, run_attempt: 2 } }
+  const outputDirectory = path.join(value.root, 'same-main-rerun'); fs.mkdirSync(outputDirectory)
+  const recovery = { identity: { ...identity, validation: current }, sourceRoot: value.sourceRoot,
+    outputDirectory, frontendBytes, signingKey, release: { assets: [...value.stored.keys()].map(name => ({ name })) },
+    readAsset: asset => value.stored.get(asset.name) }
+  await release.recoverPublishedRelease(recovery)
+  const original = JSON.parse(fs.readFileSync(path.join(outputDirectory, release.PROVENANCE)))
+  assert.deepEqual(original.validation, recorded)
+  assert.ok(original.builds.every(build => build.validation.ciRun.run_attempt === 1))
+  const changed = clone(current); changed.premerge.snapshotRevision = '9'.repeat(40)
+  await assert.rejects(() => release.recoverPublishedRelease({ ...recovery,
+    identity: { ...identity, validation: changed }, outputDirectory: path.join(value.root, 'rejected-rerun') }), /admission changed/)
+})
+
 if (!legacySuite) test('v2 refuses foreign executable contracts and Intel assets before any recovery read or upload', async (t) => {
   const value = publishingFixture(t)
   for (const name of ['bamboo-sidecars-v1.json', 'bamboo-executables-provenance-v1.json',
@@ -519,6 +680,48 @@ test('a full workflow rerun recovers the authenticated original bytes and upload
   assert.deepEqual(uploads, [release.MANIFEST])
 })
 
+test('same-main CI reruns recover original signed native admission and reject changed premerge evidence', async (t) => {
+  const value = publishingFixture(t)
+  const recorded = { schemaVersion: 1, sourceRevision: identity.sourceRevision,
+    ciRun: { id: 90, run_attempt: 1 }, premerge: { runId: 80, runAttempt: 1, snapshotRevision: '8'.repeat(40) } }
+  const proofFile = path.join(value.outputDirectory, release.PROVENANCE)
+  const proof = JSON.parse(fs.readFileSync(proofFile))
+  proof.validation = recorded
+  for (const build of proof.builds) build.validation = clone(recorded)
+  signReceipt(proof, signingKey)
+  fs.writeFileSync(proofFile, JSON.stringify(proof))
+  for (const name of fs.readdirSync(value.outputDirectory)) value.stored.set(name, fs.readFileSync(path.join(value.outputDirectory, name)))
+  const originalBytes = fs.readFileSync(proofFile)
+  const current = { ...clone(recorded), ciRun: { ...recorded.ciRun, run_attempt: 2 } }
+  const outputDirectory = path.join(value.root, 'same-main-rerun'); fs.mkdirSync(outputDirectory)
+  const recovery = { identity: { ...identity, validation: current }, sourceRoot: value.sourceRoot,
+    outputDirectory, frontendBytes, signingKey, release: { assets: [...value.stored.keys()].map(name => ({ name })) },
+    readAsset: asset => value.stored.get(asset.name) }
+  await release.recoverPublishedRelease(recovery)
+  assert.deepEqual(fs.readFileSync(path.join(outputDirectory, release.PROVENANCE)), originalBytes,
+    'Recovery must retain the exact authenticated checkpoint bytes')
+  const original = JSON.parse(fs.readFileSync(path.join(outputDirectory, release.PROVENANCE)))
+  assert.deepEqual(original.validation, recorded)
+  assert.ok(original.builds.every(build => build.validation.ciRun.run_attempt === 1))
+  for (const mutate of [
+    value => { value.ciRun.id++ }, value => { value.sourceRevision = '7'.repeat(40) },
+    value => { value.premerge.runId++ }, value => { value.premerge.runAttempt++ },
+    value => { value.premerge.snapshotRevision = '9'.repeat(40) }, value => { value.ciRun.run_attempt = 0 },
+  ]) {
+    const changed = clone(current); mutate(changed)
+    await assert.rejects(() => release.recoverPublishedRelease({ ...recovery,
+      identity: { ...identity, validation: changed }, outputDirectory: path.join(value.root, 'rejected-rerun') }))
+  }
+  // The signed checkpoint remains bound to the original admission. A nested
+  // build must not silently acquire the newer dispatch's admission identity.
+  const inconsistent = clone(proof)
+  inconsistent.builds[0].validation = clone(current)
+  signReceipt(inconsistent, signingKey)
+  value.stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(inconsistent)))
+  await assert.rejects(() => release.recoverPublishedRelease({ ...recovery,
+    outputDirectory: path.join(value.root, 'inconsistent-build') }), /must not move backwards/)
+})
+
 test('recovery rejects unsigned/tampered/foreign checkpoints, missing assets and corrupt bytes without any release writes', async (t) => {
   const value = publishingFixture(t); await release.publishAssets(value.context)
   const original = value.stored.get(release.PROVENANCE)
@@ -575,10 +778,27 @@ test('workflow retains successful-CI authority and binds its native matrix to th
   const final = source.split('  publish-executables:\n')[1]
   assert.match(source, /group: bamboo-crate-publication\n  queue: max\n  cancel-in-progress: false/)
   assert.equal(source.split('bamboo-release-controller/scripts/crate-release.cjs" plan').length - 1, 1)
+  const preparation = source.split('  automatic:\n')[1].split('  publish-crates:\n')[0]
+  const crates = source.split('  publish-crates:\n')[1].split('  executables:\n')[0]
+  assert.doesNotMatch(preparation, /crate-release\.cjs" publish|crate-release-lock\.py stamp/)
+  assert.match(crates, /needs: automatic/)
+  assert.ok(crates.includes('SOURCE_VALIDATION: ${{ needs.automatic.outputs.source_validation }}'))
+  assert.doesNotMatch(crates, /steps\.source\./, 'The crate worker must inherit preparation evidence across jobs')
+  assert.doesNotMatch(crates, /needs:.*executables|crate-release\.cjs" plan/)
+  assert.match(crates, /crate-release\.cjs" resume/)
+  assert.ok(crates.indexOf('crate-release.cjs" resume') < crates.indexOf('crate-release-lock.py stamp'))
   assert.match(matrix, /needs: automatic/)
   assert.doesNotMatch(matrix, /contents: write|secrets\.|api-only|cargo publish/)
   assert.ok(matrix.includes('matrix: ${{ fromJSON(needs.automatic.outputs.executable_matrix) }}'))
   assert.ok(matrix.includes('BAMBOO_EXECUTABLE_CONTRACT_VERSION: ${{ needs.automatic.outputs.executable_contract_version }}'))
+  assert.ok(matrix.includes('PREPARED_RELEASE: ${{ needs.automatic.outputs.prepared_release }}'))
+  assert.ok(matrix.includes('name: bamboo-prepared-frontend-attempt-${{ fromJSON(needs.automatic.outputs.prepared_release).runAttempt }}'))
+  assert.match(preparation, /name: bamboo-prepared-frontend-attempt-\$\{\{ github\.run_attempt \}\}/)
+  assert.ok(preparation.indexOf('crate-release.cjs" plan') < preparation.indexOf('name: bamboo-prepared-frontend-attempt-'))
+  assert.doesNotMatch(matrix, /GH_TOKEN:/)
+  assert.match(matrix, /workspaces: \$\{\{ steps\.cache_policy\.outputs\.workspace \}\}/)
+  assert.match(matrix, /cache-workspace-crates: false/)
+  assert.match(matrix, /save-if: \$\{\{ steps\.cache_policy\.outputs\.save == 'true' \}\}/)
   assert.ok(final.includes('BAMBOO_EXECUTABLE_CONTRACT_VERSION: ${{ needs.automatic.outputs.executable_contract_version }}'))
   assert.doesNotMatch(matrix, /inputs\./)
   assert.match(matrix, /persist-credentials: false/)
@@ -600,7 +820,7 @@ test('workflow retains successful-CI authority and binds its native matrix to th
   assert.doesNotMatch(matrix, /overwrite: true/)
   for (const match of source.matchAll(/uses: ([^\s]+)@([^\s]+)/g)) assert.match(match[2], /^[0-9a-f]{40}$/, 'Release actions must use immutable reviewed commits')
   assert.ok(final.includes('EXPECTED_BUILDS: ${{ toJSON(needs.executables.outputs) }}'))
-  assert.match(final, /needs: \[automatic, executables\]/)
+  assert.match(final, /needs: \[automatic, publish-crates, executables\]/)
   assert.match(final, /environment: bamboo-release\n    permissions:\n      contents: write/)
   assert.match(final, /bamboo-release-controller\/scripts\/sidecar-release.cjs" publish/)
   assert.doesNotMatch(final, /--clobber|cargo build|cargo publish|inputs\./)

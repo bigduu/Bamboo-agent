@@ -10,6 +10,8 @@ The [Release Process](./CONTRIBUTING.md#release-process) is authoritative for cu
 release repairs and publication. The [review rules](./AGENTS.md#pull-request-review)
 and actual branch protection remain mandatory. This policy accepts that `dev`
 can be temporarily unstable; it does not relax release or security requirements.
+Use the [CI and publication flow](./docs/releases/ci-publication-flow.md) for
+phase ownership, evidence reuse, activation and recovery.
 
 ## Ownership and parallel work
 
@@ -124,14 +126,17 @@ on a fixed snapshot when useful. Keep its actual outcomes visible; do not
 suppress failures, remove tests or make a skipped full test look like success.
 Applicable separate path-scoped workflows retain their own triggers.
 
-Frozen release/main validation retains every required check name, original test,
+Frozen release PR and explicit snapshot validation retain every required check name, original test,
 stack setting, timeout, failure propagation, frontend artifact policy and strict
 Clippy contract. Keep exact-source/tree, toolchain and before/after source
 cleanliness evidence. Consolidating equivalent heavy jobs must preserve these
 contracts and must not run the same reusable full suite twice.
 
 Keep one required check named `Test`: dev uses its compile-only mode and
-release/main/manual snapshots use its full mode. Do not skip the dev check or
+release PRs/manual snapshots use its full mode. Main pushes authenticate the
+completed release acceptance against the actual normal merge instead of
+rerunning the full Rust suite. That admission and the publisher must reject
+missing, stale, failed or mismatched evidence. Do not skip the dev check or
 add another same-named skipped job. This preserves the existing required-check
 configuration without a protection change. Verify the actual source and mode;
 never fabricate statuses, weaken main protection, or use merge overrides.
@@ -147,6 +152,14 @@ other repository capabilities that have not been verified.
 Name one release owner to cut, validate and promote each frozen candidate.
 Inventory any moving `dev → main` PR, preserve its independent work and evidence,
 then close or replace it with the recorded frozen release's PR.
+
+Within the one publisher run, reserve the exact source/version/frontend before
+fan-out. Crate publication and required native builds then execute concurrently
+in separate outputs. Native tasks use the original preparation attempt's sealed
+frontend transport and independent hash bindings. Final publication waits for
+both the complete verified crate closure and every required native receipt.
+Reuse compatible dependencies, but rebuild workspace/generated outputs for the
+actual source and version; caches cannot establish artifact acceptance.
 
 Keep one Bamboo publisher. Coordinate Bodhi/Zenith/Homebrew consumption after
 the actual published version/source is verified. Frozen version/source tags

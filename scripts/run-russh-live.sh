@@ -7,7 +7,14 @@ repo_root="$(cd -- "${script_dir}/.." && pwd)"
 readonly repo_root
 readonly fixture_dir="${repo_root}/crates/app/bamboo-broker/tests/fixtures/russh"
 
-for command_name in cargo docker ssh-keygen; do
+required_commands=(docker ssh-keygen)
+if [[ -z "${BAMBOO_RUSSH_TEST_EXECUTABLE:-}" ]]; then
+  required_commands+=(cargo)
+elif [[ ! -x "$BAMBOO_RUSSH_TEST_EXECUTABLE" ]]; then
+  echo "compiled SSH test executable is missing or not executable" >&2
+  exit 1
+fi
+for command_name in "${required_commands[@]}"; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "required command is unavailable: ${command_name}" >&2
     exit 1
@@ -103,11 +110,15 @@ if [[ ! "${ssh_port}" =~ ^[0-9]+$ ]] || (( ssh_port < 1 || ssh_port > 65535 )); 
 fi
 
 cd "${repo_root}"
+test_command=(cargo test --locked -p bamboo-broker --test russh_live
+  russh_deploys_through_reverse_tunnel -- --exact --ignored --nocapture --test-threads=1)
+if [[ -n "${BAMBOO_RUSSH_TEST_EXECUTABLE:-}" ]]; then
+  test_command=("$BAMBOO_RUSSH_TEST_EXECUTABLE" russh_deploys_through_reverse_tunnel
+    --exact --ignored --nocapture --test-threads=1 --color=never)
+fi
 RUSSH_HOST=127.0.0.1 \
 RUSSH_PORT="${ssh_port}" \
 RUSSH_USER=deploy \
 RUSSH_KEY_PATH="${private_key}" \
 RUSSH_WORKER_ID="node-russh-live-${run_identity}" \
-cargo test --locked -p bamboo-broker --test russh_live \
-  russh_deploys_through_reverse_tunnel -- \
-  --exact --ignored --nocapture --test-threads=1
+"${test_command[@]}"

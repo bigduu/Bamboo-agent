@@ -96,6 +96,10 @@ cargo test -- --nocapture
 cargo test test_bamboo_config_default
 ```
 
+For opt-in local groups, compile once per explicit input profile and retain
+independent group evidence with the [grouped test controller](docs/testing/test-groups.md).
+Its lightweight fixtures need only Node; it changes no CI or release gate.
+
 ### Code Style
 
 We follow standard Rust conventions:
@@ -200,7 +204,7 @@ bamboo/
 
 The automatic publisher also provides the standard complete Bamboo executables
 for standalone and desktop reuse. See [Shared Bamboo executables](docs/releases/shared-executable-assets.md)
-for the four-platform assets, source/version provenance, browser host archive,
+for the source-selected platform assets, source/version provenance, browser host archive,
 and consumer hash verification contract. These assets retain all release gates
 described below.
 
@@ -217,7 +221,10 @@ and security requirements still apply.
 Keep the existing required `Test` check name. Its dev mode must actually compile
 and propagate source-verification or Cargo failures; it must not be skipped.
 A green dev `Test` means compilation passed, not that the full suite ran. The
-same check retains full validation for release/main and explicit snapshots.
+same check retains full validation for release PRs and explicit snapshots.
+Main-push admission verifies the completed release evidence and actual merge;
+it does not repeat the full Rust suite. The [CI and publication flow](docs/releases/ci-publication-flow.md)
+defines the separate phase contracts, activation and recovery.
 Main's required checks are unchanged.
 
 A normal fast-forward direct push may be used once dev's actual branch rule
@@ -342,10 +349,10 @@ GitHub Release. The workflow must first reach main through that normal promotion
 do not promote unrelated development solely to activate it. Source manifests
 keep `0.0.0`; temporary publication stamps an unused `YYYY.M.N` UTC version and
 embeds the committed frontend lock. Keep this successful-main-CI path as the
-single automatic Bamboo publisher. Once Bamboo is published, downstream Zenith
-runs should use `targets=bodhi`, verify the already-published Bamboo version and
-source, and consume that release instead of dispatching a duplicate Bamboo
-publication.
+single automatic Bamboo publisher. Downstream consumers verify the already-published
+Bamboo version, source and artifact hashes, then consume that release through
+their own protected flow. They do not allocate a second Bamboo version or
+dispatch duplicate publication.
 
 Main pushes also trigger documentation publication to public GitHub Pages.
 GHCR image publication is triggered separately by `v*`/`bamboo-v*` tag pushes or
@@ -373,8 +380,10 @@ source and protected-dev controller history. It binds the server-recorded merged
 release PR's exact head/base, two-parent merge and unchanged release-head tree,
 cut → release-head → protected-dev ancestry, successful full pre-merge release CI
 (including all three platform builds and Promotion Source), and successful main
-push CI. Main push routing may skip platform builds already required before
-merge. Jobs must complete strictly before the merge; failed-only reruns may
+push admission. Main pushes reuse this authenticated pre-merge evidence rather
+than repeat the full Rust suite. Historical full main-CI evidence keeps its own
+contract; skipped jobs are never relabeled as executed full validation.
+Pre-merge jobs must complete strictly before the merge; failed-only reruns may
 retain earlier successful job attempts. Missing, ambiguous, stale or failed
 evidence stops before checkout or publication credentials. The main branch's
 protection flag is not publication evidence. The existing exact-head review
@@ -405,6 +414,22 @@ for recovery. Every downloaded crate must match its reserved checksum, Git sourc
 SHA and, for bamboo-server, original embedded frontend bytes. Only the complete
 verified closure becomes a public GitHub Release. Reruns reuse the matching
 source/frontend reservation; completed reruns verify without republishing.
+
+After this single reservation, the crate publisher and source-selected native
+matrix run concurrently. Preparation uploads exactly the preserved frontend
+manifest and ZIP as same-run transport; its independent job output binds the
+signed identity, hashes and original preparation attempt. Native workers verify
+these files without reading a private draft or receiving publication credentials.
+The crate worker authenticates the original reservation and resumes its fixed
+version without reallocating or replacing sealed frontend assets. Final asset
+publication waits for both the completed crate closure and all required native
+results. A public crate Release alone does not establish binary availability.
+
+Native dependency caches map the real runner-temp Cargo target directory and
+bind source profile, toolchain, lockfile, producer contract and target. Restored
+workspace binaries, fingerprints and generated frontend outputs are evicted
+before the formal build. Historical v1 and frozen restore-only sources cannot
+write these caches. Compiler/profile/wrapper restrictions remain intact.
 
 Authenticated reservations and registry versions advance the full-u64 allocator;
 unsigned names only occupy candidates. Verified registry/source ancestry prevents
@@ -498,17 +523,22 @@ Bamboo uses GitHub Actions for continuous integration and publishing:
   `Quick Checks` (Node policy tests and Rust formatting). A compile pass does not
   replace the owner's
   pre-merge local affected-test and regression-coverage evidence. The same `Test`
-  check runs the complete build/test job for fixed-snapshot manual validation,
-  frozen release PRs into `main`, and main pushes; dev mode does not execute
-  the full suite. Release/main and manual full-validation routes
+  check runs the complete build/test job for fixed-snapshot manual validation
+  and frozen release PRs into `main`; dev mode does not execute
+  the full suite. Release PRs and manual full-validation routes
   retain the comprehensive checks and all-feature `E2E Tests`. Same-repository
   frozen release PRs and manual full validation run the Linux/macOS/Windows
-  release-build matrix. Main pushes retain their complete CI/publication queue.
+  release-build matrix. Main pushes retain their CI/publication queue and
+  authenticate the complete pre-merge release evidence against the actual merge
+  through lightweight admission; they do not repeat the full Rust suite.
   Required-check configuration is separate from these workflow triggers; verify
   the intended dev compilation gate and preserve all main requirements before declaring
   the policy active. PR cache cleanup remains scoped to that same-repository PR.
 - **CodeQL** (`.github/workflows/codeql.yml`) -- Runs the Actions, JavaScript/TypeScript, Python, and Rust analyses for pull requests into `main`, pushes to `main`, and explicit manual dispatches. Routine `dev` activity does not run CodeQL.
 - **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes successful main CI source commits to crates.io and GitHub Releases with verified same-source recovery. Manual/Zenith dispatches retain explicit versions, the exact locked frontend and `dry_run`.
+  One authenticated preparation feeds concurrent crate publication and native
+  builds; final publication joins both results. See the [phase guide](docs/releases/ci-publication-flow.md)
+  for identity, transport, cache and retry requirements.
   Its Cargo PATH entrypoint, including metadata invoked from Python, runs the
   digest-pinned official Rust 1.99.0 Bookworm image. Docker failure is fatal;
   publication never falls back to host Cargo. The entrypoint needs Node,

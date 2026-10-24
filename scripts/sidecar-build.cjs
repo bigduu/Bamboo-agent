@@ -7,7 +7,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 const { contractForVersion, boundSourceContract, artifactName, targetOutputKey, fileIdentity, sha256, binaryArchitecture,
-  execute, git, workflowIdentity, publishedRelease, assetBytes } = require('./sidecar-release.cjs')
+  execute, git, workflowIdentity, preparedFrontend } = require('./sidecar-release.cjs')
 
 function nativeTarget(platform = process.platform, arch = process.arch) {
   const targets = { 'darwin/arm64': 'aarch64-apple-darwin', 'darwin/x64': 'x86_64-apple-darwin',
@@ -87,27 +87,82 @@ function verifyStampedVersions(metadata, version, { root = process.cwd(), manife
   return server
 }
 
+function nativeCachePolicy({ root, temporary, contractVersion, target, sourceParents, sourceMessage, cutRevision }) {
+  assert.ok(contractForVersion(contractVersion).targets.includes(target))
+  const frozen = cutRevision === 'da348a63f1d019a22df547c78575c500b6b1294e' ||
+    sourceParents.split(' ')[0] === 'dbafb74522794012fc8f0a61e761817b3913989a' ||
+    sourceMessage.toLowerCase().includes('release/da348a63f1d019a22df547c78575c500b6b1294e')
+  const targetDirectory = path.join(path.resolve(temporary), 'bamboo-executable-target')
+  const compatibility = ['Cargo.toml', 'Cargo.lock', 'scripts/sidecar-build.cjs', '.cargo/config.toml']
+    .filter((name) => fs.existsSync(path.join(root, name)))
+    .map((name) => `${name}:${fileIdentity(path.join(root, name), 8 * 1024 * 1024).sha256}`).join('\n')
+  // rust-cache adds compiler, environment, Cargo.lock and workspace manifests.
+  // This namespace also isolates the producer ABI, target and source build profile.
+  return { workspace: `${path.resolve(root)} -> ${path.relative(path.resolve(root), targetDirectory)}`,
+    key: `bamboo-executable-deps-v${contractVersion}-${target}-${sha256(compatibility)}`,
+    save: contractVersion === 2 && !frozen }
+}
+
+function evictWorkspaceArtifacts(metadata, targetDirectory, target) {
+  // Keep third-party dependencies, but never let a restored workspace binary,
+  // fingerprint or generated embed output stand in for this run's actual build.
+  const members = new Set(metadata.workspace_members)
+  const names = new Set(metadata.packages.filter((item) => members.has(item.id))
+    .flatMap((item) => [item.name, ...item.targets.map((entry) => entry.name)])
+    .flatMap((name) => [name, name.replaceAll('-', '_')]))
+  for (const name of names) assert.match(name, /^[a-zA-Z0-9_-]+$/)
+  const regularDirectory = (directory) => {
+    let info
+    try { info = fs.lstatSync(directory) } catch (error) { if (error.code === 'ENOENT') return false; throw error }
+    assert.ok(info.isDirectory() && !info.isSymbolicLink(), 'Cached build directory must not be a symlink')
+    return true
+  }
+  if (!regularDirectory(targetDirectory)) return []
+  const removed = []
+  const matches = (entry) => [...names].some((name) =>
+    [name, `lib${name}`].some((prefix) => entry === prefix || entry.startsWith(`${prefix}-`) || entry.startsWith(`${prefix}.`)))
+  const targetRoot = path.join(targetDirectory, target)
+  regularDirectory(targetRoot)
+  for (const profile of [path.join(targetDirectory, 'release'), path.join(targetRoot, 'release')]) {
+    if (!regularDirectory(profile)) continue
+    for (const relative of ['', 'deps', 'build', '.fingerprint']) {
+      const directory = path.join(profile, relative)
+      if (!regularDirectory(directory)) continue
+      for (const name of fs.readdirSync(directory)) {
+        if (!matches(name)) continue
+        const file = path.join(directory, name)
+        fs.rmSync(file, { recursive: true, force: true })
+        removed.push(path.relative(targetDirectory, file))
+      }
+    }
+  }
+  return removed
+}
+
 async function main() {
   const identity = workflowIdentity()
   const contractVersion = boundSourceContract()
   const target = process.env.BAMBOO_RELEASE_TARGET
   assert.ok(contractForVersion(contractVersion).targets.includes(target))
   assert.equal(nativeTarget(), target, 'Build and runtime verification require a native target')
-  const { release, receipt } = publishedRelease(identity)
+  if (process.argv[2] === 'cache-policy') {
+    const policy = nativeCachePolicy({ root: process.cwd(), temporary: process.env.RUNNER_TEMP, contractVersion, target,
+      cutRevision: identity.validation?.cutRevision,
+      sourceParents: git(['show', '-s', '--format=%P', 'HEAD']), sourceMessage: git(['show', '-s', '--format=%B', 'HEAD']) })
+    fs.appendFileSync(process.env.GITHUB_OUTPUT, `workspace=${policy.workspace}\nkey=${policy.key}\nsave=${policy.save}\n`)
+    return
+  }
+  assert.equal(process.argv[2], undefined)
   const temporary = path.resolve(process.env.RUNNER_TEMP)
+  const { receipt, files } = preparedFrontend(identity, {
+    preparation: JSON.parse(process.env.PREPARED_RELEASE), contractVersion,
+    inputDirectory: path.join(temporary, 'bamboo-prepared-frontend') })
   const output = path.join(temporary, 'bamboo-executable-output')
   const targetDirectory = path.join(temporary, 'bamboo-executable-target')
   fs.mkdirSync(output)
   const buildEnv = buildEnvironment(process.env, targetDirectory)
   const frontendRoot = 'crates/app/bamboo-server/frontend_package'
-  for (const [name, expected, maximum] of [
-    ['frontend-manifest.json', receipt.frontendBytes.manifestSha256, 1024 * 1024],
-    ['lotus-frontend.zip', receipt.frontendBytes.archiveSha256, 256 * 1024 * 1024],
-  ]) {
-    const asset = release.assets.find((entry) => entry.name === name)
-    assert.ok(asset, 'Completed release is missing its preserved embedded frontend')
-    const bytes = assetBytes(asset, maximum)
-    assert.equal(sha256(bytes), expected, 'Preserved frontend bytes differ from crate publication')
+  for (const { name, bytes } of files) {
     fs.writeFileSync(path.join(frontendRoot, name), bytes)
   }
   const allowed = new Set(git(['ls-files', '*Cargo.toml']).split('\n'))
@@ -125,6 +180,8 @@ async function main() {
   // package actually managed by the existing stamper, including CLI and server.
   const server = verifyStampedVersions(metadata, identity.version, { manifestPaths })
   const stamped = sourceState(allowed)
+  const removed = evictWorkspaceArtifacts(metadata, targetDirectory, target)
+  console.log(`Evicted ${removed.length} cached workspace artifacts; dependency cache remains available`)
   const args = ['build', '--locked', '--release', '--verbose', '--bin', 'bamboo', '--target', target,
     '--message-format=json-render-diagnostics']
   const log = path.join(temporary, 'bamboo-executable-cargo.jsonl')
@@ -162,5 +219,6 @@ async function main() {
     version: identity.version, sourceRevision: identity.sourceRevision, sha256: provenance.sha256 }))
 }
 
-module.exports = { nativeTarget, buildEnvironment, verifyBuildMessages, sourceState, verifyStampedVersions }
+module.exports = { nativeTarget, buildEnvironment, verifyBuildMessages, sourceState, verifyStampedVersions,
+  nativeCachePolicy, evictWorkspaceArtifacts }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })
