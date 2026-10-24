@@ -96,7 +96,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "8854921a5f81b6c254563e69d9a71e4019161f3648f5b7511ed9793687a66acb"
+          ADMISSION_HELPER_SHA256: "4ccc047bbaeedab71e93db9b6470f5a3131c1b395260f852baebef19ff9109b7"
         run: |
           python3 - <<'PYTHON'
           import base64

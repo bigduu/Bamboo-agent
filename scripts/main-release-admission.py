@@ -491,7 +491,9 @@ if ci is not None:
             for label, packages in CRATE_PACKAGES[source].items():
                 # One skipped literal covers the ordinary axis and appended
                 # include rows; expanded results must cover both completely.
-                suffix = "${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }}" if source in SERVER_BLOCKS else ""
+                # The jobs API canonicalizes the expression AST even when the
+                # matrix is skipped; bind its observed parenthesized spelling.
+                suffix = "${{ ((matrix.server_block && format('/{0}', matrix.server_block)) || '') }}" if source in SERVER_BLOCKS else ""
                 literal = f"{label} (${{{{ matrix.crate }}}}{suffix})"
                 expanded = [f"{label} ({package})" for package in packages]
                 expanded.extend(f"{label} (bamboo-server/{block})" for block in SERVER_BLOCKS.get(source, ()))

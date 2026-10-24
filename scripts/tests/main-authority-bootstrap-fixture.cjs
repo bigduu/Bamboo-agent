@@ -117,7 +117,7 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
     'Test Block (${{ matrix.id }})', 'E2E Block (${{ matrix.id }})', 'Test Doctest (${{ matrix.id }})',
     'Test Block 2 (${{ matrix.id }})', 'E2E Block 2 (${{ matrix.id }})']
     : ['Test SSH', ...['Test', 'E2E'].map(label => current
-      ? label + " (${{ matrix.crate }}${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }})"
+      ? label + " (${{ matrix.crate }}${{ ((matrix.server_block && format('/{0}', matrix.server_block)) || '') }})"
       : label + ' (${{ matrix.crate }})')]
   const jobs = (id, promotion) => ({ jobs: (!promotion && light
     ? ['Validation Source', 'Test', 'Main Release Admission', 'Quick Checks', 'Promotion Source',
@@ -555,6 +555,22 @@ with patch('subprocess.check_output', output):
         const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
         jobs.splice(jobs.findIndex(job => job.name === platforms.at(-1)), 1)
       }])
+      if (current) for (const label of ['Test', 'E2E']) {
+        negatives.push([`${label} skipped matrix must use the observed jobs API literal`, x => {
+          const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
+          jobs.find(job => job.name.startsWith(`${label} (`)).name =
+            label + " (${{ matrix.crate }}${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }})"
+        }])
+        negatives.push([`${label} partial expanded skipped matrix cannot hide a server block`, x => {
+          expandedSkipped(x)
+          const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
+          jobs.splice(jobs.findIndex(job => job.name === `${label} (bamboo-server/browser)`), 1)
+        }])
+        negatives.push([`${label} literal and expanded skipped native jobs cannot be mixed`, x => {
+          const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
+          jobs.push({ ...copy(jobs.at(-1)), id: 99999, name: `${label} (bamboo-server/browser)` })
+        }])
+      }
     } else {
       for (const [name, change] of [
         ['main push payload changed source', x => { x.event.after = foreign }],
