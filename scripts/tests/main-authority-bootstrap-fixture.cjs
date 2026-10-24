@@ -16,12 +16,13 @@ const FULL = ['Validation Source', 'Test', 'E2E Tests', 'Lint',
 const PLATFORMS = ['Build (ubuntu-latest)', 'Build (macos-latest)', 'Build (windows-latest)']
 
 async function verify(t, bootstrap, producer = 'v1', mode = 'publication', options = {}) {
-  assert.match(producer, /^v(?:[12345]|4-main-3488)$/)
+  assert.match(producer, /^v(?:[123456]|4-main-3488)$/)
   assert.ok(['publication', 'main'].includes(mode))
-  const current = producer === 'v5', grouped = producer === 'v3'
+  const current = producer === 'v6', grouped = producer === 'v3'
   const actualMain = producer === 'v4-main-3488'
-  const crates = producer === 'v4' || actualMain || current, light = grouped || crates
-  const platformLabel = current ? 'Platform Tests' : 'Build'
+  const legacyCrates = producer === 'v4' || actualMain
+  const crates = legacyCrates || producer === 'v5' || current, light = grouped || crates
+  const platformLabel = current || producer === 'v5' ? 'Platform Tests' : 'Build'
   const platforms = PLATFORMS.map(name => name.replace('Build', platformLabel))
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-main-authority-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
@@ -41,7 +42,11 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
   const producerHelperDigest = createHash('sha256').update(producerHelper).digest('hex')
   const cratePackages = crates ? [...definition.toString().split('  test-crates:\n')[1]
     .split(/\n  [a-z0-9-]+:/)[0].matchAll(/^          - ([a-z0-9-]+)$/gm)].map(match => match[1]) : []
-  const crateNames = ['Test SSH', ...['Test', 'E2E'].flatMap(label => cratePackages.map(crate => `${label} (${crate})`))]
+  const serverBlocks = current ? [...definition.toString().split('  test-crates:\n')[1]
+    .split(/\n  [a-z0-9-]+:/)[0].matchAll(/^            server_block: ([a-z-]+)$/gm)].map(match => match[1]) : []
+  const crateNames = ['Test SSH', ...['Test', 'E2E'].flatMap(label => [
+    ...cratePackages.map(crate => `${label} (${crate})`),
+    ...serverBlocks.map(block => `${label} (bamboo-server/${block})`)])]
   fs.mkdirSync(path.join(directory, '.github/workflows'), { recursive: true })
   fs.writeFileSync(path.join(directory, '.github/workflows/ci.yml'), definition)
   git('add', '.github/workflows/ci.yml')
@@ -111,7 +116,9 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
   const mainSkipped = grouped ? ['Test Build', 'E2E Build', 'Test SSH Build', 'Test SSH',
     'Test Block (${{ matrix.id }})', 'E2E Block (${{ matrix.id }})', 'Test Doctest (${{ matrix.id }})',
     'Test Block 2 (${{ matrix.id }})', 'E2E Block 2 (${{ matrix.id }})']
-    : ['Test SSH', 'Test (${{ matrix.crate }})', 'E2E (${{ matrix.crate }})']
+    : ['Test SSH', ...['Test', 'E2E'].map(label => current
+      ? label + " (${{ matrix.crate }}${{ ((matrix.server_block && format('/{0}', matrix.server_block)) || '') }})"
+      : label + ' (${{ matrix.crate }})')]
   const jobs = (id, promotion) => ({ jobs: (!promotion && light
     ? ['Validation Source', 'Test', 'Main Release Admission', 'Quick Checks', 'Promotion Source',
       'E2E Tests', 'Lint', 'MSRV (Rust 1.95)', 'Security Audit', 'cargo-deny (licenses/bans/advisories/sources)',
@@ -120,7 +127,8 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
     id: id * 100 + i, name, run_id: id, run_attempt: 1,
     head_sha: promotion ? head : source, head_branch: promotion ? release : 'main',
     steps: crates && promotion && crateNames.includes(name) ? ['Set up job', name === 'Test SSH' ? 'Run SSH fixture'
-      : name.startsWith('Test (') ? 'Test crate' : 'Run E2E crate tests', 'Complete job']
+      : name.startsWith('Test (') ? (name.includes('bamboo-server/') ? 'Test server block' : 'Test crate')
+      : (name.includes('bamboo-server/') ? 'Run E2E server block' : 'Run E2E crate tests'), 'Complete job']
       .map((name, i) => ({ name, number: i + 1, status: 'completed', conclusion: 'success' })) : steps,
     status: 'completed', conclusion: (promotion && grouped && emptyNames.includes(name)) ||
       (!promotion && light && !['Validation Source', 'Test', 'Main Release Admission'].includes(name)) ? 'skipped' : 'success',
@@ -276,8 +284,11 @@ with patch('subprocess.check_output', output):
   }
   const expandedSkipped = x => {
     const expand = list => list.flatMap(job => {
-      if (job.name.includes('${{ matrix.crate }}')) return cratePackages.map((crate, index) => ({
-        ...copy(job), id: job.id * 100 + index, name: job.name.replace('${{ matrix.crate }}', crate) }))
+      if (job.name.includes('${{ matrix.crate }}')) {
+        const label = job.name.startsWith('Test ') ? 'Test' : 'E2E'
+        return [...cratePackages, ...serverBlocks.map(block => `bamboo-server/${block}`)].map((crate, index) => ({
+          ...copy(job), id: job.id * 100 + index, name: `${label} (${crate})` }))
+      }
       if (!job.name.includes('${{ matrix.os }}')) return [job]
       const platforms = job.name.startsWith('TLS Fixture') ? ['macos-latest', 'windows-latest']
         : ['ubuntu-latest', 'macos-latest', 'windows-latest']
@@ -334,12 +345,22 @@ with patch('subprocess.check_output', output):
       job.run_attempt = 2
       x.routes['actions/runs/222/attempts/2/jobs?per_page=10&page=1'] = {jobs: [copy(job)]}
     }]] : []),
+    ...(current ? [['failed server block alone retains the other native job attempts', x => {
+      x.routes['actions/runs/222'].run_attempt = 2
+      x.routes.graphql.data.node.workflowRun.runAttempt = 2
+      const job = x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.find(j => j.name === 'Test (bamboo-server/browser)')
+      job.run_attempt = 2
+      x.routes['actions/runs/222/attempts/2/jobs?per_page=10&page=1'] = {jobs: [copy(job)]}
+    }]] : []),
     ...(light && mode === 'publication' ? [['complete expanded skipped matrices remain compatible', expandedSkipped]] : []),
   ].filter(([name]) => !(light && name === 'main push legitimately skips platform builds already checked before merge'))) await t.test(name, () => {
     const result = run(change)
     assert.equal(result.status, 0, result.stderr)
     if (crates) assert.deepEqual(result.calls.trim().split('\n').filter(route => route.endsWith('/logs')),
       ['actions/jobs/22200/logs'], 'Native crate jobs need no grouped result logs or receipts')
+    if (current) for (const label of ['Test', 'E2E']) for (const block of serverBlocks) {
+      assert.ok(result.stdout.includes(`${label} (bamboo-server/${block})=`), 'The authenticated job-attempt log includes every server block')
+    }
     const output = result.output.trimEnd().split('\n')
     assert.equal(output[0], `revision=${source}`)
     if (light && mode === 'publication') {
@@ -450,6 +471,28 @@ with patch('subprocess.check_output', output):
         x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.find(job => job.name === name).conclusion = 'skipped'
       }])
     }
+    if (current) for (const label of ['Test', 'E2E']) for (const block of serverBlocks) {
+      const name = `${label} (bamboo-server/${block})`
+      for (const state of ['missing', 'skipped']) negatives.push([`server block ${name} cannot be ${state}`, x => {
+        const list = x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs
+        const index = list.findIndex(job => job.name === name)
+        if (state === 'missing') list.splice(index, 1)
+        else list[index].conclusion = state
+      }])
+    }
+    if (current) for (const [name, change] of [
+      ['an unsplit server job cannot replace its blocks', list => {
+        list.splice(list.findIndex(job => job.name === 'Test (bamboo-server/browser)'), 1)
+        list.push({ ...copy(list[1]), name: 'Test (bamboo-server)' })
+      }],
+      ['server Cargo step cannot be skipped', list => {
+        list.find(job => job.name === 'E2E (bamboo-server/integration)').steps[1].conclusion = 'skipped'
+      }],
+      ['server job must match its original attempt', (_, input) => {
+        const list = input.routes['actions/runs/222/attempts/1/jobs?per_page=10&page=1'].jobs
+        list.splice(list.findIndex(job => job.name === 'Test (bamboo-server/browser)'), 1)
+      }],
+    ]) negatives.push([name, x => change(x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs, x)])
   }
   if (light) {
     const changeDefinition = (x, transform, revision = head) => {
@@ -473,15 +516,18 @@ with patch('subprocess.check_output', output):
       const alternate = fs.readFileSync(path.join(__dirname,
         `fixtures/main-authority-admission-${actualMain ? 'v4' : 'v4-main-3488'}.py`))
       const alternateDigest = createHash('sha256').update(alternate).digest('hex')
-      if (!current) {
+      if (legacyCrates) {
         negatives.push(['approved sibling pin cannot authenticate unchanged verifier bytes', x =>
           changeDefinition(x, text => text.replace(producerHelperDigest, alternateDigest))])
         negatives.push(['approved pin cannot authenticate sibling verifier bytes', x => {
           x.routes[`contents/scripts/main-release-admission.py?ref=${head}`].content = alternate.toString('base64')
         }])
       }
-      const foreignHelpers = current ? [alternate,
-        fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v4.py'))] : [helper]
+      const platformHelper = fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v5.py'))
+      const foreignHelpers = current ? [alternate, platformHelper,
+        fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v4.py'))]
+        : producer === 'v5' ? [helper, alternate,
+          fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v4.py'))] : [helper, platformHelper]
       for (const body of foreignHelpers) negatives.push(['verifier digest cannot cross its authenticated workflow family: ' +
         createHash('sha256').update(body).digest('hex'), x => {
         const digest = createHash('sha256').update(body).digest('hex')
@@ -509,6 +555,22 @@ with patch('subprocess.check_output', output):
         const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
         jobs.splice(jobs.findIndex(job => job.name === platforms.at(-1)), 1)
       }])
+      if (current) for (const label of ['Test', 'E2E']) {
+        negatives.push([`${label} skipped matrix must use the observed jobs API literal`, x => {
+          const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
+          jobs.find(job => job.name.startsWith(`${label} (`)).name =
+            label + " (${{ matrix.crate }}${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }})"
+        }])
+        negatives.push([`${label} partial expanded skipped matrix cannot hide a server block`, x => {
+          expandedSkipped(x)
+          const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
+          jobs.splice(jobs.findIndex(job => job.name === `${label} (bamboo-server/browser)`), 1)
+        }])
+        negatives.push([`${label} literal and expanded skipped native jobs cannot be mixed`, x => {
+          const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
+          jobs.push({ ...copy(jobs.at(-1)), id: 99999, name: `${label} (bamboo-server/browser)` })
+        }])
+      }
     } else {
       for (const [name, change] of [
         ['main push payload changed source', x => { x.event.after = foreign }],
@@ -525,7 +587,7 @@ with patch('subprocess.check_output', output):
     const attempt = 'actions/runs/222/attempts/1/jobs?per_page=10&page=1'
     negatives.push(['platform labels must match the authenticated producer', x => {
       for (const route of [latest, attempt]) for (const job of x.routes[route].jobs) {
-        if (platforms.includes(job.name)) job.name = job.name.replace(platformLabel, current ? 'Build' : 'Platform Tests')
+        if (platforms.includes(job.name)) job.name = job.name.replace(platformLabel, platformLabel === 'Platform Tests' ? 'Build' : 'Platform Tests')
       }
     }])
     for (const [name, change] of [

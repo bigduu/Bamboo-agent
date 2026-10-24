@@ -39,6 +39,17 @@ The three optimized executable builds happen only in the automatic main
 publisher, after the actual main source, version and frontend bytes are bound.
 Historical producers keep their original build-job acceptance requirements.
 
+Unit and E2E retain ordinary native Cargo jobs for the other 29 crates. Server
+jobs use eight static matrix rows: seven library blocks and one integration tail.
+Library blocks assign each name to the first matching namespace in the order
+browser, chat, execute, settings, app-state, remaining handlers, then remaining
+library tests; each block skips every earlier filter, including nested matches.
+The integration tail has no library-name filters. Unit selects the default
+integration targets, compiles examples and runs doctests; E2E selects all-feature
+integration targets. Failed jobs can be rerun independently. Each library block
+still compiles the server test binary, so more jobs alone do not prove a net
+speedup; record compile, execution, queue and complete-CI timings separately.
+
 Keep required check names stable. Do not use empty success jobs, synthesized
 statuses, `[skip ci]`, or workflow-level path filters to bypass required gates.
 The current repository's verified capabilities, rather than an assumed merge

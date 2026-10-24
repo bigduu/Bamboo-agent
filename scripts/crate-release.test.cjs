@@ -1025,6 +1025,15 @@ test('complete publication keeps canonical main CI authority and authenticates e
   assert.equal(actualMain.replace(/ADMISSION_HELPER_SHA256: "[0-9a-f]{64}"/,
     'ADMISSION_HELPER_SHA256: "<PINNED_ADMISSION_HELPER>"'), crateNormalized)
   assert.ok(preflight.includes(`LEGACY_MAIN_CRATE_HELPER = "${sha256(actualMainHelper)}"`))
+  const platform = fs.readFileSync('scripts/tests/fixtures/main-authority-ci-v5.yml', 'utf8')
+  const platformHelper = fs.readFileSync('scripts/tests/fixtures/main-authority-admission-v5.py')
+  assert.equal(sha256(platform), '573e6f26c65a41f461a5936b19182df01725b8dbbb16d2e2db26b3acda04dbf2')
+  assert.equal(sha256(platformHelper), '4b26870d8c3a978c9fab601182a8d4074ecfc3f12a3cb2840cde93e548cd0400')
+  const platformNormalized = platform.replace(/ADMISSION_HELPER_SHA256: "[0-9a-f]{64}"/,
+    'ADMISSION_HELPER_SHA256: "<PINNED_ADMISSION_HELPER>"')
+  assert.ok(preflight.includes(`LEGACY_PLATFORM_PRODUCER = "${sha256(platformNormalized)}"`))
+  assert.ok(preflight.includes(`LEGACY_PLATFORM_HELPER = "${sha256(platformHelper)}"`))
+  assert.match(platform, /name: Platform Tests \(\$\{\{ matrix\.os \}\}\)/)
 })
 
 test('trusted manual publication and automatic receipts share a queue while dry runs stay credential-free', () => {
@@ -1417,9 +1426,14 @@ test('actual main3488 native crate CI retains its original verifier and Build ev
     workflowPython('Authorize the exact source before checkout'), 'v4-main-3488')
 })
 
-test('current native crate CI requires independently authenticated Platform Tests', async (t) => {
+test('published native crate CI retains its original Platform Tests evidence', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
     workflowPython('Authorize the exact source before checkout'), 'v5')
+})
+
+test('current server blocks require independently authenticated native jobs and Platform Tests', async (t) => {
+  await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
+    workflowPython('Authorize the exact source before checkout'), 'v6')
 })
 
 test('job pagination retains its bounded capacity and leaves other API routes unchanged', () => {
@@ -1503,7 +1517,7 @@ test('eighty native CI jobs require every latest and original-attempt page', asy
 
 test('main-push admission executes the same pinned verifier with read-only authority', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
-    workflowPython('Authenticate completed release acceptance before checkout', '.github/workflows/ci.yml'), 'v5', 'main')
+    workflowPython('Authenticate completed release acceptance before checkout', '.github/workflows/ci.yml'), 'v6', 'main')
 })
 
 test('temporary manifest stamping uses exact internal dependency versions and real package versions', (t) => {
