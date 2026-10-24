@@ -21,6 +21,7 @@ function script(step) {
   return match[1].split("\n").map((line) => line.replace(/^          /, "")).join("\n");
 }
 function assertRouting(source) {
+  assert.match(source, /^permissions:\n  contents: read\n/m);
   assertSharedBuild(source);
   assertMainAdmission(source);
   const quick = job(source, "quick-checks");

@@ -108,6 +108,7 @@ PLATFORM_JOBS = {}
 TEST_JOBS = {}
 GROUPED_PLANS = {}
 CRATE_PACKAGES = {}
+SERVER_BLOCKS = {}
 
 def platform_jobs(revision):
     return PLATFORM_JOBS.get(revision, PLATFORMS)
@@ -118,6 +119,9 @@ def crate_jobs(ci, jobs):
     packages = CRATE_PACKAGES[ci["head_sha"]]
     commands = {f"{label} ({package})": step for label, step in (
         ("Test", "Test crate"), ("E2E", "Run E2E crate tests")) for package in packages[label]}
+    for label, step in (("Test", "Test server block"), ("E2E", "Run E2E server block")):
+        commands.update({f"{label} (bamboo-server/{block})": step
+                         for block in SERVER_BLOCKS.get(ci["head_sha"], ())})
     commands["Test SSH"] = "Run SSH fixture"
     actual = {job["name"] for job in jobs
               if re.match(r"^(?:Test|E2E) \(", job["name"]) or job["name"] == "Test SSH"}
@@ -305,7 +309,10 @@ REVIEWED_PRODUCERS = frozenset((PRODUCER_V1, PRODUCER_V2))
 # by a sentinel. Then independently authenticate the actual helper bytes below.
 # This breaks the workflow -> helper -> workflow hash cycle, without excluding
 # a job, global environment, trigger, command or permission from review.
-CURRENT_PRODUCER = "b8e4760f405745ab787f94373908efe9055c4eb1bfa848bdedbc7e3bd2b6c385"
+CURRENT_PRODUCER = "1eebf0643e6b87dc6f75bb0ff18e486afe6963f7d972bc36c861d98d588a5acc"
+# Published F4 kept one job per crate and the native Platform Tests matrix.
+LEGACY_PLATFORM_PRODUCER = "b8e4760f405745ab787f94373908efe9055c4eb1bfa848bdedbc7e3bd2b6c385"
+LEGACY_PLATFORM_HELPER = "4b26870d8c3a978c9fab601182a8d4074ecfc3f12a3cb2840cde93e548cd0400"
 # The previous native crate producer also required three optimized Build jobs.
 LEGACY_CRATE_PRODUCER = "4fc5b81c53b931118c5c248bbdcffa212fe8dde0fa810c70365bd2cc33c142b7"
 LEGACY_CRATE_HELPER = "c567d1f41fe70acc23bd5f4a64b1d7048c6edbd667a1d2fc12f0f5e4c7ba0529"
@@ -334,8 +341,9 @@ def producer_definition(revision):
         return "full"
     pins = re.findall(PIN, raw)
     normalized = hashlib.sha256(re.sub(PIN, NORMALIZED_PIN, raw)).hexdigest()
-    assert normalized in {CURRENT_PRODUCER, LEGACY_CRATE_PRODUCER, LEGACY_GROUPED_PRODUCER, LEGACY_ADMISSION_PRODUCER}, "Unknown source-admission producer"
+    assert normalized in {CURRENT_PRODUCER, LEGACY_PLATFORM_PRODUCER, LEGACY_CRATE_PRODUCER, LEGACY_GROUPED_PRODUCER, LEGACY_ADMISSION_PRODUCER}, "Unknown source-admission producer"
     expected_helpers = {CURRENT_PRODUCER: {ADMISSION_SCRIPT_SHA256},
+                        LEGACY_PLATFORM_PRODUCER: {LEGACY_PLATFORM_HELPER},
                         LEGACY_CRATE_PRODUCER: {LEGACY_MAIN_CRATE_HELPER, LEGACY_CRATE_HELPER},
                         LEGACY_GROUPED_PRODUCER: {LEGACY_GROUPED_HELPER},
                         LEGACY_ADMISSION_PRODUCER: {LEGACY_ADMISSION_HELPER}}[normalized]
@@ -345,8 +353,9 @@ def producer_definition(revision):
     assert helper["encoding"] == "base64" and len(helper["content"]) <= 180000
     body = base64.b64decode(helper["content"], validate=False)
     assert len(body) <= 128000 and hashlib.sha256(body).hexdigest() == expected_helper, "Admission helper bytes changed"
-    if normalized in {CURRENT_PRODUCER, LEGACY_CRATE_PRODUCER}:
+    if normalized in {CURRENT_PRODUCER, LEGACY_PLATFORM_PRODUCER, LEGACY_CRATE_PRODUCER}:
         packages = {}
+        server_blocks = {}
         for job, label in (("test-crates", "Test"), ("e2e-crates", "E2E")):
             block = re.search(rb"^  " + job.encode() + rb":\n(.*?)(?=^  [a-z0-9-]+:|\Z)", raw, re.M | re.S)
             assert block, "Missing native crate matrix"
@@ -355,9 +364,19 @@ def producer_definition(revision):
             packages[label] = tuple(re.findall(rb"^          - ([a-z0-9-]+)$", entries.group(1), re.M))
             assert len(packages[label]) == len(set(packages[label])), "Duplicate crate matrix entry"
             packages[label] = tuple(item.decode() for item in packages[label])
+            if normalized == CURRENT_PRODUCER:
+                entries = re.search(rb"^        include:\n((?:          - crate: bamboo-server\n            server_block: [a-z-]+\n)+)", block.group(1), re.M)
+                assert entries, "Missing static server blocks"
+                server_blocks[label] = tuple(item.decode() for item in re.findall(
+                    rb"^            server_block: ([a-z-]+)$", entries.group(1), re.M))
+                assert server_blocks[label] == ("browser", "chat", "execute", "settings", "app-state", "handlers", "other", "integration"), "Unexpected server blocks"
+                assert "bamboo-server" not in packages[label], "Server also has an unsplit crate job"
         assert packages["Test"] == packages["E2E"], "Default and E2E crate lists differ"
+        if normalized == CURRENT_PRODUCER:
+            assert server_blocks["Test"] == server_blocks["E2E"], "Default and E2E server blocks differ"
+            SERVER_BLOCKS[revision] = server_blocks["Test"]
         CRATE_PACKAGES[revision] = packages
-        PLATFORM_JOBS[revision] = PLATFORM_TESTS if normalized == CURRENT_PRODUCER else PLATFORMS
+        PLATFORM_JOBS[revision] = PLATFORM_TESTS if normalized in {CURRENT_PRODUCER, LEGACY_PLATFORM_PRODUCER} else PLATFORMS
         return "crates"
     return "grouped" if normalized == LEGACY_GROUPED_PRODUCER else "admission"
 
@@ -469,7 +488,16 @@ if ci is not None:
                     ("Platform Tests" if platform_jobs(source) == PLATFORM_TESTS else "Build", "os", ("ubuntu-latest", "macos-latest", "windows-latest"))]
         if contract == "crates":
             skipped.append("Test SSH")
-            matrices.extend((label, "crate", packages) for label, packages in CRATE_PACKAGES[source].items())
+            for label, packages in CRATE_PACKAGES[source].items():
+                # One skipped literal covers the ordinary axis and appended
+                # include rows; expanded results must cover both completely.
+                suffix = "${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }}" if source in SERVER_BLOCKS else ""
+                literal = f"{label} (${{{{ matrix.crate }}}}{suffix})"
+                expanded = [f"{label} ({package})" for package in packages]
+                expanded.extend(f"{label} (bamboo-server/{block})" for block in SERVER_BLOCKS.get(source, ()))
+                found = [job["name"] for job in main_jobs if job["name"] in [literal] + expanded]
+                assert found == [literal] or (len(found) == len(expanded) and set(found) == set(expanded)), label
+                skipped.extend(found)
         for label, axis, values in matrices:
             literal = label + " (${{ matrix." + axis + " }})"
             expanded = [f"{label} ({value})" for value in values]

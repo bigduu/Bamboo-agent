@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict")
 const { createHash } = require("node:crypto")
-const { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require("node:fs")
+const { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } = require("node:fs")
 const { spawnSync } = require("node:child_process")
 const os = require("node:os")
 const path = require("node:path")
@@ -218,7 +218,15 @@ function crateMatrix(source) {
   return [...list[1].matchAll(/          - ([a-z0-9-]+)/gu)].map((match) => match[1])
 }
 
-test("native Test and E2E matrices cover every default workspace crate once", () => {
+const serverBlocks = ["browser", "chat", "execute", "settings", "app-state", "handlers", "other", "integration"]
+const serverFilters = ["browser::", "handlers::agent::chat::", "handlers::agent::execute::", "handlers::settings::", "app_state::", "handlers::"]
+
+function serverMatrix(source) {
+  return [...source.matchAll(/^          - crate: ([a-z0-9-]+)\n            server_block: ([a-z-]+)$/gmu)]
+    .map((match) => ({ crate: match[1], block: match[2] }))
+}
+
+test("native matrices cover ordinary crates once and server through eight appended rows", () => {
   const manifest = readFileSync("Cargo.toml", "utf8")
   const members = manifest.match(/^default-members = \[([\s\S]*?)^\]/mu)
   assert.ok(members)
@@ -229,16 +237,126 @@ test("native Test and E2E matrices cover every default workspace crate once", ()
   assert.ok(packages.length > 0)
   for (const id of ["test-crates", "e2e-crates"]) {
     const source = job(id)
-    assert.deepEqual(crateMatrix(source).sort(), packages)
+    assert.deepEqual(crateMatrix(source).sort(), packages.filter((name) => name !== "bamboo-server"))
+    assert.deepEqual(serverMatrix(source), serverBlocks.map((block) => ({ crate: "bamboo-server", block })))
+    assert.ok(source.includes("${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }}"))
     assert.match(source, /fail-fast: false/u)
     assert.match(source, /timeout-minutes: 75/u)
     assert.ok(source.includes('TEST_CRATE: ${{ matrix.crate }}'))
+    assert.ok(source.includes('SERVER_TEST_BLOCK: ${{ matrix.server_block }}'))
+    assert.match(source, /if: matrix\.crate != 'bamboo-server'\n        run: cargo test/u)
+    assert.match(source, /if: matrix\.crate == 'bamboo-server'\n        shell: bash/u)
+    assert.ok(source.includes("${{ matrix.server_block && format('-{0}', matrix.server_block) || '' }}"))
     assert.ok(source.includes(comprehensiveOnly))
     assert.doesNotMatch(source, /max-parallel:|continue-on-error:|command: (build|run)|npm ci|--test-threads=1/u)
   }
   assert.match(job("test-crates"), /run: cargo test --locked --no-fail-fast -p "\$TEST_CRATE"\n/u)
   assert.match(job("e2e-crates"), /run: cargo test --locked --no-fail-fast -p "\$TEST_CRATE" --all-features --lib --tests\n/u)
   assert.doesNotMatch(workflow, /test-build:|e2e-build:|test-blocks:|test-doctests:|grouped-tests|ci-artifacts|plan-id:/u)
+  assert.match(workflow, /^permissions:\n  contents: read\n/mu)
+  assert.match(job("main-release-admission"), /^    permissions:\n      contents: read\n      actions: read\n/mu)
+})
+
+function serverCommand(id) {
+  const name = id === "test-crates" ? "Test server block" : "Run E2E server block"
+  const step = job(id).split(`      - name: ${name}\n`)[1]?.split(/\n      - /u)[0]
+  const command = step?.match(/        run: \|\n([\s\S]*)/u)?.[1].replace(/^          /gmu, "")
+  assert.ok(command)
+  return command
+}
+
+function serverCargoFixture(t) {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-server-cargo-"))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const calls = path.join(directory, "calls")
+  writeFileSync(path.join(directory, "cargo"), `#!/usr/bin/env node
+const fs = require('node:fs')
+const args = process.argv.slice(2)
+fs.appendFileSync(process.env.CARGO_CALLS, JSON.stringify(args) + '\\n')
+const kind = args.includes('--doc') ? 'docs' : args[0] === 'build' ? 'examples' : args.includes('--lib') ? 'library' : 'integration'
+process.exit(process.env.TEST_FAIL_KIND === kind ? 17 : 0)
+`, { mode: 0o755 })
+  return (id, block, failure = "") => {
+    writeFileSync(calls, "")
+    const result = spawnSync("bash", ["-e", "-o", "pipefail", "-c", serverCommand(id)], {
+      encoding: "utf8", env: { ...process.env, PATH: `${directory}:${process.env.PATH}`,
+        SERVER_TEST_BLOCK: block, CARGO_CALLS: calls, TEST_FAIL_KIND: failure },
+    })
+    return { ...result, calls: readFileSync(calls, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) }
+  }
+}
+
+test("server library commands partition every nested namespace by its first matching filter", (t) => {
+  const run = serverCargoFixture(t)
+  const names = ["future::unclassified::tests::case", ...serverFilters.map((filter) => `future::${filter}tests::case`)]
+  for (const first of serverFilters) for (const second of serverFilters) {
+    names.push(`future::${first}nested::${second}tests::case`)
+  }
+  for (const id of ["test-crates", "e2e-crates"]) {
+    const predicates = serverBlocks.slice(0, -1).map((block, index) => {
+      const result = run(id, block)
+      assert.equal(result.status, 0, result.stderr)
+      assert.equal(result.calls.length, 1)
+      const args = result.calls[0]
+      const separator = args.indexOf("--")
+      assert.ok(separator > 0)
+      assert.deepEqual(args.slice(0, 5), ["test", "--locked", "--no-fail-fast", "-p", "bamboo-server"])
+      assert.equal(args.includes("--all-features"), id === "e2e-crates")
+      const include = index < serverFilters.length ? serverFilters[index] : undefined
+      assert.deepEqual(args.slice(args.indexOf("--lib") + 1, separator), include ? [include] : [])
+      assert.deepEqual(args.slice(separator + 1), serverFilters.slice(0, index).flatMap((filter) => ["--skip", filter]))
+      return (name) => (!include || name.includes(include)) && serverFilters.slice(0, index).every((filter) => !name.includes(filter))
+    })
+    for (const name of names) assert.equal(predicates.filter((predicate) => predicate(name)).length, 1, name)
+    assert.equal(run(id, "browser", "library").status, 17)
+    const unknown = run(id, "unknown")
+    assert.notEqual(unknown.status, 0)
+    assert.deepEqual(unknown.calls, [])
+  }
+})
+
+test("server Cargo target layout keeps the unfiltered integration tail complete", (t) => {
+  const root = "crates/app/bamboo-server"
+  const python = ["python3", "python3.12", "python3.14"].find((candidate) => spawnSync(candidate, ["-c", "import tomllib"]).status === 0)
+  assert.ok(python, "Cargo target policy requires Python with tomllib")
+  const parsed = spawnSync(python, ["-c", "import json,tomllib; print(json.dumps(tomllib.load(open('crates/app/bamboo-server/Cargo.toml','rb'))))"], { encoding: "utf8" })
+  assert.equal(parsed.status, 0, parsed.stderr)
+  const manifest = JSON.parse(parsed.stdout)
+  assert.notEqual(manifest.package.autotests, false)
+  assert.notEqual(manifest.package.autolib, false)
+  assert.notEqual(manifest.package.autoexamples, false)
+  assert.deepEqual(manifest.lib ?? {}, {})
+  assert.deepEqual(manifest.bin ?? [], [])
+  assert.deepEqual(manifest.example ?? [], [])
+  assert.deepEqual(manifest.bench ?? [], [])
+  assert.deepEqual(manifest.test, [{ name: "env_cache_isolation", path: "tests/env_cache_isolation.rs", "required-features": ["test-utils"] }])
+  assert.deepEqual(manifest.features.default ?? [], [])
+  assert.ok(manifest.features["test-utils"])
+  assert.equal(existsSync(path.join(root, "src/main.rs")), false)
+  assert.equal(existsSync(path.join(root, "src/bin")), false)
+  const entries = readdirSync(path.join(root, "tests"), { withFileTypes: true })
+  for (const entry of entries.filter((entry) => entry.isDirectory())) {
+    assert.equal(existsSync(path.join(root, "tests", entry.name, "main.rs")), false, "directory targets need an explicit selector review")
+  }
+  const targets = entries.filter((entry) => entry.isFile() && entry.name.endsWith(".rs")).map((entry) => entry.name.slice(0, -3)).sort()
+  assert.ok(targets.includes("env_cache_isolation"))
+  const run = serverCargoFixture(t)
+  const unit = run("test-crates", "integration")
+  assert.equal(unit.status, 0, unit.stderr)
+  assert.equal(unit.calls.length, 3)
+  const base = ["test", "--locked", "--no-fail-fast", "-p", "bamboo-server"]
+  assert.deepEqual(unit.calls[0], [...base, ...targets.filter((name) => name !== "env_cache_isolation").flatMap((name) => ["--test", name])])
+  assert.deepEqual(unit.calls[1], ["build", "--locked", "-p", "bamboo-server", "--examples"])
+  assert.deepEqual(unit.calls[2], [...base, "--doc"])
+  const e2e = run("e2e-crates", "integration")
+  assert.equal(e2e.status, 0, e2e.stderr)
+  assert.deepEqual(e2e.calls, [[...base, "--all-features", "--test", "*"]])
+  for (const failure of ["integration", "examples", "docs"]) {
+    const failed = run("test-crates", "integration", failure)
+    assert.equal(failed.status, 17)
+    assert.equal(failed.calls.length, 3, "a failure must not skip the other default target kinds")
+  }
+  assert.equal(run("e2e-crates", "integration", "integration").status, 17)
 })
 
 test("native summaries reject failed, cancelled, skipped and missing crate results", () => {

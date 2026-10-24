@@ -13,6 +13,9 @@ on:
   pull_request:
     branches: [ dev, main ]
 
+permissions:
+  contents: read
+
 # Queue every main push for its own release gate; supersede iterative PR/manual
 # validation independently. Full promotion validation still covers three platforms.
 concurrency:
@@ -93,7 +96,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "4b26870d8c3a978c9fab601182a8d4074ecfc3f12a3cb2840cde93e548cd0400"
+          ADMISSION_HELPER_SHA256: "c7029d9d5bd2380fc702a8d4aff55f4fa4d198b15dd222061691b9713ca5079f"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -384,7 +387,7 @@ jobs:
           test -z "$source_status"
 
   test-crates:
-    name: Test (${{ matrix.crate }})
+    name: Test (${{ matrix.crate }}${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }})
     needs: validation-source
     if: needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
@@ -417,15 +420,32 @@ jobs:
           - bamboo-engine
           - bamboo-orchestration
           - bamboo-tools
-          - bamboo-server
           - bamboo-server-tools
           - bamboo-sdk
           - bamboo-tui
           - bamboo-client-core
           - bamboo-broker
+        include:
+          - crate: bamboo-server
+            server_block: browser
+          - crate: bamboo-server
+            server_block: chat
+          - crate: bamboo-server
+            server_block: execute
+          - crate: bamboo-server
+            server_block: settings
+          - crate: bamboo-server
+            server_block: app-state
+          - crate: bamboo-server
+            server_block: handlers
+          - crate: bamboo-server
+            server_block: other
+          - crate: bamboo-server
+            server_block: integration
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
       TEST_CRATE: ${{ matrix.crate }}
+      SERVER_TEST_BLOCK: ${{ matrix.server_block }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -441,12 +461,55 @@ jobs:
       - name: Stage frontend package
         run: node scripts/frontend-package.cjs stage
       - name: Test crate
+        if: matrix.crate != 'bamboo-server'
         run: cargo test --locked --no-fail-fast -p "$TEST_CRATE"
+      - name: Test server block
+        if: matrix.crate == 'bamboo-server'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$SERVER_TEST_BLOCK" == integration ]]; then
+            integration_args=()
+            for file in crates/app/bamboo-server/tests/*.rs; do
+              target=${file##*/}
+              target=${target%.rs}
+              # The only feature-gated integration target is disabled in default mode.
+              if [[ "$target" != env_cache_isolation ]]; then
+                integration_args+=(--test "$target")
+              fi
+            done
+            test "${#integration_args[@]}" -gt 0
+            server_status=0
+            cargo test --locked --no-fail-fast -p bamboo-server "${integration_args[@]}" || server_status=$?
+            cargo build --locked -p bamboo-server --examples || server_status=$?
+            cargo test --locked --no-fail-fast -p bamboo-server --doc || server_status=$?
+            exit "$server_status"
+          fi
+          case "$SERVER_TEST_BLOCK" in
+            browser) server_index=0 ;;
+            chat) server_index=1 ;;
+            execute) server_index=2 ;;
+            settings) server_index=3 ;;
+            app-state) server_index=4 ;;
+            handlers) server_index=5 ;;
+            other) server_index=6 ;;
+            *) exit 1 ;;
+          esac
+          server_filters=('browser::' 'handlers::agent::chat::' 'handlers::agent::execute::' 'handlers::settings::' 'app_state::' 'handlers::')
+          server_args=(--lib)
+          if (( server_index < ${#server_filters[@]} )); then
+            server_args+=("${server_filters[$server_index]}")
+          fi
+          server_args+=(--)
+          for (( index=0; index<server_index; index++ )); do
+            server_args+=(--skip "${server_filters[$index]}")
+          done
+          cargo test --locked --no-fail-fast -p bamboo-server "${server_args[@]}"
       - name: Preserve failed synthetic Ticket fixture evidence
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: fixture-failure-test-${{ matrix.crate }}-${{ github.run_attempt }}
+          name: fixture-failure-test-${{ matrix.crate }}${{ matrix.server_block && format('-{0}', matrix.server_block) || '' }}-${{ github.run_attempt }}
           path: |
             /tmp/bamboo-1481-ticket-lifecycle-*/host/host.log
             /tmp/bamboo-1481-ticket-lifecycle-*/host/question-readiness.json
@@ -455,7 +518,7 @@ jobs:
           retention-days: 7
 
   e2e-crates:
-    name: E2E (${{ matrix.crate }})
+    name: E2E (${{ matrix.crate }}${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }})
     needs: validation-source
     if: needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
@@ -488,15 +551,32 @@ jobs:
           - bamboo-engine
           - bamboo-orchestration
           - bamboo-tools
-          - bamboo-server
           - bamboo-server-tools
           - bamboo-sdk
           - bamboo-tui
           - bamboo-client-core
           - bamboo-broker
+        include:
+          - crate: bamboo-server
+            server_block: browser
+          - crate: bamboo-server
+            server_block: chat
+          - crate: bamboo-server
+            server_block: execute
+          - crate: bamboo-server
+            server_block: settings
+          - crate: bamboo-server
+            server_block: app-state
+          - crate: bamboo-server
+            server_block: handlers
+          - crate: bamboo-server
+            server_block: other
+          - crate: bamboo-server
+            server_block: integration
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-all-features
       TEST_CRATE: ${{ matrix.crate }}
+      SERVER_TEST_BLOCK: ${{ matrix.server_block }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -512,12 +592,42 @@ jobs:
       - name: Stage frontend package
         run: node scripts/frontend-package.cjs stage
       - name: Run E2E crate tests
+        if: matrix.crate != 'bamboo-server'
         run: cargo test --locked --no-fail-fast -p "$TEST_CRATE" --all-features --lib --tests
+      - name: Run E2E server block
+        if: matrix.crate == 'bamboo-server'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$SERVER_TEST_BLOCK" == integration ]]; then
+            cargo test --locked --no-fail-fast -p bamboo-server --all-features --test '*'
+            exit
+          fi
+          case "$SERVER_TEST_BLOCK" in
+            browser) server_index=0 ;;
+            chat) server_index=1 ;;
+            execute) server_index=2 ;;
+            settings) server_index=3 ;;
+            app-state) server_index=4 ;;
+            handlers) server_index=5 ;;
+            other) server_index=6 ;;
+            *) exit 1 ;;
+          esac
+          server_filters=('browser::' 'handlers::agent::chat::' 'handlers::agent::execute::' 'handlers::settings::' 'app_state::' 'handlers::')
+          server_args=(--lib)
+          if (( server_index < ${#server_filters[@]} )); then
+            server_args+=("${server_filters[$server_index]}")
+          fi
+          server_args+=(--)
+          for (( index=0; index<server_index; index++ )); do
+            server_args+=(--skip "${server_filters[$index]}")
+          done
+          cargo test --locked --no-fail-fast -p bamboo-server --all-features "${server_args[@]}"
       - name: Preserve failed synthetic Ticket fixture evidence
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: fixture-failure-e2e-${{ matrix.crate }}-${{ github.run_attempt }}
+          name: fixture-failure-e2e-${{ matrix.crate }}${{ matrix.server_block && format('-{0}', matrix.server_block) || '' }}-${{ github.run_attempt }}
           path: |
             /tmp/bamboo-1481-ticket-lifecycle-*/host/host.log
             /tmp/bamboo-1481-ticket-lifecycle-*/host/question-readiness.json
