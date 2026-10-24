@@ -2343,7 +2343,7 @@ async fn prepare_round_context_auto_compresses_when_hard_limit_truncation_pressu
             crate::runtime::context::CORE_AGENT_DIRECTIVES,
         ),
     ));
-    for index in 0..20 {
+    for index in 0..32 {
         session.messages.push(Message::user(format!(
             "Old user message {index} {}",
             "historical context under hard-limit pressure ".repeat(30)
