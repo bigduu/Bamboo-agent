@@ -16,9 +16,12 @@ const FULL = ['Validation Source', 'Test', 'E2E Tests', 'Lint',
 const PLATFORMS = ['Build (ubuntu-latest)', 'Build (macos-latest)', 'Build (windows-latest)']
 
 async function verify(t, bootstrap, producer = 'v1', mode = 'publication', options = {}) {
-  assert.match(producer, /^v[1234]$/)
+  assert.match(producer, /^v[12345]$/)
   assert.ok(['publication', 'main'].includes(mode))
-  const grouped = producer === 'v3', crates = producer === 'v4', light = grouped || crates
+  const current = producer === 'v5', grouped = producer === 'v3'
+  const crates = producer === 'v4' || current, light = grouped || crates
+  const platformLabel = current ? 'Platform Tests' : 'Build'
+  const platforms = PLATFORMS.map(name => name.replace('Build', platformLabel))
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-main-authority-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const git = (...args) => {
@@ -28,11 +31,12 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
   }
   git('init', '-q')
   // Frozen producer bytes, not an active workflow or a caller-authored receipt.
-  const definition = fs.readFileSync(crates ? '.github/workflows/ci.yml'
+  const definition = fs.readFileSync(current ? '.github/workflows/ci.yml'
     : path.join(__dirname, `fixtures/main-authority-ci-${producer}.yml`))
   const helper = fs.readFileSync('scripts/main-release-admission.py')
   const helperDigest = createHash('sha256').update(helper).digest('hex')
-  const producerHelper = grouped ? fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v3.py')) : helper
+  const producerHelper = grouped || producer === 'v4'
+    ? fs.readFileSync(path.join(__dirname, `fixtures/main-authority-admission-${producer}.py`)) : helper
   const producerHelperDigest = createHash('sha256').update(producerHelper).digest('hex')
   const cratePackages = crates ? [...definition.toString().split('  test-crates:\n')[1]
     .split(/\n  [a-z0-9-]+:/)[0].matchAll(/^          - ([a-z0-9-]+)$/gm)].map(match => match[1]) : []
@@ -110,8 +114,8 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
   const jobs = (id, promotion) => ({ jobs: (!promotion && light
     ? ['Validation Source', 'Test', 'Main Release Admission', 'Quick Checks', 'Promotion Source',
       'E2E Tests', 'Lint', 'MSRV (Rust 1.95)', 'Security Audit', 'cargo-deny (licenses/bans/advisories/sources)',
-      'Documentation', 'TLS Fixture (${{ matrix.os }})', 'ToolEvent Recorder E2E (${{ matrix.os }})', 'Build (${{ matrix.os }})', ...mainSkipped]
-    : [...FULL, ...(grouped ? groupedNames : crates ? crateNames : []), ...(promotion ? [...PLATFORMS, 'Promotion Source'] : [])]).map((name, i) => ({
+      'Documentation', 'TLS Fixture (${{ matrix.os }})', 'ToolEvent Recorder E2E (${{ matrix.os }})', platformLabel + ' (${{ matrix.os }})', ...mainSkipped]
+    : [...FULL, ...(grouped ? groupedNames : crates ? crateNames : []), ...(promotion ? [...platforms, 'Promotion Source'] : [])]).map((name, i) => ({
     id: id * 100 + i, name, run_id: id, run_attempt: 1,
     head_sha: promotion ? head : source, head_branch: promotion ? release : 'main',
     steps: crates && promotion && crateNames.includes(name) ? ['Set up job', name === 'Test SSH' ? 'Run SSH fixture'
@@ -291,7 +295,7 @@ with patch('subprocess.check_output', output):
     }],
     ['unprotected main with complete normal merge evidence', () => {}],
     ['main push legitimately skips platform builds already checked before merge', x => {
-      x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs.push(...PLATFORMS.map(name => ({ name, run_id: 111, status: 'completed', conclusion: 'skipped' })))
+      x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs.push(...platforms.map(name => ({ name, run_id: 111, status: 'completed', conclusion: 'skipped' })))
     }],
     ['protected main does not change the evidence requirement', x => { x.routes['branches/main'].protected = true }],
     ['normal dev advancement and deleted release ref need no historical ref lookup', x => {
@@ -320,6 +324,12 @@ with patch('subprocess.check_output', output):
       x.routes['actions/runs/222'].run_attempt = 2
       x.routes.graphql.data.node.workflowRun.runAttempt = 2
       const job = x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.find(j => j.name.startsWith('Test ('))
+      job.run_attempt = 2
+      x.routes['actions/runs/222/attempts/2/jobs?per_page=10&page=1'] = {jobs: [copy(job)]}
+    }], ['failed platform alone can rerun while earlier successful jobs remain valid', x => {
+      x.routes['actions/runs/222'].run_attempt = 2
+      x.routes.graphql.data.node.workflowRun.runAttempt = 2
+      const job = x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.find(j => j.name === platforms[0])
       job.run_attempt = 2
       x.routes['actions/runs/222/attempts/2/jobs?per_page=10&page=1'] = {jobs: [copy(job)]}
     }]] : []),
@@ -468,12 +478,12 @@ with patch('subprocess.check_output', output):
       }])
       negatives.push(['mixed literal and expanded skipped matrix is ambiguous', x => {
         const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
-        jobs.push({ ...copy(jobs.at(-1)), id: 99999, name: 'Build (ubuntu-latest)' })
+        jobs.push({ ...copy(jobs.at(-1)), id: 99999, name: platforms[0] })
       }])
       negatives.push(['partial expanded skipped matrix cannot hide a platform', x => {
         expandedSkipped(x)
         const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
-        jobs.splice(jobs.findIndex(job => job.name === 'Build (windows-latest)'), 1)
+        jobs.splice(jobs.findIndex(job => job.name === platforms.at(-1)), 1)
       }])
     } else {
       for (const [name, change] of [
@@ -483,9 +493,29 @@ with patch('subprocess.check_output', output):
       ]) negatives.push([name, change])
     }
   }
-  for (const name of PLATFORMS) negatives.push([`pre-merge CI cannot skip ${name}`, x => {
+  for (const name of platforms) negatives.push([`pre-merge CI cannot skip ${name}`, x => {
     x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.find(job => job.name === name).conclusion = 'skipped'
   }])
+  if (crates) {
+    const latest = 'actions/runs/222/jobs?filter=latest&per_page=10&page=1'
+    const attempt = 'actions/runs/222/attempts/1/jobs?per_page=10&page=1'
+    negatives.push(['platform labels must match the authenticated producer', x => {
+      for (const route of [latest, attempt]) for (const job of x.routes[route].jobs) {
+        if (platforms.includes(job.name)) job.name = job.name.replace(platformLabel, current ? 'Build' : 'Platform Tests')
+      }
+    }])
+    for (const [name, change] of [
+      ['missing platform', list => list.splice(list.findIndex(job => job.name === platforms[0]), 1)],
+      ['duplicate platform', list => list.push(copy(list.find(job => job.name === platforms[0])))],
+      ['failed platform', list => { list.find(job => job.name === platforms[0]).conclusion = 'failure' }],
+      ['wrong platform source', list => { list.find(job => job.name === platforms[0]).head_sha = foreign }],
+      ['late platform completion', list => { list.find(job => job.name === platforms[0]).completed_at = pull.merged_at }],
+    ]) negatives.push([name, x => change(x.routes[latest].jobs)])
+    negatives.push(['platform must belong to its original attempt', x => {
+      const list = x.routes[attempt].jobs
+      list.splice(list.findIndex(job => job.name === platforms[0]), 1)
+    }])
+  }
   const suite = x => x.routes.graphql.data.node
   const sourceJob = x => x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs[0]
   const raw = x => x.routes['actions/jobs/22200/logs']
