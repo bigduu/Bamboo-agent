@@ -54,13 +54,15 @@ def api(route):
 
 def pages(route, field=None):
     result = []
-    page_limit = 20 if re.search(r"/jobs(?:\?|$)", route) else 10
+    # Large job-list responses can fail upstream; retain the 2,000-job bound.
+    jobs = re.search(r"/jobs(?:\?|$)", route)
+    page_size, page_limit = (10, 200) if jobs else (100, 10)
     for page in range(1, page_limit + 1):
-        data = api(f"{route}{'&' if '?' in route else '?'}per_page=100&page={page}")
+        data = api(f"{route}{'&' if '?' in route else '?'}per_page={page_size}&page={page}")
         rows = data[field] if field else data
-        assert isinstance(rows, list) and len(rows) <= 100
+        assert isinstance(rows, list) and len(rows) <= page_size
         result.extend(rows)
-        if len(rows) < 100:
+        if len(rows) < page_size:
             return result
     raise AssertionError("Publication proof exceeds the bounded API page limit")
 
