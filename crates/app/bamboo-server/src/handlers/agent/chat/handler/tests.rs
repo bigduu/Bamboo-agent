@@ -3337,12 +3337,18 @@ mod optional_model_e2e {
         let state = new_state().await;
         let session_id = "workflow-reserved-before-commit";
         seed_active_instruction_workflow(&state, session_id, "plan").await;
-        let before = state
+        let mut before = state
             .storage
             .load_session(session_id)
             .await
             .expect("load seeded session")
             .expect("seeded session");
+        // Keep this race about Workflow publication. A missing Workspace would
+        // make Chat repair its Source scope and retain the runners read guard
+        // across the barrier, preventing the competing reservation itself.
+        before
+            .set_workspace_path_meta(state.app_data_dir.canonicalize().unwrap().to_string_lossy());
+        state.save_and_cache_session(&mut before).await;
         let expected_workflow_metadata = workflow_runtime_metadata(&before);
         let catalog = state.skill_manager.store().skill_catalog_snapshot().await;
         let review = catalog
@@ -3381,10 +3387,11 @@ mod optional_model_e2e {
         let reached_permit = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
             tokio::select! {
                 permit = &mut reached => permit.expect("workflow commit barrier remains open"),
-                early = &mut response => panic!(
-                    "typed chat completed before the commit barrier: {}",
-                    early.status()
-                ),
+                early = &mut response => {
+                    let status = early.status();
+                    let body: Value = test::read_body_json(early).await;
+                    panic!("typed chat completed before the commit barrier: {status}; {body}");
+                },
             }
         })
         .await
@@ -3393,11 +3400,20 @@ mod optional_model_e2e {
 
         let mut runner = crate::app_state::AgentRunner::new();
         runner.status = crate::app_state::AgentStatus::Pending;
-        state
-            .agent_runners
-            .write()
+        let mut runners = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, async {
+            tokio::select! {
+                runners = state.agent_runners.write() => runners,
+                early = &mut response => {
+                    let status = early.status();
+                    let body: Value = test::read_body_json(early).await;
+                    panic!("typed chat completed before the competing reservation: {status}; {body}");
+                },
+            }
+        })
             .await
-            .insert(session_id.to_string(), runner);
+            .expect("the pre-commit Workflow barrier must permit a competing reservation");
+        runners.insert(session_id.to_string(), runner);
+        drop(runners);
         barrier.resume.add_permits(1);
 
         let response = tokio::time::timeout(CONCURRENCY_ASSERT_TIMEOUT, &mut response)
@@ -5591,14 +5607,16 @@ mod native_inbox_wait_boundaries {
 async fn root_chat_receipt_disconnected_commit_retains_real_owner_and_single_durable_input() {
     use actix_web::{test, web, App};
     use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
+    use serde_json::Value;
     let home = tempfile::tempdir().unwrap();
     let state = web::Data::new(crate::AppState::new(home.path().into()).await.unwrap());
     let id = "root-chat-disconnected-receipt";
-    state
-        .storage
-        .save_session(&Session::new(id, "test-model"))
-        .await
-        .unwrap();
+    // The real owner is bound before Chat. Preserve its exact Workspace scope
+    // so this request exercises disconnect-safe admission, not a live scope
+    // change that must correctly be rejected before any commit.
+    let mut root = Session::new(id, "test-model");
+    root.set_workspace_path_meta(home.path().canonicalize().unwrap().to_string_lossy());
+    state.storage.save_session(&root).await.unwrap();
     let root = state.storage.load_session(id).await.unwrap().unwrap();
     let sender = state.get_session_event_sender(id).await;
     let mut owner = match reserve_session_execution(
@@ -5634,9 +5652,15 @@ async fn root_chat_receipt_disconnected_commit_retains_real_owner_and_single_dur
         tokio::time::timeout(std::time::Duration::from_secs(20), async {
             tokio::select! {
                 permit = barrier.reached.acquire() => permit.unwrap().forget(),
-                early = &mut response => panic!("Root Chat returned before durable barrier: {}",early.status()),
+                early = &mut response => {
+                    let status = early.status();
+                    let body: Value = test::read_body_json(early).await;
+                    panic!("Root Chat returned before durable barrier: {status}; {body}");
+                },
             }
-        }).await.unwrap();
+        })
+        .await
+        .expect("Root Chat reaches its durable admission barrier");
         assert!(tokio::time::timeout(
             std::time::Duration::from_millis(30),
             state.persistence.acquire_lock(id)

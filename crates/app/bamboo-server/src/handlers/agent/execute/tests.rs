@@ -1464,8 +1464,12 @@ mod execution_input_http {
                 .await
                 .unwrap();
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-            assert!(String::from_utf8_lossy(&bytes)
-                .contains("Native Root admission changed before ownership; retry execute"));
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["type"], "api_error");
+            assert_eq!(
+                body["error"]["message"],
+                "Root admission changed before ownership; retry execute"
+            );
             let contender = contender.take().unwrap();
             let writer = contender.root_actor_writer().unwrap();
             contender_run = Some(contender.run_id().to_owned());
@@ -2288,14 +2292,29 @@ mod execution_input_http {
                 input_taps().lock().unwrap().remove(&id).unwrap().is_empty(),
                 "failed startup has no execution handoff"
             );
-            // Early Native admission creates a real reservation. Its existing
-            // abandonment contract retains an exact Cancelled slot.
+            // Both server-generated and explicit input IDs belong to this
+            // current Root and require the same real reservation. Rejection
+            // must retire that exact runner and Actor before a successor.
             let runners = state.agent_runners.read().await;
-            if let Some(runner) = runners.get(&id) {
-                assert!(native);
-                assert!(matches!(runner.status, AgentStatus::Cancelled));
-            }
+            let runner = runners
+                .get(&id)
+                .expect("rejected Root startup retains its exact terminal runner");
+            assert!(matches!(runner.status, AgentStatus::Cancelled));
+            assert!(runner.cancel_token.is_cancelled());
+            let rejected_run = runner.run_id.clone();
             drop(runners);
+            let actor =
+                bamboo_domain::ActorDirectoryPort::inspect_actor(state.session_store.as_ref(), &id)
+                    .await
+                    .unwrap()
+                    .activation
+                    .expect("the rejected reservation had a real bound Root Actor");
+            assert_eq!(actor.run_id, rejected_run);
+            assert_eq!(
+                actor.status,
+                bamboo_domain::ActorActivationStatus::Cancelled
+            );
+            assert!(actor.finished_at.is_some());
             assert!(state
                 .session_activation_router
                 .current_run_id(&id)

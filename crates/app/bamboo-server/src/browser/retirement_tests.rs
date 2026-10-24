@@ -193,30 +193,49 @@ async fn retiring_a_live_chat_reaps_its_host_before_purging_with_old_arcs_alive(
 
 #[cfg(unix)]
 #[tokio::test]
-async fn retiring_a_nonzero_host_exit_still_purges_after_reaping() {
+async fn retiring_a_nonzero_host_exit_retains_the_profile_after_reaping() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("profiles");
     let marker = temporary.path().join("profile-existed-at-eof");
     let (session, path) = closing_host(&root, &marker, 23);
-    let browser = BrowserManager::with_fixture_profile_root(root);
+    let cookie = path.join("Cookies");
+    std::fs::write(&cookie, b"synthetic state").unwrap();
+    let browser = BrowserManager::with_fixture_profile_root(root.clone());
     browser
         .sessions
         .lock()
         .await
         .insert("deleted".into(), session.clone());
 
-    browser.retire("deleted").await.unwrap();
+    assert!(matches!(
+        browser.retire("deleted").await,
+        Err(BrowserError::Unavailable(message)) if message == "browser profile close unconfirmed"
+    ));
     assert!(marker.exists());
     assert!(session.reaped.load(Ordering::Acquire));
-    assert!(!session
-        .child
-        .lock()
-        .unwrap()
-        .try_wait()
-        .unwrap()
-        .unwrap()
-        .success());
-    assert!(!path.exists());
+    assert_eq!(
+        session
+            .child
+            .lock()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .unwrap()
+            .code(),
+        Some(23)
+    );
+    assert!(session.cleanup.is_quarantined());
+    assert!(!session.close_confirmed.load(Ordering::Acquire));
+    assert!(path
+        .join(".bamboo-profile-writer-exit-unconfirmed")
+        .is_file());
+    assert!(profile::acquire(&root, "deleted").is_err());
+    assert!(browser.retire("deleted").await.is_err());
+    assert!(matches!(
+        browser.open("deleted").await,
+        Err(BrowserError::NotOpen)
+    ));
+    assert_eq!(std::fs::read(cookie).unwrap(), b"synthetic state");
 }
 
 #[cfg(unix)]
