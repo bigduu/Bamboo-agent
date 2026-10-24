@@ -96,7 +96,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "c7029d9d5bd2380fc702a8d4aff55f4fa4d198b15dd222061691b9713ca5079f"
+          ADMISSION_HELPER_SHA256: "8854921a5f81b6c254563e69d9a71e4019161f3648f5b7511ed9793687a66acb"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -481,7 +481,7 @@ jobs:
             test "${#integration_args[@]}" -gt 0
             server_status=0
             cargo test --locked --no-fail-fast -p bamboo-server "${integration_args[@]}" || server_status=$?
-            cargo build --locked -p bamboo-server --examples || server_status=$?
+            cargo build --locked -p bamboo-server --examples --profile test || server_status=$?
             cargo test --locked --no-fail-fast -p bamboo-server --doc || server_status=$?
             exit "$server_status"
           fi

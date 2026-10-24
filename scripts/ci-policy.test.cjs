@@ -346,7 +346,7 @@ test("server Cargo target layout keeps the unfiltered integration tail complete"
   assert.equal(unit.calls.length, 3)
   const base = ["test", "--locked", "--no-fail-fast", "-p", "bamboo-server"]
   assert.deepEqual(unit.calls[0], [...base, ...targets.filter((name) => name !== "env_cache_isolation").flatMap((name) => ["--test", name])])
-  assert.deepEqual(unit.calls[1], ["build", "--locked", "-p", "bamboo-server", "--examples"])
+  assert.deepEqual(unit.calls[1], ["build", "--locked", "-p", "bamboo-server", "--examples", "--profile", "test"])
   assert.deepEqual(unit.calls[2], [...base, "--doc"])
   const e2e = run("e2e-crates", "integration")
   assert.equal(e2e.status, 0, e2e.stderr)

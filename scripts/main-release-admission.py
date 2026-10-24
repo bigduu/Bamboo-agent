@@ -309,7 +309,7 @@ REVIEWED_PRODUCERS = frozenset((PRODUCER_V1, PRODUCER_V2))
 # by a sentinel. Then independently authenticate the actual helper bytes below.
 # This breaks the workflow -> helper -> workflow hash cycle, without excluding
 # a job, global environment, trigger, command or permission from review.
-CURRENT_PRODUCER = "1eebf0643e6b87dc6f75bb0ff18e486afe6963f7d972bc36c861d98d588a5acc"
+CURRENT_PRODUCER = "20ca6ba17401c2d9cae9019cbb693eea29386ab77814bfda5d793ee4efb45649"
 # Published F4 kept one job per crate and the native Platform Tests matrix.
 LEGACY_PLATFORM_PRODUCER = "b8e4760f405745ab787f94373908efe9055c4eb1bfa848bdedbc7e3bd2b6c385"
 LEGACY_PLATFORM_HELPER = "4b26870d8c3a978c9fab601182a8d4074ecfc3f12a3cb2840cde93e548cd0400"
