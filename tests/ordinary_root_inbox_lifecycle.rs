@@ -928,6 +928,18 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
             move |_| probe.root_ready.load(Ordering::SeqCst),
         )
         .await;
+    let authority_path = fixture
+        .data
+        .join("sessions")
+        .join(ROOT_ID)
+        .join("actor-authority.json");
+    let authority = || {
+        let entry: bamboo_domain::ActorDirectoryEntry =
+            serde_json::from_slice(&std::fs::read(&authority_path).unwrap()).unwrap();
+        entry.validate().unwrap();
+        entry
+    };
+    let original_run_id = authority().activation.unwrap().run_id;
     let version = fixture.canonical().await.metadata_version;
     let response = fixture
         .client
@@ -961,7 +973,6 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
     assert!(revoked
         .last_run_error()
         .is_some_and(|error| error.contains("Native Session permission policy changed")));
-    let original_run_id = revoked.agent_runtime_state.as_ref().unwrap().run_id.clone();
     let original_user_ids: Vec<_> = revoked
         .messages
         .iter()
@@ -1018,6 +1029,9 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
         "Retry execute: {}",
         response.text().await.unwrap()
     );
+    let response: Value = response.json().await.unwrap();
+    let retry_run_id = response["run_id"].as_str().unwrap();
+    assert_ne!(retry_run_id, original_run_id);
     let sentinel = fixture.probe.workspace.join("permission-boundary.txt");
     let parked = fixture
         .wait(
@@ -1035,8 +1049,12 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
         )
         .await;
     assert_ne!(
-        parked.agent_runtime_state.as_ref().unwrap().run_id,
+        authority().activation.as_ref().unwrap().run_id,
         original_run_id
+    );
+    assert_eq!(
+        authority().activation.as_ref().unwrap().run_id,
+        retry_run_id
     );
     assert_eq!(
         parked
