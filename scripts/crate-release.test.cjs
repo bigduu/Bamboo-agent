@@ -1361,6 +1361,14 @@ test('real 274-block E2E inventory is authenticated across both matrices and eve
         const good = run(); assert.equal(good.status, 0, good.stderr)
         assert.match(good.calls, /actions\/runs\/222\/jobs\?filter=latest&per_page=100&page=3/)
         const secondName = blockName(plan, plan.blocks.find(b => b.matrixFamily === 2))
+        const fifteenMinutes = run(x => {
+          const job = x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs.find(j => j.name === secondName)
+          const route = x.routes[`actions/jobs/${job.id}/logs`]
+          const record = JSON.parse(Buffer.from(route.raw.trim().split(' ').at(-1), 'base64'))
+          record.testDurationMs = 900000
+          route.raw = `2026-10-20T02:58:00Z GROUPED_TEST_RESULT ${Buffer.from(JSON.stringify(record)).toString('base64')}\n`
+        })
+        assert.equal(fifteenMinutes.status, 0, fifteenMinutes.stderr)
         for (const mutate of [
           jobs => jobs.splice(jobs.findIndex(j => j.name === secondName), 1),
           jobs => jobs.push({...jobs.find(j => j.name === secondName), id: 999999}),

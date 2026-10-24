@@ -71,21 +71,21 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
     .map((name, i) => ({ name, number: i + 1, status: 'completed', conclusion: 'success' }))
   const plans = [
     {profile: 'default', label: 'Test', inventory: 2, doctests: 1, packages: ['bamboo-config'], blocks: [
-      {id: 'bamboo-config-lib-0', package: 'bamboo-config', kind: 'libtest', count: 2, ignored: 0, timeoutSeconds: 600},
-      {id: 'bamboo-config-doc-0', package: 'bamboo-config', kind: 'doctest', count: 1, ignored: 0, timeoutSeconds: 600}]},
+      {id: 'bamboo-config-lib-0', package: 'bamboo-config', kind: 'libtest', count: 2, ignored: 0, timeoutSeconds: 1200},
+      {id: 'bamboo-config-doc-0', package: 'bamboo-config', kind: 'doctest', count: 1, ignored: 0, timeoutSeconds: 1200}]},
     {profile: 'all-features', label: 'E2E', inventory: 3, doctests: 0, packages: ['bamboo-engine'], blocks: [
-      {id: 'bamboo-engine-lib-0', package: 'bamboo-engine', kind: 'libtest', count: 3, ignored: 0, timeoutSeconds: 600}]},
+      {id: 'bamboo-engine-lib-0', package: 'bamboo-engine', kind: 'libtest', count: 3, ignored: 0, timeoutSeconds: 1200}]},
     {profile: 'ssh-live', label: 'Test SSH', inventory: 1, doctests: 0, packages: ['bamboo-broker'], blocks: [
-      {id: 'bamboo-broker-russh-0', package: 'bamboo-broker', kind: 'ssh', count: 1, ignored: 0, timeoutSeconds: 600}]},
+      {id: 'bamboo-broker-russh-0', package: 'bamboo-broker', kind: 'ssh', count: 1, ignored: 0, timeoutSeconds: 1200}]},
   ].map((p, index) => ({...p, schema: 'bamboo-ci-test-plan/v1', sha: snapshot,
     tree: git('rev-parse', `${source}^{tree}`), producerAttempt: 1, planId: 900 + index,
     planKey: createHash('sha256').update(p.profile).digest('hex')}))
   if (options.inventoryFixture) {
     const actual = JSON.parse(require('node:zlib').gunzipSync(fs.readFileSync(options.inventoryFixture)))
-    const blocks = require('../test-groups-ci.cjs').makeBlocks(actual)
+    const blocks = actual.historicalBlocks
     Object.assign(plans[1], {inventory: 12397, packages: [...new Set(blocks.map(b => b.package))].sort(),
       blocks: blocks.map(b => ({id: b.id, package: b.package, kind: b.kind, matrixFamily: b.matrixFamily,
-        count: b.names.length, ignored: b.commands.reduce((n, c) => n + c.ignored, 0), timeoutSeconds: b.timeoutSeconds}))})
+        count: b.count, ignored: b.ignored, timeoutSeconds: 1200}))})
   }
   for (const plan of plans) {
     const runtime = plan.blocks.filter(b => b.kind !== 'doctest'), split = Math.ceil(runtime.length / 2)
@@ -149,7 +149,7 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
       for (const block of plan.blocks) if (job.name === blockName(plan, block)) raw += recordLog('GROUPED_TEST_RESULT', {
         schema: 'bamboo-ci-test-result/v1', planKey: plan.planKey, block: block.id, package: block.package,
         profile: plan.profile, sha: plan.sha, sourceTree: plan.tree, attempt: 1, status: 'passed', exitCode: 0,
-        expected: block.count, timeoutSeconds: 600, testDurationMs: 200,
+        expected: block.count, timeoutSeconds: 1200, testDurationMs: 200,
         counts: {passed: block.count - block.ignored, failed: 0, ignored: block.ignored}})
       if (job.name === (plan.profile === 'all-features' ? 'E2E Tests' : 'Test')) raw += recordLog('GROUPED_TEST_SUMMARY', {
         planKey: plan.planKey, profile: plan.profile, sha: plan.sha, tree: plan.tree,
@@ -386,7 +386,7 @@ with patch('subprocess.check_output', output):
       list.splice(list.findIndex(j => j.id === shard.id), 1)
     }])
     negatives.push(['different compile input cannot reuse an old green shard', x => mutateShardRecord(x, r => { r.planKey = 'e'.repeat(64) })])
-    negatives.push(['shard over ten minutes cannot be admitted', x => mutateShardRecord(x, r => { r.testDurationMs = 600001 })])
+    negatives.push(['shard over twenty minutes cannot be admitted', x => mutateShardRecord(x, r => { r.testDurationMs = 1200001 })])
     negatives.push(['ignored cases cannot hide failed shard cases', x => mutateShardRecord(x, r => { r.counts.ignored = r.expected; r.counts.passed = 0 })])
     negatives.push(['shard has no source-bound count receipt', x => { x.routes[`actions/jobs/${shard.id}/logs`].raw = 'no result\n' }])
     const changeDefinition = (x, transform, revision = head) => {

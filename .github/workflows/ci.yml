@@ -93,7 +93,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "f0d12ee0b016d6403f448ee7d732706daeddbd83127c4e6a3c19535de3eed578"
+          ADMISSION_HELPER_SHA256: "8b6678f9ea2a28b6d9af6b200d894198f6bb1e754b5d54650cc496197ba78a7e"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -567,7 +567,7 @@ jobs:
     needs: [validation-source, test-build]
     if: needs.validation-source.outputs.full == 'true' && needs.test-build.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -616,7 +616,7 @@ jobs:
     needs: [validation-source, test-build]
     if: needs.validation-source.outputs.full == 'true' && needs.test-build.result == 'success' && needs.test-build.outputs.has_blocks_2 == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -665,7 +665,7 @@ jobs:
     needs: [validation-source, e2e-build]
     if: needs.validation-source.outputs.full == 'true' && needs.e2e-build.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -714,7 +714,7 @@ jobs:
     needs: [validation-source, e2e-build]
     if: needs.validation-source.outputs.full == 'true' && needs.e2e-build.result == 'success' && needs.e2e-build.outputs.has_blocks_2 == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -763,7 +763,7 @@ jobs:
     needs: [validation-source, test-build]
     if: needs.validation-source.outputs.full == 'true' && needs.test-build.result == 'success' && needs.test-build.outputs.has_docs == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -812,7 +812,7 @@ jobs:
     needs: [validation-source, test-ssh-build]
     if: needs.validation-source.outputs.full == 'true' && needs.test-ssh-build.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-ssh-live
     steps:

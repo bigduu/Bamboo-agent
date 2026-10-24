@@ -13,8 +13,21 @@
     "ignored": 38,
     "blocks": 274
   },
-  "compressed_sha256": "efa4553008e494ab8fdfff671020e426b9972b1d450cfb81a34c297e5e25ba16",
-  "uncompressed_sha256": "c844f0a64a1673b4c6619470ea3bcac13c89c3e7f4a12b9826563cf249f23393",
+  "compressed_sha256": "d72664c4ac25634594b4492437d4dfbf2ea0b2cf3572126c8a57ba9c08be527f",
+  "uncompressed_sha256": "b53e2b95859483822cdf91f7e96e17a7e12f7ded6f92f1809367cce9c134e25b",
   "inventory_sha256": "4be6dd13bfb721818ed7824b091a7c7c0523372ab6a141ff81ae688342dd7c58",
-  "scope": "Actual compile/list inventory only; no runtime success is claimed. Host paths, compiler environment and binaries are omitted."
+  "scope": "Actual compile/list inventory only; no runtime success is claimed. Host paths, compiler environment and binaries are omitted.",
+  "historicalBlocks": 274,
+  "currentProjection": {
+    "timeoutSeconds": 1200,
+    "blocks": 171,
+    "matrices": [
+      86,
+      85
+    ],
+    "tests": 12397,
+    "ignored": 38,
+    "crates": 30,
+    "measuredRuntime": false
+  }
 }

@@ -35,16 +35,16 @@ function receipts(plan) {
     results.push({planKey: plan.planKey, block: block.id, package: block.package, profile: plan.manifest.profileName,
       sha: plan.manifest.identity.sha, sourceTree: plan.manifest.identity.tree, attempt, status: 'passed', exitCode: 0,
       expected: block.names.length, counts: {passed: block.names.length - ignored, failed: 0, ignored}, testDurationMs: 123,
-      timeoutSeconds: 600, processes: Array.from({length: block.kind === 'doctest' ? 2 : 2 * block.commands.length}, () => ({exitCode: 0, timedOut: false, interrupted: false, signal: null, error: null}))});
+      timeoutSeconds: 1200, processes: Array.from({length: block.kind === 'doctest' ? 2 : 2 * block.commands.length}, () => ({exitCode: 0, timedOut: false, interrupted: false, signal: null, error: null}))});
   }
   return {jobs, results};
 }
-test('each block contains exactly one crate/target, small stable inventories and a hard 600s cap', () => {
+test('each block contains exactly one crate, small stable inventories and a hard 1200s cap', () => {
   const plan = fixture(); ci.validatePlan(plan);
-  assert.equal(plan.blocks.filter(b => b.package === 'bamboo-config' && b.kind === 'libtest').length, 3);
-  assert.equal(plan.blocks.filter(b => b.package === 'bamboo-engine').length, 3);
+  assert.equal(plan.blocks.filter(b => b.package === 'bamboo-config' && b.kind === 'libtest').length, 2);
+  assert.equal(plan.blocks.filter(b => b.package === 'bamboo-engine').length, 2);
   for (const block of plan.blocks) {
-    assert.equal(block.timeoutSeconds, 600);
+    assert.equal(block.timeoutSeconds, 1200);
     if (block.commands) for (const command of block.commands) assert(command.targetId.startsWith(block.package + '/'));
   }
   assert.deepEqual(ci.makeBlocks(plan.manifest, plan.docs), plan.blocks);
@@ -62,18 +62,19 @@ test('zero-test crates and matrix overflow fail instead of omitting or skipping 
     tests: [{name: 'case', ignored: false}]}));
   assert.throws(() => ci.makeBlocks(overflow), /matrix family capacity/);
 });
-test('real 274-block Cargo inventory spans two matrices with no omitted or repeated cases', t => {
+test('real inventory coalesces its historical 274 blocks with no omitted or repeated cases', t => {
   actions(t);
   const actual = JSON.parse(zlib.gunzipSync(fs.readFileSync('scripts/tests/fixtures/grouped-inventory-46b52ce8.json.gz')));
   const manifest = {profileName: actual.profileName, identity: {sha: actual.source, tree: actual.tree}, targets: actual.targets};
   manifest.inputKey = r.digest(manifest);
   const blocks = ci.makeBlocks(manifest), plan = {schema: 'bamboo-ci-test-plan/v1', manifest, docs: [], producerAttempt: 1, blocks};
   plan.planKey = r.digest(plan); ci.validatePlan(plan);
-  assert.equal(blocks.length, 274); assert.equal(new Set(blocks.map(b => b.package)).size, 30);
+  assert.equal(actual.historicalBlocks.length, 274); assert.equal(blocks.length, 171); assert.equal(new Set(blocks.map(b => b.package)).size, 30);
   assert.equal(blocks.reduce((n, b) => n + b.names.length, 0), 12397);
   assert.equal(blocks.reduce((n, b) => n + b.commands.reduce((a, c) => a + c.ignored, 0), 0), 38);
   const matrices = [ci.matrixBlocks(blocks, 1), ci.matrixBlocks(blocks, 2)];
-  assert.deepEqual(matrices.map(m => m.include.length), [137, 137]);
+  assert.deepEqual(matrices.map(m => m.include.length), [86, 85]);
+  assert.deepEqual([1, 2].map(f => ci.matrixBlocks(actual.historicalBlocks, f).include.length), [137, 137]);
   assert.deepEqual(matrices.flatMap(m => m.include.map(b => b.id)).sort(), blocks.map(b => b.id).sort());
   const {jobs, results} = receipts(plan); assert.equal(ci.selectJobResults(plan, jobs, results).inventory, 12397);
   const second = jobs.findIndex(j => j.name.startsWith('E2E Block 2 ('));
@@ -109,8 +110,50 @@ test('same-run mixed attempts retain successes and require the actual latest att
   const result = ci.selectJobResults(plan, jobs, results);
   assert.equal(result.status, 'passed'); assert.equal(result.inventory, 295); assert.equal(result.doctests, 1);
   assert.equal(result.counts.passed + result.counts.ignored, 296);
+  const fifteenMinutes = copy(results); fifteenMinutes[0].testDurationMs = 900000;
+  assert.equal(ci.selectJobResults(plan, jobs, fifteenMinutes).status, 'passed');
   const stale = copy(results); stale[1].attempt = 1;
   assert.throws(() => ci.selectJobResults(plan, jobs, stale), /latest-attempt/);
+});
+test('small targets coalesce only within one crate and execute every target under one deadline', async t => {
+  actions(t);
+  const target = (id, pkg) => ({id, package: pkg, target: id.split('/').at(-1), kind: ['test'],
+    executable: '/fixture/' + id.replaceAll('/', '-'), cwd: '/fixture', tests: [{name: 'same_case', ignored: false}]});
+  const manifest = {profileName: 'default', identity: {sha: 'a'.repeat(40), tree: 'b'.repeat(40)},
+    targets: [target('bamboo-config/one', 'bamboo-config'), target('bamboo-config/two', 'bamboo-config'), target('bamboo-llm/one', 'bamboo-llm')]};
+  manifest.artifacts = manifest.targets.map(t => ({path: t.executable, sha256: 'a'.repeat(64)}));
+  manifest.inputKey = r.digest(manifest);
+  const plan = {schema: 'bamboo-ci-test-plan/v1', manifest, docs: [], producerAttempt: 1, blocks: ci.makeBlocks(manifest)};
+  plan.planKey = r.digest(plan);
+  assert.equal(plan.blocks.length, 2);
+  const block = plan.blocks.find(b => b.package === 'bamboo-config');
+  assert.equal(ci.targetIds(block).length, 2); assert.equal(block.names.length, 2);
+  for (const b of plan.blocks) for (const c of b.commands) assert.equal(manifest.targets.find(t => t.id === c.targetId).package, b.package);
+  const source = fs.readFileSync('scripts/test-groups-ci.cjs', 'utf8'), mod = {exports: {}};
+  const hashes = new Map(manifest.artifacts.map(a => [a.path, a.sha256])); let clock = 1000000;
+  vm.runInNewContext(source, {module: mod, exports: mod.exports, __dirname: path.resolve('scripts'), process, console, Buffer, Date: {now: () => clock},
+    require: name => name === './test-groups.cjs' ? {...r, identity: () => manifest.identity,
+      fileHash: filename => hashes.get(filename),
+      runtimeEnv: (_, target) => ({FIXTURE_TARGET: target.id})} : require(name)});
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-merged-block-'));
+  t.after(() => fs.rmSync(directory, {recursive: true, force: true}));
+  const calls = [], deadline = clock + 1200000;
+  const result = await mod.exports.executeBlock(plan, block, directory, deadline, async (executable, args, options) => {
+    const selected = manifest.targets.find(t => t.executable === executable); assert(selected);
+    assert.equal(options.env.FIXTURE_TARGET, selected.id); assert(options.timeoutMs > 0 && options.timeoutMs <= 1200000);
+    calls.push({id: selected.id, listing: args.includes('--list'), timeoutMs: options.timeoutMs});
+    clock += 30000;
+    return {command: executable, args, cwd: options.cwd, log: options.log, exitCode: 0, signal: null, timedOut: false,
+      interrupted: false, error: null, durationMs: 1, stderr: '', stdout: args.includes('--list') ? 'same_case: test\n1 test, 0 benchmarks\n'
+        : 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'};
+  });
+  assert.equal(result.status, 'passed', result.error); assert.equal(result.counts.passed, 2);
+  assert.equal(calls.length, 4); assert.equal(new Set(calls.filter(c => !c.listing).map(c => c.id)).size, 2);
+  assert.deepEqual(calls.map(c => c.timeoutMs), [1200000, 1170000, 1140000, 1110000]);
+  hashes.set(manifest.targets[1].executable, 'b'.repeat(64));
+  const changed = path.join(directory, 'changed'); fs.mkdirSync(changed);
+  const rejected = await mod.exports.executeBlock(plan, block, changed, deadline, async () => { throw Error('must verify every binary before starting'); });
+  assert.equal(rejected.status, 'failed'); assert.match(rejected.error, /Runtime input bytes changed/);
 });
 test('missing, skipped, cancelled, failed, duplicate and unexpected jobs cannot hide behind aggregates', t => {
   actions(t); const plan = fixture(), {jobs, results} = receipts(plan);
@@ -129,7 +172,7 @@ test('false-green count/ignored/exit/time/source/cache receipts fail closed', t 
     v => { v.planKey = 'wrong'; }, v => { v.sha = 'c'.repeat(40); }, v => { v.sourceTree = 'd'.repeat(40); },
     v => { v.package = 'other-crate'; }, v => { v.profile = 'all-features'; }, v => { v.status = 'skipped'; },
     v => { v.exitCode = 23; }, v => { v.expected--; }, v => { v.counts.ignored++; v.counts.passed--; },
-    v => { v.testDurationMs = 600001; }, v => { v.timeoutSeconds = 601; }, v => { v.processes = []; },
+    v => { v.testDurationMs = 1200001; }, v => { v.timeoutSeconds = 1201; }, v => { v.processes = []; },
     v => { v.processes[0].timedOut = true; }, v => { v.processes[0].exitCode = 23; },
   ]) {
     const changed = copy(results); mutate(changed[0]);
@@ -150,7 +193,7 @@ test('CI jobs keep runtime Cargo-free, independent build inputs and non-cancelli
     return tail.split(/\n  [a-z][a-z0-9-]*:\n/)[0];
   }
   for (const id of ['test-blocks', 'test-blocks-2', 'e2e-blocks', 'e2e-blocks-2', 'test-doctests', 'test-ssh']) {
-    const source = job(id); assert.match(source, /timeout-minutes: 10/);
+    const source = job(id); assert.match(source, /timeout-minutes: 20/);
     assert.doesNotMatch(source, /cargo (test|build)|continue-on-error/);
     assert.match(source, /BAMBOO_BLOCK_STARTED_AT/); assert.match(source, /command: run/);
     assert.match(source, /uses: \.\/\.github\/actions\/grouped-tests/);
