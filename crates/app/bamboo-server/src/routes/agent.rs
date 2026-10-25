@@ -311,6 +311,11 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             "/sessions/{session_id}/root-mode-operations/{operation_id}",
             web::post().to(agent::sessions::select_root_mode),
         )
+        .service(
+            web::resource("/sessions/{session_id}/version-migration")
+                .route(web::get().to(agent::sessions::inspect_session_version_migration))
+                .route(web::post().to(agent::sessions::migrate_session_version)),
+        )
         .route(
             "/sessions/{session_id}/named-agent-profiles",
             web::get().to(agent::named_agent_catalog::handler),
