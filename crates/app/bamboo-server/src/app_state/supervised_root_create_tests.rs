@@ -379,7 +379,7 @@ async fn supervisor_v2_ultra_spawn_uses_real_root_creation_and_exact_retry() {
 
 // These use the existing real AppState/Host operation fixture. The temporary
 // Work feature opt-in never changes installed/user security configuration.
-async fn work_bound_supervisor_chat_case(standard: bool) {
+async fn work_bound_supervisor_chat_case(standard: bool, stable_message_id: bool) {
     let f = Fixture::new(true).await;
     f.state.config.write().await.features.ticket_mutation = true;
     let observed = f.state.tickets.status().await;
@@ -448,7 +448,7 @@ async fn work_bound_supervisor_chat_case(standard: bool) {
             "supervisor_mode_required"
         );
         let input_before = f.state.session_inbox.inspect(&original.id).await.unwrap();
-        let denied = test::call_service(&app, test::TestRequest::post().uri("/api/v1/chat").peer_addr("127.0.0.1:12345".parse().unwrap()).set_json(json!({"session_id":original.id,"message":"Formal Work reply stays gated", "thread_id":"work-only-thread"})).to_request()).await;
+        let denied = test::call_service(&app, test::TestRequest::post().uri("/api/v1/chat").peer_addr("127.0.0.1:12345".parse().unwrap()).set_json(json!({"session_id":original.id,"message":"Formal Work reply stays gated", "model":"supervisor-private-model", "thread_id":"work-only-thread"})).to_request()).await;
         assert_eq!(denied.status(), StatusCode::FORBIDDEN);
         let _: Value = test::read_body_json(denied).await;
         assert_eq!(
@@ -462,13 +462,32 @@ async fn work_bound_supervisor_chat_case(standard: bool) {
         );
         assert_eq!(service.published().unwrap().0, before.0);
     }
-    let response = test::call_service(&app, test::TestRequest::post().uri("/api/v1/chat").peer_addr("127.0.0.1:12345".parse().unwrap()).set_json(json!({"session_id":original.id,"message":"Coordinate an independent Root without submitting Work"})).to_request()).await;
+    let mut chat = json!({
+        "session_id": original.id,
+        "message": "Coordinate an independent Root without submitting Work",
+        "model": "supervisor-private-model"
+    });
+    if stable_message_id {
+        chat["message_id"] = json!(uuid::Uuid::new_v4().to_string());
+    }
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/chat")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .set_json(chat.clone())
+            .to_request(),
+    )
+    .await;
     assert_eq!(
         response.status(),
         StatusCode::CREATED,
         "plain Supervisor chat must retain its independent Root ingress"
     );
     let receipt: Value = test::read_body_json(response).await;
+    if stable_message_id {
+        assert_eq!(receipt["message_id"], chat["message_id"]);
+    }
     assert!(
         receipt["message_id"].is_string() && receipt["ingress_seq"].as_u64().is_some_and(|n| n > 0)
     );
@@ -528,10 +547,15 @@ async fn work_bound_supervisor_chat_case(standard: bool) {
 
 #[actix_web::test]
 async fn work_bound_standard_supervisor_admits_plain_root_chat_without_work_authority() {
-    work_bound_supervisor_chat_case(true).await;
+    work_bound_supervisor_chat_case(true, false).await;
 }
 
 #[actix_web::test]
 async fn work_bound_ultra_supervisor_retains_formal_ingress_and_independent_roots() {
-    work_bound_supervisor_chat_case(false).await;
+    work_bound_supervisor_chat_case(false, false).await;
+}
+
+#[actix_web::test]
+async fn work_bound_standard_supervisor_keeps_native_message_identity_without_work_reference() {
+    work_bound_supervisor_chat_case(true, true).await;
 }
