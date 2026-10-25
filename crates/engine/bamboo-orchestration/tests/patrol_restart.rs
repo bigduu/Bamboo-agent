@@ -239,6 +239,111 @@ impl CheckpointPort for EncodedJournal {
     }
 }
 
+#[test]
+fn program_entry_reads_canonical_ticket_facts_without_an_execution_or_delivery() {
+    let fixture = Fixture::new();
+    let before = fixture.service().published().unwrap();
+    let before_bytes = bamboo_tickets::canonical_bytes(&before.1).unwrap();
+    let program = program::ProgramPatrol::new(Policy::default()).unwrap();
+    let mut journal = EncodedJournal::default();
+    let mut observation = fixture.observation();
+    assert_eq!(
+        program
+            .tick(
+                &fixture.scope,
+                &ClockAt(100),
+                &mut journal,
+                &mut observation
+            )
+            .unwrap()
+            .status,
+        Status::Incident
+    );
+    let mut observation = fixture.observation();
+    assert_eq!(
+        program
+            .tick(
+                &fixture.scope,
+                &ClockAt(101),
+                &mut journal,
+                &mut observation
+            )
+            .unwrap()
+            .status,
+        Status::NeedsSupervisor
+    );
+    let saved = journal.load(&fixture.scope).unwrap().unwrap();
+    let incident = saved.checkpoint.incident.unwrap();
+    assert_eq!(incident.reason, Reason::EvidenceUnknown);
+    assert_eq!(incident.attempts, 0);
+    let escalation = incident.escalation.unwrap();
+    assert_eq!(escalation.deliveries, 0);
+    assert!(!escalation.queued);
+    let after = fixture.service().published().unwrap();
+    assert_eq!(after.0, before.0);
+    assert_eq!(
+        bamboo_tickets::canonical_bytes(&after.1).unwrap(),
+        before_bytes
+    );
+}
+
+#[test]
+fn program_entry_reopen_preserves_original_incident_scope_and_checks_fresh_authority() {
+    let mut fixture = Fixture::new();
+    let program = program::ProgramPatrol::new(Policy::default()).unwrap();
+    let mut journal = EncodedJournal::default();
+    let mut observation = fixture.observation();
+    program
+        .tick(
+            &fixture.scope,
+            &ClockAt(100),
+            &mut journal,
+            &mut observation,
+        )
+        .unwrap();
+    let original = journal
+        .load(&fixture.scope)
+        .unwrap()
+        .unwrap()
+        .checkpoint
+        .incident
+        .unwrap()
+        .id;
+    fixture.reopen();
+    assert!(
+        fixture.service().published().unwrap().1.authority_epoch > fixture.scope.authority_epoch
+    );
+    let before = fixture.service().published().unwrap().0;
+    let mut observation = fixture.observation();
+    let report = program
+        .tick(
+            &fixture.scope,
+            &ClockAt(101),
+            &mut journal,
+            &mut observation,
+        )
+        .unwrap();
+    assert_eq!(report.incident, Some(original.clone()));
+    let incident = journal
+        .load(&fixture.scope)
+        .unwrap()
+        .unwrap()
+        .checkpoint
+        .incident
+        .unwrap();
+    assert_eq!(incident.id, original);
+    let escalation = incident.escalation.unwrap();
+    assert_eq!(escalation.deliveries, 0);
+    assert!(!escalation.queued);
+    assert_eq!(fixture.service().published().unwrap().0, before);
+
+    let denied = fixture.authority(Principal::User);
+    assert!(matches!(
+        host::read_observation(fixture.service(), &denied, &fixture.scope),
+        Err(PortError::Denied)
+    ));
+}
+
 struct Probe {
     observed: host::TicketObservation,
     journal: EncodedJournal,
