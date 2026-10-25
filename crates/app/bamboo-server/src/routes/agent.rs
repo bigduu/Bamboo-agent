@@ -113,6 +113,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 .route(web::get().to(agent::supervisor::inspect_project_scope))
                 .route(web::put().to(agent::supervisor::configure_project_scope)),
         )
+        .route(
+            "/supervisor/default/sessions",
+            web::get().to(agent::supervisor::inspect_managed_sessions),
+        )
+        .route(
+            "/supervisor/default/sessions/{target_id}",
+            web::put().to(agent::supervisor::configure_managed_session),
+        )
         .service(
             web::scope("/tickets")
                 .configure(agent::tickets::sprints::configure)
