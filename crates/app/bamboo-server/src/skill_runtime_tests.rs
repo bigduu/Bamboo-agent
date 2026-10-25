@@ -957,6 +957,9 @@ mod receipt_run_tests;
 #[path = "skill_runtime_retry_tests.rs"]
 mod retry_tests;
 
+#[path = "skill_runtime_file_workspace_tests.rs"]
+mod file_workspace;
+
 #[cfg(unix)]
 #[path = "skill_runtime_workspace_handoff_tests.rs"]
 mod workspace_handoff;
