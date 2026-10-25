@@ -52,8 +52,13 @@ fn millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-fn recent_events() -> &'static Mutex<VecDeque<InitialRequestDiagnostic>> {
-    static EVENTS: OnceLock<Mutex<VecDeque<InitialRequestDiagnostic>>> = OnceLock::new();
+enum RecentDiagnostic {
+    InitialRequest(InitialRequestDiagnostic),
+    StreamTimeout(bamboo_domain::LlmRequestDiagnostic),
+}
+
+fn recent_events() -> &'static Mutex<VecDeque<RecentDiagnostic>> {
+    static EVENTS: OnceLock<Mutex<VecDeque<RecentDiagnostic>>> = OnceLock::new();
     EVENTS.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
@@ -68,12 +73,16 @@ pub fn recent_initial_request_diagnostics(session_id: &str) -> Vec<InitialReques
 }
 
 fn project_session(
-    events: &VecDeque<InitialRequestDiagnostic>,
+    events: &VecDeque<RecentDiagnostic>,
     hash: &str,
 ) -> Vec<InitialRequestDiagnostic> {
     events
         .iter()
         .rev()
+        .filter_map(|event| match event {
+            RecentDiagnostic::InitialRequest(event) => Some(event),
+            RecentDiagnostic::StreamTimeout(_) => None,
+        })
         .filter(|event| event.session_hash.as_deref() == Some(hash))
         .take(MAX_SESSION_EVENTS)
         .cloned()
@@ -83,11 +92,20 @@ fn project_session(
         .collect()
 }
 
-fn push_bounded(events: &mut VecDeque<InitialRequestDiagnostic>, event: InitialRequestDiagnostic) {
+fn push_bounded(events: &mut VecDeque<RecentDiagnostic>, event: RecentDiagnostic) {
     while events.len() >= MAX_RECENT_EVENTS {
         events.pop_front();
     }
     events.push_back(event);
+}
+
+/// Reuse the existing bounded live-event projection. The canonical Session
+/// checkpoint owns persistence; this buffer only bridges the existing interval
+/// between execution returning an error and terminal owner finalization.
+pub fn record_stream_timeout_diagnostic(diagnostic: bamboo_domain::LlmRequestDiagnostic) {
+    if let Ok(mut events) = recent_events().lock() {
+        push_bounded(&mut events, RecentDiagnostic::StreamTimeout(diagnostic));
+    }
 }
 
 fn public_summary(event: &InitialRequestDiagnostic) -> Option<bamboo_domain::LlmRequestDiagnostic> {
@@ -104,15 +122,18 @@ pub fn public_request_diagnostic(
     if message.len() > 4096 {
         return None;
     }
-    let hash = crate::providers::common::log_identity(session_id);
     recent_events()
         .lock()
         .ok()?
         .iter()
         .rev()
-        .filter(|event| event.session_hash.as_deref() == Some(hash.as_str()))
-        .filter_map(public_summary)
-        .find(|diagnostic| diagnostic.matches_error_message(message))
+        .filter_map(|event| match event {
+            RecentDiagnostic::InitialRequest(event) => public_summary(event),
+            RecentDiagnostic::StreamTimeout(diagnostic) => Some(diagnostic.clone()),
+        })
+        .find(|diagnostic| {
+            diagnostic.matches_session(session_id) && diagnostic.matches_error_message(message)
+        })
 }
 
 impl AttemptObservation {
@@ -215,7 +236,7 @@ impl InitialRequestBudget {
         // their ordinary logs without evicting scoped evidence from this buffer.
         if d.session_hash.is_some() {
             if let Ok(mut events) = recent_events().lock() {
-                push_bounded(&mut events, d.clone());
+                push_bounded(&mut events, RecentDiagnostic::InitialRequest(d.clone()));
             }
         }
         if let Ok(mut latest) = self.latest.lock() {
@@ -302,9 +323,11 @@ mod tests {
         for _ in 0..(MAX_RECENT_EVENTS + 1) {
             push_bounded(
                 &mut buffer,
-                budget
-                    .observation(Instant::now(), "send_headers", "none", None)
-                    .diagnostic,
+                RecentDiagnostic::InitialRequest(
+                    budget
+                        .observation(Instant::now(), "send_headers", "none", None)
+                        .diagnostic,
+                ),
             );
         }
         let events = project_session(&buffer, &crate::providers::common::log_identity(&session));
@@ -318,5 +341,68 @@ mod tests {
         let json = serde_json::to_string(&events).unwrap();
         assert!(!json.contains(&session));
         assert!(json.len() < 12 * 1024);
+    }
+
+    #[test]
+    fn timeout_projection_uses_the_existing_ring_and_requires_exact_error_identity() {
+        let session = format!("private-timeout-session-{}", uuid::Uuid::new_v4());
+        let sample = || {
+            let id = uuid::Uuid::new_v4();
+            bamboo_domain::LlmRequestDiagnostic::from_stream_timeout(
+                bamboo_domain::StreamTimeoutDiagnostic {
+                    schema_version: 1,
+                    kind: "stream_timeout".into(),
+                    diagnostic_id: id,
+                    error_id: id,
+                    observed_at: chrono::Utc::now(),
+                    provider: None,
+                    model: Some("model".into()),
+                    session_hash: bamboo_domain::llm_diagnostic_session_hash(&session),
+                    run_id: None,
+                    phase: "transport_idle".into(),
+                    deadline_ms: 120_000,
+                    last_transport_ms_ago: 120_000,
+                    last_semantic_ms_ago: Some(120_000),
+                    semantic_output_started: true,
+                    retry_safe: false,
+                    last_http_status: None,
+                    retry_delay_ms: None,
+                },
+            )
+            .unwrap()
+        };
+        let old = sample();
+        let current = sample();
+        record_stream_timeout_diagnostic(old.clone());
+        record_stream_timeout_diagnostic(current.clone());
+        assert_eq!(
+            public_request_diagnostic(&session, &old.error_message()),
+            Some(old.clone())
+        );
+        assert_eq!(
+            public_request_diagnostic(&session, &current.error_message()),
+            Some(current.clone())
+        );
+        assert!(public_request_diagnostic("foreign", &current.error_message()).is_none());
+        assert!(public_request_diagnostic(
+            &session,
+            &format!("upstream: {}", current.error_message())
+        )
+        .is_none());
+        assert!(recent_initial_request_diagnostics(&session).is_empty());
+
+        let mut buffer = VecDeque::new();
+        for _ in 0..(MAX_RECENT_EVENTS + 1) {
+            push_bounded(
+                &mut buffer,
+                RecentDiagnostic::StreamTimeout(current.clone()),
+            );
+        }
+        assert_eq!(buffer.len(), MAX_RECENT_EVENTS);
+        assert!(project_session(
+            &buffer,
+            &bamboo_domain::llm_diagnostic_session_hash(&session)
+        )
+        .is_empty());
     }
 }
