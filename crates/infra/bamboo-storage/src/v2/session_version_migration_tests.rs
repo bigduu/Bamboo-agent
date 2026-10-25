@@ -345,6 +345,134 @@ async fn version_migration_recovers_each_pair_publication_boundary_after_restart
 }
 
 #[tokio::test]
+async fn version_migration_unpublished_staging_never_blocks_actor_views_after_restart_or_retry() {
+    use bamboo_domain::{
+        ActorSnapshotError, ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincipal,
+    };
+    async fn readable(store: &SessionStoreV2, id: &str) {
+        store
+            .actor_subtree_snapshot(
+                ActorSnapshotPrincipal::host_owner(),
+                id,
+                id,
+                ActorSnapshotLimits::default(),
+            )
+            .await
+            .unwrap();
+        store.actor_tree_cursor(id).await.unwrap();
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let store = SessionStoreV2::new(home.clone()).await.unwrap();
+    let mut root = Session::new("orphan-migration-root", "model");
+    root.session_version = None;
+    store.save_session(&root).await.unwrap();
+    let intent = request(
+        &store
+            .inspect_session_version_migration(&root.id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    let directory = home.join(super::session_version_migration::MIGRATION_DIR);
+    let unpublished = directory.join(format!("{}.json", intent.operation_id));
+    // Interrupt the real durable primitive after its staging file is synced,
+    // before publication; unwinding simulates a process stop without cleanup.
+    assert!(tokio::task::spawn_blocking(move || {
+        durable_atomic_write_blocking(&unpublished, b"unpublished migration staging", |phase| {
+            assert_ne!(
+                phase,
+                DurableWritePhase::BeforeReplace,
+                "simulated process stop"
+            );
+            Ok(())
+        })
+    })
+    .await
+    .unwrap_err()
+    .is_panic());
+    let orphan = fs::read_dir(&directory)
+        .await
+        .unwrap()
+        .next_entry()
+        .await
+        .unwrap()
+        .unwrap()
+        .path();
+    assert!(orphan
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .contains(".durable.tmp."));
+    let initial = pair(&home, &root.id).await;
+    readable(&store, &root.id).await;
+    assert_eq!(pair(&home, &root.id).await, initial);
+    store.flush_search_index().await;
+    drop(store);
+    let store = SessionStoreV2::new(home.clone()).await.unwrap();
+    readable(&store, &root.id).await;
+    assert_eq!(pair(&home, &root.id).await, initial);
+    *store.session_version_migration_fault.lock().unwrap() =
+        Some(super::session_version_migration::MigrationFault::Prepared);
+    assert!(store
+        .migrate_session_version(&root.id, &intent)
+        .await
+        .is_err());
+    let journals = store.session_version_migration_journals().await.unwrap();
+    assert_eq!(journals.len(), 1);
+    let journal = fs::read(&journals[0]).await.unwrap();
+    assert_eq!(
+        store
+            .actor_subtree_snapshot(
+                ActorSnapshotPrincipal::host_owner(),
+                &root.id,
+                &root.id,
+                ActorSnapshotLimits::default()
+            )
+            .await
+            .unwrap_err(),
+        ActorSnapshotError::PendingTransaction
+    );
+    assert_eq!(
+        store.actor_tree_cursor(&root.id).await.unwrap_err(),
+        ActorSnapshotError::PendingTransaction
+    );
+    assert_eq!(fs::read(&journals[0]).await.unwrap(), journal);
+    assert_eq!(pair(&home, &root.id).await, initial);
+    assert!(matches!(
+        store
+            .migrate_session_version(&root.id, &intent)
+            .await
+            .unwrap(),
+        SessionVersionMigrationDecision::Committed(_)
+    ));
+    readable(&store, &root.id).await;
+    let committed = pair(&home, &root.id).await;
+    store.flush_search_index().await;
+    drop(store);
+    let reopened = SessionStoreV2::new(home.clone()).await.unwrap();
+    assert!(matches!(
+        reopened
+            .migrate_session_version(&root.id, &intent)
+            .await
+            .unwrap(),
+        SessionVersionMigrationDecision::Committed(_)
+    ));
+    readable(&reopened, &root.id).await;
+    assert_eq!(pair(&home, &root.id).await, committed);
+    assert!(reopened
+        .session_version_migration_journals()
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        fs::read(orphan).await.unwrap(),
+        b"unpublished migration staging"
+    );
+    reopened.flush_search_index().await;
+}
+
+#[tokio::test]
 async fn version_migration_recovery_never_overwrites_unexpected_canonical_bytes() {
     let (home, store, original) = fixture(false).await;
     let view = store
