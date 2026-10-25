@@ -32,6 +32,8 @@ Project/grant, changes mode/settings, logs in, or automatically approves a tool.
 Normal typed fixture approval, if needed, must be completed by its owner while
 the driver waits. Plain Standard Root input must succeed; only explicit formal Work refusal is expected.
 Formal Work task dispatch and submission/acceptance are outside this Root-composition suite.
+The two-mode run has a 120-second bound including normal typed owner response;
+per-mode scripted-model request and HTTP attempt caps remain unchanged.
 
 Receipt schema bamboo.v2-native-fixture.v1:
   source_sha, tree_sha: exact audited Host build above (not version 0.0.0)
@@ -473,7 +475,7 @@ async function runCase(c, fixtureId, request, signal, injectedProvider = 'no_aut
   } finally { await stopProvider(); }
 }
 async function runSuite(config, request = jsonRequest) {
-  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 30000), cases = [];
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 120000), cases = [];
   try {
     for (const c of config.cases) {
       const file = path.join(c.workspace_path, 'bamboo-v2-native-fixture.txt'), flow = scenario(c, config.fixture_id);
