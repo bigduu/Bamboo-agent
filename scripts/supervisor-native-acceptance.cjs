@@ -422,8 +422,7 @@ async function runCase(c, fixtureId, request, signal, injectedProvider = 'no_aut
   const stopProvider = await startProvider(c, flow, hooks, signal, { injected_provider: injectedProvider, fixture_id: fixtureId });
   try {
     const submit = async (id, message) => {
-      const r = await api('/chat', { session_id: id, message,
-        ...(id === SUPERVISOR && c.mode === 'ultra' ? { thread_id: 'native-work-' + fixtureId } : {}) });
+      const r = await api('/chat', { session_id: id, message });
       requireFact(r.status === 201 || r.status === 200, 'chat_admission_failed');
       const run = await api('/sessions/' + encodeURIComponent(id) + '/execute', {});
       requireFact(run.status === 202 || run.status === 200, 'execute_admission_failed'); return true;
