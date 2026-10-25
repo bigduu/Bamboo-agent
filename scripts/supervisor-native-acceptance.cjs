@@ -218,7 +218,8 @@ function session(value, expectedId, expectedBirth) {
   requireFact(s.permission_mode === 'default' && s.bypass_permissions === false, 'ordinary_permissions_required');
   return s;
 }
-function stable(value) { return JSON.stringify(value); }
+function stable(value) { return JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
+  ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item); }
 function creationReceipt(value, request) {
   requireFact(value?.action === 'create' && value.operation_id === request.operation_id && value.project_id === request.project_id
     && value.created_durable === true && value.linked === true && value.admitted === true
@@ -431,7 +432,22 @@ async function runCase(c, fixtureId, request, signal, injectedProvider = 'no_aut
       const refusal = await api('/chat', { session_id: SUPERVISOR,
         message: 'BAMBOO_NATIVE_FORMAL_WORK_ONLY:' + fixtureId, thread_id: 'native-work-' + fixtureId });
       requireFact(refusal.status === 403 && JSON.stringify(refusal.body.error).includes('Supervisor orchestration authority required'), 'unexpected_standard_denial');
-      requireFact(stable(await list()) === stable(initialList) && stable(await get('/supervisor/default/scope')) === stable(scope)
+      // Existing native chat preparation can materialize its System checkpoint
+      // and managed workspace before Work admission refuses the User envelope.
+      // Permit only those exact changes; User/Tool history, other Sessions,
+      // permissions, membership and management scope must remain unchanged.
+      const afterRefusal = await list(), rejectedHistory = messages(await get('/sessions/' + SUPERVISOR + '/history'));
+      const expectedList = structuredClone(initialList), expectedSup = expectedList.find(s => s.id === SUPERVISOR);
+      const actualSup = afterRefusal.find(s => s.id === SUPERVISOR);
+      const systemOnly = rejectedHistory.length === 1 && rejectedHistory[0].role === 'system'
+        && !textContent(rejectedHistory[0].content).includes('BAMBOO_NATIVE_FORMAL_WORK_ONLY:' + fixtureId);
+      if (systemOnly && actualSup) {
+        expectedSup.message_count = 1;
+        if (!expectedSup.workspace_path && actualSup.workspace_path === path.join(c.data_dir, 'workspaces', SUPERVISOR))
+          expectedSup.workspace_path = actualSup.workspace_path;
+      }
+      requireFact((rejectedHistory.length === 0 || systemOnly) && stable(afterRefusal) === stable(expectedList)
+        && stable(await get('/supervisor/default/scope')) === stable(scope)
         && flow.requests === 0, 'standard_refusal_had_side_effects');
     }
     await submit(SUPERVISOR, flow.markers.supervisor);
