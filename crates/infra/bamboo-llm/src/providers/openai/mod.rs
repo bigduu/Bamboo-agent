@@ -3,7 +3,7 @@
 //! This module provides integration with OpenAI's chat completion API,
 //! including support for streaming responses and function calling.
 
-use crate::providers::common::{log_identity, should_retry_without_reasoning};
+use crate::providers::common::log_identity;
 use async_trait::async_trait;
 use reqwest::{
     header::{HeaderMap, HeaderValue, AUTHORIZATION},
@@ -438,82 +438,6 @@ impl OpenAIProvider {
                 return Ok(stream);
             }
 
-            if should_retry_without_reasoning(reasoning_effort, status, &text) {
-                tracing::warn!(
-                    "OpenAI /responses rejected reasoning for model_hash {}; retrying without reasoning_effort",
-                    log_identity(model)
-                );
-
-                let mut fallback_options = responses_options.cloned().unwrap_or_default();
-                fallback_options.reasoning_summary = None;
-                let mut fallback_body = build_responses_body_with_capability_loading(
-                    model,
-                    messages,
-                    tools,
-                    max_output_tokens,
-                    None,
-                    Some(&fallback_options),
-                    parallel_tool_calls,
-                    generated_cache_plan,
-                    capability_loading_mode,
-                    tool_search_execution,
-                );
-                request_overrides::apply_overrides_to_body(
-                    &mut fallback_body,
-                    self.request_overrides.as_ref(),
-                    request_overrides::ENDPOINT_RESPONSES,
-                    Some(model),
-                );
-                if let Some(name) = required_tool {
-                    fallback_body["tool_choice"] = json!({"type": "function", "name": name});
-                }
-                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
-                self.observe_responses_wire(
-                    &fallback_body,
-                    Some(&fallback_options),
-                    session_log_id,
-                );
-                let fallback_headers =
-                    self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
-                let fallback =
-                    crate::retry::send_with_retry(crate::retry::global(), "OpenAI", || {
-                        self.client
-                            .post(&responses_url)
-                            .headers(fallback_headers.clone())
-                            .json(&fallback_body)
-                    })
-                    .await?;
-
-                if !fallback.status().is_success() {
-                    let fallback_status = fallback.status();
-                    let fallback_text = fallback.text().await?;
-                    return Err(LLMError::Api(format!(
-                        "HTTP {}: {}",
-                        fallback_status, fallback_text
-                    )));
-                }
-
-                let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, None)
-                    .with_protocol_events(retain_protocol_events);
-                let model_for_debug = model.to_string();
-                let stream = llm_stream_from_sse_multi_requiring_done(
-                    fallback,
-                    move |event, data| {
-                        let parsed = parser.handle_event_multi(event, data);
-                        append_responses_sse_record(
-                            "OpenAI",
-                            &model_for_debug,
-                            event,
-                            data,
-                            &parsed,
-                        );
-                        parsed
-                    },
-                    "OpenAI Responses",
-                );
-                return Ok(stream);
-            }
-
             return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
         }
 
@@ -789,65 +713,6 @@ impl LLMProvider for OpenAIProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await?;
-
-            if should_retry_without_reasoning(reasoning_effort, status, &text) {
-                tracing::warn!(
-                    "OpenAI /chat/completions rejected reasoning for model_hash {}; retrying without reasoning_effort",
-                    log_identity(model)
-                );
-
-                let mut fallback_body = build_openai_compat_body(
-                    model,
-                    messages,
-                    tools,
-                    None,
-                    max_output_tokens,
-                    None,
-                    parallel_tool_calls,
-                );
-                request_overrides::apply_overrides_to_body(
-                    &mut fallback_body,
-                    self.request_overrides.as_ref(),
-                    request_overrides::ENDPOINT_CHAT_COMPLETIONS,
-                    Some(model),
-                );
-                if let Some(name) = required_tool {
-                    fallback_body["tool_choice"] =
-                        json!({"type": "function", "function": {"name": name}});
-                }
-                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
-                let fallback_headers =
-                    self.build_headers(request_overrides::ENDPOINT_CHAT_COMPLETIONS, Some(model))?;
-                let fallback =
-                    crate::retry::send_with_retry(crate::retry::global(), "OpenAI", || {
-                        self.client
-                            .post(&chat_url)
-                            .headers(fallback_headers.clone())
-                            .json(&fallback_body)
-                    })
-                    .await?;
-
-                if fallback.status().is_success() {
-                    let stream = openai_compat_chat_stream_from_sse(fallback, |_event, data| {
-                        if data.trim().is_empty() {
-                            return Ok(Vec::new());
-                        }
-
-                        parse_openai_compat_sse_data_strict_multi(data)
-                    });
-
-                    return Ok(stream);
-                }
-
-                // The no-reasoning retry itself failed — surface ITS status/body,
-                // not the stale original "reasoning unsupported" 400 (which would
-                // mask the real failure, e.g. a 500/429 on the retry). (#237)
-                let fallback_status = fallback.status();
-                let fallback_text = fallback.text().await.unwrap_or_default();
-                return Err(LLMError::Api(format!(
-                    "HTTP {fallback_status}: {fallback_text} (after retrying without reasoning_effort)"
-                )));
-            }
 
             if Self::looks_like_responses_only_error(status, &text) {
                 tracing::info!(
@@ -1679,7 +1544,13 @@ mod tests {
             ("/chat/completions", "/reasoning_effort", CHAT_SSE_OK),
             ("/responses", "/reasoning/effort", RESPONSES_SSE_OK),
         ] {
-            for model in ["deepseek-flash", "gpt-6.1-sol", "custom-route"] {
+            for model in [
+                "deepseek-flash",
+                "gpt-6.1-sol",
+                "gemini-compatible-alias",
+                "google/custom-route",
+                "custom-route",
+            ] {
                 let server = MockServer::start().await;
                 Mock::given(method("POST"))
                     .and(path(endpoint))
@@ -1780,61 +1651,6 @@ mod tests {
                     "{endpoint}"
                 );
             }
-        }
-    }
-
-    #[tokio::test]
-    async fn unsupported_non_max_reasoning_keeps_existing_compatibility_retry() {
-        for (endpoint, effort_pointer, sse) in [
-            ("/chat/completions", "/reasoning_effort", CHAT_SSE_OK),
-            ("/responses", "/reasoning/effort", RESPONSES_SSE_OK),
-        ] {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path(endpoint))
-                .respond_with(move |request: &Request| {
-                    let body: Value = serde_json::from_slice(&request.body).unwrap();
-                    if body.pointer(effort_pointer).is_some() {
-                        ResponseTemplate::new(400).set_body_json(json!({
-                            "error": {"message": "Unsupported parameter: reasoning_effort"}
-                        }))
-                    } else {
-                        ResponseTemplate::new(200)
-                            .insert_header("content-type", "text/event-stream")
-                            .set_body_string(sse)
-                    }
-                })
-                .expect(2)
-                .mount(&server)
-                .await;
-            let mut provider = OpenAIProvider::new("test-key")
-                .with_base_url(server.uri())
-                .with_client(Client::builder().no_proxy().build().unwrap());
-            if endpoint == "/responses" {
-                provider = provider.with_responses_only_models(vec!["custom-route".to_string()]);
-            }
-            let options = LLMRequestOptions {
-                reasoning_effort: Some(ReasoningEffort::High),
-                ..Default::default()
-            };
-            let mut stream = provider
-                .chat_stream_with_options(
-                    &[Message::user("hello")],
-                    &[],
-                    None,
-                    "custom-route",
-                    Some(&options),
-                )
-                .await
-                .expect("non-max compatibility retry succeeds");
-            while let Some(chunk) = stream.next().await {
-                chunk.expect("valid SSE response");
-            }
-            let requests = server.received_requests().await.unwrap();
-            let first: Value = serde_json::from_slice(&requests[0].body).unwrap();
-            let second: Value = serde_json::from_slice(&requests[1].body).unwrap();
-            assert_eq!(first.pointer(effort_pointer), Some(&json!("high")));
-            assert!(second.pointer(effort_pointer).is_none());
         }
     }
 

@@ -741,7 +741,7 @@ pub fn build_responses_body_with_capability_loading(
     if reasoning_effort.is_some() || reasoning_summary.is_some() {
         let mut reasoning = serde_json::Map::new();
         if let Some(effort) = reasoning_effort {
-            reasoning.insert("effort".to_string(), json!(effort.to_wire_format(model)));
+            reasoning.insert("effort".to_string(), json!(effort.as_str()));
         }
         if let Some(summary) = reasoning_summary {
             reasoning.insert("summary".to_string(), json!(summary));
