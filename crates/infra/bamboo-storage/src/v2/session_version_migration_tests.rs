@@ -530,6 +530,10 @@ async fn version_migration_refuses_pending_legacy_control_planes_for_root_and_ch
     let mut running = AgentRuntimeState::new("legacy-active");
     running.status = AgentStatusState::Running;
     let legacy_running = serde_json::to_string(&running).unwrap();
+    let mut unknown = running;
+    unknown.status = AgentStatusState::Completed;
+    unknown.version = 99;
+    let legacy_unknown = serde_json::to_string(&unknown).unwrap();
     for child in [false, true] {
         let (home, store, root) = fixture(false).await;
         let target = if child {
@@ -545,6 +549,7 @@ async fn version_migration_refuses_pending_legacy_control_planes_for_root_and_ch
         let main = fs::read(directory.join("session.json")).await.unwrap();
         for (key, value) in [
             ("agent.runtime.state", legacy_running.as_str()),
+            ("agent.runtime.state", legacy_unknown.as_str()),
             ("agent.runtime.state", "malformed legacy runtime"),
             ("pending_injected_messages", "malformed accepted input"),
             ("typed_pending_injected_messages", ""),
