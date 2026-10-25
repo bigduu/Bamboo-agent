@@ -543,3 +543,13 @@ test('NATIVE REPORT: scripted Child emits the existing required-packet v1 report
     reported_evidence: [], reported_verification: [], proposals: [], blockers: [], open_decisions: [] });
   assert.equal(flow.readObserved, true);
 });
+
+
+for (const tool of ['session_control', 'Read']) {
+  test(`NATIVE DENIAL: current backend callability refusal identifies ${tool}`, async () => {
+    const mode = c('ultra'), flow = d.scenario(mode, randomUUID()); flow.steps.ordinary = 1;
+    const request = { messages: [user(flow.markers.ordinary), { role: 'tool', content: `Error: Tool '${tool}' is not callable at the current conversation position` }], tools };
+    if (tool === 'session_control') { await d.nextReply(request, mode, flow, {}); assert.equal(flow.ordinaryDenied, true); }
+    else await assert.rejects(d.nextReply(request, mode, flow, {}), e => e.code === 'ordinary_management_not_denied');
+  });
+}
