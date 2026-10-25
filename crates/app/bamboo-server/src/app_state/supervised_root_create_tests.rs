@@ -379,6 +379,7 @@ async fn supervisor_v2_ultra_spawn_uses_real_root_creation_and_exact_retry() {
 
 // These use the existing real AppState/Host operation fixture. The temporary
 // Work feature opt-in never changes installed/user security configuration.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn work_bound_supervisor_chat_case(standard: bool, stable_message_id: bool) {
     let f = Fixture::new(true).await;
     f.state.config.write().await.features.ticket_mutation = true;
@@ -545,16 +546,19 @@ async fn work_bound_supervisor_chat_case(standard: bool, stable_message_id: bool
     f.state.shutdown().await;
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[actix_web::test]
 async fn work_bound_standard_supervisor_admits_plain_root_chat_without_work_authority() {
     work_bound_supervisor_chat_case(true, false).await;
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[actix_web::test]
 async fn work_bound_ultra_supervisor_retains_formal_ingress_and_independent_roots() {
     work_bound_supervisor_chat_case(false, false).await;
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[actix_web::test]
 async fn work_bound_standard_supervisor_keeps_native_message_identity_without_work_reference() {
     work_bound_supervisor_chat_case(true, true).await;
