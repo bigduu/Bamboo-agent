@@ -59,14 +59,11 @@ impl ReasoningEffort {
 
     /// Return the provider/model-appropriate wire-format string.
     ///
-    /// Different model families expect different reasoning effort values:
-    /// - **GPT-5.6 family**: `none`, `low`, `medium`, `high`, `xhigh`, `max`
-    /// - **Other OpenAI-compatible models**: `low`, `medium`, `high`, `xhigh`
-    ///   (`max` → `xhigh` until the model advertises/supports it)
+    /// - **OpenAI-compatible models**: preserve the configured effort, including
+    ///   `max`. Model names may be gateway aliases and cannot establish which
+    ///   values an endpoint supports; unsupported values must be rejected by the
+    ///   endpoint rather than silently lowered here.
     /// - **Gemini**: `low`, `medium`, `high` (`xhigh`/`max` → `high`)
-    ///
-    /// This method only keeps the Gemini-specific mapping. All other models use
-    /// the default OpenAI-compatible format.
     pub fn to_wire_format(self, model: &str) -> &'static str {
         let model_lower = model.trim().to_ascii_lowercase();
 
@@ -79,23 +76,11 @@ impl ReasoningEffort {
             };
         }
 
-        if matches!(self, Self::Max) && !Self::supports_max_reasoning_effort(&model_lower) {
-            return "xhigh";
-        }
-
         self.as_str()
     }
 
     fn is_gemini_model(model_lower: &str) -> bool {
         model_lower.starts_with("gemini") || model_lower.contains("google")
-    }
-
-    fn supports_max_reasoning_effort(model_lower: &str) -> bool {
-        // GPT-5.6 is the first OpenAI model family whose published effort enum
-        // includes `max`. `contains` also covers gateway-qualified identifiers
-        // such as `openai/gpt-5.6-sol` without treating unknown compatible
-        // endpoints as capable by default.
-        model_lower.contains("gpt-5.6")
     }
 }
 
@@ -322,9 +307,9 @@ mod tests {
         assert_eq!(ReasoningEffort::Medium.to_wire_format("gpt-4o"), "medium");
         assert_eq!(ReasoningEffort::High.to_wire_format("gpt-4o"), "high");
         assert_eq!(ReasoningEffort::Xhigh.to_wire_format("gpt-4o"), "xhigh");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("gpt-4o"), "xhigh");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("o1-preview"), "xhigh");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("o3-mini"), "xhigh");
+        assert_eq!(ReasoningEffort::Max.to_wire_format("gpt-4o"), "max");
+        assert_eq!(ReasoningEffort::Max.to_wire_format("o1-preview"), "max");
+        assert_eq!(ReasoningEffort::Max.to_wire_format("o3-mini"), "max");
     }
 
     #[test]
@@ -335,6 +320,25 @@ mod tests {
             ReasoningEffort::Max.to_wire_format("openai/gpt-5.6-terra"),
             "max"
         );
+    }
+
+    #[test]
+    fn max_is_preserved_for_new_models_and_custom_gateway_aliases() {
+        for model in [
+            "deepseek-flash",
+            "gpt-6.1-sol",
+            "gpt-6-astra",
+            "openai/gpt-6.1-sol",
+            "custom-route",
+            "  GPT-6.1-SOL  ",
+        ] {
+            assert_eq!(ReasoningEffort::Max.to_wire_format(model), "max", "{model}");
+            assert_eq!(
+                ReasoningEffort::Xhigh.to_wire_format(model),
+                "xhigh",
+                "{model}"
+            );
+        }
     }
 
     #[test]
@@ -357,12 +361,9 @@ mod tests {
         );
         assert_eq!(
             ReasoningEffort::Max.to_wire_format("claude-sonnet-4"),
-            "xhigh"
+            "max"
         );
-        assert_eq!(
-            ReasoningEffort::Max.to_wire_format("claude-3-opus"),
-            "xhigh"
-        );
+        assert_eq!(ReasoningEffort::Max.to_wire_format("claude-3-opus"), "max");
     }
 
     #[test]
@@ -395,7 +396,7 @@ mod tests {
         );
         assert_eq!(
             ReasoningEffort::Max.to_wire_format("some-unknown-model"),
-            "xhigh"
+            "max"
         );
         assert_eq!(ReasoningEffort::High.to_wire_format("llama-3"), "high");
     }
@@ -408,7 +409,7 @@ mod tests {
         );
         assert_eq!(
             ReasoningEffort::Max.to_wire_format("Claude-3.5-Sonnet"),
-            "xhigh"
+            "max"
         );
         assert_eq!(
             ReasoningEffort::Xhigh.to_wire_format("GEMINI-2.5-PRO"),
@@ -419,7 +420,7 @@ mod tests {
             "high"
         );
         assert_eq!(ReasoningEffort::Xhigh.to_wire_format("GPT-4o"), "xhigh");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("GPT-4o"), "xhigh");
+        assert_eq!(ReasoningEffort::Max.to_wire_format("GPT-4o"), "max");
         assert_eq!(ReasoningEffort::Max.to_wire_format("GPT-5.6-SOL"), "max");
     }
 }
