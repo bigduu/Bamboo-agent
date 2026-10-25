@@ -3,7 +3,7 @@
 //! This module provides integration with OpenAI's chat completion API,
 //! including support for streaming responses and function calling.
 
-use crate::providers::common::log_identity;
+use crate::providers::common::{log_identity, should_retry_without_reasoning};
 use async_trait::async_trait;
 use reqwest::{
     header::{HeaderMap, HeaderValue, AUTHORIZATION},
@@ -248,11 +248,6 @@ impl OpenAIProvider {
         b.contains("/responses") || b.contains("responses api") || b.contains("use responses")
     }
 
-    fn looks_like_reasoning_unsupported_error(status: reqwest::StatusCode, body: &str) -> bool {
-        // Shared, tightened heuristic (#237 finding 5).
-        crate::providers::common::looks_like_reasoning_unsupported_error(status, body)
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn chat_stream_via_responses(
         &self,
@@ -443,10 +438,7 @@ impl OpenAIProvider {
                 return Ok(stream);
             }
 
-            // A configured maximum must not turn into an unreasoned retry.
-            if reasoning_effort.is_some_and(|effort| effort != ReasoningEffort::Max)
-                && Self::looks_like_reasoning_unsupported_error(status, &text)
-            {
+            if should_retry_without_reasoning(reasoning_effort, status, &text) {
                 tracing::warn!(
                     "OpenAI /responses rejected reasoning for model_hash {}; retrying without reasoning_effort",
                     log_identity(model)
@@ -798,10 +790,7 @@ impl LLMProvider for OpenAIProvider {
             let status = response.status();
             let text = response.text().await?;
 
-            // A configured maximum must not turn into an unreasoned retry.
-            if reasoning_effort.is_some_and(|effort| effort != ReasoningEffort::Max)
-                && Self::looks_like_reasoning_unsupported_error(status, &text)
-            {
+            if should_retry_without_reasoning(reasoning_effort, status, &text) {
                 tracing::warn!(
                     "OpenAI /chat/completions rejected reasoning for model_hash {}; retrying without reasoning_effort",
                     log_identity(model)
