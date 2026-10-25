@@ -6,7 +6,6 @@ use crate::api::models::{
     ImageUrl, Role, Tool, ToolCall, ToolChoice, Usage,
 };
 use serde_json::{json, Value};
-use std::collections::HashMap;
 
 /// HTTP status code type (avoiding actix-web dependency)
 pub type HttpStatusCode = u16;
@@ -133,8 +132,6 @@ pub fn convert_messages_request(
         parameters.insert("stop".to_string(), json!(stop_sequences));
     }
 
-    apply_reasoning_mapping(&mut parameters);
-
     let tools = request.tools.map(|tools| {
         tools
             .into_iter()
@@ -163,46 +160,6 @@ pub fn convert_messages_request(
         stream_options: None,
         parameters,
     })
-}
-
-/// Apply reasoning effort mapping from Anthropic to OpenAI format
-pub fn apply_reasoning_mapping(parameters: &mut HashMap<String, Value>) {
-    let reasoning = match parameters.remove("reasoning") {
-        Some(value) => value,
-        None => return,
-    };
-
-    if parameters.contains_key("reasoning_effort") {
-        return;
-    }
-
-    let value = match reasoning {
-        Value::String(value) => value,
-        other => {
-            parameters.insert("reasoning".to_string(), other);
-            return;
-        }
-    };
-
-    let normalized = value.trim().to_ascii_lowercase();
-    let mapped = match normalized.as_str() {
-        "low" => Some("low"),
-        "mid" | "medium" => Some("medium"),
-        "high" => Some("high"),
-        _ => None,
-    };
-
-    match mapped {
-        Some(effort) => {
-            parameters.insert(
-                "reasoning_effort".to_string(),
-                Value::String(effort.to_string()),
-            );
-        }
-        None => {
-            parameters.insert("reasoning".to_string(), Value::String(value));
-        }
-    }
 }
 
 fn append_user_blocks(
@@ -567,8 +524,6 @@ pub fn convert_complete_request(
         parameters.insert("top_k".to_string(), json!(top_k));
     }
 
-    apply_reasoning_mapping(&mut parameters);
-
     Ok(ChatCompletionRequest {
         model: request.model,
         messages: vec![ChatMessage {
@@ -667,6 +622,35 @@ pub fn format_model_display_name(model_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incoming_reasoning_parameters_are_not_renamed_or_normalized() {
+        for effort in [
+            "none", "low", "medium", "high", "xhigh", "max", "mid", " MAX ",
+        ] {
+            let request = serde_json::from_value(serde_json::json!({
+                "model": "custom-route", "max_tokens": 1,
+                "messages": [{"role":"user", "content":"hello"}],
+                "reasoning": effort, "reasoning_effort": effort
+            }))
+            .unwrap();
+            let converted = convert_messages_request(request)
+                .unwrap_or_else(|_| panic!("valid messages fixture"));
+            assert_eq!(converted.parameters["reasoning"], effort);
+            assert_eq!(converted.parameters["reasoning_effort"], effort);
+
+            let request = serde_json::from_value(serde_json::json!({
+                "model": "custom-route", "max_tokens_to_sample": 1,
+                "prompt": "\n\nHuman: hello\n\nAssistant:",
+                "reasoning": effort, "reasoning_effort": effort
+            }))
+            .unwrap();
+            let converted = convert_complete_request(request)
+                .unwrap_or_else(|_| panic!("valid completion fixture"));
+            assert_eq!(converted.parameters["reasoning"], effort);
+            assert_eq!(converted.parameters["reasoning_effort"], effort);
+        }
+    }
 
     fn response_with_tool_args(arguments: &str) -> ChatCompletionResponse {
         serde_json::from_value(serde_json::json!({

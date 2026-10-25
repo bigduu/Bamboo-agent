@@ -14,3 +14,6 @@ pub use bodhi::BodhiProvider;
 pub use copilot::CopilotProvider;
 pub use gemini::GeminiProvider;
 pub use openai::OpenAIProvider;
+
+#[cfg(test)]
+mod reasoning_passthrough_tests;

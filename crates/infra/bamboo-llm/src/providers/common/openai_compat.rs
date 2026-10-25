@@ -172,7 +172,7 @@ pub fn build_openai_compat_body(
     set_openai_compat_token_limit(&mut body, max_output_tokens, reasoning_effort.is_some());
 
     if let Some(reasoning_effort) = reasoning_effort {
-        body["reasoning_effort"] = json!(reasoning_effort.to_wire_format(model));
+        body["reasoning_effort"] = json!(reasoning_effort.as_str());
     }
 
     if let Some(parallel_tool_calls) = parallel_tool_calls {

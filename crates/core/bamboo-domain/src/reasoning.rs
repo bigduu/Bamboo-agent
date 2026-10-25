@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 /// Provider-agnostic reasoning effort levels.
 ///
-/// These values are surfaced to clients and can be mapped to provider-specific
-/// request parameters where supported.
+/// These values are surfaced to clients and sent through the selected protocol
+/// without changing the chosen level. Unsupported values return provider errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
@@ -55,32 +55,6 @@ impl ReasoningEffort {
             Self::Xhigh => "xhigh",
             Self::Max => "max",
         }
-    }
-
-    /// Return the provider/model-appropriate wire-format string.
-    ///
-    /// - **OpenAI-compatible models**: preserve the configured effort, including
-    ///   `max`. Model names may be gateway aliases and cannot establish which
-    ///   values an endpoint supports; unsupported values must be rejected by the
-    ///   endpoint rather than silently lowered here.
-    /// - **Gemini**: `low`, `medium`, `high` (`xhigh`/`max` → `high`)
-    pub fn to_wire_format(self, model: &str) -> &'static str {
-        let model_lower = model.trim().to_ascii_lowercase();
-
-        if Self::is_gemini_model(&model_lower) {
-            return match self {
-                Self::Disabled => "none",
-                Self::Low => "low",
-                Self::Medium => "medium",
-                Self::High | Self::Xhigh | Self::Max => "high",
-            };
-        }
-
-        self.as_str()
-    }
-
-    fn is_gemini_model(model_lower: &str) -> bool {
-        model_lower.starts_with("gemini") || model_lower.contains("google")
     }
 }
 
@@ -293,134 +267,5 @@ mod tests {
         assert_eq!(ReasoningEffort::parse("@medium"), None);
         assert_eq!(ReasoningEffort::parse("high#"), None);
         assert_eq!(ReasoningEffort::parse("$xhigh"), None);
-    }
-
-    // --- to_wire_format tests ---
-
-    #[test]
-    fn wire_format_gpt_models_use_openai_values() {
-        assert_eq!(
-            ReasoningEffort::Disabled.to_wire_format("gpt-5.6-sol"),
-            "none"
-        );
-        assert_eq!(ReasoningEffort::Low.to_wire_format("gpt-4o"), "low");
-        assert_eq!(ReasoningEffort::Medium.to_wire_format("gpt-4o"), "medium");
-        assert_eq!(ReasoningEffort::High.to_wire_format("gpt-4o"), "high");
-        assert_eq!(ReasoningEffort::Xhigh.to_wire_format("gpt-4o"), "xhigh");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("gpt-4o"), "max");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("o1-preview"), "max");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("o3-mini"), "max");
-    }
-
-    #[test]
-    fn max_is_preserved_for_gpt_5_6_family_and_gateway_ids() {
-        assert_eq!(ReasoningEffort::Max.to_wire_format("gpt-5.6"), "max");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("gpt-5.6-sol"), "max");
-        assert_eq!(
-            ReasoningEffort::Max.to_wire_format("openai/gpt-5.6-terra"),
-            "max"
-        );
-    }
-
-    #[test]
-    fn max_is_preserved_for_new_models_and_custom_gateway_aliases() {
-        for model in [
-            "deepseek-flash",
-            "gpt-6.1-sol",
-            "gpt-6-astra",
-            "openai/gpt-6.1-sol",
-            "custom-route",
-            "  GPT-6.1-SOL  ",
-        ] {
-            assert_eq!(ReasoningEffort::Max.to_wire_format(model), "max", "{model}");
-            assert_eq!(
-                ReasoningEffort::Xhigh.to_wire_format(model),
-                "xhigh",
-                "{model}"
-            );
-        }
-    }
-
-    #[test]
-    fn wire_format_claude_models_default_to_openai_values() {
-        assert_eq!(
-            ReasoningEffort::Low.to_wire_format("claude-3.5-sonnet"),
-            "low"
-        );
-        assert_eq!(
-            ReasoningEffort::Medium.to_wire_format("claude-3.5-sonnet"),
-            "medium"
-        );
-        assert_eq!(
-            ReasoningEffort::High.to_wire_format("claude-sonnet-4"),
-            "high"
-        );
-        assert_eq!(
-            ReasoningEffort::Xhigh.to_wire_format("claude-sonnet-4"),
-            "xhigh"
-        );
-        assert_eq!(
-            ReasoningEffort::Max.to_wire_format("claude-sonnet-4"),
-            "max"
-        );
-        assert_eq!(ReasoningEffort::Max.to_wire_format("claude-3-opus"), "max");
-    }
-
-    #[test]
-    fn wire_format_gemini_models_cap_at_high() {
-        assert_eq!(ReasoningEffort::Low.to_wire_format("gemini-2.5-pro"), "low");
-        assert_eq!(
-            ReasoningEffort::Medium.to_wire_format("gemini-2.5-pro"),
-            "medium"
-        );
-        assert_eq!(
-            ReasoningEffort::High.to_wire_format("gemini-2.5-pro"),
-            "high"
-        );
-        // Both xhigh and max → "high" for Gemini
-        assert_eq!(
-            ReasoningEffort::Xhigh.to_wire_format("gemini-2.5-pro"),
-            "high"
-        );
-        assert_eq!(
-            ReasoningEffort::Max.to_wire_format("gemini-2.5-pro"),
-            "high"
-        );
-    }
-
-    #[test]
-    fn wire_format_unknown_models_default_to_openai() {
-        assert_eq!(
-            ReasoningEffort::Xhigh.to_wire_format("some-unknown-model"),
-            "xhigh"
-        );
-        assert_eq!(
-            ReasoningEffort::Max.to_wire_format("some-unknown-model"),
-            "max"
-        );
-        assert_eq!(ReasoningEffort::High.to_wire_format("llama-3"), "high");
-    }
-
-    #[test]
-    fn wire_format_case_insensitive_model_matching() {
-        assert_eq!(
-            ReasoningEffort::Xhigh.to_wire_format("Claude-3.5-Sonnet"),
-            "xhigh"
-        );
-        assert_eq!(
-            ReasoningEffort::Max.to_wire_format("Claude-3.5-Sonnet"),
-            "max"
-        );
-        assert_eq!(
-            ReasoningEffort::Xhigh.to_wire_format("GEMINI-2.5-PRO"),
-            "high"
-        );
-        assert_eq!(
-            ReasoningEffort::Max.to_wire_format("GEMINI-2.5-PRO"),
-            "high"
-        );
-        assert_eq!(ReasoningEffort::Xhigh.to_wire_format("GPT-4o"), "xhigh");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("GPT-4o"), "max");
-        assert_eq!(ReasoningEffort::Max.to_wire_format("GPT-5.6-SOL"), "max");
     }
 }
