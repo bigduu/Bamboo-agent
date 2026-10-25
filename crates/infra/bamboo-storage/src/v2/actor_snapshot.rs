@@ -300,6 +300,9 @@ mod supported {
         /// Its stable identity is still useful to the Host owner's diagnostic
         /// topology, but its runtime observations must not become authority.
         own_observation_current: bool,
+        /// Historical projection requires a fully committed canonical pair;
+        /// it cannot resolve a partial Main/runtime metadata publication.
+        metadata_pair_current: bool,
     }
 
     /// Parsed only for v2, from the same bounded sidecar bytes as Identity.
@@ -499,6 +502,9 @@ mod supported {
                     .map_err(|_| Error::StaleAuthority)?;
             }
         }
+        let metadata_pair_current = side
+            .as_ref()
+            .is_none_or(|side| side.metadata_version == main.metadata_version);
         let mut session = side.unwrap_or(main);
         if is_root && session.root_session_id.is_empty() {
             session.root_session_id = id.to_owned();
@@ -544,6 +550,7 @@ mod supported {
             row,
             local_task,
             own_observation_current,
+            metadata_pair_current,
         })
     }
 
@@ -703,8 +710,10 @@ mod supported {
         let mut historical_observations = HashSet::new();
         for (id, source) in &sources {
             let chain = lineage(id, &sources)?;
+            let canonical_pairs_current = source.metadata_pair_current
+                && chain.iter().all(|ancestor| ancestor.metadata_pair_current);
             if !source.own_observation_current {
-                if !host_owner {
+                if !host_owner || !canonical_pairs_current {
                     return Err(Error::StaleAuthority);
                 }
                 historical_observations.insert(id.clone());
@@ -731,7 +740,7 @@ mod supported {
                                     && recorded.session_created_at == current.session_created_at
                                     && recorded.metadata_version <= current.metadata_version
                             });
-                    if !host_owner || !older_same_lineage {
+                    if !host_owner || !older_same_lineage || !canonical_pairs_current {
                         return Err(Error::StaleAuthority);
                     }
                     historical_observations.insert(id.clone());

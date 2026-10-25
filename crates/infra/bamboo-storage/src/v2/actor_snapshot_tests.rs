@@ -536,17 +536,19 @@ async fn title_observations_noop_reloads_instead_of_trusting_caller_snapshot() {
 #[tokio::test]
 async fn title_observations_report_partial_io_and_validate_noop_truthfully() {
     use super::default_actor_context_tests::DefaultWriteHook;
-    for (file, phase, new_title_visible, consistent) in [
+    for (file, phase, new_title_visible, consistent, snapshot_readable) in [
         (
             "actor-authority.json",
             DurableWritePhase::AfterReplace,
             true,
             false,
+            true,
         ),
         (
             RUNTIME_SIDECAR_FILE,
             DurableWritePhase::BeforeReplace,
             false,
+            true,
             true,
         ),
         (
@@ -554,10 +556,12 @@ async fn title_observations_report_partial_io_and_validate_noop_truthfully() {
             DurableWritePhase::BeforeReplace,
             true,
             false,
+            false,
         ),
         (
             SEARCH_INDEX_REVISION_FILE,
             DurableWritePhase::BeforeReplace,
+            true,
             true,
             true,
         ),
@@ -567,7 +571,8 @@ async fn title_observations_report_partial_io_and_validate_noop_truthfully() {
         f.store.save_manual_title(&baseline).await.unwrap();
         let child = f.child("io-title-child", &baseline).await;
         f.store.ensure_actor(&f.root.id).await.unwrap();
-        f.store.ensure_actor(&child.id).await.unwrap();
+        let activation = f.activate(&child.id).await;
+        let child_row_before = title_row(&f, &child.id).await;
         let old = f.store.load_session(&f.root.id).await.unwrap().unwrap();
         let mut next = rename_title(old.clone());
         next.title = "Next requested title".into();
@@ -583,7 +588,58 @@ async fn title_observations_report_partial_io_and_validate_noop_truthfully() {
         let validation = f.store.validate_title_observations(&current).await;
         let snapshot = f.snapshot(&f.root.id, ActorSnapshotLimits::default()).await;
         assert_eq!(validation.is_ok(), consistent, "no-op after {file}");
-        assert_eq!(snapshot.is_ok(), consistent, "snapshot after {file}");
+        assert_eq!(snapshot.is_ok(), snapshot_readable, "snapshot after {file}");
+        if file == "actor-authority.json" {
+            // Main/runtime and all Root proofs already committed before the
+            // Actor refresh fault. The first (Root) row advanced; the Child
+            // observation is still historical. That is enough for a Host
+            // topology, never for reusing the Child's stale execution view.
+            let view = snapshot.unwrap();
+            assert_eq!(view.nodes.len(), 2);
+            let root = view
+                .nodes
+                .iter()
+                .find(|node| node.actor_id == f.root.id)
+                .unwrap();
+            assert_eq!(
+                root.revision.session_metadata_version,
+                next.metadata_version
+            );
+            assert_eq!(root.logical_state, Some(ActorLogicalState::Cold));
+            let observed_child = view
+                .nodes
+                .iter()
+                .find(|node| node.actor_id == child.id)
+                .unwrap();
+            assert_eq!(
+                observed_child.parent_actor_id.as_deref(),
+                Some(f.root.id.as_str())
+            );
+            assert_eq!(
+                observed_child.revision.actor_directory_revision,
+                Some(child_row_before.revision)
+            );
+            assert!(observed_child.logical_state.is_none());
+            assert!(observed_child.activation.is_none());
+            assert!(observed_child.placement_class.is_none());
+            assert_eq!(
+                f.store
+                    .actor_subtree_snapshot(
+                        ActorSnapshotPrincipal::live_actor(activation.fence()),
+                        &f.root.id,
+                        &child.id,
+                        ActorSnapshotLimits::default(),
+                    )
+                    .await
+                    .unwrap_err(),
+                Error::StaleAuthority
+            );
+        } else if file == "session.json" {
+            // Runtime carries the new metadata but Main is still the old
+            // generation. Historical projection cannot certify that partial
+            // canonical pair, even when their stable identity is unchanged.
+            assert_eq!(snapshot.unwrap_err(), Error::StaleAuthority);
+        }
         assert_eq!(durable_tree(&f.home), before_validation);
         if !consistent {
             // A same-title manual retry checks the validator above. Changing
