@@ -4,7 +4,6 @@ use crate::config::GoldConfig;
 use crate::runtime::gold_evaluation::GoldEvaluationResult;
 use crate::TaskLoopContext;
 use bamboo_agent_core::{AgentEvent, Session};
-use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::ProviderModelRef;
 use bamboo_llm::{LLMProvider, LLMRequestOptions};
 use tokio::sync::mpsc;
@@ -145,7 +144,7 @@ pub(crate) async fn evaluate_gold_auto_answer_question_with_target(
     let tools = get_gold_auto_answer_tools();
     let request_options = LLMRequestOptions {
         session_id: Some(session_id.to_string()),
-        reasoning_effort: normalize_lightweight_reasoning_effort(session.reasoning_effort),
+        reasoning_effort: session.reasoning_effort,
         parallel_tool_calls: None,
         required_tool: None,
         responses: None,
@@ -341,19 +340,135 @@ fn gold_auxiliary_target(
     }
 }
 
-fn normalize_lightweight_reasoning_effort(
-    reasoning_effort: Option<ReasoningEffort>,
-) -> Option<ReasoningEffort> {
-    reasoning_effort.map(|effort| match effort {
-        ReasoningEffort::Xhigh | ReasoningEffort::Max => ReasoningEffort::High,
-        other => other,
-    })
-}
-
 #[cfg(test)]
 mod provider_selection_tests {
+    use std::sync::{Arc, Mutex};
+
     use super::gold_provider_name;
-    use bamboo_agent_core::Session;
+    use super::{
+        evaluate_gold_auto_answer_question_with_target, evaluate_gold_state_with_target,
+        GoldAuxiliaryTarget,
+    };
+    use crate::runtime::config::GoldConfig;
+    use crate::runtime::gold_evaluation::GoldEvaluationResult;
+    use crate::runtime::stream::handler::StreamTimeoutContext;
+    use bamboo_agent_core::{
+        GoldCheckpoint, GoldConfidence, GoldDecision, Message, PendingQuestion,
+        PendingQuestionSource, Session, ToolSchema,
+    };
+    use bamboo_domain::ReasoningEffort;
+    use bamboo_llm::{LLMError, LLMProvider, LLMRequestOptions, LLMStream};
+
+    #[derive(Default)]
+    struct RecordingRejectingProvider {
+        requests: Mutex<Vec<(String, Option<ReasoningEffort>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for RecordingRejectingProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            panic!("Gold requests must carry request controls")
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+            options: Option<&LLMRequestOptions>,
+        ) -> Result<LLMStream, LLMError> {
+            let options = options.expect("request controls");
+            self.requests.lock().unwrap().push((
+                options.request_purpose.clone().expect("request purpose"),
+                options.reasoning_effort,
+            ));
+            Err(LLMError::Api(
+                "fixture rejected selected effort".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn gold_evaluator_requests_preserve_selected_reasoning_effort() {
+        for effort in [
+            None,
+            Some(ReasoningEffort::Disabled),
+            Some(ReasoningEffort::Low),
+            Some(ReasoningEffort::Medium),
+            Some(ReasoningEffort::High),
+            Some(ReasoningEffort::Xhigh),
+            Some(ReasoningEffort::Max),
+        ] {
+            let mut session = Session::new("gold-effort-selection", "session-model");
+            session.reasoning_effort = effort;
+            session.pending_question = Some(PendingQuestion {
+                tool_call_id: "pending-question".to_string(),
+                tool_name: "conclusion_with_options".to_string(),
+                question: "Continue?".to_string(),
+                options: vec!["Continue".to_string()],
+                allow_custom: false,
+                source: PendingQuestionSource::PauseTool,
+            });
+            let provider = Arc::new(RecordingRejectingProvider::default());
+            let target = || GoldAuxiliaryTarget {
+                provider: provider.clone(),
+                model: "gold-effort-model".to_string(),
+                timeout_context: StreamTimeoutContext::default(),
+                configured_limit: 1,
+            };
+            let config = GoldConfig::default();
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(2);
+            let error = evaluate_gold_state_with_target(
+                &session.id,
+                &session,
+                &config,
+                target(),
+                &event_tx,
+                0,
+            )
+            .await
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("fixture rejected selected effort"));
+
+            let state_evaluation = GoldEvaluationResult {
+                checkpoint: GoldCheckpoint::Terminal,
+                iteration: 0,
+                decision: GoldDecision::Continue,
+                confidence: GoldConfidence::High,
+                reasoning: "fixture state evaluation".to_string(),
+                missing_information: Vec::new(),
+                next_action: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            };
+            let error = evaluate_gold_auto_answer_question_with_target(
+                &session.id,
+                &session,
+                &config,
+                &state_evaluation,
+                target(),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("fixture rejected selected effort"));
+            assert_eq!(
+                provider.requests.lock().unwrap().as_slice(),
+                &[
+                    ("gold_evaluation".to_string(), effort),
+                    ("gold_auto_answer".to_string(), effort)
+                ],
+            );
+        }
+    }
 
     #[test]
     fn gold_provider_fallback_uses_default_provider_instance() {

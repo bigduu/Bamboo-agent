@@ -225,33 +225,44 @@ impl LLMProvider for RecordingRequestOptionsProvider {
 }
 
 #[tokio::test]
-async fn task_evaluation_caps_reasoning_effort_to_high_for_lightweight_request() {
-    let context = create_test_context();
-    let session = bamboo_agent_core::Session::new("test-session", "session-model");
-    let provider = Arc::new(RecordingRequestOptionsProvider::default());
-    let llm: Arc<dyn LLMProvider> = provider.clone();
-    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(4);
-    let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::default();
+async fn task_evaluation_requests_preserve_selected_reasoning_effort() {
+    for effort in [
+        None,
+        Some(ReasoningEffort::Disabled),
+        Some(ReasoningEffort::Low),
+        Some(ReasoningEffort::Medium),
+        Some(ReasoningEffort::High),
+        Some(ReasoningEffort::Xhigh),
+        Some(ReasoningEffort::Max),
+    ] {
+        let context = create_test_context();
+        let session = bamboo_agent_core::Session::new("test-session", "session-model");
+        let provider = Arc::new(RecordingRequestOptionsProvider::default());
+        let llm: Arc<dyn LLMProvider> = provider.clone();
+        let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(4);
+        let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::default();
 
-    let _ = evaluate_task_progress(
-        &context,
-        &session,
-        llm,
-        &super::TaskEvaluationFrame {
-            event_tx: &event_tx,
-            session_id: "test-session",
-            model: "gpt-5-mini",
-            reasoning_effort: Some(ReasoningEffort::Xhigh),
-            timeout_context: &timeout_context,
-        },
-    )
-    .await
-    .expect("evaluation request should succeed");
+        let _ = evaluate_task_progress(
+            &context,
+            &session,
+            llm,
+            &super::TaskEvaluationFrame {
+                event_tx: &event_tx,
+                session_id: "test-session",
+                model: "gpt-5-mini",
+                reasoning_effort: effort,
+                timeout_context: &timeout_context,
+            },
+        )
+        .await
+        .expect("evaluation request should succeed");
 
-    assert_eq!(
-        provider.last_requested_reasoning(),
-        Some(Some(ReasoningEffort::High))
-    );
+        assert_eq!(
+            provider.last_requested_reasoning(),
+            Some(effort),
+            "selected effort {effort:?} must reach the provider unchanged"
+        );
+    }
 }
 
 #[tokio::test]
