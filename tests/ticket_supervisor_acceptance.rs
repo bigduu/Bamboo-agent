@@ -520,10 +520,10 @@ async fn actual_supervisor_rejects_reworks_verifies_and_waits_for_exact_user_acc
     f.finish().await;
 }
 
-// #1968 tracks the product mismatch: two-mode delegation policy/catalog does
-// not currently grant Standard mode a Host Ticket scope. Preserve that gate.
+// Standard permits ordinary chat. An explicit thread requests formal Ticket
+// ingress, which still requires Supervisor orchestration authority.
 #[actix_web::test]
-async fn standard_supervisor_ticket_gate_refuses_chat_without_publishing_work_or_human() {
+async fn standard_supervisor_ticket_gate_refuses_formal_chat_without_publishing_work_or_human() {
     let f = Fixture::new().await;
     select_mode(&f, "standard").await;
     let store = SessionStoreV2::new(f.data.clone()).await.unwrap();
@@ -549,6 +549,7 @@ async fn standard_supervisor_ticket_gate_refuses_chat_without_publishing_work_or
         .post(format!("{}/chat", f.base))
         .json(&json!({
             "session_id":DEFAULT_SUPERVISOR_SESSION_ID,"message_id":"standard-refused-human",
+            "thread_id":"standard-refused-formal-thread",
             "message":format!("Create and start {TITLE}"),"model":"ticket-model","provider":"openai"
         }))
         .send()
