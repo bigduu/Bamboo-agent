@@ -122,6 +122,7 @@ async function mockHost(t, mode, options = {}) {
   const fixtureId = options.fixtureId || randomUUID(), modeCase = c(mode);
   modeCase.workspace_path = directory; modeCase.provider_port = 0;
   const flow = d.scenario(modeCase, fixtureId), sessions = new Map(), histories = new Map(), calls = [], errors = [];
+  let authorityConflict = !!options.authorityConflictOnce;
   const sup = root('bamboo-default-supervisor', mode), ordinary = root(modeCase.ordinary_session_id, 'ultra');
   sessions.set(sup.id, sup); sessions.set(ordinary.id, ordinary); histories.set(sup.id, []); histories.set(ordinary.id, []);
   const scope = { scope: { supervisor: { session_id: sup.id, incarnation_id: fixtureId }, state_revision: 1, allowed_projects: [modeCase.project_id] } };
@@ -179,6 +180,10 @@ async function mockHost(t, mode, options = {}) {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : undefined; calls.push({ method: req.method, url: req.url, body });
     const send = (status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
+    if (req.url === '/api/v1/sessions/bamboo-default-supervisor' && authorityConflict) {
+      authorityConflict = false;
+      return send(409, { error: { code: options.otherAuthorityConflict ? 'session_execution_conflict' : 'session_authority_unavailable' } });
+    }
     if (req.url === '/api/v1/bootstrap') return send(200, { server: { product: 'bamboo' }, api: { name: 'bamboo.agent' }, capabilities: ['http.native_receipt_run.v1'] });
     if (req.url === '/api/v1/sessions') return send(200, { sessions: [...sessions.values()] });
     if (req.url === '/api/v1/supervisor/default/scope') return send(200, scope);
@@ -553,3 +558,16 @@ for (const tool of ['session_control', 'Read']) {
     else await assert.rejects(d.nextReply(request, mode, flow, {}), e => e.code === 'ordinary_management_not_denied');
   });
 }
+
+
+test('NATIVE READ: a pending canonical proof is re-observed without replaying mutations', async t => {
+  const f = await mockHost(t, 'ultra', { authorityConflictOnce: true });
+  const result = await d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] });
+  assert.equal(result.status, 'PASS');
+  assert.equal(f.calls.filter(c => c.url === '/api/v1/chat').length, 2);
+});
+test('NATIVE READ: another 409 is not treated as a recoverable proof read', async t => {
+  const f = await mockHost(t, 'ultra', { authorityConflictOnce: true, otherAuthorityConflict: true });
+  await assert.rejects(d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] }), e => e.code === 'canonical_read_failed');
+  assert.equal(f.calls.filter(c => c.method === 'POST').length, 0);
+});
