@@ -347,13 +347,14 @@ async function nextReply(request, c, flow, hooks) {
       reported_verification: [], proposals: [], blockers: [], open_decisions: [] }) };
   }
   if (step === 0) {
-    // Intentionally unadvertised on an ordinary Ultra Root: test the final
-    // authority gate rather than treating absence from the catalog as proof.
+    // Submit an unadvertised management operation on an ordinary Ultra Root.
+    // Require an actual backend refusal, not catalog absence; the current
+    // callability fence can reject it before the deeper identity check.
     return { role: 'assistant', content: null, tool_calls: [{ id: 'ordinary-denial', type: 'function',
       function: { name: 'session_control', arguments: '{"action":"scope"}' } }] };
   }
   const text = textContent(request.messages.findLast(m => m.role === 'tool')?.content);
-  requireFact(/(not allowed|not available|unavailable|requires|denied|unknown tool)/i.test(text)
+  requireFact(/(not allowed|not available|not callable|unavailable|requires|denied|unknown tool)/i.test(text)
     && /(session_control|Supervisor|orchestration)/i.test(text), 'ordinary_management_not_denied');
   flow.ordinaryDenied = true; return { role: 'assistant', content: 'Fixture management denial observed.' };
 }
