@@ -269,6 +269,94 @@ async fn version_migration_unknown_schema_and_pending_inbox_remain_untouched() {
 }
 
 #[tokio::test]
+async fn version_migration_cleanup_loss_cannot_reblock_later_commits() {
+    use super::session_version_migration::{is_published_migration_journal, MigrationFault};
+    use bamboo_domain::{ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincipal};
+
+    let (home, store, original) = fixture(false).await;
+    let intent = request(
+        &store
+            .inspect_session_version_migration(&original.id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    *store.session_version_migration_fault.lock().unwrap() = Some(MigrationFault::Receipt);
+    assert!(store
+        .migrate_session_version(&original.id, &intent)
+        .await
+        .is_err());
+    let active = store
+        .session_version_migration_journals()
+        .await
+        .unwrap()
+        .remove(0);
+    let journal = fs::read(&active).await.unwrap();
+    *store.session_version_migration_fault.lock().unwrap() = Some(MigrationFault::Deactivated);
+    assert!(store
+        .migrate_session_version(&original.id, &intent)
+        .await
+        .is_err());
+    let mut entries = fs::read_dir(active.parent().unwrap()).await.unwrap();
+    // Capture the actual cleanup destination. The old unlink-only path has no
+    // destination: losing its unlink revives the original active .json name.
+    let cleanup = entries
+        .next_entry()
+        .await
+        .unwrap()
+        .map_or_else(|| active.clone(), |entry| entry.path());
+    if cleanup.exists() {
+        assert_eq!(fs::read(&cleanup).await.unwrap(), journal);
+        fs::remove_file(&cleanup).await.unwrap();
+    }
+    let mut later = store.load_session(&original.id).await.unwrap().unwrap();
+    later.add_message(Message::user("valid history after migration committed"));
+    store.save_session(&later).await.unwrap();
+    let committed = pair(home.path(), &original.id).await;
+    store.flush_search_index().await;
+    drop(store);
+
+    // Namespace fault model, not a native power-loss claim: resurrect exactly
+    // the name and bytes left by production cleanup after a later legal save.
+    fs::write(&cleanup, &journal).await.unwrap();
+    let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+    assert!(!is_published_migration_journal(&cleanup));
+    assert_eq!(pair(home.path(), &original.id).await, committed);
+    assert_eq!(
+        serde_json::to_value(
+            reopened
+                .load_session(&original.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .messages
+        )
+        .unwrap(),
+        serde_json::to_value(&later.messages).unwrap()
+    );
+    assert!(matches!(
+        reopened
+            .migrate_session_version(&original.id, &intent)
+            .await
+            .unwrap(),
+        SessionVersionMigrationDecision::Committed(_)
+    ));
+    reopened
+        .actor_subtree_snapshot(
+            ActorSnapshotPrincipal::host_owner(),
+            &original.id,
+            &original.id,
+            ActorSnapshotLimits::default(),
+        )
+        .await
+        .unwrap();
+    reopened.actor_tree_cursor(&original.id).await.unwrap();
+    assert_eq!(pair(home.path(), &original.id).await, committed);
+    assert_eq!(fs::read(cleanup).await.unwrap(), journal);
+    reopened.flush_search_index().await;
+}
+
+#[tokio::test]
 async fn version_migration_recovers_each_pair_publication_boundary_after_restart() {
     use super::session_version_migration::MigrationFault;
     for fault in [

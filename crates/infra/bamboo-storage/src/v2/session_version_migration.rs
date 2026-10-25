@@ -289,6 +289,7 @@ pub(super) enum MigrationFault {
     Runtime,
     Main,
     Receipt,
+    Deactivated,
 }
 
 impl SessionStoreV2 {
@@ -795,6 +796,8 @@ impl SessionStoreV2 {
             sync_parent(&path)
         })
         .await?;
+        #[cfg(test)]
+        self.migration_fault(MigrationFault::Deactivated)?;
         Ok(receipt)
     }
 
