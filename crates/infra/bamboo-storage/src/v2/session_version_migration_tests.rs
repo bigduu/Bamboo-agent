@@ -270,6 +270,10 @@ async fn version_migration_unknown_schema_and_pending_inbox_remain_untouched() {
 
 #[tokio::test]
 async fn version_migration_cleanup_loss_cannot_reblock_later_commits() {
+    cleanup_loss_regression().await;
+}
+
+pub(super) async fn cleanup_loss_regression() {
     use super::session_version_migration::{is_published_migration_journal, MigrationFault};
     use bamboo_domain::{ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincipal};
 

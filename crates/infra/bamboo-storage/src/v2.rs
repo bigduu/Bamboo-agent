@@ -6346,6 +6346,19 @@ async fn atomic_rename(from: &Path, to: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
+        atomic_rename_blocking(from, to)
+    }
+}
+
+// Owned writer jobs retain their authority while the complete rename and
+// caller-owned directory synchronization run on the same blocking worker.
+fn atomic_rename_blocking(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+    #[cfg(windows)]
+    {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{
             MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,

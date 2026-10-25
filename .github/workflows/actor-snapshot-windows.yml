@@ -162,7 +162,7 @@ jobs:
             'live_actor_fence_authorizes_self_and_descendants_but_not_siblings_or_foreign_roots'
             'regular_file_symlink_replacement_is_rejected_and_open_handle_retains_original'
             'nested_snapshot_is_private_read_only_and_stable_after_restart'
-            'pending_task_and_copy_journals_leave_owned_home_unchanged'
+            'pending_transactions_and_migration_cleanup_preserve_owned_state'
             'retained_directory_and_file_handles_reject_reparse_replacement'
             'stale_identity_and_tight_budgets_fail_without_partial_tree'
             'unsupported_namespaces_selectors_and_object_kinds_fail_without_writes'

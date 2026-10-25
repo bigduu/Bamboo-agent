@@ -791,13 +791,25 @@ impl SessionStoreV2 {
         #[cfg(test)]
         self.migration_fault(MigrationFault::Receipt)?;
         let path = path.to_path_buf();
-        Self::default_writer_job(guards, move || {
-            std::fs::remove_file(&path)?;
-            sync_parent(&path)
+        let inactive = Self::default_writer_job(guards, move || {
+            let inactive = path.with_extension(format!("removed.{}", Uuid::new_v4()));
+            // Persist an inactive name before allowing later canonical writes.
+            // Windows uses the same write-through rename as other journals.
+            atomic_rename_blocking(&path, &inactive)?;
+            sync_parent(&inactive)?;
+            Ok(inactive)
         })
         .await?;
         #[cfg(test)]
         self.migration_fault(MigrationFault::Deactivated)?;
+        Self::default_writer_job(guards, move || {
+            // Cancellation or a lost cleanup unlink leaves an inert tombstone.
+            if std::fs::remove_file(&inactive).is_ok() {
+                let _ = sync_parent(&inactive);
+            }
+            Ok(())
+        })
+        .await?;
         Ok(receipt)
     }
 
