@@ -1282,7 +1282,9 @@ mod tests {
         let raw = f
             .roots()
             .join(std::ffi::OsString::from_vec(b"non-utf8-\xff".to_vec()));
-        init_discovery_repo(&raw);
+        fs::create_dir_all(&raw).unwrap();
+        // Git may include the raw directory name in its initialization output.
+        git_bytes(&raw, &["init", "-b", "main"]).unwrap();
         let discovery = discover_repositories(&f.roots());
         assert!(discovery.repositories.is_empty(), "{discovery:?}");
         assert_eq!(discovery.diagnostics.len(), 1, "{discovery:?}");
