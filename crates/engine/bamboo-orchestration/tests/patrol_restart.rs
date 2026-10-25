@@ -361,7 +361,9 @@ fn program_entry_reopen_preserves_original_incident_scope_and_checks_fresh_autho
     assert!(!escalation.queued);
     assert_eq!(fixture.service().published().unwrap().0, before);
 
-    let denied = fixture.authority(Principal::User);
+    let denied = fixture.authority(Principal::User {
+        user_id: "owner".into(),
+    });
     assert!(matches!(
         program.tick_project(
             fixture.service(),
