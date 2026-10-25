@@ -689,7 +689,7 @@ async fn changed_birth_stale_actor_and_root_authority_fail_without_repair() {
 }
 
 #[tokio::test]
-async fn pending_transactions_and_migration_cleanup_preserve_owned_state() {
+async fn pending_task_and_copy_journals_leave_owned_home_unchanged() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().canonicalize().unwrap();
     let store = SessionStoreV2::new(home.clone()).await.unwrap();
@@ -732,6 +732,8 @@ async fn pending_transactions_and_migration_cleanup_preserve_owned_state() {
             original
         );
     }
+    // Keep the selected native journal case and also run migration cleanup's
+    // shared regression on Windows, including its write-through rename.
     super::session_version_migration_tests::cleanup_loss_regression().await;
 }
 
