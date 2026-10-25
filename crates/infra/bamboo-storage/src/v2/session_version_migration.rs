@@ -274,7 +274,7 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MigrationFault {
     Prepared,
     Runtime,

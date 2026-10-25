@@ -33,7 +33,7 @@ async fn fixture(supervisor: bool) -> (tempfile::TempDir, SessionStoreV2, Sessio
     };
     session.add_message(Message::system("retained system"));
     session.add_message(Message::user("retained user history"));
-    session.set_workspace_path_meta("/retained/workspace".into());
+    session.set_workspace_path_meta("/retained/workspace");
     session.set_provider_name("retained-provider");
     session.agent_runtime_state = Some(AgentRuntimeState::new("finished-run"));
     session.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Completed;
