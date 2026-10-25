@@ -2,7 +2,8 @@
 //! never an ordinary checkpoint, model capability, or automatic legacy load.
 use super::*;
 use bamboo_domain::{
-    ActorDirectoryEntry, ActorLogicalState, AgentStatusState, CURRENT_SESSION_VERSION,
+    ActorDirectoryEntry, ActorLogicalState, AgentRuntimeState, AgentStatusState,
+    CURRENT_SESSION_VERSION,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -146,6 +147,51 @@ fn blocker(code: &str, message: &str) -> SessionVersionMigrationBlocker {
         code: code.into(),
         message: message.into(),
     }
+}
+
+fn pending_response(session: &Session) -> bool {
+    session.pending_question.is_some()
+        || session.has_pending_injected_messages()
+        || session.metadata.iter().any(|(key, value)| {
+            key == "permission.replay_save_recovery_required"
+                || ((key.contains("permission_reexecute")
+                    || key.starts_with("permission.reexecute")
+                    || matches!(
+                        key.as_str(),
+                        "retry_resume_pending"
+                            | "clarification_resume_pending"
+                            | "conclusion_with_options_resume_pending"
+                    ))
+                    && !value.is_empty()
+                    && value != "false")
+        })
+}
+
+fn runtime_not_idle(session: &Session) -> bool {
+    let busy = |state: &AgentRuntimeState| {
+        !matches!(
+            state.status,
+            AgentStatusState::Idle
+                | AgentStatusState::Completed
+                | AgentStatusState::Cancelled
+                | AgentStatusState::Failed
+        ) || state.tools.active_tool_calls != 0
+            || state.waiting_for_children.is_some()
+            || state.waiting_for_bash.is_some()
+            || state.suspension.is_some()
+            || state.plan_mode.is_some()
+    };
+    if let Some(state) = &session.agent_runtime_state {
+        return busy(state);
+    }
+    // Match the engine's typed-first fallback without inventing an idle state
+    // when the retained legacy control plane cannot be decoded.
+    session
+        .metadata
+        .get("agent.runtime.state")
+        .is_some_and(|raw| {
+            serde_json::from_str::<AgentRuntimeState>(raw).map_or(true, |state| busy(&state))
+        })
 }
 
 /// Preserve every original JSON value (including unknown fields and retained
@@ -386,33 +432,13 @@ impl SessionStoreV2 {
                 "This Session already uses the current behavior version.",
             ));
         }
-        if session.pending_question.is_some()
-            || session.metadata.iter().any(|(key, value)| {
-                (key.contains("permission_reexecute")
-                    || key.starts_with("permission.reexecute")
-                    || key == "retry_resume_pending")
-                    && !value.is_empty()
-                    && value != "false"
-            })
-        {
+        if pending_response(session) {
             reasons.push(blocker(
                 "pending_response",
-                "Finish the pending clarification, approval or retained replay first.",
+                "Resolve pending input, clarification, approval or retained replay first.",
             ));
         }
-        if session.agent_runtime_state.as_ref().is_some_and(|state| {
-            !matches!(
-                state.status,
-                AgentStatusState::Idle
-                    | AgentStatusState::Completed
-                    | AgentStatusState::Cancelled
-                    | AgentStatusState::Failed
-            ) || state.tools.active_tool_calls != 0
-                || state.waiting_for_children.is_some()
-                || state.waiting_for_bash.is_some()
-                || state.suspension.is_some()
-                || state.plan_mode.is_some()
-        }) {
+        if runtime_not_idle(session) {
             reasons.push(blocker(
                 "execution_not_idle",
                 "Retire the current execution, Child/Bash wait or Plan before migration.",
@@ -474,18 +500,8 @@ impl SessionStoreV2 {
                         return Err(invalid("Child identity or Project changed"));
                     }
                     let runtime_busy = !state.execution_compatibility().execution_allowed
-                        || state.pending_question.is_some()
-                        || state.agent_runtime_state.as_ref().is_some_and(|runtime| {
-                            !matches!(
-                                runtime.status,
-                                AgentStatusState::Idle
-                                    | AgentStatusState::Completed
-                                    | AgentStatusState::Cancelled
-                                    | AgentStatusState::Failed
-                            ) || runtime.tools.active_tool_calls != 0
-                                || runtime.waiting_for_children.is_some()
-                                || runtime.waiting_for_bash.is_some()
-                        });
+                        || pending_response(&state)
+                        || runtime_not_idle(&state);
                     let actor_busy =
                         match regular(&child.join("actor-authority.json"), MAX_STATE_BYTES).await {
                             Ok(bytes) => {

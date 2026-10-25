@@ -526,6 +526,87 @@ async fn version_migration_refuses_idle_child_with_queued_work_without_writes() 
 }
 
 #[tokio::test]
+async fn version_migration_refuses_pending_legacy_control_planes_for_root_and_child() {
+    let mut running = AgentRuntimeState::new("legacy-active");
+    running.status = AgentStatusState::Running;
+    let legacy_running = serde_json::to_string(&running).unwrap();
+    for child in [false, true] {
+        let (home, store, root) = fixture(false).await;
+        let target = if child {
+            let child = Session::new_child_of("legacy-child", &root, "model", "worker");
+            store.save_session(&child).await.unwrap();
+            child
+        } else {
+            root.clone()
+        };
+        let directory = store.abs_path_from_rel(&store.resolve_rel_path(&target.id).await.unwrap());
+        let path = directory.join(RUNTIME_SIDECAR_FILE);
+        let original = fs::read(&path).await.unwrap();
+        let main = fs::read(directory.join("session.json")).await.unwrap();
+        for (key, value) in [
+            ("agent.runtime.state", legacy_running.as_str()),
+            ("agent.runtime.state", "malformed legacy runtime"),
+            ("pending_injected_messages", "malformed accepted input"),
+            ("typed_pending_injected_messages", ""),
+            ("clarification_resume_pending", "true"),
+            ("conclusion_with_options_resume_pending", "true"),
+            ("permission.replay_save_recovery_required", ""),
+        ] {
+            let mut raw: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            raw["agent_runtime_state"] = serde_json::Value::Null;
+            raw["runtime_metadata"] = serde_json::Value::Null;
+            if key == "typed_pending_injected_messages" {
+                raw["runtime_metadata"] =
+                    serde_json::json!({"pending_injected_messages":[{"content":"accepted"}]});
+            } else {
+                raw["metadata"][key] = serde_json::json!(value);
+            }
+            fs::write(&path, serde_json::to_vec_pretty(&raw).unwrap())
+                .await
+                .unwrap();
+            let root_before = pair(home.path(), &root.id).await;
+            let target_before = fs::read(&path).await.unwrap();
+            let view = store
+                .inspect_session_version_migration(&root.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!view.eligible, "child={child}, key={key}");
+            let code = if child {
+                "child_execution_pending"
+            } else if key == "agent.runtime.state" {
+                "execution_not_idle"
+            } else {
+                "pending_response"
+            };
+            assert!(
+                view.blockers.iter().any(|reason| reason.code == code),
+                "{view:?}"
+            );
+            assert!(matches!(
+                store
+                    .migrate_session_version(&root.id, &request(&view))
+                    .await
+                    .unwrap(),
+                SessionVersionMigrationDecision::Blocked(_)
+            ));
+            assert_eq!(pair(home.path(), &root.id).await, root_before);
+            assert_eq!(fs::read(&path).await.unwrap(), target_before);
+            assert_eq!(
+                fs::read(directory.join("session.json")).await.unwrap(),
+                main
+            );
+            assert!(store
+                .session_version_migration_journals()
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        store.flush_search_index().await;
+    }
+}
+
+#[tokio::test]
 async fn version_migration_pending_pair_refuses_both_public_task_paths_without_writes() {
     async fn task_pair_bytes(store: &SessionStoreV2) -> Vec<Vec<u8>> {
         let mut bytes = Vec::new();
