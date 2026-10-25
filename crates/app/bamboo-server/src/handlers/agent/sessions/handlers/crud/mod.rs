@@ -8,7 +8,6 @@ mod root_mode;
 mod running;
 mod running_snapshot;
 mod system_prompt;
-mod version_migration;
 
 #[cfg(test)]
 mod tests;
@@ -24,4 +23,3 @@ pub use regenerate_title::regenerate_session_title;
 pub use root_mode::{recover_root_mode, select_root_mode};
 pub use running_snapshot::running_sessions_snapshot;
 pub use system_prompt::get_system_prompt_snapshot;
-pub use version_migration::{inspect_session_version_migration, migrate_session_version};
