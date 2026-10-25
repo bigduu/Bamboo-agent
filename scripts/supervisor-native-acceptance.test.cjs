@@ -26,7 +26,7 @@ const c = mode => ({ mode, api_base: 'http://127.0.0.1:39001', host_pid: 123, ho
   data_dir: path.join(FIXTURE_ROOT, 'data-' + mode), workspace_path: path.join(FIXTURE_ROOT, 'work-' + mode),
   project_id: 'project-' + mode, supervisor_created_at: BIRTH, ordinary_session_id: 'ordinary-' + mode,
   ordinary_created_at: BIRTH, provider_port: mode === 'standard' ? 39002 : 39004,
-  operation_id: randomUUID(), expected_standard_ticket_denial: false });
+  operation_id: randomUUID(), expected_standard_ticket_denial: mode === 'standard' });
 function receipt() {
   const standard = c('standard'), ultra = c('ultra'); ultra.api_base = 'http://127.0.0.1:39003';
   return { schema: 'bamboo.v2-native-fixture.v1', source_sha: d.SOURCE, tree_sha: d.TREE, fixture_id: randomUUID(),
@@ -120,11 +120,11 @@ async function listen(server, port = 0) {
 async function mockHost(t, mode, options = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'v2-http-protocol-')); t.after(() => fs.rm(directory, { recursive: true }));
   const fixtureId = options.fixtureId || randomUUID(), modeCase = c(mode);
-  modeCase.workspace_path = directory; modeCase.provider_port = 0; modeCase.expected_standard_ticket_denial = !!options.standardDenial;
+  modeCase.workspace_path = directory; modeCase.provider_port = 0;
   const flow = d.scenario(modeCase, fixtureId), sessions = new Map(), histories = new Map(), calls = [], errors = [];
   const sup = root('bamboo-default-supervisor', mode), ordinary = root(modeCase.ordinary_session_id, 'ultra');
   sessions.set(sup.id, sup); sessions.set(ordinary.id, ordinary); histories.set(sup.id, []); histories.set(ordinary.id, []);
-  const scope = { scope: { supervisor: { session_id: sup.id }, state_revision: 1, allowed_projects: [modeCase.project_id] } };
+  const scope = { scope: { supervisor: { session_id: sup.id, incarnation_id: fixtureId }, state_revision: 1, allowed_projects: [modeCase.project_id] } };
   const provider = async (msgs, stream = false) => {
     const response = await fetch(`http://127.0.0.1:${modeCase.provider_port}/v1/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: 'synthetic-no-upstream', messages: msgs, tools, stream }) });
@@ -182,8 +182,13 @@ async function mockHost(t, mode, options = {}) {
     if (req.url === '/api/v1/bootstrap') return send(200, { server: { product: 'bamboo' }, api: { name: 'bamboo.agent' }, capabilities: ['http.native_receipt_run.v1'] });
     if (req.url === '/api/v1/sessions') return send(200, { sessions: [...sessions.values()] });
     if (req.url === '/api/v1/supervisor/default/scope') return send(200, scope);
+    if (req.url === '/api/v1/tickets/scope') return send(200, {
+      mutation_enabled: true, available: mode === 'ultra', readable: mode === 'ultra',
+      availability: mode === 'standard' ? { kind: 'forbidden', reason_code: 'supervisor_mode_required' } : { kind: 'ready', reason_code: 'scope_ready' },
+      binding: { supervisor_session_id: sup.id, scope_id: 'supervisor/' + fixtureId, binding_revision: 1 }
+    });
     if (req.url === '/api/v1/chat') {
-      if (modeCase.expected_standard_ticket_denial) return send(403, { code: 'scope_denied', error: { message: options.wrongDenial ? 'unrelated access error' : 'Supervisor orchestration authority required' } });
+      if (mode === 'standard' && body.session_id === sup.id && (body.thread_id || options.standardDenial)) return send(403, { code: 'scope_denied', error: { message: options.wrongDenial ? 'unrelated access error' : 'Supervisor orchestration authority required' } });
       sessions.get(body.session_id).message_count++; return send(201, { session_id: body.session_id });
     }
     const match = /^\/api\/v1\/sessions\/([^/]+)(\/history|\/execute)?$/.exec(req.url);
@@ -213,12 +218,10 @@ test('FRAMEWORK HTTP: both modes create one Root, replay one input, share Child 
     assert.ok(f.calls.every(c => c.method === 'GET' || c.url === '/api/v1/chat' || c.url.endsWith('/execute')));
   }
 });
-test('FRAMEWORK HTTP: real-shaped Standard Ticket 403 remains BLOCKED/PARTIAL with zero provider calls and no mutation retry', { timeout: 10000 }, async t => {
-  const id = randomUUID(), a = await mockHost(t, 'standard', { fixtureId: id, standardDenial: true }), b = await mockHost(t, 'ultra', { fixtureId: id });
-  const result = await d.runSuite({ fixture_id: id, cases: [a.case, b.case] });
-  assert.equal(result.status, 'PARTIAL'); assert.equal(result.cases[0].status, 'BLOCKED_EXISTING_STANDARD_TICKET_GATE');
-  assert.equal(result.cases[0].provider_requests, 0); assert.equal(result.cases[0].v2_positive, 'UNRUN');
-  assert.equal(a.calls.filter(c => c.method === 'POST').length, 1);
+test('FRAMEWORK HTTP: plain Standard 403 is a regression rather than a successful Work refusal', { timeout: 10000 }, async t => {
+  const a = await mockHost(t, 'standard', { standardDenial: true });
+  await assert.rejects(d.runSuite({ fixture_id: a.fixtureId, cases: [a.case] }), e => e.code === 'chat_admission_failed');
+  assert.equal(a.calls.filter(c => c.method === 'POST').length, 2);
 });
 test('FRAMEWORK HTTP: an unrelated 403 cannot masquerade as the known Standard boundary', { timeout: 5000 }, async t => {
   const a = await mockHost(t, 'standard', { standardDenial: true, wrongDenial: true });
@@ -497,4 +500,14 @@ for (const kind of ['missing', 'foreign', 'wrong-mode', 'cookie']) {
 test('STOCK_CLI_FIXTURE: plain Standard 403 cannot count as an expected Work refusal', { timeout: 5000 }, async t => {
   const f = await mockHost(t, 'standard', { standardDenial: true });
   await assert.rejects(d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] }), e => e.code === 'chat_admission_failed');
+});
+
+test('STOCK_CLI_FIXTURE: Standard permits Root composition while its explicit Work reference is refused', { timeout: 10000 }, async t => {
+  const f = await mockHost(t, 'standard');
+  const result = await d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] });
+  assert.equal(result.status, 'PASS');
+  assert.equal(result.cases[0].standard_formal_work_refused, true);
+  assert.equal(result.cases[0].formal_work_dispatch, 'UNRUN');
+  assert.equal(f.calls.filter(c => c.url === '/api/v1/chat' && c.body.thread_id).length, 1);
+  assert.deepEqual(f.errors, []);
 });
