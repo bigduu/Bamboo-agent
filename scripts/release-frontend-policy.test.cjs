@@ -45,7 +45,12 @@ test("accepts only the locked Lotus Next version", () => {
     }).packageVersion,
     LOTUS_NEXT_VERSION,
   );
-  for (const requestedVersion of ["latest", "2026.9.13", "2026.9.15"]) {
+  for (const requestedVersion of [
+    "latest",
+    "2026.9.13",
+    "2026.9.15",
+    "2026.10.23",
+  ]) {
     assert.throws(
       () =>
         resolveReleaseFrontend({
