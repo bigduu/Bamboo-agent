@@ -3161,3 +3161,43 @@ async fn supervisor_delegation_first_legacy_selection_refuses_before_setup_side_
         assert_eq!(serde_json::to_value(&session).unwrap(), before);
     }
 }
+
+#[test]
+fn supervisor_existing_session_first_subagent_schema_preserves_ordinary_contract() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("SubAgent")],
+    };
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    for ultra in [false, true] {
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let schemas = resolve_available_tool_schemas_for_session(&config, &tools, &supervisor);
+        assert!(schemas[0]
+            .function
+            .description
+            .contains("existing managed Sessions"));
+        assert!(schemas[0]
+            .function
+            .description
+            .contains("auxiliary planning"));
+        let guide = super::prompt_setup::build_tool_guide_context(
+            &config,
+            &schemas,
+            "base",
+            &supervisor.id,
+            &super::tool_schemas::effective_guide_activation(&config, &supervisor),
+        );
+        assert!(guide.contains("session_history list"));
+        assert!(guide.contains("auxiliary planning"));
+    }
+    let ordinary = Session::new("ordinary-policy", "model");
+    let ordinary_schemas = resolve_available_tool_schemas_for_session(&config, &tools, &ordinary);
+    assert!(!ordinary_schemas[0]
+        .function
+        .description
+        .contains("existing managed Sessions"));
+}

@@ -240,7 +240,7 @@ fn resolve_catalog_with_activation(
             .filter(|schema| schema.function.name == "SubAgent")
         {
             schema.function.description = format!(
-                "Supervisor: delegate execution, including simple implementation tasks; retain only necessary dedicated read-only acquisition and orchestration here. If no suitable authorized worker is available, report the actual recoverable blocker instead of self-executing or repeatedly creating children. {}",
+                "Supervisor: delegate execution to existing managed Sessions first. Use session_history list and bounded inspect before main execution, then continue the same authorized independent Root. Use SubAgent only for auxiliary planning, review or verification; retain only necessary dedicated read-only acquisition and orchestration here. If no suitable authorized target is available, report the actual recoverable blocker instead of self-executing or repeatedly creating children. {}",
                 schema.function.description,
             );
         }
