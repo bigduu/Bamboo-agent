@@ -149,7 +149,7 @@ pub async fn migrate_session_version(
 mod tests {
     use super::*;
     use actix_web::{test, App};
-    use bamboo_domain::{Message, Session, Storage};
+    use bamboo_domain::{Message, Session};
     use serde_json::{json, Value};
 
     #[actix_web::test]
@@ -273,7 +273,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.messages, legacy.messages);
+        assert_eq!(
+            serde_json::to_value(&loaded.messages).unwrap(),
+            serde_json::to_value(&legacy.messages).unwrap()
+        );
         assert_eq!(loaded.model, legacy.model);
         assert_eq!(loaded.created_at, legacy.created_at);
         assert_eq!(loaded.session_version, Some(2));
