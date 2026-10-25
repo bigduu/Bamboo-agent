@@ -11,6 +11,12 @@ use super::{
     Scope, Status, StoredCheckpoint, SupervisorReason,
 };
 
+/// Trusted caller selection, not read authority or a recovered policy grant.
+pub struct ProgramSelection<'a> {
+    pub project_id: &'a bamboo_domain::ProjectId,
+    pub work_ids: &'a [String],
+}
+
 /// One bounded program pass. Construction neither installs a policy nor starts
 /// a worker; callers still supply fresh authorized observations and canonical CAS.
 pub struct ProgramPatrol {
@@ -22,6 +28,102 @@ impl ProgramPatrol {
         Ok(Self {
             patrol: super::Patrol::new(policy, None)?,
         })
+    }
+
+    /// Bounded assembly used by the existing Ready worker. Reads the current
+    /// canonical attempt for the selected Project/Works and leaves all Ticket
+    /// facts untouched. Only a changed snapshot or due check writes the journal.
+    pub fn tick_project(
+        &self,
+        service: &bamboo_tickets::TicketService,
+        authority: &bamboo_tickets::Authority,
+        selection: &ProgramSelection<'_>,
+        clock: &dyn Clock,
+        checkpoints: &mut dyn CheckpointPort,
+    ) -> Result<usize, Error> {
+        if selection.work_ids.len() > bamboo_tickets::CLAIM_CANDIDATE_LIMIT
+            || selection.work_ids.iter().any(|id| !super::valid_id(id))
+            || selection
+                .work_ids
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != selection.work_ids.len()
+        {
+            return Err(Error::InvalidConfiguration);
+        }
+        if !matches!(
+            authority.principal(),
+            bamboo_tickets::Principal::Runtime | bamboo_tickets::Principal::Supervisor { .. }
+        ) {
+            return Err(PortError::Denied.into());
+        }
+        let (commit, snapshot) = service.published().map_err(|_| PortError::Unavailable)?;
+        // Ready permits 64 Works; the canonical inspect API bounds each read
+        // to 32. Authorize every chunk against one fixed snapshot before any
+        // journal write, without relaxing that API's limit.
+        for work_ids in selection.work_ids.chunks(32) {
+            let inspected = service
+                .work_inspect_sections(
+                    authority,
+                    work_ids,
+                    &bamboo_tickets::InspectOptions {
+                        sections: std::collections::BTreeSet::new(),
+                        depth: 0,
+                        budget_bytes: 65_536,
+                        fixed_commit: Some(commit.clone()),
+                    },
+                )
+                .map_err(super::host::ticket_error)?;
+            if inspected.snapshot.commit != commit {
+                return Err(PortError::Conflict.into());
+            }
+        }
+        let mut checked = 0;
+        for work_id in selection.work_ids {
+            if service.published().map_err(|_| PortError::Unavailable)?.0 != commit {
+                return Err(PortError::Conflict.into());
+            }
+            let work = snapshot.tickets.get(work_id).ok_or(PortError::Denied)?;
+            if snapshot.project.links.get(work_id) != Some(selection.project_id) {
+                return Err(PortError::Denied.into());
+            }
+            let assignment = work.active_assignment.as_ref().or_else(|| {
+                work.current_submission
+                    .as_ref()
+                    .and_then(|id| snapshot.submissions.get(id))
+                    .map(|s| &s.assignment_id)
+            });
+            let Some(assignment) = assignment else {
+                continue;
+            };
+            let scope = super::host::scope_for_assignment(
+                service,
+                authority,
+                selection.project_id.as_str(),
+                work_id,
+                assignment,
+            )?;
+            let mut observation = super::host::read_observation(service, authority, &scope)?;
+            let existing = checkpoints.load(&scope)?;
+            if let Some(stored) = &existing {
+                super::validate_checkpoint(&stored.checkpoint, &scope)?;
+                if stored.version == 0 {
+                    return Err(Error::InvalidCheckpoint);
+                }
+                if stored.checkpoint.last_check_ms > clock.now_ms() {
+                    return Err(Error::ClockRegression);
+                }
+                if stored.checkpoint.source_revision == snapshot.seq
+                    && stored.checkpoint.next_check_ms > clock.now_ms()
+                {
+                    continue;
+                }
+            }
+            self.tick(&scope, clock, checkpoints, &mut observation)?;
+            checked += 1;
+        }
+        Ok(checked)
     }
 
     /// Read current facts even when semantic adapters are unavailable. A saved
