@@ -732,6 +732,9 @@ async fn pending_task_and_copy_journals_leave_owned_home_unchanged() {
             original
         );
     }
+    // Keep the selected native journal case and also run migration cleanup's
+    // shared regression on Windows, including its write-through rename.
+    super::session_version_migration_tests::cleanup_loss_regression().await;
 }
 
 async fn readonly_snapshot(

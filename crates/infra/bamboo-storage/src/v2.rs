@@ -116,6 +116,15 @@ mod scoped_loop_control_tests;
 pub(crate) mod scoped_transport_expiry;
 #[cfg(test)]
 mod session_compatibility_tests;
+mod session_version_migration;
+pub use session_version_migration::{
+    SessionVersionMigrationBlocker, SessionVersionMigrationDecision,
+    SessionVersionMigrationObservation, SessionVersionMigrationReceipt,
+    SessionVersionMigrationRequest,
+};
+
+#[cfg(test)]
+mod session_version_migration_tests;
 mod title_observations;
 pub use host_registry::FileHostRegistry;
 #[cfg(test)]
@@ -567,12 +576,17 @@ impl Drop for PeerDeliveryGuard {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct SessionLifecycleWriteGuard {
+    _lease: Arc<SessionLifecycleWriteLease>,
+}
+
+struct SessionLifecycleWriteLease {
     _process: OwnedRwLockWriteGuard<()>,
     file: std::fs::File,
 }
 
-impl Drop for SessionLifecycleWriteGuard {
+impl Drop for SessionLifecycleWriteLease {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
@@ -1476,6 +1490,9 @@ pub struct SessionStoreV2 {
     #[cfg(test)]
     runtime_task_faults: std::sync::Mutex<Vec<RuntimeTaskTransactionFault>>,
     #[cfg(test)]
+    session_version_migration_fault:
+        std::sync::Mutex<Option<session_version_migration::MigrationFault>>,
+    #[cfg(test)]
     runtime_task_first_write_pause: std::sync::Mutex<Option<RuntimeTaskFirstWritePause>>,
     #[cfg(test)]
     runtime_task_durability_events: std::sync::Mutex<Vec<RuntimeTaskDurabilityEvent>>,
@@ -1809,6 +1826,8 @@ impl SessionStoreV2 {
             #[cfg(test)]
             runtime_task_faults: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
+            session_version_migration_fault: std::sync::Mutex::new(None),
+            #[cfg(test)]
             runtime_task_first_write_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             runtime_task_durability_events: std::sync::Mutex::new(Vec::new()),
@@ -1846,6 +1865,8 @@ impl SessionStoreV2 {
         storage.ensure_runtime_task_transaction_dir().await?;
         storage.ensure_session_copy_transaction_dir().await?;
         storage.ensure_session_write_lock_dir().await?;
+        storage.ensure_session_version_migration_dir().await?;
+        storage.recover_session_version_migrations().await?;
 
         // Constructor recovery takes the same cross-process exclusive gate as
         // a live commit. A second store can therefore recover an orphan, but
@@ -2622,6 +2643,8 @@ impl SessionStoreV2 {
                 .write(true)
                 .open(&path)?;
             if exclusive {
+                #[cfg(test)]
+                session_version_migration_tests::lifecycle_attempted(&path);
                 FileExt::lock_exclusive(&file)?;
             } else {
                 FileExt::lock_shared(&file)?;
@@ -2844,8 +2867,10 @@ impl SessionStoreV2 {
         let process = self.session_lifecycle_lock.clone().write_owned().await;
         let file = self.open_session_lifecycle_file(true).await?;
         Ok(SessionLifecycleWriteGuard {
-            _process: process,
-            file,
+            _lease: Arc::new(SessionLifecycleWriteLease {
+                _process: process,
+                file,
+            }),
         })
     }
 
@@ -3201,6 +3226,12 @@ impl SessionStoreV2 {
     }
 
     async fn ensure_no_runtime_task_journal_locked(&self) -> io::Result<()> {
+        if !self.session_version_migration_journals().await?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Session version migration recovery is required before control-plane access",
+            ));
+        }
         match self.runtime_task_journal_paths().await {
             Ok(paths) if paths.is_empty() => {
                 self.runtime_task_recovery_required
@@ -3699,6 +3730,7 @@ impl SessionStoreV2 {
         event: RuntimeTaskDurabilityEvent,
         guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
+        self.ensure_no_session_version_migration_locked().await?;
         validate_session_id(&session.id)?;
         let Some(rel) = self.resolve_rel_path(&session.id).await else {
             return Err(io::Error::new(
@@ -3981,6 +4013,12 @@ impl SessionStoreV2 {
         &self,
         guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
+        if !self.session_version_migration_journals().await?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Session version migration must recover before Task transactions",
+            ));
+        }
         let paths = self.runtime_task_journal_paths().await?;
         for path in paths {
             let journal = match self.read_runtime_task_journal(&path).await {
@@ -4340,6 +4378,12 @@ impl SessionStoreV2 {
     }
 
     async fn recover_all_session_copy_transactions_locked(&self) -> io::Result<()> {
+        if !self.session_version_migration_journals().await?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Session version migration must recover before copy transactions",
+            ));
+        }
         let mut families: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for path in self.session_copy_journal_paths().await? {
             let id = path
@@ -4381,6 +4425,7 @@ impl SessionStoreV2 {
         second_session_id: &str,
         guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
+        self.ensure_no_session_version_migration_locked().await?;
         validate_session_id(first_session_id)?;
         validate_session_id(second_session_id)?;
         if first_session_id >= second_session_id {
@@ -4562,6 +4607,7 @@ impl SessionStoreV2 {
         second_updated: &Session,
         guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<bool> {
+        self.ensure_no_session_version_migration_locked().await?;
         for session in [
             first_original,
             first_updated,
@@ -6297,6 +6343,19 @@ async fn atomic_rename(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(not(windows))]
     {
         fs::rename(from, to).await
+    }
+    #[cfg(windows)]
+    {
+        atomic_rename_blocking(from, to)
+    }
+}
+
+// Owned writer jobs retain their authority while the complete rename and
+// caller-owned directory synchronization run on the same blocking worker.
+fn atomic_rename_blocking(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
     }
     #[cfg(windows)]
     {

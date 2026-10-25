@@ -133,6 +133,7 @@ mod supported {
     use super::super::{
         actor_snapshot_reader::{Directory, ReadBudget},
         root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE,
+        session_version_migration::{is_published_migration_journal, MIGRATION_DIR},
         supervisor,
         supervisor_proof::SUPERVISOR_PROOF_FILE,
         ActorTreeRevision, ACTOR_TREE_REVISION_FILE, RUNTIME_SIDECAR_FILE,
@@ -192,9 +193,15 @@ mod supported {
     pub(super) fn read_cursor(home: &Path, root: &str) -> Result<Option<(String, u64)>, Error> {
         let home = Directory::open_absolute(home)?;
         let mut budget = ReadBudget::new(ActorSnapshotLimits::default());
-        for name in [RUNTIME_TASK_TRANSACTION_DIR, SESSION_COPY_TRANSACTION_DIR] {
+        for name in [
+            RUNTIME_TASK_TRANSACTION_DIR,
+            SESSION_COPY_TRANSACTION_DIR,
+            MIGRATION_DIR,
+        ] {
             if let Some(dir) = home.child(OsStr::new(name))? {
-                if !dir.entries(&mut budget)?.is_empty() {
+                if dir.entries(&mut budget)?.iter().any(|entry| {
+                    name != MIGRATION_DIR || is_published_migration_journal(Path::new(entry))
+                }) {
                     return Err(Error::PendingTransaction);
                 }
             }
@@ -629,9 +636,15 @@ mod supported {
         let mut budget = ReadBudget::new(limits);
         // Any pending journal makes a coherent view unavailable. Stop at first
         // bounded enumeration; never call auto-recovery or mutate the journal.
-        for name in [RUNTIME_TASK_TRANSACTION_DIR, SESSION_COPY_TRANSACTION_DIR] {
+        for name in [
+            RUNTIME_TASK_TRANSACTION_DIR,
+            SESSION_COPY_TRANSACTION_DIR,
+            MIGRATION_DIR,
+        ] {
             if let Some(dir) = home.child(OsStr::new(name))? {
-                if !dir.entries(&mut budget)?.is_empty() {
+                if dir.entries(&mut budget)?.iter().any(|entry| {
+                    name != MIGRATION_DIR || is_published_migration_journal(Path::new(entry))
+                }) {
                     return Err(Error::PendingTransaction);
                 }
             }
