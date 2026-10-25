@@ -78,7 +78,7 @@ pub struct SessionVersionMigrationReceipt {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionVersionMigrationDecision {
-    Committed(SessionVersionMigrationReceipt),
+    Committed(Box<SessionVersionMigrationReceipt>),
     NotFound,
     PreconditionFailed,
     OperationConflict,
@@ -822,6 +822,7 @@ impl SessionStoreV2 {
             return self
                 .finish_version_migration(&path, &journal, &guards)
                 .await
+                .map(Box::new)
                 .map(SessionVersionMigrationDecision::Committed);
         }
         if !journals.is_empty() {
@@ -835,7 +836,7 @@ impl SessionStoreV2 {
                 return Err(invalid("migration receipt lifetime mismatch"));
             }
             return Ok(if receipt.request == *request {
-                SessionVersionMigrationDecision::Committed(receipt)
+                SessionVersionMigrationDecision::Committed(Box::new(receipt))
             } else {
                 SessionVersionMigrationDecision::OperationConflict
             });
@@ -874,6 +875,7 @@ impl SessionStoreV2 {
         let journal = self.read_migration_journal(&path).await?;
         self.finish_version_migration(&path, &journal, &guards)
             .await
+            .map(Box::new)
             .map(SessionVersionMigrationDecision::Committed)
     }
 
