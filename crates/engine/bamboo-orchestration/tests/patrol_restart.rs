@@ -375,6 +375,107 @@ fn program_entry_reopen_preserves_original_incident_scope_and_checks_fresh_autho
 }
 
 #[test]
+fn program_entry_observes_cancelled_attempt_after_runtime_stop_clears_the_active_pointer() {
+    let mut fixture = Fixture::new();
+    let project = ProjectId::parse(fixture.scope.project_id.clone()).unwrap();
+    let ids = [fixture.scope.work_id.clone()];
+    let selection = program::ProgramSelection {
+        project_id: &project,
+        work_ids: &ids,
+    };
+    let program = program::ProgramPatrol::new(Policy::default()).unwrap();
+    let mut journal = EncodedJournal::default();
+    for now in [100, 30_100] {
+        assert_eq!(
+            program
+                .tick_project(
+                    fixture.service(),
+                    &fixture.runtime(),
+                    &selection,
+                    &ClockAt(now),
+                    &mut journal,
+                )
+                .unwrap(),
+            1
+        );
+    }
+    let original = journal.load(&fixture.scope).unwrap().unwrap();
+    let incident = original.checkpoint.incident.unwrap();
+    assert!(!matches!(incident.phase, Phase::Resolved { .. }));
+    let escalation = incident.escalation.unwrap();
+    assert_eq!(escalation.deliveries, 0);
+    assert!(!escalation.queued);
+
+    fixture.apply(
+        Principal::Supervisor {
+            session_id: "supervisor".into(),
+        },
+        vec![Operation::Cancel {
+            work_id: fixture.scope.work_id.clone(),
+        }],
+    );
+    assert_eq!(
+        program
+            .tick_project(
+                fixture.service(),
+                &fixture.runtime(),
+                &selection,
+                &ClockAt(30_101),
+                &mut journal,
+            )
+            .unwrap(),
+        1
+    );
+    assert!(!matches!(
+        journal
+            .load(&fixture.scope)
+            .unwrap()
+            .unwrap()
+            .checkpoint
+            .incident
+            .unwrap()
+            .phase,
+        Phase::Resolved { .. }
+    ));
+
+    fixture.apply(
+        Principal::Runtime,
+        vec![Operation::RuntimeStopped {
+            assignment_id: fixture.scope.assignment_id.clone(),
+            receipt: fixture.receipt.clone(),
+            completed: false,
+        }],
+    );
+    let (before, snapshot) = fixture.service().published().unwrap();
+    let work = &snapshot.tickets[&fixture.scope.work_id];
+    assert_eq!(work.state, WorkState::Cancelled);
+    assert!(work.active_assignment.is_none());
+    assert!(work.current_submission.is_none());
+    assert!(snapshot.assignments[&fixture.scope.assignment_id].process_stopped);
+    assert_eq!(
+        program
+            .tick_project(
+                fixture.service(),
+                &fixture.runtime(),
+                &selection,
+                &ClockAt(30_102),
+                &mut journal,
+            )
+            .unwrap(),
+        1
+    );
+    let resolved = journal.load(&fixture.scope).unwrap().unwrap();
+    assert!(resolved.version > original.version);
+    let resolved = resolved.checkpoint.incident.unwrap();
+    assert_eq!(resolved.id, incident.id);
+    assert!(matches!(resolved.phase, Phase::Resolved { .. }));
+    let escalation = resolved.escalation.unwrap();
+    assert_eq!(escalation.deliveries, 0);
+    assert!(!escalation.queued);
+    assert_eq!(fixture.service().published().unwrap().0, before);
+}
+
+#[test]
 fn program_entry_selection_cannot_cross_project_or_duplicate_a_work() {
     let fixture = Fixture::new();
     let program = program::ProgramPatrol::new(Policy::default()).unwrap();

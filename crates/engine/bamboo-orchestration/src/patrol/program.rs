@@ -88,12 +88,27 @@ impl ProgramPatrol {
             if snapshot.project.links.get(work_id) != Some(selection.project_id) {
                 return Err(PortError::Denied.into());
             }
-            let assignment = work.active_assignment.as_ref().or_else(|| {
+            let mut assignment = work.active_assignment.as_ref().or_else(|| {
                 work.current_submission
                     .as_ref()
                     .and_then(|id| snapshot.submissions.get(id))
                     .map(|s| &s.assignment_id)
             });
+            if assignment.is_none() && work.state == bamboo_tickets::WorkState::Cancelled {
+                // RuntimeStopped clears the active pointer after cancellation.
+                // Discover only this canonical generation/contract's attempt;
+                // the original Host projection still verifies its Spec, receipt
+                // and terminal evidence. Never guess between multiple attempts.
+                let mut candidates = snapshot.assignments.values().filter(|candidate| {
+                    candidate.work_id == work.id
+                        && candidate.generation == work.generation
+                        && candidate.contract_revision == work.contract_revision
+                });
+                assignment = candidates.next().map(|candidate| &candidate.id);
+                if candidates.next().is_some() {
+                    return Err(PortError::Conflict.into());
+                }
+            }
             let Some(assignment) = assignment else {
                 continue;
             };
