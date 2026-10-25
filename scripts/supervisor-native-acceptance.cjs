@@ -391,7 +391,20 @@ async function startProvider(c, flow, hooks, signal, fixture = {}) {
 }
 async function runCase(c, fixtureId, request, signal, injectedProvider = 'no_auth_local_scripted_no_fallback') {
   const api = async (route, body) => request(c.api_base, '/api/v1' + route, body, signal);
-  const get = async route => { const r = await api(route); requireFact(r.status === 200, 'canonical_read_failed'); return r.body; };
+  const get = async route => {
+    while (!signal.aborted) {
+      const r = await api(route);
+      // A concurrent owned management commit can expose Prepared proof. Wait
+      // for a newly verified canonical read; never repair authority or replay
+      // a mutation, and never reinterpret another conflict as success.
+      if (r.status === 409 && r.body.error?.code === 'session_authority_unavailable'
+        && /^\/sessions\/[A-Za-z0-9_.:-]+$/.test(route)) {
+        await new Promise(resolve => setTimeout(resolve, 100)); continue;
+      }
+      requireFact(r.status === 200, 'canonical_read_failed'); return r.body;
+    }
+    throw new Failure('fixture_deadline');
+  };
   const detail = async id => (await get('/sessions/' + encodeURIComponent(id))).session;
   const list = async () => { const v = await get('/sessions'); requireFact(Array.isArray(v.sessions) && v.sessions.length <= 16 && !v.has_more, 'fresh_fixture_session_list_required'); return v.sessions; };
   const waitFor = async check => {
