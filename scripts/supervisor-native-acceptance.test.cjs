@@ -456,3 +456,45 @@ test('HTTP BOUNDARY COMPONENT ONLY: a response is withheld if owner verification
   await assert.rejects(bound(base, '/api/v1/evidence', undefined, AbortSignal.timeout(2000)), e => e.code === 'host_process_changed');
   assert.equal(checks, 2); assert.equal(requests, 1);
 });
+
+// These are actual loopback HTTP protocol checks, never native Host evidence.
+const SYNTHETIC_PROVIDER = 'synthetic_key_local_scripted_no_fallback';
+const syntheticKey = (fixtureId, mode) => `bamboo-v2-native-fixture-${fixtureId}-${mode}`;
+async function stockCliProvider(t) {
+  const mode = c('ultra'); mode.provider_port = 0;
+  const fixtureId = randomUUID(), flow = d.scenario(mode, fixtureId), controller = new AbortController();
+  flow.createRequest = { operation_id: mode.operation_id, expected_state_revision: 1,
+    project_id: mode.project_id, workspace_path: mode.workspace_path, message: flow.assignment };
+  const close = await d.startProvider(mode, flow, {}, controller.signal,
+    { injected_provider: SYNTHETIC_PROVIDER, fixture_id: fixtureId });
+  t.after(close);
+  return { mode, fixtureId, flow, url: `http://127.0.0.1:${mode.provider_port}/v1/chat/completions` };
+}
+test('STOCK_CLI_FIXTURE: receipt explicitly selects fixture synthetic-key transport', () => {
+  const value = receipt(); value.injected_provider = SYNTHETIC_PROVIDER;
+  assert.equal(d.validateReceipt(value).injected_provider, SYNTHETIC_PROVIDER);
+});
+test('STOCK_CLI_FIXTURE: exact synthetic key permits the real-shaped OpenAI request', async t => {
+  const f = await stockCliProvider(t);
+  const r = await fetch(f.url, { method: 'POST', headers: { 'Content-Type': 'application/json',
+    Authorization: `Bearer ${syntheticKey(f.fixtureId, f.mode.mode)}` }, body: JSON.stringify(request(f.flow.markers.supervisor)) });
+  assert.equal(r.status, 200);
+  const body = await r.json(); assert.equal(body.choices[0].message.tool_calls[0].function.name, 'spawn_session');
+  assert.equal(f.flow.requests, 1);
+});
+for (const kind of ['missing', 'foreign', 'wrong-mode', 'cookie']) {
+  test(`STOCK_CLI_FIXTURE: ${kind} credentials never enter the scripted model`, async t => {
+    const f = await stockCliProvider(t);
+    const headers = { 'Content-Type': 'application/json' };
+    if (kind !== 'missing') headers.Authorization = kind === 'foreign' ? `Bearer ${SECRET}`
+      : `Bearer ${syntheticKey(f.fixtureId, kind === 'wrong-mode' ? 'standard' : f.mode.mode)}`;
+    if (kind === 'cookie') headers.Cookie = SECRET;
+    const r = await fetch(f.url, { method: 'POST', headers, body: JSON.stringify(request(f.flow.markers.supervisor)) });
+    assert.equal(r.status, 422); assert.ok(!(await r.text()).includes(SECRET));
+    assert.equal(f.flow.requests, 0);
+  });
+}
+test('STOCK_CLI_FIXTURE: plain Standard 403 cannot count as an expected Work refusal', { timeout: 5000 }, async t => {
+  const f = await mockHost(t, 'standard', { standardDenial: true });
+  await assert.rejects(d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] }), e => e.code === 'chat_admission_failed');
+});
