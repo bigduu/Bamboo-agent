@@ -36,8 +36,8 @@ use crate::provider::LLMError;
 
 mod diagnostics;
 pub use diagnostics::{
-    public_request_diagnostic, recent_initial_request_diagnostics, InitialRequestDiagnostic,
-    RequestStopReason,
+    public_request_diagnostic, recent_initial_request_diagnostics,
+    record_stream_timeout_diagnostic, InitialRequestDiagnostic, RequestStopReason,
 };
 use diagnostics::{AttemptObservation, CancellationObservation};
 

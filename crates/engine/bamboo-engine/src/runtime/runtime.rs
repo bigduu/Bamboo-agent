@@ -1116,6 +1116,18 @@ impl AgentRuntime {
         )
         .await;
 
+        // Capture only the typed terminal watchdog error from this execution.
+        // The existing checkpoint and exact run fingerprint own durable state;
+        // the existing bounded live projection attaches the same receipt to the
+        // error event without changing terminal ordering or retry decisions.
+        if let Err(bamboo_agent_core::AgentError::StreamTimeout(timeout)) = &result {
+            if let Some(diagnostic) = timeout.diagnostic(session) {
+                if session.record_llm_request_diagnostic(diagnostic.clone()) {
+                    bamboo_llm::retry::record_stream_timeout_diagnostic(diagnostic);
+                }
+            }
+        }
+
         // The runtime is the one shared execute boundary for HTTP, child-agent
         // and direct SDK callers.  Checkpoint here on every outcome so durable
         // transcript correctness never depends on a caller-specific finalize

@@ -44,6 +44,7 @@ impl fmt::Display for StreamTimeoutPhase {
 /// after semantic output starts are terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamTimeoutError {
+    identity: Box<StreamTimeoutIdentity>,
     phase: StreamTimeoutPhase,
     deadline: Duration,
     provider: Option<String>,
@@ -52,6 +53,12 @@ pub struct StreamTimeoutError {
     last_semantic: Option<Duration>,
     turn_retry_eligible: bool,
     last_http_retry: Option<Box<(u16, Duration)>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StreamTimeoutIdentity {
+    diagnostic_id: uuid::Uuid,
+    observed_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl StreamTimeoutError {
@@ -68,10 +75,16 @@ impl StreamTimeoutError {
         turn_retry_eligible: bool,
     ) -> Self {
         Self {
+            identity: Box::new(StreamTimeoutIdentity {
+                diagnostic_id: uuid::Uuid::new_v4(),
+                observed_at: chrono::Utc::now(),
+            }),
             phase,
             deadline,
-            provider,
-            model,
+            provider: provider
+                .filter(|value| bamboo_domain::StreamTimeoutDiagnostic::valid_identifier(value)),
+            model: model
+                .filter(|value| bamboo_domain::StreamTimeoutDiagnostic::valid_identifier(value)),
             last_transport,
             last_semantic,
             turn_retry_eligible,
@@ -106,6 +119,47 @@ impl StreamTimeoutError {
     pub fn semantic_output_started(&self) -> bool {
         self.last_semantic.is_some()
     }
+
+    /// Project the typed watchdog failure without parsing its display text.
+    /// This observation carries no authority to replay a request or a tool.
+    pub fn diagnostic(
+        &self,
+        session: &bamboo_domain::Session,
+    ) -> Option<bamboo_domain::LlmRequestDiagnostic> {
+        let millis = |duration: Duration| u64::try_from(duration.as_millis()).ok();
+        let last_semantic_ms_ago = match self.last_semantic {
+            Some(elapsed) => Some(millis(elapsed)?),
+            None => None,
+        };
+        let (last_http_status, retry_delay_ms) = match self.last_http_retry() {
+            Some((status, delay)) => (Some(status), Some(millis(delay)?)),
+            None => (None, None),
+        };
+        bamboo_domain::LlmRequestDiagnostic::from_stream_timeout(
+            bamboo_domain::StreamTimeoutDiagnostic {
+                schema_version: 1,
+                kind: "stream_timeout".into(),
+                diagnostic_id: self.identity.diagnostic_id,
+                error_id: self.identity.diagnostic_id,
+                observed_at: self.identity.observed_at,
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+                session_hash: bamboo_domain::llm_diagnostic_session_hash(&session.id),
+                run_id: session
+                    .agent_runtime_state
+                    .as_ref()
+                    .and_then(|state| uuid::Uuid::parse_str(&state.run_id).ok()),
+                phase: self.phase.to_string(),
+                deadline_ms: millis(self.deadline)?,
+                last_transport_ms_ago: millis(self.last_transport)?,
+                last_semantic_ms_ago,
+                semantic_output_started: self.semantic_output_started(),
+                retry_safe: self.retry_safe(),
+                last_http_status,
+                retry_delay_ms,
+            },
+        )
+    }
 }
 
 impl fmt::Display for StreamTimeoutError {
@@ -134,7 +188,11 @@ impl fmt::Display for StreamTimeoutError {
                 delay.as_millis()
             )?;
         }
-        Ok(())
+        write!(
+            formatter,
+            ". Diagnostic ID: {}.",
+            self.identity.diagnostic_id
+        )
     }
 }
 
@@ -267,12 +325,13 @@ mod tests {
         assert_eq!(timeout.phase(), StreamTimeoutPhase::Bootstrap);
         assert!(timeout.retry_safe());
         assert!(!timeout.semantic_output_started());
-        assert_eq!(
-            AgentError::StreamTimeout(timeout).to_string(),
+        let expected = format!(
             "Stream timed out: phase=bootstrap, deadline_ms=120000, provider=provider-id, \
              model=model-id, last_transport_ms_ago=120000, last_semantic_ms_ago=never, \
-             semantic_output_started=false, retry_safe=true"
+             semantic_output_started=false, retry_safe=true. Diagnostic ID: {}.",
+            timeout.identity.diagnostic_id,
         );
+        assert_eq!(AgentError::StreamTimeout(timeout).to_string(), expected);
     }
 
     #[test]
@@ -296,5 +355,97 @@ mod tests {
         assert!(timeout
             .to_string()
             .contains("last_http_status=429, retry_delay_ms=60000"));
+    }
+
+    #[test]
+    fn every_watchdog_phase_exports_the_exact_unique_terminal_error() {
+        let session = bamboo_domain::Session::new("private-session", "model");
+        for (phase, semantic) in [
+            (StreamTimeoutPhase::Bootstrap, None),
+            (StreamTimeoutPhase::FirstSemantic, None),
+            (
+                StreamTimeoutPhase::TransportIdle,
+                Some(Duration::from_secs(120)),
+            ),
+            (
+                StreamTimeoutPhase::SemanticIdle,
+                Some(Duration::from_secs(600)),
+            ),
+        ] {
+            let timeout = StreamTimeoutError::new(
+                phase,
+                Duration::from_secs(if phase == StreamTimeoutPhase::SemanticIdle {
+                    600
+                } else {
+                    120
+                }),
+                Some("provider-id".into()),
+                Some("gpt-6-astra".into()),
+                Duration::from_secs(120),
+                semantic,
+                true,
+            );
+            let timeout = if phase == StreamTimeoutPhase::Bootstrap {
+                timeout.with_last_http_retry(429, Duration::from_secs(5))
+            } else {
+                timeout
+            };
+            let receipt = timeout.diagnostic(&session).unwrap();
+            let error = AgentError::StreamTimeout(timeout);
+            assert_eq!(receipt.error_message(), error.to_string());
+            assert!(receipt.matches_session(&session.id));
+            assert!(!receipt.matches_session("foreign-session"));
+            assert!(!receipt.matches_error_message(&format!("LLM error: {error}")));
+            let wire = serde_json::to_value(&receipt).unwrap();
+            assert_eq!(wire["kind"], "stream_timeout");
+            assert_eq!(wire["semantic_output_started"], semantic.is_some());
+            assert_eq!(wire["retry_safe"], semantic.is_none());
+            assert_eq!(wire["diagnostic_id"], wire["error_id"]);
+            assert!(wire.get("request_id").is_none());
+            assert!(!wire.to_string().contains("private-session"));
+
+            let other = StreamTimeoutError::new(
+                phase,
+                Duration::from_secs(120),
+                None,
+                None,
+                Duration::from_secs(120),
+                semantic,
+                true,
+            );
+            assert_ne!(other.identity.diagnostic_id, receipt.diagnostic_id());
+            assert!(!receipt.matches_error_message(&AgentError::StreamTimeout(other).to_string()));
+        }
+        assert!(std::mem::size_of::<AgentError>() <= 128);
+    }
+
+    #[test]
+    fn timeout_identifiers_are_redacted_before_both_display_and_export() {
+        let session = bamboo_domain::Session::new("session", "model");
+        for secret in [
+            "https://private.invalid/token",
+            "sk-private-credential",
+            "Bearer_private",
+            "raw private input",
+        ] {
+            let timeout = StreamTimeoutError::new(
+                StreamTimeoutPhase::TransportIdle,
+                Duration::from_secs(120),
+                Some(secret.into()),
+                Some(secret.into()),
+                Duration::from_secs(120),
+                None,
+                true,
+            );
+            let receipt = timeout.diagnostic(&session).unwrap();
+            assert!(!timeout.to_string().contains(secret));
+            let wire = serde_json::to_value(&receipt).unwrap();
+            assert!(wire["provider"].is_null());
+            assert!(wire["model"].is_null());
+            assert_eq!(
+                receipt.error_message(),
+                AgentError::StreamTimeout(timeout).to_string()
+            );
+        }
     }
 }

@@ -241,6 +241,94 @@ impl LLMProvider for PartialTransientProvider {
     }
 }
 
+struct PartialThenStalledProvider(AtomicUsize);
+
+#[async_trait]
+impl LLMProvider for PartialThenStalledProvider {
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        assert_eq!(
+            self.0.fetch_add(1, Ordering::SeqCst),
+            0,
+            "partial output must not replay"
+        );
+        Ok(Box::pin(
+            stream::once(async {
+                Ok(LLMChunk::ReasoningToken("private partial reasoning".into()))
+            })
+            .chain(stream::pending()),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn terminal_stream_timeout_receipt_reaches_live_events_and_the_existing_checkpoint() {
+    let provider = Arc::new(PartialThenStalledProvider(AtomicUsize::new(0)));
+    let mut config = bamboo_llm::Config::default();
+    config.stream_timeout.transport_idle_timeout_secs = 1;
+    let (_temp, agent, storage) =
+        build_direct_execute_agent_with_config(provider.clone(), None, None, config).await;
+    let mut session = Session::new(
+        &format!("timeout-diagnostic-{}", uuid::Uuid::new_v4()),
+        "test-model",
+    );
+    session.add_message(Message::user("private user prompt"));
+    storage.save_session(&session).await.unwrap();
+    let (tx, mut rx) = mpsc::channel(128);
+    let error = agent
+        .execute(&mut session, direct_request(tx, CancellationToken::new()))
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, AgentError::StreamTimeout(timeout) if !timeout.retry_safe()));
+    assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+    let live =
+        bamboo_llm::retry::public_request_diagnostic(&session.id, &error.to_string()).unwrap();
+    assert!(
+        bamboo_llm::retry::public_request_diagnostic("foreign-session", &error.to_string())
+            .is_none()
+    );
+    let mut saved = storage.load_session(&session.id).await.unwrap().unwrap();
+    let captured = bamboo_domain::LlmRequestDiagnostic::from_json(
+        saved
+            .metadata
+            .get(bamboo_domain::LAST_RUN_LLM_DIAGNOSTIC_KEY)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(live, captured);
+    assert!(captured.matches_error_message(&error.to_string()));
+    let wire = serde_json::to_value(&captured).unwrap();
+    assert_eq!(wire["phase"], "transport_idle");
+    assert_eq!(wire["deadline_ms"], 1_000);
+    assert_eq!(wire["semantic_output_started"], true);
+    assert_eq!(wire["retry_safe"], false);
+    assert!(!wire.to_string().contains("private user prompt"));
+    assert!(!wire.to_string().contains("private partial reasoning"));
+    assert!(saved.messages.iter().any(|message| message
+        .metadata
+        .as_ref()
+        .and_then(|value| value.get("interrupted"))
+        .and_then(|value| value.as_bool())
+        == Some(true)));
+    while let Ok(event) = rx.try_recv() {
+        assert!(!matches!(
+            event,
+            AgentEvent::Complete { .. } | AgentEvent::Error { .. }
+        ));
+    }
+    // Existing terminal owners set the canonical error after direct execution;
+    // no new checkpoint or status lifecycle is introduced for diagnostics.
+    saved.set_last_run_error(error.to_string());
+    storage.save_session(&saved).await.unwrap();
+    let cold = storage.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(cold.last_run_diagnostic(), Some(captured));
+}
+
 #[tokio::test]
 async fn partial_text_reasoning_and_tool_fragments_remain_terminal_and_durable() {
     for kind in 0..3 {
@@ -366,6 +454,14 @@ async fn anthropic_bootstrap_watchdog_does_not_restart_a_managed_budget() {
         .execute(&mut session, direct_request(tx, CancellationToken::new()))
         .await
         .unwrap_err();
+    let receipt =
+        bamboo_llm::retry::public_request_diagnostic(&session.id, &error.to_string()).unwrap();
+    let wire = serde_json::to_value(&receipt).unwrap();
+    assert_eq!(wire["phase"], "bootstrap");
+    assert_eq!(wire["last_http_status"], 401);
+    assert_eq!(wire["retry_delay_ms"], 5_000);
+    assert_eq!(wire["semantic_output_started"], false);
+    assert_eq!(wire["retry_safe"], false);
     match error {
         AgentError::StreamTimeout(timeout) => {
             assert!(!timeout.retry_safe());
