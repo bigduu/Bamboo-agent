@@ -340,7 +340,11 @@ async function nextReply(request, c, flow, hooks) {
   if (role === 'child') {
     if (step === 0) return call('Read', { file_path: flow.fixtureFile });
     requireFact(textContent(request.messages.findLast(m => m.role === 'tool')?.content).includes(flow.fileContent.trim()), 'actual_fixture_read_missing');
-    flow.readObserved = true; return { role: 'assistant', content: flow.childReport };
+    // Required-packet children use the existing strict report projection. The
+    // reported summary is a claim; the real Read result is checked above.
+    flow.readObserved = true; return { role: 'assistant', content: JSON.stringify({
+      version: 1, outcome: 'completed', summary: flow.childReport, reported_evidence: [],
+      reported_verification: [], proposals: [], blockers: [], open_decisions: [] }) };
   }
   if (step === 0) {
     // Intentionally unadvertised on an ordinary Ultra Root: test the final
