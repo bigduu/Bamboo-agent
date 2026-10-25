@@ -65,7 +65,7 @@ async fn management_snapshot(
         SupervisorScopeObservation,
         BTreeMap<String, SupervisorManagedLink>,
     ),
-    HttpResponse,
+    Box<HttpResponse>,
 > {
     // The existing reader holds canonical lifetime/Session/proof authority. Do
     // not replace it with the index, raw runtime metadata or a cached Session.
@@ -81,7 +81,7 @@ async fn management_snapshot(
             ))
         })?;
     if current.supervisor_incarnation_id() != Some(reference.incarnation_id) {
-        return Err(changed_scope());
+        return Err(changed_scope().into());
     }
     let (revision, projects, links) = if let Some(management) = current.supervisor_management {
         management
@@ -126,7 +126,7 @@ pub async fn inspect_managed_sessions(
     };
     let (scope, links) = match management_snapshot(&state, &reference).await {
         Ok(snapshot) => snapshot,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let service = SupervisorSessionService::new(state.storage.clone());
     let observed = match service.inspect_scope(&reference).await {
@@ -200,7 +200,7 @@ async fn validate_attach_target(
     state: &AppState,
     target_id: &str,
     scope: &SupervisorScopeObservation,
-) -> Result<(), HttpResponse> {
+) -> Result<(), Box<HttpResponse>> {
     let target = state
         .storage
         .load_root_authority(target_id)
@@ -224,7 +224,8 @@ async fn validate_attach_target(
             StatusCode::FORBIDDEN,
             "target_not_ordinary_root",
             "Only an independent Ordinary Root can be managed",
-        ));
+        )
+        .into());
     }
     let project = target
         .project_id_meta()
@@ -241,7 +242,8 @@ async fn validate_attach_target(
             StatusCode::FORBIDDEN,
             "target_outside_scope",
             "The intended Root's Project is outside the explicitly selected Supervisor scope",
-        ));
+        )
+        .into());
     }
     let projects = state.project_store.clone();
     match tokio::task::spawn_blocking(move || projects.get(&project)).await {
@@ -262,6 +264,7 @@ async fn validate_attach_target(
             "The intended Root's Project could not be verified",
         )),
     }
+    .map_err(Box::new)
 }
 
 /// Explicit owner attachment/revalidation or revocation of one existing Root.
@@ -333,7 +336,7 @@ pub async fn configure_managed_session(
     }
     if body.enabled {
         if let Err(response) = validate_attach_target(&state, &target_id, &scope).await {
-            return Ok(response);
+            return Ok(*response);
         }
     }
     // The storage CAS retains its canonical locks through publication and
