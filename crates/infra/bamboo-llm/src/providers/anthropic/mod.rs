@@ -477,7 +477,10 @@ impl AnthropicProvider {
             log_identity(model)
         );
         let applied_reasoning_effort = reasoning_effort;
-        let thinking_enabled = body.get("thinking").is_some();
+        let thinking_enabled = body
+            .pointer("/thinking/type")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode != "disabled");
         let thinking_budget_tokens = body
             .get("thinking")
             .and_then(|thinking| thinking.get("budget_tokens"))
@@ -812,7 +815,12 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
     }
 
     if let Some(effort) = reasoning_effort {
+        // Effort controls depth, not activation. Enable the protocol's adaptive
+        // mode without deriving a budget or changing the selected effort.
         body["output_config"] = json!({"effort": effort.as_str()});
+        body["thinking"] = json!({
+            "type": if effort == ReasoningEffort::Disabled { "disabled" } else { "adaptive" }
+        });
     }
 
     if !tools.is_empty() {
@@ -4003,7 +4011,8 @@ mod anthropic_request_building {
                 false,
                 &[],
             );
-            assert!(next_request.get("thinking").is_none());
+            assert_eq!(next_request["output_config"]["effort"], "medium");
+            assert_eq!(next_request["thinking"]["type"], "adaptive");
             assert!(next_request["messages"][1]["content"]
                 .as_array()
                 .unwrap()
@@ -4379,7 +4388,7 @@ mod anthropic_request_building {
                 &groups,
             );
             assert_eq!(body["output_config"]["effort"], "medium");
-            assert!(body.get("thinking").is_none());
+            assert_eq!(body["thinking"]["type"], "adaptive");
             let content = body["messages"][1]["content"].as_array().unwrap();
             assert!(content.iter().all(|block| !matches!(
                 block.get("type").and_then(Value::as_str),
@@ -4520,7 +4529,15 @@ mod anthropic_request_building {
                 );
                 assert_eq!(body["output_config"]["effort"], effort.as_str());
                 assert_eq!(body["max_tokens"], max_tokens);
-                assert!(body.get("thinking").is_none());
+                assert_eq!(
+                    body["thinking"]["type"],
+                    if effort == ReasoningEffort::Disabled {
+                        "disabled"
+                    } else {
+                        "adaptive"
+                    }
+                );
+                assert!(body.pointer("/thinking/budget_tokens").is_none());
             }
         }
     }
@@ -6602,7 +6619,7 @@ mod anthropic_request_building_edge_cases {
         );
 
         assert_eq!(out["output_config"]["effort"], "medium");
-        assert!(out.get("thinking").is_none());
+        assert_eq!(out["thinking"]["type"], "adaptive");
         // And no unsigned thinking block leaks into the turn either.
         let content = out["messages"][1]["content"].as_array().unwrap();
         assert!(content
@@ -6917,7 +6934,7 @@ mod anthropic_provider_tests {
         let requests = server.received_requests().await.expect("requests recorded");
         assert_eq!(requests.len(), 1);
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(body.get("thinking").is_none());
+        assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["max_tokens"], 2_048);
         assert_eq!(body["output_config"]["effort"], "max");
     }

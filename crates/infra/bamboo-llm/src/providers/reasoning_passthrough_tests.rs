@@ -89,6 +89,16 @@ fn assert_effort(body: &Value, pointer: &str, effort: Option<ReasoningEffort>) {
         }
     });
     assert_eq!(body.pointer(pointer), expected.as_ref());
+    if pointer == "/output_config/effort" {
+        let activation = effort.map(|effort| {
+            if effort == ReasoningEffort::Disabled {
+                json!("disabled")
+            } else {
+                json!("adaptive")
+            }
+        });
+        assert_eq!(body.pointer("/thinking/type"), activation.as_ref());
+    }
     assert!(body.pointer("/thinking/budget_tokens").is_none());
     assert!(body
         .pointer("/generationConfig/thinkingConfig/thinkingBudget")

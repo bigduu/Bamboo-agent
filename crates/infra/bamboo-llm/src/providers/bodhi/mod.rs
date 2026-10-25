@@ -643,7 +643,7 @@ mod tests {
         let requests = server.received_requests().await.expect("requests recorded");
         assert_eq!(requests.len(), 1);
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(body.get("thinking").is_none());
+        assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["max_tokens"], 2_048);
         assert_eq!(body["output_config"]["effort"], "max");
         assert_eq!(body["tool_choice"]["type"], "tool");
@@ -709,7 +709,7 @@ mod tests {
         let requests = server.received_requests().await.expect("requests recorded");
         assert_eq!(requests.len(), 1);
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(body.get("thinking").is_none());
+        assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["max_tokens"], 2_048);
         assert_eq!(body["output_config"]["effort"], "max");
     }
