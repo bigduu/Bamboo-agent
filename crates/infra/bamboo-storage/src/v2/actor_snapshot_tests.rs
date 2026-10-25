@@ -93,6 +93,214 @@ impl Fixture {
     }
 }
 
+/// Model/profile writes advance Session metadata without rewriting older Actor
+/// rows. A Host owner's diagnostic view must keep topology without advertising
+/// those older rows as current execution authority.
+async fn advance_model_metadata(f: &Fixture) {
+    for model in ["second-model", "third-model"] {
+        let mut root = f.store.load_session(&f.root.id).await.unwrap().unwrap();
+        root.model = model.into();
+        root.metadata_version += 1;
+        root.updated_at = Utc::now();
+        f.store.save_session(&root).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn historical_metadata_observations_keep_host_topology_without_runtime_claims() {
+    for supervisor in [false, true] {
+        let mut f = Fixture::new().await;
+        if supervisor {
+            let receipt = f
+                .store
+                .get_or_create_default_supervisor("model")
+                .await
+                .unwrap();
+            f.root = f
+                .store
+                .load_session(&receipt.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        // Include an initialized Root: both own and ancestor observations can
+        // lag after a normal model write. Historical completed/cancelled Children
+        // must not invalidate one another or the fresh sibling.
+        f.store.ensure_actor(&f.root.id).await.unwrap();
+        let mut recorded = std::collections::BTreeMap::new();
+        for (id, outcome) in [
+            (
+                "historical-completed",
+                bamboo_domain::ActorActivationFinish::Succeeded,
+            ),
+            (
+                "historical-cancelled",
+                bamboo_domain::ActorActivationFinish::Cancelled,
+            ),
+        ] {
+            let child = f.child(id, &f.root).await;
+            let activation = f.activate(&child.id).await;
+            f.store
+                .start_activation(&activation.fence(), Utc::now())
+                .await
+                .unwrap();
+            f.store
+                .finish_activation(&activation.fence(), Utc::now(), outcome)
+                .await
+                .unwrap();
+            recorded.insert(child.id.clone(), title_row(&f, &child.id).await.revision);
+        }
+        let root_row_revision = title_row(&f, &f.root.id).await.revision;
+        advance_model_metadata(&f).await;
+        let latest = f.store.load_session(&f.root.id).await.unwrap().unwrap();
+        let fresh = f.child("current-child", &latest).await;
+        f.store.ensure_actor(&fresh.id).await.unwrap();
+        let before = durable_tree(&f.home);
+        let view = f
+            .snapshot(&f.root.id, ActorSnapshotLimits::default())
+            .await
+            .expect("the Host owner can read historical topology after model metadata changes");
+        assert_eq!(view.nodes.len(), 4);
+        for node in &view.nodes {
+            if node.actor_id == fresh.id {
+                assert_eq!(node.logical_state, Some(ActorLogicalState::Cold));
+                continue;
+            }
+            assert!(node.logical_state.is_none());
+            assert!(node.activation.is_none());
+            assert!(node.placement_class.is_none());
+            assert_eq!(
+                node.revision.actor_directory_revision,
+                Some(if node.actor_id == f.root.id {
+                    root_row_revision
+                } else {
+                    recorded[&node.actor_id]
+                })
+            );
+            assert_eq!(
+                node.revision.session_metadata_version,
+                if node.actor_id == f.root.id {
+                    latest.metadata_version
+                } else {
+                    0
+                }
+            );
+        }
+        let reopened = SessionStoreV2::new(f.home.clone()).await.unwrap();
+        let restored = reopened
+            .actor_subtree_snapshot(
+                ActorSnapshotPrincipal::host_owner(),
+                &f.root.id,
+                &f.root.id,
+                ActorSnapshotLimits::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(view, restored);
+        // This includes every Session, proof, Actor row, marker and tree cursor.
+        assert_eq!(durable_tree(&f.home), before);
+    }
+}
+
+#[tokio::test]
+async fn historical_metadata_observations_keep_live_actor_principal_strict() {
+    let f = Fixture::new().await;
+    let child = f.child("historical-active-child", &f.root).await;
+    let activation = f.activate(&child.id).await;
+    advance_model_metadata(&f).await;
+    let before = durable_tree(&f.home);
+    assert_eq!(
+        f.store
+            .actor_subtree_snapshot(
+                ActorSnapshotPrincipal::live_actor(activation.fence()),
+                &f.root.id,
+                &child.id,
+                ActorSnapshotLimits::default(),
+            )
+            .await
+            .unwrap_err(),
+        Error::StaleAuthority
+    );
+    // A Host diagnostic result must not repair an execution capability.
+    let view = f
+        .snapshot(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert!(view.nodes[0].logical_state.is_none());
+    assert!(view.nodes[0].activation.is_none());
+    assert!(f
+        .store
+        .validate_fence(&activation.fence(), Utc::now())
+        .await
+        .is_err());
+    assert_eq!(durable_tree(&f.home), before);
+}
+
+#[tokio::test]
+async fn historical_metadata_observations_reject_future_revision_or_changed_birth() {
+    for damage in ["future", "birth", "project"] {
+        let f = Fixture::new().await;
+        let child = f.child("historical-invalid-child", &f.root).await;
+        f.store.ensure_actor(&child.id).await.unwrap();
+        advance_model_metadata(&f).await;
+        f.edit(&child.id, "actor-authority.json", |value| match damage {
+            "future" => value["actor"]["ancestor_observations"][0]["metadata_version"] = 3.into(),
+            "birth" => {
+                value["actor"]["ancestor_observations"][0]["session_created_at"] =
+                    serde_json::json!(f.root.created_at - chrono::Duration::seconds(1))
+            }
+            _ => value["actor"]["project_id"] = "foreign-project".into(),
+        })
+        .await;
+        let before = durable_tree(&f.home);
+        assert!(
+            f.snapshot(&f.root.id, ActorSnapshotLimits::default())
+                .await
+                .is_err(),
+            "{damage}"
+        );
+        assert_eq!(durable_tree(&f.home), before, "{damage}");
+    }
+}
+
+#[tokio::test]
+async fn historical_metadata_observations_omit_v2_local_task_claims() {
+    let f = Fixture::new().await;
+    let mut child = f.child("historical-local-child", &f.root).await;
+    let activation = f.activate_local(&child, chrono::Duration::minutes(5)).await;
+    f.local_checkpoint(&mut child, &activation, "running").await;
+    assert!(f
+        .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap()
+        .nodes[0]
+        .local_task
+        .is_some());
+    advance_model_metadata(&f).await;
+    let before = durable_tree(&f.home);
+    let view = f
+        .snapshot_v2(&child.id, ActorSnapshotLimits::default())
+        .await
+        .unwrap();
+    assert!(view.nodes[0].local_task.is_none());
+    assert!(view.nodes[0].actor.activation.is_none());
+    assert!(view.nodes[0].actor.logical_state.is_none());
+    assert_eq!(view.refresh_after_ms, None);
+    assert_eq!(
+        f.store
+            .actor_subtree_snapshot_v2(
+                ActorSnapshotPrincipal::live_actor(activation.fence()),
+                &f.root.id,
+                &child.id,
+                ActorSnapshotLimits::default(),
+            )
+            .await
+            .unwrap_err(),
+        Error::StaleAuthority
+    );
+    assert_eq!(durable_tree(&f.home), before);
+}
+
 #[tokio::test]
 async fn title_save_keeps_initialized_child_ancestor_observation_coherent() {
     let f = Fixture::new().await;
