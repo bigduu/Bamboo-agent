@@ -1,4 +1,6 @@
-use crate::providers::common::{http_error_kind, llm_error_kind, log_identity};
+use crate::providers::common::{
+    http_error_kind, llm_error_kind, log_identity, should_retry_without_reasoning,
+};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::json;
@@ -480,11 +482,6 @@ impl CopilotProvider {
         b.contains("/responses") || b.contains("responses api") || b.contains("use responses")
     }
 
-    fn looks_like_reasoning_unsupported_error(status: reqwest::StatusCode, body: &str) -> bool {
-        // Shared, tightened heuristic (#237 finding 5).
-        crate::providers::common::looks_like_reasoning_unsupported_error(status, body)
-    }
-
     fn looks_like_previous_response_id_unsupported_error(
         status: reqwest::StatusCode,
         body: &str,
@@ -714,9 +711,7 @@ impl CopilotProvider {
                 let response_header_count = response.headers().len();
                 let text = response.text().await.unwrap_or_default();
 
-                if reasoning_effort.is_some()
-                    && Self::looks_like_reasoning_unsupported_error(status, &text)
-                {
+                if should_retry_without_reasoning(reasoning_effort, status, &text) {
                     tracing::warn!(
                         "[session_hash={}] Copilot /responses rejected reasoning for model_hash {}; retrying without reasoning_effort",
                         log_identity(session_log_id),
@@ -1328,9 +1323,7 @@ impl LLMProvider for CopilotProvider {
                     )));
                 }
 
-                if reasoning_effort.is_some()
-                    && Self::looks_like_reasoning_unsupported_error(status, &text)
-                {
+                if should_retry_without_reasoning(reasoning_effort, status, &text) {
                     tracing::warn!(
                         "[session_hash={}] Copilot /chat/completions rejected reasoning for model_hash {}; retrying without reasoning_effort",
                         log_identity(session_log_id),
@@ -2026,7 +2019,13 @@ mod tests {
 
     #[test]
     fn copilot_reasoning_and_previous_response_id_fallback_detectors_do_not_overlap() {
-        assert!(CopilotProvider::looks_like_reasoning_unsupported_error(
+        assert!(!should_retry_without_reasoning(
+            Some(ReasoningEffort::Max),
+            reqwest::StatusCode::BAD_REQUEST,
+            "reasoning_effort is not supported for this model",
+        ));
+        assert!(should_retry_without_reasoning(
+            Some(ReasoningEffort::High),
             reqwest::StatusCode::BAD_REQUEST,
             "reasoning_effort is not supported for this model",
         ));
@@ -2045,7 +2044,8 @@ mod tests {
             )
         );
         assert!(
-            !CopilotProvider::looks_like_reasoning_unsupported_error(
+            !should_retry_without_reasoning(
+                Some(ReasoningEffort::High),
                 reqwest::StatusCode::BAD_REQUEST,
                 "previous_response_id unsupported_value",
             ),
