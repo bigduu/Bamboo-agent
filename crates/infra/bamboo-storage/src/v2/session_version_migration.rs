@@ -3,7 +3,7 @@
 use super::*;
 use bamboo_domain::{
     ActorDirectoryEntry, ActorLogicalState, AgentRuntimeState, AgentStatusState,
-    CURRENT_SESSION_VERSION,
+    AGENT_RUNTIME_STATE_VERSION, CURRENT_SESSION_VERSION,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -169,13 +169,15 @@ fn pending_response(session: &Session) -> bool {
 
 fn runtime_not_idle(session: &Session) -> bool {
     let busy = |state: &AgentRuntimeState| {
-        !matches!(
-            state.status,
-            AgentStatusState::Idle
-                | AgentStatusState::Completed
-                | AgentStatusState::Cancelled
-                | AgentStatusState::Failed
-        ) || state.tools.active_tool_calls != 0
+        state.version != AGENT_RUNTIME_STATE_VERSION
+            || !matches!(
+                state.status,
+                AgentStatusState::Idle
+                    | AgentStatusState::Completed
+                    | AgentStatusState::Cancelled
+                    | AgentStatusState::Failed
+            )
+            || state.tools.active_tool_calls != 0
             || state.waiting_for_children.is_some()
             || state.waiting_for_bash.is_some()
             || state.suspension.is_some()
