@@ -376,3 +376,190 @@ async fn supervisor_v2_standard_spawn_uses_real_root_creation_and_exact_retry() 
 async fn supervisor_v2_ultra_spawn_uses_real_root_creation_and_exact_retry() {
     assert_v2_spawn_uses_root_port_in_both_modes(true).await;
 }
+
+// These use the existing real AppState/Host operation fixture. The temporary
+// Work feature opt-in never changes installed/user security configuration.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn work_bound_supervisor_chat_case(standard: bool, stable_message_id: bool) {
+    let f = Fixture::new(true).await;
+    f.state.config.write().await.features.ticket_mutation = true;
+    let observed = f.state.tickets.status().await;
+    let payload = observed["initialization"].clone();
+    assert!(
+        payload.is_object(),
+        "fresh Work scope must expose its initializer"
+    );
+    let app = test::init_service(
+        App::new()
+            .app_data(f.state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+    let initialized = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/tickets/initialize")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .set_json(payload)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        initialized.status(),
+        StatusCode::OK,
+        "normal owner Work initialization must succeed"
+    );
+    let _: Value = test::read_body_json(initialized).await;
+    let service = f.state.tickets.service().unwrap();
+    let original = f
+        .state
+        .storage
+        .load_root_authority(&f.supervisor.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    if standard {
+        f.state
+            .storage
+            .root_mode_operation(&RootModeOperationRequest {
+                session_id: original.id.clone(),
+                operation_id: format!(
+                    "{}:{}",
+                    original.root_mode_transition_epoch,
+                    uuid::Uuid::new_v4()
+                ),
+                birth_token: original.root_mode_birth_token(),
+                expected_epoch: original.root_mode_transition_epoch,
+                requested_enabled: false,
+                action: RootModeOperationAction::Select,
+            })
+            .await
+            .unwrap();
+        f.state.sessions.remove(&original.id);
+    }
+    let before = service.published().unwrap();
+    let scope = f.state.tickets.status().await;
+    assert_eq!(
+        scope["availability"]["kind"],
+        if standard { "forbidden" } else { "ready" }
+    );
+    if standard {
+        assert_eq!(
+            scope["availability"]["reason_code"],
+            "supervisor_mode_required"
+        );
+        let input_before = f.state.session_inbox.inspect(&original.id).await.unwrap();
+        let denied = test::call_service(&app, test::TestRequest::post().uri("/api/v1/chat").peer_addr("127.0.0.1:12345".parse().unwrap()).set_json(json!({"session_id":original.id,"message":"Formal Work reply stays gated", "model":"supervisor-private-model", "thread_id":"work-only-thread"})).to_request()).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let _: Value = test::read_body_json(denied).await;
+        assert_eq!(
+            f.state
+                .session_inbox
+                .inspect(&original.id)
+                .await
+                .unwrap()
+                .generation,
+            input_before.generation
+        );
+        assert_eq!(service.published().unwrap().0, before.0);
+    }
+    let mut chat = json!({
+        "session_id": original.id,
+        "message": "Coordinate an independent Root without submitting Work",
+        "model": "supervisor-private-model"
+    });
+    if stable_message_id {
+        chat["message_id"] = json!(uuid::Uuid::new_v4().to_string());
+    }
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/chat")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .set_json(chat.clone())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "plain Supervisor chat must retain its independent Root ingress"
+    );
+    let receipt: Value = test::read_body_json(response).await;
+    if stable_message_id {
+        assert_eq!(receipt["message_id"], chat["message_id"]);
+    }
+    assert!(
+        receipt["message_id"].is_string() && receipt["ingress_seq"].as_u64().is_some_and(|n| n > 0)
+    );
+    if standard {
+        assert_eq!(
+            service.published().unwrap().0,
+            before.0,
+            "ordinary Root ingress must not create a formal Work intent"
+        );
+        assert!(bamboo_engine::ticket_runtime::verified_scope_binding(
+            f.state.storage.as_ref(),
+            &original.id
+        )
+        .await
+        .is_err());
+    } else {
+        assert!(
+            service.published().unwrap().1.resolutions.len() > before.1.resolutions.len(),
+            "Ultra Human ingress must still record its formal Work intent"
+        );
+        assert!(bamboo_engine::ticket_runtime::verified_scope_binding(
+            f.state.storage.as_ref(),
+            &original.id
+        )
+        .await
+        .is_ok());
+    }
+    drop(app);
+    let operation = uuid::Uuid::new_v4();
+    let created = f.invoke(f.request(operation)).await;
+    assert_eq!(created["admitted"], true);
+    let id = created["target_session_id"].as_str().unwrap();
+    let root = f
+        .state
+        .storage
+        .load_root_authority(id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(root.kind, SessionKind::Root);
+    assert!(root.parent_session_id.is_none() && root.authority_identity.is_ordinary());
+    assert_eq!(root.supervisor_incarnation_id(), None);
+    assert!(!root.root_orchestration_only_enabled());
+    assert_eq!(
+        root.workspace_path_meta().as_deref(),
+        Some(f.workspace.as_str())
+    );
+    let replay = f.invoke(f.request(operation)).await;
+    assert_eq!(replay["target_session_id"], created["target_session_id"]);
+    assert_eq!(replay["receipt_id"], created["receipt_id"]);
+    assert_eq!(
+        f.state.session_inbox.inspect(id).await.unwrap().generation,
+        1
+    );
+    f.state.shutdown().await;
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[actix_web::test]
+async fn work_bound_standard_supervisor_admits_plain_root_chat_without_work_authority() {
+    work_bound_supervisor_chat_case(true, false).await;
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[actix_web::test]
+async fn work_bound_ultra_supervisor_retains_formal_ingress_and_independent_roots() {
+    work_bound_supervisor_chat_case(false, false).await;
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[actix_web::test]
+async fn work_bound_standard_supervisor_keeps_native_message_identity_without_work_reference() {
+    work_bound_supervisor_chat_case(true, true).await;
+}
