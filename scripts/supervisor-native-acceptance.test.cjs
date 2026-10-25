@@ -534,3 +534,12 @@ for (const rejected of ['refusalUserWrite', 'refusalOrdinaryPermission', 'refusa
     await assert.rejects(d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] }), e => e.code === 'standard_refusal_had_side_effects');
   });
 }
+
+
+test('NATIVE REPORT: scripted Child emits the existing required-packet v1 report', async () => {
+  const mode = c('ultra'), flow = d.scenario(mode, randomUUID()); flow.steps.child = 1;
+  const reply = await d.nextReply({ messages: [user(flow.markers.child), { role: 'tool', content: flow.fileContent }], tools }, mode, flow, {});
+  assert.deepEqual(JSON.parse(reply.content), { version: 1, outcome: 'completed', summary: flow.childReport,
+    reported_evidence: [], reported_verification: [], proposals: [], blockers: [], open_decisions: [] });
+  assert.equal(flow.readObserved, true);
+});
