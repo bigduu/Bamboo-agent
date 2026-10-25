@@ -31,7 +31,7 @@ fn error(status: StatusCode, code: &str, message: impl ToString) -> HttpResponse
 
 // Once canonical publication is issued, an untyped I/O error cannot prove
 // no commit occurred. Match the existing native adapter's conservative boundary.
-fn publication_error(failure: io::Error) -> HttpResponse {
+pub(super) fn publication_error(failure: io::Error) -> HttpResponse {
     if failure
         .get_ref()
         .is_some_and(|inner| inner.is::<bamboo_domain::SessionAuthorityConflict>())
@@ -42,7 +42,7 @@ fn publication_error(failure: io::Error) -> HttpResponse {
     }
 }
 
-fn storage_error(error_value: io::Error) -> HttpResponse {
+pub(super) fn storage_error(error_value: io::Error) -> HttpResponse {
     let (status, code) = match error_value.kind() {
         io::ErrorKind::WouldBlock => (StatusCode::CONFLICT, "scope_revision_conflict"),
         io::ErrorKind::PermissionDenied => (StatusCode::FORBIDDEN, "supervisor_identity_mismatch"),
@@ -54,7 +54,9 @@ fn storage_error(error_value: io::Error) -> HttpResponse {
     error(status, code, error_value)
 }
 
-async fn canonical_reference(state: &AppState) -> Result<SupervisorReference, Box<HttpResponse>> {
+pub(super) async fn canonical_reference(
+    state: &AppState,
+) -> Result<SupervisorReference, Box<HttpResponse>> {
     let canonical =
         match state
             .storage
