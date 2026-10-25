@@ -101,6 +101,7 @@ async fn version_migration_preserves_ordinary_and_supervisor_state_after_reopen(
         let SessionVersionMigrationDecision::Committed(receipt) = outcome else {
             panic!("{outcome:?}")
         };
+        let receipt = *receipt;
         assert_eq!(receipt.target_version, CURRENT_SESSION_VERSION);
         let mut expected = serde_json::to_value(&original).unwrap();
         expected["session_version"] = serde_json::json!(CURRENT_SESSION_VERSION);
@@ -117,7 +118,7 @@ async fn version_migration_preserves_ordinary_and_supervisor_state_after_reopen(
                 .migrate_session_version(&original.id, &intent)
                 .await
                 .unwrap(),
-            SessionVersionMigrationDecision::Committed(receipt.clone())
+            SessionVersionMigrationDecision::Committed(Box::new(receipt.clone()))
         );
         let before_reopen = pair(home.path(), &original.id).await;
         store.flush_search_index().await;
@@ -128,7 +129,7 @@ async fn version_migration_preserves_ordinary_and_supervisor_state_after_reopen(
                 .migrate_session_version(&original.id, &intent)
                 .await
                 .unwrap(),
-            SessionVersionMigrationDecision::Committed(receipt)
+            SessionVersionMigrationDecision::Committed(Box::new(receipt))
         );
         assert_eq!(pair(home.path(), &original.id).await, before_reopen);
         let mut stale = original.clone();
