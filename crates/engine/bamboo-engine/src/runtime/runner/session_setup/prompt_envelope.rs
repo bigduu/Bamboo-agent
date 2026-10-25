@@ -907,3 +907,38 @@ mod tests {
         assert!(build_history_boundary_context_block(&Session::new("plain", "model")).is_none());
     }
 }
+
+#[cfg(test)]
+#[test]
+fn supervisor_existing_session_first_policy_keeps_children_auxiliary_and_scope_explicit() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    for ultra in [false, true] {
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let guidance = build_root_orchestration_context_block(&supervisor)
+            .unwrap()
+            .content;
+        for concept in [
+            "Existing-session-first",
+            "session_history list",
+            "bounded inspect",
+            "main execution",
+            "auxiliary planning",
+            "same target",
+            "explicitly attach",
+            "No suitable managed Session",
+            "never self-execute",
+        ] {
+            assert!(guidance.contains(concept), "missing {concept}");
+        }
+        assert!(
+            guidance.find("session_history list").unwrap()
+                < guidance.find("auxiliary planning").unwrap()
+        );
+        let child = Session::new_child_of("policy-child", &supervisor, "model", "Child");
+        assert!(build_root_orchestration_context_block(&child).is_none());
+    }
+}
