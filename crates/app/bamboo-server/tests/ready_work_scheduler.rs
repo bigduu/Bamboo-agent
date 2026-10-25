@@ -599,6 +599,7 @@ async fn policy_wake_runs_real_child_task_and_submits_once_without_auto_acceptan
     assert_eq!(snapshot.assignments.len(), 1);
     let assignment = snapshot.assignments.values().next().unwrap();
     let dispatch_key = assignment.dispatch_key.clone();
+    let patrol_assignment_id = assignment.id.clone();
     let child_id = assignment.runtime.as_ref().unwrap().session_id.clone();
     let child = fixture
         .state
@@ -656,6 +657,48 @@ async fn policy_wake_runs_real_child_task_and_submits_once_without_auto_acceptan
     fixture.state.tickets.reconcile_ready_work().await.unwrap();
     fixture.assert_quiet(2).await;
     fixture.state.tickets.revoke_ready_work_policy().await;
+    // The actual installed worker used the same checkpoint adapter. This is
+    // ordinary publication/readback, not the filesystem lock-fault test target.
+    let scope = fixture
+        .state
+        .tickets
+        .patrol_scope(
+            fixture.project.as_str(),
+            &fixture.works[0].id,
+            &patrol_assignment_id,
+        )
+        .await
+        .unwrap();
+    #[cfg(unix)]
+    {
+        let mut journal = fixture
+            .state
+            .tickets
+            .open_patrol_checkpoints(&scope)
+            .await
+            .unwrap();
+        let stored = bamboo_orchestration::patrol::CheckpointPort::load(&mut journal, &scope)
+            .unwrap()
+            .expect("existing Ready reconcile must persist its program observation");
+        let incident = stored.checkpoint.incident.unwrap();
+        assert_eq!(incident.id.scope, scope);
+        assert_eq!(incident.attempts, 0);
+        let escalation = incident
+            .escalation
+            .expect("changed canonical Work produces a pending decision");
+        assert_eq!(escalation.deliveries, 0);
+        assert!(!escalation.queued);
+        drop(journal);
+    }
+    #[cfg(not(unix))]
+    assert!(
+        matches!(
+            fixture.state.tickets.open_patrol_checkpoints(&scope).await,
+            Err(bamboo_tickets::Error::AuthorityUnavailable(_))
+        ),
+        "unsupported file observation must leave the real Ready worker operational"
+    );
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 2);
     fixture.state.shutdown().await;
 }
 

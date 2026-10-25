@@ -72,6 +72,14 @@ impl ReadyWorkHost for TicketApplication {
         Ok(())
     }
 
+    async fn reconcile_program_patrol(
+        &self,
+        selection: &bamboo_orchestration::patrol::program::ProgramSelection<'_>,
+        fence: &bamboo_orchestration::ReadyAdmissionFence,
+    ) -> Result<()> {
+        self.reconcile_ready_program_patrol(selection, fence).await
+    }
+
     async fn preflight(&self, command: &Command) -> Result<()> {
         let service = self.service()?;
         self.validate_project_operations(&service, command)?;
