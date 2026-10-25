@@ -1,6 +1,7 @@
 use super::*;
 use bamboo_agent_core::AgentError;
 use bamboo_llm::providers::anthropic::AnthropicProvider;
+use futures::StreamExt;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
