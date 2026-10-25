@@ -480,11 +480,6 @@ impl CopilotProvider {
         b.contains("/responses") || b.contains("responses api") || b.contains("use responses")
     }
 
-    fn looks_like_reasoning_unsupported_error(status: reqwest::StatusCode, body: &str) -> bool {
-        // Shared, tightened heuristic (#237 finding 5).
-        crate::providers::common::looks_like_reasoning_unsupported_error(status, body)
-    }
-
     fn looks_like_previous_response_id_unsupported_error(
         status: reqwest::StatusCode,
         body: &str,
@@ -713,113 +708,6 @@ impl CopilotProvider {
                     .to_string();
                 let response_header_count = response.headers().len();
                 let text = response.text().await.unwrap_or_default();
-
-                if reasoning_effort.is_some()
-                    && Self::looks_like_reasoning_unsupported_error(status, &text)
-                {
-                    tracing::warn!(
-                        "[session_hash={}] Copilot /responses rejected reasoning for model_hash {}; retrying without reasoning_effort",
-                        log_identity(session_log_id),
-                        log_identity(model)
-                    );
-                    let mut fallback_options = effective_responses_options.clone();
-                    fallback_options.reasoning_summary = None;
-                    let mut fallback_body = build_responses_body(
-                        model,
-                        messages,
-                        tools,
-                        max_output_tokens,
-                        None,
-                        Some(&fallback_options),
-                        parallel_tool_calls,
-                        None,
-                    );
-                    request_overrides::apply_overrides_to_body(
-                        &mut fallback_body,
-                        self.request_overrides.as_ref(),
-                        request_overrides::ENDPOINT_RESPONSES,
-                        Some(model),
-                    );
-                    if let Some(name) = required_tool {
-                        fallback_body["tool_choice"] = json!({"type": "function", "name": name});
-                    }
-                    crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
-                    let fallback_headers = self.build_llm_headers(
-                        token,
-                        messages,
-                        tools,
-                        request_overrides::ENDPOINT_RESPONSES,
-                        Some(model),
-                    )?;
-                    let mut fallback = self
-                        .send_with_transport_retry(
-                            || {
-                                self.client
-                                    .post(url)
-                                    .headers(fallback_headers.clone())
-                                    .json(&fallback_body)
-                            },
-                            "copilot responses reasoning fallback",
-                            Some(session_log_id),
-                        )
-                        .await?;
-
-                    if !fallback.status().is_success() {
-                        let fallback_status = fallback.status();
-                        if (fallback_status == 401 || fallback_status == 403)
-                            && self.auth_handler.is_some()
-                        {
-                            if let Some(handler) = &self.auth_handler {
-                                if let Ok(Some(refreshed)) =
-                                    handler.force_refresh_chat_token().await
-                                {
-                                    let refreshed_fallback_headers = self.build_llm_headers(
-                                        &refreshed,
-                                        messages,
-                                        tools,
-                                        request_overrides::ENDPOINT_RESPONSES,
-                                        Some(model),
-                                    )?;
-                                    fallback = self
-                                        .send_with_transport_retry(
-                                            || {
-                                                self.client
-                                                    .post(url)
-                                                    .headers(refreshed_fallback_headers.clone())
-                                                    .json(&fallback_body)
-                                            },
-                                            "copilot responses reasoning fallback auth-refresh retry",
-                                            Some(session_log_id),
-                                        )
-                                        .await?;
-                                }
-                            }
-                        }
-                    }
-
-                    if fallback.status().is_success() {
-                        let mut parser =
-                            ResponsesSseParser::new_with_context("Copilot", model, None)
-                                .with_protocol_events(retain_protocol_events);
-                        let model_for_debug = model.to_string();
-                        let stream = llm_stream_from_sse_multi_requiring_done(
-                            fallback,
-                            move |event, data| {
-                                let parsed = parser.handle_event_multi(event, data);
-                                append_responses_sse_record(
-                                    "Copilot",
-                                    &model_for_debug,
-                                    event,
-                                    data,
-                                    &parsed,
-                                );
-                                parsed
-                            },
-                            "Copilot Responses",
-                        );
-                        return Ok(stream);
-                    }
-                }
 
                 if status == 401 || status == 403 {
                     return Err(LLMError::Auth(format!(
@@ -1221,7 +1109,7 @@ impl LLMProvider for CopilotProvider {
         set_openai_compat_token_limit(&mut body, max_output_tokens, reasoning_effort.is_some());
 
         if let Some(reasoning_effort) = reasoning_effort {
-            body["reasoning_effort"] = json!(reasoning_effort.to_wire_format(upstream_model));
+            body["reasoning_effort"] = json!(reasoning_effort.as_str());
         }
         request_overrides::apply_overrides_to_body(
             &mut body,
@@ -1326,109 +1214,6 @@ impl LLMProvider for CopilotProvider {
                         "Authentication failed: {}. Please run authenticate() again.",
                         text
                     )));
-                }
-
-                if reasoning_effort.is_some()
-                    && Self::looks_like_reasoning_unsupported_error(status, &text)
-                {
-                    tracing::warn!(
-                        "[session_hash={}] Copilot /chat/completions rejected reasoning for model_hash {}; retrying without reasoning_effort",
-                        log_identity(session_log_id),
-                        log_identity(upstream_model)
-                    );
-
-                    let mut body_no_reasoning = json!({
-                        "model": upstream_model,
-                        "messages": messages_to_openai_compat_json(messages),
-                        "stream": true,
-                    });
-                    if !tools.is_empty() {
-                        body_no_reasoning["tools"] = json!(tools_to_openai_compat_json(tools));
-                        body_no_reasoning["tool_choice"] = required_tool.map_or_else(
-                            || json!("auto"),
-                            |name| json!({"type": "function", "function": {"name": name}}),
-                        );
-                    }
-                    if let Some(parallel_tool_calls) = parallel_tool_calls {
-                        body_no_reasoning["parallel_tool_calls"] = json!(parallel_tool_calls);
-                    }
-                    if let Some(max_tokens) = max_output_tokens {
-                        body_no_reasoning["max_tokens"] = json!(max_tokens);
-                    }
-                    request_overrides::apply_overrides_to_body(
-                        &mut body_no_reasoning,
-                        self.request_overrides.as_ref(),
-                        request_overrides::ENDPOINT_CHAT_COMPLETIONS,
-                        Some(upstream_model),
-                    );
-                    if let Some(name) = required_tool {
-                        body_no_reasoning["tool_choice"] =
-                            json!({"type": "function", "function": {"name": name}});
-                    }
-                    crate::masking::mask_outbound_body(
-                        &mut body_no_reasoning,
-                        &self.masking_config,
-                    );
-
-                    let retry_headers = self.build_llm_headers(
-                        &token,
-                        messages,
-                        tools,
-                        request_overrides::ENDPOINT_CHAT_COMPLETIONS,
-                        Some(upstream_model),
-                    )?;
-                    let mut retry = self
-                        .send_with_transport_retry(
-                            || {
-                                self.client
-                                    .post(url)
-                                    .headers(retry_headers.clone())
-                                    .json(&body_no_reasoning)
-                            },
-                            "copilot chat/completions reasoning fallback",
-                            Some(session_log_id),
-                        )
-                        .await?;
-
-                    if !retry.status().is_success() {
-                        let retry_status = retry.status();
-                        if (retry_status == 401 || retry_status == 403)
-                            && self.auth_handler.is_some()
-                        {
-                            if let Some(handler) = &self.auth_handler {
-                                if let Ok(Some(refreshed)) =
-                                    handler.force_refresh_chat_token().await
-                                {
-                                    let refreshed_retry_headers = self.build_llm_headers(
-                                        &refreshed,
-                                        messages,
-                                        tools,
-                                        request_overrides::ENDPOINT_CHAT_COMPLETIONS,
-                                        Some(upstream_model),
-                                    )?;
-                                    retry = self
-                                        .send_with_transport_retry(
-                                            || {
-                                                self.client
-                                                    .post(url)
-                                                    .headers(refreshed_retry_headers.clone())
-                                                    .json(&body_no_reasoning)
-                                            },
-                                            "copilot chat/completions reasoning fallback auth-refresh retry",
-                                            Some(session_log_id),
-                                        )
-                                        .await?;
-                                }
-                            }
-                        }
-                    }
-
-                    if retry.status().is_success() {
-                        let stream = openai_compat_chat_stream_from_sse(retry, |_event, data| {
-                            parse_openai_compat_sse_data_lenient_multi(data)
-                        });
-                        return Ok(stream);
-                    }
                 }
 
                 // If this model only supports Responses API, retry with /responses.
@@ -2025,31 +1810,12 @@ mod tests {
     }
 
     #[test]
-    fn copilot_reasoning_and_previous_response_id_fallback_detectors_do_not_overlap() {
-        assert!(CopilotProvider::looks_like_reasoning_unsupported_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            "reasoning_effort is not supported for this model",
-        ));
+    fn reasoning_error_does_not_trigger_previous_response_fallback() {
         assert!(
             !CopilotProvider::looks_like_previous_response_id_unsupported_error(
                 reqwest::StatusCode::BAD_REQUEST,
-                "reasoning_effort is not supported for this model",
-            ),
-            "reasoning fallback classifier should not misclassify as previous_response_id fallback"
-        );
-
-        assert!(
-            CopilotProvider::looks_like_previous_response_id_unsupported_error(
-                reqwest::StatusCode::BAD_REQUEST,
-                "previous_response_id unsupported_value",
+                "reasoning_effort is not supported for this model"
             )
-        );
-        assert!(
-            !CopilotProvider::looks_like_reasoning_unsupported_error(
-                reqwest::StatusCode::BAD_REQUEST,
-                "previous_response_id unsupported_value",
-            ),
-            "previous_response_id fallback classifier should not misclassify as reasoning fallback"
         );
     }
 

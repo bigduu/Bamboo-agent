@@ -172,7 +172,7 @@ pub fn build_openai_compat_body(
     set_openai_compat_token_limit(&mut body, max_output_tokens, reasoning_effort.is_some());
 
     if let Some(reasoning_effort) = reasoning_effort {
-        body["reasoning_effort"] = json!(reasoning_effort.to_wire_format(model));
+        body["reasoning_effort"] = json!(reasoning_effort.as_str());
     }
 
     if let Some(parallel_tool_calls) = parallel_tool_calls {
@@ -578,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn build_openai_compat_body_keeps_legacy_models_on_xhigh() {
+    fn build_openai_compat_body_preserves_max_for_legacy_model_names() {
         let body = super::build_openai_compat_body(
             "gpt-4o",
             &[],
@@ -589,7 +589,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(body["reasoning_effort"], "xhigh");
+        assert_eq!(body["reasoning_effort"], "max");
         assert_eq!(body["max_completion_tokens"], 16_384);
         assert!(body.get("max_tokens").is_none());
     }

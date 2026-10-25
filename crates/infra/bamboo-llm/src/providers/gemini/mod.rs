@@ -40,26 +40,21 @@ pub(crate) fn apply_generation_config(
     request: &mut GeminiRequest,
     max_output_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
-) -> Option<u32> {
-    let thinking_budget = reasoning_effort.and_then(|effort| {
-        crate::providers::common::bounded_thinking_budget(effort, max_output_tokens)
-    });
-    if max_output_tokens.is_none() && thinking_budget.is_none() {
-        return None;
+) {
+    if max_output_tokens.is_none() && reasoning_effort.is_none() {
+        return;
     }
-
     let mut generation_config = serde_json::Map::new();
     if let Some(max_tokens) = max_output_tokens {
         generation_config.insert("maxOutputTokens".to_string(), json!(max_tokens));
     }
-    if let Some(thinking_budget) = thinking_budget {
+    if let Some(effort) = reasoning_effort {
         generation_config.insert(
             "thinkingConfig".to_string(),
-            json!({ "thinkingBudget": thinking_budget }),
+            json!({ "thinkingLevel": effort.as_str().to_ascii_uppercase() }),
         );
     }
     request.generation_config = Some(Value::Object(generation_config));
-    thinking_budget
 }
 use bamboo_domain::ToolSchema;
 
@@ -161,19 +156,6 @@ impl GeminiProvider {
     fn list_models_url(&self) -> String {
         format!("{}/models", self.base_url.trim_end_matches('/'))
     }
-
-    fn thinking_budget_for_effort(
-        effort: ReasoningEffort,
-        max_output_tokens: Option<u32>,
-    ) -> Option<u32> {
-        crate::providers::common::bounded_thinking_budget(effort, max_output_tokens)
-    }
-
-    fn looks_like_reasoning_unsupported_error(status: reqwest::StatusCode, body: &str) -> bool {
-        // Shared, tightened heuristic (#237 finding 5). `thinking` substring covers
-        // Gemini's thinkingBudget/thinkingConfig.
-        crate::providers::common::looks_like_reasoning_unsupported_error(status, body)
-    }
 }
 
 #[async_trait]
@@ -221,10 +203,6 @@ impl LLMProvider for GeminiProvider {
         let reasoning_effort = options
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
-        crate::providers::common::validate_max_thinking_budget(
-            reasoning_effort,
-            max_output_tokens,
-        )?;
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
         let required_tool = crate::provider::required_tool_from_options(options, tools)?;
         let reasoning_source = if request_reasoning_effort.is_some() {
@@ -240,9 +218,6 @@ impl LLMProvider for GeminiProvider {
         let session_log_id = options
             .and_then(|o| o.session_id.as_deref())
             .unwrap_or("unknown-session");
-        let mut applied_reasoning_effort = reasoning_effort;
-        let mut applied_thinking_budget = reasoning_effort
-            .and_then(|effort| Self::thinking_budget_for_effort(effort, max_output_tokens));
 
         // Auth is supplied via the x-goog-api-key header (see build_headers).
         let url = self.stream_url(model);
@@ -275,7 +250,7 @@ impl LLMProvider for GeminiProvider {
         // Last-moment scan: mask every text value in the fully-assembled body.
         crate::masking::mask_outbound_body(&mut request_json, &self.masking_config);
         tracing::info!(
-            "[session_hash={}] Gemini request protocol=streamGenerateContent model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_budget={} max_output_tokens={} purpose_hash={}",
+            "[session_hash={}] Gemini request protocol=streamGenerateContent model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose_hash={}",
             log_identity(session_log_id),
             log_identity(model),
             reasoning_effort
@@ -283,9 +258,6 @@ impl LLMProvider for GeminiProvider {
                 .unwrap_or("none"),
             reasoning_source,
             reasoning_effort.is_some(),
-            applied_thinking_budget
-                .map(|tokens| tokens.to_string())
-                .unwrap_or_else(|| "none".to_string()),
             max_output_tokens
                 .map(|tokens| tokens.to_string())
                 .unwrap_or_else(|| "none".to_string()),
@@ -303,7 +275,7 @@ impl LLMProvider for GeminiProvider {
         )?;
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
-        let mut response = crate::retry::send_with_retry(crate::retry::global(), "Gemini", || {
+        let response = crate::retry::send_with_retry(crate::retry::global(), "Gemini", || {
             self.client
                 .post(&url)
                 .headers(headers.clone())
@@ -311,70 +283,6 @@ impl LLMProvider for GeminiProvider {
         })
         .await
         .map_err(LLMError::Http)?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.map_err(LLMError::Http)?;
-
-            if reasoning_effort.is_some()
-                && Self::looks_like_reasoning_unsupported_error(status, &text)
-            {
-                tracing::warn!(
-                    "Gemini streamGenerateContent rejected reasoning for model_hash {}; retrying without reasoning_effort",
-                    log_identity(model)
-                );
-
-                let fallback_request = build_request(None)?;
-                let mut fallback_request_json =
-                    serde_json::to_value(&fallback_request).map_err(LLMError::Json)?;
-                request_overrides::apply_overrides_to_body(
-                    &mut fallback_request_json,
-                    self.request_overrides.as_ref(),
-                    request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
-                    Some(model),
-                );
-                apply_required_tool_choice(&mut fallback_request_json, required_tool);
-                crate::masking::mask_outbound_body(
-                    &mut fallback_request_json,
-                    &self.masking_config,
-                );
-                applied_reasoning_effort = None;
-                applied_thinking_budget = None;
-                tracing::info!(
-                    "Gemini request retry protocol=streamGenerateContent model_hash={} reasoning_effort=none reasoning_source={} request_reasoning_enabled=false thinking_budget=none max_output_tokens={} purpose_hash={}",
-                    log_identity(model),
-                    reasoning_source,
-                    max_output_tokens
-                        .map(|tokens| tokens.to_string())
-                        .unwrap_or_else(|| "none".to_string()),
-                    log_identity(request_purpose)
-                );
-                let fallback_headers = self.build_headers(
-                    request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
-                    Some(model),
-                )?;
-                response = crate::retry::send_with_retry(crate::retry::global(), "Gemini", || {
-                    self.client
-                        .post(&url)
-                        .headers(fallback_headers.clone())
-                        .json(&fallback_request_json)
-                })
-                .await
-                .map_err(LLMError::Http)?;
-            } else {
-                if status == 401 || status == 403 {
-                    return Err(LLMError::Auth(format!(
-                        "Gemini authentication failed: {}. Please check your API key.",
-                        text
-                    )));
-                }
-
-                return Err(LLMError::Api(format!(
-                    "Gemini API error: HTTP {}: {}",
-                    status, text
-                )));
-            }
-        }
 
         if !response.status().is_success() {
             let status = response.status();
@@ -404,8 +312,7 @@ impl LLMProvider for GeminiProvider {
         // is delivered even when the connection closes immediately afterwards.
         let mut state = GeminiStreamState::default();
         let model_for_log = model.to_string();
-        let requested_reasoning_for_log = applied_reasoning_effort;
-        let request_thinking_budget_for_log = applied_thinking_budget;
+        let requested_reasoning_for_log = reasoning_effort;
         let mut logged_summary = false;
 
         let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
@@ -418,14 +325,11 @@ impl LLMProvider for GeminiProvider {
                     && chunks.iter().any(|c| matches!(c, LLMChunk::Done))
                 {
                     tracing::info!(
-                        "Gemini reasoning summary: model_hash={} requested_effort={} request_thinking_budget={} observed_thinking_signal={} thinking_parts_count={} thinking_text_chars={}",
+                        "Gemini reasoning summary: model_hash={} requested_effort={} observed_thinking_signal={} thinking_parts_count={} thinking_text_chars={}",
                         log_identity(&model_for_log),
                         requested_reasoning_for_log
                             .map(ReasoningEffort::as_str)
                             .unwrap_or("none"),
-                        request_thinking_budget_for_log
-                            .map(|tokens| tokens.to_string())
-                            .unwrap_or_else(|| "none".to_string()),
                         state.observed_thinking_signal,
                         state.thinking_parts_count,
                         state.thinking_text_chars
@@ -496,66 +400,22 @@ mod tests {
     }
 
     #[test]
-    fn max_reasoning_uses_a_distinct_larger_thinking_budget() {
-        assert_eq!(
-            GeminiProvider::thinking_budget_for_effort(ReasoningEffort::Xhigh, None),
-            Some(8_192)
-        );
-        assert_eq!(
-            GeminiProvider::thinking_budget_for_effort(ReasoningEffort::Max, None),
-            Some(16_384)
-        );
-        assert_eq!(
-            GeminiProvider::thinking_budget_for_effort(ReasoningEffort::Xhigh, Some(16_384)),
-            Some(8_192)
-        );
-        assert_eq!(
-            GeminiProvider::thinking_budget_for_effort(ReasoningEffort::Max, Some(16_384)),
-            Some(12_288)
-        );
-        assert_eq!(
-            GeminiProvider::thinking_budget_for_effort(ReasoningEffort::Xhigh, Some(8_320)),
-            Some(4_160)
-        );
-        assert_eq!(
-            GeminiProvider::thinking_budget_for_effort(ReasoningEffort::Max, Some(8_320)),
-            Some(6_240)
-        );
-        assert_eq!(
-            GeminiProvider::thinking_budget_for_effort(ReasoningEffort::Max, Some(1_024)),
-            None
-        );
-    }
-
-    #[test]
-    fn max_reasoning_request_reserves_visible_output_at_the_wire() {
-        let mut request: GeminiRequest = vec![Message::user("hello")]
-            .to_provider()
-            .expect("Gemini request");
-        let applied =
-            apply_generation_config(&mut request, Some(16_384), Some(ReasoningEffort::Max));
-        let body = serde_json::to_value(request).expect("serialized Gemini request");
-
-        assert_eq!(applied, Some(12_288));
-        assert_eq!(body["generationConfig"]["maxOutputTokens"], 16_384);
-        assert_eq!(
-            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            12_288
-        );
-    }
-
-    #[test]
-    fn impossible_max_reasoning_limit_omits_numeric_budget_at_the_wire() {
-        let mut request: GeminiRequest = vec![Message::user("hello")]
-            .to_provider()
-            .expect("Gemini request");
-        let applied =
-            apply_generation_config(&mut request, Some(1_024), Some(ReasoningEffort::Max));
-        let body = serde_json::to_value(request).expect("serialized Gemini request");
-
-        assert_eq!(applied, None);
-        assert_eq!(body["generationConfig"]["maxOutputTokens"], 1_024);
-        assert!(body["generationConfig"].get("thinkingConfig").is_none());
+    fn generation_config_encodes_selected_effort_without_budget_or_capping() {
+        for (effort, wire) in [
+            (ReasoningEffort::Disabled, "NONE"),
+            (ReasoningEffort::Low, "LOW"),
+            (ReasoningEffort::Medium, "MEDIUM"),
+            (ReasoningEffort::High, "HIGH"),
+            (ReasoningEffort::Xhigh, "XHIGH"),
+            (ReasoningEffort::Max, "MAX"),
+        ] {
+            let mut request: GeminiRequest = vec![Message::user("hello")].to_provider().unwrap();
+            apply_generation_config(&mut request, Some(1), Some(effort));
+            let config = request.generation_config.unwrap();
+            assert_eq!(config["thinkingConfig"]["thinkingLevel"], wire);
+            assert!(config["thinkingConfig"].get("thinkingBudget").is_none());
+            assert_eq!(config["maxOutputTokens"], 1);
+        }
     }
 
     #[test]
