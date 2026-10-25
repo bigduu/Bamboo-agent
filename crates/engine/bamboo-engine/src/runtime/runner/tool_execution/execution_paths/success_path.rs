@@ -84,15 +84,7 @@ pub(super) async fn handle_successful_tool_result(mut ctx: SuccessPathContext<'_
     )
     .await;
 
-    workspace::maybe_apply_workspace_update(
-        ctx.session,
-        ctx.tool_call,
-        result,
-        ctx.session_id,
-        ctx.config.project_context_resolver.as_deref(),
-        ctx.event_tx,
-    )
-    .await;
+    workspace::maybe_apply_workspace_update(ctx.session, ctx.tool_call, result, ctx.session_id);
 
     goal::maybe_apply_goal_update(ctx.session, ctx.tool_call, result, ctx.config, ctx.round);
 
