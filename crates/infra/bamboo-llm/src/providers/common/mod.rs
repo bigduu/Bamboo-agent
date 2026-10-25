@@ -155,6 +155,17 @@ pub(crate) fn looks_like_reasoning_unsupported_error(
     mentions_reasoning && indicates_unsupported
 }
 
+/// OpenAI-compatible adapters may keep their legacy parameter fallback, but a
+/// configured maximum must surface rejection instead of silently losing reasoning.
+pub(crate) fn should_retry_without_reasoning(
+    effort: Option<ReasoningEffort>,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> bool {
+    effort.is_some_and(|effort| effort != ReasoningEffort::Max)
+        && looks_like_reasoning_unsupported_error(status, body)
+}
+
 /// Whether an error response means the referenced `previous_response_id` does
 /// not exist upstream (OpenAI's `previous_response_not_found`), so a single
 /// retry WITHOUT the stateful continuation is warranted. Bamboo always sends
@@ -224,7 +235,36 @@ mod previous_response_not_found_tests {
 #[cfg(test)]
 mod reasoning_heuristic_tests {
     use super::looks_like_reasoning_unsupported_error as f;
+    use super::should_retry_without_reasoning;
+    use bamboo_domain::ReasoningEffort;
     use reqwest::StatusCode;
+
+    #[test]
+    fn compatibility_retry_preserves_max_and_keeps_existing_non_max_policy() {
+        let body = "reasoning_effort is not supported for this model";
+        for status in [StatusCode::BAD_REQUEST, StatusCode::UNPROCESSABLE_ENTITY] {
+            assert!(!should_retry_without_reasoning(
+                Some(ReasoningEffort::Max),
+                status,
+                body
+            ));
+            assert!(!should_retry_without_reasoning(None, status, body));
+            for effort in [
+                ReasoningEffort::Disabled,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+                ReasoningEffort::Xhigh,
+            ] {
+                assert!(should_retry_without_reasoning(Some(effort), status, body));
+            }
+        }
+        assert!(!should_retry_without_reasoning(
+            Some(ReasoningEffort::High),
+            StatusCode::BAD_REQUEST,
+            "Unknown parameter: temperature",
+        ));
+    }
 
     #[test]
     fn fires_only_on_reasoning_parameter_rejection() {
