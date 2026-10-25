@@ -1,10 +1,38 @@
-use super::{
-    apply_workspace_path_to_session, extract_workspace_path_from_tool_result,
-    should_apply_workspace_update,
-};
+use super::{apply_workspace_path_to_session, extract_workspace_path_from_tool_result};
 use crate::project_context::WorkspaceBindingStatus;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolResult};
 use bamboo_agent_core::{Message, Session};
+
+#[test]
+fn file_operations_do_not_supply_session_workspace() {
+    for name in [
+        "Write",
+        "Edit",
+        "write_file",
+        "default::Write",
+        "default::Edit",
+    ] {
+        let tool_call = ToolCall {
+            id: "scratch-file".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: r#"{"file_path":"/tmp/issue.md"}"#.to_string(),
+            },
+        };
+        let result = ToolResult {
+            success: true,
+            result: r#"{"workspace":"/tmp","binding_status":"registered"}"#.to_string(),
+            display_preference: Some("json".to_string()),
+            images: Vec::new(),
+        };
+
+        assert!(
+            extract_workspace_path_from_tool_result(&tool_call, &result).is_none(),
+            "{name} must not turn a file's parent directory into Session Source"
+        );
+    }
+}
 
 #[test]
 fn extract_workspace_path_from_tool_result_supports_alias_name() {
@@ -30,94 +58,6 @@ fn extract_workspace_path_from_tool_result_supports_alias_name() {
             binding_status: WorkspaceBindingStatus::Unregistered,
         })
     );
-}
-
-#[test]
-fn workspace_tool_set_is_an_explicit_persisted_update() {
-    let session = Session::new("session-workspace", "test-model");
-    let tool_call = ToolCall {
-        id: "call-workspace".to_string(),
-        tool_type: "function".to_string(),
-        function: FunctionCall {
-            name: "Workspace".to_string(),
-            arguments: r#"{"path":"/tmp/project"}"#.to_string(),
-        },
-    };
-    assert!(should_apply_workspace_update(&session, &tool_call));
-}
-
-#[test]
-fn should_apply_workspace_update_when_workspace_is_missing_for_write() {
-    let session = Session::new("session-1", "test-model");
-    let tool_call = ToolCall {
-        id: "call_1".to_string(),
-        tool_type: "function".to_string(),
-        function: FunctionCall {
-            name: "Write".to_string(),
-            arguments: r#"{"file_path":"/tmp/project/src/main.rs"}"#.to_string(),
-        },
-    };
-
-    assert!(should_apply_workspace_update(&session, &tool_call));
-}
-
-#[test]
-fn should_not_apply_workspace_update_when_target_is_inside_workspace() {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let workspace = temp_dir.path().join("workspace");
-    let file_path = workspace.join("src").join("main.rs");
-    std::fs::create_dir_all(file_path.parent().expect("has parent"))
-        .expect("create workspace dirs");
-    std::fs::write(&file_path, "fn main() {}\n").expect("write test file");
-
-    let workspace_display = bamboo_config::paths::path_to_display_string(&workspace);
-    let file_display = bamboo_config::paths::path_to_display_string(&file_path);
-
-    let mut session = Session::new("session-1", "test-model");
-    session
-        .metadata
-        .insert("workspace_path".to_string(), workspace_display);
-
-    let tool_call = ToolCall {
-        id: "call_1".to_string(),
-        tool_type: "function".to_string(),
-        function: FunctionCall {
-            name: "Edit".to_string(),
-            arguments: serde_json::json!({ "file_path": file_display }).to_string(),
-        },
-    };
-
-    assert!(!should_apply_workspace_update(&session, &tool_call));
-}
-
-#[test]
-fn should_apply_workspace_update_when_target_is_outside_workspace() {
-    let temp_dir = tempfile::tempdir().expect("create temp dir");
-    let workspace = temp_dir.path().join("workspace");
-    let external_dir = temp_dir.path().join("external");
-    let file_path = external_dir.join("notes.md");
-    std::fs::create_dir_all(&workspace).expect("create workspace dir");
-    std::fs::create_dir_all(&external_dir).expect("create external dir");
-    std::fs::write(&file_path, "notes").expect("write file");
-
-    let workspace_display = bamboo_config::paths::path_to_display_string(&workspace);
-    let file_display = bamboo_config::paths::path_to_display_string(&file_path);
-
-    let mut session = Session::new("session-1", "test-model");
-    session
-        .metadata
-        .insert("workspace_path".to_string(), workspace_display);
-
-    let tool_call = ToolCall {
-        id: "call_1".to_string(),
-        tool_type: "function".to_string(),
-        function: FunctionCall {
-            name: "Edit".to_string(),
-            arguments: serde_json::json!({ "file_path": file_display }).to_string(),
-        },
-    };
-
-    assert!(should_apply_workspace_update(&session, &tool_call));
 }
 
 #[test]

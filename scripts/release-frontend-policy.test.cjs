@@ -17,7 +17,10 @@ const {
 
 const ROOT = path.resolve(__dirname, "..");
 const LOTUS_NEXT_PACKAGE_NAME = "@bigduu/lotus-next";
-const LOTUS_NEXT_VERSION = "2026.10.19";
+// The committed lock is the declared release input, independent of the resolver.
+const LOTUS_NEXT_VERSION = JSON.parse(
+  fs.readFileSync(path.join(__dirname, "frontend-package-lock.json"), "utf8"),
+).packageVersion;
 
 test("defaults releases and tag events to the exact locked Lotus Next artifact", () => {
   assert.deepEqual(resolveReleaseFrontend(), {
@@ -42,7 +45,12 @@ test("accepts only the locked Lotus Next version", () => {
     }).packageVersion,
     LOTUS_NEXT_VERSION,
   );
-  for (const requestedVersion of ["latest", "2026.9.13", "2026.9.15"]) {
+  for (const requestedVersion of [
+    "latest",
+    "2026.9.13",
+    "2026.9.15",
+    "2026.10.23",
+  ]) {
     assert.throws(
       () =>
         resolveReleaseFrontend({

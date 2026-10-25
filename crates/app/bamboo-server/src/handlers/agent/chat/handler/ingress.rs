@@ -119,12 +119,64 @@ pub(super) async fn queue(
     effective_message: &str,
     http: &HttpRequest,
 ) -> ResponseResult<Option<SessionInboxReceipt>> {
-    let ticket = state.config.read().await.features.ticket_mutation
+    let bound_work_scope = state.config.read().await.features.ticket_mutation
         && state.tickets.service().ok().is_some_and(|s| {
             s.published()
                 .is_ok_and(|(_, snapshot)| snapshot.binding.supervisor_session_id == session.id)
         });
+    // Work authority is narrower than the Supervisor's Session-management
+    // role. An opened Work store must not make a plain Standard turn require
+    // Ultra. Stable message_id is delivery identity, not a Work reference.
+    let plain_standard = if bound_work_scope
+        && [
+            &request.thread_id,
+            &request.in_reply_to,
+            &request.correlation_id,
+        ]
+        .into_iter()
+        .all(Option::is_none)
+    {
+        let current = state
+            .storage
+            .load_root_authority(&session.id)
+            .await
+            .map_err(|_| {
+                error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Canonical Supervisor authority unavailable",
+                )
+            })?
+            .ok_or_else(|| {
+                error(
+                    StatusCode::CONFLICT,
+                    "Supervisor disappeared before chat admission",
+                )
+            })?;
+        if let Some(response) =
+            crate::handlers::agent::sessions::SessionSummary::execution_conflict(&current)
+        {
+            return Err(response.into());
+        }
+        if current.created_at != session.created_at
+            || current.authority_identity != session.authority_identity
+            || current.root_tool_authority_revision != session.root_tool_authority_revision
+            || current.root_mode_transition_epoch != session.root_mode_transition_epoch
+            || current.root_orchestration_only_enabled()
+                != session.root_orchestration_only_enabled()
+        {
+            return Err(error(
+                StatusCode::CONFLICT,
+                "Supervisor control state changed before chat admission",
+            )
+            .into());
+        }
+        current.supervisor_incarnation_id().is_some() && !current.root_orchestration_only_enabled()
+    } else {
+        false
+    };
+    let ticket = bound_work_scope && !plain_standard;
     if !ticket
+        && !plain_standard
         && [
             &request.message_id,
             &request.thread_id,
@@ -236,7 +288,11 @@ pub(super) async fn queue(
         .session_messenger
         .admit_with_activation_intent(
             envelope,
-            bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+            if plain_standard {
+                bamboo_domain::SessionActivationPolicy::RespectSpecificWait
+            } else {
+                bamboo_domain::SessionActivationPolicy::InterruptSpecificWait
+            },
             None,
         )
         .await

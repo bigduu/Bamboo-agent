@@ -21,6 +21,7 @@ function script(step) {
   return match[1].split("\n").map((line) => line.replace(/^          /, "")).join("\n");
 }
 function assertRouting(source) {
+  assert.match(source, /^permissions:\n  contents: read\n/m);
   assertSharedBuild(source);
   assertMainAdmission(source);
   const quick = job(source, "quick-checks");
@@ -108,7 +109,7 @@ test("full Test binds immutable merge/event source and fails on dirty source", (
   assert.match(full, /rustc --version --verbose\n          cargo --version --verbose/);
 });
 
-test("frontend source acceptance leaves ordinary dev admission but retains exact-head full commands", () => {
+test("frontend source acceptance retains the exact-head build and focused frontend tests", () => {
   assert.match(frontend, /pull_request:\n    branches: \[main\]/);
   assert.doesNotMatch(frontend, /branches: \[dev\]|paths:/);
   assert.match(frontend, /snapshot_sha:\n.*\n        required: true\n        type: string/);
@@ -121,7 +122,14 @@ test("frontend source acceptance leaves ordinary dev admission but retains exact
     assert.doesNotMatch(block, /continue-on-error:/);
   }
   assert.ok(job(frontend, "build").includes("        run: cargo build --locked\n"));
-  for (const command of ["cargo test --locked --no-run", "cargo test --locked --no-fail-fast"]) assert.ok(job(frontend, "test").includes(`        run: ${command}\n`));
+  for (const mode of ["--no-run", "--no-fail-fast"]) {
+    for (const target of [
+      "-p bamboo-agent --test frontend_packaging",
+      "-p bamboo-server --test frontend_build_contract",
+      "-p bamboo-server --lib services::frontend_package::tests",
+    ]) assert.ok(job(frontend, "test").includes(`          cargo test --locked ${mode} ${target}\n`));
+  }
+  assert.doesNotMatch(job(frontend, "test"), /^\s*cargo test --locked --(?:no-run|no-fail-fast)\s*$/m);
   assert.match(job(frontend, "lint"), /cargo clippy --all-features --/);
 });
 

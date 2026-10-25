@@ -39,6 +39,17 @@ The three optimized executable builds happen only in the automatic main
 publisher, after the actual main source, version and frontend bytes are bound.
 Historical producers keep their original build-job acceptance requirements.
 
+Unit and E2E retain ordinary native Cargo jobs for the other 29 crates. Server
+jobs use eight static matrix rows: seven library blocks and one integration tail.
+Library blocks assign each name to the first matching namespace in the order
+browser, chat, execute, settings, app-state, remaining handlers, then remaining
+library tests; each block skips every earlier filter, including nested matches.
+The integration tail has no library-name filters. Unit selects the default
+integration targets, compiles examples and runs doctests; E2E selects all-feature
+integration targets. Failed jobs can be rerun independently. Each library block
+still compiles the server test binary, so more jobs alone do not prove a net
+speedup; record compile, execution, queue and complete-CI timings separately.
+
 Keep required check names stable. Do not use empty success jobs, synthesized
 statuses, `[skip ci]`, or workflow-level path filters to bypass required gates.
 The current repository's verified capabilities, rather than an assumed merge
@@ -51,14 +62,19 @@ queue or auto-merge setting, determine its admission route.
 2. Create `release/<that-40-character-SHA>` normally at that exact commit. Keep
    dev open while the release owner validates this frozen candidate.
 3. Complete current-head/base review, the full promotion suite and the separate
-   original frontend-head contract. Record run URLs, actual tested source/tree,
-   toolchain, lockfile, features, profile and results.
+   original frontend-head contract: strict Clippy, the full locked build and the
+   three frontend packaging/build/runtime test targets. Backend test suites
+   belong to canonical CI. Record run URLs, actual tested source/tree, toolchain,
+   lockfile, features, profile and results.
 4. Use the normal two-parent release merge. Main admission authenticates that
    exact merge and its completed pre-merge evidence. Do not update the release
    with unrelated dev changes merely because dev advanced.
-5. For a necessary repair, follow the separate original fix `F` and protected-dev
-   integration `U` procedure in the Release Process. Neither one's evidence
-   substitutes for the other. Preserve the cut and original failure evidence.
+5. For a necessary repair, record original fix `F`'s exact SHA/tree, affected local
+   tests and independent Code and Security review. Preserve `F` through normal
+   protected-dev integration `U`, then fast-forward the release to `F`. Complete
+   the mandatory full CI on the final release PR; an extra manual full CI on `F`
+   is optional diagnosis, not a second mandatory full run. Keep each source's
+   evidence separate and preserve the cut and original failure evidence.
 
 The release head, PR synthetic merge, final main merge and workflow controller
 are separate Git identities. Equal trees alone do not make their binaries or

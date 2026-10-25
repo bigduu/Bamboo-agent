@@ -8,6 +8,7 @@
 
 pub mod checkpoint;
 pub mod host;
+pub mod program;
 
 use serde::{Deserialize, Serialize};
 
@@ -504,33 +505,8 @@ impl Patrol {
         host: &mut dyn Host,
         provider: &mut dyn ReadOnlyDiagnosticProvider,
     ) -> Result<Report, Error> {
-        if !valid_scope(scope) {
-            return Err(Error::InvalidObservation);
-        }
-        let now = clock.now_ms();
-        let stored = host.load(scope)?;
-        let mut version = stored.as_ref().map(|s| s.version);
-        let mut cp = stored.map(|s| s.checkpoint).unwrap_or_else(|| Checkpoint {
-            scope: scope.clone(),
-            cursor: 0,
-            source_revision: 0,
-            last_check_ms: now,
-            next_check_ms: now,
-            incident: None,
-        });
-        validate_checkpoint(&cp, scope)?;
-        if now < cp.last_check_ms {
-            return Err(Error::ClockRegression);
-        }
-        let observation = host.observation(scope, cp.cursor)?;
-        validate_observation(&observation, scope, now)?;
-        cp.last_check_ms = now;
-        cp.next_check_ms = now.saturating_add(self.policy.check_interval_ms);
-        if observation.cursor < cp.cursor
-            || observation.source_revision < cp.source_revision
-            || matches!(observation.kind, ObservationKind::Delta { previous_cursor }
-                if observation.cursor > cp.cursor && previous_cursor != cp.cursor)
-        {
+        let (mut cp, mut version, observation, now) = self.begin_tick(scope, clock, host)?;
+        if needs_resync(&cp, &observation) {
             save(host, &mut version, &mut cp)?;
             return Ok(report(&cp, Status::ResyncRequired));
         }
@@ -624,24 +600,7 @@ impl Patrol {
                     matches!(i.phase, Phase::Resolved { .. }) && sequence > i.id.progress_sequence
                 }))
         {
-            cp.incident = Some(Incident {
-                id: IncidentId {
-                    scope: scope.clone(),
-                    progress_sequence: sequence,
-                },
-                reason,
-                opened_at_ms: now,
-                opened_cursor: cp.cursor,
-                source_revision: cp.source_revision,
-                attempts: 0,
-                last_diagnostic_cursor: cp.cursor,
-                last_diagnostic_evidence_revision: None,
-                last_diagnosis: None,
-                pending_settlement: None,
-                pending_settlement_usage: None,
-                phase: Phase::Open,
-                escalation: None,
-            });
+            cp.incident = Some(open_incident(reason, &observation, now));
             save(host, &mut version, &mut cp)?;
             return Ok(report(&cp, Status::Incident));
         }
@@ -750,6 +709,37 @@ impl Patrol {
         cp.incident = Some(incident);
         save(host, &mut version, &mut cp)?;
         Ok(report(&cp, status(&cp)))
+    }
+
+    fn begin_tick<H: CheckpointPort + ObservationPort + ?Sized>(
+        &self,
+        scope: &Scope,
+        clock: &dyn Clock,
+        host: &mut H,
+    ) -> Result<(Checkpoint, Option<u64>, Observation, u64), Error> {
+        if !valid_scope(scope) {
+            return Err(Error::InvalidObservation);
+        }
+        let now = clock.now_ms();
+        let stored = host.load(scope)?;
+        let version = stored.as_ref().map(|s| s.version);
+        let mut cp = stored.map(|s| s.checkpoint).unwrap_or_else(|| Checkpoint {
+            scope: scope.clone(),
+            cursor: 0,
+            source_revision: 0,
+            last_check_ms: now,
+            next_check_ms: now,
+            incident: None,
+        });
+        validate_checkpoint(&cp, scope)?;
+        if now < cp.last_check_ms {
+            return Err(Error::ClockRegression);
+        }
+        let observation = host.observation(scope, cp.cursor)?;
+        validate_observation(&observation, scope, now)?;
+        cp.last_check_ms = now;
+        cp.next_check_ms = now.saturating_add(self.policy.check_interval_ms);
+        Ok((cp, version, observation, now))
     }
 
     fn reason(&self, o: &Observation, now: u64) -> Option<Reason> {
@@ -1110,6 +1100,34 @@ fn valid_input(input: &DiagnosticInput, model: &Model, o: &Observation, since: u
         })
 }
 
+fn needs_resync(cp: &Checkpoint, o: &Observation) -> bool {
+    o.cursor < cp.cursor
+        || o.source_revision < cp.source_revision
+        || matches!(o.kind, ObservationKind::Delta { previous_cursor }
+            if o.cursor > cp.cursor && previous_cursor != cp.cursor)
+}
+
+fn open_incident(reason: Reason, observation: &Observation, now: u64) -> Incident {
+    Incident {
+        id: IncidentId {
+            scope: observation.scope.clone(),
+            progress_sequence: observation.progress.map_or(0, |p| p.sequence),
+        },
+        reason,
+        opened_at_ms: now,
+        opened_cursor: observation.cursor,
+        source_revision: observation.source_revision,
+        attempts: 0,
+        last_diagnostic_cursor: observation.cursor,
+        last_diagnostic_evidence_revision: None,
+        last_diagnosis: None,
+        pending_settlement: None,
+        pending_settlement_usage: None,
+        phase: Phase::Open,
+        escalation: None,
+    }
+}
+
 fn escalate(incident: &mut Incident, reason: SupervisorReason, o: &Observation, now: u64) {
     if incident.escalation.is_none() {
         incident.escalation = Some(Escalation {
@@ -1127,8 +1145,8 @@ fn escalate(incident: &mut Incident, reason: SupervisorReason, o: &Observation, 
     }
 }
 
-fn save(
-    host: &mut dyn Host,
+fn save<H: CheckpointPort + ?Sized>(
+    host: &mut H,
     version: &mut Option<u64>,
     checkpoint: &mut Checkpoint,
 ) -> Result<(), Error> {

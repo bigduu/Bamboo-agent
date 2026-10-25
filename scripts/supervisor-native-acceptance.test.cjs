@@ -26,7 +26,7 @@ const c = mode => ({ mode, api_base: 'http://127.0.0.1:39001', host_pid: 123, ho
   data_dir: path.join(FIXTURE_ROOT, 'data-' + mode), workspace_path: path.join(FIXTURE_ROOT, 'work-' + mode),
   project_id: 'project-' + mode, supervisor_created_at: BIRTH, ordinary_session_id: 'ordinary-' + mode,
   ordinary_created_at: BIRTH, provider_port: mode === 'standard' ? 39002 : 39004,
-  operation_id: randomUUID(), expected_standard_ticket_denial: false });
+  operation_id: randomUUID(), expected_standard_ticket_denial: mode === 'standard' });
 function receipt() {
   const standard = c('standard'), ultra = c('ultra'); ultra.api_base = 'http://127.0.0.1:39003';
   return { schema: 'bamboo.v2-native-fixture.v1', source_sha: d.SOURCE, tree_sha: d.TREE, fixture_id: randomUUID(),
@@ -120,11 +120,12 @@ async function listen(server, port = 0) {
 async function mockHost(t, mode, options = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'v2-http-protocol-')); t.after(() => fs.rm(directory, { recursive: true }));
   const fixtureId = options.fixtureId || randomUUID(), modeCase = c(mode);
-  modeCase.workspace_path = directory; modeCase.provider_port = 0; modeCase.expected_standard_ticket_denial = !!options.standardDenial;
+  modeCase.workspace_path = directory; modeCase.provider_port = 0;
   const flow = d.scenario(modeCase, fixtureId), sessions = new Map(), histories = new Map(), calls = [], errors = [];
+  let authorityConflict = !!options.authorityConflictOnce;
   const sup = root('bamboo-default-supervisor', mode), ordinary = root(modeCase.ordinary_session_id, 'ultra');
   sessions.set(sup.id, sup); sessions.set(ordinary.id, ordinary); histories.set(sup.id, []); histories.set(ordinary.id, []);
-  const scope = { scope: { supervisor: { session_id: sup.id }, state_revision: 1, allowed_projects: [modeCase.project_id] } };
+  const scope = { scope: { supervisor: { session_id: sup.id, incarnation_id: fixtureId }, state_revision: 1, allowed_projects: [modeCase.project_id] } };
   const provider = async (msgs, stream = false) => {
     const response = await fetch(`http://127.0.0.1:${modeCase.provider_port}/v1/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: 'synthetic-no-upstream', messages: msgs, tools, stream }) });
@@ -179,11 +180,30 @@ async function mockHost(t, mode, options = {}) {
     const chunks = []; for await (const chunk of req) chunks.push(chunk);
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks)) : undefined; calls.push({ method: req.method, url: req.url, body });
     const send = (status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
+    if (req.url === '/api/v1/sessions/bamboo-default-supervisor' && authorityConflict) {
+      authorityConflict = false;
+      return send(409, { error: { code: options.otherAuthorityConflict ? 'session_execution_conflict' : 'session_authority_unavailable' } });
+    }
     if (req.url === '/api/v1/bootstrap') return send(200, { server: { product: 'bamboo' }, api: { name: 'bamboo.agent' }, capabilities: ['http.native_receipt_run.v1'] });
     if (req.url === '/api/v1/sessions') return send(200, { sessions: [...sessions.values()] });
     if (req.url === '/api/v1/supervisor/default/scope') return send(200, scope);
+    if (req.url === '/api/v1/tickets/scope') return send(200, {
+      mutation_enabled: true, available: mode === 'ultra', readable: mode === 'ultra',
+      availability: mode === 'standard' ? { kind: 'forbidden', reason_code: 'supervisor_mode_required' } : { kind: 'ready', reason_code: 'scope_ready' },
+      binding: { supervisor_session_id: sup.id, scope_id: 'supervisor/' + fixtureId, binding_revision: 1 }
+    });
     if (req.url === '/api/v1/chat') {
-      if (modeCase.expected_standard_ticket_denial) return send(403, { code: 'scope_denied', error: { message: options.wrongDenial ? 'unrelated access error' : 'Supervisor orchestration authority required' } });
+      if (mode === 'standard' && body.session_id === sup.id && (body.thread_id || options.standardDenial)) {
+        if (options.lazySystemCheckpoint) {
+          sup.workspace_path = path.join(modeCase.data_dir, 'workspaces', sup.id);
+          sup.message_count = 1;
+          histories.set(sup.id, [{ role: 'system', content: 'Existing native system prompt.' }]);
+          if (options.refusalUserWrite) { histories.get(sup.id).push({ role: 'user', content: body.message }); sup.message_count++; }
+          if (options.refusalOrdinaryPermission) ordinary.permission_mode = 'auto';
+          if (options.refusalScopeWrite) scope.scope.state_revision++;
+        }
+        return send(403, { code: 'scope_denied', error: { message: options.wrongDenial ? 'unrelated access error' : 'Supervisor orchestration authority required' } });
+      }
       sessions.get(body.session_id).message_count++; return send(201, { session_id: body.session_id });
     }
     const match = /^\/api\/v1\/sessions\/([^/]+)(\/history|\/execute)?$/.exec(req.url);
@@ -213,12 +233,10 @@ test('FRAMEWORK HTTP: both modes create one Root, replay one input, share Child 
     assert.ok(f.calls.every(c => c.method === 'GET' || c.url === '/api/v1/chat' || c.url.endsWith('/execute')));
   }
 });
-test('FRAMEWORK HTTP: real-shaped Standard Ticket 403 remains BLOCKED/PARTIAL with zero provider calls and no mutation retry', { timeout: 10000 }, async t => {
-  const id = randomUUID(), a = await mockHost(t, 'standard', { fixtureId: id, standardDenial: true }), b = await mockHost(t, 'ultra', { fixtureId: id });
-  const result = await d.runSuite({ fixture_id: id, cases: [a.case, b.case] });
-  assert.equal(result.status, 'PARTIAL'); assert.equal(result.cases[0].status, 'BLOCKED_EXISTING_STANDARD_TICKET_GATE');
-  assert.equal(result.cases[0].provider_requests, 0); assert.equal(result.cases[0].v2_positive, 'UNRUN');
-  assert.equal(a.calls.filter(c => c.method === 'POST').length, 1);
+test('FRAMEWORK HTTP: plain Standard 403 is a regression rather than a successful Work refusal', { timeout: 10000 }, async t => {
+  const a = await mockHost(t, 'standard', { standardDenial: true });
+  await assert.rejects(d.runSuite({ fixture_id: a.fixtureId, cases: [a.case] }), e => e.code === 'chat_admission_failed');
+  assert.equal(a.calls.filter(c => c.method === 'POST').length, 2);
 });
 test('FRAMEWORK HTTP: an unrelated 403 cannot masquerade as the known Standard boundary', { timeout: 5000 }, async t => {
   const a = await mockHost(t, 'standard', { standardDenial: true, wrongDenial: true });
@@ -455,4 +473,101 @@ test('HTTP BOUNDARY COMPONENT ONLY: a response is withheld if owner verification
   const bound = d.bindHostRequest(config, transport, verify);
   await assert.rejects(bound(base, '/api/v1/evidence', undefined, AbortSignal.timeout(2000)), e => e.code === 'host_process_changed');
   assert.equal(checks, 2); assert.equal(requests, 1);
+});
+
+// These are actual loopback HTTP protocol checks, never native Host evidence.
+const SYNTHETIC_PROVIDER = 'synthetic_key_local_scripted_no_fallback';
+const syntheticKey = (fixtureId, mode) => `bamboo-v2-native-fixture-${fixtureId}-${mode}`;
+async function stockCliProvider(t) {
+  const mode = c('ultra'); mode.provider_port = 0;
+  const fixtureId = randomUUID(), flow = d.scenario(mode, fixtureId), controller = new AbortController();
+  flow.createRequest = { operation_id: mode.operation_id, expected_state_revision: 1,
+    project_id: mode.project_id, workspace_path: mode.workspace_path, message: flow.assignment };
+  const close = await d.startProvider(mode, flow, {}, controller.signal,
+    { injected_provider: SYNTHETIC_PROVIDER, fixture_id: fixtureId });
+  t.after(close);
+  return { mode, fixtureId, flow, url: `http://127.0.0.1:${mode.provider_port}/v1/chat/completions` };
+}
+test('STOCK_CLI_FIXTURE: receipt explicitly selects fixture synthetic-key transport', () => {
+  const value = receipt(); value.injected_provider = SYNTHETIC_PROVIDER;
+  assert.equal(d.validateReceipt(value).injected_provider, SYNTHETIC_PROVIDER);
+});
+test('STOCK_CLI_FIXTURE: exact synthetic key permits the real-shaped OpenAI request', async t => {
+  const f = await stockCliProvider(t);
+  const r = await fetch(f.url, { method: 'POST', headers: { 'Content-Type': 'application/json',
+    Authorization: `Bearer ${syntheticKey(f.fixtureId, f.mode.mode)}` }, body: JSON.stringify(request(f.flow.markers.supervisor)) });
+  assert.equal(r.status, 200);
+  const body = await r.json(); assert.equal(body.choices[0].message.tool_calls[0].function.name, 'spawn_session');
+  assert.equal(f.flow.requests, 1);
+});
+for (const kind of ['missing', 'foreign', 'wrong-mode', 'cookie']) {
+  test(`STOCK_CLI_FIXTURE: ${kind} credentials never enter the scripted model`, async t => {
+    const f = await stockCliProvider(t);
+    const headers = { 'Content-Type': 'application/json' };
+    if (kind !== 'missing') headers.Authorization = kind === 'foreign' ? `Bearer ${SECRET}`
+      : `Bearer ${syntheticKey(f.fixtureId, kind === 'wrong-mode' ? 'standard' : f.mode.mode)}`;
+    if (kind === 'cookie') headers.Cookie = SECRET;
+    const r = await fetch(f.url, { method: 'POST', headers, body: JSON.stringify(request(f.flow.markers.supervisor)) });
+    assert.equal(r.status, 422); assert.ok(!(await r.text()).includes(SECRET));
+    assert.equal(f.flow.requests, 0);
+  });
+}
+test('STOCK_CLI_FIXTURE: plain Standard 403 cannot count as an expected Work refusal', { timeout: 5000 }, async t => {
+  const f = await mockHost(t, 'standard', { standardDenial: true });
+  await assert.rejects(d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] }), e => e.code === 'chat_admission_failed');
+});
+
+test('STOCK_CLI_FIXTURE: Standard permits Root composition while its explicit Work reference is refused', { timeout: 10000 }, async t => {
+  const f = await mockHost(t, 'standard');
+  const result = await d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] });
+  assert.equal(result.status, 'PASS');
+  assert.equal(result.cases[0].standard_formal_work_refused, true);
+  assert.equal(result.cases[0].formal_work_dispatch, 'UNRUN');
+  assert.equal(f.calls.filter(c => c.url === '/api/v1/chat' && c.body.thread_id).length, 1);
+  assert.deepEqual(f.errors, []);
+});
+
+
+test('NATIVE CHECKPOINT: formal Work refusal permits only native system/workspace initialization', async t => {
+  const f = await mockHost(t, 'standard', { lazySystemCheckpoint: true });
+  const result = await d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] });
+  assert.equal(result.status, 'PASS');
+});
+for (const rejected of ['refusalUserWrite', 'refusalOrdinaryPermission', 'refusalScopeWrite']) {
+  test(`NATIVE CHECKPOINT: refusal still rejects ${rejected}`, async t => {
+    const f = await mockHost(t, 'standard', { lazySystemCheckpoint: true, [rejected]: true });
+    await assert.rejects(d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] }), e => e.code === 'standard_refusal_had_side_effects');
+  });
+}
+
+
+test('NATIVE REPORT: scripted Child emits the existing required-packet v1 report', async () => {
+  const mode = c('ultra'), flow = d.scenario(mode, randomUUID()); flow.steps.child = 1;
+  const reply = await d.nextReply({ messages: [user(flow.markers.child), { role: 'tool', content: flow.fileContent }], tools }, mode, flow, {});
+  assert.deepEqual(JSON.parse(reply.content), { version: 1, outcome: 'completed', summary: flow.childReport,
+    reported_evidence: [], reported_verification: [], proposals: [], blockers: [], open_decisions: [] });
+  assert.equal(flow.readObserved, true);
+});
+
+
+for (const tool of ['session_control', 'Read']) {
+  test(`NATIVE DENIAL: current backend callability refusal identifies ${tool}`, async () => {
+    const mode = c('ultra'), flow = d.scenario(mode, randomUUID()); flow.steps.ordinary = 1;
+    const request = { messages: [user(flow.markers.ordinary), { role: 'tool', content: `Error: Tool '${tool}' is not callable at the current conversation position` }], tools };
+    if (tool === 'session_control') { await d.nextReply(request, mode, flow, {}); assert.equal(flow.ordinaryDenied, true); }
+    else await assert.rejects(d.nextReply(request, mode, flow, {}), e => e.code === 'ordinary_management_not_denied');
+  });
+}
+
+
+test('NATIVE READ: a pending canonical proof is re-observed without replaying mutations', async t => {
+  const f = await mockHost(t, 'ultra', { authorityConflictOnce: true });
+  const result = await d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] });
+  assert.equal(result.status, 'PASS');
+  assert.equal(f.calls.filter(c => c.url === '/api/v1/chat').length, 2);
+});
+test('NATIVE READ: another 409 is not treated as a recoverable proof read', async t => {
+  const f = await mockHost(t, 'ultra', { authorityConflictOnce: true, otherAuthorityConflict: true });
+  await assert.rejects(d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] }), e => e.code === 'canonical_read_failed');
+  assert.equal(f.calls.filter(c => c.method === 'POST').length, 0);
 });
