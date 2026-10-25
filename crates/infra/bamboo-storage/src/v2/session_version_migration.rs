@@ -106,6 +106,9 @@ struct Pair {
 
 impl Pair {
     fn new(main: Vec<u8>, runtime: Vec<u8>) -> io::Result<Self> {
+        if main.len() > MAX_STATE_BYTES || runtime.len() > MAX_STATE_BYTES {
+            return Err(invalid("migration pair exceeds state byte bound"));
+        }
         let main = String::from_utf8(main).map_err(invalid)?;
         let runtime = String::from_utf8(runtime).map_err(invalid)?;
         let sha256 = pair_digest(main.as_bytes(), runtime.as_bytes());

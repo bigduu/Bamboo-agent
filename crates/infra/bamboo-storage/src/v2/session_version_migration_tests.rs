@@ -1001,3 +1001,83 @@ async fn version_migration_preserves_raw_unknown_numbers_and_frozen_argument_byt
     );
     store.flush_search_index().await;
 }
+
+#[tokio::test]
+async fn version_migration_refuses_transformed_main_over_real_byte_bound_before_journaling() {
+    use bamboo_domain::{ActorSnapshotLimits, ActorSnapshotPort, ActorSnapshotPrincipal};
+    const LIMIT: usize = 64 * 1024 * 1024;
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().canonicalize().unwrap();
+    let store = SessionStoreV2::new(home.clone()).await.unwrap();
+    let mut legacy = Session::new("near-limit-legacy", "model");
+    legacy.session_version = None;
+    store.save_session(&legacy).await.unwrap();
+    let healthy = Session::new("unrelated-healthy-root", "model");
+    store.save_session(&healthy).await.unwrap();
+    let directory = home.join("sessions").join(&legacy.id);
+    let main_path = directory.join("session.json");
+    let runtime_path = directory.join(RUNTIME_SIDECAR_FILE);
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(&main_path).await.unwrap()).unwrap();
+    raw.as_object_mut()
+        .unwrap()
+        .remove("_bamboo_main_authority");
+    raw.as_object_mut().unwrap().remove("session_version");
+    let mut main = serde_json::to_vec(&raw).unwrap();
+    assert_eq!(main.pop(), Some(b'}'));
+    main.extend_from_slice(b",\"retained_padding\":\"");
+    main.resize(LIMIT - 2, b'x');
+    main.extend_from_slice(b"\"}");
+    // A valid compact legacy Main exactly at the real 64 MiB bound cannot
+    // accommodate the new stamp or pretty-printed top-level separators.
+    assert_eq!(main.len(), LIMIT);
+    fs::write(&main_path, &main).await.unwrap();
+    let runtime = fs::read(&runtime_path).await.unwrap();
+    let view = store
+        .inspect_session_version_migration(&legacy.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(view.eligible, "{view:?}");
+    assert_eq!(view.session_version, None);
+    let error = store
+        .migrate_session_version(&legacy.id, &request(&view))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(fs::read(&main_path).await.unwrap(), main);
+    assert_eq!(fs::read(&runtime_path).await.unwrap(), runtime);
+    assert!(
+        store
+            .session_version_migration_journals()
+            .await
+            .unwrap()
+            .is_empty(),
+        "an unrecoverable transformed pair must never publish its journal"
+    );
+    assert!(
+        fs::read_dir(home.join(super::session_version_migration::MIGRATION_DIR))
+            .await
+            .unwrap()
+            .next_entry()
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store.flush_search_index().await;
+    drop(store);
+    let reopened = SessionStoreV2::new(home).await.unwrap();
+    assert_eq!(fs::read(&main_path).await.unwrap(), main);
+    assert_eq!(fs::read(&runtime_path).await.unwrap(), runtime);
+    reopened
+        .actor_subtree_snapshot(
+            ActorSnapshotPrincipal::host_owner(),
+            &healthy.id,
+            &healthy.id,
+            ActorSnapshotLimits::default(),
+        )
+        .await
+        .unwrap();
+    reopened.actor_tree_cursor(&healthy.id).await.unwrap();
+    reopened.flush_search_index().await;
+}
