@@ -52,13 +52,13 @@ pub struct StreamTimeoutError {
     last_transport: Duration,
     last_semantic: Option<Duration>,
     turn_retry_eligible: bool,
-    last_http_retry: Option<Box<(u16, Duration)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StreamTimeoutIdentity {
     diagnostic_id: uuid::Uuid,
     observed_at: chrono::DateTime<chrono::Utc>,
+    last_http_retry: Option<(u16, Duration)>,
 }
 
 impl StreamTimeoutError {
@@ -78,6 +78,7 @@ impl StreamTimeoutError {
             identity: Box::new(StreamTimeoutIdentity {
                 diagnostic_id: uuid::Uuid::new_v4(),
                 observed_at: chrono::Utc::now(),
+                last_http_retry: None,
             }),
             phase,
             deadline,
@@ -88,19 +89,18 @@ impl StreamTimeoutError {
             last_transport,
             last_semantic,
             turn_retry_eligible,
-            last_http_retry: None,
         }
     }
 
     /// Attach a status and bounded delay observed while the initial provider
     /// request was being retried. No response body, URL, or credential is kept.
     pub fn with_last_http_retry(mut self, status: u16, delay: Duration) -> Self {
-        self.last_http_retry = Some(Box::new((status, delay)));
+        self.identity.last_http_retry = Some((status, delay));
         self
     }
 
     pub fn last_http_retry(&self) -> Option<(u16, Duration)> {
-        self.last_http_retry.as_deref().copied()
+        self.identity.last_http_retry
     }
 
     /// Watchdog phase that expired.
@@ -344,8 +344,13 @@ mod tests {
             Duration::from_secs(120),
             None,
             true,
-        )
-        .with_last_http_retry(429, Duration::from_secs(60));
+        );
+        let identity_before_retry = (timeout.identity.diagnostic_id, timeout.identity.observed_at);
+        let timeout = timeout.with_last_http_retry(429, Duration::from_secs(60));
+        assert_eq!(
+            (timeout.identity.diagnostic_id, timeout.identity.observed_at),
+            identity_before_retry
+        );
 
         assert!(timeout.retry_safe());
         assert_eq!(
@@ -355,6 +360,16 @@ mod tests {
         assert!(timeout
             .to_string()
             .contains("last_http_status=429, retry_delay_ms=60000"));
+
+        let cloned = timeout.clone();
+        assert_eq!(cloned, timeout);
+        assert_eq!(cloned.to_string(), timeout.to_string());
+        assert_eq!(cloned.last_http_retry(), timeout.last_http_retry());
+        let session = bamboo_domain::Session::new("private-session", "model");
+        assert_eq!(
+            serde_json::to_value(cloned.diagnostic(&session).unwrap()).unwrap(),
+            serde_json::to_value(timeout.diagnostic(&session).unwrap()).unwrap()
+        );
     }
 
     #[test]
@@ -416,7 +431,9 @@ mod tests {
             assert_ne!(other.identity.diagnostic_id, receipt.diagnostic_id());
             assert!(!receipt.matches_error_message(&AgentError::StreamTimeout(other).to_string()));
         }
-        assert!(std::mem::size_of::<AgentError>() <= 128);
+        // StreamHandlingFailure adds a boxed partial-output snapshot to this
+        // error; the complete error must stay below Clippy's 128-byte limit.
+        assert!(std::mem::size_of::<(AgentError, Box<()>)>() < 128);
     }
 
     #[test]
