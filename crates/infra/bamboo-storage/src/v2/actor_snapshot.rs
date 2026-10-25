@@ -133,7 +133,7 @@ mod supported {
     use super::super::{
         actor_snapshot_reader::{Directory, ReadBudget},
         root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE,
-        session_version_migration::MIGRATION_DIR,
+        session_version_migration::{is_published_migration_journal, MIGRATION_DIR},
         supervisor,
         supervisor_proof::SUPERVISOR_PROOF_FILE,
         ActorTreeRevision, ACTOR_TREE_REVISION_FILE, RUNTIME_SIDECAR_FILE,
@@ -199,7 +199,9 @@ mod supported {
             MIGRATION_DIR,
         ] {
             if let Some(dir) = home.child(OsStr::new(name))? {
-                if !dir.entries(&mut budget)?.is_empty() {
+                if dir.entries(&mut budget)?.iter().any(|entry| {
+                    name != MIGRATION_DIR || is_published_migration_journal(Path::new(entry))
+                }) {
                     return Err(Error::PendingTransaction);
                 }
             }
@@ -640,7 +642,9 @@ mod supported {
             MIGRATION_DIR,
         ] {
             if let Some(dir) = home.child(OsStr::new(name))? {
-                if !dir.entries(&mut budget)?.is_empty() {
+                if dir.entries(&mut budget)?.iter().any(|entry| {
+                    name != MIGRATION_DIR || is_published_migration_journal(Path::new(entry))
+                }) {
                     return Err(Error::PendingTransaction);
                 }
             }
