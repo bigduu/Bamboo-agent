@@ -13,6 +13,8 @@ pub struct Worktree {
     pub prunable: bool,
     pub dirty: Option<bool>,
     pub error: Option<String>,
+    pub openable: bool,
+    bare: bool,
 }
 
 fn git_command(repo: &Path) -> Command {
@@ -188,6 +190,380 @@ pub fn workspace_root(path: &Path) -> Result<PathBuf, String> {
     fs::canonicalize(value).map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Default)]
+pub struct Discovery {
+    pub repositories: Vec<PathBuf>,
+    pub diagnostics: Vec<(PathBuf, String)>,
+}
+
+#[derive(Clone, Copy)]
+struct DiscoveryLimits {
+    max_depth: usize,
+    max_entries: usize,
+}
+
+/// Discover checkouts within one registered Project root without changing Git
+/// or Project state. A directly bound repository subdirectory keeps its exact
+/// path: discovery must not broaden that binding to its ancestor repository.
+/// Each root is bounded to 12 levels and 20,000 directory entries, including
+/// ignored entries. Truncation is reported rather than presented as complete.
+pub fn discover_repositories(root: &Path) -> Discovery {
+    discover_with_limits(
+        root,
+        DiscoveryLimits {
+            max_depth: 12,
+            max_entries: 20_000,
+        },
+    )
+}
+
+fn discover_with_limits(root: &Path, limits: DiscoveryLimits) -> Discovery {
+    let mut result = Discovery::default();
+    let canonical = match fs::canonicalize(root) {
+        Ok(path) if path.is_dir() => path,
+        Ok(_) => {
+            result.diagnostics.push((
+                root.to_path_buf(),
+                "Project workspace is not a directory".into(),
+            ));
+            return result;
+        }
+        Err(error) => {
+            result.diagnostics.push((
+                root.to_path_buf(),
+                format!("Project workspace is unavailable: {error}"),
+            ));
+            return result;
+        }
+    };
+    let mut scan = RepositoryScan {
+        root: &canonical,
+        limits,
+        remaining_entries: limits.max_entries,
+        exhausted: false,
+        result: &mut result,
+    };
+    scan.visit(&canonical, 0);
+    result.repositories.sort();
+    result.repositories.dedup();
+    result.diagnostics.sort();
+    result.diagnostics.dedup();
+    result
+}
+
+struct RepositoryScan<'a> {
+    root: &'a Path,
+    limits: DiscoveryLimits,
+    remaining_entries: usize,
+    exhausted: bool,
+    result: &'a mut Discovery,
+}
+
+impl RepositoryScan<'_> {
+    fn diagnostic(&mut self, path: &Path, message: impl Into<String>) {
+        self.result
+            .diagnostics
+            .push((path.to_path_buf(), message.into()));
+    }
+
+    fn visit(&mut self, path: &Path, depth: usize) {
+        // Recheck each path at use time. Directory symlinks are never followed,
+        // including aliases that lead back inside the same Project.
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+            Ok(_) => return,
+            Err(error) => {
+                self.diagnostic(path, format!("Cannot inspect directory: {error}"));
+                return;
+            }
+        };
+        match fs::canonicalize(path) {
+            Ok(canonical) if canonical == path && canonical.starts_with(self.root) => {}
+            Ok(_) => {
+                self.diagnostic(path, "Directory changed or escapes the Project workspace");
+                return;
+            }
+            Err(error) => {
+                self.diagnostic(path, format!("Cannot resolve directory: {error}"));
+                return;
+            }
+        }
+        let marker = match fs::symlink_metadata(path.join(".git")) {
+            Ok(marker) if marker.is_dir() || marker.is_file() => true,
+            Ok(_) => {
+                self.diagnostic(path, "Git marker is not a regular file or directory");
+                return;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                self.diagnostic(path, format!("Cannot inspect Git marker: {error}"));
+                return;
+            }
+        };
+        // Bare repositories have no .git marker. Recognize their metadata
+        // shape without invoking Git for every ordinary directory, then stop
+        // before walking objects, refs or nested linked-worktree metadata.
+        let metadata_shape = path.join("HEAD").is_file()
+            && path.join("objects").is_dir()
+            && path.join("refs").is_dir();
+        if metadata_shape {
+            match git(path, &["rev-parse", "--is-bare-repository"]) {
+                Ok(value) if value.trim() == "true" => {
+                    // Explicit bare source bindings already support worktree
+                    // creation. Preserve that path without scanning metadata.
+                    if depth == 0 && path.to_str().is_some() && retains_identity(path, &metadata) {
+                        self.result.repositories.push(path.to_path_buf());
+                    } else {
+                        self.diagnostic(path, "Bare Git metadata directory was not scanned");
+                    }
+                    return;
+                }
+                Err(error) => {
+                    self.diagnostic(path, error);
+                    return;
+                }
+                Ok(_) => {
+                    if git(path, &["rev-parse", "--is-inside-git-dir"])
+                        .is_ok_and(|value| value.trim() == "true")
+                    {
+                        self.diagnostic(
+                            path,
+                            "Git metadata directory has no working checkout; skipped",
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        if depth == 0 || marker {
+            match workspace_root(path) {
+                Ok(checkout) if (depth == 0 && path.starts_with(&checkout)) || checkout == path => {
+                    if depth > 0 {
+                        // A .git file alone can point at an unrelated repository.
+                        // Git's native registry must also identify this checkout
+                        // before a discovered path can authorize branch creation.
+                        match registered_worktree(path) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                self.diagnostic(
+                                    path,
+                                    "Discovered directory is not a registered Git worktree",
+                                );
+                                return;
+                            }
+                            Err(error) => {
+                                self.diagnostic(path, error);
+                                return;
+                            }
+                        }
+                    }
+                    if path.to_str().is_some() {
+                        self.result.repositories.push(path.to_path_buf());
+                    } else {
+                        self.diagnostic(
+                            path,
+                            "Repository path contains non-UTF-8 bytes; this UI cannot open it",
+                        );
+                        return;
+                    }
+                }
+                Ok(_) => {
+                    self.diagnostic(
+                        path,
+                        "Git checkout resolves outside its discovered directory",
+                    );
+                }
+                Err(error) => {
+                    let ordinary_directory = !marker
+                        && !path
+                            .ancestors()
+                            .skip(1)
+                            .any(|ancestor| fs::symlink_metadata(ancestor.join(".git")).is_ok())
+                        && error.starts_with(&format!(
+                            "Git at {}: fatal: not a git repository (or any",
+                            path.display()
+                        ));
+                    if !ordinary_directory {
+                        self.diagnostic(path, error);
+                        if depth == 0
+                            && git(path, &["rev-parse", "--is-inside-git-dir"])
+                                .is_ok_and(|value| value.trim() == "true")
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        if !retains_identity(path, &metadata) {
+            self.result
+                .repositories
+                .retain(|candidate| candidate != path);
+            self.diagnostic(path, "Directory changed during repository discovery");
+            return;
+        }
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.diagnostic(path, format!("Cannot read directory: {error}"));
+                return;
+            }
+        };
+        let mut directories = Vec::new();
+        for entry in entries {
+            if self.remaining_entries == 0 {
+                self.exhausted = true;
+                self.diagnostic(
+                    path,
+                    format!(
+                        "Repository discovery truncated after {} directory entries",
+                        self.limits.max_entries
+                    ),
+                );
+                // Do not select an arbitrary read_dir prefix. Previously
+                // completed directories remain useful and deterministic.
+                return;
+            }
+            self.remaining_entries -= 1;
+            match entry.and_then(|entry| Ok((entry.file_type()?, entry.path()))) {
+                Ok((kind, child)) if kind.is_dir() && !ignored_discovery_directory(&child) => {
+                    directories.push(child);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.diagnostic(path, format!("Cannot read directory entry: {error}"))
+                }
+            }
+        }
+        directories.sort();
+        if depth == self.limits.max_depth && !directories.is_empty() {
+            self.diagnostic(
+                path,
+                format!(
+                    "Repository discovery truncated at depth {}",
+                    self.limits.max_depth
+                ),
+            );
+            return;
+        }
+        for directory in directories {
+            self.visit(&directory, depth + 1);
+            if self.exhausted {
+                break;
+            }
+        }
+    }
+}
+
+fn registered_worktree(path: &Path) -> Result<bool, String> {
+    let listing = git_bytes(path, &["worktree", "list", "--porcelain", "-z"])?;
+    for field in listing.split(|byte| *byte == 0) {
+        if let Some(registered) = field.strip_prefix(b"worktree ") {
+            let registered = path_from_bytes(registered)?;
+            if fs::canonicalize(registered).is_ok_and(|registered| registered == path) {
+                return Ok(true);
+            }
+        }
+    }
+    // Git lists a submodule's separate metadata directory as its main entry.
+    // Accept its reverse checkout binding only from the shared metadata's own
+    // config, never a candidate-controlled config.worktree, include or global.
+    let common = repository(path)?;
+    Ok(configured_main_worktree(path, &common)?.is_some_and(|configured| configured == path))
+}
+
+fn configured_main_worktree(repo: &Path, common: &Path) -> Result<Option<PathBuf>, String> {
+    let config = common.join("config");
+    let config = config
+        .to_str()
+        .ok_or("Git metadata configuration path contains non-UTF-8 bytes")?;
+    let output = command(
+        repo,
+        &[
+            "config",
+            "--file",
+            config,
+            "--no-includes",
+            "--path",
+            "--null",
+            "--get",
+            "core.worktree",
+        ],
+    )?;
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(format!(
+            "Cannot verify Git checkout binding: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let bytes = output.stdout.strip_suffix(&[0]).unwrap_or(&output.stdout);
+    let configured = path_from_bytes(bytes)?;
+    fs::canonicalize(common.join(configured))
+        .map(Some)
+        .map_err(|error| format!("Configured Git checkout is unavailable: {error}"))
+}
+
+fn main_worktree_for_list(repo: &Path, common: &Path) -> Result<PathBuf, String> {
+    let verify = |checkout: PathBuf| {
+        if repository(&checkout)? == common && workspace_root(&checkout)? == checkout {
+            Ok(checkout)
+        } else {
+            Err("Configured Git main checkout belongs to a different repository".to_string())
+        }
+    };
+    let configured = configured_main_worktree(repo, common)
+        .and_then(|checkout| {
+            checkout.ok_or_else(|| {
+                "Native Git main entry points to metadata without a verified checkout binding"
+                    .to_string()
+            })
+        })
+        .and_then(verify);
+    match configured {
+        Ok(checkout) => Ok(checkout),
+        Err(error) => {
+            // An explicitly bound main checkout may use separate metadata with
+            // no reverse config. Its own Git directory proves it is the main
+            // caller; a linked worktree must never impersonate that record.
+            let main_caller = git_path(repo, &["rev-parse", "--absolute-git-dir"])
+                .and_then(|path| fs::canonicalize(path).map_err(|error| error.to_string()))
+                .is_ok_and(|path| path == common);
+            if main_caller {
+                workspace_root(repo).and_then(verify)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn ignored_discovery_directory(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(
+            ".git"
+                | ".hg"
+                | ".svn"
+                | "node_modules"
+                | "target"
+                | "dist"
+                | "build"
+                | ".next"
+                | ".nuxt"
+                | ".venv"
+                | "venv"
+                | "__pycache__"
+                | ".cache"
+                | ".turbo"
+                | ".parcel-cache"
+                | "coverage"
+        )
+    )
+}
+
 pub fn root(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err("Worktree root must be an absolute existing directory without '..'".into());
@@ -277,22 +653,44 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
             if field == b"prunable" || field.starts_with(b"prunable ") {
                 current.prunable = true;
             }
+            if field == b"bare" {
+                current.bare = true;
+            }
         }
     }
     if let Some(previous) = entry {
         result.push(previous);
     }
     for entry in &mut result {
+        if entry.bare {
+            entry.error = Some("Bare repository metadata has no working checkout".into());
+            continue;
+        }
+        // Native Git represents a submodule/separate-git-dir main checkout by
+        // its metadata path. Never expose that path as an openable workspace.
+        // Linked entries have their own registry paths and are left unchanged.
+        if fs::canonicalize(&entry.path).is_ok_and(|path| path == common) {
+            match main_worktree_for_list(repo, &common) {
+                Ok(path) => entry.path = path,
+                Err(error) => {
+                    entry.error = Some(error);
+                    continue;
+                }
+            }
+        }
         if entry.path.to_str().is_none() {
             entry.error = Some("Worktree path contains non-UTF-8 bytes and is displayed as an escaped label. This UI cannot open it; use a Git client. No files were changed.".into());
             continue;
         }
-        let inspect = || -> Result<(PathBuf, bool), String> {
+        let mut inspect = || -> Result<(PathBuf, bool), String> {
             let canonical = fs::canonicalize(&entry.path)
                 .map_err(|e| format!("{} is unavailable: {e}", entry.path.display()))?;
             if repository(&canonical)? != common || workspace_root(&canonical)? != canonical {
                 return Err("Worktree path now belongs to a different repository".into());
             }
+            // Opening depends on checkout identity, not whether Git can report
+            // its complete dirty state (for example, a disabled content filter).
+            entry.openable = true;
             let index = git_bytes(&canonical, &["ls-files", "--stage", "-z"])?;
             let has_submodules = index
                 .split(|byte| *byte == 0)
@@ -553,6 +951,361 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn init_discovery_repo(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        git(path, &["init", "-b", "main"]).unwrap();
+    }
+
+    #[test]
+    fn discovery_scans_containers_and_nested_repositories_in_stable_order() {
+        let f = Fixture::new();
+        let container = f.roots();
+        let nested = container.join("z-group/repo");
+        let outer = container.join("a-outer");
+        let inner = outer.join("packages/inner");
+        for path in [&nested, &outer, &inner] {
+            init_discovery_repo(path);
+        }
+        let discovery = discover_repositories(&container);
+        assert_eq!(discovery.repositories, vec![outer, inner, nested]);
+        assert!(discovery.diagnostics.is_empty(), "{discovery:?}");
+        assert_eq!(
+            discovery.repositories,
+            discover_repositories(&container).repositories
+        );
+    }
+
+    #[test]
+    fn discovery_preserves_direct_subdirectory_binding_without_parent_expansion() {
+        let f = Fixture::new();
+        let subdirectory = f.repo().join("src/deep");
+        fs::create_dir_all(&subdirectory).unwrap();
+        let discovery = discover_repositories(&subdirectory);
+        assert_eq!(discovery.repositories, vec![subdirectory]);
+        assert!(discovery.diagnostics.is_empty(), "{discovery:?}");
+        let empty = discover_repositories(&f.roots());
+        assert!(empty.repositories.is_empty());
+        assert!(empty.diagnostics.is_empty(), "{empty:?}");
+    }
+
+    #[test]
+    fn discovery_accepts_linked_worktrees_and_separate_git_metadata_files() {
+        let f = Fixture::new();
+        let linked = create(&f.repo(), &f.roots(), "linked", "linked").unwrap();
+        let submodule = f.roots().join("group/submodule");
+        fs::create_dir_all(&submodule).unwrap();
+        let metadata = f.0.join("submodule-metadata");
+        git(
+            &submodule,
+            &["init", "--separate-git-dir", metadata.to_str().unwrap()],
+        )
+        .unwrap();
+        // Separated Git metadata without a reverse checkout binding is
+        // indistinguishable from an arbitrary pointer into another repository.
+        let unbound = discover_repositories(&f.roots());
+        assert_eq!(unbound.repositories, vec![linked.clone()]);
+        assert_eq!(unbound.diagnostics.len(), 1);
+        assert_eq!(
+            discover_repositories(&submodule).repositories,
+            vec![submodule.clone()]
+        );
+        let explicit_entries = list(&submodule).unwrap();
+        assert_eq!(explicit_entries.len(), 1);
+        assert_eq!(explicit_entries[0].path, submodule);
+        assert!(explicit_entries[0].error.is_none());
+        git(
+            &submodule,
+            &["config", "core.worktree", submodule.to_str().unwrap()],
+        )
+        .unwrap();
+        assert!(linked.join(".git").is_file());
+        assert!(submodule.join(".git").is_file());
+        let discovery = discover_repositories(&f.roots());
+        assert_eq!(discovery.repositories, vec![submodule, linked]);
+        assert!(discovery.diagnostics.is_empty(), "{discovery:?}");
+    }
+
+    #[test]
+    fn discovery_accepts_an_initialized_real_git_submodule() {
+        let f = Fixture::new();
+        let parent = f.roots().join("parent");
+        init_discovery_repo(&parent);
+        let output = git_command(&parent)
+            .env("GIT_ALLOW_PROTOCOL", "file")
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                f.repo().to_str().unwrap(),
+                "modules/child",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let submodule = parent.join("modules/child");
+        assert!(submodule.join(".git").is_file());
+        let discovery = discover_repositories(&f.roots());
+        assert_eq!(discovery.repositories, vec![parent, submodule]);
+        assert!(discovery.diagnostics.is_empty(), "{discovery:?}");
+        let submodule = discovery.repositories[1].clone();
+        let entries = list(&submodule).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, submodule);
+        assert_eq!(entries[0].dirty, Some(false));
+        assert!(entries[0].error.is_none());
+        assert!(entries[0].openable);
+        let linked = create(&submodule, &f.roots(), "module-linked", "module-linked").unwrap();
+        let entries = list(&submodule).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry.path == submodule));
+        assert!(entries.iter().any(|entry| entry.path == linked));
+        assert!(entries
+            .iter()
+            .all(|entry| entry.openable && entry.dirty == Some(false) && entry.error.is_none()));
+        let common = repository(&submodule).unwrap();
+        fs::rename(&submodule, f.0.join("saved-submodule")).unwrap();
+        let partial = list(&linked).unwrap();
+        assert_eq!(partial.len(), 2);
+        let unavailable_main = partial.iter().find(|entry| entry.path == common).unwrap();
+        assert!(!unavailable_main.openable);
+        assert_eq!(unavailable_main.dirty, None);
+        assert!(unavailable_main.error.is_some());
+        let usable_linked = partial.iter().find(|entry| entry.path == linked).unwrap();
+        assert!(usable_linked.openable);
+        assert_eq!(usable_linked.dirty, Some(false));
+        assert!(usable_linked.error.is_none());
+    }
+
+    #[test]
+    fn bare_repository_linked_caller_keeps_native_bare_entry_unopenable() {
+        let f = Fixture::new();
+        let bare = f.0.join("bare.git");
+        let output = git_command(&f.0)
+            .env("GIT_ALLOW_PROTOCOL", "file")
+            .args([
+                "clone",
+                "--bare",
+                f.repo().to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let linked = create(&bare, &f.roots(), "bare-linked", "from-bare").unwrap();
+        for caller in [&bare, &linked] {
+            let entries = list(caller).unwrap();
+            assert_eq!(entries.len(), 2);
+            let main = entries.iter().find(|entry| entry.path == bare).unwrap();
+            assert!(main.bare);
+            assert!(!main.openable);
+            assert_eq!(main.dirty, None);
+            assert!(main.error.is_some());
+            let checkout = entries.iter().find(|entry| entry.path == linked).unwrap();
+            assert!(!checkout.bare);
+            assert!(checkout.openable);
+            assert_eq!(checkout.dirty, Some(false));
+            assert!(checkout.error.is_none());
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_unregistered_git_file_and_common_directory_pointers() {
+        let f = Fixture::new();
+        let outside = f.repo().join(".git");
+        let forged_file = f.roots().join("forged-file");
+        fs::create_dir(&forged_file).unwrap();
+        fs::write(
+            forged_file.join(".git"),
+            format!("gitdir: {}\n", outside.display()),
+        )
+        .unwrap();
+        let forged_directory = f.roots().join("forged-directory");
+        init_discovery_repo(&forged_directory);
+        fs::write(
+            forged_directory.join(".git/commondir"),
+            format!("{}\n", outside.display()),
+        )
+        .unwrap();
+        for forged in [&forged_file, &forged_directory] {
+            // --show-toplevel alone accepts both forged pointers; it does not
+            // establish a native registration for the discovered checkout.
+            assert_eq!(workspace_root(forged).unwrap(), *forged);
+            assert_eq!(repository(forged).unwrap(), outside);
+        }
+        let before = git(&f.repo(), &["show-ref"]).unwrap();
+        let discovery = discover_repositories(&f.roots());
+        assert!(discovery.repositories.is_empty(), "{discovery:?}");
+        assert_eq!(discovery.diagnostics.len(), 2, "{discovery:?}");
+        assert!(discovery
+            .diagnostics
+            .iter()
+            .all(|(_, message)| message.contains("not a registered Git worktree")));
+        assert_eq!(git(&f.repo(), &["show-ref"]).unwrap(), before);
+        // Explicitly registered Project roots retain their existing contract.
+        assert_eq!(
+            discover_repositories(&forged_file).repositories,
+            vec![forged_file.clone()]
+        );
+        // A candidate must not manufacture its reverse binding through its
+        // per-worktree configuration or an included file in shared config.
+        let injected = forged_directory.join("injected-config");
+        let content = format!("[core]\nworktree = {}\n", forged_directory.display());
+        fs::write(&injected, &content).unwrap();
+        fs::write(forged_directory.join(".git/config.worktree"), &content).unwrap();
+        git(&f.repo(), &["config", "extensions.worktreeConfig", "true"]).unwrap();
+        git(
+            &f.repo(),
+            &["config", "include.path", injected.to_str().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(workspace_root(&forged_directory).unwrap(), forged_directory);
+        assert!(!registered_worktree(&forged_directory).unwrap());
+        assert!(discover_repositories(&f.roots()).repositories.is_empty());
+    }
+
+    #[test]
+    fn discovery_retains_broken_git_and_filesystem_diagnostics() {
+        let f = Fixture::new();
+        let broken_file = f.roots().join("broken-file");
+        let broken_directory = f.roots().join("broken-directory");
+        fs::create_dir(&broken_file).unwrap();
+        fs::create_dir_all(broken_directory.join(".git")).unwrap();
+        fs::write(broken_file.join(".git"), "gitdir: missing-metadata\n").unwrap();
+        let discovery = discover_repositories(&f.roots());
+        assert!(discovery.repositories.is_empty());
+        assert_eq!(discovery.diagnostics.len(), 2, "{discovery:?}");
+        assert!(discovery
+            .diagnostics
+            .iter()
+            .all(|(_, message)| message.contains("Git at")));
+        let nested = broken_directory.join("src");
+        fs::create_dir(&nested).unwrap();
+        assert_eq!(discover_repositories(&nested).diagnostics.len(), 1);
+        let unavailable = discover_repositories(&f.0.join("missing"));
+        assert_eq!(unavailable.diagnostics.len(), 1);
+        assert!(unavailable.diagnostics[0].1.contains("unavailable"));
+    }
+
+    #[test]
+    fn discovery_skips_dependency_output_and_bare_repository_metadata() {
+        let f = Fixture::new();
+        for ignored in ["node_modules", "target", "dist", "build", ".venv", ".git"] {
+            init_discovery_repo(&f.roots().join(ignored).join("hidden"));
+        }
+        // A container with an invalid .git directory must retain that diagnostic,
+        // but its metadata is still never recursively treated as source.
+        let bare = f.roots().join("bare.git");
+        fs::create_dir(&bare).unwrap();
+        git(&bare, &["init", "--bare"]).unwrap();
+        init_discovery_repo(&bare.join("objects/hidden"));
+        let visible = f.roots().join(".config/visible");
+        init_discovery_repo(&visible);
+        let discovery = discover_repositories(&f.roots());
+        assert_eq!(discovery.repositories, vec![visible]);
+        assert!(discovery
+            .diagnostics
+            .iter()
+            .any(|(path, error)| path == &bare && error.contains("metadata directory")));
+        let direct_bare = discover_repositories(&bare);
+        assert_eq!(direct_bare.repositories, vec![bare.clone()]);
+        assert!(direct_bare.diagnostics.is_empty());
+        for metadata in [bare.join("objects"), f.repo().join(".git")] {
+            let discovery = discover_repositories(&metadata);
+            assert!(discovery.repositories.is_empty(), "{discovery:?}");
+            assert!(!discovery.diagnostics.is_empty(), "{discovery:?}");
+        }
+    }
+
+    #[test]
+    fn discovery_reports_depth_and_entry_limits_without_arbitrary_prefixes() {
+        let f = Fixture::new();
+        let shallow = f.roots().join("a-shallow");
+        let deep = f.roots().join("z/deep/repo");
+        init_discovery_repo(&shallow);
+        init_discovery_repo(&deep);
+        let discovery = discover_with_limits(
+            &f.roots(),
+            DiscoveryLimits {
+                max_depth: 1,
+                max_entries: 100,
+            },
+        );
+        assert_eq!(discovery.repositories, vec![shallow]);
+        assert!(discovery
+            .diagnostics
+            .iter()
+            .any(|(_, error)| error.contains("truncated at depth 1")));
+        let discovery = discover_with_limits(
+            &f.roots(),
+            DiscoveryLimits {
+                max_depth: 12,
+                max_entries: 1,
+            },
+        );
+        assert!(discovery.repositories.is_empty());
+        assert_eq!(discovery.diagnostics.len(), 1);
+        assert!(discovery.diagnostics[0]
+            .1
+            .contains("truncated after 1 directory entries"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_does_not_follow_directory_or_git_marker_symlinks() {
+        let f = Fixture::new();
+        let other = Fixture::new();
+        std::os::unix::fs::symlink(other.repo(), f.roots().join("outside")).unwrap();
+        std::os::unix::fs::symlink(f.roots(), f.roots().join("loop")).unwrap();
+        let malformed = f.roots().join("marker-link");
+        fs::create_dir(&malformed).unwrap();
+        std::os::unix::fs::symlink(other.repo().join(".git"), malformed.join(".git")).unwrap();
+        let discovery = discover_repositories(&f.roots());
+        assert!(discovery.repositories.is_empty(), "{discovery:?}");
+        assert_eq!(discovery.diagnostics.len(), 1, "{discovery:?}");
+        assert_eq!(discovery.diagnostics[0].0, malformed);
+    }
+
+    // APFS cannot create raw-byte directory names. Exercise the real traversal
+    // on Unix filesystems that support these paths instead of a lossy fixture.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn discovery_reports_non_utf8_repository_without_exposing_a_candidate() {
+        use std::os::unix::ffi::OsStringExt;
+        let f = Fixture::new();
+        let raw = f
+            .roots()
+            .join(std::ffi::OsString::from_vec(b"non-utf8-\xff".to_vec()));
+        init_discovery_repo(&raw);
+        let discovery = discover_repositories(&f.roots());
+        assert!(discovery.repositories.is_empty(), "{discovery:?}");
+        assert_eq!(discovery.diagnostics.len(), 1, "{discovery:?}");
+        assert!(discovery
+            .diagnostics
+            .iter()
+            .any(|(path, error)| path == &raw && error.contains("non-UTF-8")));
+    }
+
+    #[test]
+    fn discovery_rejects_candidate_with_checkout_redirected_outside_project() {
+        let f = Fixture::new();
+        let redirected = f.roots().join("redirected");
+        init_discovery_repo(&redirected);
+        git(
+            &redirected,
+            &["config", "core.worktree", f.repo().to_str().unwrap()],
+        )
+        .unwrap();
+        let discovery = discover_repositories(&f.roots());
+        assert!(discovery.repositories.is_empty(), "{discovery:?}");
+        assert_eq!(discovery.diagnostics.len(), 1);
+        assert!(discovery.diagnostics[0].1.contains("outside"));
     }
 
     #[test]
@@ -958,7 +1711,8 @@ mod tests {
             let explicit_error = if kind == "clean" {
                 fs::write(f.repo().join("tracked.txt"), "changed\n").unwrap();
                 let entries = list(&f.repo()).unwrap();
-                entries[0].dirty.is_none()
+                entries[0].openable
+                    && entries[0].dirty.is_none()
                     && entries[0]
                         .error
                         .as_ref()

@@ -107,12 +107,15 @@ struct RepositoryInventory {
     common_dir: Option<String>,
     worktrees: Vec<WorktreeInventory>,
     error: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
 struct WorktreeInventory {
     path: String,
     path_encoding: &'static str,
+    openable: bool,
     branch: Option<String>,
     head: String,
     locked: bool,
@@ -120,6 +123,9 @@ struct WorktreeInventory {
     dirty: Option<bool>,
     error: Option<String>,
     occupied: bool,
+    /// The checkout is already covered by this Project's registered roots.
+    /// Clients can open it without trying to register an overlapping child root.
+    project_owned: bool,
     sessions: Vec<Value>,
 }
 
@@ -142,21 +148,28 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
         .cloned()
         .or(preferences.default_root);
     let repositories = blocking(move || {
-        // Inspect only namespaces selected by this Project or discovered by
-        // native worktree inventory. Historical Session paths elsewhere may be
-        // offline and must not trigger filesystem/Git work for this request.
+        // Discover repositories within registered Project roots without adding
+        // overlapping workspace bindings or another repository registry.
         let bound_sources: Vec<_> = project.workspace_roots().map(PathBuf::from).collect();
+        let canonical_roots: Vec<_> = bound_sources.iter().filter_map(|root| root.canonicalize().ok()).collect();
+        let mut sources = Vec::new();
+        let mut diagnostics = Vec::new();
+        for source in &bound_sources {
+            let discovered = git::discover_repositories(source);
+            sources.extend(discovered.repositories);
+            diagnostics.extend(discovered.diagnostics);
+        }
         let mut session_checkouts = HashMap::<PathBuf, Option<PathBuf>>::new();
         let mut repositories = Vec::new();
         let mut seen = HashSet::new();
-        for source in project.workspace_roots() {
-            let path = PathBuf::from(source);
+        for path in sources {
+            let source = git::path_label(&path);
             let common = match git::repository(&path) {
                 Ok(common) => common,
                 Err(error) => {
                     repositories.push(RepositoryInventory {
-                        path: source.to_owned(), common_dir: None,
-                        worktrees: Vec::new(), error: Some(error),
+                        path: source, common_dir: None,
+                        worktrees: Vec::new(), error: Some(error), warnings: Vec::new(),
                     });
                     continue;
                 }
@@ -198,23 +211,45 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
                                 || matches!(session.last_run_status.as_deref(), Some("running" | "pending"))
                                 || session.has_pending_question})).collect();
                         let occupied = entry.locked || related.iter().any(|s| s["active"] == true);
+                        let project_owned = entry.path.canonicalize().is_ok_and(|path|
+                            canonical_roots.iter().any(|root| path.starts_with(root)));
                         WorktreeInventory {
                             path: git::path_label(&entry.path),
                             path_encoding: if entry.path.to_str().is_some() { "utf-8" } else { "escaped" },
+                            openable: entry.openable,
                             branch: entry.branch, head: entry.head, locked: entry.locked,
                             prunable: entry.prunable, dirty: entry.dirty, error: entry.error,
-                            occupied, sessions: related,
+                            occupied, project_owned, sessions: related,
                         }
                     }).collect();
                     repositories.push(RepositoryInventory {
-                        path: source.to_owned(), common_dir: Some(git::path_label(&common)),
-                        worktrees, error: None,
+                        path: source, common_dir: Some(git::path_label(&common)),
+                        worktrees, error: None, warnings: Vec::new(),
                     });
                 }
                 Err(error) => repositories.push(RepositoryInventory {
-                    path: source.to_owned(), common_dir: Some(git::path_label(&common)),
-                    worktrees: Vec::new(), error: Some(error),
+                    path: source, common_dir: Some(git::path_label(&common)),
+                    worktrees: Vec::new(), error: Some(error), warnings: Vec::new(),
                 }),
+            }
+        }
+        // A scan warning can share a path with a valid source (for example when
+        // its descendants reach the scan limit). Keep that source selectable and
+        // keep one row per path for clients that use paths as list identities.
+        for (path, diagnostic) in diagnostics {
+            let path = git::path_label(&path);
+            if let Some(repository) = repositories.iter_mut().find(|repo| repo.path == path) {
+                if let Some(error) = &mut repository.error {
+                    error.push('\n');
+                    error.push_str(&diagnostic);
+                } else {
+                    repository.warnings.push(diagnostic);
+                }
+            } else {
+                repositories.push(RepositoryInventory {
+                    path, common_dir: None, worktrees: Vec::new(),
+                    error: Some(diagnostic), warnings: Vec::new(),
+                });
             }
         }
         Ok(repositories)
@@ -253,13 +288,18 @@ pub async fn create(
         let canonical = repo
             .canonicalize()
             .map_err(|e| format!("Repository is unavailable: {e}"))?;
-        // Only an explicitly bound source directory may be used as repository.
-        // Matching a common .git directory alone would admit arbitrary paths.
-        if !project
-            .workspace_roots()
-            .any(|source| Path::new(source).canonicalize().ok().as_ref() == Some(&canonical))
-        {
-            return Err("Repository is not bound to this Project".into());
+        // Re-run the same bounded discovery used by inventory. A path merely
+        // being below a root, or sharing a common .git directory, is insufficient:
+        // ignored trees, symlink escapes and stale inventory must not be admitted.
+        if !project.workspace_roots().any(|source| {
+            git::discover_repositories(Path::new(source))
+                .repositories
+                .contains(&canonical)
+        }) {
+            return Err(
+                "Repository is not a discovered source of this Project; refresh the worktree list"
+                    .into(),
+            );
         }
         git::create(&canonical, Path::new(&root), &request.name, &request.branch)
     })
@@ -271,3 +311,6 @@ pub async fn create(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod discovery_tests;
