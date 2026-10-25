@@ -9,6 +9,13 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub(super) const MIGRATION_DIR: &str = ".session-version-migrations";
+// Shared with bounded Actor readers: durable staging files have not published
+// a migration intent and must not become permanent read barriers after a crash.
+pub(super) fn is_published_migration_journal(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "json")
+}
+
 const RECEIPT_FILE: &str = "session-version-migration.json";
 const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: usize = MAX_STATE_BYTES * 8 + 32 * 1024;
@@ -321,7 +328,7 @@ impl SessionStoreV2 {
         };
         let mut paths = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
-            if entry.path().extension().is_some_and(|ext| ext == "json") {
+            if is_published_migration_journal(&entry.path()) {
                 if !entry.file_type().await?.is_file() || paths.len() >= 256 {
                     return Err(invalid("invalid or excessive migration journals"));
                 }
