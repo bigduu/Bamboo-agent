@@ -2971,7 +2971,7 @@ mod tests {
     }
 
     #[test]
-    fn build_responses_body_keeps_legacy_models_on_xhigh() {
+    fn build_responses_body_preserves_max_for_legacy_model_names() {
         let body = build_responses_body(
             "gpt-4o",
             &[],
@@ -2983,7 +2983,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert_eq!(body["reasoning"]["effort"], "max");
         assert_eq!(body["max_output_tokens"], 16_384);
     }
 
