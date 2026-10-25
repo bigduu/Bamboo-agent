@@ -44,6 +44,9 @@ pub async fn open_default(
     }
 }
 
+mod managed_sessions;
+pub use managed_sessions::{configure_managed_session, inspect_managed_sessions};
+
 mod project_scope;
 pub use project_scope::{configure_project_scope, inspect_project_scope};
 
