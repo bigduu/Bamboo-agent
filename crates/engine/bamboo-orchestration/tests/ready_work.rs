@@ -94,6 +94,9 @@ struct Host {
     ensure_errors: Mutex<VecDeque<PortError>>,
     error_after_commit: AtomicBool,
     conflict_once: AtomicBool,
+    program_passes: Mutex<Vec<(ProjectId, Vec<String>)>>,
+    program_unavailable: AtomicBool,
+    program_delay_ms: AtomicU64,
 }
 
 impl Host {
@@ -140,6 +143,29 @@ impl ReadyWorkHost for Host {
         if !self.budget_enabled.load(Ordering::SeqCst) || max_rounds != ROUNDS {
             return Err(Error::ResourceBlocked(
                 "finite Host budget unavailable".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn reconcile_program_patrol(
+        &self,
+        selection: &bamboo_orchestration::patrol::program::ProgramSelection<'_>,
+        fence: &bamboo_orchestration::ReadyAdmissionFence,
+    ) -> Result<()> {
+        fence.check()?;
+        self.program_passes
+            .lock()
+            .unwrap()
+            .push((selection.project_id.clone(), selection.work_ids.to_vec()));
+        let delay = self.program_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        fence.check()?;
+        if self.program_unavailable.load(Ordering::SeqCst) {
+            return Err(Error::AuthorityUnavailable(
+                "controlled program observer outage".into(),
             ));
         }
         Ok(())
@@ -250,6 +276,9 @@ impl Fixture {
             ensure_errors: Mutex::new(VecDeque::new()),
             error_after_commit: AtomicBool::new(false),
             conflict_once: AtomicBool::new(false),
+            program_passes: Mutex::default(),
+            program_unavailable: AtomicBool::new(false),
+            program_delay_ms: AtomicU64::new(0),
         });
         let project = ProjectId::parse("ready-work-project").unwrap();
         let mut fixture = Self {
@@ -345,6 +374,92 @@ impl Fixture {
             lifetime: Duration::from_secs(7),
         }
     }
+}
+
+#[tokio::test]
+async fn program_observation_runs_only_for_the_explicit_ready_selection() {
+    let fixture = Fixture::new(2, true);
+    let scheduler = ReadyWorkScheduler::default();
+    assert!(matches!(
+        scheduler.reconcile(fixture.host.as_ref()).await.unwrap(),
+        ReadyReconcile::Disabled
+    ));
+    assert!(fixture.host.program_passes.lock().unwrap().is_empty());
+    let mut policy = fixture.policy(1);
+    policy.grants.truncate(1);
+    scheduler
+        .install(fixture.host.as_ref(), policy)
+        .await
+        .unwrap();
+    scheduler.reconcile(fixture.host.as_ref()).await.unwrap();
+    assert_eq!(
+        *fixture.host.program_passes.lock().unwrap(),
+        vec![(
+            fixture.project.clone(),
+            vec![fixture.grants[0].work_id.clone()]
+        )]
+    );
+    scheduler.revoke().await;
+    assert!(matches!(
+        scheduler.reconcile(fixture.host.as_ref()).await.unwrap(),
+        ReadyReconcile::Disabled
+    ));
+    assert_eq!(fixture.host.program_passes.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn unavailable_program_observation_never_becomes_a_work_failure_or_extra_dispatch() {
+    let fixture = Fixture::new(1, true);
+    let scheduler = ReadyWorkScheduler::default();
+    fixture
+        .host
+        .program_unavailable
+        .store(true, Ordering::SeqCst);
+    scheduler
+        .install(fixture.host.as_ref(), fixture.policy(1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        scheduler.reconcile(fixture.host.as_ref()).await.unwrap(),
+        ReadyReconcile::Dispatched { .. }
+    ));
+    scheduler.reconcile(fixture.host.as_ref()).await.unwrap();
+    assert_eq!(fixture.host.dispatches.lock().unwrap().len(), 1);
+    assert_eq!(
+        fixture
+            .host
+            .service()
+            .published()
+            .unwrap()
+            .1
+            .assignments
+            .len(),
+        1
+    );
+    assert_eq!(fixture.host.program_passes.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn expiry_during_program_observation_cannot_authorize_a_later_start() {
+    let fixture = Fixture::new(1, true);
+    let scheduler = ReadyWorkScheduler::default();
+    let mut policy = fixture.policy(1);
+    policy.lifetime = Duration::from_secs(1);
+    fixture.host.program_delay_ms.store(2_000, Ordering::SeqCst);
+    scheduler
+        .install(fixture.host.as_ref(), policy)
+        .await
+        .unwrap();
+    assert!(scheduler.reconcile(fixture.host.as_ref()).await.is_err());
+    assert!(fixture.host.dispatches.lock().unwrap().is_empty());
+    assert!(fixture
+        .host
+        .service()
+        .published()
+        .unwrap()
+        .1
+        .assignments
+        .is_empty());
 }
 
 #[tokio::test]

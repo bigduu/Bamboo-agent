@@ -1,6 +1,7 @@
 //! Host-only patrol adapters. No registration, worker action or provider call.
 
 mod checkpoint_store;
+mod program;
 pub use checkpoint_store::PatrolCheckpointStore;
 
 use bamboo_orchestration::patrol::{host, Scope};
