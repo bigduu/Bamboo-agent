@@ -16,8 +16,8 @@ const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const exec = promisify(execFile);
 
-const SOURCE = '3682cf35171316d3b281ea49b90dd722a32488cb';
-const TREE = '5e8cd3c84fa6fb2dae42868ebcaa5bf181319cf9';
+const SOURCE = '829dcc780f1f5c7a27de518c2f54dfe26440a88a';
+const TREE = '40ed3319764e33c46438d2b3791ea0b5adca9a81';
 const LIMIT = 1024 * 1024;
 const SUPERVISOR = 'bamboo-default-supervisor';
 const HELP = `Fixture-only v2 Supervisor acceptance (Node 22+, no npm packages)
@@ -30,20 +30,25 @@ run uses two ALREADY PREPARED, producer-owned, isolated loopback Hosts. It start
 only its own scripted provider; it never launches/builds/stops Bamboo, creates a
 Project/grant, changes mode/settings, logs in, or automatically approves a tool.
 Normal typed fixture approval, if needed, must be completed by its owner while
-the driver waits. Standard Ticket refusal is reported BLOCKED, not success.
+the driver waits. Plain Standard Root input must succeed; only explicit formal Work refusal is expected.
+Formal Work task dispatch and submission/acceptance are outside this Root-composition suite.
+The two-mode run has a 120-second bound including normal typed owner response;
+per-mode scripted-model request and HTTP attempt caps remain unchanged.
 
 Receipt schema bamboo.v2-native-fixture.v1:
   source_sha, tree_sha: exact audited Host build above (not version 0.0.0)
   binary: {path, sha256}; an exported artifact, not target/intermediate output
   fixture_root: canonical OS temp directory named bamboo-v2-native-fixture-<id>
-  fixture_id: UUID; injected_provider: no_auth_local_scripted_no_fallback
+  fixture_id: UUID; injected_provider: no_auth_local_scripted_no_fallback, or
+    synthetic_key_local_scripted_no_fallback for the stock OpenAI connector. Its
+    only accepted key is bamboo-v2-native-fixture-<fixture_id>-<mode>; never a user key.
   cases: exactly standard and ultra, each with api_base (literal loopback HTTP),
     host_pid, host_started_at (ps lstart), data_dir, workspace_path, project_id,
     supervisor_created_at, ordinary_session_id, ordinary_created_at,
     provider_port, operation_id, expected_standard_ticket_denial (boolean).
 Each Host must already use its case's provider_port at /v1/chat/completions,
 have a fresh v2 Supervisor and ordinary Ultra Root, an explicit existing bound
-Project/workspace and its normal permissions. No auth/cookie/proof is accepted.
+Project/workspace and its normal permissions. No backend auth/cookie/proof is accepted; model auth is only the explicit fixture mode.
 Native process binding requires ps, plus macOS's system lsof or readable Linux
 procfs. Only an exact literal loopback listener is accepted, never a wildcard
 or a listener in another IP family/network namespace. Linux does not use lsof.
@@ -77,7 +82,7 @@ function validateReceipt(value) {
     && Object.keys(value.binary || {}).every(k => ['path', 'sha256'].includes(k)), 'unknown_receipt_fields');
   requireFact(value.source_sha === SOURCE && value.tree_sha === TREE, 'host_source_mismatch');
   requireFact(uuid(value.fixture_id), 'fixture_identity_required');
-  requireFact(value.injected_provider === 'no_auth_local_scripted_no_fallback', 'injected_local_provider_required');
+  requireFact(['no_auth_local_scripted_no_fallback', 'synthetic_key_local_scripted_no_fallback'].includes(value.injected_provider), 'injected_local_provider_required');
   requireFact(path.isAbsolute(value.fixture_root || '') && /^bamboo-v2-native-fixture-[a-zA-Z0-9_-]+$/.test(path.basename(value.fixture_root)), 'isolated_fixture_required');
   requireFact(path.isAbsolute(value.binary?.path || '') && /^[0-9a-f]{64}$/.test(value.binary?.sha256 || ''), 'host_artifact_required');
   requireFact(!value.binary.path.split(path.sep).some(part => ['target', 'intermediate'].includes(part)), 'exported_host_artifact_required');
@@ -97,7 +102,7 @@ function validateReceipt(value) {
     requireFact(path.isAbsolute(c.data_dir || '') && path.isAbsolute(c.workspace_path || '')
       && inside(value.fixture_root, c.data_dir) && inside(value.fixture_root, c.workspace_path), 'fixture_paths_required');
     requireFact(typeof c.expected_standard_ticket_denial === 'boolean'
-      && (!c.expected_standard_ticket_denial || c.mode === 'standard'), 'explicit_standard_boundary_required');
+      && c.expected_standard_ticket_denial === (c.mode === 'standard'), 'explicit_standard_boundary_required');
   }
   return value;
 }
@@ -215,7 +220,8 @@ function session(value, expectedId, expectedBirth) {
   requireFact(s.permission_mode === 'default' && s.bypass_permissions === false, 'ordinary_permissions_required');
   return s;
 }
-function stable(value) { return JSON.stringify(value); }
+function stable(value) { return JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
+  ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item); }
 function creationReceipt(value, request) {
   requireFact(value?.action === 'create' && value.operation_id === request.operation_id && value.project_id === request.project_id
     && value.created_durable === true && value.linked === true && value.admitted === true
@@ -334,27 +340,37 @@ async function nextReply(request, c, flow, hooks) {
   if (role === 'child') {
     if (step === 0) return call('Read', { file_path: flow.fixtureFile });
     requireFact(textContent(request.messages.findLast(m => m.role === 'tool')?.content).includes(flow.fileContent.trim()), 'actual_fixture_read_missing');
-    flow.readObserved = true; return { role: 'assistant', content: flow.childReport };
+    // Required-packet children use the existing strict report projection. The
+    // reported summary is a claim; the real Read result is checked above.
+    flow.readObserved = true; return { role: 'assistant', content: JSON.stringify({
+      version: 1, outcome: 'completed', summary: flow.childReport, reported_evidence: [],
+      reported_verification: [], proposals: [], blockers: [], open_decisions: [] }) };
   }
   if (step === 0) {
-    // Intentionally unadvertised on an ordinary Ultra Root: test the final
-    // authority gate rather than treating absence from the catalog as proof.
+    // Submit an unadvertised management operation on an ordinary Ultra Root.
+    // Require an actual backend refusal, not catalog absence; the current
+    // callability fence can reject it before the deeper identity check.
     return { role: 'assistant', content: null, tool_calls: [{ id: 'ordinary-denial', type: 'function',
       function: { name: 'session_control', arguments: '{"action":"scope"}' } }] };
   }
   const text = textContent(request.messages.findLast(m => m.role === 'tool')?.content);
-  requireFact(/(not allowed|not available|unavailable|requires|denied|unknown tool)/i.test(text)
+  requireFact(/(not allowed|not available|not callable|unavailable|requires|denied|unknown tool)/i.test(text)
     && /(session_control|Supervisor|orchestration)/i.test(text), 'ordinary_management_not_denied');
   flow.ordinaryDenied = true; return { role: 'assistant', content: 'Fixture management denial observed.' };
 }
-async function startProvider(c, flow, hooks, signal) {
+async function startProvider(c, flow, hooks, signal, fixture = {}) {
+  const providerMode = fixture.injected_provider || 'no_auth_local_scripted_no_fallback';
+  requireFact(['no_auth_local_scripted_no_fallback', 'synthetic_key_local_scripted_no_fallback'].includes(providerMode), 'injected_local_provider_required');
+  const synthetic = providerMode === 'synthetic_key_local_scripted_no_fallback';
+  requireFact(!synthetic || (uuid(fixture.fixture_id) && ['standard', 'ultra'].includes(c.mode)), 'fixture_identity_required');
+  const authorization = synthetic ? `Bearer bamboo-v2-native-fixture-${fixture.fixture_id}-${c.mode}` : undefined;
   let attempts = 0;
   const server = http.createServer(async (req, res) => {
     const reply = (status, value) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
     try {
       requireFact(++attempts <= 16, 'provider_http_attempt_budget');
-      requireFact(req.method === 'POST' && req.url === '/v1/chat/completions' && !req.headers.authorization
-        && !req.headers.cookie && !signal.aborted, 'provider_route_or_credentials_refused');
+      requireFact(req.method === 'POST' && req.url === '/v1/chat/completions' && req.headers.authorization === authorization
+        && req.headers.cookie === undefined && !signal.aborted, 'provider_route_or_credentials_refused');
       let size = 0; const chunks = [];
       for await (const chunk of req) { size += chunk.length; requireFact(size <= LIMIT, 'provider_request_size'); chunks.push(chunk); }
       let request; try { request = JSON.parse(Buffer.concat(chunks)); } catch { throw new Failure('provider_invalid_json'); }
@@ -373,9 +389,22 @@ async function startProvider(c, flow, hooks, signal) {
   c.provider_port = server.address().port;
   return async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); };
 }
-async function runCase(c, fixtureId, request, signal) {
+async function runCase(c, fixtureId, request, signal, injectedProvider = 'no_auth_local_scripted_no_fallback') {
   const api = async (route, body) => request(c.api_base, '/api/v1' + route, body, signal);
-  const get = async route => { const r = await api(route); requireFact(r.status === 200, 'canonical_read_failed'); return r.body; };
+  const get = async route => {
+    while (!signal.aborted) {
+      const r = await api(route);
+      // A concurrent owned management commit can expose Prepared proof. Wait
+      // for a newly verified canonical read; never repair authority or replay
+      // a mutation, and never reinterpret another conflict as success.
+      if (r.status === 409 && r.body.error?.code === 'session_authority_unavailable'
+        && /^\/sessions\/[A-Za-z0-9_.:-]+$/.test(route)) {
+        await new Promise(resolve => setTimeout(resolve, 100)); continue;
+      }
+      requireFact(r.status === 200, 'canonical_read_failed'); return r.body;
+    }
+    throw new Failure('fixture_deadline');
+  };
   const detail = async id => (await get('/sessions/' + encodeURIComponent(id))).session;
   const list = async () => { const v = await get('/sessions'); requireFact(Array.isArray(v.sessions) && v.sessions.length <= 16 && !v.has_more, 'fresh_fixture_session_list_required'); return v.sessions; };
   const waitFor = async check => {
@@ -393,29 +422,55 @@ async function runCase(c, fixtureId, request, signal) {
     && !sup.has_pending_question && !ordinary.has_pending_question && initialList.length === 2, 'fresh_mode_fixture_required');
   const scope = await get('/supervisor/default/scope');
   requireFact(scope.scope?.supervisor?.session_id === SUPERVISOR && scope.scope.allowed_projects?.length === 1
-    && scope.scope.allowed_projects[0] === c.project_id && Number.isSafeInteger(scope.scope.state_revision), 'explicit_fixture_project_scope_required');
+    && scope.scope.allowed_projects[0] === c.project_id && uuid(scope.scope.supervisor.incarnation_id)
+    && Number.isSafeInteger(scope.scope.state_revision), 'explicit_fixture_project_scope_required');
+  const work = await get('/tickets/scope');
+  requireFact(work.mutation_enabled === true, 'prepared_work_scope_required');
+  if (c.mode === 'standard') {
+    requireFact(work.available === false && work.availability?.kind === 'forbidden'
+      && work.availability.reason_code === 'supervisor_mode_required', 'standard_work_boundary_required');
+  } else {
+    requireFact(work.available === true && work.readable === true && work.availability?.kind === 'ready'
+      && work.binding?.supervisor_session_id === SUPERVISOR
+      && work.binding.scope_id === 'supervisor/' + scope.scope.supervisor.incarnation_id
+      && Number.isSafeInteger(work.binding.binding_revision) && work.binding.binding_revision > 0, 'prepared_work_scope_required');
+  }
   const flow = scenario(c, fixtureId);
   flow.createRequest = Object.freeze({ operation_id: c.operation_id, expected_state_revision: scope.scope.state_revision,
     project_id: c.project_id, workspace_path: c.workspace_path, message: flow.assignment, title: 'Synthetic v2 fixture Root' });
   const hooks = { waitRoot: id => waitFor(async () => settled(await detail(id))),
     waitChild: () => waitFor(async () => { const candidates = (await list()).filter(s => s.kind === 'child'); return candidates.length === 1 && settled(await detail(candidates[0].id)); }) };
-  const stopProvider = await startProvider(c, flow, hooks, signal);
+  const stopProvider = await startProvider(c, flow, hooks, signal, { injected_provider: injectedProvider, fixture_id: fixtureId });
   try {
     const submit = async (id, message) => {
       const r = await api('/chat', { session_id: id, message });
-      if (r.status === 403 && c.expected_standard_ticket_denial && id === SUPERVISOR) {
-        requireFact(JSON.stringify(r.body.error).includes('Supervisor orchestration authority required'), 'unexpected_standard_denial'); return false;
-      }
       requireFact(r.status === 201 || r.status === 200, 'chat_admission_failed');
       const run = await api('/sessions/' + encodeURIComponent(id) + '/execute', {});
       requireFact(run.status === 202 || run.status === 200, 'execute_admission_failed'); return true;
     };
-    const admitted = await submit(SUPERVISOR, flow.markers.supervisor);
-    if (!admitted) {
-      requireFact(stable(await list()) === stable(initialList) && stable(await get('/supervisor/default/scope')) === stable(scope)
+    if (c.mode === 'standard') {
+      const refusal = await api('/chat', { session_id: SUPERVISOR,
+        message: 'BAMBOO_NATIVE_FORMAL_WORK_ONLY:' + fixtureId, thread_id: 'native-work-' + fixtureId });
+      requireFact(refusal.status === 403 && JSON.stringify(refusal.body.error).includes('Supervisor orchestration authority required'), 'unexpected_standard_denial');
+      // Existing native chat preparation can materialize its System checkpoint
+      // and managed workspace before Work admission refuses the User envelope.
+      // Permit only those exact changes; User/Tool history, other Sessions,
+      // permissions, membership and management scope must remain unchanged.
+      const afterRefusal = await list(), rejectedHistory = messages(await get('/sessions/' + SUPERVISOR + '/history'));
+      const expectedList = structuredClone(initialList), expectedSup = expectedList.find(s => s.id === SUPERVISOR);
+      const actualSup = afterRefusal.find(s => s.id === SUPERVISOR);
+      const systemOnly = rejectedHistory.length === 1 && rejectedHistory[0].role === 'system'
+        && !textContent(rejectedHistory[0].content).includes('BAMBOO_NATIVE_FORMAL_WORK_ONLY:' + fixtureId);
+      if (systemOnly && actualSup) {
+        expectedSup.message_count = 1;
+        if (!expectedSup.workspace_path && actualSup.workspace_path === path.join(c.data_dir, 'workspaces', SUPERVISOR))
+          expectedSup.workspace_path = actualSup.workspace_path;
+      }
+      requireFact((rejectedHistory.length === 0 || systemOnly) && stable(afterRefusal) === stable(expectedList)
+        && stable(await get('/supervisor/default/scope')) === stable(scope)
         && flow.requests === 0, 'standard_refusal_had_side_effects');
-      return { mode: c.mode, status: 'BLOCKED_EXISTING_STANDARD_TICKET_GATE', provider_requests: 0, v2_positive: 'UNRUN' };
     }
+    await submit(SUPERVISOR, flow.markers.supervisor);
     const finalSupervisor = await waitFor(async () => { const s = await detail(SUPERVISOR); return settled(s) && s; });
     requireFact(finalSupervisor.last_run_status === 'completed' && flow.rootId, 'supervisor_did_not_complete');
     const root = await detail(flow.rootId), children = (await list()).filter(s => s.parent_session_id === root.id);
@@ -432,17 +487,19 @@ async function runCase(c, fixtureId, request, signal) {
       && stable((await list()).map(s => s.id).sort()) === stable(beforeList), 'ordinary_management_side_effect');
     requireFact(flow.errors.length === 0, 'scripted_provider_errors');
     return { mode: c.mode, status: 'PASS', root_retry_deduplicated: true, child_notification_observed: true,
-      independent_root: true, shared_workspace_child: true, ordinary_management_denied: true, provider_requests: flow.requests };
+      independent_root: true, shared_workspace_child: true, ordinary_management_denied: true,
+      standard_formal_work_refused: c.mode === 'standard', formal_work_human_ingress: c.mode === 'ultra',
+      formal_work_dispatch: 'UNRUN', provider_requests: flow.requests };
   } finally { await stopProvider(); }
 }
 async function runSuite(config, request = jsonRequest) {
-  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 30000), cases = [];
+  const controller = new AbortController(), timer = setTimeout(() => controller.abort(), 120000), cases = [];
   try {
     for (const c of config.cases) {
       const file = path.join(c.workspace_path, 'bamboo-v2-native-fixture.txt'), flow = scenario(c, config.fixture_id);
       const handle = await fs.open(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), 0o600);
       try { await handle.writeFile(flow.fileContent); } finally { await handle.close(); }
-      cases.push(await runCase(c, config.fixture_id, request, controller.signal));
+      cases.push(await runCase(c, config.fixture_id, request, controller.signal, config.injected_provider));
     }
     return { status: cases.every(c => c.status === 'PASS') ? 'PASS' : 'PARTIAL', cases };
   } finally { controller.abort(); clearTimeout(timer); }
