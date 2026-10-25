@@ -188,7 +188,17 @@ async function mockHost(t, mode, options = {}) {
       binding: { supervisor_session_id: sup.id, scope_id: 'supervisor/' + fixtureId, binding_revision: 1 }
     });
     if (req.url === '/api/v1/chat') {
-      if (mode === 'standard' && body.session_id === sup.id && (body.thread_id || options.standardDenial)) return send(403, { code: 'scope_denied', error: { message: options.wrongDenial ? 'unrelated access error' : 'Supervisor orchestration authority required' } });
+      if (mode === 'standard' && body.session_id === sup.id && (body.thread_id || options.standardDenial)) {
+        if (options.lazySystemCheckpoint) {
+          sup.workspace_path = path.join(modeCase.data_dir, 'workspaces', sup.id);
+          sup.message_count = 1;
+          histories.set(sup.id, [{ role: 'system', content: 'Existing native system prompt.' }]);
+          if (options.refusalUserWrite) { histories.get(sup.id).push({ role: 'user', content: body.message }); sup.message_count++; }
+          if (options.refusalOrdinaryPermission) ordinary.permission_mode = 'auto';
+          if (options.refusalScopeWrite) scope.scope.state_revision++;
+        }
+        return send(403, { code: 'scope_denied', error: { message: options.wrongDenial ? 'unrelated access error' : 'Supervisor orchestration authority required' } });
+      }
       sessions.get(body.session_id).message_count++; return send(201, { session_id: body.session_id });
     }
     const match = /^\/api\/v1\/sessions\/([^/]+)(\/history|\/execute)?$/.exec(req.url);
@@ -511,3 +521,16 @@ test('STOCK_CLI_FIXTURE: Standard permits Root composition while its explicit Wo
   assert.equal(f.calls.filter(c => c.url === '/api/v1/chat' && c.body.thread_id).length, 1);
   assert.deepEqual(f.errors, []);
 });
+
+
+test('NATIVE CHECKPOINT: formal Work refusal permits only native system/workspace initialization', async t => {
+  const f = await mockHost(t, 'standard', { lazySystemCheckpoint: true });
+  const result = await d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] });
+  assert.equal(result.status, 'PASS');
+});
+for (const rejected of ['refusalUserWrite', 'refusalOrdinaryPermission', 'refusalScopeWrite']) {
+  test(`NATIVE CHECKPOINT: refusal still rejects ${rejected}`, async t => {
+    const f = await mockHost(t, 'standard', { lazySystemCheckpoint: true, [rejected]: true });
+    await assert.rejects(d.runSuite({ fixture_id: f.fixtureId, cases: [f.case] }), e => e.code === 'standard_refusal_had_side_effects');
+  });
+}
