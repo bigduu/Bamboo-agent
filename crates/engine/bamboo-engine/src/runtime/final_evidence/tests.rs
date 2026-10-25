@@ -292,10 +292,7 @@ async fn dispatch_is_single_scoped_and_read_only_with_authoritative_usage() {
     );
     assert_eq!(request.options.required_tool.as_deref(), Some(REPORT_TOOL));
     assert_eq!(request.options.parallel_tool_calls, Some(false));
-    assert_eq!(
-        request.options.reasoning_effort,
-        Some(ReasoningEffort::High)
-    );
+    assert_eq!(request.options.reasoning_effort, Some(ReasoningEffort::Max));
     assert_eq!(
         request.options.session_id.as_deref(),
         Some(session.id.as_str())
@@ -304,6 +301,42 @@ async fn dispatch_is_single_scoped_and_read_only_with_authoritative_usage() {
     assert!(request.messages[0]
         .content
         .contains("success=null is unknown"));
+}
+
+#[tokio::test]
+async fn final_evidence_requests_preserve_selected_reasoning_effort() {
+    for effort in [
+        None,
+        Some(ReasoningEffort::Disabled),
+        Some(ReasoningEffort::Low),
+        Some(ReasoningEffort::Medium),
+        Some(ReasoningEffort::High),
+        Some(ReasoningEffort::Xhigh),
+        Some(ReasoningEffort::Max),
+    ] {
+        let session = session_with_result("10 passed; exit 0", true);
+        let provider = RecordingProvider::new(Response::Chunks(vec![
+            LLMChunk::ToolCalls(vec![report("supported", None, &["check-1"])]),
+            LLMChunk::Done,
+        ]));
+        let cancel = CancellationToken::new();
+        let timeout = StreamTimeoutContext::default();
+        let mut request_frame = frame(&cancel, &timeout);
+        request_frame.reasoning_effort = effort;
+        let result = evaluate_final_evidence(
+            &session,
+            "10 tests passed.",
+            provider.clone(),
+            &request_frame,
+            || {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.verdict, Some(FinalEvidenceVerdict::Supported));
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].options.reasoning_effort, effort);
+    }
 }
 
 /// Fixed provider responses certify the correction contract, not model quality.

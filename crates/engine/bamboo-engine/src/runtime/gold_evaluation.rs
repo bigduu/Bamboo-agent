@@ -67,15 +67,6 @@ pub(crate) struct AsyncGoldEvaluationResult {
     pub(crate) evaluation_result: GoldEvaluationResult,
 }
 
-fn normalize_lightweight_reasoning_effort(
-    reasoning_effort: Option<ReasoningEffort>,
-) -> Option<ReasoningEffort> {
-    reasoning_effort.map(|effort| match effort {
-        ReasoningEffort::Xhigh | ReasoningEffort::Max => ReasoningEffort::High,
-        other => other,
-    })
-}
-
 fn estimate_prompt_tokens(messages: &[Message]) -> u64 {
     let counter = TiktokenTokenCounter::default();
     u64::from(counter.count_messages(messages))
@@ -236,10 +227,9 @@ where
     let prompt_tokens = estimate_prompt_tokens(&messages);
     let tools = get_gold_evaluation_tools();
 
-    let request_reasoning_effort = normalize_lightweight_reasoning_effort(reasoning_effort);
     let request_options = LLMRequestOptions {
         session_id: Some(session_id.to_string()),
-        reasoning_effort: request_reasoning_effort,
+        reasoning_effort,
         parallel_tool_calls: None,
         required_tool: None,
         responses: None,
