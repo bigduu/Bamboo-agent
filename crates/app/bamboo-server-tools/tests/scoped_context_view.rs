@@ -234,6 +234,18 @@ async fn two_project_supervisor_views_are_bounded_immutable_and_survive_reopen()
         header["limit"] = json!(40);
         let header = result(f.tool().invoke(header, ctx(&f.supervisor)).await.unwrap());
         let content = header["content"].as_str().unwrap();
+        assert_eq!(receipt["scope"]["caller_session_id"], f.supervisor.id);
+        assert_eq!(
+            receipt["scope"]["root_session_id"],
+            f.supervisor.root_session_id
+        );
+        assert_eq!(
+            content
+                .lines()
+                .find_map(|line| line.strip_prefix("- Root: ")),
+            Some(target.root_session_id.as_str()),
+            "status Root describes the target, not caller provenance"
+        );
         assert!(content.contains("- Schema: session-context-view.scoped.v1"));
         assert!(content.contains(&format!(
             "- Source digest: {}",
@@ -302,6 +314,26 @@ async fn child_read_scope_does_not_inherit_supervisor_or_send_authority() {
     .await;
     let receipt = f.export(&child, 0).await;
     f.read(&child, 0, &receipt).await;
+    for (index, target) in f.targets.iter().enumerate() {
+        let child_receipt = f.export(&child, index).await;
+        assert_eq!(child_receipt["scope"]["caller_session_id"], child.id);
+        assert_eq!(
+            child_receipt["scope"]["root_session_id"],
+            child.root_session_id
+        );
+        let mut header = request(target, &child_receipt);
+        header["limit"] = json!(40);
+        let header = result(f.tool().invoke(header, ctx(&child)).await.unwrap());
+        assert_eq!(
+            header["content"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("- Root: ")),
+            Some(target.root_session_id.as_str()),
+            "a Child reader cannot relabel an independent target's Root"
+        );
+    }
     let token = f
         .store
         .find_host_session_scope(&SessionCallerReference::from(&child))
