@@ -433,20 +433,33 @@ pub fn resolve_task_summary_model(
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
-    if config.features.provider_model_ref {
-        if let Some(defaults) = config.defaults.as_ref() {
-            return resolve_role_ref_chain(
-                provider_registry,
-                [
-                    defaults.task_summary.as_ref(),
-                    defaults.fast.as_ref(),
-                    Some(&defaults.chat),
-                ],
-            );
+    match try_resolve_task_summary_model(config, provider_name, provider_registry) {
+        Ok(model) => model,
+        Err(error) => {
+            tracing::warn!(%error, "Configured task-summary route is unavailable");
+            None
         }
     }
+}
 
-    resolve_fast_model(config, provider_name, provider_registry)
+/// Resolve saved global roles even when an older settings client omitted the
+/// primary-chat rollout flag. Only unset roles fall back; an explicit route
+/// failure remains an error, never a reason to switch provider accounts.
+pub fn try_resolve_task_summary_model(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Result<Option<ResolvedModel>, LLMError> {
+    if let Some(defaults) = config.defaults.as_ref() {
+        let model_ref = defaults
+            .task_summary
+            .as_ref()
+            .or(defaults.fast.as_ref())
+            .unwrap_or(&defaults.chat);
+        let provider = ProviderModelRouter::new(provider_registry.clone()).route(model_ref)?;
+        return Ok(Some(ResolvedModel::from_ref(provider, model_ref)));
+    }
+    Ok(resolve_fast_model(config, provider_name, provider_registry))
 }
 
 /// Resolve the background/fast summarization model considering both

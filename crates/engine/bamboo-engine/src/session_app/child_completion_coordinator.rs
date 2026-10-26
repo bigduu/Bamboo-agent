@@ -2119,6 +2119,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                     .map(|m| m.model_name.clone()),
                 background_model_provider: areas.background.map(|m| m.provider),
                 summarization_model_provider: areas.summarization.map(|m| m.provider),
+                summarization_model_error: areas.summarization_error,
             }
         });
         let model_roster = crate::ModelRoster {
