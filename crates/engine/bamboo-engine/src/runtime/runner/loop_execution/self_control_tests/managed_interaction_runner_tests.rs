@@ -135,9 +135,9 @@ impl Tool for ForeignInteractionTool {
 
 #[derive(Clone, Copy, Debug)]
 enum InteractionSequence {
-    SameBatchAsStart,
-    AfterStart,
-    WithoutStart,
+    SameBatch,
+    Later,
+    Unmanaged,
 }
 
 struct InteractionProvider {
@@ -206,15 +206,15 @@ impl LLMProvider for InteractionProvider {
             .unwrap();
         self.durable_seen.lock().unwrap().push(durable);
         let output = match (self.sequence, round) {
-            (InteractionSequence::SameBatchAsStart, 1) => {
+            (InteractionSequence::SameBatch, 1) => {
                 let LLMChunk::ToolCalls(mut calls) = start_call(2, 8) else {
                     unreachable!("existing helper emits the real Start call")
                 };
                 calls.push(foreign_interaction_call());
                 LLMChunk::ToolCalls(calls)
             }
-            (InteractionSequence::AfterStart, 1) => start_call(2, 8),
-            (InteractionSequence::AfterStart, 2) | (InteractionSequence::WithoutStart, 1) => {
+            (InteractionSequence::Later, 1) => start_call(2, 8),
+            (InteractionSequence::Later, 2) | (InteractionSequence::Unmanaged, 1) => {
                 LLMChunk::ToolCalls(vec![foreign_interaction_call()])
             }
             // RED sources may suspend before reaching these rounds. Do not
@@ -375,9 +375,9 @@ async fn assert_managed_interaction_continues(
         "{shape:?}/{sequence:?}"
     );
     let expected_rounds = match sequence {
-        InteractionSequence::SameBatchAsStart => 3,
-        InteractionSequence::AfterStart => 4,
-        InteractionSequence::WithoutStart => unreachable!(),
+        InteractionSequence::SameBatch => 3,
+        InteractionSequence::Later => 4,
+        InteractionSequence::Unmanaged => unreachable!(),
     };
     assert_eq!(
         provider.calls.load(Ordering::SeqCst),
@@ -443,49 +443,50 @@ async fn assert_managed_interaction_continues(
     for snapshot in provider.durable_seen.lock().unwrap().iter() {
         assert_no_interaction_wait(snapshot);
     }
-    let observations = provider.seen.lock().unwrap();
-    for messages in observations.iter() {
-        assert!(messages
-            .iter()
-            .any(|message| message.content == ORIGINAL_FACT));
-        assert!(!messages.iter().any(|message| message
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("runtime_kind"))
-            .and_then(Value::as_str)
-            == Some("max_rounds_summary")));
-    }
-    let answer_round = match sequence {
-        InteractionSequence::SameBatchAsStart => 2,
-        InteractionSequence::AfterStart => 3,
-        InteractionSequence::WithoutStart => unreachable!(),
-    };
-    for round in answer_round..=expected_rounds {
-        let answer = format!("Real bounded objective answer from provider round {round}.");
-        assert!(
-            fixture
-                .session
-                .messages
+    {
+        let observations = provider.seen.lock().unwrap();
+        for messages in observations.iter() {
+            assert!(messages
                 .iter()
-                .any(|message| message.role == Role::Assistant && message.content == answer),
-            "each iteration requires its actual no-tool answer"
-        );
+                .any(|message| message.content == ORIGINAL_FACT));
+            assert!(!messages.iter().any(|message| message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("runtime_kind"))
+                .and_then(Value::as_str)
+                == Some("max_rounds_summary")));
+        }
+        let answer_round = match sequence {
+            InteractionSequence::SameBatch => 2,
+            InteractionSequence::Later => 3,
+            InteractionSequence::Unmanaged => unreachable!(),
+        };
+        for round in answer_round..=expected_rounds {
+            let answer = format!("Real bounded objective answer from provider round {round}.");
+            assert!(
+                fixture
+                    .session
+                    .messages
+                    .iter()
+                    .any(|message| message.role == Role::Assistant && message.content == answer),
+                "each iteration requires its actual no-tool answer"
+            );
+        }
     }
-    drop(observations);
     fixture.close().await;
 }
 
 #[tokio::test]
 async fn self_control_managed_foreign_interaction_shapes_cannot_suspend_after_start() {
     for shape in INTERACTION_SHAPES {
-        assert_managed_interaction_continues(shape, InteractionSequence::AfterStart).await;
+        assert_managed_interaction_continues(shape, InteractionSequence::Later).await;
     }
 }
 
 #[tokio::test]
 async fn self_control_start_and_foreign_question_same_batch_recheck_active_policy() {
     for shape in INTERACTION_SHAPES {
-        assert_managed_interaction_continues(shape, InteractionSequence::SameBatchAsStart).await;
+        assert_managed_interaction_continues(shape, InteractionSequence::SameBatch).await;
     }
 }
 
@@ -512,7 +513,7 @@ async fn self_control_host_opt_in_without_start_preserves_ordinary_foreign_quest
         })
         .unwrap();
     let provider = Arc::new(InteractionProvider::new(
-        InteractionSequence::WithoutStart,
+        InteractionSequence::Unmanaged,
         fixture.storage.clone(),
     ));
     let persistence = fixture

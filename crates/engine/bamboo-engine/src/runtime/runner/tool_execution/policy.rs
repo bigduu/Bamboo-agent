@@ -756,16 +756,36 @@ mod tests {
             ("mcp::Read", "{}", Ok(ToolResult::text(true, "same"))),
         ] {
             let mut guard = ToolPolicyGuard::default();
-            assert!(!observation_round(&mut guard, 0, &[observation.clone()]));
-            assert!(!observation_round(&mut guard, 1, &[observation.clone()]));
+            assert!(!observation_round(
+                &mut guard,
+                0,
+                std::slice::from_ref(&observation)
+            ));
+            assert!(!observation_round(
+                &mut guard,
+                1,
+                std::slice::from_ref(&observation)
+            ));
             assert!(!observation_round(
                 &mut guard,
                 2,
                 &[observation.clone(), breaker]
             ));
-            assert!(!observation_round(&mut guard, 3, &[observation.clone()]));
-            assert!(!observation_round(&mut guard, 4, &[observation.clone()]));
-            assert!(observation_round(&mut guard, 5, &[observation.clone()]));
+            assert!(!observation_round(
+                &mut guard,
+                3,
+                std::slice::from_ref(&observation)
+            ));
+            assert!(!observation_round(
+                &mut guard,
+                4,
+                std::slice::from_ref(&observation)
+            ));
+            assert!(observation_round(
+                &mut guard,
+                5,
+                std::slice::from_ref(&observation)
+            ));
         }
     }
     #[test]

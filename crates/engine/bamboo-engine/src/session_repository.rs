@@ -1131,6 +1131,30 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
     }
 }
 
+fn validate_bound_root_snapshot(
+    owner: &bamboo_domain::RootActorRuntimeWrite,
+    snapshot: &Session,
+) -> std::io::Result<()> {
+    if snapshot.id != owner.fence.actor_id
+        || snapshot.created_at != owner.created_at
+        || snapshot.kind != bamboo_domain::SessionKind::Root
+        || !snapshot.authority_identity.is_ordinary()
+    {
+        return Err(root_actor_binding_error("bound Root identity changed"));
+    }
+    owner
+        .conversation_generation
+        .check_canonical(snapshot)
+        .map_err(root_actor_binding_error)
+}
+
+fn root_actor_binding_error(reason: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        bamboo_domain::SessionAuthorityConflict(format!("Root Actor execution rejected: {reason}")),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2921,28 +2945,4 @@ mod tests {
             );
         }
     }
-}
-
-fn validate_bound_root_snapshot(
-    owner: &bamboo_domain::RootActorRuntimeWrite,
-    snapshot: &Session,
-) -> std::io::Result<()> {
-    if snapshot.id != owner.fence.actor_id
-        || snapshot.created_at != owner.created_at
-        || snapshot.kind != bamboo_domain::SessionKind::Root
-        || !snapshot.authority_identity.is_ordinary()
-    {
-        return Err(root_actor_binding_error("bound Root identity changed"));
-    }
-    owner
-        .conversation_generation
-        .check_canonical(snapshot)
-        .map_err(root_actor_binding_error)
-}
-
-fn root_actor_binding_error(reason: impl std::fmt::Display) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::WouldBlock,
-        bamboo_domain::SessionAuthorityConflict(format!("Root Actor execution rejected: {reason}")),
-    )
 }
