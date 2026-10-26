@@ -194,7 +194,10 @@ impl Fixture {
         let mut config = Config::from_data_dir(Some(home.path().to_path_buf()));
         config.provider = "followup-provider".into();
         // Keep this provider probe dedicated to the native Root turns.
-        config.memory.auto_dream_enabled = false;
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = false;
         let mut state =
             AppState::new_with_provider(home.path().to_path_buf(), config, probe.clone())
                 .await
