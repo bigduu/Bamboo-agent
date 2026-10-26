@@ -67,7 +67,7 @@ impl LLMProvider for LocalProvider {
     }
 }
 
-pub(crate) async fn host(root: &Path, provider: Arc<LocalProvider>) -> AppState {
+pub(crate) async fn host(root: &Path, provider: Arc<dyn LLMProvider>) -> AppState {
     let mut config: Config = serde_json::from_value(json!({
         "provider":"openai",
         "features":{"ticket_mutation":true,"ticket_dispatch":true},

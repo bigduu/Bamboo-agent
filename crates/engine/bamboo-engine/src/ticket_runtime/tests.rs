@@ -320,9 +320,34 @@ impl Fixture {
             },
         }];
         if project {
+            let contract = match &operations[0] {
+                Operation::Create { contract, .. } => contract.clone(),
+                _ => unreachable!(),
+            };
             operations.push(Operation::AssociateProject {
                 ticket_id: "work".into(),
                 project_id: "budget-fixture-project".parse().unwrap(),
+            });
+            operations.push(Operation::SetProjectContext {
+                work_id: "work".into(),
+                context: bamboo_tickets::ProjectContextSnapshot {
+                    project_id: "budget-fixture-project".parse().unwrap(),
+                    project_revision: 1,
+                    resource_revision: 1,
+                    workspace_binding: bamboo_domain::WorkspaceBinding {
+                        path: dir
+                            .path()
+                            .canonicalize()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                        label: None,
+                        git_common_dir: None,
+                    },
+                    contract_revision: 1,
+                    contract,
+                    sources: Default::default(),
+                },
             });
         }
         operations.extend([
