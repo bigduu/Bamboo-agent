@@ -3,6 +3,7 @@
 
 use bamboo_agent_core::tools::ExecutingSupervisorObservation;
 use bamboo_agent_core::{Message, Session, Storage, Tool, ToolCtx, ToolOutcome};
+use bamboo_domain::session::task::{TaskItem, TaskItemStatus, TaskList};
 use bamboo_domain::{
     ActorAncestorObservation, HostScopeSessionObservation, HostSessionRight as Right,
     HostSessionScopeBinding, HostSessionTargetScope, SessionCallerReference,
@@ -58,6 +59,19 @@ impl Fixture {
             target.add_message(Message::user("PRIVATE-TRANSCRIPT"));
             target.add_message(Message::assistant("PRIVATE-ASSISTANT", None));
             target.set_last_run_status("running");
+            target.task_list = Some(TaskList {
+                session_id: target.id.clone(),
+                title: "Task list detail".into(),
+                items: vec![TaskItem {
+                    id: "task-preview-id".into(),
+                    description: "Task description detail".into(),
+                    status: TaskItemStatus::Blocked,
+                    notes: "PRIVATE-TASK-NOTES".into(),
+                    ..Default::default()
+                }],
+                created_at: target.created_at,
+                updated_at: target.updated_at,
+            });
             store.save_session(&target).await.unwrap();
             targets.push(target);
         }
@@ -137,6 +151,17 @@ impl Fixture {
         ancestors: Vec<ActorAncestorObservation>,
         revision: u64,
     ) {
+        self.install_rights(caller, ancestors, revision, &[Right::ReadContextView])
+            .await;
+    }
+
+    async fn install_rights(
+        &self,
+        caller: &Session,
+        ancestors: Vec<ActorAncestorObservation>,
+        revision: u64,
+        rights: &[Right],
+    ) {
         self.store
             .install_host_session_scope(
                 revision,
@@ -157,7 +182,7 @@ impl Fixture {
                                         vec![],
                                     )
                                     .unwrap(),
-                                    rights: [Right::InspectBoundedProgress].into(),
+                                    rights: rights.iter().copied().collect(),
                                 },
                             )
                         })
@@ -218,6 +243,7 @@ async fn two_project_supervisor_views_are_bounded_immutable_and_survive_reopen()
                 "PRIVATE-TRANSCRIPT",
                 "PRIVATE-ASSISTANT",
                 "PRIVATE-MODEL",
+                "PRIVATE-TASK-NOTES",
                 "/private/",
             ] {
                 assert!(!content.contains(private), "{private} leaked in {file}");
@@ -533,4 +559,182 @@ async fn ordinary_root_self_export_preserves_the_existing_host_routed_contract()
         )
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn old_metadata_and_progress_rights_do_not_grant_context_task_details() {
+    let f = Fixture::new().await;
+    f.install(&f.supervisor, vec![], 0).await;
+    let receipt = f.export(&f.supervisor, 0).await;
+    let mut brief = request(&f.targets[0], &receipt);
+    brief["file"] = json!("brief");
+    brief["limit"] = json!(40);
+    let admitted = result(
+        f.tool()
+            .invoke(brief.clone(), ctx(&f.supervisor))
+            .await
+            .unwrap(),
+    );
+    assert!(admitted["content"]
+        .as_str()
+        .unwrap()
+        .contains("Task description detail"));
+    for (revision, right) in [(1, Right::InspectBoundedProgress), (2, Right::ListMetadata)] {
+        f.install_rights(&f.supervisor, vec![], revision, &[right])
+            .await;
+        let denied = f
+            .tool()
+            .invoke(brief.clone(), ctx(&f.supervisor))
+            .await
+            .unwrap_err();
+        assert!(
+            denied.to_string().contains("host_session_scope_denied"),
+            "the new right is checked before selecting old files: {denied}"
+        );
+        let denied = f
+            .tool()
+            .invoke(
+                json!({"action":"export_context", "session_id":f.targets[0].id}),
+                ctx(&f.supervisor),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            denied.to_string().contains("host_session_scope_denied"),
+            "old grant cannot fall back to the Supervisor managed link: {denied}"
+        );
+        if right == Right::InspectBoundedProgress {
+            let old = result(
+                f.tool()
+                    .invoke(
+                        json!({"action":"inspect", "session_id":f.targets[0].id}),
+                        ctx(&f.supervisor),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(old["task_counts"]["blocked"], 1);
+            assert!(!old.to_string().contains("Task description detail"));
+            assert!(!old.to_string().contains("Task list detail"));
+            assert!(!old.to_string().contains("task-preview-id"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn context_right_grants_neither_progress_history_listing_nor_actual_inbox_send() {
+    use bamboo_domain::{
+        SessionInboxPort, SessionMessageBody, SessionMessageContent, SessionMessageDeliveryIntent,
+        SessionMessageEnvelope, SessionMessageKind, SessionMessageSource,
+    };
+    let f = Fixture::new().await;
+    let mut caller = Session::new("view-only-reader", "model");
+    caller.set_project_id_meta("reader-project");
+    f.store.save_session(&caller).await.unwrap();
+    f.install(&caller, vec![], 0).await;
+    let receipt = f.export(&caller, 0).await;
+    f.read(&caller, 0, &receipt).await;
+    assert_eq!(
+        serde_json::to_value(Right::ReadContextView).unwrap(),
+        json!("read_context_view")
+    );
+    for action in [
+        "inspect",
+        "read_messages",
+        "get_meta",
+        "read_compressed_cache",
+    ] {
+        assert!(
+            f.tool()
+                .invoke(
+                    json!({"action":action,"session_id":f.targets[0].id}),
+                    ctx(&caller)
+                )
+                .await
+                .is_err(),
+            "{action}"
+        );
+    }
+    let page = result(
+        f.tool()
+            .invoke(json!({"action":"list"}), ctx(&caller))
+            .await
+            .unwrap(),
+    );
+    assert!(page["sessions"].as_array().unwrap().is_empty());
+    let original = SessionCallerReference::from(&caller);
+    let token = f
+        .store
+        .find_host_session_scope(&original)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(f
+        .store
+        .load_host_scoped_target(&token, &original, &f.targets[0].id)
+        .await
+        .is_err());
+    let operation = "view-right-cannot-send";
+    let id = bamboo_domain::session_peer_message_id(
+        &caller.id,
+        caller.created_at,
+        &f.targets[0].id,
+        f.targets[0].created_at,
+        operation,
+    );
+    let envelope = SessionMessageEnvelope {
+        thread_id: Some(id.to_string()),
+        id,
+        source: SessionMessageSource::Session {
+            session_id: caller.id.clone(),
+        },
+        target_session_id: f.targets[0].id.clone(),
+        kind: SessionMessageKind::PeerMessage,
+        body: SessionMessageBody::Content(SessionMessageContent::text("must not be sent")),
+        created_at: chrono::Utc::now(),
+        in_reply_to: None,
+        attempt: None,
+        correlation_id: Some(operation.into()),
+    };
+    let inbox = bamboo_storage::FileSessionInbox::new(f.store.clone(), Default::default());
+    let before = inbox.inspect(&f.targets[0].id).await.unwrap();
+    let denied = inbox
+        .deliver_host_scoped_peer_message(
+            &token,
+            &original,
+            &envelope,
+            SessionMessageDeliveryIntent::QueueOnly,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        denied.to_string().contains("host_session_scope_denied"),
+        "{denied}"
+    );
+    assert_eq!(inbox.inspect(&f.targets[0].id).await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn upgrade_reuses_the_original_legacy_manifest_byte_encoding() {
+    let f = Fixture::new().await;
+    let caller = &f.targets[0];
+    let args = json!({"action":"export_context", "session_id":caller.id});
+    let receipt = result(f.tool().invoke(args.clone(), ctx(caller)).await.unwrap());
+    let path = receipt["manifest_path"].as_str().unwrap();
+    let produced: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    // This is the pre-#2295 encoder's exact construction order. The locked
+    // serde_json graph enables preserve_order, and immutable reuse compares bytes.
+    let old_encoding = json!({
+        "schema_version":produced["schema_version"], "revision":produced["revision"],
+        "source_digest":produced["source_digest"], "scope":produced["scope"],
+        "source_observed_at":produced["source_observed_at"],
+        "observation":produced["observation"], "files":produced["files"],
+        "filenames":produced["filenames"],
+    });
+    let bytes = serde_json::to_vec_pretty(&old_encoding).unwrap();
+    std::fs::write(path, &bytes).unwrap();
+    let reused = result(f.tool().invoke(args, ctx(caller)).await.unwrap());
+    assert_eq!(reused["revision"], receipt["revision"]);
+    assert_eq!(reused["reused"], true);
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
 }

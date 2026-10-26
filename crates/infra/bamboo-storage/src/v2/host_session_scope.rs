@@ -353,7 +353,7 @@ impl SessionStoreV2 {
         let scope = self.host_scope_registry.retain(token, caller).await?;
         let binding = scope.token().binding();
         let target = binding
-            .target(target_id, HostSessionRight::InspectBoundedProgress)
+            .target(target_id, HostSessionRight::ReadContextView)
             .map_err(|error| denied(error.to_string()))?
             .observation
             .clone();
