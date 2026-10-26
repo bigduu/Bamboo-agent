@@ -585,6 +585,12 @@ async fn no_host_policy_keeps_empty_and_ready_queues_provider_free() {
 #[tokio::test]
 async fn policy_wake_runs_real_child_task_and_submits_once_without_auto_acceptance() {
     let mut fixture = Fixture::new(1).await;
+    #[cfg(unix)]
+    let (supervisor_id, inbox_before) = {
+        let target = fixture.snapshot().binding.supervisor_session_id;
+        let before = fixture.state.session_inbox.inspect(&target).await.unwrap();
+        (target, before)
+    };
     fixture
         .state
         .tickets
@@ -677,18 +683,136 @@ async fn policy_wake_runs_real_child_task_and_submits_once_without_auto_acceptan
             .open_patrol_checkpoints(&scope)
             .await
             .unwrap();
-        let stored = bamboo_orchestration::patrol::CheckpointPort::load(&mut journal, &scope)
+        use bamboo_orchestration::patrol::CheckpointPort;
+        // This must already exist because the real installed worker observed
+        // the Work. The test must not create its missing checkpoint or incident.
+        let observed = journal
+            .load(&scope)
             .unwrap()
             .expect("existing Ready reconcile must persist its program observation");
+        let observed_incident = observed
+            .checkpoint
+            .incident
+            .as_ref()
+            .expect("the actual Ready worker must observe the changed canonical Work");
+        assert_eq!(observed_incident.id.scope, scope);
+        assert_eq!(observed_incident.attempts, 0);
+        let original_incident = observed_incident.id.clone();
+        let original_operation = observed_incident
+            .escalation
+            .as_ref()
+            .expect("changed canonical Work produces a pending decision")
+            .operation
+            .clone();
+        drop(journal);
+        fixture
+            .state
+            .tickets
+            .install_ready_work_policy(fixture.policy(1))
+            .await
+            .unwrap();
+        // The assembled Host includes the separately fenced delivery adapter.
+        // Wait for its real Inbox ACK, rather than sampling an arbitrary pass.
+        // Program-only 0/false remains covered by the orchestration test
+        // missing_measurements_keep_one_pending_undelivered_incident.
+        let stored = tokio::time::timeout(WAIT, async {
+            loop {
+                fixture.state.tickets.wake_ready_work();
+                fixture.state.tickets.reconcile_ready_work().await.unwrap();
+                if let Ok(mut journal) = fixture.state.tickets.open_patrol_checkpoints(&scope).await
+                {
+                    let stored = journal
+                        .load(&scope)
+                        .unwrap()
+                        .expect("existing Ready observation has a canonical checkpoint");
+                    if stored
+                        .checkpoint
+                        .incident
+                        .as_ref()
+                        .and_then(|incident| incident.escalation.as_ref())
+                        .is_some_and(|escalation| escalation.queued)
+                    {
+                        break stored;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the assembled Host must acknowledge its original pending notice");
         let incident = stored.checkpoint.incident.unwrap();
         assert_eq!(incident.id.scope, scope);
+        assert_eq!(incident.id, original_incident);
         assert_eq!(incident.attempts, 0);
-        let escalation = incident
-            .escalation
-            .expect("changed canonical Work produces a pending decision");
-        assert_eq!(escalation.deliveries, 0);
-        assert!(!escalation.queued);
-        drop(journal);
+        let escalation = incident.escalation.expect("canonical pending decision");
+        assert_eq!(escalation.operation, original_operation);
+        assert_eq!(escalation.deliveries, 1);
+        assert!(escalation.queued);
+        let delivered = fixture
+            .state
+            .session_inbox
+            .inspect(&supervisor_id)
+            .await
+            .unwrap();
+        assert_eq!(delivered.pending, inbox_before.pending + 1);
+        assert_eq!(
+            delivered.activation_generation,
+            inbox_before.activation_generation
+        );
+        assert_eq!(
+            delivered.interrupt_generation,
+            inbox_before.interrupt_generation
+        );
+        let mut notices = Vec::new();
+        for entry in std::fs::read_dir(
+            fixture
+                ._root
+                .path()
+                .join("sessions")
+                .join(&supervisor_id)
+                .join("inbox/new"),
+        )
+        .unwrap()
+        {
+            let transport: bamboo_subagent::InboxMessage =
+                serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap();
+            let notice: bamboo_domain::SessionMessageEnvelope =
+                serde_json::from_value(transport.body).unwrap();
+            if matches!(&notice.source, bamboo_domain::SessionMessageSource::Runtime { subsystem }
+                if subsystem == "ticket_patrol")
+            {
+                notices.push(notice);
+            }
+        }
+        assert_eq!(notices.len(), 1, "one original Patrol notice");
+        assert_eq!(notices[0].target_session_id, supervisor_id);
+        assert!(fixture
+            .state
+            .session_inbox
+            .existing_staged_delivery(&notices[0])
+            .await
+            .unwrap()
+            .is_some());
+        assert!(notices[0]
+            .to_provider_message()
+            .unwrap()
+            .content
+            .contains(&scope.work_id));
+        for _ in 0..3 {
+            fixture.state.tickets.reconcile_ready_work().await.unwrap();
+        }
+        assert_eq!(
+            fixture
+                .state
+                .session_inbox
+                .inspect(&supervisor_id)
+                .await
+                .unwrap(),
+            delivered,
+            "repeated reconciliation cannot enqueue or activate the notice again"
+        );
+        fixture.state.tickets.revoke_ready_work_policy().await;
+        fixture.assert_quiet(2).await;
     }
     #[cfg(not(unix))]
     assert!(
@@ -697,6 +821,11 @@ async fn policy_wake_runs_real_child_task_and_submits_once_without_auto_acceptan
             Err(bamboo_tickets::Error::AuthorityUnavailable(_))
         ),
         "unsupported file observation must leave the real Ready worker operational"
+    );
+    assert_eq!(
+        serde_json::to_value(fixture.snapshot()).unwrap(),
+        serde_json::to_value(snapshot).unwrap(),
+        "Patrol observation and delivery change no Work, Assignment, Submission or acceptance fact"
     );
     assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 2);
     fixture.state.shutdown().await;
