@@ -98,7 +98,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "cfed0ee23810e25fe086660fb94ba7806450255878c7f3da6f68a738f5ba4ff4"
+          ADMISSION_HELPER_SHA256: "7e23d459771da7fdb4e4f0195f5fe82bc2c735ff38ebb3b5af8de558f918bd34"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -406,7 +406,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 75
     env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/feature-all-features
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/feature-tests
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
@@ -420,8 +420,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
         with:
-          shared-key: bamboo-feature-all-features-${{ runner.os }}
-          workspaces: . -> target/feature-all-features
+          shared-key: bamboo-feature-configurations-${{ runner.os }}
+          workspaces: . -> target/feature-tests
           save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
       - name: Require exact feature source and committed frontend
         shell: bash
@@ -440,7 +440,7 @@ jobs:
             printf 'Target: %s\nDev debug: %s\nTest debug: %s\nIncremental: %s\n' "$CARGO_TARGET_DIR" "$CARGO_PROFILE_DEV_DEBUG" "$CARGO_PROFILE_TEST_DEBUG" "$CARGO_INCREMENTAL"
             df -Pk "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
           } | tee "$RUNNER_TEMP/bamboo-feature-profile.log"
-      - name: Run Unit, E2E, doctests and compiled live SSH once
+      - name: Run default and additive Unit/E2E with shared outputs
         run: node scripts/run-feature-tests.cjs
       - name: Record final feature disk usage
         if: always()
@@ -464,7 +464,7 @@ jobs:
         with:
           name: feature-unit-e2e-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/bamboo-feature-tests-*/*.log
+            ${{ runner.temp }}/bamboo-feature-tests-*/*
             ${{ runner.temp }}/bamboo-feature-profile.log
           if-no-files-found: ignore
           retention-days: 7

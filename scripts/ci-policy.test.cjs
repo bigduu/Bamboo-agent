@@ -258,9 +258,9 @@ test("legacy release matrices retain their original crate and server coverage", 
   assert.match(job("main-release-admission"), /^    permissions:\n      contents: read\n      actions: read\n/mu)
 })
 
-test("one feature executor owns the complete existing package and target catalog", () => {
-  const { selectedPackages, cargoArguments } = require('./run-feature-tests.cjs')
-  const result = spawnSync('cargo', ['metadata', '--locked', '--all-features', '--format-version', '1', '--no-deps'], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
+test("one feature executor preserves default configurations and complete explicit additive case ownership", () => {
+  const { selectedPackages, sourceFeatureHash, FEATURE_SOURCE_SHA256, FEATURE_CONTEXTS, cargoArguments } = require('./run-feature-tests.cjs')
+  const result = spawnSync('cargo', ['metadata', '--locked', '--format-version', '1', '--no-deps'], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
   assert.equal(result.status, 0, result.stderr)
   const metadata = JSON.parse(result.stdout), packages = selectedPackages(metadata)
   const expected = metadata.packages.filter(item => metadata.workspace_default_members.includes(item.id) || item.name === 'bamboo-tool-event-recorder-example')
@@ -271,10 +271,23 @@ test("one feature executor owns the complete existing package and target catalog
   const e2e = kinds.filter(target => target.kind.includes('test')).map(target => target.id)
   assert.ok(unit.length > 0 && e2e.length > 0)
   assert.deepEqual(unit.filter(id => e2e.includes(id)), [])
-  const args = cargoArguments(packages)
-  assert.equal(args.filter(arg => arg === '--all-features').length, 1)
-  assert.ok(!args.some(arg => ['--lib','--bins','--test','--tests','--doc','--all-targets'].includes(arg)))
-  assert.match(job('feature-tests'), /target\/feature-all-features/u)
+  for (const owner of packages) {
+    const args = cargoArguments(owner)
+    assert.equal(args.filter(arg => arg === '-p').length, 1)
+    assert.equal(args[args.indexOf('-p') + 1], owner.name)
+    assert.ok(!args.some(arg => ['--all-features','--features','--lib','--bins','--test','--tests','--doc','--all-targets'].includes(arg)))
+  }
+  assert.equal(sourceFeatureHash(packages, require('node:fs').realpathSync('.')), FEATURE_SOURCE_SHA256,
+    'New feature-sensitive source requires a reviewed ownership update')
+  assert.equal(FEATURE_CONTEXTS.flatMap(context => context.targets.flatMap(target => target.added)).length, 18)
+  assert.deepEqual(FEATURE_CONTEXTS.map(context => [context.package, context.features]), [
+    ['bamboo-infrastructure', ['otel-otlp', 'test-utils']], ['bamboo-tickets', ['test-utils']],
+    ['bamboo-server', ['test-utils']], ['bamboo-agent', ['ticket-runtime-fixtures']]])
+  for (const context of FEATURE_CONTEXTS) {
+    assert.ok(packages.some(owner => owner.name === context.package))
+    assert.ok(!cargoArguments({ name: context.package }, context).includes('--all-features'))
+  }
+  assert.match(job('feature-tests'), /target\/feature-tests/u)
   assert.match(job('feature-tests'), /run: node scripts\/run-feature-tests.cjs/u)
 })
 
@@ -319,7 +332,7 @@ test("serial Root birth selectors reuse canonical storage compilation and preser
   assert.deepEqual(SERIAL_STORAGE_FILTERS, ["root_birth_tests", "host_root_create::tests", "supervisor_management", "supervisor_proof"])
   const source = readFileSync("crates/infra/bamboo-storage/src/v2/root_birth_tests.rs", "utf8")
   assert.deepEqual([...source.matchAll(/async fn (root_birth_[a-z_]+)\(/gu)].map(match => match[1]).sort(), [...ROOT_BIRTH_CASES].sort())
-  const args = cargoArguments([{ name: "bamboo-storage" }])
+  const args = cargoArguments({ name: "bamboo-storage" })
   assert.deepEqual(args.slice(args.indexOf("--") + 1), SERIAL_STORAGE_SELECTORS.flatMap(prefix => ["--skip", prefix]))
   const lint = readFileSync(".github/workflows/root-birth-acceptance.yml", "utf8")
   assert.doesNotMatch(lint, /cargo test/u)
@@ -330,7 +343,7 @@ test("serial Root birth selectors reuse canonical storage compilation and preser
 function assertLinuxTestOwnership(definitions) {
   const registered = {
     "ci.yml": {
-      "feature-tests": "The canonical all-features product test executor",
+      "feature-tests": "The canonical isolated-default and explicit-feature test executor",
       "quick-checks": "Small synthetic workflow/controller policy fixtures",
       test: "Pinned legacy release policy fixtures; feature mode is admission only",
       "test-crates": "Pinned legacy release Unit acceptance until source cutover",

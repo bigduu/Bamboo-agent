@@ -16,17 +16,20 @@ Follow [Parallel Development](./gitflow.md). Give each bounded Issue one owner,
 branch and isolated worktree; only the named integrator writes a shared batch
 branch. Every feature PR to `dev` must pass required `Test`, which aggregates
 Unit, E2E and the live SSH fixture on its actual merge source. One Linux Cargo
-executor uses one all-features package selection and owned target directory;
-Cargo runs library/binary, integration and documentation tests once. The ignored
-SSH case reuses its already compiled executable. Unit/E2E are logical target
-groups, not separate compilation jobs. All agents add ordinary cases to that
+executor owns one target directory and preserves independent default package
+configurations. Cargo runs each package's library/binary, integration and
+documentation cases once. Explicit feature owners run only their catalogued
+additional cases; new feature-sensitive cases require ownership review.
+Compatible configurations reuse compiled artifacts, with features/profile and
+actual Cargo freshness recorded. The ignored SSH case reuses its compiled
+executable. Unit/E2E are logical target groups. All agents add ordinary cases to that
 Cargo target catalog, instead of creating another Linux workflow for a covered
 case subset. CI policy rejects unregistered Rust test producers; native OS,
 containment-boundary, explicit manual diagnostics and pinned legacy routes are
 scoped exceptions with named owners. Preserve
 applicable native-platform acceptance before dev admission. Fix failures in the
 feature branch before merging; record exact source, commands and results.
-Keep the storage authority families' serial runtime selection in that same
+Keep the standalone default storage authority families' serial selection in that same
 executor, reusing its compiled library-test executable without repeating cases.
 `Quick Checks` remains auxiliary and never substitutes for runtime tests.
 

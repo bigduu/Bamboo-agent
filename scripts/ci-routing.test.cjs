@@ -266,10 +266,10 @@ test("required Test admits only successful feature execution or the matching leg
   ]) assert.notEqual(run(overrides).status, 0);
 });
 
-test("feature execution uses one owned Cargo configuration and excludes duplicate Linux fixtures", () => {
+test("feature execution shares owned outputs across explicit configurations and excludes duplicate Linux fixtures", () => {
   const feature = job(ci, "feature-tests");
   assert.match(feature, /if: needs.validation-source.outputs.feature == 'true'/);
-  assert.match(feature, /CARGO_TARGET_DIR: \$\{\{ github.workspace \}\}\/target\/feature-all-features/);
+  assert.match(feature, /CARGO_TARGET_DIR: \$\{\{ github.workspace \}\}\/target\/feature-tests/);
   assert.match(feature, /run: node scripts\/run-feature-tests.cjs/);
   assert.match(feature, /node scripts\/frontend-package.cjs verify/);
   assert.doesNotMatch(feature, /cargo build|cargo test|continue-on-error|secrets\./);

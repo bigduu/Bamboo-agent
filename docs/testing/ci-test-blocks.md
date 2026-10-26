@@ -1,70 +1,80 @@
 # Feature Unit and E2E execution
 
-Every feature PR to `dev` uses one physical Linux Cargo executor and one owned
-`target/feature-all-features` directory. `scripts/run-feature-tests.cjs` reads the
-actual Cargo metadata and selects existing `default-members` plus the recorder;
-`bamboo-analytics` and unrelated example packages remain outside acceptance.
+Every feature PR to dev uses one physical Linux executor and one owned
+target/feature-tests directory. The controller selects existing Cargo
+default-members plus the recorder; analytics and unrelated example packages
+stay outside acceptance.
 
-The executor invokes `cargo test --locked --all-features --no-fail-fast` once,
-with an explicit `-p` for each selected package and Cargo's default target
-selection. That runs library/binary Unit tests, integration E2E targets and
-doctests without combining incompatible `--doc`/target flags or compiling the
-same server library test binary in separate crate/filter workers. Unit and E2E
-are logical target/reporting groups, not separate Cargo build jobs.
+Each package runs independently with its default features. Cargo's default
+target selection covers library/binary Unit cases, integration E2E cases and
+doctests once. Do not combine the selected packages into one Cargo command:
+workspace feature unification can enable test utilities in production-default
+dependencies. Unit/E2E are logical target groups, not separate build jobs.
 
-The Root birth/storage authority Unit selectors keep their original serial
-runtime requirement, including the matching session-merge regression. The Cargo
-invocation skips only their qualified selectors; the same compiled storage
-library-test executable then runs the original filters with `--test-threads=1`.
-Its discovered catalog and exact success log must match, including all five
-required families and four Root birth regressions. No case runs in both paths and no
-second Cargo invocation compiles it. The path-scoped Root Birth workflow retains
-its original strict Clippy policy, without another runtime test producer.
+The default infrastructure context must compile and execute the telemetry
+feature-unavailable regression. Tickets retain the direct production publication
+branches. Standalone storage retains its own default dependency configuration.
+Different configurations may require different compiled artifacts; their
+compatible units share the owned target without cleanup/recompilation cycles.
 
-Only this feature job sets dev/test debug info to `0`; it keeps debug assertions,
-the existing optimization settings and `CARGO_INCREMENTAL=0`. Formal release
-profiles are unchanged. All selected-package artifacts coexist in the owned
-target directory. The job preserves the exact toolchain/profile, available disk
-before/after execution and final target size. GitHub documents 14 GB SSD storage
-for [standard Ubuntu runners](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job);
-a full cold hosted run must establish that the
-complete suite fits. A small executor fixture or cache hit does not prove this.
-Do not recover capacity by deleting outputs and compiling the same targets again.
+Only these additive feature owners run extra cases:
 
-Cargo's JSON compiler-artifact record identifies the exact `russh_live`
-integration executable. The live Docker/SSH fixture uses that compiled binary
-with `--exact --ignored`; it never invokes Cargo again. Source checkout,
-`CARGO_BIN_EXE` paths, generated resources and working directory remain together
-in the same job. Runtime test evidence stays in the owned Cargo log artifact.
+| Package | Explicit features | Additional cases |
+| --- | --- | --- |
+| Infrastructure | otel-otlp, test-utils | 5 OTLP, 1 shutdown, 1 public test-API |
+| Tickets | test-utils | 5 file publication/reconciliation fault cases |
+| Server | test-utils | 1 credential Unit case, 1 env-cache integration case |
+| Agent | ticket-runtime-fixtures | 3 publication, 1 file reconciliation cases |
 
-The canonical executor already includes ordinary Linux orchestration, scoped
-context and recorder lifecycle cases. Separate workflows retain native
-Mac/Windows behavior and the Jiandu registry identity policy, rather than
-repeating those Linux test suites.
+Each owner first compiles its selected targets and compares their actual test
+catalog with the independently tested default catalog. Added/removed names must
+match the explicit map. Cargo then runs only the new names with exact filters;
+all compiler units must report fresh reuse. Common ordinary cases do not run
+again under another flag. The controller preserves package working directories,
+Cargo-generated resources and executable environment while running these cases.
 
-Mac/Windows TLS and recorder jobs still compile common server/dependency code in
-separate jobs. The macOS TLS guard deliberately uses the dev profile to check
-compact-unwind limits; other native cases retain their existing test profiles
-and feature sets. This slice removes duplicate ordinary Linux producers, but
-does not establish zero duplicate compilation on every OS. Native consolidation
-needs one owner/target directory per OS and compatible configuration, retaining
-the dev-profile unwind guard as its own configuration. It is a separate bounded
-dependency before claiming the complete no-duplication contract is active.
+A pinned inventory covers feature declarations, required-feature targets and
+full feature-sensitive source/module fingerprints, including macro additions. A new feature-gated case
+outside the mapped targets also fails admission until its ownership is reviewed.
+Update that inventory only after reviewing the default/additive case map.
+Ordinary cases in existing ungated targets join default execution automatically.
 
-Required `Test` rejects failed, missing, cancelled or skipped feature execution,
-Quick Checks and native fixture results. `E2E Tests` reports that same executor's
-result without executing tests again. A failure is repaired in the feature
-branch before dev admission. Rerun its failed job, preserving the original
-source and attempt evidence; a cache hit is not independent runtime proof.
+The original serial storage selectors retain --test-threads=1, including their
+matching session-merge regression. The Cargo invocation excludes those qualified
+selectors, then the same standalone default storage executable runs them.
+Its catalog and exact success log must match all five required families and
+four Root birth regressions. The Root Birth workflow retains strict Clippy
+analysis without another runtime producer.
 
-The release-source publication cutover is separate from #2311. Existing frozen
-release matrices/main admission and historical recovery remain unchanged until
-that change is accepted. Their crate jobs retain independent failed-job reruns:
+Cargo's JSON compiler-artifact record identifies the default broker's exact
+russh_live executable. The ignored Docker/SSH fixture uses it with exact/ignored
+selection immediately in that context, without another Cargo compilation.
 
-```sh
-gh run rerun RUN_ID -R bigduu/Bamboo-agent --job JOB_ID
-gh run rerun RUN_ID -R bigduu/Bamboo-agent --failed
-```
+Only this feature job sets dev/test debug info to 0; debug assertions, existing
+optimization settings and CARGO_INCREMENTAL=0 remain. Formal release profiles
+are unchanged. All context artifacts coexist. Evidence includes per-context
+commands, features/profile/fresh receipts, toolchain, before/after disk and final
+target size. Standard [Ubuntu runners](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job)
+advertise 14 GB SSD storage. A full cold hosted run must establish that the
+suite fits; a tiny executor fixture or cache hit does not prove capacity.
 
-See [CI and publication flow](../releases/ci-publication-flow.md) for activation
-boundaries. No new production dispatch is implied by feature admission.
+Ordinary Linux orchestration, scoped-context and recorder cases already belong
+to this executor. All agents use the same ownership path. Policy rejects new
+ordinary Linux PR Cargo-test producers, including tests hidden behind supported
+repository wrappers. Native OS, containment boundaries, explicit manual
+diagnostics and pinned legacy routes retain named scoped exceptions.
+
+Mac/Windows TLS and recorder jobs still compile common code in separate jobs.
+The macOS TLS guard deliberately uses a dev profile for compact-unwind checks.
+Native consolidation needs one owner/target per OS and compatible configuration;
+this slice does not establish ecosystem-wide zero duplicate compilation.
+
+Required Test rejects failed, missing, cancelled or skipped selected results.
+E2E Tests reports the same executor result without another runtime pass. Repair
+failures in the feature branch before dev admission. Keep original attempt and
+source evidence when rerunning a failed job.
+
+Release-source publication cutover is separate from #2311. Frozen legacy release
+matrices, main admission and historical recovery remain active until it lands.
+See [CI and publication flow](../releases/ci-publication-flow.md) for those
+activation boundaries. No new production dispatch is implied.

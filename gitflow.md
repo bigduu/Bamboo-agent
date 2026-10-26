@@ -32,9 +32,10 @@ phase ownership, evidence reuse, activation and recovery.
   failing relevant local tests block merge; a successful compile is not a
   substitute. Disclose unrun checks and the reason rather than claiming a pass.
 - PRs targeting dev must pass required `Test`, which aggregates disjoint Unit
-  and E2E runtime tests plus the live SSH fixture. One Linux Cargo invocation
-  uses one all-features package set and target directory for library/binary,
-  integration and documentation tests; SSH reuses its compiled executable.
+  and E2E runtime tests plus the live SSH fixture. One Linux executor preserves
+  independent default package contexts and explicitly catalogued feature
+  additions in one target directory. Ordinary library/binary, integration and
+  documentation cases run once; SSH reuses its compiled executable.
   Applicable native-platform workflows also run before
   admission. Fix failures in the feature branch before merging into dev.
   `Quick Checks` remains auxiliary. Do not assume automatic coverage exists for
@@ -129,8 +130,9 @@ validation receipts; cleanup is a separate owned action.
 The required `Test` gate aggregates Unit, E2E and SSH results on the actual
 feature PR merge source. A missing, skipped, cancelled or failed selected job
 fails admission. No standalone dev-profile workspace build precedes these tests. One physical
-Linux executor compiles/tests the selected packages once under all features;
-Unit/E2E remain logical target groups. Reuse the compiled ignored SSH executable
+Linux executor preserves isolated default configurations and narrow feature
+additions, reusing compatible compiled artifacts. Unit/E2E remain logical target
+groups. Reuse the compiled ignored SSH executable
 in that same checkout. Keep native-specific acceptance before dev admission.
 
 The target release path freezes the exact accepted dev cut, reserves one formal

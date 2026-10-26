@@ -213,9 +213,10 @@ described below.
 
 Follow [Parallel Development](./gitflow.md) for ownership and evidence. Every
 feature PR into `dev` runs required `Test`, aggregating Unit, E2E and the live SSH
-fixture. One physical Linux executor uses one all-features package set and target
-directory. Cargo runs library/binary, integration and documentation tests once;
-the ignored SSH case reuses its compiled executable. Applicable native
+fixture. One physical Linux executor preserves independent default package
+configurations in one target directory. Cargo runs ordinary library/binary,
+integration and documentation cases once; explicit feature owners run only
+catalogued additions. The ignored SSH case reuses its compiled executable. Applicable native
 acceptance also runs before dev admission. Before merge, owners must run affected tests locally and add or update coverage
 for changed behavior, recording exact source, commands and results. Failures are
 repaired in the feature branch before it enters dev; `Quick Checks` is auxiliary.
@@ -528,9 +529,10 @@ must finish before independent main publication is activated.
 Bamboo uses GitHub Actions for continuous integration and publishing:
 
 - **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run the required
-  `Test` check over one physical Linux all-features Cargo invocation for the
-  selected packages, including library/binary, integration and documentation
-  tests; the live SSH fixture reuses its already compiled executable.
+  `Test` check over one physical Linux executor and owned target directory.
+  Independent default package configurations own ordinary library/binary,
+  integration and documentation cases; narrow feature owners run catalogued
+  additions. Compatible compiled outputs and the live SSH executable are reused.
   `Quick Checks` remains auxiliary. Fix failed feature tests before dev admission.
   The existing release suite, native platform checks and lightweight main
   admission remain active until release-source publication cutover; that pending

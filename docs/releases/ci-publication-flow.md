@@ -8,12 +8,13 @@ for cuts, original-source repairs, protected admission and credentials.
 ## Phase contracts and activation
 
 Feature admission is implemented by #2311. Required `Test` aggregates Unit, E2E
-and SSH runtime results on every dev PR. One physical Linux executor runs one
-all-features Cargo test invocation over the existing default packages plus the
-recorder, in one owned target directory. Cargo's default target selection runs
-library/binary, integration and documentation tests once; the ignored SSH case
-then reuses the executable from that same invocation. Unit/E2E remain logical
-reporting groups. Applicable native-platform acceptance runs before dev
+and SSH runtime results on every dev PR. One physical Linux executor preserves
+independent default package configurations plus the recorder in one owned target
+directory. Ordinary library/binary, integration and documentation cases run once;
+explicit feature owners run only catalogued additions. The controller records
+each configuration's features/profile and actual compiled-artifact freshness.
+Serial storage and ignored SSH reuse their default context executables.
+Unit/E2E remain logical reporting groups. Applicable native acceptance runs before dev
 admission; the recorder's Linux lifecycle is already in the canonical executor.
 Ordinary Linux orchestration/context tests do not get separate compilation jobs.
 Fix failures in feature branches.
