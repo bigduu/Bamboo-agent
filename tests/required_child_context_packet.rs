@@ -530,7 +530,7 @@ async fn fixture(case: Case) {
             child.root_thinking_mode(),
             bamboo_domain::RootThinkingMode::Standard
         );
-        assert_eq!(child.agent_runtime_state.as_ref().unwrap().read_only, false);
+        assert!(!child.agent_runtime_state.as_ref().unwrap().read_only);
         if case == Case::Complete {
             assert_eq!(
                 child.metadata["assignment_prompt"],

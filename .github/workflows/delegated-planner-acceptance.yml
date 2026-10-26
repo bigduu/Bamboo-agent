@@ -75,17 +75,18 @@ jobs:
           result="$RUNNER_TEMP/planner-artifacts.log"
           cargo test --locked -p bamboo-engine --lib planner_artifact \
             -- --test-threads=1 2>&1 | tee "$result"
-          grep -Fq 'test result: ok. 7 passed; 0 failed; 0 ignored' "$result"
+          grep -Fq 'test result: ok. 9 passed; 0 failed; 0 ignored' "$result"
       - name: Verify actual CLI worker, publication, automatic resume and cold partial reads
         shell: bash
         run: |
           set -euo pipefail
           result="$RUNNER_TEMP/planner-native.log"
           cargo test --locked -p bamboo-agent --test required_child_context_packet \
-            delegated_planner::real_cli_planner_publishes_versioned_artifact_and_resumes_with_partial_cold_reads \
-            -- --exact --test-threads=1 --nocapture 2>&1 | tee "$result"
-          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored' "$result"
+            delegated_planner::real_cli_planner_ \
+            -- --test-threads=1 --nocapture 2>&1 | tee "$result"
+          grep -Fq 'test result: ok. 2 passed; 0 failed; 0 ignored' "$result"
           grep -Fq 'actual delegated Plan: source-bound Host+worker;' "$result"
+          grep -Fq 'actual delegated Plan crash: real Host SIGKILL/restart;' "$result"
       - name: Check affected production libraries under original CI lint policy
         run: >-
           cargo clippy --locked --all-features

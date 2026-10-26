@@ -5,6 +5,7 @@ use super::*;
 
 struct PlannerProbe {
     data: PathBuf,
+    crash_child: bool,
     root_calls: AtomicUsize,
     child_calls: AtomicUsize,
     requests: Mutex<Vec<Value>>,
@@ -43,6 +44,17 @@ async fn planner_response(body: web::Json<Value>, probe: web::Data<PlannerProbe>
         .as_array()
         .is_some_and(|tools| tools.iter().any(|t| t["function"]["name"] == "Plan"));
     let is_planner = body["model"] == "child-packet-test";
+    if is_planner && probe.crash_child {
+        assert_eq!(
+            probe.child_calls.fetch_add(1, Ordering::SeqCst),
+            0,
+            "a lost planner must not be silently redispatched"
+        );
+        // The controller kills its own real Host while this real worker has a
+        // pending model request. No response/report or completion seal exists.
+        tokio::time::sleep(Duration::from_secs(600)).await;
+        panic!("the isolated pending provider must be stopped by fixture teardown");
+    }
     let (delta, finish) = if !is_root && !is_planner {
         (
             json!({"content":"isolated fixture auxiliary response"}),
@@ -85,6 +97,26 @@ async fn planner_response(body: web::Json<Value>, probe: web::Data<PlannerProbe>
         }
     } else {
         let round = probe.root_calls.fetch_add(1, Ordering::SeqCst);
+        if probe.crash_child && round == 1 {
+            let projection = body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|m| m["content"].as_str())
+                .find_map(resume_typed_projection)
+                .expect(
+                    "real boot recovery must resume the parent with a bounded unavailable outcome",
+                );
+            assert_eq!(projection["view"], "planner_artifact");
+            assert_eq!(projection["available"], false);
+            assert_eq!(projection["execution_approved"], false);
+            assert!(projection["read"].is_null());
+            let event = json!({"id":"planner-failure-response","object":"chat.completion.chunk",
+                "choices":[{"index":0,"delta":{"content":"REAL_PLANNER_FAILURE_REPORTED"},"finish_reason":"stop"}]});
+            return HttpResponse::Ok()
+                .content_type("text/event-stream")
+                .body(format!("data: {event}\n\ndata: [DONE]\n\n"));
+        }
         match round {
             0 => {
                 let disk = SessionStoreV2::new(probe.data.clone()).await.unwrap();
@@ -219,7 +251,7 @@ async fn execute_only_legacy_chat(client: &reqwest::Client, base: &str, receipt:
     );
 }
 
-async fn planner_fixture() {
+async fn planner_fixture(crash_child: bool) {
     let temp = tempfile::Builder::new()
         .prefix("bamboo-1059-native-plan-")
         .tempdir()
@@ -228,6 +260,7 @@ async fn planner_fixture() {
     std::fs::write(data.join("source.txt"), "NATIVE_READ_SOURCE\n").unwrap();
     let probe = web::Data::new(PlannerProbe {
         data: data.clone(),
+        crash_child,
         root_calls: AtomicUsize::new(0),
         child_calls: AtomicUsize::new(0),
         requests: Mutex::new(Vec::new()),
@@ -297,6 +330,71 @@ async fn planner_fixture() {
     let disk = SessionStoreV2::new(data.clone()).await.unwrap();
     let original = disk.load_session("planner-root").await.unwrap().unwrap();
     execute_only_legacy_chat(&client, &base, &receipt).await;
+    if crash_child {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while probe.child_calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the real worker must reach the pending provider before Host loss");
+        let disk = SessionStoreV2::new(data.clone()).await.unwrap();
+        let children: Vec<_> = disk
+            .list_index_entries()
+            .await
+            .into_iter()
+            .filter(|e| e.parent_session_id.as_deref() == Some("planner-root"))
+            .collect();
+        assert_eq!(children.len(), 1);
+        let child_id = children[0].id.clone();
+        assert_eq!(
+            disk.load_session(&child_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref(),
+            Some("running")
+        );
+        drop(host); // SIGKILL + wait, never a graceful cancellation or a forged terminal save.
+        let mut restarted = start_host(&data, port);
+        await_host(&mut restarted, &client, &base, &data).await;
+        let parent = completed(&data, "REAL_PLANNER_FAILURE_REPORTED").await;
+        assert_eq!(probe.root_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
+        assert!(parent
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .waiting_for_children
+            .is_none());
+        assert!(parent
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .plan_mode
+            .is_none());
+        assert_eq!(
+            parent.agent_runtime_state.as_ref().unwrap().permission_mode,
+            original
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .permission_mode
+        );
+        let disk = SessionStoreV2::new(data.clone()).await.unwrap();
+        let child = disk.load_session(&child_id).await.unwrap().unwrap();
+        assert_eq!(child.last_run_status().as_deref(), Some("error"));
+        assert!(!child
+            .metadata
+            .contains_key("runtime.child_completion_source_v1"));
+        assert!(!data.join("plan/delegated").exists());
+        assert!(!data.join("must-not-exist.txt").exists());
+        drop(restarted);
+        handle.stop(false).await;
+        eprintln!("actual delegated Plan crash: real Host SIGKILL/restart; pending worker; boot synthetic error; bounded unavailable parent resume; no sealed report/file; no redispatch; 0 paid calls");
+        return;
+    }
     let parent = completed(&data, "REAL_PLANNER_ROOT_FINISHED").await;
     assert_eq!(probe.root_calls.load(Ordering::SeqCst), 4);
     assert_eq!(probe.child_calls.load(Ordering::SeqCst), 3);
@@ -378,7 +476,17 @@ async fn planner_fixture() {
 fn real_cli_planner_publishes_versioned_artifact_and_resumes_with_partial_cold_reads() {
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
-        .spawn(|| actix_web::rt::System::new().block_on(planner_fixture()))
+        .spawn(|| actix_web::rt::System::new().block_on(planner_fixture(false)))
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn real_cli_planner_crash_recovery_resumes_without_publishing_unsealed_report() {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| actix_web::rt::System::new().block_on(planner_fixture(true)))
         .unwrap()
         .join()
         .unwrap();

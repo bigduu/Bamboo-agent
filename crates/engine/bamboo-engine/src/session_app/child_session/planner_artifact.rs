@@ -611,4 +611,44 @@ mod tests {
             .await
             .is_err());
     }
+
+    #[tokio::test]
+    async fn planner_artifact_synthetic_failure_returns_no_report_or_file_but_unsealed_success_is_rejected(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, child) = fixture();
+        for status in ["error", "timeout", "cancelled", "skipped"] {
+            let mut child = child.clone();
+            child.set_last_run_status(status);
+            child.metadata.remove("runtime.child_completion_source_v1");
+            child.messages.last_mut().unwrap().content =
+                "UNSEALED_REPORT_MUST_NOT_BE_IMPORTED".into();
+            let completion = ChildCompletion {
+                parent_session_id: parent.id.clone(),
+                child_session_id: child.id.clone(),
+                status: status.into(),
+                error: Some("synthetic failure".into()),
+                completed_at: child.updated_at,
+                source: None,
+            };
+            let result = publish_completion(dir.path(), &completion, &child, &parent)
+                .await
+                .expect("a failed job must unblock its parent without authenticating its report")
+                .unwrap();
+            assert_eq!(result["available"], false);
+            assert_eq!(result["execution_approved"], false);
+            assert!(result["read"].is_null());
+            assert!(!result.to_string().contains("UNSEALED_REPORT"));
+            assert!(!dir.path().join("plan/delegated").exists());
+            let mut success = completion;
+            success.status = "completed".into();
+            child.set_last_run_status("completed");
+            assert!(
+                publish_completion(dir.path(), &success, &child, &parent)
+                    .await
+                    .is_err(),
+                "a source-less success cannot publish a file or release a successful report"
+            );
+        }
+    }
 }

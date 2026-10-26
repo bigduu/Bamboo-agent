@@ -4277,6 +4277,54 @@ mod tests {
             .is_file());
     }
 
+    #[tokio::test]
+    async fn planner_artifact_real_boot_orphan_recovery_admits_unavailable_once_without_unsealed_report(
+    ) {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        save_waiting_test_parent(
+            &store,
+            "lost-plan-parent",
+            vec!["lost-plan-child".into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let mut parent = store
+            .load_session("lost-plan-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        parent.add_message(Message::user("Original selected source"));
+        store.save_session(&parent).await.unwrap();
+        let mut child = planner_test_child(&parent, "lost-plan-child");
+        child.set_last_run_status("running");
+        child.messages.last_mut().unwrap().content = "UNSEALED_REPORT_MUST_NOT_BE_IMPORTED".into();
+        ChildCompletionSource::prepare(&mut child, "lost-worker", &Default::default());
+        child.updated_at = Utc::now() - chrono::Duration::minutes(5);
+        store.save_session(&child).await.unwrap();
+
+        // Exercise the actual boot watchdog, including canonical error save
+        // and publish_synthetic_completion(source=None), not a fabricated report.
+        coordinator.reconcile_orphans_at_boot().await;
+        coordinator.reconcile_orphans_at_boot().await;
+        let claims = inbox.claim(&parent.id, 8).await.unwrap();
+        assert_eq!(
+            claims.len(),
+            1,
+            "the lost worker must not strand the six-hour wait"
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        let message = claims[0].envelope.to_provider_message().unwrap();
+        assert!(message.content.contains("planner_artifact"));
+        assert!(message.content.contains("\"available\":false"));
+        assert!(!serde_json::to_string(&claims[0].envelope)
+            .unwrap()
+            .contains("UNSEALED_REPORT"));
+        let child = store.load_session(&child.id).await.unwrap().unwrap();
+        assert_eq!(child.last_run_status().as_deref(), Some("error"));
+        assert!(ChildCompletionSource::from_committed_session(&child).is_none());
+        assert!(!store.bamboo_home_dir().join("plan/delegated").exists());
+    }
+
     fn unusable_typed_test_child(
         parent: &Session,
         id: &str,
