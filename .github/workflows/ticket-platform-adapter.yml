@@ -110,8 +110,9 @@ jobs:
             session_repository::tests topology_preserves_unexpanded_map_prefix_without_fabricating_item_zero
           )
           for filter in "${filters[@]}"; do
+            printf 'Regression started %s: %s\n' "$(date -u +%FT%TZ)" "$filter"
             log=$(mktemp)
-            cargo test --locked -p bamboo-engine --lib "$filter" -- --test-threads=1 | tee "$log"
+            timeout --kill-after=30s 10m cargo test --locked -p bamboo-engine --lib "$filter" -- --test-threads=1 | tee "$log"
             python3 - "$log" <<'PY'
           import pathlib, re, sys
           result = re.findall(r'test result: ok\. (\d+) passed; (\d+) failed;', pathlib.Path(sys.argv[1]).read_text())
@@ -119,6 +120,7 @@ jobs:
           assert all(int(failed) == 0 for _, failed in result)
           PY
             rm "$log"
+            printf 'Regression finished %s: %s\n' "$(date -u +%FT%TZ)" "$filter"
           done
 
       - name: Check affected libraries and test targets under the existing CI lint policy
