@@ -345,7 +345,7 @@ pub(crate) fn publish_observer_change_snapshot(
             libc::openat(
                 parent.as_raw_fd(),
                 name.as_ptr(),
-                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
                 0o600,
             )
         };
