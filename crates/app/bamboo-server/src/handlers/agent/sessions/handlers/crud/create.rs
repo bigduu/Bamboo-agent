@@ -1311,7 +1311,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn create_session_does_not_wait_for_unrelated_paused_save() {
+    async fn create_session_waits_for_retained_root_writer_then_progresses() {
         let state = new_state().await;
         let app = test::init_service(
             App::new()
@@ -1321,6 +1321,11 @@ mod tests {
         .await;
 
         let paused = Session::new("paused-unrelated-save", "test-model");
+        state
+            .storage
+            .save_session(&paused)
+            .await
+            .expect("seed the existing Root before pausing its ordinary update");
         let (reached, release) = state
             .session_store
             .pause_full_save_before_filesystem_commit_for_test(&paused.id);
@@ -1330,21 +1335,32 @@ mod tests {
         reached.wait().await;
 
         let request_started = Instant::now();
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            test::call_service(
-                &app,
-                test::TestRequest::post()
-                    .uri("/api/v1/sessions")
-                    .set_json(serde_json::json!({ "title": "Independent create" }))
-                    .to_request(),
-            ),
-        )
+        let request = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/sessions")
+                .set_json(serde_json::json!({ "title": "Independent create" }))
+                .to_request(),
+        );
+        tokio::pin!(request);
+        let deadline =
+            tokio::time::Instant::from_std(request_started) + std::time::Duration::from_secs(5);
+        let response = tokio::time::timeout_at(deadline, async {
+            // A new Root waits for retained shared authority. Poll the same
+            // request, release promptly, and include that wait in its budget.
+            let blocked =
+                tokio::time::timeout(std::time::Duration::from_millis(100), request.as_mut()).await;
+            release.wait().await;
+            assert!(
+                blocked.is_err(),
+                "Root birth must wait for the retained writer"
+            );
+            request.as_mut().await
+        })
         .await
-        .expect("new-session request must not wait for the unrelated paused save");
+        .expect("Root birth must finish within the original five-second request budget");
         let elapsed = request_started.elapsed();
 
-        release.wait().await;
         paused_save
             .await
             .expect("paused save task")
@@ -1361,6 +1377,12 @@ mod tests {
             .get_index_entry(created_id)
             .await
             .is_some());
+        assert!(state
+            .session_store
+            .load_session(created_id)
+            .await
+            .expect("read the durable created Root")
+            .is_some());
         let persistence = state.session_store.persistence_metrics();
         assert_eq!(persistence.create_latency.count, 1);
         assert!(persistence.create_latency.p50_ms < 5_000);
@@ -1369,7 +1391,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn concurrent_creates_report_latency_distribution_below_client_timeout() {
+    async fn concurrent_creates_keep_latency_budget_across_retained_root_writer() {
         let state = new_state().await;
         let app = test::init_service(
             App::new()
@@ -1379,6 +1401,11 @@ mod tests {
         .await;
 
         let paused = Session::new("paused-during-create-workload", "test-model");
+        state
+            .storage
+            .save_session(&paused)
+            .await
+            .expect("seed the existing Root before pausing its ordinary update");
         let (reached, release) = state
             .session_store
             .pause_full_save_before_filesystem_commit_for_test(&paused.id);
@@ -1399,15 +1426,33 @@ mod tests {
             )
         });
         let started = Instant::now();
-        let responses = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            futures::future::join_all(requests),
-        )
+        let workload = futures::future::join_all(requests);
+        tokio::pin!(workload);
+        let deadline = tokio::time::Instant::from_std(started) + std::time::Duration::from_secs(10);
+        let responses = tokio::time::timeout_at(deadline, async {
+            let blocked =
+                tokio::time::timeout(std::time::Duration::from_millis(100), workload.as_mut())
+                    .await;
+            let completed_creates = state
+                .session_store
+                .persistence_metrics()
+                .create_latency
+                .count;
+            release.wait().await;
+            assert!(
+                blocked.is_err(),
+                "the new Roots must wait for the retained writer"
+            );
+            assert_eq!(
+                completed_creates, 0,
+                "no Root may be born across the retained writer"
+            );
+            workload.as_mut().await
+        })
         .await
         .expect("bounded create workload must stay below the Lotus timeout");
         let elapsed = started.elapsed();
 
-        release.wait().await;
         paused_save
             .await
             .expect("paused save task")
@@ -1422,6 +1467,21 @@ mod tests {
         assert!(persistence.create_latency.p50_ms < 10_000);
         assert!(persistence.create_latency.p95_ms < 10_000);
         assert!(persistence.create_latency.max_ms < 10_000);
+        for response in responses {
+            let body: serde_json::Value = test::read_body_json(response).await;
+            let created_id = body["session"]["id"].as_str().expect("created Root id");
+            assert!(state
+                .session_store
+                .get_index_entry(created_id)
+                .await
+                .is_some());
+            assert!(state
+                .session_store
+                .load_session(created_id)
+                .await
+                .expect("read each durable created Root")
+                .is_some());
+        }
     }
 
     #[actix_web::test]
