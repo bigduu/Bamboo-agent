@@ -419,6 +419,25 @@ fn actual_provider_and_mcp_publications_preserve_unrelated_receipts() {
             assert_eq!(consumer(&defaults, id)["applied_dependencies"], Value::Null);
         }
         let serialized = serde_json::to_string(&defaults).unwrap();
+        assert!(
+            serialized.contains("9876"),
+            "exercise the timestamp collision"
+        );
+        // Only port digits can overlap valid diagnostic timestamps. Keep the
+        // complete report for every secret, model and private-field check.
+        let mut endpoint_report = defaults.clone();
+        let clear_timestamp = |value: &mut Value| {
+            if !value.is_null() {
+                chrono::DateTime::parse_from_rfc3339(value.as_str().unwrap()).unwrap();
+                *value = Value::Null;
+            }
+        };
+        assert!(endpoint_report["observed_at"].is_string());
+        clear_timestamp(&mut endpoint_report["observed_at"]);
+        for consumer in endpoint_report["consumers"].as_array_mut().unwrap() {
+            clear_timestamp(&mut consumer["last_applied_at"]);
+        }
+        let endpoint_serialized = serde_json::to_string(&endpoint_report).unwrap();
         for (fixture_marker, forbidden) in [
             ("provider-secret", "application-secret-sentinel"),
             ("previous-model", "old-model"),
@@ -427,8 +446,13 @@ fn actual_provider_and_mcp_publications_preserve_unrelated_receipts() {
             ("private-digest-field", "digest"),
             ("provider-endpoint-port", "9876"),
         ] {
+            let scanned = if fixture_marker == "provider-endpoint-port" {
+                &endpoint_serialized
+            } else {
+                &serialized
+            };
             assert!(
-                !serialized.contains(forbidden),
+                !scanned.contains(forbidden),
                 "application diagnostics contain forbidden fixture marker: {fixture_marker}"
             );
         }
