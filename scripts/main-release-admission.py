@@ -237,6 +237,10 @@ def full_jobs(ci, promotion=False, before=None):
     if ci["head_sha"] in FEATURE_REVISIONS:
         feature = [job for job in jobs if job["name"] == "Feature Unit and E2E"]
         assert len(feature) == 1 and feature[0]["conclusion"] == "skipped", "Feature execution cannot repeat on a legacy release"
+        native_names = ("Native Feature (${{ matrix.os }})", "Native Feature (windows-2025)", "Native Feature (macos-latest)")
+        native = [job for job in jobs if job["name"] in native_names]
+        assert [job["name"] for job in native] == [native_names[0]] or {job["name"] for job in native} == set(native_names[1:]) and len(native) == 2, "Missing or ambiguous feature-native skip representation"
+        assert all(job["status"] == "completed" and job["conclusion"] == "skipped" for job in native), "Native feature tests cannot repeat on a legacy release"
     tests = grouped_jobs(ci, jobs, before) if contract == "grouped" else crate_jobs(ci, jobs) if contract == "crates" else ()
     for name in FULL + (platform_jobs(ci["head_sha"]) + ("Promotion Source",) if promotion else ()) + tests:
         found = [job for job in jobs if job["name"] == name]
@@ -313,7 +317,7 @@ REVIEWED_PRODUCERS = frozenset((PRODUCER_V1, PRODUCER_V2))
 # by a sentinel. Then independently authenticate the actual helper bytes below.
 # This breaks the workflow -> helper -> workflow hash cycle, without excluding
 # a job, global environment, trigger, command or permission from review.
-CURRENT_PRODUCER = "14a1202b41b86a18524ffcae26f310d58230628895fae17eeb69c2d9e1ebe06c"
+CURRENT_PRODUCER = "5d0a4f83c27b27834672f969d47e3839402c83f9f7518c29391c6575f68495cc"
 # Preserve the previously reviewed default/all-feature server partitions.
 LEGACY_SERVER_BLOCK_PRODUCER = "20ca6ba17401c2d9cae9019cbb693eea29386ab77814bfda5d793ee4efb45649"
 LEGACY_SERVER_BLOCK_HELPER = "4ccc047bbaeedab71e93db9b6470f5a3131c1b395260f852baebef19ff9109b7"
@@ -500,6 +504,8 @@ if ci is not None:
         matrices = [("TLS Fixture", "os", ("macos-latest", "windows-latest")),
                     ("ToolEvent Recorder E2E", "os", ("ubuntu-latest", "macos-latest", "windows-latest")),
                     ("Platform Tests" if platform_jobs(source) == PLATFORM_TESTS else "Build", "os", ("ubuntu-latest", "macos-latest", "windows-latest"))]
+        if source in FEATURE_REVISIONS:
+            matrices.append(("Native Feature", "os", ("windows-2025", "macos-latest")))
         if contract == "crates":
             skipped.append("Test SSH")
             for label, packages in CRATE_PACKAGES[source].items():

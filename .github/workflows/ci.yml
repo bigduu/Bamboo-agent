@@ -98,7 +98,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "7e23d459771da7fdb4e4f0195f5fe82bc2c735ff38ebb3b5af8de558f918bd34"
+          ADMISSION_HELPER_SHA256: "b789dd1c57550268d071b455e7d6384a17fb13cfa5a9a81fcc7ed89f4741ba54"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -150,7 +150,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Test fast workflow and release policies
-        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs scripts/run-feature-tests.test.cjs
+        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs scripts/run-feature-tests.test.cjs scripts/native-test-owner.test.cjs
 
       - name: Test Supervisor driver and owned loopback process binding
         run: node --test scripts/supervisor-native-acceptance.test.cjs
@@ -246,7 +246,7 @@ jobs:
       actions: read
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
-    needs: [validation-source, main-release-admission, quick-checks, feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]
+    needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]
     # A source-gate failure must fail required Test, never turn it into a skip.
     if: always() && !cancelled()
     runs-on: ubuntu-latest
@@ -260,8 +260,7 @@ jobs:
           FEATURE_VALIDATION: ${{ needs.validation-source.outputs.feature }}
           FEATURE_RESULT: ${{ needs.feature-tests.result }}
           QUICK_RESULT: ${{ needs.quick-checks.result }}
-          TLS_RESULT: ${{ needs.tls-fixture-test.result }}
-          RECORDER_RESULT: ${{ needs.tool-event-recorder-e2e.result }}
+          NATIVE_RESULT: ${{ needs.native-feature-tests.result }}
         shell: bash
         run: |
           set -euo pipefail
@@ -271,8 +270,7 @@ jobs:
               test "$FEATURE_VALIDATION" = true
               test "$FEATURE_RESULT" = success
               test "$QUICK_RESULT" = success
-              test "$TLS_RESULT" = success
-              test "$RECORDER_RESULT" = success
+              test "$NATIVE_RESULT" = success
               ;;
             pull_request:main:true|workflow_dispatch::true) test "$FEATURE_VALIDATION" = false ;;
             push::false)
@@ -305,7 +303,7 @@ jobs:
 
       - name: Test CI workflow policy
         if: needs.validation-source.outputs.full == 'true'
-        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs scripts/run-feature-tests.test.cjs
+        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs scripts/run-feature-tests.test.cjs scripts/native-test-owner.test.cjs
 
       - name: Test Supervisor driver and owned loopback process binding
         if: needs.validation-source.outputs.full == 'true'
@@ -468,6 +466,58 @@ jobs:
             ${{ runner.temp }}/bamboo-feature-profile.log
           if-no-files-found: ignore
           retention-days: 7
+
+  native-feature-tests:
+    name: Native Feature (${{ matrix.os }})
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/native-feature
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Preserve the Actor acceptance compiler
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0-x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target/native-feature
+          shared-key: bamboo-native-feature-${{ runner.os }}
+          cache-workspace-crates: false
+          save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
+      - name: Require the committed native inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          node scripts/frontend-package.cjs verify
+          openssl version
+      - name: Run fixed native ownership and record real compiled cases
+        run: node scripts/native-test-owner.cjs
+      - name: Preserve native ownership evidence including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-feature-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bamboo-native-owner-*/*
+          if-no-files-found: error
+          retention-days: 14
 
   test-crates:
     name: Test (${{ matrix.crate }}${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }})
@@ -768,7 +818,7 @@ jobs:
   tls-fixture-test:
     name: TLS Fixture (${{ matrix.os }})
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true' || needs.validation-source.outputs.feature == 'true'
+    if: needs.validation-source.outputs.full == 'true'
     # Keep the test-only certificate generator portable across the OpenSSL and
     # LibreSSL variants on every supported host. The release build matrix below
     # does not compile or execute #[cfg(test)] code.
@@ -803,7 +853,7 @@ jobs:
   tool-event-recorder-e2e:
     name: ToolEvent Recorder E2E (${{ matrix.os }})
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true' || needs.validation-source.outputs.feature == 'true'
+    if: needs.validation-source.outputs.full == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -824,13 +874,10 @@ jobs:
       - name: Run native recorder contract and lifecycle tests
         if: needs.validation-source.outputs.full == 'true'
         run: cargo test --locked --no-fail-fast -p bamboo-tool-event-recorder-example -- --nocapture --test-threads=1
-      - name: Run native recorder lifecycle integration
-        if: needs.validation-source.outputs.feature == 'true'
-        run: cargo test --locked --no-fail-fast -p bamboo-tool-event-recorder-example --all-features --test tool_event_lifecycle -- --nocapture --test-threads=1
 
   e2e-test:
     name: E2E Tests
-    needs: [validation-source, feature-tests, e2e-crates, test-ssh]
+    needs: [validation-source, feature-tests, native-feature-tests, e2e-crates, test-ssh]
     if: always() && !cancelled() && (needs.validation-source.outputs.full == 'true' || needs.validation-source.outputs.feature == 'true')
     runs-on: ubuntu-latest
     steps:
@@ -840,9 +887,12 @@ jobs:
           SSH_RESULT: ${{ needs.test-ssh.result }}
           FEATURE_VALIDATION: ${{ needs.validation-source.outputs.feature }}
           FEATURE_RESULT: ${{ needs.feature-tests.result }}
+          NATIVE_RESULT: ${{ needs.native-feature-tests.result }}
         run: |
+          set -euo pipefail
           if test "$FEATURE_VALIDATION" = true; then
             test "$FEATURE_RESULT" = success
+            test "$NATIVE_RESULT" = success
           else
             test "$CRATE_RESULT" = success
             test "$SSH_RESULT" = success
