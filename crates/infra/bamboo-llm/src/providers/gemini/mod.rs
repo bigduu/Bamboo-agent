@@ -287,8 +287,7 @@ impl LLMProvider for GeminiProvider {
                     .headers(headers.clone())
                     .json(&request_json)
             })
-            .await
-            .map_err(LLMError::Http)?;
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
