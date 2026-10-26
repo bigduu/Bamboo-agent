@@ -390,6 +390,13 @@ mod execution_input_http {
             model: Some("test-model".into()),
             ..Default::default()
         });
+        // These fixtures count execution calls. The default-on first Dream
+        // tick may otherwise extract a just-persisted fixture through the same
+        // provider before the admission barrier has been released.
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = false;
         let mut state =
             crate::AppState::new_with_provider(home.path().into(), config, provider.clone())
                 .await
