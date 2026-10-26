@@ -1,4 +1,4 @@
-//! Shared setup for the two native Work integration binaries; no tests or runtime protocol.
+//! Shared setup for native Work integration binaries; no tests or runtime protocol.
 use async_trait::async_trait;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_domain::Message;
