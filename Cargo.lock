@@ -802,7 +802,7 @@ dependencies = [
  "http 1.5.0",
  "libc",
  "mockall",
- "parking_lot 0.13.0",
+ "parking_lot 0.12.5",
  "rand 0.10.3",
  "regex",
  "reqwest",
