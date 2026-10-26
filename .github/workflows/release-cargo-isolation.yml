@@ -29,6 +29,10 @@ jobs:
         env:
           BAMBOO_CARGO_INTEGRATION: "1"
         run: node --test scripts/release-cargo-sandbox.test.cjs scripts/release-cargo-upload.test.cjs
+      - name: Recover real Cargo ENOSPC on a bounded fixture filesystem
+        env:
+          BAMBOO_CARGO_DISK_INTEGRATION: "1"
+        run: node --test scripts/release-cargo-sandbox-disk.integration.cjs
       - name: Verify existing release frontend policies
         run: node --test scripts/release-frontend-policy.test.cjs scripts/lotus-next-artifact.test.cjs
       - name: Install isolated Cargo for actual workspace compatibility
