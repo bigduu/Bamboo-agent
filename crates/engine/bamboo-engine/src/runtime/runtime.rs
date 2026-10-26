@@ -308,6 +308,8 @@ impl Default for AgentRuntimeBuilder {
 /// be provided.  The provider is taken from [`AgentRuntime::provider`]; tools
 /// default to [`AgentRuntime::default_tools`] when `None`.
 pub struct ExecuteRequest {
+    /// Native Host attribution, never decoded from HTTP or Worker arguments.
+    pub ticket_token_budget: Option<Arc<crate::ticket_token_budget::NativeWorkTokenBudget>>,
     /// Host-installed, per-run private plan capability. Never decoded from HTTP.
     pub ticket_worker_plan: Option<Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>>,
     // -- Required ----------------------------------------------------------
@@ -389,6 +391,7 @@ pub struct ExecuteRequest {
 /// schedule manager) and the root `bamboo_agent` SDK facade (which re-exports
 /// it) construct requests through one shared builder — no forked assembly.
 pub struct ExecuteRequestBuilder {
+    ticket_token_budget: Option<Arc<crate::ticket_token_budget::NativeWorkTokenBudget>>,
     ticket_worker_plan: Option<Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>>,
     initial_message: String,
     event_tx: mpsc::Sender<AgentEvent>,
@@ -428,6 +431,14 @@ pub struct ExecuteRequestBuilder {
 }
 
 impl ExecuteRequestBuilder {
+    pub(crate) fn ticket_token_budget(
+        mut self,
+        budget: Arc<crate::ticket_token_budget::NativeWorkTokenBudget>,
+    ) -> Self {
+        self.ticket_token_budget = Some(budget);
+        self
+    }
+
     /// Create a builder with the three required fields. All optional overrides
     /// default to `None`.
     pub fn new(
@@ -438,6 +449,7 @@ impl ExecuteRequestBuilder {
         Self {
             initial_message: initial_message.into(),
             ticket_worker_plan: None,
+            ticket_token_budget: None,
             event_tx,
             cancel_token,
             tools: None,
@@ -704,6 +716,7 @@ impl ExecuteRequestBuilder {
         };
         ExecuteRequest {
             ticket_worker_plan: self.ticket_worker_plan,
+            ticket_token_budget: self.ticket_token_budget,
             initial_message: self.initial_message,
             event_tx: self.event_tx,
             cancel_token: self.cancel_token,
@@ -879,6 +892,7 @@ impl AgentRuntime {
         let config = self.config.read().await;
         let ExecuteRequest {
             ticket_worker_plan,
+            ticket_token_budget,
             initial_message,
             event_tx,
             cancel_token,
@@ -953,7 +967,7 @@ impl AgentRuntime {
                     }),
             );
         }
-        let loop_config = AgentLoopConfig {
+        let mut loop_config = AgentLoopConfig {
             ticket_worker_plan: ticket_worker_plan.clone(),
             guidance_active_run_id,
             system_prompt,
@@ -1071,6 +1085,10 @@ impl AgentRuntime {
         };
 
         drop(config);
+        let llm = match ticket_token_budget {
+            Some(budget) => budget.decorate(&mut loop_config, llm),
+            None => llm,
+        };
         #[cfg(test)]
         crate::runtime::tests::observe_untrusted_inputs(
             &session.id,

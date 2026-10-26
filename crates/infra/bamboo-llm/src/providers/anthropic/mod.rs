@@ -434,6 +434,11 @@ impl AnthropicProvider {
             native_groups,
             capability_loading_mode,
         );
+        request_overrides::validate_budgeted_overrides(
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_MESSAGES,
+            Some(model),
+        )?;
         request_overrides::apply_overrides_to_body(
             &mut body,
             self.request_overrides.as_ref(),

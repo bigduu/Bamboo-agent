@@ -533,6 +533,7 @@ impl CopilotProvider {
     {
         let session_log_id = session_id.unwrap_or("unknown-session");
         for attempt in 1..=COPILOT_TRANSPORT_MAX_ATTEMPTS {
+            crate::retry::claim_work_physical_request()?;
             match build_request().send().await {
                 Ok(response) => return Ok(response),
                 Err(error) => {
@@ -612,6 +613,11 @@ impl CopilotProvider {
             parallel_tool_calls,
             None,
         );
+        request_overrides::validate_budgeted_overrides(
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_RESPONSES,
+            Some(model),
+        )?;
         request_overrides::apply_overrides_to_body(
             &mut body,
             self.request_overrides.as_ref(),
@@ -1111,6 +1117,11 @@ impl LLMProvider for CopilotProvider {
         if let Some(reasoning_effort) = reasoning_effort {
             body["reasoning_effort"] = json!(reasoning_effort.as_str());
         }
+        request_overrides::validate_budgeted_overrides(
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            Some(upstream_model),
+        )?;
         request_overrides::apply_overrides_to_body(
             &mut body,
             self.request_overrides.as_ref(),
