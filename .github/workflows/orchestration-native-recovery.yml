@@ -6,6 +6,7 @@ on:
     paths:
       - 'tests/ticket_runtime_lifecycle.rs'
       - 'tests/support/ticket_runtime.rs'
+      - 'crates/app/bamboo-server/src/app_state/session_control_tests.rs'
       - '.github/workflows/orchestration-native-recovery.yml'
 
 permissions:
@@ -17,7 +18,7 @@ concurrency:
 
 jobs:
   actual-host-loss:
-    name: Native Project Host Loss (Linux)
+    name: Native Orchestration Matrix (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -65,10 +66,52 @@ jobs:
           actual_host_loss_fences_unknown_run_without_automatic_redispatch
           -- --exact --test-threads=1 --nocapture
 
+      - name: Verify native Supervisor scope revocation and explicit reattachment
+        shell: bash
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/native-supervisor-scope.log"
+          cargo test --locked -p bamboo-server --lib \
+            app_state::tests::session_control_tests::supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_detached_target \
+            -- --exact --test-threads=1 --nocapture 2>&1 | tee "$result"
+          grep -Fq '1 passed; 0 failed; 0 ignored' "$result"
+          grep -Fq 'native Supervisor scope: mode=Standard;' "$result"
+          grep -Fq 'native Supervisor scope: mode=Ultra;' "$result"
+
+      - name: Verify existing authority and capability component contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            local result="$RUNNER_TEMP/authority-$1.log"
+            shift
+            "$@" 2>&1 | tee "$result"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed' "$result"
+            if grep -Eq 'test result: ok\. 0 passed;' "$result"; then
+              echo 'An authority component selector matched no tests' >&2
+              return 1
+            fi
+          }
+          run_nonempty domain cargo test --locked -p bamboo-domain --lib session::tool_authority::tests \
+            -- --test-threads=1
+          run_nonempty messaging cargo test --locked -p bamboo-server-tools \
+            --test scoped_session_messaging --test supervisor_history_scope \
+            -- --test-threads=1
+          run_nonempty owner cargo test --locked -p bamboo-server --lib \
+            handlers::agent::supervisor::project_scope -- --test-threads=1
+
       - name: Check the affected target under the original CI lint policy
         run: >-
           cargo clippy --locked --all-features -p bamboo-agent
           --test ticket_runtime_lifecycle --
+          -D warnings -A deprecated -A clippy::module_inception
+          -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
+          -A clippy::too-many-arguments -A clippy::while-let-loop
+          -A clippy::type_complexity -A dead-code
+
+      - name: Check the affected Supervisor test library under the same lint policy
+        run: >-
+          cargo clippy --locked --all-features -p bamboo-server --lib --tests --
           -D warnings -A deprecated -A clippy::module_inception
           -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
           -A clippy::too-many-arguments -A clippy::while-let-loop
