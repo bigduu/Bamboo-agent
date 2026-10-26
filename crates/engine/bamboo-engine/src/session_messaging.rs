@@ -2086,9 +2086,8 @@ mod tests {
             .await
             .unwrap();
         store.delete_session(&old.id).await.unwrap();
-        let mut replacement = Session::new(&old.id, "model");
-        replacement.created_at = birth + chrono::Duration::seconds(1);
-        store.save_session(&replacement).await.unwrap();
+        let replacement = store.recreate_root_session(&old.id, "model").await.unwrap();
+        assert_ne!(replacement.created_at, birth);
         release.notify_one();
         assert!(!tokio::time::timeout(Duration::from_secs(5), sending)
             .await
@@ -2120,9 +2119,8 @@ mod tests {
             .await
             .unwrap();
         store.delete_session(&old.id).await.unwrap();
-        let mut replacement = Session::new(&old.id, "model");
-        replacement.created_at = old.created_at + chrono::Duration::seconds(1);
-        store.save_session(&replacement).await.unwrap();
+        let replacement = store.recreate_root_session(&old.id, "model").await.unwrap();
+        assert_ne!(replacement.created_at, old.created_at);
         let staged = messenger
             .admit(SessionMessageEnvelope::user_input(
                 &old.id,
