@@ -12922,7 +12922,12 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            drop(registration);
+            // Drop schedules cleanup; the retry needs the old owner released first.
+            registration.abandon().await;
+            assert!(
+                !binding.router.owns_run(&child.id, "first-run").await,
+                "{case}: abandoned first run must release its owner before retry"
+            );
             let envelope = bamboo_domain::SessionMessageEnvelope::user_input(
                 &child.id,
                 if case == "oversize" {

@@ -5781,6 +5781,12 @@ mod native_chat_scope {
                 model: Some("test-model".into()),
                 ..Default::default()
             });
+            // Count only Chat admission calls; the default-on first Dream tick
+            // can otherwise extract this persisted fixture via the same provider.
+            config
+                .memory_mut()
+                .get_or_insert_with(Default::default)
+                .auto_dream_enabled = false;
             let provider = Arc::new(NoModelCalls::default());
             let mut state =
                 crate::AppState::new_with_provider(home.path().into(), config, provider.clone())
