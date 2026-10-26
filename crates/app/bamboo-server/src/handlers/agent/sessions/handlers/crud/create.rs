@@ -1378,7 +1378,7 @@ mod tests {
             .await
             .is_some());
         assert!(state
-            .session_store
+            .storage
             .load_session(created_id)
             .await
             .expect("read the durable created Root")
@@ -1476,7 +1476,7 @@ mod tests {
                 .await
                 .is_some());
             assert!(state
-                .session_store
+                .storage
                 .load_session(created_id)
                 .await
                 .expect("read each durable created Root")
