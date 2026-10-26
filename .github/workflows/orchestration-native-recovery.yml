@@ -67,15 +67,15 @@ jobs:
           actual_host_loss_fences_unknown_run_without_automatic_redispatch
           -- --exact --test-threads=1 --nocapture
 
-      - name: Verify native Supervisor scope revocation and explicit reattachment
+      - name: Verify native Supervisor scope and affected lifecycle cases
         shell: bash
         run: |
           set -euo pipefail
           result="$RUNNER_TEMP/native-supervisor-scope.log"
           cargo test --locked -p bamboo-server --lib \
-            app_state::tests::session_control_tests::supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_detached_target \
-            -- --exact --test-threads=1 --nocapture 2>&1 | tee "$result"
-          grep -Fq '1 passed; 0 failed; 0 ignored' "$result"
+            app_state::tests::session_control_tests:: \
+            -- --test-threads=1 --nocapture 2>&1 | tee "$result"
+          grep -Fq 'test result: ok. 5 passed; 0 failed; 0 ignored' "$result"
           grep -Fq 'native Supervisor scope: mode=Standard;' "$result"
           grep -Fq 'native Supervisor scope: mode=Ultra;' "$result"
 

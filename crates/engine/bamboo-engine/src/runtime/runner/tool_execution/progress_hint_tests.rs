@@ -167,7 +167,7 @@ impl LLMProvider for ObservationProvider {
                                 name: self.tool_name.into(),
                                 arguments: if self.tool_name == "write_stdin" {
                                     serde_json::json!({"session_id":"mock-polled-session", "chars":""}).to_string()
-                                } else if round % 2 == 0 {
+                                } else if round.is_multiple_of(2) {
                                     r#"{"path":"file","offset":1}"#.into()
                                 } else {
                                     r#"{"offset":1,"path":"file"}"#.into()

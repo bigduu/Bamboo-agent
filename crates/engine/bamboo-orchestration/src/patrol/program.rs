@@ -129,7 +129,7 @@ impl ProgramPatrol {
                 if stored.checkpoint.last_check_ms > clock.now_ms() {
                     return Err(Error::ClockRegression);
                 }
-                if stored.checkpoint.source_revision == snapshot.seq
+                if stored.checkpoint.source_revision == snapshot.execution_facts_revision()
                     && stored.checkpoint.next_check_ms > clock.now_ms()
                 {
                     continue;

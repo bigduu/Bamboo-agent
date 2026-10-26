@@ -355,6 +355,14 @@ pub struct ImportSource {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub schema: u32,
+    /// Optional host-configured accounting; schema 8 fences older writers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_budget: Option<crate::WorkTokenBudget>,
+    /// Last non-accounting Ticket commit. Budget writes still advance `seq`
+    /// and HEAD, but cannot manufacture new execution evidence or invalidate
+    /// their own already-authorized diagnostic request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_facts_seq: Option<u64>,
     /// Explicit project membership and immutable adopted context; absent in legacy scopes.
     #[serde(default, skip_serializing_if = "crate::ProjectTicketState::is_empty")]
     pub project: crate::ProjectTicketState,
@@ -382,6 +390,8 @@ impl Snapshot {
     pub fn empty(binding: ScopeBinding) -> Self {
         Self {
             schema: 1,
+            execution_budget: None,
+            execution_facts_seq: None,
             project: Default::default(),
             sprint: Default::default(),
             binding,
@@ -398,6 +408,10 @@ impl Snapshot {
             migration: None,
             legacy_attachment: None,
         }
+    }
+
+    pub fn execution_facts_revision(&self) -> u64 {
+        self.execution_facts_seq.unwrap_or(self.seq)
     }
 }
 
