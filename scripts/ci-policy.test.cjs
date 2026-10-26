@@ -23,7 +23,9 @@ function frozenSourceFixture() {
       name: "CI", path: frozenSource.WORKFLOW, status: "completed", conclusion: "success", pull_requests: [],
       created_at: times.created, updated_at: times.completed },
     main: { name: "main", protected: true, commit: { sha: C } },
-    dev: { name: "dev", protected: true, commit: { sha: S } },
+    dev: { name: "dev", protected: true, commit: { sha: S }, protection: { required_status_checks: {
+      enforcement_level: "everyone", contexts: ["Test", "E2E Tests"], checks: [
+        { context: "Test", app_id: 15368 }, { context: "E2E Tests", app_id: 15368 }] } } },
     release: { name: `release/${S}`, protected: false, commit: { sha: S } },
     accepted: { sha: S, parents: [{ sha: B }, { sha: F }], tree: { sha: "e".repeat(40) } },
     snapshot: { sha: M, parents: [{ sha: B }, { sha: F }], tree: { sha: "e".repeat(40) } },
@@ -84,12 +86,19 @@ function frozenSourceFixture() {
         result = Object.keys(content).map(path => gitBlob(path, S)).find(value => value.sha === route.slice(10)); assert.ok(result)
       } else if (route === "actions/workflows/456") result = model.workflow
       else if (route.startsWith("actions/workflows/456/runs?")) result = { workflow_runs: model.newerRun || (model.raceNewRun && nth > 1) ? [model.run, { ...model.run, id: 124, created_at: times.started, conclusion: "failure" }] : [model.run] }
-      else if (route.startsWith("actions/runs/123/jobs?")) result = { jobs: model.latest }
+      else if (route.startsWith("actions/runs/123/jobs?")) result = { jobs: route.includes("filter=all") ? Object.values(model.attempts).flat() : model.latest }
       else if (route.startsWith("actions/runs/123/attempts/")) result = { jobs: model.attempts[route.match(/attempts\/(\d+)/)[1]] ?? [] }
       else if (route.startsWith("actions/jobs/")) result = model.physical.find(job => job.id === Number(route.slice(13)))
       else assert.fail(`Unexpected source resolver read: ${route}`)
       if (model.apiFailure && route === "actions/jobs/100") throw Error("Original API evidence unavailable")
       result = clone(result)
+      for (const key of ["jobs", "workflow_runs"]) if (result[key]) {
+        const all = result[key], page = Number(route.match(/&page=(\d+)$/)[1])
+        result.total_count = all.length; result[key] = all.slice((page - 1) * 100, page * 100)
+        if (model.missingTotal) delete result.total_count
+        if ((model.truncatedRuns && key === "workflow_runs") || (model.truncatedJobs && key === "jobs")) result.total_count++
+        if (model.changedPageTotal && page > 1) result.total_count++
+      }
       if (nth > 1) {
         if (model.raceRun && route === "actions/runs/123") result.run_attempt++
         if (model.raceRef && route.startsWith("branches/release")) result.commit.sha = "b".repeat(40)
@@ -126,6 +135,9 @@ function mutateSourceFixture(model, item) {
   else if (operation === "alterLogical") model.latest[0].steps[0].name += " changed"
   else if (operation === "fakeAttempt") model.latest[0].run_attempt = 0
   else if (operation === "differentPhysicalId") model.physical[0].id = 999
+  else if (operation === "duplicateStepNumber") {
+    for (const job of [model.latest[3], model.physical[3], model.attempts[1][3]]) job.steps.push({ ...job.steps[0], name: "different step with repeated number" })
+  }
   else if (operation === "conflictingAssociation") model.run.pull_requests = [{ number: 999, base: { sha: frozenFixture.identities.B }, head: { sha: frozenFixture.identities.F } }]
   else if (operation === "duplicateSourceLog") model.sourceLog += model.sourceLog
   else if (operation === "unknownProducer") model.files[frozenFixture.identities.F][frozenSource.WORKFLOW] += "\nunknown producer"
@@ -148,7 +160,13 @@ function mutateSourceFixture(model, item) {
       }
     }
   } else if (operation === "inputPolicy") model.input.producers = model.policy.producers
-  else model[operation] = true
+  else {
+    model[operation] = true
+    if (operation === "changedPageTotal") {
+      const rows = model.attempts[1]
+      while (rows.length <= 100) rows.push({ ...structuredClone(rows[0]), id: 2000 + rows.length, name: "Unselected historical branch " + rows.length })
+    }
+  }
 }
 test("frozen source foundation is inactive for every known incomplete deployed or unexecuted producer", async () => {
   assert.deepEqual(frozenSource.ACCEPTED_PRODUCERS, {})
@@ -175,9 +193,10 @@ test("frozen source foundation accepts exact nonempty association and normal dev
 })
 test("frozen source foundation retains original physical jobs across mixed failed-job reruns", async () => {
   const model = frozenSourceFixture(); model.run.run_attempt = 2; model.suite.workflowRun.runAttempt = 2
-  model.latest.forEach(job => { job.run_attempt = 2 })
+  for (const job of model.latest) { job.run_attempt = 2; job.id += 1000; job.check_run_url += "-copied" }
+  model.attempts[2] = structuredClone(model.latest); model.physical.push(...structuredClone(model.latest))
   const rerun = model.physical[6]; rerun.run_attempt = 2; rerun.id = 206
-  model.latest[6] = structuredClone(rerun); model.attempts[2] = [structuredClone(rerun)]
+  model.latest[6] = structuredClone(rerun); model.attempts[2][6] = structuredClone(rerun)
   const proof = await model.resolve()
   assert.equal(proof.feature.logicalAttempt, 2); assert.equal(proof.feature.physicalJobs[0].physicalAttempt, 1)
   assert.equal(proof.feature.physicalJobs[6].physicalAttempt, 2)

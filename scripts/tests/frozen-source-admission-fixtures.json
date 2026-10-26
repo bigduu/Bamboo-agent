@@ -367,6 +367,65 @@
     {
       "name": "physical job canonical ID is not its requested ID",
       "operation": "differentPhysicalId"
+    },
+    {
+      "name": "pagination omits total_count",
+      "operation": "missingTotal"
+    },
+    {
+      "name": "pagination truncates a later run",
+      "operation": "truncatedRuns"
+    },
+    {
+      "name": "pagination truncates a later physical job",
+      "operation": "truncatedJobs"
+    },
+    {
+      "name": "pagination total changes between pages",
+      "operation": "changedPageTotal"
+    },
+    {
+      "name": "protected flag contains deletion rules only",
+      "target": "dev.protection",
+      "value": {}
+    },
+    {
+      "name": "dev administrators bypass required feature gates",
+      "target": "dev.protection.required_status_checks.enforcement_level",
+      "value": "non_admins"
+    },
+    {
+      "name": "required E2E context is absent",
+      "target": "dev.protection.required_status_checks.contexts",
+      "value": [
+        "Test"
+      ]
+    },
+    {
+      "name": "required Test app is foreign",
+      "target": "dev.protection.required_status_checks.checks.0.app_id",
+      "value": 99
+    },
+    {
+      "name": "required E2E app check is absent",
+      "target": "dev.protection.required_status_checks.checks",
+      "value": [
+        {
+          "context": "Test",
+          "app_id": 15368
+        }
+      ]
+    },
+    {
+      "name": "physical step ends outside its job",
+      "operation": "job",
+      "index": 3,
+      "target": "steps.0.completed_at",
+      "value": "2026-10-27T01:02:30Z"
+    },
+    {
+      "name": "physical step number duplicated",
+      "operation": "duplicateStepNumber"
     }
   ],
   "knownIncompleteSources": [
