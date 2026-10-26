@@ -190,7 +190,7 @@ impl SessionStoreV2 {
         targets: impl IntoIterator<Item = String>,
         absence: Option<crate::host_session_scope::HostSessionScopeAbsence>,
     ) -> io::Result<Arc<SupervisorManagementGuards>> {
-        validate_supervisor_target_id(child_id).map_err(invalid)?;
+        target_id_is_valid(child_id)?;
         let lifecycle = self.lock_session_lifecycle_shared().await?;
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let mut roots: BTreeSet<String> = targets.into_iter().collect();

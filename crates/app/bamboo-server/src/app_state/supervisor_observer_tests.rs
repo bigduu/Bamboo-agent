@@ -691,6 +691,18 @@ async fn observer_grants_are_explicit_fresh_and_durably_revoked() {
         .is_supervisor_observer_child(&parent, &writable.id)
         .await
         .unwrap());
+    assert!(
+        tokio::time::timeout(
+            WAIT,
+            f.state
+                .storage
+                .is_supervisor_observer_child(&parent, &parent.id)
+        )
+        .await
+        .unwrap()
+        .is_err(),
+        "self IDs must fail before acquiring the same maintenance lock twice"
+    );
     assert!(f
         .state
         .session_store
