@@ -282,7 +282,8 @@ fn over_cap_report_is_retained_across_reopen_and_halts_new_admission() {
         budget.reservations[&request.operation_id].over_cap_usage,
         Some(ExecutionTokenOverCapUsage {
             input_tokens: Some(u64::from(u32::MAX) + 1),
-            output_tokens: Some(1)
+            output_tokens: Some(1),
+            total_tokens: None,
         })
     );
     assert!(service

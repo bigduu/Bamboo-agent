@@ -76,6 +76,8 @@ pub enum ExecutionTokenUsage {
 pub struct ExecutionTokenOverCapUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
 }
 
 impl ExecutionTokenOverCapUsage {
@@ -85,6 +87,9 @@ impl ExecutionTokenOverCapUsage {
             || self
                 .output_tokens
                 .is_some_and(|output| output > u64::from(request.output_cap))
+            || self.total_tokens.is_some_and(|total| {
+                total > u64::from(request.input_cap) + u64::from(request.output_cap)
+            })
     }
 }
 
@@ -660,6 +665,7 @@ impl TicketService {
             record.over_cap_usage = Some(ExecutionTokenOverCapUsage {
                 input_tokens: Some(input_tokens),
                 output_tokens: Some(output_tokens),
+                total_tokens: None,
             });
             next.seq = next.seq.checked_add(1).ok_or(Error::RevisionConflict)?;
             crate::service::validate_snapshot(&next)?;

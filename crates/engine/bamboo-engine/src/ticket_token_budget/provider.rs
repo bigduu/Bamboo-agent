@@ -292,8 +292,9 @@ struct Usage {
     output: Option<u64>,
     // Legacy events lose optional-field presence. Positive counts are still
     // authoritative lower bounds, independently useful for stopping overruns.
-    legacy_input_floor: Option<u64>,
-    legacy_output_floor: Option<u64>,
+    reported_input_floor: Option<u64>,
+    reported_output_floor: Option<u64>,
+    reported_total: Option<u64>,
     done: bool,
     inconsistent: bool,
 }
@@ -305,7 +306,10 @@ impl Usage {
                 input_tokens,
                 output_tokens,
                 total_tokens,
-                ..
+                reasoning_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+                cache_write_input_tokens,
             } => {
                 if let (Some(input), Some(output), Some(total)) =
                     (input_tokens, output_tokens, total_tokens)
@@ -318,6 +322,17 @@ impl Usage {
                 if let Some(output) = output_tokens {
                     self.output = Some(self.output.unwrap_or(0).max(*output));
                 }
+                self.reported_total = self.reported_total.max(*total_tokens);
+                // Positive subsets prove a lower bound even when the full
+                // input/output total was omitted by the provider.
+                let cached = cache_creation_input_tokens
+                    .unwrap_or(0)
+                    .saturating_add(cache_read_input_tokens.unwrap_or(0));
+                self.reported_input_floor = self
+                    .reported_input_floor
+                    .max(Some(cached))
+                    .max(*cache_write_input_tokens);
+                self.reported_output_floor = self.reported_output_floor.max(*reasoning_tokens);
                 // Reasoning/cache are subsets of these canonical totals.
             }
             LLMChunk::CacheUsage {
@@ -330,7 +345,7 @@ impl Usage {
                 let floor = input_tokens
                     .saturating_add(*cache_creation_input_tokens)
                     .saturating_add(*cache_read_input_tokens);
-                self.legacy_input_floor = Some(self.legacy_input_floor.unwrap_or(0).max(floor));
+                self.reported_input_floor = Some(self.reported_input_floor.unwrap_or(0).max(floor));
             }
             LLMChunk::UsageSummary {
                 output_tokens,
@@ -339,7 +354,8 @@ impl Usage {
                 // Thinking may be a subset of output, so never add it. Either
                 // positive dimension alone supplies an output lower bound.
                 let floor = (*output_tokens).max(*thinking_tokens);
-                self.legacy_output_floor = Some(self.legacy_output_floor.unwrap_or(0).max(floor));
+                self.reported_output_floor =
+                    Some(self.reported_output_floor.unwrap_or(0).max(floor));
             }
             _ => {}
         }
@@ -347,22 +363,26 @@ impl Usage {
     fn over_cap_report(&self, request: &WorkTokenRequest) -> Option<ExecutionTokenOverCapUsage> {
         // Canonical totals already include cache/reasoning: use max, not sum,
         // when the provider emits both canonical and legacy representations.
-        let input_tokens = self.input.max(self.legacy_input_floor);
-        let output_tokens = self.output.max(self.legacy_output_floor);
+        let input_tokens = self.input.max(self.reported_input_floor);
+        let output_tokens = self.output.max(self.reported_output_floor);
         (input_tokens.is_some_and(|v| v > u64::from(request.input_cap))
-            || output_tokens.is_some_and(|v| v > u64::from(request.output_cap)))
+            || output_tokens.is_some_and(|v| v > u64::from(request.output_cap))
+            || self
+                .reported_total
+                .is_some_and(|v| v > u64::from(request.input_cap) + u64::from(request.output_cap)))
         .then_some(ExecutionTokenOverCapUsage {
             input_tokens,
             output_tokens,
+            total_tokens: self.reported_total,
         })
     }
     fn measured(&self) -> Option<ExecutionTokenUsage> {
         if self.inconsistent
             || self
-                .legacy_input_floor
+                .reported_input_floor
                 .is_some_and(|floor| self.input.is_some_and(|actual| floor > actual))
             || self
-                .legacy_output_floor
+                .reported_output_floor
                 .is_some_and(|floor| self.output.is_some_and(|actual| floor > actual))
         {
             return None;

@@ -24,6 +24,9 @@ enum Script {
     LegacyOverflowOverCap,
     LegacyWithinCap,
     MixedKnown,
+    CanonicalCacheOnlyOverCap,
+    CanonicalReasoningOnlyOverCap,
+    CanonicalTotalOnlyOverCap,
 }
 struct Provider {
     script: Script,
@@ -78,6 +81,26 @@ impl LLMProvider for Provider {
             Script::Partial => vec![Ok(LLMChunk::Done), Ok(usage(None, Some(10)))],
             Script::OverCap => vec![Ok(usage(Some(101), Some(10)))],
             Script::PartialOverCap => vec![Ok(usage(Some(101), None))],
+            Script::CanonicalCacheOnlyOverCap
+            | Script::CanonicalReasoningOnlyOverCap
+            | Script::CanonicalTotalOnlyOverCap => {
+                let mut chunk = usage(None, None);
+                if let LLMChunk::ProviderUsage {
+                    cache_read_input_tokens,
+                    reasoning_tokens,
+                    total_tokens,
+                    ..
+                } = &mut chunk
+                {
+                    match self.script {
+                        Script::CanonicalCacheOnlyOverCap => *cache_read_input_tokens = Some(101),
+                        Script::CanonicalReasoningOnlyOverCap => *reasoning_tokens = Some(41),
+                        Script::CanonicalTotalOnlyOverCap => *total_tokens = Some(141),
+                        _ => unreachable!(),
+                    }
+                }
+                vec![Ok(chunk)]
+            }
             Script::LegacyCachedInputOverCap => vec![Ok(LLMChunk::CacheUsage {
                 input_tokens: 0,
                 cache_creation_input_tokens: 0,
@@ -298,6 +321,9 @@ async fn token_budget_over_cap_report_halts_subsequent_provider_entry() {
         Script::LegacyOutputOverCap,
         Script::LegacyThinkingOverCap,
         Script::LegacyOverflowOverCap,
+        Script::CanonicalCacheOnlyOverCap,
+        Script::CanonicalReasoningOnlyOverCap,
+        Script::CanonicalTotalOnlyOverCap,
     ] {
         let (f, _registration) = admitted().await;
         configure(&f, 500);
