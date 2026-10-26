@@ -365,6 +365,37 @@ impl SessionStoreV2 {
         self.load_session_unlocked(target_id).await
     }
 
+    pub(super) async fn management_context(
+        &self,
+        reference: &SupervisorReference,
+        target_id: &str,
+    ) -> io::Result<(Session, SupervisorLinkObservation)> {
+        let _guard = self.lock_supervisor_followup(reference, target_id).await?;
+        let current = self.management_supervisor_locked(reference).await?;
+        let state = current
+            .supervisor_management
+            .ok_or_else(|| denied("Supervisor scope missing"))?;
+        let link = state
+            .links
+            .get(target_id)
+            .cloned()
+            .ok_or_else(|| denied("Supervisor link missing"))?;
+        let target = self
+            .load_root_authority_unchecked(target_id)
+            .await?
+            .ok_or_else(|| denied("context view target disappeared"))?;
+        Ok((
+            target,
+            SupervisorLinkObservation {
+                supervisor: reference.clone(),
+                state_revision: state.revision,
+                target_session_id: target_id.to_owned(),
+                link: Some(link),
+                authorized: true,
+            },
+        ))
+    }
+
     pub(super) async fn supervisor_orchestration_job(
         &self,
         reference: &SupervisorReference,

@@ -1,0 +1,99 @@
+name: Scoped Context View Acceptance
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - 'crates/core/bamboo-domain/src/storage.rs'
+      - 'crates/core/bamboo-domain/src/host_session_scope.rs'
+      - 'crates/infra/bamboo-storage/**'
+      - 'crates/app/bamboo-server-tools/src/session_inspector/**'
+      - 'crates/app/bamboo-server-tools/tests/scoped_context_view.rs'
+      - 'crates/app/bamboo-server-tools/tests/session_context_view.rs'
+      - 'crates/app/bamboo-server-tools/tests/host_session_discovery.rs'
+      - 'crates/app/bamboo-server-tools/tests/supervisor_history_scope.rs'
+      - '.github/workflows/scoped-context-view.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scoped-context-view-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  context:
+    name: Canonical scoped context runtime and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_TARGET_DIR: target/grouped-default
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: '8388608'
+      EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Bind runtime acceptance to exact clean source
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SOURCE"
+          test -z "$status"
+          git show -s --format='Context source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Restore existing dependencies without saving cache storage
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-test-${{ runner.os }}
+          workspaces: . -> target/grouped-default
+          save-if: false
+
+      - name: Run real canonical scope and immutable file regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -vV
+          cargo -V
+          cargo test --locked -p bamboo-server-tools --test scoped_context_view --test session_context_view --test host_session_discovery --test supervisor_history_scope -- --test-threads=1 --nocapture --color=never | tee "$RUNNER_TEMP/scoped-context-tests.log"
+          python3 - <<'PY'
+          import os, pathlib, re
+          log = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'scoped-context-tests.log').read_text()
+          summaries = re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', log)
+          assert len(summaries) == 4, summaries
+          assert all(int(p) > 0 and int(f) == int(i) == 0 for p, f, i in summaries), summaries
+          print('Canonical integration targets:', summaries)
+          PY
+
+      - name: Check affected libraries and actual integration targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy=(-D warnings -A deprecated -A clippy::module_inception
+            -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
+            -A clippy::too-many-arguments -A clippy::while-let-loop
+            -A clippy::type_complexity -A dead-code)
+          cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-storage -p bamboo-server-tools -- "${policy[@]}"
+          cargo clippy --locked --all-features -p bamboo-server-tools --test scoped_context_view --test session_context_view --test host_session_discovery -- "${policy[@]}"
+
+      - name: Verify exact source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SOURCE"
+          test -z "$status"
+          git show -s --format='Final context source: %H tree: %T' HEAD

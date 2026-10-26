@@ -12,7 +12,7 @@ trusted Host calls `install_host_session_scope(expected_revision, binding)`.
 Ordinary Session saves, Project membership, parent/Child links, management
 receipts and model arguments never call it. Root, Child and Supervisor use the
 same finite binding: a stable caller identity and complete ancestors, at most
-128 exact targets with separate ListMetadata/InspectBoundedProgress/SendPeer
+128 exact targets with separate ListMetadata/InspectBoundedProgress/ReadContextView/SendPeer
 rights, plus at most 32 exact creation-operation/Project/workspace permits.
 Creation and Send rights are recorded data; their final writers are separate
 mandatory source slices and are not emulated by the read ports.
@@ -50,6 +50,17 @@ ListMetadata-authorized targets, returns finite metadata observations and never
 returns transcripts. Inspection reads one explicitly InspectBoundedProgress
 target; the installed tool adapter must reuse the existing bounded persisted
 progress projection and expose no full-history method through that right.
+`ReadContextView` separately permits immutable status/brief snapshots containing
+the exporter's bounded Task-list title, IDs and description previews. It does
+not follow from `ListMetadata` or `InspectBoundedProgress`, and grants neither
+of those rights, assistant-excerpt inspection, raw history nor `SendPeer`.
+Scoped `export_context`/`read_context` use only this explicit right (or the
+original Supervisor's independently authorized managed-target route when no
+Host scope has ever been installed). Fixed revision/file selectors are not
+grants; each operation revalidates the original caller, current scope epoch and
+target lifetime. The reader admits only retained no-follow fixed bundle reads
+on supported platforms and otherwise fails closed. Existing strict authority
+validation may read Main; only the view-bundle reads have the 8/16/8 KiB caps.
 Returned snapshots and cursors are observations, never admission receipts or
 completion evidence. Tool pagination and scope/caller/query-bound cursors remain
 in the separate discovery adapter, without injecting unrelated history.

@@ -119,6 +119,9 @@ pub const MAX_HOST_SESSION_ANCESTORS: usize = 64;
 pub enum HostSessionRight {
     ListMetadata,
     InspectBoundedProgress,
+    /// Fixed immutable status/brief views, including bounded Task previews.
+    /// Separate from the original progress/assistant-excerpt projection.
+    ReadContextView,
     SendPeer,
 }
 
