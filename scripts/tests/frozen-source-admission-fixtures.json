@@ -1,0 +1,394 @@
+{
+  "notice": "INERT TEST DATA ONLY. This workflow/helper text was never executed and is not an accepted production producer.",
+  "identities": {
+    "B": "1111111111111111111111111111111111111111",
+    "F": "2222222222222222222222222222222222222222",
+    "M": "3333333333333333333333333333333333333333",
+    "S": "4444444444444444444444444444444444444444",
+    "C": "5555555555555555555555555555555555555555",
+    "anchor": "6666666666666666666666666666666666666666",
+    "devAdvance": "7777777777777777777777777777777777777777"
+  },
+  "workflowText": "name: CI\n# inert complete-contract fixture; not an executable production workflow\n",
+  "helperText": "// inert source-closure fixture, never executed\n",
+  "jobs": [
+    "Validation Source",
+    "Quick Checks",
+    "Feature Tests",
+    "Native Feature (windows-2025)",
+    "Native Feature (macos-latest)",
+    "Test",
+    "E2E Tests",
+    "Lint",
+    "MSRV (1.95)",
+    "Documentation",
+    "Security Audit",
+    "Check Licenses & Dependencies"
+  ],
+  "times": {
+    "created": "2026-10-27T01:00:00Z",
+    "started": "2026-10-27T01:00:01Z",
+    "completed": "2026-10-27T01:02:00Z",
+    "merged": "2026-10-27T01:03:00Z"
+  },
+  "negativeCases": [
+    {
+      "name": "PR remains OPEN despite a Git merge object",
+      "target": "pr.state",
+      "value": "open"
+    },
+    {
+      "name": "PR has no completed merge event",
+      "target": "pr.merged",
+      "value": false
+    },
+    {
+      "name": "foreign repository ID",
+      "target": "run.repository.id",
+      "value": 99
+    },
+    {
+      "name": "fork feature head",
+      "target": "pr.head.repo.full_name",
+      "value": "foreign/Bamboo-agent"
+    },
+    {
+      "name": "same-tree different PR head",
+      "target": "pr.head.sha",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "accepted merge is not a normal two-parent merge",
+      "target": "accepted.parents",
+      "value": [
+        {
+          "sha": "2222222222222222222222222222222222222222"
+        }
+      ]
+    },
+    {
+      "name": "accepted second parent differs from original F",
+      "target": "accepted.parents.1.sha",
+      "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "name": "tested M has another original base",
+      "target": "snapshot.parents.0.sha",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "tested M has another original head",
+      "target": "snapshot.parents.1.sha",
+      "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "name": "same parents with another tested tree",
+      "target": "snapshot.tree.sha",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "source run is the compile-only main-push route",
+      "target": "run.event",
+      "value": "push"
+    },
+    {
+      "name": "failed latest logical run",
+      "target": "run.conclusion",
+      "value": "failure"
+    },
+    {
+      "name": "pending latest logical run",
+      "target": "run.status",
+      "value": "in_progress"
+    },
+    {
+      "name": "unofficial check-suite application",
+      "target": "suite.app.databaseId",
+      "value": 123
+    },
+    {
+      "name": "suite bound to a different F",
+      "target": "suite.commit.oid",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "suite belongs to a different physical run",
+      "target": "suite.workflowRun.databaseId",
+      "value": 999
+    },
+    {
+      "name": "foreign workflow definition URL",
+      "target": "suite.workflowRun.file.repositoryFileUrl",
+      "value": "https://example.com/forged/ci.yml"
+    },
+    {
+      "name": "CI workflow ID differs from trusted policy",
+      "target": "workflow.id",
+      "value": 777
+    },
+    {
+      "name": "disabled workflow route",
+      "target": "workflow.state",
+      "value": "disabled_manually"
+    },
+    {
+      "name": "frozen branch moves away from S",
+      "target": "release.commit.sha",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "dev is unprotected",
+      "target": "dev.protected",
+      "value": false
+    },
+    {
+      "name": "trusted main is unprotected",
+      "target": "main.protected",
+      "value": false
+    },
+    {
+      "name": "required native matrix entry is missing",
+      "operation": "missingJob",
+      "index": 4
+    },
+    {
+      "name": "duplicate latest feature job",
+      "operation": "duplicateJob",
+      "index": 1
+    },
+    {
+      "name": "original required job failed",
+      "operation": "job",
+      "index": 2,
+      "target": "conclusion",
+      "value": "failure"
+    },
+    {
+      "name": "original required job was skipped",
+      "operation": "job",
+      "index": 3,
+      "target": "conclusion",
+      "value": "skipped"
+    },
+    {
+      "name": "original required job was cancelled",
+      "operation": "job",
+      "index": 4,
+      "target": "conclusion",
+      "value": "cancelled"
+    },
+    {
+      "name": "original required job is pending",
+      "operation": "job",
+      "index": 2,
+      "target": "status",
+      "value": "in_progress"
+    },
+    {
+      "name": "required step skipped inside successful job",
+      "operation": "job",
+      "index": 3,
+      "target": "steps.0.conclusion",
+      "value": "skipped"
+    },
+    {
+      "name": "failed step inside successful job",
+      "operation": "job",
+      "index": 4,
+      "target": "steps.0.conclusion",
+      "value": "failure"
+    },
+    {
+      "name": "missing critical step",
+      "operation": "job",
+      "index": 4,
+      "target": "steps",
+      "value": []
+    },
+    {
+      "name": "runtime completed only after dev admission",
+      "operation": "job",
+      "index": 2,
+      "target": "completed_at",
+      "value": "2026-10-27T01:04:00Z"
+    },
+    {
+      "name": "job predates original CI run",
+      "operation": "job",
+      "index": 2,
+      "target": "started_at",
+      "value": "2026-10-27T00:59:59Z"
+    },
+    {
+      "name": "original physical attempt absent",
+      "operation": "missingOriginal",
+      "index": 3
+    },
+    {
+      "name": "same job ID has altered original steps",
+      "operation": "alterOriginal",
+      "index": 3
+    },
+    {
+      "name": "original source log expired",
+      "target": "sourceLog",
+      "value": ""
+    },
+    {
+      "name": "source log claims full release regression",
+      "target": "sourceLog",
+      "value": "2026-10-27T01:00:01Z Event source: 3333333333333333333333333333333333333333; full validation: true\n"
+    },
+    {
+      "name": "controller env is rewritten to product S",
+      "operation": "environment",
+      "target": "GITHUB_SHA",
+      "value": "4444444444444444444444444444444444444444"
+    },
+    {
+      "name": "legacy dev workflow_run controller cannot become main v2",
+      "operation": "environment",
+      "target": "GITHUB_EVENT_NAME",
+      "value": "workflow_run"
+    },
+    {
+      "name": "untrusted controller ref",
+      "operation": "environment",
+      "target": "GITHUB_REF",
+      "value": "refs/heads/dev"
+    },
+    {
+      "name": "unassigned coverage category",
+      "operation": "policy",
+      "target": "coverage",
+      "value": [
+        "unit",
+        "e2e"
+      ]
+    },
+    {
+      "name": "unknown producer cannot be accepted",
+      "operation": "unknownProducer"
+    },
+    {
+      "name": "source authority has a missing helper pin",
+      "operation": "missingHelper"
+    },
+    {
+      "name": "accepted dev history rewrites during proof",
+      "operation": "rewriteDev"
+    },
+    {
+      "name": "main source history is absent",
+      "operation": "missingMainHistory"
+    },
+    {
+      "name": "newer failed feature run exists",
+      "operation": "newerRun"
+    },
+    {
+      "name": "latest logical attempt changes during proof",
+      "operation": "raceRun"
+    },
+    {
+      "name": "frozen release ref changes during proof",
+      "operation": "raceRef"
+    },
+    {
+      "name": "required job changes during proof",
+      "operation": "raceJobs"
+    },
+    {
+      "name": "PR merge event changes during proof",
+      "operation": "racePr"
+    },
+    {
+      "name": "API page fails closed",
+      "operation": "apiFailure"
+    },
+    {
+      "name": "Cargo.lock differs from tested M",
+      "operation": "fileDrift",
+      "path": "Cargo.lock"
+    },
+    {
+      "name": "native driver differs from pinned producer",
+      "operation": "fileDrift",
+      "path": "scripts/native-test-owner.cjs"
+    },
+    {
+      "name": "native source selects legacy four-target contract",
+      "operation": "nativeV1"
+    },
+    {
+      "name": "frontend ZIP differs from committed manifest",
+      "operation": "frontendZip"
+    },
+    {
+      "name": "frontend lock is dirty",
+      "operation": "frontendDirty"
+    },
+    {
+      "name": "untrusted dispatch fields cannot inject controller policy",
+      "operation": "inputPolicy"
+    },
+    {
+      "name": "newer run appears during proof",
+      "operation": "raceNewRun"
+    },
+    {
+      "name": "conflicting nonempty PR association",
+      "operation": "conflictingAssociation"
+    },
+    {
+      "name": "duplicate source snapshot line",
+      "operation": "duplicateSourceLog"
+    },
+    {
+      "name": "logical copy alters original critical steps",
+      "operation": "alterLogical"
+    },
+    {
+      "name": "logical copy pretends earlier attempt than physical execution",
+      "operation": "fakeAttempt"
+    },
+    {
+      "name": "fresh PR changes original merged-at timestamp",
+      "operation": "raceMergedAt"
+    },
+    {
+      "name": "fresh official check-suite changes source",
+      "operation": "raceSuite"
+    },
+    {
+      "name": "accepted frontend lock has malformed semver",
+      "operation": "frontendVersion"
+    },
+    {
+      "name": "physical job canonical ID is not its requested ID",
+      "operation": "differentPhysicalId"
+    }
+  ],
+  "knownIncompleteSources": [
+    {
+      "label": "compile-only-v6",
+      "revision": "a9bdded381761226ee0ff778a6b190bd56cf9fc4",
+      "workflowSha256": "24ae01bc74e1c02c06fe1f748d85a5ab7744402334b2e8d961cd49d7ac3bf4df"
+    },
+    {
+      "label": "A339-no-native",
+      "revision": "339c997918a05789fb06fc407106728e64b36a41",
+      "workflowSha256": "7e17d7e7d31401faf67e18f6ba7945e6a04afab58dda50227130a7a61a03c03d"
+    },
+    {
+      "label": "C0f38-no-portable-feature-node",
+      "revision": "0f38d559f250d92d43cd0dcc9ad21b39a7e9eca1",
+      "workflowSha256": "5fb5d171368fa4b9d1e202e22417a05d2fd512a8c7369c4eef778c37abd5648c"
+    },
+    {
+      "label": "C7c552-unexecuted-native-quality-pending",
+      "revision": "7c5525bba44953996476cc21c77a7dbfa9e600be",
+      "workflowSha256": "71588d38695a4e74c6e828ef0aa8ced5845117be6906bd4826b0854792607c61"
+    }
+  ]
+}

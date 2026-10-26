@@ -40,6 +40,22 @@ parallel builds never create another allocator or publication queue.
 
 ## Pull Request Review
 
+### Inactive frozen-source foundation (#2323)
+
+`scripts/frozen-source-admission.cjs` produces read-only source context, with
+`publicationAuthorized: false`. Its default complete-producer registry is empty.
+Do not pass test fixture policy into an actual controller, treat that context as
+a signed reservation/publication receipt, or wire it into the live publisher.
+The current compile-only route, A339 and unexecuted C/native drafts do not earn
+v2 acceptance. Preserve all active legacy gates and genuine v6/HMAC recovery.
+Future activation must pin a fully accepted feature producer and its helper
+closure, with complete Unit/E2E/native/quality ownership and original physical
+jobs. Independently prove the exact merged PR and normal B/F/M/S identities when
+GitHub drops run PR associations. Keep actual main controller C separate from
+product checkout S and never rewrite GITHUB_SHA. See the
+[foundation contract](docs/releases/ci-publication-flow.md#inactive-frozen-source-foundation-2323)
+for the read adapter, pending owners and verification command.
+
 ### Bamboo #791 integration exception
 
 For the #791 multi-agent epic, the user's 2026-09-28 delivery instruction takes

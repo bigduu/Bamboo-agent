@@ -5,6 +5,93 @@ This is the operating guide for Bamboo's CI and automatic release path. The
 for cuts, original-source repairs, protected admission and credentials.
 [Parallel Development](../../gitflow.md) defines ownership and local evidence.
 
+## Inactive frozen-source foundation (#2323)
+
+`scripts/frozen-source-admission.cjs` is an unused, read-only library. The live
+phase contracts below remain active. This foundation does not change Actions,
+publishers, signed reservations, release recovery, protection or dispatches.
+Its default accepted-producer registry is empty: deployed compile-only/v6,
+A339 without complete native owners, C0f38 without portable feature Node owners,
+and the unexecuted C7c552 correction cannot acquire v2 source acceptance.
+
+The target order is feature Unit/E2E and quality acceptance -> protected dev ->
+exact frozen release source -> the existing single version reservation -> one
+formal build/publication per native target -> normal main promotion. Product
+repairs return through feature/dev and a new cut. Main push/promotion must not
+repeat build/tests; a release dispatch using trusted main controller code is the
+release phase. Immutable tags, Release manifests/provenance and promotion refs
+record publication; do not mutate the release head or add a post-build source
+JSON commit. This library does not activate that order.
+
+The result is `bamboo-frozen-source-context/v2`, with
+`publicationAuthorized: false`. It records:
+
+- `source`: exact frozen ref, S, accepted dev merge D, tree, trusted main-history
+  anchor and observed dev heads. S must equal D; the frozen ref must remain S.
+- `feature`: original PR, immutable B/F/M, original CI run, latest logical
+  attempt, official workflow/check-suite identity and definition revision Q,
+  producer digest and each original job ID/physical attempt/steps fingerprint.
+- `controller`: actual trusted main workflow revision C, event/ref and observed
+  main heads. Actual GITHUB_SHA and GITHUB_WORKFLOW_SHA remain C; product S is
+  a separate source selection. No source checkout or candidate code executes.
+- `inputs`: original Git blob IDs and SHA-256 for Cargo.lock, committed frontend
+  lock/wrapper/ZIP and native contract, plus the fixed three native targets.
+  Frontend wrapper/ZIP digests must agree. Registry and universal-resource
+  verification remain owned by the existing artifact/preparation verifiers.
+
+The independent PR API must report a closed, merged dev PR with exact F and D.
+Both the original physical source-job log's M and D must have ordered parents
+[B,F] and the same tree; matching trees alone cannot identify a PR. B comes
+from these immutable merge objects, rather than a mutable PR `base.sha` view.
+Empty `run.pull_requests` is allowed only with that independent proof, the
+official GitHub Actions check-suite and original jobs. Conflicting associations,
+an OPEN PR despite a Git merge, missing logs or ambiguous identity fail closed.
+The selected CI run must remain the latest matching feature run. Each required
+physical job must have completed before dev admission with its required steps
+successful. Logical copies in a later attempt retain their original physical
+attempt; a copied logical entry is not another execution. Re-read PR, run,
+check-suite, latest jobs, original jobs and refs before returning. The result is
+an observed source context, not permission for a later publication write.
+
+The trusted caller supplies `json(relativeRoute)` for fixed-repository REST
+GETs, `checkSuite(nodeId)` using the existing read-only check-suite query and
+`jobLog(jobId)` for original logs. Reuse the controller's existing transport;
+the library adds no HTTP/credential/polling or artifact-execution mechanism.
+`policy` belongs to reviewed controller code, never dispatch inputs or a PR.
+It pins a complete workflow digest, workflow ID, critical jobs/steps, helper
+closure and main-history anchor. Fixture policy is inert unit-test data; it is
+not evidence that a real complete producer has run. The source-selected native
+contract is read as bytes, without importing publication/signing helpers.
+
+Run the focused contract fixtures through their existing Quick policy owner:
+
+```bash
+node --test --test-name-pattern='frozen source foundation' scripts/ci-policy.test.cjs
+```
+
+Before a real producer can be installed, finish #2322 Linux acceptance and
+#2319 native/portable Node acceptance, including the actual matching hosted
+platforms. The native drafts preserve 41 Actor cases and distinct compiler,
+features, frontend and profile contexts; source context cannot substitute for
+their runtime evidence. Legacy Platform's 61 portable Node registrations per
+OS migrate to Ubuntu Quick and each native feature job in #2319, not this
+foundation. #2330 separately owns all 13 browser-runtime Node files missing an
+automatic owner; #2329 corrects the old retirement fixture independently.
+
+Other pending owners cannot disappear at cutover: full strict all-feature
+Clippy; Rust 1.95 MSRV/Python/locked all-target checks; source-sensitive Root
+Birth strict Clippy; cargo-audit/cargo-deny/CodeQL; and the original frontend
+build/lint contracts. #2321 owns unique documentation production/deployment.
+All of these need explicit feature/analysis ownership before release tests are
+retired. Keep the Release Cargo Isolation boundary owner. Normal main history
+must enter the accepted dev cut through real tested ancestry, not tree equality.
+
+The publisher/controller activation remains separate from #2324 original native
+output durability, #2325 original crate archive reuse and #2320 Docker consumers.
+Public main-promotion completion proof is another authority and is outside this
+foundation. Preserve genuine v6 and the frozen 2026.10.11 HMAC recovery bytes;
+never reinterpret those signed formats as the new read-only source context.
+
 ## Phase contracts
 
 | Phase | Trigger and owner | Required result |
