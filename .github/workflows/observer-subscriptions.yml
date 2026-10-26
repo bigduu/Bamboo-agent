@@ -12,6 +12,7 @@ on:
       - 'crates/infra/bamboo-storage/src/v2/supervisor_management.rs'
       - 'crates/app/bamboo-server-tools/src/session_inspector/**'
       - 'crates/app/bamboo-server/src/app_state/observer_subscription*.rs'
+      - 'crates/app/bamboo-server/src/app_state/observer_fault_tests.rs'
       - 'crates/app/bamboo-server/src/app_state/builder.rs'
       - 'crates/app/bamboo-server/src/app_state/mod.rs'
       - 'crates/app/bamboo-server/src/app_state/wake_reconciler.rs'
@@ -116,8 +117,16 @@ jobs:
               'subscription_status_filter_ignores_question_and_task_noise_but_tracks_run_identity',
           }
           expected = {f'app_state::observer_subscriptions::tests::{name}' for name in fixtures}
+          faults = {
+              'fault_cap_from_actual_publication_failure_notifies_idle_parent_once',
+              'fault_preserves_live_work_wait_and_original_user_input',
+              'fault_parent_inbox_before_checkpoint_reopens_and_never_replays_provider',
+              'fault_missing_source_can_report_but_revoked_registration_cannot',
+              'fault_delivery_failure_is_bounded_durable_and_preserves_original_payload',
+          }
+          expected |= {f'app_state::observer_subscriptions::tests::fault::{name}' for name in faults}
           assert results['server'] == expected, results['server'] ^ expected
-          print('Six canonical windows, exact legacy serde and all six actual subscription Host fixtures passed')
+          print('Six canonical windows, exact legacy serde, six subscription and five fault Host fixtures passed')
           PY
 
       - name: Check affected production libraries under the original lint policy

@@ -908,3 +908,6 @@ async fn subscription_status_filter_ignores_question_and_task_noise_but_tracks_r
     assert_eq!(f.probe.calls.load(Ordering::SeqCst), 0);
     f.state.shutdown().await;
 }
+
+#[path = "observer_fault_tests.rs"]
+mod fault;
