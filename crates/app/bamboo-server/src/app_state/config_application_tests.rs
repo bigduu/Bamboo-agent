@@ -381,10 +381,9 @@ fn actual_provider_and_mcp_publications_preserve_unrelated_receipts() {
             .unwrap();
         // Legal receipt metadata may contain the synthetic endpoint's digits.
         // Pin that collision so the disclosure assertion cannot pass by chance.
-        let applied_at =
-            chrono::DateTime::parse_from_rfc3339("2026-10-26T02:54:49.987600Z")
-                .unwrap()
-                .with_timezone(&Utc);
+        let applied_at = chrono::DateTime::parse_from_rfc3339("2026-10-26T02:54:49.987600Z")
+            .unwrap()
+            .with_timezone(&Utc);
         {
             let mut application = state.config_application.write().unwrap();
             for id in [ConfigConsumer::ProviderRuntime, ConfigConsumer::McpRuntime] {
@@ -401,7 +400,10 @@ fn actual_provider_and_mcp_publications_preserve_unrelated_receipts() {
         let defaults = application_report(&state).await;
         assert_eq!(consumer(&defaults, "provider-runtime")["state"], "in_sync");
         for id in ["provider-runtime", "mcp-runtime"] {
-            assert_eq!(consumer(&defaults, id)["last_applied_at"], json!(applied_at));
+            assert_eq!(
+                consumer(&defaults, id)["last_applied_at"],
+                json!(applied_at)
+            );
         }
         for id in [
             "connect-manager",
