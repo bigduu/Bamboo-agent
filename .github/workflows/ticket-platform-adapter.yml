@@ -2,6 +2,12 @@ name: Ticket Platform Adapter
 
 on:
   workflow_dispatch:
+    inputs:
+      snapshot_sha:
+        description: Exact source SHA for Native Work budget acceptance; empty runs Windows only
+        required: false
+        default: ''
+        type: string
   pull_request:
     branches: [dev, main]
     paths:
@@ -19,6 +25,85 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  native-budget:
+    name: Native Work Budget Acceptance (Linux)
+    if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
+      RUST_MIN_STACK: '8388608'
+      BAMBOO_FRONTEND_BUILD_MODE: api-only
+      EXPECTED_SNAPSHOT_SHA: ${{ inputs.snapshot_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Bind acceptance to the exact clean source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_SNAPSHOT_SHA" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SNAPSHOT_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git show -s --format='Acceptance source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Record compiler and available disk
+        run: |
+          rustc -vV
+          cargo -V
+          df -h .
+
+      - name: Restore existing dependencies without writing cache storage
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-test-${{ runner.os }}
+          workspaces: . -> target/grouped-default
+          save-if: false
+
+      - name: Verify the actual Native Host and Ready assembly
+        run: >-
+          cargo test --locked -p bamboo-server
+          --test native_work_token_budget --test native_work_acceptance
+          --test native_work_project_isolation --test patrol_ready_assembly
+          -- --test-threads=1 --nocapture
+
+      - name: Check affected libraries and test targets under the existing CI lint policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy=(-D warnings -A deprecated -A clippy::module_inception
+            -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
+            -A clippy::too-many-arguments -A clippy::while-let-loop
+            -A clippy::type_complexity -A dead-code)
+          cargo clippy --locked --all-features --lib \
+            -p bamboo-tickets -p bamboo-orchestration -p bamboo-llm \
+            -p bamboo-engine -p bamboo-server -- "${policy[@]}"
+          cargo clippy --locked --all-features -p bamboo-server \
+            --test native_work_token_budget --test native_work_acceptance \
+            --test native_work_project_isolation --test patrol_ready_assembly -- "${policy[@]}"
+          cargo clippy --locked --all-features -p bamboo-tickets \
+            --test execution_budget -- "${policy[@]}"
+
+      - name: Verify the source stayed exact and clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SNAPSHOT_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
   windows:
     name: Ticket Platform Adapter (Windows)
     runs-on: windows-latest
