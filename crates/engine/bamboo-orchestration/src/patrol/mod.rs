@@ -8,6 +8,7 @@
 
 pub mod budget;
 pub mod checkpoint;
+pub mod delivery;
 pub mod host;
 pub mod program;
 
