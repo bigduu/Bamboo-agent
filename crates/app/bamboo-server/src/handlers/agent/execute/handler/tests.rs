@@ -279,6 +279,12 @@ mod idempotency_e2e {
             ..Default::default()
         });
 
+        // Provider counts belong to this HTTP execution fixture. Background
+        // Dream must not consume its blocking provider or startup semaphore.
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = false;
         let provider_trait: Arc<dyn LLMProvider> = provider.clone();
         let mut state = AppState::new_with_provider(data_dir, config, provider_trait)
             .await
@@ -318,6 +324,12 @@ mod idempotency_e2e {
         config.default_provider_instance = Some("main-anthropic".to_string());
         config.features.provider_model_ref = true;
 
+        // Count only explicit execution routing; default-on Dream otherwise
+        // shares the original runtime provider with this synthetic fixture.
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = false;
         let runtime_default: Arc<dyn LLMProvider> = default_provider.clone();
         let mut state = AppState::new_with_provider(data_dir, config, runtime_default)
             .await
