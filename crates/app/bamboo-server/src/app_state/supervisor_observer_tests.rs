@@ -676,7 +676,7 @@ async fn active_observer_cancel_drains_its_owner_without_cancelling_work() {
 fn reader_ctx(child: &Session) -> ToolCtx {
     let mut ctx = ToolCtx::none("observer-view");
     ctx.session_id = Some(Arc::from(child.id.as_str()));
-    ctx.executing_caller = Some(SessionCallerReference::from(child));
+    ctx.executing_caller = Some(Arc::new(SessionCallerReference::from(child)));
     ctx
 }
 

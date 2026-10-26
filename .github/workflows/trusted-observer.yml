@@ -1,0 +1,152 @@
+name: Trusted Observer Acceptance
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - 'crates/core/bamboo-domain/src/session/supervisor_management.rs'
+      - 'crates/core/bamboo-domain/src/storage.rs'
+      - 'crates/infra/bamboo-storage/src/v2.rs'
+      - 'crates/infra/bamboo-storage/src/v2/supervisor*.rs'
+      - 'crates/infra/bamboo-storage/src/v2/child_wait_control_plane.rs'
+      - 'crates/engine/bamboo-engine/src/external_agents/**'
+      - 'crates/engine/bamboo-engine/src/runtime/runner/loop_execution/pipeline.rs'
+      - 'crates/app/bamboo-server/src/app_state/supervisor_observer*.rs'
+      - 'crates/app/bamboo-server/src/tools/child_session_adapter.rs'
+      - 'crates/app/bamboo-server-tools/src/session_inspector/scoped_context.rs'
+      - '.github/workflows/trusted-observer.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trusted-observer-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  observer:
+    name: Canonical Observer Host runtime and lint (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '8388608'
+      # These native Host tests exercise API/runtime contracts, not frontend
+      # packaging or publication. No frontend bytes are staged or substituted.
+      BAMBOO_FRONTEND_BUILD_MODE: api-only
+      EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Bind acceptance to the exact clean source and lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git show -s --format='Observer source: %H tree: %T' HEAD | tee "$RUNNER_TEMP/observer-source.log"
+          sha256sum Cargo.lock | tee -a "$RUNNER_TEMP/observer-source.log"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Record actual compiler and build mode
+        run: |
+          set -euo pipefail
+          rustc -vV | tee -a "$RUNNER_TEMP/observer-source.log"
+          cargo -V | tee -a "$RUNNER_TEMP/observer-source.log"
+          printf 'frontend=%s jobs=%s incremental=%s target=%s\n' "$BAMBOO_FRONTEND_BUILD_MODE" "$CARGO_BUILD_JOBS" "$CARGO_INCREMENTAL" "$CARGO_TARGET_DIR" | tee -a "$RUNNER_TEMP/observer-source.log"
+          df -h .
+
+      - name: Restore existing dependencies without saving cache storage
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-test-${{ runner.os }}
+          workspaces: . -> target/grouped-default
+          save-if: false
+
+      - name: Run real management, proof, lock-order and native Host cases
+        shell: bash
+        run: |
+          set -euo pipefail
+          # All positional libtest filters after -- are ORed. Keep one Cargo
+          # invocation; this includes the whole storage management family.
+          # Capture passing test output so every per-case `... ok` is unambiguous.
+          cargo test --locked -p bamboo-domain -p bamboo-storage -p bamboo-server --lib -- \
+            supervisor_management supervisor_proof supervisor_observers::tests observer_lock_order \
+            --test-threads=1 --color=never 2>&1 | tee "$RUNNER_TEMP/observer-tests.log"
+          python3 - <<'PY'
+          import os, pathlib, re
+          log = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'observer-tests.log').read_text()
+          runs = list(re.finditer(r'^\s*Running unittests [^\n]*\(([^()\n]+)\)\s*$', log, re.M))
+          assert len(runs) == 3, [r.group(1) for r in runs]
+          results = {}
+          for index, run in enumerate(runs):
+              binary = pathlib.Path(run.group(1)).name
+              package = re.fullmatch(r'bamboo_(domain|storage|server)-[0-9a-f]+', binary)
+              assert package, binary
+              package = package.group(1)
+              assert package not in results, package
+              section = log[run.end():runs[index + 1].start() if index + 1 < len(runs) else len(log)]
+              summaries = re.findall(r'test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', section)
+              assert len(summaries) == 1, (package, summaries)
+              passed, failed, ignored = map(int, summaries[0])
+              assert passed > 0 and failed == ignored == 0, (package, summaries)
+              names = set(re.findall(r'^test ([\w:]+) \.\.\. ok$', section, re.M))
+              assert len(names) == passed, (package, passed, names)
+              results[package] = names
+              print(f'{package}: {passed} real tests passed')
+          assert set(results) == {'domain', 'storage', 'server'}, results
+          assert any(n.startswith('session::supervisor_management::tests::') for n in results['domain'])
+          for family in ('supervisor_management_tests', 'supervisor_management_lifetime_tests', 'supervisor_proof_tests', 'supervisor_management::observer_lock_order_tests'):
+              assert any(n.startswith(f'v2::{family}::') for n in results['storage']), family
+          fixtures = {
+              'native_observer_reads_two_projects_and_never_holds_idle_parent',
+              'native_observer_result_preserves_live_work_wait_and_user_input',
+              'active_observer_cancel_drains_its_owner_without_cancelling_work',
+              'observer_grants_are_explicit_fresh_and_durably_revoked',
+              'native_observer_cannot_read_files_mutate_send_or_delegate',
+          }
+          expected = {f'app_state::supervisor_observers::tests::{name}' for name in fixtures}
+          assert results['server'] == expected, results['server'] ^ expected
+          print('All five actual Creator/provider/ChildCompletion/FileInbox Host fixtures passed')
+          PY
+
+      - name: Check five affected production libraries under the original lint policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy=(-D warnings -A deprecated -A clippy::module_inception
+            -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
+            -A clippy::too-many-arguments -A clippy::while-let-loop
+            -A clippy::type_complexity -A dead-code)
+          cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-storage \
+            -p bamboo-engine -p bamboo-server-tools -p bamboo-server -- "${policy[@]}" \
+            2>&1 | tee "$RUNNER_TEMP/observer-clippy.log"
+
+      - name: Verify exact source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git show -s --format='Final Observer source: %H tree: %T' HEAD | tee -a "$RUNNER_TEMP/observer-source.log"
+          sha256sum Cargo.lock | tee -a "$RUNNER_TEMP/observer-source.log"
+
+      - name: Retain source-bound runtime and lint logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trusted-observer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/observer-*.log
+          if-no-files-found: error
+          retention-days: 7
