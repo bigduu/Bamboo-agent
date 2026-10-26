@@ -29,6 +29,8 @@ use tokio::sync::Notify;
 const PROVIDER: &str = "observer-fixture";
 const PARENT_MODEL: &str = "observer-parent";
 const OBSERVER_MODEL: &str = "observer-reader";
+const FAILURE_MODEL: &str = "observer-failed-source";
+const FAILURE: &str = "CONTROLLED_OBSERVER_FAILURE";
 const WORK_MODEL: &str = "observer-held-work";
 const ROOT_A: &str = "observer-source-a";
 const ROOT_B: &str = "observer-source-b";
@@ -95,6 +97,10 @@ impl LLMProvider for Probe {
                 self.work_entered.notify_one();
                 self.work_release.notified().await;
                 LLMChunk::Token("Original work completed after its own release.".into())
+            }
+            FAILURE_MODEL => {
+                self.turns.fetch_add(1, Ordering::SeqCst);
+                return Err(LLMError::Auth(FAILURE.into()));
             }
             OBSERVER_MODEL => {
                 let names = tools
@@ -601,6 +607,107 @@ async fn native_observer_reads_two_projects_and_never_holds_idle_parent() {
 #[tokio::test]
 async fn native_observer_result_preserves_live_work_wait_and_user_input() {
     native_case(true).await;
+}
+
+#[tokio::test]
+async fn failed_observer_reports_without_wait_and_restart_never_replays_it() {
+    let f = Fixture::new(None).await;
+    f.child(OBSERVER, true, FAILURE_MODEL).await;
+    let operation = Uuid::new_v4();
+    f.state
+        .start_supervisor_observer(
+            &f.reference,
+            f.revision().await,
+            operation,
+            OBSERVER,
+            f.targets(),
+        )
+        .await
+        .unwrap();
+    let child = wait_saved(&f.state, OBSERVER, |child| {
+        child.last_run_status().as_deref() == Some("error") && source(child).is_some()
+    })
+    .await;
+    let failed_source = source(&child).unwrap();
+    assert_eq!(failed_source.status, "error");
+    let parent = wait_saved(&f.state, &f.reference.session_id, |parent| {
+        parent.last_run_status().as_deref() == Some("completed")
+            && parent
+                .messages
+                .iter()
+                .any(|message| message.content.contains(FAILURE))
+    })
+    .await;
+    assert!(parent
+        .agent_runtime_state
+        .as_ref()
+        .unwrap()
+        .waiting_for_children
+        .is_none());
+    assert_eq!(
+        parent
+            .messages
+            .iter()
+            .filter(|message| message.content.contains(FAILURE))
+            .count(),
+        1
+    );
+    assert_eq!(f.probe.turns.load(Ordering::SeqCst), 1);
+    let retry = f
+        .state
+        .start_supervisor_observer(&f.reference, 0, operation, OBSERVER, f.targets())
+        .await
+        .unwrap();
+    assert!(!retry.changed);
+    assert_eq!(f.probe.turns.load(Ordering::SeqCst), 1);
+    let Fixture {
+        home,
+        state: old,
+        probe,
+        reference,
+        ..
+    } = f;
+    old.shutdown().await;
+    drop(old);
+    let reopened = state(home.path(), probe.clone()).await;
+    reopened.wait_for_boot_reconcile_services().await;
+    let generation = reopened
+        .session_inbox
+        .inspect(&reference.session_id)
+        .await
+        .unwrap()
+        .generation;
+    reopened
+        .child_completion_coordinator
+        .on_child_completed(ChildCompletion {
+            parent_session_id: reference.session_id.clone(),
+            child_session_id: OBSERVER.into(),
+            status: failed_source.status.clone(),
+            error: Some(FAILURE.into()),
+            completed_at: chrono::Utc::now(),
+            source: Some(failed_source),
+        })
+        .await;
+    assert_eq!(
+        reopened
+            .session_inbox
+            .inspect(&reference.session_id)
+            .await
+            .unwrap()
+            .generation,
+        generation
+    );
+    assert_eq!(
+        saved(&reopened, &reference.session_id)
+            .await
+            .messages
+            .iter()
+            .filter(|message| message.content.contains(FAILURE))
+            .count(),
+        1
+    );
+    assert_eq!(probe.turns.load(Ordering::SeqCst), 1);
+    reopened.shutdown().await;
 }
 
 #[tokio::test]

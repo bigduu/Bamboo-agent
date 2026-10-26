@@ -113,13 +113,14 @@ jobs:
           fixtures = {
               'native_observer_reads_two_projects_and_never_holds_idle_parent',
               'native_observer_result_preserves_live_work_wait_and_user_input',
+              'failed_observer_reports_without_wait_and_restart_never_replays_it',
               'active_observer_cancel_drains_its_owner_without_cancelling_work',
               'observer_grants_are_explicit_fresh_and_durably_revoked',
               'native_observer_cannot_read_files_mutate_send_or_delegate',
           }
           expected = {f'app_state::supervisor_observers::tests::{name}' for name in fixtures}
           assert results['server'] == expected, results['server'] ^ expected
-          print('All five actual Creator/provider/ChildCompletion/FileInbox Host fixtures passed')
+          print('All six actual Creator/provider/ChildCompletion/FileInbox Host fixtures passed')
           PY
 
       - name: Check five affected production libraries under the original lint policy
