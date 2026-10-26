@@ -99,8 +99,17 @@ impl NativeWorkTokenBudget {
                         Ok(None)
                     };
                 }
-                let (binding, _) =
-                    ticket_runtime::verified_scope_binding(storage.as_ref(), &canonical.id).await?;
+                // A mounted historical TicketService must not block an
+                // ordinary, unbudgeted Child after Root leaves orchestration
+                // mode. Keep the capability, so configuring limits during the
+                // run still revalidates fresh Root/Work authority per call.
+                let binding = if published.execution_budget.is_some() || dispatch.is_some() {
+                    ticket_runtime::verified_scope_binding(storage.as_ref(), &canonical.id)
+                        .await?
+                        .0
+                } else {
+                    published.binding.clone()
+                };
                 if binding != published.binding
                     || dispatch.as_ref().is_some_and(|d| d.binding != binding)
                 {

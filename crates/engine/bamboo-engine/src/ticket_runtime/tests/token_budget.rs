@@ -390,3 +390,56 @@ async fn token_budget_native_descendant_uses_original_work_and_rejects_lost_ance
         .is_err());
     assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn token_budget_unconfigured_ordinary_child_preserves_legacy_and_later_config_fails_closed() {
+    let f = Fixture::with_project(true).await;
+    let mut root = f
+        .storage
+        .load_root_authority(&f.supervisor.id)
+        .await
+        .unwrap()
+        .unwrap();
+    root.set_root_orchestration_only(false).unwrap();
+    f.storage.save_session(&root).await.unwrap();
+    let child = Session::new_child_of(
+        "ordinary-no-budget",
+        &root,
+        "fixture-model",
+        "ordinary child",
+    );
+    f.storage.save_session(&child).await.unwrap();
+    let capability =
+        NativeWorkTokenBudget::capture(Some(f.service.clone()), f.storage.clone(), &child)
+            .await
+            .unwrap()
+            .unwrap();
+    let inner = Provider::new(Script::Known);
+    let decorated = capability.wrap(
+        inner.clone(),
+        &AgentLoopConfig {
+            app_data_dir: Some(f.dir.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let mut stream = decorated
+        .chat_stream(&[], &[], Some(40), "fixture-model")
+        .await
+        .unwrap();
+    while let Some(chunk) = stream.next().await {
+        chunk.unwrap();
+    }
+    assert!(f.service.published().unwrap().1.execution_budget.is_none());
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+    configure(&f, 500);
+    assert!(decorated
+        .chat_stream(&[], &[], Some(40), "fixture-model")
+        .await
+        .is_err());
+    assert_eq!(
+        inner.calls.load(Ordering::SeqCst),
+        1,
+        "late configuration cannot escape the retained capability"
+    );
+    assert_eq!(ledger(&f).total_charged, 0);
+}
