@@ -28,7 +28,7 @@ static AUXILIARY_BUDGETS: OnceLock<Mutex<HashMap<AuxiliaryBudgetKey, AuxiliaryBu
 fn provider_identity(provider: &Arc<dyn LLMProvider>) -> usize {
     provider
         .resource_allocation_identity()
-        .unwrap_or_else(|| Arc::as_ptr(provider) as *const () as usize)
+        .unwrap_or(Arc::as_ptr(provider) as *const () as usize)
 }
 
 fn semaphore(

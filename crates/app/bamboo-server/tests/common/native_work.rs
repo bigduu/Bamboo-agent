@@ -89,7 +89,7 @@ pub(crate) async fn host(root: &Path, provider: Arc<dyn LLMProvider>) -> AppStat
     .await
     .unwrap();
     state.provider_registry.replace_with(ProviderRegistry::new(
-        HashMap::from([("openai".into(), provider as Arc<dyn LLMProvider>)]),
+        HashMap::from([("openai".into(), provider)]),
         "openai".into(),
     ));
     state

@@ -76,7 +76,7 @@ impl LLMProvider for RoleReasoningProvider {
         Some(
             self.inner
                 .resource_allocation_identity()
-                .unwrap_or_else(|| Arc::as_ptr(&self.inner) as *const () as usize),
+                .unwrap_or(Arc::as_ptr(&self.inner) as *const () as usize),
         )
     }
 
