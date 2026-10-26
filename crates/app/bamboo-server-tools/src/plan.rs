@@ -753,9 +753,9 @@ mod tests {
     async fn selected_context_uses_canonical_child_binding_without_changing_parent_authority() {
         let dir = tempfile::tempdir().unwrap();
         for mode in [
-            bamboo_domain::PermissionMode::Default,
-            bamboo_domain::PermissionMode::Auto,
-            bamboo_domain::PermissionMode::BypassPermissions,
+            bamboo_domain::SessionPermissionMode::Default,
+            bamboo_domain::SessionPermissionMode::Auto,
+            bamboo_domain::SessionPermissionMode::Bypass,
         ] {
             let mut port = selected_plan_port(&dir.path().to_string_lossy());
             port.parent
