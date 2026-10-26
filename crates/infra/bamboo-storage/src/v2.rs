@@ -110,6 +110,8 @@ mod root_actor_input;
 #[cfg(test)]
 mod root_actor_input_tests;
 mod root_actor_runtime;
+#[cfg(test)]
+mod root_birth_tests;
 mod scoped_loop_control;
 #[cfg(test)]
 mod scoped_loop_control_tests;
@@ -6733,6 +6735,7 @@ impl SessionStoreV2 {
             None => None,
         };
         let session = reconciled.as_ref().unwrap_or(session);
+        self.check_root_birth_guards(session, guards, false).await?;
         self.check_default_or_root_actor_context(
             session,
             &self.abs_path_from_rel(rel),
@@ -6968,6 +6971,7 @@ impl SessionStoreV2 {
             ));
         }
 
+        self.check_root_birth_guards(session, guards, true).await?;
         let intended_rel = Self::default_writer_rel_path(session)?;
         self.check_default_or_root_actor_context(
             session,
@@ -7226,6 +7230,12 @@ impl Storage for SessionStoreV2 {
     async fn save_manual_title(&self, session: &Session) -> io::Result<()> {
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
+        if session.kind == SessionKind::Root && !self.root_has_birth_files(&session.id).await? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "manual title target has no canonical Root source",
+            ));
+        }
         let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         let session_write = self
             .acquire_session_write_lock(&session.id, SaveKind::Full)
@@ -7560,6 +7570,20 @@ impl Storage for SessionStoreV2 {
     async fn save_session(&self, session: &Session) -> io::Result<()> {
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
+        if session.kind == SessionKind::Root && !self.root_has_birth_files(&session.id).await? {
+            // Release shared lifecycle before requesting exclusive ownership;
+            // no Task, Session or tree guard is retained across this change.
+            drop(lifecycle);
+            let lifecycle = self.lock_session_lifecycle_exclusive().await?;
+            let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+            let session_write = self
+                .acquire_session_write_lock(&session.id, SaveKind::Full)
+                .await?;
+            let guards = DefaultWriterGuards::root_birth(lifecycle, runtime_task, session_write);
+            return self
+                .save_session_after_lock(session, total_started, &guards, None)
+                .await;
+        }
         let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         let session_write = self
             .acquire_session_write_lock(&session.id, SaveKind::Full)
