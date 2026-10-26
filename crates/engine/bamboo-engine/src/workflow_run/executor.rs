@@ -1438,7 +1438,7 @@ impl WorkflowRunEngine {
         let mut entry = self
             .commit_fences
             .entry(run_id.to_owned())
-            .or_insert_with(Weak::new);
+            .or_default();
         if let Some(fence) = entry.upgrade() {
             return fence;
         }
