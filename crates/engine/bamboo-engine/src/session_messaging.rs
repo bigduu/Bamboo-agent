@@ -1334,6 +1334,33 @@ impl SessionMessenger {
         self.admit_with_gate(envelope, None).await
     }
 
+    pub(crate) fn supports_runtime_target_lifetime(&self) -> bool {
+        self.inbox.supports_runtime_target_lifetime()
+    }
+
+    pub(crate) async fn admit_runtime_for_target(
+        &self,
+        envelope: SessionMessageEnvelope,
+        target_created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<SessionMessengerAdmission, SessionMessengerError> {
+        let started = Instant::now();
+        let result = async {
+            self.validate_relationship(&envelope).await?;
+            self.inbox
+                .deliver_runtime_for_target(&envelope, target_created_at)
+                .await
+                .map_err(SessionMessengerError::Inbox)
+        }
+        .await;
+        match result {
+            Ok(receipt) => Ok(self.record_admission(envelope, receipt, started)),
+            Err(error) => {
+                self.record_rejection(&error);
+                Err(error)
+            }
+        }
+    }
+
     pub async fn admit_with_gate(
         &self,
         envelope: SessionMessageEnvelope,
@@ -1584,6 +1611,8 @@ mod tests {
         SessionMessageContent, SessionMessageId, SessionMessageKind,
     };
     use bamboo_storage::{FileSessionInbox, SessionStoreV2};
+    use chrono::Utc;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     struct RecordingActivation {
@@ -1842,6 +1871,22 @@ mod tests {
 
     #[async_trait]
     impl SessionInboxPort for PausedPeerAdmission {
+        fn supports_runtime_target_lifetime(&self) -> bool {
+            true
+        }
+
+        async fn deliver_runtime_for_target(
+            &self,
+            envelope: &SessionMessageEnvelope,
+            target_created_at: chrono::DateTime<Utc>,
+        ) -> Result<SessionInboxReceipt, SessionInboxError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner
+                .deliver_runtime_for_target(envelope, target_created_at)
+                .await
+        }
+
         async fn deliver(
             &self,
             envelope: &SessionMessageEnvelope,
@@ -1989,6 +2034,68 @@ mod tests {
                 assert_eq!(activation.calls.lock().await.len(), 1);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn background_exec_admission_rechecks_target_birth_at_actual_inbox_publication() {
+        let (_temp, store, activation, _) = fixture().await;
+        let old = Session::new("runtime-completion-target", "model");
+        store.save_session(&old).await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let inbox = Arc::new(FileSessionInbox::new(
+            store.clone(),
+            SessionInboxLimits::default(),
+        ));
+        let paused = SessionMessenger::new(
+            store.clone(),
+            Arc::new(PausedPeerAdmission {
+                inner: inbox.clone(),
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            activation.clone(),
+        );
+        let mut envelope = SessionMessageEnvelope::user_input(&old.id, "unused");
+        envelope.source = SessionMessageSource::Runtime {
+            subsystem: "background_exec".into(),
+        };
+        envelope.kind = bamboo_domain::SessionMessageKind::RuntimeInstruction;
+        envelope.body = bamboo_domain::SessionMessageBody::RuntimeInstruction(
+            bamboo_domain::SessionRuntimeInstruction {
+                instruction: "background_exec_completed".into(),
+                content: Some(bamboo_domain::SessionMessageContent::text(
+                    "old command result",
+                )),
+                data: None,
+                provider_message: None,
+            },
+        );
+        let birth = old.created_at;
+        let sending = tokio::spawn(async move {
+            match paused.admit_runtime_for_target(envelope, birth).await {
+                Ok(admission) => {
+                    paused.prepare_activation(&admission).await.unwrap();
+                    paused.activate_prepared(&admission).await.unwrap();
+                    true
+                }
+                Err(_) => false,
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        store.delete_session(&old.id).await.unwrap();
+        let mut replacement = Session::new(&old.id, "model");
+        replacement.created_at = birth + chrono::Duration::seconds(1);
+        store.save_session(&replacement).await.unwrap();
+        release.notify_one();
+        assert!(!tokio::time::timeout(Duration::from_secs(5), sending)
+            .await
+            .unwrap()
+            .unwrap());
+        assert_eq!(inbox.inspect(&old.id).await.unwrap().pending, 0);
+        assert!(activation.calls.lock().await.is_empty());
     }
 
     #[tokio::test]

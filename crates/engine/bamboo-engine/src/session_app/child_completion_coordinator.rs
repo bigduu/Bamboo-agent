@@ -2909,7 +2909,9 @@ impl BashResumeHook for ChildCompletionCoordinator {
     }
 
     fn supports_background_exec(&self) -> bool {
-        self.agent.session_messenger().is_some()
+        self.agent
+            .session_messenger()
+            .is_some_and(|messenger| messenger.supports_runtime_target_lifetime())
     }
 
     fn arrange_exec_self_resume(
@@ -2922,6 +2924,7 @@ impl BashResumeHook for ChildCompletionCoordinator {
         let coordinator = self.clone();
         tokio::spawn(async move {
             let info = job.completion().await;
+            drop(job);
             coordinator
                 .deliver_shell_completion_for_lifetime(
                     info,
@@ -2938,6 +2941,54 @@ impl BashResumeHook for ChildCompletionCoordinator {
 enum ShellCompletionKind {
     Bash,
     Exec,
+}
+
+async fn clear_completed_exec_wait<P>(
+    persistence: &LockedSessionStore,
+    session: &Session,
+    handle: &str,
+    publish: P,
+) -> std::io::Result<Option<Session>>
+where
+    P: FnOnce(&Session),
+{
+    let expected_wait = read_runtime_state(session).waiting_for_bash;
+    let birth = session.created_at;
+    let handle = handle.to_owned();
+    persistence
+        .update_runtime_config_and_publish(
+            &session.id,
+            move |latest| {
+                let mut state = read_runtime_state(latest);
+                if latest.created_at != birth || state.waiting_for_bash != expected_wait {
+                    return;
+                }
+                state.waiting_for_bash = None;
+                if state.status == AgentStatusState::Suspended
+                    && state
+                        .suspension
+                        .as_ref()
+                        .is_some_and(|s| s.reason == "waiting_for_bash")
+                {
+                    state.status = AgentStatusState::Idle;
+                    state.suspension = None;
+                }
+                write_runtime_state(latest, &state);
+                if latest.metadata.get("runtime.background_exec_id") == Some(&handle) {
+                    latest.metadata.remove("runtime.background_exec_id");
+                }
+                if latest
+                    .metadata
+                    .get("runtime.suspend_reason")
+                    .map(String::as_str)
+                    == Some("waiting_for_bash")
+                {
+                    latest.metadata.remove("runtime.suspend_reason");
+                }
+            },
+            publish,
+        )
+        .await
 }
 
 fn exec_wait_resume_message(ids: &[String], timed_out: bool) -> Message {
@@ -3187,14 +3238,16 @@ impl ChildCompletionCoordinator {
         // crash.
         let messenger = self.agent.session_messenger().cloned();
         let admission = match messenger.as_ref() {
-            Some(messenger) => match messenger
-                .admit(if kind == ShellCompletionKind::Bash {
-                    bash_completion_envelope(&info)
-                } else {
-                    shell_completion_envelope(&info, kind)
-                })
-                .await
-            {
+            Some(messenger) => match if kind == ShellCompletionKind::Exec {
+                messenger
+                    .admit_runtime_for_target(
+                        shell_completion_envelope(&info, kind),
+                        expected_birth.unwrap_or(session.created_at),
+                    )
+                    .await
+            } else {
+                messenger.admit(bash_completion_envelope(&info)).await
+            } {
                 Ok(admission) => Some(admission),
                 Err(error) => {
                     tracing::warn!(
@@ -3266,47 +3319,20 @@ impl ChildCompletionCoordinator {
                 // handoff. Clear only this exact wait under the persistence
                 // lock; never save the earlier message/status snapshot over
                 // that active conversation.
-                let expected_wait = runtime.waiting_for_bash.clone();
-                let birth = session.created_at;
-                let handle = info.bash_id.clone();
-                match self
-                    .persistence
-                    .update_runtime_config(&info.session_id, move |latest| {
-                        let mut state = read_runtime_state(latest);
-                        if latest.created_at != birth || state.waiting_for_bash != expected_wait {
-                            return;
-                        }
-                        state.waiting_for_bash = None;
-                        if state.status == AgentStatusState::Suspended
-                            && state
-                                .suspension
-                                .as_ref()
-                                .is_some_and(|s| s.reason == "waiting_for_bash")
-                        {
-                            state.status = AgentStatusState::Idle;
-                            state.suspension = None;
-                        }
-                        write_runtime_state(latest, &state);
-                        if latest.metadata.get("runtime.background_exec_id") == Some(&handle) {
-                            latest.metadata.remove("runtime.background_exec_id");
-                        }
-                        if latest
-                            .metadata
-                            .get("runtime.suspend_reason")
-                            .map(String::as_str)
-                            == Some("waiting_for_bash")
-                        {
-                            latest.metadata.remove("runtime.suspend_reason");
-                        }
-                    })
-                    .await
-                {
-                    Ok(Some(saved)) => {
+                match clear_completed_exec_wait(
+                    &self.persistence,
+                    &session,
+                    &info.bash_id,
+                    |saved| {
                         self.sessions.insert(
                             saved.id.clone(),
-                            Arc::new(crate::SessionSnapshot::new(saved)),
+                            Arc::new(crate::SessionSnapshot::new(saved.clone())),
                         );
-                    }
+                    },
+                )
+                .await
+                {
+                    Ok(Some(_)) => {}
                     Ok(None) => return,
                     Err(error) => {
                         tracing::warn!(session_id = %info.session_id, %error, "background exec completion is durable but wait clear failed");
