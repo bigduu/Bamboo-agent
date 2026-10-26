@@ -225,14 +225,20 @@ async fn background_exec_cache_publication_holds_the_same_lock_as_human_append()
     let completing = session.clone();
     let publishing = coordinator.clone();
     let clear = tokio::spawn(async move {
-        clear_completed_exec_wait(&publishing.persistence, &completing, "exec-lock", |saved| {
-            entered_tx.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            publishing.sessions.insert(
-                saved.id.clone(),
-                Arc::new(crate::SessionSnapshot::new(saved.clone())),
-            );
-        })
+        let cache = publishing.sessions.clone();
+        clear_completed_exec_wait(
+            &publishing.persistence,
+            &completing,
+            "exec-lock",
+            move |saved| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            },
+        )
         .await
         .unwrap();
     });
