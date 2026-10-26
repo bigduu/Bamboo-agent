@@ -166,6 +166,24 @@ fn link_authorizes_target(
 }
 
 impl SessionStoreV2 {
+    async fn strict_observer_child(
+        &self,
+        parent: &Session,
+        child_id: &str,
+    ) -> io::Result<Option<Session>> {
+        let directory = self.abs_path_from_rel(&Self::child_rel_path(&parent.id, child_id));
+        if Self::read_runtime_sidecar_at(&directory.join(RUNTIME_SIDECAR_FILE), child_id)
+            .await?
+            .is_none()
+        {
+            return Err(denied("Observer current runtime sidecar is unavailable"));
+        }
+        // Unlike ordinary Child compatibility reads, an Observer never borrows
+        // an old Main after its current sidecar disappeared. The existing full
+        // pair validator preserves canonical birth and tool/generation proofs.
+        self.load_child_wait_session(parent, child_id, true).await
+    }
+
     async fn observer_guards(
         &self,
         child_id: &str,
@@ -229,7 +247,7 @@ impl SessionStoreV2 {
             .clone()
             .unwrap_or_else(|| empty_state(reference.incarnation_id));
         let child = self
-            .load_child_wait_session(&parent, child_id, true)
+            .strict_observer_child(&parent, child_id)
             .await?
             .ok_or_else(|| denied("Observer Child is missing"))?;
         if let Some(old) = state.observers.get(child_id) {
@@ -271,6 +289,13 @@ impl SessionStoreV2 {
             .as_ref()
             .ok_or_else(|| denied("Observer requires typed read-only runtime state"))?;
         if !observer_native_child(&child)
+            || child.parent_created_at != Some(parent.created_at)
+            || child.spawn_depth != 1
+            || child.root_session_id != parent.id
+            || child.project_id_meta() != parent.project_id_meta()
+            || child.pending_question.is_some()
+            || runtime.waiting_for_children.is_some()
+            || runtime.waiting_for_bash.is_some()
             || child.child_launch_generation() != 1
             || child.recoverable_child_launch_generation().is_some()
             || child.last_run_status().as_deref() != Some("pending")
@@ -399,7 +424,7 @@ impl SessionStoreV2 {
             return Ok(false);
         }
         let child = self
-            .load_child_wait_session(&parent, child_id, false)
+            .strict_observer_child(&parent, child_id)
             .await?
             .ok_or_else(|| denied("registered Observer Child is unavailable"))?;
         Ok(state.classifies_observer(&parent, &child))
@@ -411,25 +436,9 @@ impl SessionStoreV2 {
         {
             return Ok(false);
         }
-        let caller = bamboo_domain::SessionCallerReference::from(expected);
-        // An installed/revoked Host namespace is sticky. Do not reinstall a
-        // scope or turn a failed lookup into canonical-registration fallback.
-        let token = self.host_scope_registry.lookup(&caller).await?;
-        let _host_scope = match token.as_ref() {
-            Some(token) => Some(self.host_scope_registry.retain(token, &caller).await?),
-            None => None,
-        };
-        let _absence = if token.is_none() {
-            Some(
-                self.host_scope_registry
-                    .retain_never_installed(&caller.session_id)
-                    .await?,
-            )
-        } else {
-            None
-        };
-        // Discover IDs only; they grant nothing. The complete set is checked
-        // again while the physical authority guards are retained below.
+        // First establish that this exact lifetime is registered. Ordinary
+        // Children retain their existing runtime even if a Host namespace is
+        // absent or revoked; a cosmetic tracker label changes nothing.
         let Some(preview) =
             Storage::load_root_authority(self, DEFAULT_SUPERVISOR_SESSION_ID).await?
         else {
@@ -445,11 +454,33 @@ impl SessionStoreV2 {
         else {
             return Ok(false);
         };
+        if registration.child_created_at != expected.created_at
+            || Some(registration.parent_created_at) != expected.parent_created_at
+        {
+            return Ok(false);
+        }
         let ids = registration
             .target_links
             .keys()
             .cloned()
             .collect::<Vec<_>>();
+        let caller = bamboo_domain::SessionCallerReference::from(expected);
+        // A registered Observer never replaces a failed Host lookup with its
+        // durable fallback. Retain the selected publication fence until checks end.
+        let token = self.host_scope_registry.lookup(&caller).await?;
+        let _host_scope = match token.as_ref() {
+            Some(token) => Some(self.host_scope_registry.retain(token, &caller).await?),
+            None => None,
+        };
+        let _absence = if token.is_none() {
+            Some(
+                self.host_scope_registry
+                    .retain_never_installed(&caller.session_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let _guards = self.observer_guards(&expected.id, ids, None).await?;
         let parent = self.management_supervisor_locked(&reference).await?;
         let state = parent
@@ -457,7 +488,7 @@ impl SessionStoreV2 {
             .as_ref()
             .ok_or_else(|| denied("Observer state is missing"))?;
         let child = self
-            .load_child_wait_session(&parent, &expected.id, false)
+            .strict_observer_child(&parent, &expected.id)
             .await?
             .ok_or_else(|| denied("Observer Child is missing"))?;
         if !caller.matches_session(&child)
@@ -516,7 +547,7 @@ impl SessionStoreV2 {
             .as_ref()
             .ok_or_else(|| denied("Observer state is missing"))?;
         let child = self
-            .load_child_wait_session(&parent, &caller.session_id, false)
+            .strict_observer_child(&parent, &caller.session_id)
             .await?
             .ok_or_else(|| denied("Observer Child is missing"))?;
         if !caller.matches_session(&child)

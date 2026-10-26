@@ -773,7 +773,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         }
         if observer {
             request = request.run_budget(bamboo_config::RunBudgetConfig {
-                max_rounds: Some(4),
+                max_rounds: Some(6),
                 max_tool_calls: Some(8),
                 ..Default::default()
             });

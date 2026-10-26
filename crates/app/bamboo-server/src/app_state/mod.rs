@@ -617,6 +617,7 @@ pub(crate) mod mutation_idempotency;
 pub(crate) mod session_create_operations;
 pub mod session_events;
 mod session_loader;
+mod supervisor_observers;
 pub mod supervisor_owner_authorization;
 pub mod ticket_application;
 mod tools;

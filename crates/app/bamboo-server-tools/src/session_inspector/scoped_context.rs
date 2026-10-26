@@ -60,9 +60,11 @@ async fn authorize(
             )
         }
         None if original.kind == SessionKind::Child => {
-            let (target, observer) = tool.storage
+            let (target, observer) = tool
+                .storage
                 .load_supervisor_observer_context_target(original, target_id)
-                .await.map_err(error)?;
+                .await
+                .map_err(error)?;
             (target, json!({"route":"observer","registration":observer}))
         }
         None => {
