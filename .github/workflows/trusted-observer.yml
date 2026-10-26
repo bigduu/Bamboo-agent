@@ -49,8 +49,10 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
-          test -z "$(git status --porcelain --untracked-files=all)"
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SOURCE_SHA"
+          test -z "$status"
           git show -s --format='Observer source: %H tree: %T' HEAD | tee "$RUNNER_TEMP/observer-source.log"
           sha256sum Cargo.lock | tee -a "$RUNNER_TEMP/observer-source.log"
 
@@ -137,16 +139,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
-          test -z "$(git status --porcelain --untracked-files=all)"
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SOURCE_SHA"
+          test -z "$status"
           git show -s --format='Final Observer source: %H tree: %T' HEAD | tee -a "$RUNNER_TEMP/observer-source.log"
           sha256sum Cargo.lock | tee -a "$RUNNER_TEMP/observer-source.log"
-
-      - name: Retain source-bound runtime and lint logs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: trusted-observer-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/observer-*.log
-          if-no-files-found: error
-          retention-days: 7

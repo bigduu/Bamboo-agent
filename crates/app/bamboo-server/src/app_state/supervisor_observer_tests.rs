@@ -243,7 +243,7 @@ impl Fixture {
         parent
             .agent_runtime_state
             .get_or_insert_with(Default::default)
-            .set_permission_mode(PermissionMode::Bypass);
+            .set_permission_mode(PermissionMode::BypassPermissions);
         state.storage.save_session(&parent).await.unwrap();
         let mut projects = BTreeSet::new();
         let mut targets = Vec::new();
