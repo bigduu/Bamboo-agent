@@ -1,189 +1,29 @@
 //! Actual assembled Host execution, followed by an explicit owner HTTP decision.
 //! The only model is an in-process gate. No Runtime receipt or Submission is seeded.
 use actix_web::{http::StatusCode, test, web, App};
-use async_trait::async_trait;
-use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
-use bamboo_domain::{Message, Role, WorkspaceBinding};
+use bamboo_agent_core::tools::{FunctionCall, ToolCall};
+use bamboo_domain::{Role, WorkspaceBinding};
 use bamboo_engine::ticket_runtime;
-use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
-use bamboo_server::AppState;
+use bamboo_llm::LLMChunk;
 use bamboo_tickets::{
-    canonical_bytes, content_hash, Contract, ExecutionWorkspace, Operation, Principal,
-    ProjectContextSnapshot, StepStatus, TicketKind, WorkState,
+    canonical_bytes, content_hash, Contract, Operation, Principal, ProjectContextSnapshot,
+    StepStatus, TicketKind, WorkState,
 };
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    path::Path,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-const MODEL: &str = "native-work-acceptance-local-gate";
-const CALL: &str = "native-work-owned-task";
-const RESULT: &str = "The real native Task completed; this result still requires owner review.";
-const WAIT: Duration = Duration::from_secs(20);
-
-struct ModelRequest {
-    messages: Vec<Message>,
-    tools: Vec<ToolSchema>,
-    reply: oneshot::Sender<LLMChunk>,
-}
-
-struct LocalProvider {
-    requests: mpsc::UnboundedSender<ModelRequest>,
-    calls: AtomicUsize,
-}
-
-#[async_trait]
-impl LLMProvider for LocalProvider {
-    async fn chat_stream(
-        &self,
-        messages: &[Message],
-        tools: &[ToolSchema],
-        _max_output_tokens: Option<u32>,
-        model: &str,
-    ) -> Result<LLMStream, LLMError> {
-        assert_eq!(model, MODEL);
-        assert!(
-            self.calls.fetch_add(1, Ordering::SeqCst) < 2,
-            "bounded local model"
-        );
-        let (reply, receive) = oneshot::channel();
-        self.requests
-            .send(ModelRequest {
-                messages: messages.to_vec(),
-                tools: tools.to_vec(),
-                reply,
-            })
-            .map_err(|_| LLMError::Api("local observer closed".into()))?;
-        let chunk = receive
-            .await
-            .map_err(|_| LLMError::Api("local provider gate closed".into()))?;
-        Ok(Box::pin(futures::stream::iter([
-            Ok(chunk),
-            Ok(LLMChunk::Done),
-        ])))
-    }
-}
-
-async fn host(root: &Path, provider: Arc<LocalProvider>) -> AppState {
-    let mut config: Config = serde_json::from_value(json!({
-        "provider":"openai",
-        "features":{"ticket_mutation":true,"ticket_dispatch":true},
-        "providers":{"openai":{"api_key":"synthetic-unused-local-gate","model":MODEL}},
-        "run_budget":{"max_rounds":4},
-        "subagents":{"max_concurrent":1}
-    }))
-    .unwrap();
-    config
-        .memory_mut()
-        .get_or_insert_with(Default::default)
-        .auto_dream_enabled = false;
-    let state = AppState::new_with_provider_and_memory_store(
-        root.to_path_buf(),
-        config,
-        provider.clone(),
-        bamboo_memory::memory_store::MemoryStore::new(root.join("jiandu")),
-    )
-    .await
-    .unwrap();
-    state.provider_registry.replace_with(ProviderRegistry::new(
-        HashMap::from([("openai".into(), provider as Arc<dyn LLMProvider>)]),
-        "openai".into(),
-    ));
-    state
-}
-
-fn git(repo: &Path, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "commit.gpgsign=false",
-            "-C",
-        ])
-        .arg(repo)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout).unwrap().trim().into()
-}
-
-// Same isolated Git identity contract as the existing native Ready fixture.
-fn execution_workspace(root: &Path) -> ExecutionWorkspace {
-    let repo = root.join("repo");
-    std::fs::create_dir(&repo).unwrap();
-    git(&repo, &["init", "-b", "fixture"]);
-    std::fs::write(repo.join("fixture.txt"), "disposable native acceptance\n").unwrap();
-    git(&repo, &["add", "fixture.txt"]);
-    git(
-        &repo,
-        &[
-            "-c",
-            "user.name=Native fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "commit",
-            "-m",
-            "fixture",
-        ],
-    );
-    let base_commit = git(&repo, &["rev-parse", "HEAD"]);
-    let worktree = root.join("worktree");
-    git(
-        &repo,
-        &[
-            "worktree",
-            "add",
-            "-b",
-            "native-work",
-            worktree.to_str().unwrap(),
-            &base_commit,
-        ],
-    );
-    let worktree = worktree
-        .canonicalize()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    ExecutionWorkspace {
-        repo: repo.canonicalize().unwrap().to_string_lossy().into_owned(),
-        base_commit,
-        branch: "native-work".into(),
-        worktree: worktree.clone(),
-        write_roots: vec![worktree.clone()],
-        claims: BTreeSet::from([format!("worktree:{worktree}")]),
-    }
-}
-
-macro_rules! owner_post {
-    ($app:expr, $uri:expr, $body:expr, $status:expr) => {{
-        let response = test::call_service(
-            &$app,
-            test::TestRequest::post()
-                .uri($uri)
-                .peer_addr("127.0.0.1:5700".parse().unwrap())
-                .set_json($body)
-                .to_request(),
-        )
-        .await;
-        let status = response.status();
-        let body: Value = test::read_body_json(response).await;
-        assert_eq!(status, $status, "{}: {body}", $uri);
-        body
-    }};
-}
+#[macro_use]
+#[path = "common/native_work.rs"]
+mod native_work;
+use native_work::{execution_workspace, host, LocalProvider, CALL, RESULT, WAIT};
 
 #[actix_web::test]
 async fn native_task_submission_requires_owner_accept_and_survives_host_restart() {
@@ -194,6 +34,7 @@ async fn native_task_submission_requires_owner_accept_and_survives_host_restart(
     let provider = Arc::new(LocalProvider {
         requests: send,
         calls: AtomicUsize::new(0),
+        max_requests: 2,
     });
 
     let (
