@@ -2,7 +2,8 @@
 //!
 //! This is not a delivery queue or an authority grant. Only the integrated
 //! canonical writer may persist it after checking the current Observer epoch;
-//! only a real SessionInbox receipt permits committing a pending observation.
+//! only a real SessionInbox enqueue receipt permits advancing the producer
+//! cursor. Consumer admission/ACK stays exclusively in the existing Inbox.
 
 use std::collections::BTreeMap;
 
@@ -55,10 +56,11 @@ pub struct ObserverSubscriptionWindow {
     pub version: u32,
     /// Exact registration epoch. Relation/cursor writes do not advance it.
     pub scope_epoch: u64,
-    pub delivered_sequence: u64,
-    pub delivered_fingerprints: BTreeMap<String, String>,
+    pub enqueued_sequence: u64,
+    pub enqueued_fingerprints: BTreeMap<String, String>,
     pub pending: Option<ObserverViewChange>,
-    /// Bounded derived change references; canonical Inbox remains ACK truth.
+    /// Bounded enqueue references, never a consumer/model watermark. Canonical
+    /// Inbox remains consumer ACK truth.
     pub history: Vec<ObserverViewChange>,
 }
 
@@ -73,7 +75,7 @@ pub enum ObserverStageOutcome {
 pub struct ObserverChangePage {
     pub scope_epoch: u64,
     pub after_sequence: u64,
-    pub delivered_sequence: u64,
+    pub enqueued_sequence: u64,
     pub gap: bool,
     pub changes: Vec<ObserverViewChange>,
 }
@@ -124,8 +126,8 @@ impl ObserverSubscriptionWindow {
         let window = Self {
             version: OBSERVER_SUBSCRIPTION_VERSION,
             scope_epoch,
-            delivered_sequence: 0,
-            delivered_fingerprints: BTreeMap::new(),
+            enqueued_sequence: 0,
+            enqueued_fingerprints: BTreeMap::new(),
             pending: None,
             history: Vec::new(),
         };
@@ -136,7 +138,7 @@ impl ObserverSubscriptionWindow {
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.version != OBSERVER_SUBSCRIPTION_VERSION
             || self.scope_epoch == 0
-            || self.delivered_fingerprints.len() > MAX_OBSERVER_WINDOW_TARGETS
+            || self.enqueued_fingerprints.len() > MAX_OBSERVER_WINDOW_TARGETS
             || self.history.len() > MAX_OBSERVER_CHANGE_HISTORY
             || serde_json::to_vec(self)
                 .map_err(|_| "window encoding")?
@@ -145,14 +147,14 @@ impl ObserverSubscriptionWindow {
         {
             return Err("invalid or oversized Observer subscription window");
         }
-        for (target, fingerprint) in &self.delivered_fingerprints {
+        for (target, fingerprint) in &self.enqueued_fingerprints {
             crate::validate_supervisor_target_id(target)?;
             if !digest_shape(fingerprint) {
                 return Err("invalid Observer source fingerprint");
             }
         }
         let first = self
-            .delivered_sequence
+            .enqueued_sequence
             .checked_sub(self.history.len() as u64)
             .ok_or("invalid Observer history length")?;
         for (index, change) in self.history.iter().enumerate() {
@@ -162,17 +164,17 @@ impl ObserverSubscriptionWindow {
                 return Err("noncontiguous Observer history");
             }
         }
-        if (self.delivered_sequence == 0) != self.history.is_empty() {
-            return Err("missing Observer delivered history");
+        if (self.enqueued_sequence == 0) != self.history.is_empty() {
+            return Err("missing Observer enqueue history");
         }
         if let Some(pending) = &self.pending {
             pending.validate()?;
             if pending.scope_epoch != self.scope_epoch
-                || Some(pending.sequence) != self.delivered_sequence.checked_add(1)
+                || Some(pending.sequence) != self.enqueued_sequence.checked_add(1)
                 || (!self
-                    .delivered_fingerprints
+                    .enqueued_fingerprints
                     .contains_key(&pending.target_session_id)
-                    && self.delivered_fingerprints.len() >= MAX_OBSERVER_WINDOW_TARGETS)
+                    && self.enqueued_fingerprints.len() >= MAX_OBSERVER_WINDOW_TARGETS)
             {
                 return Err("invalid Observer pending sequence or epoch");
             }
@@ -212,18 +214,18 @@ impl ObserverSubscriptionWindow {
         if let Some(pending) = &self.pending {
             return Ok(ObserverStageOutcome::ExistingPending(pending.clone()));
         }
-        if self.delivered_fingerprints.get(target).map(String::as_str) == Some(source_fingerprint) {
+        if self.enqueued_fingerprints.get(target).map(String::as_str) == Some(source_fingerprint) {
             return Ok(ObserverStageOutcome::Unchanged);
         }
-        if !self.delivered_fingerprints.contains_key(target)
-            && self.delivered_fingerprints.len() >= MAX_OBSERVER_WINDOW_TARGETS
+        if !self.enqueued_fingerprints.contains_key(target)
+            && self.enqueued_fingerprints.len() >= MAX_OBSERVER_WINDOW_TARGETS
         {
             return Err("Observer target capacity exceeded");
         }
         let mut change = ObserverViewChange {
             scope_epoch: self.scope_epoch,
             sequence: self
-                .delivered_sequence
+                .enqueued_sequence
                 .checked_add(1)
                 .ok_or("Observer sequence exhausted")?,
             target_session_id: target.into(),
@@ -244,7 +246,7 @@ impl ObserverSubscriptionWindow {
 
     /// A matching real Inbox receipt is required by the integrated writer.
     /// This pure data transition cannot inspect or manufacture that receipt.
-    pub fn commit_admitted(
+    pub fn commit_enqueued(
         &mut self,
         owner: &ObserverSubscriptionOwner<'_>,
         receipt: &SessionInboxReceipt,
@@ -270,8 +272,8 @@ impl ObserverSubscriptionWindow {
         }
         let mut candidate = self.clone();
         let pending = candidate.pending.take().expect("matching pending checked");
-        candidate.delivered_sequence = pending.sequence;
-        candidate.delivered_fingerprints.insert(
+        candidate.enqueued_sequence = pending.sequence;
+        candidate.enqueued_fingerprints.insert(
             pending.target_session_id.clone(),
             pending.source_fingerprint.clone(),
         );
@@ -293,14 +295,14 @@ impl ObserverSubscriptionWindow {
         if scope_epoch != self.scope_epoch {
             return Err("Observer cursor belongs to another registration epoch");
         }
-        if sequence > self.delivered_sequence {
-            return Err("Observer cursor is ahead of the delivered sequence");
+        if sequence > self.enqueued_sequence {
+            return Err("Observer cursor is ahead of the enqueue sequence");
         }
         let oldest = self.history.first().map_or(1, |change| change.sequence);
         Ok(ObserverChangePage {
             scope_epoch: self.scope_epoch,
             after_sequence: sequence,
-            delivered_sequence: self.delivered_sequence,
+            enqueued_sequence: self.enqueued_sequence,
             gap: sequence.saturating_add(1) < oldest,
             changes: self
                 .history
@@ -386,7 +388,7 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, ObserverStageOutcome::ExistingPending(pending));
         assert_eq!(serde_json::to_vec(&reopened).unwrap(), persisted);
-        assert_eq!(reopened.delivered_sequence, 0);
+        assert_eq!(reopened.enqueued_sequence, 0);
         assert!(reopened.changes_after(7, 0).unwrap().changes.is_empty());
     }
 
@@ -397,10 +399,10 @@ mod tests {
         let before = window.clone();
         let mut other = receipt(&pending);
         other.id = SessionMessageId::new();
-        assert!(window.commit_admitted(&owner(), &other).is_err());
+        assert!(window.commit_enqueued(&owner(), &other).is_err());
         other = receipt(&pending);
         other.generation = 0;
-        assert!(window.commit_admitted(&owner(), &other).is_err());
+        assert!(window.commit_enqueued(&owner(), &other).is_err());
         assert_eq!(window, before);
     }
 
@@ -409,12 +411,12 @@ mod tests {
         let mut window = ObserverSubscriptionWindow::new(7).unwrap();
         let pending = stage(&mut window, 1);
         assert!(window
-            .commit_admitted(&owner(), &receipt(&pending))
+            .commit_enqueued(&owner(), &receipt(&pending))
             .unwrap());
         assert!(!window
-            .commit_admitted(&owner(), &receipt(&pending))
+            .commit_enqueued(&owner(), &receipt(&pending))
             .unwrap());
-        assert_eq!(window.delivered_sequence, 1);
+        assert_eq!(window.enqueued_sequence, 1);
         let outcome = window
             .stage(
                 &owner(),
@@ -435,12 +437,12 @@ mod tests {
         for n in 1..=20 {
             let pending = stage(&mut window, n);
             window
-                .commit_admitted(&owner(), &receipt(&pending))
+                .commit_enqueued(&owner(), &receipt(&pending))
                 .unwrap();
         }
         let page = window.changes_after(7, 0).unwrap();
         assert!(page.gap);
-        assert_eq!(page.delivered_sequence, 20);
+        assert_eq!(page.enqueued_sequence, 20);
         assert_eq!(page.changes.len(), MAX_OBSERVER_CHANGE_HISTORY);
         assert_eq!(page.changes[0].sequence, 5);
         assert!(!window.changes_after(7, 4).unwrap().gap);
@@ -478,7 +480,7 @@ mod tests {
         window.pending.as_mut().unwrap().event_id = SessionMessageId::new();
         let before = window.clone();
         assert!(window
-            .commit_admitted(&owner(), &receipt(&pending))
+            .commit_enqueued(&owner(), &receipt(&pending))
             .is_err());
         assert_eq!(window, before);
         window.pending.as_mut().unwrap().scope_epoch = 8;
