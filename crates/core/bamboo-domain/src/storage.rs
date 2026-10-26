@@ -478,6 +478,22 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Strict metadata/runtime-only Root source for a bounded immutable view.
+    /// This is the same installed inspection authority, never raw history.
+    /// Authority validation may inspect Main; this is not a total-I/O cap.
+    async fn load_host_scoped_context_target(
+        &self,
+        token: &crate::HostSessionScopeToken,
+        caller: &crate::SessionCallerReference,
+        target_id: &str,
+    ) -> std::io::Result<Session> {
+        let _ = (token, caller, target_id);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "host_context_view_unsupported",
+        ))
+    }
+
     /// Bounded trusted host scope observation, never a Session directory.
     async fn inspect_supervisor_scope(
         &self,
@@ -532,6 +548,21 @@ pub trait Storage: Send + Sync {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "storage backend does not support scoped Supervisor history",
+        ))
+    }
+
+    /// A strict control-plane source and its exact relationship epoch, read
+    /// under one retained canonical Supervisor/target authority lock set.
+    /// The projection receives no messages; strict authority checks may read Main.
+    async fn load_supervisor_context_target(
+        &self,
+        supervisor: &SupervisorReference,
+        target_id: &str,
+    ) -> std::io::Result<(Session, SupervisorLinkObservation)> {
+        let _ = (supervisor, target_id);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "supervisor_context_view_unsupported",
         ))
     }
 

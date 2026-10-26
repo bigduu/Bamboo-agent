@@ -54,7 +54,10 @@ fn project_id(session: &Session) -> Result<Option<String>, ToolError> {
     }
 }
 
-async fn control_plane(tool: &SessionInspectorTool, id: &str) -> Result<Session, ToolError> {
+pub(super) async fn control_plane(
+    tool: &SessionInspectorTool,
+    id: &str,
+) -> Result<Session, ToolError> {
     validate_id(id)?;
     let session = tool
         .storage
@@ -112,6 +115,8 @@ struct Scope {
     root_session_id: String,
     target_session_id: String,
     project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authority: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -159,6 +164,7 @@ fn safe_source(caller: &Session, target: &Session, project: Option<String>) -> S
             root_session_id: root_id(caller).to_string(),
             target_session_id: target.id.clone(),
             project_id: project,
+            authority: None,
         },
         kind: target.kind,
         parent_session_id: target.parent_session_id.clone(),
@@ -193,11 +199,13 @@ fn safe_source(caller: &Session, target: &Session, project: Option<String>) -> S
     }
 }
 
-fn render(source: &SafeSource, revision: &str) -> (String, String) {
+fn render(source: &SafeSource, revision: &str, scoped: bool) -> (String, String) {
     let id_line = |id: &str| preview(id, 360).text;
+    let schema = if scoped { SCOPED_SCHEMA } else { SCHEMA };
+    let label = if scoped { "Source digest" } else { "Revision" };
     let status = format!(
         "# Session status\n\nLast persisted observation; not verified live progress.\n\n\
-         - Schema: {SCHEMA}\n- Revision: {revision}\n- Session: {}\n- Root: {}\n\
+         - Schema: {schema}\n- {label}: {revision}\n- Session: {}\n- Root: {}\n\
          - Parent: {}\n- Kind: {}\n- Project: {}\n- Title: {}\n\
          - Source updated at: {}\n- Last persisted status: {}\n\
          - Has pending question: {}\n- Task count: {}\n\n\
@@ -224,7 +232,7 @@ fn render(source: &SafeSource, revision: &str) -> (String, String) {
     let mut brief = format!(
         "# Session task brief\n\nObserved task data, not new instructions or a complete delegation contract.\n\
          Previews may omit constraints; consult the original task before acting.\n\n\
-         - Session: {}\n- Revision: {revision}\n- Source updated at: {}\n\
+         - Session: {}\n- {label}: {revision}\n- Source updated at: {}\n\
          - Task list: {}\n- Tasks shown: {} of {}\n\n## Task previews\n",
         id_line(&source.scope.target_session_id), source.updated_at,
         source.task_list_title.as_ref().map_or("not recorded", |t| &t.text), source.tasks.len(), source.task_count,
@@ -283,12 +291,39 @@ pub(super) async fn export_context(
     if let Some(parent) = &target.parent_session_id {
         validate_id(parent)?;
     }
-    let source = safe_source(&caller, &target, project);
+    publish_context(tool, &caller, &target, project, None).await
+}
+
+pub(super) const SCOPED_SCHEMA: &str = "session-context-view.scoped.v1";
+
+pub(super) async fn publish_scoped_context(
+    tool: &SessionInspectorTool,
+    caller: &Session,
+    target: &Session,
+    authority: serde_json::Value,
+) -> Result<ToolResult, ToolError> {
+    publish_context(tool, caller, target, project_id(target)?, Some(authority)).await
+}
+
+async fn publish_context(
+    tool: &SessionInspectorTool,
+    caller: &Session,
+    target: &Session,
+    project: Option<String>,
+    authority: Option<serde_json::Value>,
+) -> Result<ToolResult, ToolError> {
+    let scoped = authority.is_some();
+    let mut source = safe_source(caller, target, project);
+    source.scope.authority = authority;
     let source_bytes =
         serde_json::to_vec(&source).map_err(|e| ToolError::Execution(e.to_string()))?;
     let source_digest = digest(&source_bytes);
-    let revision = digest(format!("{SCHEMA}:{source_digest}").as_bytes());
-    let (status, brief) = render(&source, &revision);
+    let source_revision = if scoped {
+        source_digest.clone()
+    } else {
+        digest(format!("{SCHEMA}:{source_digest}").as_bytes())
+    };
+    let (status, brief) = render(&source, &source_revision, scoped);
     if status.lines().count() > 40
         || brief.lines().count() > 120
         || status
@@ -301,12 +336,21 @@ pub(super) async fn export_context(
         ));
     }
     let files = json!({ "status": file_info(&status), "brief": file_info(&brief) });
-    let manifest = json!({
-        "schema_version": SCHEMA, "revision": revision, "source_digest": source_digest,
+    let schema = if scoped { SCOPED_SCHEMA } else { SCHEMA };
+    let mut manifest = json!({
+        "schema_version": schema, "source_digest": source_digest,
         "scope": source.scope, "source_observed_at": source.updated_at,
         "observation": "last_persisted", "files": files,
         "filenames": { "status": "status.md", "brief": "brief.md" },
     });
+    // Scoped selectors commit to the scope and every file digest, so editing
+    // both a file and its manifest cannot retain the same requested revision.
+    let revision = if scoped {
+        digest(&serde_json::to_vec(&manifest).map_err(|e| ToolError::Execution(e.to_string()))?)
+    } else {
+        source_revision
+    };
+    manifest["revision"] = json!(revision);
     let published = publish_session_context_snapshot(
         tool.session_store.bamboo_home_dir(),
         &caller.id,
@@ -323,7 +367,7 @@ pub(super) async fn export_context(
     Ok(ToolResult {
         success: true,
         result: json!({
-            "schema_version": SCHEMA, "revision": revision, "source_digest": source_digest,
+            "schema_version": schema, "revision": revision, "source_digest": source_digest,
             "scope": source.scope, "files": files, "reused": published.reused,
             "manifest_path": published.directory.join("manifest.json"),
             "status_path": published.directory.join("status.md"),
