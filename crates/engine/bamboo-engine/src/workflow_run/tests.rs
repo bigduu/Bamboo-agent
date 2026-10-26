@@ -3098,6 +3098,177 @@ async fn wall_timeout_finalizes_step_before_terminal_run_event() {
     assert_eq!(engine.runtime_resource_counts(), (0, 0));
 }
 
+// The cached read returns the last actually committed File repository state
+// without an incidental I/O yield. The first owned commit is paused before it
+// enters that repository's lock; later commits wait until it really completes.
+struct PausedOwnedWorkflowCommit {
+    repository: FileWorkflowRunRepository,
+    cached: std::sync::Mutex<Option<WorkflowRunSnapshot>>,
+    commits: AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
+    completed: tokio::sync::Semaphore,
+    fail_first: bool,
+}
+
+#[async_trait]
+impl WorkflowRunRepository for PausedOwnedWorkflowCommit {
+    async fn create(
+        &self,
+        snapshot: &WorkflowRunSnapshot,
+        event: &WorkflowRunEvent,
+    ) -> std::io::Result<()> {
+        self.repository.create(snapshot, event).await?;
+        *self.cached.lock().unwrap() = Some(snapshot.clone());
+        Ok(())
+    }
+
+    async fn commit(
+        &self,
+        snapshot: &WorkflowRunSnapshot,
+        event: &WorkflowRunEvent,
+    ) -> std::io::Result<()> {
+        let ordinal = self.commits.fetch_add(1, Ordering::SeqCst);
+        if ordinal == 0 {
+            assert!(matches!(event.kind, WorkflowRunEventKind::RunStarted));
+            self.entered.notify_one();
+            self.release.acquire().await.unwrap().forget();
+        } else {
+            assert_eq!(
+                ordinal, 1,
+                "only the original commit and cancellation may enter"
+            );
+            self.completed.acquire().await.unwrap().forget();
+        }
+        let result = if ordinal == 0 && self.fail_first {
+            Err(std::io::Error::other("injected owned commit refusal"))
+        } else {
+            // Retain the real monotonic-sequence and terminal-immutability checks.
+            self.repository.commit(snapshot, event).await
+        };
+        if result.is_ok() {
+            *self.cached.lock().unwrap() = Some(snapshot.clone());
+        }
+        if ordinal == 0 {
+            self.completed.add_permits(1);
+        }
+        result
+    }
+
+    async fn load(&self, run_id: &str) -> std::io::Result<Option<WorkflowRunSnapshot>> {
+        Ok(self
+            .cached
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|snapshot| snapshot.run_id == run_id)
+            .cloned())
+    }
+
+    async fn events_since(
+        &self,
+        run_id: &str,
+        sequence: u64,
+    ) -> std::io::Result<Vec<WorkflowRunEvent>> {
+        self.repository.events_since(run_id, sequence).await
+    }
+
+    async fn list_run_ids(&self) -> std::io::Result<Vec<String>> {
+        self.repository.list_run_ids().await
+    }
+}
+
+#[tokio::test]
+async fn cancelled_caller_cannot_overtake_an_owned_workflow_commit() {
+    for fail_first in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Arc::new(PausedOwnedWorkflowCommit {
+            repository: FileWorkflowRunRepository::new(directory.path().to_path_buf()).unwrap(),
+            cached: std::sync::Mutex::new(None),
+            commits: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+            completed: tokio::sync::Semaphore::new(0),
+            fail_first,
+        });
+        let engine = WorkflowRunEngine::new(
+            repository.clone(),
+            Arc::new(MockTools),
+            Arc::new(MockAgents),
+            Arc::new(MockDefinitions::default()),
+            Arc::new(MockPolicy),
+            Arc::new(MockSecrets),
+            budgets(),
+        );
+        let caller = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                let workflow = definition(
+                    vec![tool_step("unentered", "echo", json!({}))],
+                    WorkflowPlan::Step {
+                        step: "unentered".into(),
+                    },
+                );
+                engine.run(request(workflow, json!({}))).await
+            })
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            repository.entered.notified(),
+        )
+        .await
+        .expect("the real run reaches its owned startup commit");
+        let queued = repository.cached.lock().unwrap().as_ref().unwrap().clone();
+        assert_eq!(queued.status, WorkflowRunStatus::Queued);
+        assert_eq!(queued.last_sequence, 1);
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(engine.runtime_resource_counts(), (0, 0));
+
+        let cancellation = engine.cancel(&queued.run_id);
+        tokio::pin!(cancellation);
+        // An immediately-ready cached load lets one poll freeze the old code's
+        // next candidate before releasing the first commit. The fixed engine
+        // instead waits at the original commit fence, even after its runtime
+        // registration was dropped. No timer or scheduling delay orders this.
+        assert!(futures::poll!(&mut cancellation).is_pending());
+        repository.release.add_permits(1);
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(3), cancellation)
+            .await
+            .expect("owned commit completion or refusal releases cancellation")
+            .unwrap();
+        assert_eq!(cancelled.status, WorkflowRunStatus::Cancelled);
+        let progress = engine.progress(&queued.run_id, 0).await.unwrap();
+        assert_eq!(progress.snapshot, cancelled);
+        assert_eq!(
+            progress.snapshot.last_sequence,
+            if fail_first { 2 } else { 3 }
+        );
+        assert_eq!(
+            progress.events.len() as u64,
+            progress.snapshot.last_sequence
+        );
+        assert!(progress
+            .events
+            .windows(2)
+            .all(|pair| pair[1].sequence == pair[0].sequence + 1));
+        assert_eq!(
+            progress
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind, WorkflowRunEventKind::RunStarted))
+                .count(),
+            usize::from(!fail_first),
+        );
+        assert!(matches!(
+            progress.events.last().unwrap().kind,
+            WorkflowRunEventKind::RunCancelled
+        ));
+        assert_eq!(repository.commits.load(Ordering::SeqCst), 2);
+        assert_eq!(engine.runtime_resource_counts(), (0, 0));
+    }
+}
+
 #[tokio::test]
 async fn timeout_and_cancel_commit_boundaries_remain_consistent_for_100_rounds() {
     let timeout_dir = tempfile::tempdir().unwrap();
