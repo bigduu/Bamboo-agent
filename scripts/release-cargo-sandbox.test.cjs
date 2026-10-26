@@ -236,6 +236,29 @@ else {
     }
     assert.equal(fs.readFileSync(count, "utf8"), "call\n".repeat(4));
   });
+  test("package failure summaries never replay modern or legacy worker commands outside markers", t => {
+    const root = temporary(); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const source = path.join(root, "repo"); fixture(source);
+    const state = sandbox.install(source, path.join(root, "state"));
+    const bin = path.join(root, "bin"); fs.mkdirSync(bin);
+    const injected = ["error ##[warning]legacy-worker-command", "::warning::modern-worker-command"];
+    fs.writeFileSync(path.join(bin, "docker"), '#!/usr/bin/env node\n' +
+      `console.error(${JSON.stringify(injected[0])}); console.log(${JSON.stringify(injected[1])}); process.exit(101);\n`, { mode: 0o755 });
+    const result = spawnSync(process.execPath, [helper, "package", "--locked", "--allow-dirty", "-p", "fixture-probe"], { encoding: "utf8", env: {
+      PATH: bin + path.delimiter + process.env.PATH, HOME: process.env.HOME, GITHUB_ACTIONS: "true",
+      BAMBOO_CARGO_SANDBOX: path.join(state.stateRoot, "state.json"),
+    } });
+    assert.equal(result.status, 101, result.stderr);
+    const protectedOutput = [...result.stderr.matchAll(/::stop-commands::([a-f0-9]{48})\n([\s\S]*?)\n::\1::\n/g)];
+    assert.equal(protectedOutput.length, 1);
+    for (const command of injected) {
+      assert.equal(result.stderr.split(command).length, 2, "worker text is emitted exactly once");
+      assert.ok(protectedOutput[0][2].includes(command));
+    }
+    const outside = result.stderr.replace(protectedOutput[0][0], "");
+    assert.doesNotMatch(outside, /##\[|::warning::/);
+    assert.match(outside, /phase=package-failed attempt=1 package=fixture-probe status=101 failure_kind=cargo/);
+  });
   function diskFixture(root) {
     const stateRoot = path.join(root, "state");
     fs.mkdirSync(stateRoot, { mode: 0o700 });

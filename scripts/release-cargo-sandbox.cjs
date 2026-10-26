@@ -100,8 +100,10 @@ function withDiskRecovery(state, args, invoke) {
       }
     }
     if (result.status === 0) return result;
-    const first = ((result.stderr || "") + "\n" + (result.stdout || "")).split(/\r?\n/).find(line => /error|ENOSPC|No space left/i.test(line)) || "worker failed";
-    process.stderr.write(`[cargo-disk] phase=package-failed attempt=${attempt} package=${before.packageName} status=${result.status ?? "unknown"} first_error=${JSON.stringify(first.slice(0, 400))}\n`);
+    // Raw diagnostics were already emitted inside the stop-commands boundary.
+    // Even a quoted legacy runner command must not be echoed outside it.
+    const failureKind = enospc(result) ? "space" : normalWorkerExit(result) ? "cargo" : "worker";
+    process.stderr.write(`[cargo-disk] phase=package-failed attempt=${attempt} package=${before.packageName} status=${result.status ?? "unknown"} failure_kind=${failureKind}\n`);
     if (attempt !== 1 || !enospc(result)) return result;
     try { reclaimScratch(state); }
     catch { process.stderr.write("[cargo-disk] scratch reclamation refused; retaining original Cargo failure\n"); return result; }
