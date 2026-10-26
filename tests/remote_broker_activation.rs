@@ -78,6 +78,9 @@ impl Process {
 }
 impl Drop for Process {
     fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("remote fixture child at failure: {}", self.diagnostic());
+        }
         self.0.kill().ok();
         self.0.wait().ok();
     }
@@ -283,7 +286,12 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
     p.step.store(0, Ordering::SeqCst);
     let reply=client.post(format!("{base}/chat")).json(&json!({"session_id":"remote-root","message":format!("Perform remote operation {number}"),
         "model":"remote-root","provider":"openai","model_ref":{"provider":"openai","model":"remote-root"},
-        "permission_mode":"bypass","workspace_path":p.data.join("host-workspace")})).send().await.unwrap();
+        "permission_mode":"bypass","workspace_path":p.data.join("host-workspace")})).send().await.unwrap_or_else(|error| {
+            panic!(
+                "remote Chat transport failed: turn={number} operation={op} target={target}: {}",
+                diagnostic_text(&format!("{error:?}")),
+            )
+        });
     assert!(
         reply.status().is_success(),
         "{}",
