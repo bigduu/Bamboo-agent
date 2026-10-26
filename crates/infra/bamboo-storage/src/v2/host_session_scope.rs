@@ -1,5 +1,6 @@
 //! Final reads for finite Host scopes. Never borrow Supervisor authority.
 
+use super::default_actor_context::LifecycleGuard;
 use super::*;
 use crate::host_session_scope::{HostSessionScopeAbsence, HostSessionScopeUse};
 use bamboo_domain::{
@@ -19,11 +20,15 @@ pub(crate) struct HostScopedSessionGuards {
     tree_roots: BTreeSet<String>,
     sessions: Vec<SessionWriteGuard>,
     _task: RuntimeTaskTransactionReadGuard,
-    _lifecycle: SessionLifecycleReadGuard,
+    _lifecycle: LifecycleGuard,
     _scope: Option<HostSessionScopeUse>,
 }
 
 impl HostScopedSessionGuards {
+    pub(super) fn retains_exclusive_lifecycle(&self) -> bool {
+        self._lifecycle.retains_exclusive()
+    }
+
     /// Report only the physical tree guards successfully acquired by this set.
     /// Writers use this owned authority to avoid reacquiring the same lock.
     pub(super) fn holds_tree(&self, root_id: &str) -> bool {
@@ -215,7 +220,17 @@ impl SessionStoreV2 {
         scope: Option<HostSessionScopeUse>,
         extra_root_ids: &[String],
     ) -> io::Result<HostScopedSessionGuards> {
-        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        // Only a reserved Root birth needs exclusive lifecycle. Ordinary
+        // scoped reads keep their existing shared concurrency contract.
+        let lifecycle = if extra_root_ids.is_empty() {
+            LifecycleGuard::Shared {
+                _guard: self.lock_session_lifecycle_shared().await?,
+            }
+        } else {
+            LifecycleGuard::Exclusive {
+                _guard: self.lock_session_lifecycle_exclusive().await?,
+            }
+        };
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let mut ordered = BTreeSet::new();
         let mut roots = BTreeSet::new();
