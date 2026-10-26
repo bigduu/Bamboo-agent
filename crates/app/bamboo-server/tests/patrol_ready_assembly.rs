@@ -846,3 +846,130 @@ async fn ready_submission_and_patrol_checkpoint_reopen_under_the_same_canonical_
         .is_none());
     host.close().await;
 }
+
+#[tokio::test]
+async fn reopened_ready_host_stages_one_patrol_decision_without_a_model_activation() {
+    use bamboo_orchestration::patrol::{Escalation, OperationId, OperationKind, SupervisorReason};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().canonicalize().unwrap();
+    let token = uuid::Uuid::new_v4().to_string();
+    std::fs::write(
+        root.join(PARENT_MARKER),
+        serde_json::to_vec(&ParentMarker {
+            token: token.clone(),
+            parent_pid: std::process::id(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    // Reuse the existing real native Worker fixture in its own process. The
+    // parent waits for OS exit before opening the same canonical data root.
+    let seed = run_seed_process(&root, &token).await;
+    let mut host = support::Host::new(&root).await;
+    let before = host.snapshot();
+    let scope = &seed.scope;
+    let assignment = &before.assignments[&scope.assignment_id];
+    let spec = &before.intents[&assignment.dispatch_key].immutable_spec;
+    let project = before.project.links[&scope.work_id].clone();
+    let grant = bamboo_server::app_state::ticket_application::ReadyWorkGrant {
+        work_id: scope.work_id.clone(),
+        contract_revision: before.tickets[&scope.work_id].contract_revision,
+        context_hash: before.project.work_contexts[&scope.work_id].clone(),
+        workspace: spec.workspace.clone().unwrap(),
+    };
+    let mut journal = host
+        .state()
+        .tickets
+        .open_patrol_checkpoints(scope)
+        .await
+        .unwrap();
+    let stored = journal.load(scope).unwrap().unwrap();
+    let mut cp = stored.checkpoint;
+    let fresh = observe(host.state().tickets.as_ref(), scope, cp.cursor).await;
+    cp.cursor = fresh.cursor;
+    cp.source_revision = fresh.source_revision;
+    cp.last_check_ms = now_ms();
+    cp.next_check_ms = cp.last_check_ms + 30_000;
+    let incident = cp.incident.as_mut().unwrap();
+    incident.escalation = Some(Escalation {
+        operation: OperationId {
+            incident: incident.id.clone(),
+            kind: OperationKind::Escalation,
+        },
+        reason: SupervisorReason::DeterministicAnomaly,
+        source_revision: fresh.source_revision,
+        cursor: fresh.cursor,
+        deliveries: 0,
+        queued: false,
+        next_delivery_ms: 0,
+    });
+    journal.save(Some(stored.version), &cp).unwrap();
+    drop(journal);
+    let target = &before.binding.supervisor_session_id;
+    let initial = host.state().session_inbox.inspect(target).await.unwrap();
+    host.state()
+        .tickets
+        .install_ready_work_policy(support::Host::policy(project, grant))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            host.state().tickets.wake_ready_work();
+            if let Ok(mut journal) = host.state().tickets.open_patrol_checkpoints(scope).await {
+                let checkpoint = journal.load(scope).unwrap().unwrap();
+                let escalation = checkpoint
+                    .checkpoint
+                    .incident
+                    .as_ref()
+                    .unwrap()
+                    .escalation
+                    .as_ref()
+                    .unwrap();
+                if escalation.queued {
+                    assert_eq!(escalation.deliveries, 1);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("real Ready assembly durably stages and acknowledges the decision");
+    let delivered = host.state().session_inbox.inspect(target).await.unwrap();
+    assert_eq!(delivered.pending, initial.pending + 1);
+    assert_eq!(
+        delivered.activation_generation,
+        initial.activation_generation
+    );
+    assert_eq!(delivered.interrupt_generation, initial.interrupt_generation);
+    for _ in 0..3 {
+        host.state().tickets.reconcile_ready_work().await.unwrap();
+    }
+    assert_eq!(
+        host.state().session_inbox.inspect(target).await.unwrap(),
+        delivered
+    );
+    let claims = host.state().session_inbox.claim(target, 128).await.unwrap();
+    let notices: Vec<_> = claims
+        .iter()
+        .filter(|claim| {
+            matches!(&claim.envelope.source,
+        bamboo_domain::SessionMessageSource::Runtime { subsystem } if subsystem == "ticket_patrol")
+        })
+        .collect();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0]
+        .envelope
+        .to_provider_message()
+        .unwrap()
+        .content
+        .contains(&scope.work_id));
+    assert_eq!(
+        serde_json::to_value(host.snapshot()).unwrap(),
+        serde_json::to_value(before).unwrap(),
+        "Patrol delivery changes no Ticket, Assignment, Submission or acceptance fact"
+    );
+    host.state().tickets.revoke_ready_work_policy().await;
+    host.assert_quiet(0).await;
+    host.close().await;
+}

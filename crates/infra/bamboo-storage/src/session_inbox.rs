@@ -2464,6 +2464,42 @@ impl SessionInboxPort for FileSessionInbox {
         .await
     }
 
+    async fn stage_supervisor_patrol_notice(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        orchestration_revision: u64,
+        envelope: &SessionMessageEnvelope,
+        gate: &bamboo_domain::AdmissionGate,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        if envelope.target_session_id != supervisor.session_id
+            || envelope.source
+                != (SessionMessageSource::Runtime {
+                    subsystem: "ticket_patrol".into(),
+                })
+            || envelope.kind != bamboo_domain::SessionMessageKind::RuntimeInstruction
+            || !matches!(&envelope.body,
+                bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction)
+                if instruction.instruction == "ticket_patrol_escalation_v1"
+                    && instruction.provider_message.is_none())
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "Patrol notice requires its canonical runtime origin and Supervisor target".into(),
+            ));
+        }
+        let authority = self
+            .sessions
+            .lock_supervisor_patrol_notice(supervisor, orchestration_revision)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        self.deliver_with_lifecycle_held(
+            envelope,
+            InboxAuthority::Supervisor { _guard: authority },
+            Some(gate),
+            None,
+        )
+        .await
+    }
+
     async fn deliver_peer_message(
         &self,
         envelope: &SessionMessageEnvelope,
@@ -3030,6 +3066,95 @@ mod tests {
         let dir = reopened.inbox_dir("session-1").await.unwrap().join("new");
         let mut entries = tokio::fs::read_dir(dir).await.unwrap();
         assert!(entries.next_entry().await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn patrol_notice_cancelled_at_physical_rename_cannot_publish_late() {
+        let (_temp, sessions, inbox) = fixture(SessionInboxLimits::default()).await;
+        let bootstrap = sessions
+            .get_or_create_default_supervisor("model")
+            .await
+            .unwrap();
+        let reference = bamboo_domain::SupervisorReference::from(&bootstrap);
+        let mut supervisor = sessions
+            .load_session(&bootstrap.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        supervisor.set_root_orchestration_only(true).unwrap();
+        sessions.save_session(&supervisor).await.unwrap();
+        let mut envelope = SessionMessageEnvelope::user_input(&bootstrap.session_id, "");
+        envelope.source = SessionMessageSource::Runtime {
+            subsystem: "ticket_patrol".into(),
+        };
+        envelope.kind = bamboo_domain::SessionMessageKind::RuntimeInstruction;
+        envelope.body = bamboo_domain::SessionMessageBody::RuntimeInstruction(
+            bamboo_domain::SessionRuntimeInstruction {
+                instruction: "ticket_patrol_escalation_v1".into(),
+                content: Some(bamboo_domain::SessionMessageContent::text(
+                    "Current decision pending",
+                )),
+                data: None,
+                provider_message: None,
+            },
+        );
+        let (send, entered) = tokio::sync::oneshot::channel();
+        let send = std::sync::Mutex::new(Some(send));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        struct Release(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                *self.0 .0.lock().unwrap() = true;
+                self.0 .1.notify_all();
+            }
+        }
+        let cleanup = Release(release.clone());
+        let inbox = Arc::new(inbox.with_owned_filesystem_hook_for_test(Arc::new(
+            move |phase, _| {
+                if phase == "maildir_replace" {
+                    if let Some(send) = send.lock().unwrap().take() {
+                        let _ = send.send(());
+                    }
+                    let mut released = release.0.lock().unwrap();
+                    while !*released {
+                        released = release.1.wait(released).unwrap();
+                    }
+                }
+                Ok(())
+            },
+        )));
+        let gate = bamboo_domain::AdmissionGate::default();
+        let delivery_gate = gate.clone();
+        let delivery_inbox = inbox.clone();
+        let delivery = tokio::spawn(async move {
+            delivery_inbox
+                .stage_supervisor_patrol_notice(
+                    &reference,
+                    supervisor.root_tool_authority_revision,
+                    &envelope,
+                    &delivery_gate,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        // This is the cancellation performed by the Host's drop guard when
+        // Ready revoke wins its outer select, while the disk job is still live.
+        gate.cancel_if_pending();
+        delivery.abort();
+        assert!(delivery.await.unwrap_err().is_cancelled());
+        drop(cleanup);
+        let backlog = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            inbox.inspect(&bootstrap.session_id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 0);
+        assert!(!backlog.activation_pending());
     }
 
     #[tokio::test]

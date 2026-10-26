@@ -165,6 +165,35 @@ fn link_authorizes_target(
 }
 
 impl SessionStoreV2 {
+    /// Retain the existing lifecycle/Task/Session authority while staging a
+    /// decision for this exact Supervisor, without managing itself as a Root.
+    pub(crate) async fn lock_supervisor_patrol_notice(
+        &self,
+        reference: &SupervisorReference,
+        orchestration_revision: u64,
+    ) -> io::Result<SupervisorFollowupGuard> {
+        reference_is_valid(reference)?;
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let sessions = self.management_session_locks(None).await?;
+        let current = self.management_supervisor_locked(reference).await?;
+        self.check_management_session_compatibility(&current)
+            .await?;
+        if orchestration_revision == 0
+            || !current.root_orchestration_only_enabled()
+            || current.root_tool_authority_revision != orchestration_revision
+        {
+            return Err(denied("Supervisor orchestration binding changed"));
+        }
+        Ok(SupervisorFollowupGuard {
+            sessions,
+            _task: task,
+            _lifecycle: lifecycle,
+            scoped_loop_stopped: false,
+            scoped_native: None,
+        })
+    }
+
     /// Each started job owns the complete physical guard set through sync and
     /// error cleanup, even if its caller or originating runtime disappears.
     /// This does not promise that the next management stage will be started.
