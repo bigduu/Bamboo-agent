@@ -428,15 +428,17 @@ mod live_disabled_tests {
         // round 2 "beta_tool" disabled — mirrors a user disabling a tool mid-run.
         let disabled = Arc::new(AtomicBool::new(false));
         let d = disabled.clone();
-        let mut config = AgentLoopConfig::default();
-        config.disabled_filter_resolver = Some(Arc::new(move || {
-            let tools = if d.load(Ordering::SeqCst) {
-                BTreeSet::from(["beta_tool".to_string()])
-            } else {
-                BTreeSet::new()
-            };
-            (tools, BTreeSet::new())
-        }));
+        let config = AgentLoopConfig {
+            disabled_filter_resolver: Some(Arc::new(move || {
+                let tools = if d.load(Ordering::SeqCst) {
+                    BTreeSet::from(["beta_tool".to_string()])
+                } else {
+                    BTreeSet::new()
+                };
+                (tools, BTreeSet::new())
+            })),
+            ..Default::default()
+        };
         let session = Session::new("s", "m");
         let tools = TwoTools;
 
@@ -499,8 +501,10 @@ mod live_disabled_tests {
             ("default::Bash", true, true, true),
             ("unregistered::Bash", true, true, true),
         ] {
-            let mut config = AgentLoopConfig::default();
-            config.disabled_tools = BTreeSet::from([denied.to_owned()]);
+            let config = AgentLoopConfig {
+                disabled_tools: BTreeSet::from([denied.to_owned()]),
+                ..Default::default()
+            };
             let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
             let present = |name| catalog.iter().any(|entry| entry.execution_name() == name);
             assert_eq!(present("exec_command"), exec_allowed, "{denied}");

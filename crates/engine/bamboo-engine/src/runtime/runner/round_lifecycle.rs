@@ -20,6 +20,7 @@ mod context_preparation;
 mod prefix_drift;
 mod stream_execution;
 mod token_budget;
+pub(crate) use token_budget::resolve_known_token_ceilings;
 mod token_estimation;
 
 pub(crate) use context_preparation::force_overflow_context_recovery;

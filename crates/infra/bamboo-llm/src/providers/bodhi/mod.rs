@@ -269,7 +269,7 @@ impl BodhiProvider {
 
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
-        let response = crate::retry::send_with_retry(crate::retry::global(), "Bodhi", || {
+        let response = crate::retry::send_provider_request(crate::retry::global(), "Bodhi", || {
             self.client.post(&url).headers(headers.clone()).json(&body)
         })
         .await?;
@@ -326,7 +326,7 @@ impl BodhiProvider {
 
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
-        let response = crate::retry::send_with_retry(crate::retry::global(), "Bodhi", || {
+        let response = crate::retry::send_provider_request(crate::retry::global(), "Bodhi", || {
             self.client.post(&url).headers(headers.clone()).json(&body)
         })
         .await?;
@@ -388,7 +388,7 @@ impl BodhiProvider {
 
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
-        let response = crate::retry::send_with_retry(crate::retry::global(), "Bodhi", || {
+        let response = crate::retry::send_provider_request(crate::retry::global(), "Bodhi", || {
             self.client
                 .post(&url)
                 .headers(headers.clone())

@@ -269,8 +269,10 @@ async fn external_memory_includes_ledger_agenda_when_records_are_open() {
     assert!(system_prompt.contains("record it with the `ledger` tool"));
 
     // Flag off → the section disappears even with open records.
-    let mut flags = crate::runtime::config::PromptMemoryFlags::default();
-    flags.ledger_agenda = false;
+    let flags = crate::runtime::config::PromptMemoryFlags {
+        ledger_agenda: false,
+        ..Default::default()
+    };
     super::refresh_external_memory_context_with_stores(
         &mut session,
         &store,

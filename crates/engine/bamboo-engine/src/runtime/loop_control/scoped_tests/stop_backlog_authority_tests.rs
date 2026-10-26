@@ -167,10 +167,9 @@ async fn scoped_native_root_tail_io_failure_preserves_real_stop_and_never_acks_o
     let backlog = h.inbox.inspect(TARGET).await.unwrap();
     assert_eq!((backlog.pending, backlog.claimed), (1, 1));
     assert!(
-        h.session
+        !h.session
             .metadata
-            .get(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY)
-            .is_none(),
+            .contains_key(bamboo_domain::SCOPED_LOOP_UNCERTAIN_KEY),
         "strict canonical reload confirmed the actual facts"
     );
     assert_eq!(
