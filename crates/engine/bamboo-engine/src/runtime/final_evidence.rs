@@ -357,10 +357,7 @@ pub(crate) async fn evaluate_final_evidence(
     };
     let options = LLMRequestOptions {
         session_id: Some(session.id.clone()),
-        reasoning_effort: frame.reasoning_effort.map(|effort| match effort {
-            ReasoningEffort::Xhigh | ReasoningEffort::Max => ReasoningEffort::High,
-            other => other,
-        }),
+        reasoning_effort: frame.reasoning_effort,
         parallel_tool_calls: Some(false),
         required_tool: Some(REPORT_TOOL.to_string()),
         request_purpose: Some("final_evidence_check".to_string()),

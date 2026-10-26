@@ -234,7 +234,13 @@ The trusted default Supervisor uses this bounded orchestration posture in both
 Standard and Ultra, with `session_control` and scoped `session_history` admitted
 only through their existing Supervisor checks. Its independent-Root followup
 requires an explicitly attached target in current authorized Project/lifetime
-scope. Ordinary Ultra Roots do not gain that exception. Neither mode nor tool
+scope. Main execution first lists and inspects suitable managed independent
+Sessions; bounded Child agents assist with planning, review and verification.
+The owner-facing `GET /api/v1/supervisor/default/sessions` observes these links,
+and explicit `PUT /api/v1/supervisor/default/sessions/{target_id}` attaches or
+detaches an existing Root with the current incarnation and management revision.
+These operations start no task and preserve the target's context and permissions.
+Ordinary Ultra Roots do not gain that exception. Neither mode nor tool
 exposure initializes Work, enables its feature flags, or proves worker readiness.
 Unavailable delegation is a recoverable blocker; the Supervisor does not switch
 to direct implementation. See [Supervisor role and scope](../supervisor-identity.md#model-role-and-thinking-mode).

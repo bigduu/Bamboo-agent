@@ -98,13 +98,20 @@ Skill/Workflow execution and external tools cannot become read-only shortcuts.
 Catalog projection, final dispatch, approval replay and queued tool actions
 apply the same exact execution-name boundary.
 
-Use `SubAgent` for a bounded child assignment and `Plan` for a read-only planning
-child. `work_dispatch` uses the existing Work authority. `session_control`
-continues an independent Ordinary Root only after explicit attach and current
-Project, lifetime and Supervisor checks. `session_history` allows only
-`read_messages` and `get_meta` in that scope; it is not a global Session directory.
-`session_message` retains its same-task-tree restriction and cannot replace an
-independent-Root followup.
+For main execution, first use `session_history` with `list`, then bounded
+`inspect`, to select a suitable managed independent Ordinary Root. Continue it
+with `session_control` `followup` under its existing context. Explicit attach,
+current Project, lifetime and Supervisor checks remain required; discovery is
+an observation rather than a grant. If no suitable authorized Root exists,
+report the missing scope or target, or create a Root only when separately
+authorized.
+
+Use `SubAgent` for bounded auxiliary planning, review or verification and `Plan`
+for a read-only planning child. `work_dispatch` retains the existing Work
+authority. The default `session_message` adapter keeps Ordinary/Child sends
+within their task tree; the trusted Supervisor adapter may use an explicitly
+attached followup with `delivery_intent=trigger_turn` under the same independent
+Root checks. Neither messaging nor Child creation grants management authority.
 
 Providers may defer delegation tool definitions. The trusted Supervisor can use
 the existing read-only discovery protocol to load its approved orchestration

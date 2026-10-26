@@ -52,6 +52,19 @@ pub struct OpenAIProvider {
 }
 
 impl OpenAIProvider {
+    /// Only log known effort labels from the final request body. Overrides can
+    /// contain arbitrary values, which must not be copied into payload-free logs.
+    fn wire_reasoning_effort_label(body: &Value, pointer: &str) -> &'static str {
+        match body.pointer(pointer) {
+            None => "unset",
+            Some(value) => value
+                .as_str()
+                .and_then(ReasoningEffort::parse)
+                .map(ReasoningEffort::as_str)
+                .unwrap_or("invalid"),
+        }
+    }
+
     /// Creates a new OpenAI provider with an API key.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
@@ -235,11 +248,6 @@ impl OpenAIProvider {
         b.contains("/responses") || b.contains("responses api") || b.contains("use responses")
     }
 
-    fn looks_like_reasoning_unsupported_error(status: reqwest::StatusCode, body: &str) -> bool {
-        // Shared, tightened heuristic (#237 finding 5).
-        crate::providers::common::looks_like_reasoning_unsupported_error(status, body)
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn chat_stream_via_responses(
         &self,
@@ -302,12 +310,13 @@ impl OpenAIProvider {
             .and_then(Value::as_str)
             .is_some_and(|value| !value.trim().is_empty());
         tracing::info!(
-            "[session_hash={}] OpenAI request protocol=responses model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} explicit_prompt_cache={} prompt_cache_affinity_hint={} cache_hit_guaranteed=false purpose_hash={}",
+            "[session_hash={}] OpenAI request protocol=responses model_hash={} reasoning_effort={} wire_reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} input_source={} input_messages_before={} input_messages_after={} duplicate_system_fallback={} explicit_prompt_cache={} prompt_cache_affinity_hint={} cache_hit_guaranteed=false purpose_hash={}",
             log_identity(session_log_id),
             log_identity(model),
             reasoning_effort
                 .map(ReasoningEffort::as_str)
                 .unwrap_or("none"),
+            Self::wire_reasoning_effort_label(&body, "/reasoning/effort"),
             reasoning_source,
             reasoning_effort.is_some(),
             max_output_tokens
@@ -410,84 +419,6 @@ impl OpenAIProvider {
                 let mut parser =
                     ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort)
                         .with_protocol_events(retain_protocol_events);
-                let model_for_debug = model.to_string();
-                let stream = llm_stream_from_sse_multi_requiring_done(
-                    fallback,
-                    move |event, data| {
-                        let parsed = parser.handle_event_multi(event, data);
-                        append_responses_sse_record(
-                            "OpenAI",
-                            &model_for_debug,
-                            event,
-                            data,
-                            &parsed,
-                        );
-                        parsed
-                    },
-                    "OpenAI Responses",
-                );
-                return Ok(stream);
-            }
-
-            if reasoning_effort.is_some()
-                && Self::looks_like_reasoning_unsupported_error(status, &text)
-            {
-                tracing::warn!(
-                    "OpenAI /responses rejected reasoning for model_hash {}; retrying without reasoning_effort",
-                    log_identity(model)
-                );
-
-                let mut fallback_options = responses_options.cloned().unwrap_or_default();
-                fallback_options.reasoning_summary = None;
-                let mut fallback_body = build_responses_body_with_capability_loading(
-                    model,
-                    messages,
-                    tools,
-                    max_output_tokens,
-                    None,
-                    Some(&fallback_options),
-                    parallel_tool_calls,
-                    generated_cache_plan,
-                    capability_loading_mode,
-                    tool_search_execution,
-                );
-                request_overrides::apply_overrides_to_body(
-                    &mut fallback_body,
-                    self.request_overrides.as_ref(),
-                    request_overrides::ENDPOINT_RESPONSES,
-                    Some(model),
-                );
-                if let Some(name) = required_tool {
-                    fallback_body["tool_choice"] = json!({"type": "function", "name": name});
-                }
-                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
-                self.observe_responses_wire(
-                    &fallback_body,
-                    Some(&fallback_options),
-                    session_log_id,
-                );
-                let fallback_headers =
-                    self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
-                let fallback =
-                    crate::retry::send_with_retry(crate::retry::global(), "OpenAI", || {
-                        self.client
-                            .post(&responses_url)
-                            .headers(fallback_headers.clone())
-                            .json(&fallback_body)
-                    })
-                    .await?;
-
-                if !fallback.status().is_success() {
-                    let fallback_status = fallback.status();
-                    let fallback_text = fallback.text().await?;
-                    return Err(LLMError::Api(format!(
-                        "HTTP {}: {}",
-                        fallback_status, fallback_text
-                    )));
-                }
-
-                let mut parser = ResponsesSseParser::new_with_context("OpenAI", model, None)
-                    .with_protocol_events(retain_protocol_events);
                 let model_for_debug = model.to_string();
                 let stream = llm_stream_from_sse_multi_requiring_done(
                     fallback,
@@ -751,12 +682,13 @@ impl LLMProvider for OpenAIProvider {
         }
         crate::masking::mask_outbound_body(&mut body, &self.masking_config);
         tracing::info!(
-            "[session_hash={}] OpenAI request protocol=chat_completions model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose_hash={}",
+            "[session_hash={}] OpenAI request protocol=chat_completions model_hash={} reasoning_effort={} wire_reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose_hash={}",
             log_identity(session_log_id),
             log_identity(model),
             reasoning_effort
                 .map(ReasoningEffort::as_str)
                 .unwrap_or("none"),
+            Self::wire_reasoning_effort_label(&body, "/reasoning_effort"),
             reasoning_source,
             reasoning_effort.is_some(),
             max_output_tokens
@@ -781,67 +713,6 @@ impl LLMProvider for OpenAIProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await?;
-
-            if reasoning_effort.is_some()
-                && Self::looks_like_reasoning_unsupported_error(status, &text)
-            {
-                tracing::warn!(
-                    "OpenAI /chat/completions rejected reasoning for model_hash {}; retrying without reasoning_effort",
-                    log_identity(model)
-                );
-
-                let mut fallback_body = build_openai_compat_body(
-                    model,
-                    messages,
-                    tools,
-                    None,
-                    max_output_tokens,
-                    None,
-                    parallel_tool_calls,
-                );
-                request_overrides::apply_overrides_to_body(
-                    &mut fallback_body,
-                    self.request_overrides.as_ref(),
-                    request_overrides::ENDPOINT_CHAT_COMPLETIONS,
-                    Some(model),
-                );
-                if let Some(name) = required_tool {
-                    fallback_body["tool_choice"] =
-                        json!({"type": "function", "function": {"name": name}});
-                }
-                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
-                let fallback_headers =
-                    self.build_headers(request_overrides::ENDPOINT_CHAT_COMPLETIONS, Some(model))?;
-                let fallback =
-                    crate::retry::send_with_retry(crate::retry::global(), "OpenAI", || {
-                        self.client
-                            .post(&chat_url)
-                            .headers(fallback_headers.clone())
-                            .json(&fallback_body)
-                    })
-                    .await?;
-
-                if fallback.status().is_success() {
-                    let stream = openai_compat_chat_stream_from_sse(fallback, |_event, data| {
-                        if data.trim().is_empty() {
-                            return Ok(Vec::new());
-                        }
-
-                        parse_openai_compat_sse_data_strict_multi(data)
-                    });
-
-                    return Ok(stream);
-                }
-
-                // The no-reasoning retry itself failed — surface ITS status/body,
-                // not the stale original "reasoning unsupported" 400 (which would
-                // mask the real failure, e.g. a 500/429 on the retry). (#237)
-                let fallback_status = fallback.status();
-                let fallback_text = fallback.text().await.unwrap_or_default();
-                return Err(LLMError::Api(format!(
-                    "HTTP {fallback_status}: {fallback_text} (after retrying without reasoning_effort)"
-                )));
-            }
 
             if Self::looks_like_responses_only_error(status, &text) {
                 tracing::info!(
@@ -975,6 +846,38 @@ mod tests {
     fn test_default_values() {
         let provider = OpenAIProvider::new("test_key");
         assert_eq!(provider.base_url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn wire_reasoning_effort_label_reports_final_body_without_arbitrary_values() {
+        for (body, pointer, expected) in [
+            (
+                json!({"reasoning_effort": "max"}),
+                "/reasoning_effort",
+                "max",
+            ),
+            (
+                json!({"reasoning": {"effort": "xhigh"}}),
+                "/reasoning/effort",
+                "xhigh",
+            ),
+            (json!({}), "/reasoning_effort", "unset"),
+            (
+                json!({"reasoning_effort": "private-override-value"}),
+                "/reasoning_effort",
+                "invalid",
+            ),
+            (
+                json!({"reasoning_effort": null}),
+                "/reasoning_effort",
+                "invalid",
+            ),
+        ] {
+            assert_eq!(
+                OpenAIProvider::wire_reasoning_effort_label(&body, pointer),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -1634,6 +1537,122 @@ mod tests {
         "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
     const SESSION_CACHE_KEY: &str =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[tokio::test]
+    async fn max_reasoning_effort_reaches_actual_http_requests_for_model_aliases() {
+        for (endpoint, effort_pointer, sse) in [
+            ("/chat/completions", "/reasoning_effort", CHAT_SSE_OK),
+            ("/responses", "/reasoning/effort", RESPONSES_SSE_OK),
+        ] {
+            for model in [
+                "deepseek-flash",
+                "gpt-6.1-sol",
+                "gemini-compatible-alias",
+                "google/custom-route",
+                "custom-route",
+            ] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path(endpoint))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_string(sse),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+
+                let mut provider = OpenAIProvider::new("test-key")
+                    .with_base_url(server.uri())
+                    .with_client(Client::builder().no_proxy().build().unwrap());
+                if endpoint == "/responses" {
+                    provider = provider.with_responses_only_models(vec![model.to_string()]);
+                }
+                let options = LLMRequestOptions {
+                    reasoning_effort: Some(ReasoningEffort::Max),
+                    ..Default::default()
+                };
+                let mut stream = provider
+                    .chat_stream_with_options(
+                        &[Message::user("hello")],
+                        &[],
+                        Some(32_000),
+                        model,
+                        Some(&options),
+                    )
+                    .await
+                    .expect("max request must succeed");
+                while let Some(chunk) = stream.next().await {
+                    chunk.expect("valid SSE response");
+                }
+
+                let requests = server.received_requests().await.unwrap();
+                let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+                assert_eq!(body["model"], model);
+                assert_eq!(
+                    body.pointer(effort_pointer),
+                    Some(&json!("max")),
+                    "{endpoint} {model}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_max_reasoning_effort_is_not_retried_without_reasoning() {
+        for endpoint in ["/chat/completions", "/responses"] {
+            for provider_default in [false, true] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                    "error": {
+                        "message": "Unsupported value: reasoning_effort 'max' is not supported with this model",
+                        "type": "invalid_request_error",
+                        "param": "reasoning_effort"
+                    }
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+                let mut provider = OpenAIProvider::new("test-key")
+                    .with_base_url(server.uri())
+                    .with_client(Client::builder().no_proxy().build().unwrap())
+                    .with_reasoning_effort(Some(if provider_default {
+                        ReasoningEffort::Max
+                    } else {
+                        ReasoningEffort::High
+                    }));
+                if endpoint == "/responses" {
+                    provider = provider.with_responses_only_models(vec!["gpt-5.6-sol".to_string()]);
+                }
+                let options = (!provider_default).then_some(LLMRequestOptions {
+                    reasoning_effort: Some(ReasoningEffort::Max),
+                    ..Default::default()
+                });
+                let error = match provider
+                    .chat_stream_with_options(
+                        &[Message::user("hello")],
+                        &[],
+                        None,
+                        "gpt-5.6-sol",
+                        options.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(_) => panic!("rejected max must surface the upstream error"),
+                    Err(error) => error,
+                };
+                assert!(error.to_string().contains("HTTP 400"));
+                assert_eq!(
+                    server.received_requests().await.unwrap().len(),
+                    1,
+                    "{endpoint}"
+                );
+            }
+        }
+    }
 
     fn load_skill_tool() -> ToolSchema {
         ToolSchema {

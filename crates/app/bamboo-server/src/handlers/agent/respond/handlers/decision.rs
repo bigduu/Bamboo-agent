@@ -724,6 +724,12 @@ mod tests {
             model: Some("test-model".into()),
             ..Default::default()
         });
+        // Keep the permission-admission probe independent of the default-on
+        // first Dream tick over the fixture's newly persisted conversation.
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = false;
         let probe = Arc::new(CompatibilityPermissionProbe::default());
         let state = web::Data::new(
             AppState::new_with_provider(dir.path().into(), config, probe.clone())

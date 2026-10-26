@@ -133,6 +133,7 @@ mod supported {
     use super::super::{
         actor_snapshot_reader::{Directory, ReadBudget},
         root_context::ROOT_TOOL_AUTHORITY_PROOF_FILE,
+        session_version_migration::{is_published_migration_journal, MIGRATION_DIR},
         supervisor,
         supervisor_proof::SUPERVISOR_PROOF_FILE,
         ActorTreeRevision, ACTOR_TREE_REVISION_FILE, RUNTIME_SIDECAR_FILE,
@@ -192,9 +193,15 @@ mod supported {
     pub(super) fn read_cursor(home: &Path, root: &str) -> Result<Option<(String, u64)>, Error> {
         let home = Directory::open_absolute(home)?;
         let mut budget = ReadBudget::new(ActorSnapshotLimits::default());
-        for name in [RUNTIME_TASK_TRANSACTION_DIR, SESSION_COPY_TRANSACTION_DIR] {
+        for name in [
+            RUNTIME_TASK_TRANSACTION_DIR,
+            SESSION_COPY_TRANSACTION_DIR,
+            MIGRATION_DIR,
+        ] {
             if let Some(dir) = home.child(OsStr::new(name))? {
-                if !dir.entries(&mut budget)?.is_empty() {
+                if dir.entries(&mut budget)?.iter().any(|entry| {
+                    name != MIGRATION_DIR || is_published_migration_journal(Path::new(entry))
+                }) {
                     return Err(Error::PendingTransaction);
                 }
             }
@@ -296,6 +303,13 @@ mod supported {
         session: Session,
         row: Option<ActorDirectoryEntry>,
         local_task: Option<LocalTaskMetadata>,
+        /// A persisted Actor row can predate a model/profile metadata write.
+        /// Its stable identity is still useful to the Host owner's diagnostic
+        /// topology, but its runtime observations must not become authority.
+        own_observation_current: bool,
+        /// Historical projection requires a fully committed canonical pair;
+        /// it cannot resolve a partial Main/runtime metadata publication.
+        metadata_pair_current: bool,
     }
 
     /// Parsed only for v2, from the same bounded sidecar bytes as Identity.
@@ -495,6 +509,9 @@ mod supported {
                     .map_err(|_| Error::StaleAuthority)?;
             }
         }
+        let metadata_pair_current = side
+            .as_ref()
+            .is_none_or(|side| side.metadata_version == main.metadata_version);
         let mut session = side.unwrap_or(main);
         if is_root && session.root_session_id.is_empty() {
             session.root_session_id = id.to_owned();
@@ -517,7 +534,7 @@ mod supported {
                     || marker.session_created_at != session.created_at
                     || !row.actor.matches_session(&session)
                     || row.actor.project_id != session.project_id_meta()
-                    || row.actor.observed_metadata_version != session.metadata_version
+                    || row.actor.observed_metadata_version > session.metadata_version
                 {
                     return Err(Error::StaleAuthority);
                 }
@@ -532,10 +549,15 @@ mod supported {
             }
             _ => return Err(Error::InconsistentAuthority),
         };
+        let own_observation_current = row
+            .as_ref()
+            .is_none_or(|row| row.actor.observed_metadata_version == session.metadata_version);
         Ok(Source {
             session,
             row,
             local_task,
+            own_observation_current,
+            metadata_pair_current,
         })
     }
 
@@ -614,9 +636,15 @@ mod supported {
         let mut budget = ReadBudget::new(limits);
         // Any pending journal makes a coherent view unavailable. Stop at first
         // bounded enumeration; never call auto-recovery or mutate the journal.
-        for name in [RUNTIME_TASK_TRANSACTION_DIR, SESSION_COPY_TRANSACTION_DIR] {
+        for name in [
+            RUNTIME_TASK_TRANSACTION_DIR,
+            SESSION_COPY_TRANSACTION_DIR,
+            MIGRATION_DIR,
+        ] {
             if let Some(dir) = home.child(OsStr::new(name))? {
-                if !dir.entries(&mut budget)?.is_empty() {
+                if dir.entries(&mut budget)?.iter().any(|entry| {
+                    name != MIGRATION_DIR || is_published_migration_journal(Path::new(entry))
+                }) {
                     return Err(Error::PendingTransaction);
                 }
             }
@@ -642,6 +670,9 @@ mod supported {
                     .ok_or(Error::UnauthorizedScope)?;
                 read_source(&directory, &fence.actor_id, root, false, &mut budget, v2)?
             };
+            if !source.own_observation_current {
+                return Err(Error::StaleAuthority);
+            }
             if !live_fence_matches(&source, fence) {
                 return Err(Error::UnauthorizedScope);
             }
@@ -684,10 +715,22 @@ mod supported {
                 }
             }
         }
-        // Verify every direct-parent edge and full ancestor/birth observations,
-        // including nodes outside the selected subtree. Cached index is unused.
+        // Verify every direct-parent edge and ancestor birth, including nodes
+        // outside the selected subtree. Only the Host owner's diagnostic view
+        // may retain older metadata observations, without any runtime claims.
+        // A live Actor principal still requires the exact current revisions.
+        let host_owner = matches!(principal.authority(), ActorSnapshotAuthority::HostOwner);
+        let mut historical_observations = HashSet::new();
         for (id, source) in &sources {
             let chain = lineage(id, &sources)?;
+            let canonical_pairs_current = source.metadata_pair_current
+                && chain.iter().all(|ancestor| ancestor.metadata_pair_current);
+            if !source.own_observation_current {
+                if !host_owner || !canonical_pairs_current {
+                    return Err(Error::StaleAuthority);
+                }
+                historical_observations.insert(id.clone());
+            }
             if let Some(row) = &source.row {
                 let observations = chain
                     .iter()
@@ -698,7 +741,22 @@ mod supported {
                     })
                     .collect::<Vec<_>>();
                 if row.actor.ancestor_observations != observations {
-                    return Err(Error::StaleAuthority);
+                    let older_same_lineage = row.actor.ancestor_observations.len()
+                        == observations.len()
+                        && row
+                            .actor
+                            .ancestor_observations
+                            .iter()
+                            .zip(&observations)
+                            .all(|(recorded, current)| {
+                                recorded.actor_id == current.actor_id
+                                    && recorded.session_created_at == current.session_created_at
+                                    && recorded.metadata_version <= current.metadata_version
+                            });
+                    if !host_owner || !older_same_lineage || !canonical_pairs_current {
+                        return Err(Error::StaleAuthority);
+                    }
+                    historical_observations.insert(id.clone());
                 }
             }
         }
@@ -735,7 +793,8 @@ mod supported {
                 continue;
             }
             let row = source.row.as_ref();
-            let activation = row.and_then(|r| r.activation.as_ref());
+            let current_row = row.filter(|_| !historical_observations.contains(id));
+            let activation = current_row.and_then(|r| r.activation.as_ref());
             nodes.push(PublicActorSnapshotNode {
                 actor_id: id.clone(),
                 parent_actor_id: source.session.parent_session_id.clone(),
@@ -743,7 +802,7 @@ mod supported {
                 depth: source.session.spawn_depth,
                 title: public_title(&source.session.title),
                 role: source.session.kind,
-                logical_state: row.map(|r| r.actor.state),
+                logical_state: current_row.map(|r| r.actor.state),
                 placement_class: activation.and_then(|a| a.placement_ref.as_ref().map(|p| p.class)),
                 revision: PublicActorRevision {
                     session_metadata_version: source.session.metadata_version,
@@ -767,7 +826,11 @@ mod supported {
             let nodes: Vec<_> = nodes
                 .into_iter()
                 .map(|actor| {
-                    let local_task = local_task_observation(&sources[&actor.actor_id], now);
+                    let local_task = if historical_observations.contains(&actor.actor_id) {
+                        None
+                    } else {
+                        local_task_observation(&sources[&actor.actor_id], now)
+                    };
                     PublicActorSnapshotNodeV2 { actor, local_task }
                 })
                 .collect();

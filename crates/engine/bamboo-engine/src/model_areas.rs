@@ -25,15 +25,15 @@ use bamboo_domain::ProviderModelRef;
 use bamboo_llm::{Config, ProviderRegistry, ResolvedModel};
 
 use crate::model_config_helper::{
-    resolve_background_model, resolve_fast_model, resolve_subagent_model,
-    resolve_task_summary_model, resolve_vision_model,
+    resolve_background_model, resolve_fast_model, resolve_subagent_model, resolve_vision_model,
+    try_resolve_task_summary_model,
 };
 
 /// The auxiliary (non-chat) models, all resolved from **global** config for a
 /// given provider routing key. None of these are session-bound.
 ///
 /// Each `*_ref` is the effective [`ProviderModelRef`] after the same fallback
-/// chain as its resolved model (or `None` in legacy mode), kept alongside the
+/// chain as its resolved model (or `None` without role references), kept alongside the
 /// provider so snapshot callers never lose the winning role's reasoning policy.
 pub struct GlobalAreaModels {
     /// Fast/cheap model — title generation, lightweight tasks.
@@ -45,6 +45,9 @@ pub struct GlobalAreaModels {
     /// Task-summary model — conversation/task summarization and compression.
     pub summarization: Option<ResolvedModel>,
     pub summarization_ref: Option<ProviderModelRef>,
+    /// An explicit configured route failed admission. Compression must report
+    /// this failure instead of treating it as an unset role and falling back.
+    pub summarization_error: Option<String>,
 }
 
 /// Resolve the auxiliary area models from **global** config.
@@ -69,16 +72,31 @@ pub fn resolve_global_area_models(
             (
                 fast.clone(),
                 defaults.memory_background.as_ref().unwrap_or(fast).clone(),
-                defaults.task_summary.as_ref().unwrap_or(fast).clone(),
             )
         });
+    let (summarization, summarization_error) =
+        match try_resolve_task_summary_model(config, provider_name, provider_registry) {
+            Ok(model) => (model, None),
+            Err(error) => {
+                tracing::warn!(%error, "Configured task-summary route is unavailable");
+                (None, Some(error.to_string()))
+            }
+        };
     GlobalAreaModels {
         fast: resolve_fast_model(config, provider_name, provider_registry),
-        fast_ref: refs.as_ref().map(|(fast, _, _)| fast.clone()),
+        fast_ref: refs.as_ref().map(|(fast, _)| fast.clone()),
         background: resolve_background_model(config, provider_name, provider_registry),
-        background_ref: refs.as_ref().map(|(_, background, _)| background.clone()),
-        summarization: resolve_task_summary_model(config, provider_name, provider_registry),
-        summarization_ref: refs.map(|(_, _, summarization)| summarization),
+        background_ref: refs.map(|(_, background)| background),
+        summarization,
+        summarization_ref: config.defaults.as_ref().map(|defaults| {
+            defaults
+                .task_summary
+                .as_ref()
+                .or(defaults.fast.as_ref())
+                .unwrap_or(&defaults.chat)
+                .clone()
+        }),
+        summarization_error,
     }
 }
 
