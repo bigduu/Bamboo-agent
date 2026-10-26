@@ -7,6 +7,7 @@
 //! All port calls happen outside Ticket locks. Concrete I/O adapters live in the Host.
 
 pub mod checkpoint;
+pub mod delivery;
 pub mod host;
 pub mod program;
 

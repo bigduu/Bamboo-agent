@@ -1927,6 +1927,21 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// Host-only staged Patrol decision item. Retain the canonical Supervisor
+    /// incarnation and orchestration revision through durable publication.
+    /// This grants no activation, changes no wait and starts no model call.
+    async fn stage_supervisor_patrol_notice(
+        &self,
+        _supervisor: &super::SupervisorReference,
+        _orchestration_revision: u64,
+        _envelope: &SessionMessageEnvelope,
+        _gate: &super::AdmissionGate,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "Supervisor patrol notice admission is unsupported".into(),
+        ))
+    }
+
     /// Durably authorize execution for the queue prefix through `generation`.
     ///
     /// This is separate from [`deliver`](Self::deliver) so orchestration

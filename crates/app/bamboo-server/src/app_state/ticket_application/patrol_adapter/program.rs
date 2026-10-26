@@ -17,14 +17,15 @@ impl Clock for SystemClock {
     }
 }
 
-struct FencedJournal<'a> {
+struct FencedJournal {
     store: PatrolCheckpointStore,
     fence: ReadyAdmissionFence,
-    service: &'a bamboo_tickets::TicketService,
+    service: std::sync::Arc<bamboo_tickets::TicketService>,
     commit: String,
+    scopes: Vec<Scope>,
 }
 
-impl FencedJournal<'_> {
+impl FencedJournal {
     fn current(&self) -> std::result::Result<(), PortError> {
         self.fence.check().map_err(|_| PortError::Denied)?;
         if self.service.health() != bamboo_tickets::Health::Writable {
@@ -43,9 +44,12 @@ impl FencedJournal<'_> {
     }
 }
 
-impl CheckpointPort for FencedJournal<'_> {
+impl CheckpointPort for FencedJournal {
     fn load(&mut self, scope: &Scope) -> std::result::Result<Option<StoredCheckpoint>, PortError> {
         self.current()?;
+        if !self.scopes.contains(scope) {
+            self.scopes.push(scope.clone());
+        }
         let loaded = self.store.load(scope)?;
         self.current()?;
         Ok(loaded)
@@ -72,13 +76,14 @@ impl TicketApplication {
         fence.check()?;
         let (service, authority) = self.authority(Principal::Runtime).await?;
         let (commit, snapshot) = service.published()?;
+        let expected_binding = snapshot.binding.clone();
         let binding =
             bamboo_tickets::content_hash(&bamboo_tickets::canonical_bytes(&snapshot.binding)?);
         let root = self.root.clone();
         let project_id = selection.project_id.clone();
         let work_ids = selection.work_ids.to_vec();
         let fence = fence.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut journal = tokio::task::spawn_blocking(move || -> Result<FencedJournal> {
             fence.check()?;
             let root = root
                 .canonicalize()?
@@ -89,8 +94,9 @@ impl TicketApplication {
             let mut journal = FencedJournal {
                 store,
                 fence,
-                service: &service,
+                service: service.clone(),
                 commit,
+                scopes: Vec::new(),
             };
             journal.current().map_err(patrol_error)?;
             let program = ProgramPatrol::new(Policy::default())
@@ -119,9 +125,61 @@ impl TicketApplication {
                         "program patrol observation rejected: {other:?}"
                     )),
                 })?;
-            Ok(())
+            Ok(journal)
         })
         .await
-        .map_err(|_| Error::AuthorityUnavailable("program patrol worker stopped".into()))?
+        .map_err(|_| Error::AuthorityUnavailable("program patrol worker stopped".into()))??;
+        // Keep the same exclusive journal lease across the staged Inbox call.
+        // The existing worker remains the only scheduler, with no model call.
+        let scopes = std::mem::take(&mut journal.scopes);
+        for scope in scopes {
+            let prepared = tokio::task::spawn_blocking(move || -> Result<_> {
+                journal.current().map_err(patrol_error)?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|d| u64::try_from(d.as_millis()).ok())
+                    .ok_or_else(|| {
+                        Error::AuthorityUnavailable("Patrol clock unavailable".into())
+                    })?;
+                let pending = bamboo_orchestration::patrol::delivery::prepare(
+                    &scope,
+                    &Policy::default(),
+                    &SystemClock(now),
+                    &mut journal,
+                )
+                .map_err(|error| {
+                    Error::AuthorityUnavailable(format!("Patrol delivery rejected: {error:?}"))
+                })?;
+                journal.current().map_err(patrol_error)?;
+                Ok((journal, pending))
+            })
+            .await
+            .map_err(|_| Error::AuthorityUnavailable("Patrol delivery worker stopped".into()))??;
+            journal = prepared.0;
+            if let Some(pending) = prepared.1 {
+                journal.fence.check()?;
+                if self
+                    .stage_ready_patrol_notice(&expected_binding, &pending, &journal.fence)
+                    .await?
+                {
+                    journal = tokio::task::spawn_blocking(move || -> Result<_> {
+                        journal.current().map_err(patrol_error)?;
+                        pending.acknowledge(&mut journal).map_err(|error| {
+                            Error::AuthorityUnavailable(format!(
+                                "Patrol delivery ACK rejected: {error:?}"
+                            ))
+                        })?;
+                        journal.current().map_err(patrol_error)?;
+                        Ok(journal)
+                    })
+                    .await
+                    .map_err(|_| {
+                        Error::AuthorityUnavailable("Patrol ACK worker stopped".into())
+                    })??;
+                }
+            }
+        }
+        Ok(())
     }
 }
