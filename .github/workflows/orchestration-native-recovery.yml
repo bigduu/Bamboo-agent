@@ -74,7 +74,7 @@ jobs:
           cargo test --locked -p bamboo-server --lib \
             app_state::tests::session_control_tests:: \
             -- --test-threads=1 --nocapture 2>&1 | tee "$result"
-          grep -Fq '5 passed; 0 failed; 0 ignored' "$result"
+          grep -Fq 'test result: ok. 5 passed; 0 failed; 0 ignored' "$result"
           grep -Fq 'native Supervisor scope: mode=Standard;' "$result"
           grep -Fq 'native Supervisor scope: mode=Ultra;' "$result"
 
