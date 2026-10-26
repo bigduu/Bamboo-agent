@@ -200,6 +200,155 @@ else {
     assert.deepEqual(fs.readdirSync(path.join(root, "output")), ["Cargo.lock"]);
     fs.rmSync(root, { recursive: true, force: true });
   });
+  test("disk policy is bounded and cannot select a deletion path", () => {
+    assert.deepEqual(sandbox.diskPolicy(), { lowFreeBytes: 2 * 1024 ** 3, maxScratchBytes: 8 * 1024 ** 3 });
+    assert.deepEqual(sandbox.diskPolicy({ lowFreeBytes: 64 * 1024 ** 2, maxScratchBytes: 96 * 1024 ** 2 }), { lowFreeBytes: 64 * 1024 ** 2, maxScratchBytes: 96 * 1024 ** 2 });
+    for (const policy of [{ lowFreeBytes: 1, maxScratchBytes: 32 * 1024 ** 2 }, { lowFreeBytes: 64 * 1024 ** 2, maxScratchBytes: 32 * 1024 ** 2 }, { lowFreeBytes: 32 * 1024 ** 2, maxScratchBytes: 32 * 1024 ** 3 }, { ...sandbox.DEFAULT_DISK_POLICY, path: "/outside" }]) assert.throws(() => sandbox.diskPolicy(policy));
+  });
+  test("ENOSPC classification requires a completed Cargo failure and an explicit space diagnostic", () => {
+    const failed = { status: 101, signal: null, stderr: "error: No space left on device", stdout: "" };
+    assert.equal(sandbox.enospc(failed), true);
+    assert.equal(sandbox.enospc({ ...failed, stderr: "", stdout: "error: ENOSPC" }), true);
+    for (const change of [
+      { status: 79 }, { status: 125 }, { status: 126 }, { status: 127 }, { status: null },
+      { signal: "SIGTERM" }, { error: Object.assign(new Error("ENOSPC"), { code: "ENOSPC" }) },
+      { stderr: "error: ENOBUFS" }, { stderr: "error: Permission denied (EACCES)" },
+      { stderr: "error: failed to compile" }, { stderr: "Error response from daemon: ENOSPC" },
+    ]) assert.equal(sandbox.enospc({ ...failed, ...change }), false);
+  });
+  test("non-package commands do not gain an ENOSPC retry or scratch reclamation", t => {
+    const root = temporary(); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const source = path.join(root, "repo"); fixture(source);
+    const state = sandbox.install(source, path.join(root, "state"));
+    const debug = path.join(state.stateRoot, "data/target/debug"); fs.mkdirSync(debug);
+    fs.writeFileSync(path.join(debug, "keep"), "compiled");
+    const count = path.join(root, "calls"); const bin = path.join(root, "bin"); fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, "docker"), '#!/usr/bin/env node\n' +
+      `require("node:fs").appendFileSync(${JSON.stringify(count)}, "call\\n"); console.error("error: ENOSPC"); process.exit(101);\n`, { mode: 0o755 });
+    for (const command of ["metadata", "check", "build", "test"]) {
+      const result = spawnSync(process.execPath, [helper, command], { encoding: "utf8", env: {
+        PATH: bin + path.delimiter + process.env.PATH, HOME: process.env.HOME,
+        BAMBOO_CARGO_SANDBOX: path.join(state.stateRoot, "state.json"),
+      } });
+      assert.equal(result.status, 101, result.stderr);
+      assert.doesNotMatch(result.stderr, /\[cargo-disk\]/);
+      assert.equal(fs.readFileSync(path.join(debug, "keep"), "utf8"), "compiled");
+    }
+    assert.equal(fs.readFileSync(count, "utf8"), "call\n".repeat(4));
+  });
+  function diskFixture(root) {
+    const stateRoot = path.join(root, "state");
+    fs.mkdirSync(stateRoot, { mode: 0o700 });
+    for (const part of ["data/target/debug", "data/target/package", "data/cache", "source/target/package"]) fs.mkdirSync(path.join(stateRoot, part), { recursive: true });
+    for (const file of ["data/target/debug/compiler", "data/target/package/reserved.crate", "data/cache/registry", "source/target/package/reserved.crate", "source/manifest", "receipt.json"]) fs.writeFileSync(path.join(stateRoot, file), file);
+    return { stateRoot, diskPolicy: { lowFreeBytes: 16 * 1024 ** 2, maxScratchBytes: 32 * 1024 ** 2 } };
+  }
+  test("low free space reclaims only owned debug and preserves archives, cache, source and receipts", t => {
+    const root = temporary(); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const state = diskFixture(root);
+    const keep = ["data/target/package/reserved.crate", "data/cache/registry", "source/target/package/reserved.crate", "source/manifest", "receipt.json"];
+    t.mock.method(fs, "statfsSync", () => ({ bsize: 1, bavail: 1 }));
+    let calls = 0;
+    const result = sandbox.withDiskRecovery(state, ["package", "-p", "fixture-probe"], () => {
+      calls++; assert.ok(!fs.existsSync(path.join(state.stateRoot, "data/target/debug")));
+      return { status: 0, stdout: "", stderr: "", signal: null };
+    });
+    assert.equal(result.status, 0); assert.equal(calls, 1);
+    for (const file of keep) assert.equal(fs.readFileSync(path.join(state.stateRoot, file), "utf8"), file);
+  });
+  test("adequate space retains compiler scratch between packages and sparse files do not exhaust its budget", t => {
+    const root = temporary(); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const state = diskFixture(root);
+    t.mock.method(fs, "statfsSync", () => ({ bsize: 1, bavail: 1024 ** 3 }));
+    const sparse = path.join(state.stateRoot, "data/target/debug/sparse");
+    const fd = fs.openSync(sparse, "w"); fs.ftruncateSync(fd, 128 * 1024 ** 2); fs.closeSync(fd);
+    let calls = 0;
+    for (let packageIndex = 0; packageIndex < 2; packageIndex++) sandbox.withDiskRecovery(state, ["package", "-p", "fixture-probe"], () => {
+      calls++; assert.ok(fs.existsSync(sparse)); assert.ok(fs.existsSync(path.join(state.stateRoot, "data/target/debug/compiler")));
+      return { status: 0, stdout: "", stderr: "", signal: null };
+    });
+    assert.equal(calls, 2);
+  });
+  test("scratch reclamation rejects linked roots or parents and never follows nested links", t => {
+    const root = temporary(); const outside = temporary();
+    t.after(() => { fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(outside, { recursive: true, force: true }); });
+    const state = diskFixture(root); const marker = path.join(outside, "keep"); fs.writeFileSync(marker, "outside");
+    const debug = path.join(state.stateRoot, "data/target/debug");
+    fs.symlinkSync(outside, path.join(debug, "nested-link"));
+    sandbox.reclaimScratch(state); assert.equal(fs.readFileSync(marker, "utf8"), "outside");
+    fs.symlinkSync(outside, debug);
+    assert.throws(() => sandbox.reclaimScratch(state), /Unsafe compiler scratch/);
+    fs.unlinkSync(debug); fs.rmSync(path.join(state.stateRoot, "data/target"), { recursive: true });
+    fs.symlinkSync(outside, path.join(state.stateRoot, "data/target"));
+    assert.throws(() => sandbox.reclaimScratch(state), /Unsafe compiler scratch parent/);
+    assert.equal(fs.readFileSync(marker, "utf8"), "outside");
+  });
+  test("fake Docker retries only one normal Cargo ENOSPC with identical verified-package arguments", async t => {
+    const matrix = [
+      { name: "ENOSPC once succeeds", results: [{ status: 101, stderr: "error: No space left on device (ENOSPC)\n" }, { status: 0, stderr: "verified\n" }], calls: 2, status: 0 },
+      { name: "normal compiler failure", results: [{ status: 101, stderr: "error: unresolved import\n" }], calls: 1, status: 101 },
+      { name: "second ENOSPC stays fatal", results: [{ status: 101, stderr: "error: ENOSPC first\n" }, { status: 101, stderr: "error: ENOSPC second\n" }], calls: 2, status: 101 },
+      { name: "Docker reserved failure", results: [{ status: 125, stderr: "docker: ENOSPC\n", unsafe: true }], calls: 1, status: 125 },
+      { name: "ambiguous daemon error", results: [{ status: 101, stderr: "Error response from daemon: ENOSPC\n", unsafe: true }], calls: 1, status: 101 },
+      { name: "Docker signal", results: [{ signal: "SIGTERM", stderr: "ENOSPC\n", unsafe: true }], calls: 1, status: 1 },
+    ];
+    for (const scenario of matrix) await t.test(scenario.name, () => {
+      const root = temporary(); const outside = temporary();
+      try {
+        const source = path.join(root, "repo"); fixture(source);
+        const state = sandbox.install(source, path.join(root, "state"), { lowFreeBytes: 16 * 1024 ** 2, maxScratchBytes: 32 * 1024 ** 2 });
+        const target = path.join(state.stateRoot, "data/target"); const debug = path.join(target, "debug");
+        fs.mkdirSync(debug); fs.writeFileSync(path.join(debug, "original"), "compiled");
+        const reserved = Buffer.from("fixed reserved archive"); const archive = "fixture-probe-0.0.0.crate";
+        for (const base of [path.join(target, "package"), path.join(source, "target/package")]) { fs.mkdirSync(base, { recursive: true }); fs.writeFileSync(path.join(base, archive), reserved); }
+        fs.writeFileSync(path.join(outside, "keep"), "outside");
+        const receipt = fs.readFileSync(path.join(state.stateRoot, "state.json"));
+        const counter = path.join(state.stateRoot, "data/cache/calls.json");
+        const bin = path.join(root, "bin"); fs.mkdirSync(bin);
+        fs.writeFileSync(path.join(bin, "docker"), "#!/usr/bin/env node\n" + `
+const fs=require('node:fs');
+const counter=${JSON.stringify(counter)},debug=${JSON.stringify(debug)},outside=${JSON.stringify(outside)};
+const calls=fs.existsSync(counter)?JSON.parse(fs.readFileSync(counter)):[];
+calls.push({args:process.argv.slice(2),hadScratch:fs.existsSync(debug)});fs.writeFileSync(counter,JSON.stringify(calls));
+if(process.env.CARGO_REGISTRY_TOKEN||process.env.GH_TOKEN||process.env.BAMBOO_RELEASE_SIGNING_KEY)process.exit(88);
+const results=${JSON.stringify(scenario.results)};const result=results[Math.min(calls.length-1,results.length-1)];
+fs.mkdirSync(debug,{recursive:true});fs.writeFileSync(debug+'/attempt','compiled');
+if(result.unsafe){fs.rmSync(debug,{recursive:true});fs.symlinkSync(outside,debug);}
+process.stderr.write(result.stderr);if(result.signal)process.kill(process.pid,result.signal);else process.exit(result.status);
+`, { mode: 0o755 });
+        const args = ["package", "--allow-dirty", "--locked", "-p", "fixture-probe"];
+        const result = spawnSync(process.execPath, [helper, ...args], { encoding: "utf8", env: { PATH: bin + path.delimiter + process.env.PATH, HOME: process.env.HOME, DOCKER_HOST: state.endpoint, BAMBOO_CARGO_SANDBOX: path.join(state.stateRoot, "state.json"), CARGO_REGISTRY_TOKEN: "dummy-parent-only", GH_TOKEN: "dummy-parent-only", BAMBOO_RELEASE_SIGNING_KEY: "dummy-parent-only" } });
+        assert.equal(result.status, scenario.status, result.stderr);
+        const calls = JSON.parse(fs.readFileSync(counter)); assert.equal(calls.length, scenario.calls);
+        assert.ok(calls.every(call => assert.deepEqual(call.args.slice(-args.length), args) === undefined));
+        if (calls.length === 2) assert.equal(calls[1].hadScratch, false);
+        assert.equal((result.stderr.match(/^\[cargo-disk\] phase=enospc-retry attempt=2 /gm) || []).length, scenario.calls - 1);
+        if (scenario.results[0].unsafe) { assert.ok(fs.lstatSync(debug).isSymbolicLink()); assert.ok(!result.stderr.includes("phase=package-end")); }
+        else assert.equal((result.stderr.match(/phase=package-end/g) || []).length, scenario.calls);
+        assert.deepEqual(fs.readFileSync(path.join(target, "package", archive)), reserved);
+        assert.deepEqual(fs.readFileSync(path.join(source, "target/package", archive)), reserved);
+        assert.deepEqual(fs.readFileSync(path.join(state.stateRoot, "state.json")), receipt);
+        assert.equal(fs.readFileSync(path.join(source, "src/lib.rs"), "utf8"), "pub use fixture_probe::ready;\n");
+        assert.equal(fs.readFileSync(path.join(outside, "keep"), "utf8"), "outside");
+        if (scenario.calls === 2 && scenario.status !== 0) assert.ok(fs.existsSync(path.join(debug, "attempt")), "second ENOSPC does not clean or retry again");
+      } finally { fs.rmSync(root, { recursive: true, force: true }); fs.rmSync(outside, { recursive: true, force: true }); }
+    });
+  });
+  test("worker permission repair ignores symlinks, permits generated directory cleanup and retains Cargo status", { skip: !process.getuid }, () => {
+    const root = temporary();
+    try {
+      for (const part of ["source", "cache", "target", "outside", "bin"]) fs.mkdirSync(path.join(root, part));
+      const outside = path.join(root, "outside/keep"); fs.writeFileSync(outside, "outside", { mode: 0o400 });
+      fs.writeFileSync(path.join(root, "bin/cargo"), '#!/bin/sh\nmkdir -p "$TEST_SOURCE/generated/nested"\nln -s "$TEST_OUTSIDE" "$TEST_SOURCE/generated/link"\nchmod 000 "$TEST_SOURCE/generated/nested"\nexit 73\n', { mode: 0o755 });
+      const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
+      const script = sandbox.WORKER_SCRIPT.replaceAll("/source", quote(path.join(root, "source"))).replaceAll("/cargo-home", quote(path.join(root, "cache"))).replaceAll("/target", quote(path.join(root, "target"))).replaceAll("-uid 65532", `-uid ${process.getuid()}`);
+      const result = spawnSync("/bin/sh", ["-c", script, "cargo", "--version"], { encoding: "utf8", env: { PATH: path.join(root, "bin") + path.delimiter + process.env.PATH, TEST_SOURCE: path.join(root, "source"), TEST_OUTSIDE: path.join(root, "outside") } });
+      assert.equal(result.status, 73); assert.equal(result.stderr, "");
+      assert.equal(fs.statSync(outside).mode & 0o777, 0o400);
+      assert.doesNotThrow(() => fs.rmSync(path.join(root, "source/generated"), { recursive: true }));
+      assert.match(sandbox.WORKER_SCRIPT, /find -P .* -uid 65532/); assert.ok(!sandbox.WORKER_SCRIPT.includes("chmod -R"));
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  });
   test("real Cargo isolation with dummy controller authority", { skip: process.env.BAMBOO_CARGO_INTEGRATION !== "1" }, () => {
     const env = { PATH: process.env.PATH, HOME: process.env.HOME, DOCKER_HOST: process.env.DOCKER_HOST, DOCKER_CONTEXT: process.env.DOCKER_CONTEXT,
       BAMBOO_TEST_REAL_CARGO: exec("sh", ["-c", "command -v cargo"]).trim(), RUSTUP_HOME: process.env.RUSTUP_HOME || path.join(os.homedir(), ".rustup"), RUSTUP_TOOLCHAIN: "stable",
