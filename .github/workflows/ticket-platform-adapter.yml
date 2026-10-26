@@ -81,17 +81,13 @@ jobs:
           --test native_work_project_isolation --test patrol_ready_assembly
           -- --test-threads=1 --nocapture
 
-      - name: Verify canonical metering and existing auxiliary consumers
-        run: |
-          cargo test --locked -p bamboo-engine --lib ticket_runtime::tests::token_budget -- --test-threads=1 --nocapture
-          cargo test --locked -p bamboo-engine --lib llm_summarizer:: -- --test-threads=1
-          cargo test --locked -p bamboo-engine --lib runtime::runner::image_fallback::tests:: -- --test-threads=1
-
-      - name: Verify the bounded engine test lint repairs
+      - name: Verify metering, auxiliary consumers and the bounded lint regressions
         shell: bash
         run: |
           set -euo pipefail
           filters=(
+            ticket_runtime::tests::token_budget llm_summarizer::
+            runtime::runner::image_fallback::tests::
             execute_external_child_rejects_direct_remote_worker
             owned_glob_collector_requires_actual_ordered_tool_trace_and_typed_tail
             resolve_disabled_filters_ queue_capacity_revalidation
@@ -109,19 +105,25 @@ jobs:
             progress_hint_tests runtime::runner::tool_execution::task::tests
             session_repository::tests topology_preserves_unexpanded_map_prefix_without_fabricating_item_zero
           )
-          for filter in "${filters[@]}"; do
-            printf 'Regression started %s: %s\n' "$(date -u +%FT%TZ)" "$filter"
-            log=$(mktemp)
-            timeout --kill-after=30s 10m cargo test --locked -p bamboo-engine --lib "$filter" -- --test-threads=1 | tee "$log"
-            python3 - "$log" <<'PY'
+          log=$(mktemp)
+          printf 'Selected regression groups: %s\n' "${filters[*]}"
+          # libtest accepts multiple filters after -- and runs their union.
+          # One Cargo invocation avoids repeating the same engine compilation.
+          timeout --kill-after=30s 20m cargo test --locked -p bamboo-engine --lib -- \
+            "${filters[@]}" --test-threads=1 --format=pretty --color=never --show-output | tee "$log"
+          python3 - "$log" "${filters[@]}" <<'PY'
           import pathlib, re, sys
-          result = re.findall(r'test result: ok\. (\d+) passed; (\d+) failed;', pathlib.Path(sys.argv[1]).read_text())
+          log = pathlib.Path(sys.argv[1]).read_text()
+          result = re.findall(r'test result: ok\. (\d+) passed; (\d+) failed;', log)
           assert result and sum(int(passed) for passed, _ in result) > 0, 'Selected regression must execute tests'
           assert all(int(failed) == 0 for _, failed in result)
+          progress = log.split('\nsuccesses:\n', 1)[0]
+          passed = set(re.findall(r'^test (\S+) \.\.\. ok$', progress, re.MULTILINE))
+          coverage = {name: sum(name in test for test in passed) for name in sys.argv[2:]}
+          assert all(coverage.values()), f'Selected group did not pass tests: {coverage}'
+          print(f'Passed group coverage: {coverage}')
           PY
-            rm "$log"
-            printf 'Regression finished %s: %s\n' "$(date -u +%FT%TZ)" "$filter"
-          done
+          rm "$log"
 
       - name: Check affected libraries and test targets under the existing CI lint policy
         shell: bash
