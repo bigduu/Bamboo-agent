@@ -40,6 +40,13 @@ async fn planner_response(body: web::Json<Value>, probe: web::Data<PlannerProbe>
         probe.requests.lock().unwrap().len() <= 16,
         "bounded fixture request count"
     );
+    eprintln!(
+        "planner fixture request: model={} root_calls={} child_calls={} crash={}",
+        body["model"],
+        probe.root_calls.load(Ordering::SeqCst),
+        probe.child_calls.load(Ordering::SeqCst),
+        probe.crash_child
+    );
     let is_root = body["tools"]
         .as_array()
         .is_some_and(|tools| tools.iter().any(|t| t["function"]["name"] == "Plan"));
@@ -331,13 +338,28 @@ async fn planner_fixture(crash_child: bool) {
     let original = disk.load_session("planner-root").await.unwrap().unwrap();
     execute_only_legacy_chat(&client, &base, &receipt).await;
     if crash_child {
-        tokio::time::timeout(Duration::from_secs(30), async {
+        let readiness_started = std::time::Instant::now();
+        // The same binary's healthy Host/worker chain can exceed 30 seconds.
+        // Match the existing bounded completion wait, while still requiring the
+        // actual pending worker request before any kill or recovery assertion.
+        tokio::time::timeout(Duration::from_secs(90), async {
             while probe.child_calls.load(Ordering::SeqCst) == 0 {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
         .await
-        .expect("the real worker must reach the pending provider before Host loss");
+        .unwrap_or_else(|error| {
+            panic!(
+                "pending worker readiness {error}; root_calls={} child_calls={}\n{}",
+                probe.root_calls.load(Ordering::SeqCst),
+                probe.child_calls.load(Ordering::SeqCst),
+                std::fs::read_to_string(data.join("host.log")).unwrap()
+            )
+        });
+        eprintln!(
+            "planner crash fixture reached its actual pending worker after {:?}",
+            readiness_started.elapsed()
+        );
         let disk = SessionStoreV2::new(data.clone()).await.unwrap();
         let children: Vec<_> = disk
             .list_index_entries()
