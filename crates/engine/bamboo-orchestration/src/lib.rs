@@ -116,6 +116,21 @@ impl std::fmt::Debug for ReadyAdmissionFence {
 }
 
 impl ReadyAdmissionFence {
+    /// A staged program notice has no retry admission or model permission.
+    /// Its caller must cancel this gate on drop; the Inbox checks its deadline
+    /// under the actual synchronous publication mutex, including late disk jobs.
+    pub fn patrol_notice_gate(&self) -> Result<bamboo_domain::AdmissionGate> {
+        self.check()?;
+        if self.retry.is_some() {
+            return Err(Error::ResourceBlocked(
+                "Patrol notice cannot use a retry admission fence".into(),
+            ));
+        }
+        Ok(bamboo_domain::AdmissionGate::with_deadline(
+            self.expires.into_std(),
+        ))
+    }
+
     pub fn check(&self) -> Result<()> {
         if self.revoked.is_cancelled() {
             return Err(Error::ResourceBlocked(
@@ -141,7 +156,8 @@ pub trait ReadyWorkHost: Send + Sync {
     async fn authority(&self) -> Result<(Arc<TicketService>, Authority)>;
     async fn check_budget(&self, max_rounds: u32) -> Result<()>;
     /// Observe only the Works selected by this already installed Host policy.
-    /// This creates no grant, diagnostic model call, delivery or recovery action.
+    /// This creates no grant, diagnostic model call or recovery action. The
+    /// Host may stage a bounded decision notice without granting activation.
     async fn reconcile_program_patrol(
         &self,
         _selection: &patrol::program::ProgramSelection<'_>,
