@@ -3296,7 +3296,17 @@ impl ChildCompletionCoordinator {
         }
 
         if let (Some(messenger), Some(admission)) = (messenger.as_ref(), admission.as_ref()) {
-            if let Err(error) = messenger.prepare_activation(admission).await {
+            let prepared = if kind == ShellCompletionKind::Exec {
+                messenger
+                    .prepare_message_activation(
+                        admission,
+                        SessionActivationPolicy::RespectSpecificWait,
+                    )
+                    .await
+            } else {
+                messenger.prepare_activation(admission).await
+            };
+            if let Err(error) = prepared {
                 tracing::warn!(
                     session_id = %info.session_id,
                     bash_id = %info.bash_id,

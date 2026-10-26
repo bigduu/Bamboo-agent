@@ -2099,6 +2099,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_exec_old_receipt_cannot_authorize_a_recreated_sessions_staged_message() {
+        let (_temp, store, activation, messenger) = fixture().await;
+        let old = Session::new("runtime-activation-target", "model");
+        store.save_session(&old).await.unwrap();
+        let mut envelope = SessionMessageEnvelope::user_input(&old.id, "unused");
+        envelope.source = SessionMessageSource::Runtime {
+            subsystem: "background_exec".into(),
+        };
+        envelope.kind = SessionMessageKind::RuntimeInstruction;
+        envelope.body =
+            SessionMessageBody::RuntimeInstruction(bamboo_domain::SessionRuntimeInstruction {
+                instruction: "background_exec_completed".into(),
+                content: Some(SessionMessageContent::text("old result")),
+                data: None,
+                provider_message: None,
+            });
+        let admission = messenger
+            .admit_runtime_for_target(envelope, old.created_at)
+            .await
+            .unwrap();
+        store.delete_session(&old.id).await.unwrap();
+        let mut replacement = Session::new(&old.id, "model");
+        replacement.created_at = old.created_at + chrono::Duration::seconds(1);
+        store.save_session(&replacement).await.unwrap();
+        let staged = messenger
+            .admit(SessionMessageEnvelope::user_input(
+                &old.id,
+                "new staged input",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(admission.delivery.generation, staged.delivery.generation);
+        assert_ne!(admission.delivery.id, staged.delivery.id);
+        assert!(messenger
+            .prepare_message_activation(&admission, SessionActivationPolicy::RespectSpecificWait)
+            .await
+            .is_err());
+        assert!(!messenger
+            .inbox()
+            .inspect(&old.id)
+            .await
+            .unwrap()
+            .activation_pending());
+        assert!(activation.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn peer_reply_revalidates_received_proof_after_concurrent_clear_or_save() {
         for clear in [true, false] {
             let (_temp, store, activation, messenger) = fixture().await;
