@@ -309,12 +309,34 @@ async fn cancelled_inflight_work_cannot_replay_task_or_regain_authority_after_re
             .values()
             .filter(|s| s.work_id == work)
             .all(|s| s.stale));
-        let child = state
-            .storage
-            .load_session(&runtime.session_id)
-            .await
-            .unwrap()
-            .unwrap();
+        // Ticket stop is committed after the task/resource join, before the
+        // SDK's terminal Session publication tail. Observe both boundaries;
+        // the first receipt alone does not mean every diagnostic is published.
+        let child = tokio::time::timeout(WAIT, async {
+            loop {
+                let child = state
+                    .storage
+                    .load_session(&runtime.session_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if child
+                    .metadata
+                    .get("runtime.local_task.state")
+                    .map(String::as_str)
+                    == Some("stopped")
+                    && matches!(
+                        child.last_run_status().as_deref(),
+                        Some("completed" | "error" | "timeout" | "cancelled" | "skipped")
+                    )
+                {
+                    break child;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("SDK durably publishes the already joined Child's terminal state");
         let stop_receipt: Value =
             serde_json::from_str(&child.metadata["ticket.runtime.owned_stop.v1"]).unwrap();
         assert_eq!(stop_receipt["receipt"], json!(runtime));
