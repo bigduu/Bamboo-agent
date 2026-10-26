@@ -310,6 +310,10 @@ impl Fixture {
     }
 
     async fn project_workspaces(&self) -> (Value, Value, Value) {
+        // Project's primary directory and additional repository binding must
+        // be distinct roots. The real registry rejects overlapping roots.
+        let project_home = self.temp.join("project-home");
+        std::fs::create_dir(&project_home).unwrap();
         let repo = self.temp.join("project-repo");
         std::fs::create_dir(&repo).unwrap();
         git(&repo, &["init", "-b", "fixture"]);
@@ -350,9 +354,12 @@ impl Fixture {
         let fresh = workspace("new-claim");
         let project = post(&self.client, &self.base, "/projects", &json!({
             "name":"Native crash Project","description":"Disposable process-loss fixture",
-            "project_path":repo,"workspace_bindings":[{"path":repo,"label":"fixture","git_common_dir":null}]
+            "project_path":project_home,"workspace_bindings":[{"path":repo,"label":"fixture","git_common_dir":null}]
         })).await;
         assert_eq!(project["workspace_bindings"].as_array().unwrap().len(), 1);
+        let primary = Path::new(project["project_path"].as_str().unwrap());
+        let binding = Path::new(project["workspace_bindings"][0]["path"].as_str().unwrap());
+        assert!(!primary.starts_with(binding) && !binding.starts_with(primary));
         (project, old, fresh)
     }
 
