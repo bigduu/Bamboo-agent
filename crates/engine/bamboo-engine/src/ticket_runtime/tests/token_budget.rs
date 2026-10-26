@@ -8,8 +8,16 @@ use bamboo_tickets::{ExecutionTokenUsage, WorkTokenLimits};
 use futures::StreamExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod terminal;
+
 enum Script {
     Known,
+    KnownText,
+    DoneError,
+    DoneOverCap,
+    DonePending,
+    RepeatedDone,
+    NoDone,
     Partial,
     BootstrapError,
     StreamError,
@@ -56,23 +64,93 @@ fn usage(input: Option<u64>, output: Option<u64>) -> LLMChunk {
 }
 #[async_trait::async_trait]
 impl LLMProvider for Provider {
+    async fn vision_support_override(&self, model: &str) -> Option<bool> {
+        (model == "auxiliary-model").then_some(true)
+    }
     async fn list_model_info(&self) -> bamboo_llm::provider::Result<Vec<ProviderModelInfo>> {
-        Ok(vec![ProviderModelInfo {
-            id: "fixture-model".into(),
-            max_context_tokens: Some(100),
-            max_output_tokens: Some(40),
-        }])
+        Ok(vec![
+            ProviderModelInfo {
+                id: "fixture-model".into(),
+                max_context_tokens: Some(100),
+                max_output_tokens: Some(40),
+            },
+            ProviderModelInfo {
+                id: "auxiliary-model".into(),
+                max_context_tokens: Some(8192),
+                max_output_tokens: Some(2048),
+            },
+        ])
     }
     async fn chat_stream(
         &self,
         _: &[bamboo_domain::Message],
         _: &[bamboo_domain::ToolSchema],
         cap: Option<u32>,
-        _: &str,
+        model: &str,
     ) -> bamboo_llm::provider::Result<LLMStream> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        assert_eq!(cap, Some(40));
+        if model == "auxiliary-model" {
+            assert!(cap.is_some_and(|cap| cap > 0 && cap <= 2048));
+        } else {
+            assert_eq!(cap, Some(40));
+        }
+        let mut complete = usage(Some(20), Some(u64::from(cap.unwrap_or(40).min(10))));
+        if let LLMChunk::ProviderUsage {
+            reasoning_tokens,
+            cache_read_input_tokens,
+            ..
+        } = &mut complete
+        {
+            *reasoning_tokens = None;
+            *cache_read_input_tokens = None;
+        }
         let chunks = match self.script {
+            Script::KnownText => vec![
+                Ok(LLMChunk::Token("Fixture result".into())),
+                Ok(complete.clone()),
+                Ok(LLMChunk::Done),
+                Ok(LLMChunk::Token("FORBIDDEN_LATE_TEXT".into())),
+                Ok(LLMChunk::ReasoningToken("FORBIDDEN_LATE_REASONING".into())),
+                Ok(LLMChunk::ReasoningSignature(
+                    "FORBIDDEN_LATE_SIGNATURE".into(),
+                )),
+                Ok(LLMChunk::ResponseId("FORBIDDEN_LATE_ID".into())),
+                Ok(LLMChunk::ResponsesEvent {
+                    event_type: "late".into(),
+                    data: Box::new(serde_json::json!({"late":true})),
+                }),
+                Ok(LLMChunk::ToolCalls(vec![])),
+                Ok(complete),
+                Ok(LLMChunk::Done),
+            ],
+            Script::DoneError => vec![
+                Ok(complete),
+                Ok(LLMChunk::Done),
+                Err(LLMError::Stream("late failure".into())),
+            ],
+            Script::DoneOverCap => vec![
+                Ok(complete),
+                Ok(LLMChunk::Done),
+                Ok(usage(Some(101), Some(10))),
+            ],
+            Script::NoDone => vec![
+                Ok(LLMChunk::Token("Incomplete response".into())),
+                Ok(complete),
+            ],
+            Script::DonePending | Script::RepeatedDone => {
+                let prefix = futures::stream::iter(vec![
+                    Ok(LLMChunk::Token("Fixture result".into())),
+                    Ok(complete),
+                    Ok(LLMChunk::Done),
+                ]);
+                return if matches!(self.script, Script::DonePending) {
+                    Ok(Box::pin(prefix.chain(futures::stream::pending())))
+                } else {
+                    Ok(Box::pin(prefix.chain(futures::stream::repeat_with(|| {
+                        Ok(LLMChunk::Done)
+                    }))))
+                };
+            }
             Script::BootstrapError => {
                 return Err(LLMError::Api("controlled bootstrap error".into()))
             }
@@ -292,14 +370,20 @@ async fn token_budget_reserves_before_provider_and_settles_only_after_trailing_u
     assert_eq!(ledger(&f).total_charged, 140);
     assert!(matches!(
         stream.next().await.unwrap().unwrap(),
-        LLMChunk::Done
+        LLMChunk::ProviderUsage { .. }
     ));
     assert_eq!(ledger(&f).total_charged, 140);
-    while let Some(chunk) = stream.next().await {
-        chunk.unwrap();
-    }
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap(),
+        LLMChunk::Done
+    ));
+    // Existing auxiliary consumers stop here; their charge is already settled.
     let budget = ledger(&f);
     assert_eq!(budget.total_charged, 30);
+    let final_seq = f.service.published().unwrap().1.seq;
+    assert!(stream.next().await.is_none());
+    assert!(stream.next().await.is_none());
+    assert_eq!(f.service.published().unwrap().1.seq, final_seq);
     let record = budget.reservations.values().next().unwrap();
     assert_eq!(
         record.request.attempt.as_ref().unwrap().assignment_id,

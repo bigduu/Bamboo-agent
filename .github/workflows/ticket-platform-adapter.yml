@@ -79,6 +79,12 @@ jobs:
           --test native_work_project_isolation --test patrol_ready_assembly
           -- --test-threads=1 --nocapture
 
+      - name: Verify canonical metering and existing auxiliary consumers
+        run: |
+          cargo test --locked -p bamboo-engine --lib ticket_runtime::tests::token_budget -- --test-threads=1 --nocapture
+          cargo test --locked -p bamboo-engine --lib llm_summarizer:: -- --test-threads=1
+          cargo test --locked -p bamboo-engine --lib runtime::runner::image_fallback::tests:: -- --test-threads=1
+
       - name: Check affected libraries and test targets under the existing CI lint policy
         shell: bash
         run: |
@@ -95,6 +101,8 @@ jobs:
             --test native_work_project_isolation --test patrol_ready_assembly -- "${policy[@]}"
           cargo clippy --locked --all-features -p bamboo-tickets \
             --test execution_budget -- "${policy[@]}"
+          cargo clippy --locked --all-features -p bamboo-engine \
+            --lib --tests -- "${policy[@]}"
 
       - name: Verify the source stayed exact and clean
         if: always()

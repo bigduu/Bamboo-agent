@@ -16,6 +16,12 @@ use futures::StreamExt;
 
 use crate::runtime::config::{AgentLoopConfig, AuxiliaryModelConfig};
 
+// Bound accounting trailers even when a normalized provider stream stays open
+// after its semantic terminal. An incomplete trailer never permits a refund.
+const POST_DONE_USAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const INCOMPLETE_POST_DONE_USAGE: &str =
+    "provider stream did not finish after Done; full reservation retained";
+
 fn denied(error: impl std::fmt::Display) -> LLMError {
     // The existing runner must retain the accounting boundary, rather than
     // retrying it as a transient transport/bootstrap failure.
@@ -244,40 +250,99 @@ impl BudgetedProvider {
             return stream;
         };
         Box::pin(futures::stream::unfold(
-            (stream, Some(admission), Usage::default()),
-            |(mut stream, mut admission, mut usage)| async move {
-                let receipt = admission.as_ref()?;
-                match receipt.transport.scope(stream.next()).await {
-                    Some(Ok(chunk)) => {
-                        usage.observe(&chunk);
-                        if let Some(report) = usage.over_cap_report(&receipt.record.request) {
-                            let error = receipt.over_cap(report).err().unwrap_or_else(|| {
-                                denied("provider exceeded its reserved ceilings")
-                            });
+            (
+                stream,
+                Some(admission),
+                Usage::default(),
+                None::<tokio::time::Instant>,
+            ),
+            |(mut stream, mut admission, mut usage, mut deadline)| async move {
+                loop {
+                    let receipt = admission.as_ref()?;
+                    let next = if let Some(end) = deadline {
+                        if tokio::time::Instant::now() >= end {
                             admission = None;
-                            return Some((Err(error), (stream, admission, usage)));
+                            return Some((
+                                Err(denied(INCOMPLETE_POST_DONE_USAGE)),
+                                (stream, admission, usage, deadline),
+                            ));
                         }
-                        Some((Ok(chunk), (stream, admission, usage)))
-                    }
-                    Some(Err(error)) => {
-                        // Transport/protocol failure retains the complete cap.
-                        admission = None;
-                        Some((Err(error), (stream, admission, usage)))
-                    }
-                    None => {
-                        // Done can precede trailing usage. Only EOF completes a
-                        // successful meter; dropping/cancelling retains None/full.
-                        let measured = if usage.done {
-                            usage.measured().unwrap_or(ExecutionTokenUsage::Unknown)
-                        } else {
-                            ExecutionTokenUsage::Unknown
-                        };
-                        match receipt.settle(measured) {
-                            Ok(()) => None,
-                            Err(error) => {
+                        match tokio::time::timeout_at(end, receipt.transport.scope(stream.next()))
+                            .await
+                        {
+                            Ok(next) => next,
+                            Err(_) => {
                                 admission = None;
-                                Some((Err(error), (stream, admission, usage)))
+                                return Some((
+                                    Err(denied(INCOMPLETE_POST_DONE_USAGE)),
+                                    (stream, admission, usage, deadline),
+                                ));
                             }
+                        }
+                    } else {
+                        receipt.transport.scope(stream.next()).await
+                    };
+                    match next {
+                        Some(Ok(chunk)) => {
+                            let after_done = usage.done;
+                            usage.observe(&chunk);
+                            if let Some(report) = usage.over_cap_report(&receipt.record.request) {
+                                let error = receipt.over_cap(report).err().unwrap_or_else(|| {
+                                    denied("provider exceeded its reserved ceilings")
+                                });
+                                admission = None;
+                                return Some((Err(error), (stream, admission, usage, deadline)));
+                            }
+                            if matches!(&chunk, LLMChunk::Done) {
+                                deadline.get_or_insert_with(|| {
+                                    tokio::time::Instant::now() + POST_DONE_USAGE_TIMEOUT
+                                });
+                                // Always-ready duplicate terminals must not starve
+                                // the caller's cancellation or this fixed deadline.
+                                tokio::task::yield_now().await;
+                                continue;
+                            }
+                            if after_done {
+                                tokio::task::yield_now().await;
+                                // Only accounting/transport may follow the original
+                                // terminal; never leak late text, tools or transcript.
+                                if !matches!(
+                                    &chunk,
+                                    LLMChunk::ProviderUsage { .. }
+                                        | LLMChunk::CacheUsage { .. }
+                                        | LLMChunk::UsageSummary { .. }
+                                        | LLMChunk::TransportActivity
+                                ) {
+                                    continue;
+                                }
+                            }
+                            return Some((Ok(chunk), (stream, admission, usage, deadline)));
+                        }
+                        Some(Err(error)) => {
+                            // Transport/protocol failure retains the complete cap.
+                            admission = None;
+                            return Some((Err(error), (stream, admission, usage, deadline)));
+                        }
+                        None => {
+                            // Only the normalized stream's EOF completes accounting.
+                            // Release a single terminal after settlement, so existing
+                            // summary/Vision consumers can safely stop at Done.
+                            let measured = if usage.done {
+                                usage.measured().unwrap_or(ExecutionTokenUsage::Unknown)
+                            } else {
+                                ExecutionTokenUsage::Unknown
+                            };
+                            let settled = receipt.settle(measured);
+                            admission = None;
+                            return match settled {
+                                Ok(()) if usage.done => {
+                                    Some((Ok(LLMChunk::Done), (stream, admission, usage, deadline)))
+                                }
+                                Ok(()) => None,
+                                Err(error) => {
+                                    Some((Err(error), (stream, admission, usage, deadline)))
+                                }
+                            };
                         }
                     }
                 }
