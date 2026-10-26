@@ -355,6 +355,9 @@ pub struct ImportSource {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub schema: u32,
+    /// Optional host-configured accounting; schema 8 fences older writers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_budget: Option<crate::WorkTokenBudget>,
     /// Explicit project membership and immutable adopted context; absent in legacy scopes.
     #[serde(default, skip_serializing_if = "crate::ProjectTicketState::is_empty")]
     pub project: crate::ProjectTicketState,
@@ -382,6 +385,7 @@ impl Snapshot {
     pub fn empty(binding: ScopeBinding) -> Self {
         Self {
             schema: 1,
+            execution_budget: None,
             project: Default::default(),
             sprint: Default::default(),
             binding,
