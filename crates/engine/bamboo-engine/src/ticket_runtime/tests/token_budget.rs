@@ -17,6 +17,13 @@ enum Script {
     OverCap,
     PartialOverCap,
     InconsistentOverCap,
+    LegacyCachedInputOverCap,
+    LegacyCompositeInputOverCap,
+    LegacyOutputOverCap,
+    LegacyThinkingOverCap,
+    LegacyOverflowOverCap,
+    LegacyWithinCap,
+    MixedKnown,
 }
 struct Provider {
     script: Script,
@@ -71,6 +78,54 @@ impl LLMProvider for Provider {
             Script::Partial => vec![Ok(LLMChunk::Done), Ok(usage(None, Some(10)))],
             Script::OverCap => vec![Ok(usage(Some(101), Some(10)))],
             Script::PartialOverCap => vec![Ok(usage(Some(101), None))],
+            Script::LegacyCachedInputOverCap => vec![Ok(LLMChunk::CacheUsage {
+                input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 101,
+            })],
+            Script::LegacyCompositeInputOverCap => vec![Ok(LLMChunk::CacheUsage {
+                input_tokens: 40,
+                cache_creation_input_tokens: 40,
+                cache_read_input_tokens: 40,
+            })],
+            Script::LegacyOverflowOverCap => vec![Ok(LLMChunk::CacheUsage {
+                input_tokens: u64::MAX,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 1,
+            })],
+            Script::LegacyOutputOverCap => vec![Ok(LLMChunk::UsageSummary {
+                output_tokens: 41,
+                thinking_tokens: 0,
+            })],
+            Script::LegacyThinkingOverCap => vec![Ok(LLMChunk::UsageSummary {
+                output_tokens: 0,
+                thinking_tokens: 41,
+            })],
+            Script::LegacyWithinCap => vec![
+                Ok(LLMChunk::CacheUsage {
+                    input_tokens: 60,
+                    cache_creation_input_tokens: 10,
+                    cache_read_input_tokens: 30,
+                }),
+                Ok(LLMChunk::UsageSummary {
+                    output_tokens: 40,
+                    thinking_tokens: 5,
+                }),
+                Ok(LLMChunk::Done),
+            ],
+            Script::MixedKnown => vec![
+                Ok(LLMChunk::CacheUsage {
+                    input_tokens: 5,
+                    cache_creation_input_tokens: 10,
+                    cache_read_input_tokens: 5,
+                }),
+                Ok(LLMChunk::UsageSummary {
+                    output_tokens: 10,
+                    thinking_tokens: 5,
+                }),
+                Ok(usage(Some(20), Some(10))),
+                Ok(LLMChunk::Done),
+            ],
             Script::InconsistentOverCap => {
                 let mut chunk = usage(Some(101), Some(10));
                 if let LLMChunk::ProviderUsage { total_tokens, .. } = &mut chunk {
@@ -238,6 +293,11 @@ async fn token_budget_over_cap_report_halts_subsequent_provider_entry() {
         Script::OverCap,
         Script::PartialOverCap,
         Script::InconsistentOverCap,
+        Script::LegacyCachedInputOverCap,
+        Script::LegacyCompositeInputOverCap,
+        Script::LegacyOutputOverCap,
+        Script::LegacyThinkingOverCap,
+        Script::LegacyOverflowOverCap,
     ] {
         let (f, _registration) = admitted().await;
         configure(&f, 500);
@@ -262,6 +322,33 @@ async fn token_budget_over_cap_report_halts_subsequent_provider_entry() {
             .await
             .is_err());
         assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn token_budget_legacy_usage_keeps_caps_and_mixed_usage_never_double_counts() {
+    for (script, charged, known) in [
+        (Script::LegacyWithinCap, 140, false),
+        (Script::MixedKnown, 30, true),
+    ] {
+        let (f, _registration) = admitted().await;
+        configure(&f, 500);
+        let decorated = provider(&f, Provider::new(script)).await;
+        let mut stream = decorated
+            .chat_stream(&[], &[], None, "fixture-model")
+            .await
+            .unwrap();
+        while let Some(chunk) = stream.next().await {
+            chunk.unwrap();
+        }
+        let budget = ledger(&f);
+        assert_eq!(budget.total_charged, charged);
+        let receipt = budget.reservations.values().next().unwrap();
+        assert!(receipt.over_cap_usage.is_none());
+        assert_eq!(
+            matches!(receipt.usage, Some(ExecutionTokenUsage::Known { .. })),
+            known
+        );
     }
 }
 

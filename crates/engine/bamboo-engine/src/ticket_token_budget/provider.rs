@@ -250,22 +250,10 @@ impl BudgetedProvider {
                 match receipt.transport.scope(stream.next()).await {
                     Some(Ok(chunk)) => {
                         usage.observe(&chunk);
-                        if usage
-                            .input
-                            .is_some_and(|v| v > u64::from(receipt.record.request.input_cap))
-                            || usage
-                                .output
-                                .is_some_and(|v| v > u64::from(receipt.record.request.output_cap))
-                        {
-                            let error = receipt
-                                .over_cap(ExecutionTokenOverCapUsage {
-                                    input_tokens: usage.input,
-                                    output_tokens: usage.output,
-                                })
-                                .err()
-                                .unwrap_or_else(|| {
-                                    denied("provider exceeded its reserved ceilings")
-                                });
+                        if let Some(report) = usage.over_cap_report(&receipt.record.request) {
+                            let error = receipt.over_cap(report).err().unwrap_or_else(|| {
+                                denied("provider exceeded its reserved ceilings")
+                            });
                             admission = None;
                             return Some((Err(error), (stream, admission, usage)));
                         }
@@ -302,6 +290,10 @@ impl BudgetedProvider {
 struct Usage {
     input: Option<u64>,
     output: Option<u64>,
+    // Legacy events lose optional-field presence. Positive counts are still
+    // authoritative lower bounds, independently useful for stopping overruns.
+    legacy_input_floor: Option<u64>,
+    legacy_output_floor: Option<u64>,
     done: bool,
     inconsistent: bool,
 }
@@ -328,13 +320,51 @@ impl Usage {
                 }
                 // Reasoning/cache are subsets of these canonical totals.
             }
-            // Legacy Anthropic chunks lose optional-field presence in the
-            // parser. Until it preserves it, they keep the full reservation.
+            LLMChunk::CacheUsage {
+                input_tokens,
+                cache_creation_input_tokens,
+                cache_read_input_tokens,
+            } => {
+                // These normalized fields are disjoint fresh/read/creation
+                // counts. Saturation still proves a finite cap was exceeded.
+                let floor = input_tokens
+                    .saturating_add(*cache_creation_input_tokens)
+                    .saturating_add(*cache_read_input_tokens);
+                self.legacy_input_floor = Some(self.legacy_input_floor.unwrap_or(0).max(floor));
+            }
+            LLMChunk::UsageSummary {
+                output_tokens,
+                thinking_tokens,
+            } => {
+                // Thinking may be a subset of output, so never add it. Either
+                // positive dimension alone supplies an output lower bound.
+                let floor = (*output_tokens).max(*thinking_tokens);
+                self.legacy_output_floor = Some(self.legacy_output_floor.unwrap_or(0).max(floor));
+            }
             _ => {}
         }
     }
+    fn over_cap_report(&self, request: &WorkTokenRequest) -> Option<ExecutionTokenOverCapUsage> {
+        // Canonical totals already include cache/reasoning: use max, not sum,
+        // when the provider emits both canonical and legacy representations.
+        let input_tokens = self.input.max(self.legacy_input_floor);
+        let output_tokens = self.output.max(self.legacy_output_floor);
+        (input_tokens.is_some_and(|v| v > u64::from(request.input_cap))
+            || output_tokens.is_some_and(|v| v > u64::from(request.output_cap)))
+        .then_some(ExecutionTokenOverCapUsage {
+            input_tokens,
+            output_tokens,
+        })
+    }
     fn measured(&self) -> Option<ExecutionTokenUsage> {
-        if self.inconsistent {
+        if self.inconsistent
+            || self
+                .legacy_input_floor
+                .is_some_and(|floor| self.input.is_some_and(|actual| floor > actual))
+            || self
+                .legacy_output_floor
+                .is_some_and(|floor| self.output.is_some_and(|actual| floor > actual))
+        {
             return None;
         }
         Some(ExecutionTokenUsage::Known {
