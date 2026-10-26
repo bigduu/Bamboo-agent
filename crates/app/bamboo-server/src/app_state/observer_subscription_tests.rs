@@ -5,8 +5,8 @@ use super::*;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
 use bamboo_domain::{
-    Message, ObserverStageOutcome, ObserverViewChange, PermissionMode, ProviderModelRef, Session,
-    SessionInboxPort,
+    Message, ObserverStageOutcome, ObserverViewChange, ProviderModelRef, Session, SessionInboxPort,
+    SessionPermissionMode,
 };
 use bamboo_engine::session_app::child_session::{
     create_child_action, ChildSessionPort, CreateChildInput,
@@ -177,7 +177,7 @@ impl Fixture {
             .agent_runtime_state
             .as_mut()
             .unwrap()
-            .set_permission_mode(PermissionMode::BypassPermissions);
+            .set_permission_mode(SessionPermissionMode::Bypass);
         state.storage.save_session(&parent).await.unwrap();
         let mut projects = BTreeSet::new();
         for id in [ROOT_A, ROOT_B] {
