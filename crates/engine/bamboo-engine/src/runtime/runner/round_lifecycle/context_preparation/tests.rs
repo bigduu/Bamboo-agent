@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 #[cfg(unix)]
 mod exec_sessions;
 mod message_summary;
+mod summary_model;
 
 fn required_packet_session() -> Session {
     let mut parent = Session::new("packet-parent", "test-model");

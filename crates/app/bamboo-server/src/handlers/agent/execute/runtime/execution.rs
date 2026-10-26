@@ -121,6 +121,7 @@ pub(crate) fn make_auxiliary_model_resolver(
             summarization_model_name: areas.summarization.as_ref().map(|m| m.model_name.clone()),
             background_model_provider: areas.background.map(|m| m.provider),
             summarization_model_provider: areas.summarization.map(|m| m.provider),
+            summarization_model_error: areas.summarization_error,
         }
     })
 }
