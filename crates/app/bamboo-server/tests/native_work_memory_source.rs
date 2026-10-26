@@ -89,7 +89,8 @@ async fn adopted_native_source_needs_current_project_and_never_mutates_tickets()
             },
         )
         .unwrap();
-    let doc = memory
+    let project_memory = memory.for_project(&project.id);
+    let doc = project_memory
         .write_memory(
             MemoryScope::Project,
             Some(project.id.as_str()),
@@ -204,7 +205,7 @@ async fn adopted_native_source_needs_current_project_and_never_mutates_tickets()
         canonical_bytes(&service.published().unwrap()).unwrap(),
         before
     );
-    memory
+    project_memory
         .merge_memory_with_retrieval(
             pin.memory_id(),
             Some(project.id.as_str()),

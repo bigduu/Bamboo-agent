@@ -1,7 +1,7 @@
 //! Actual native Jiandu files and facade reads; no copied hash or memory index.
 use bamboo_memory::memory_store::{MemoryStore, ProjectMemoryRead, ProjectMemoryRef};
 use jiandu_memory::memory_store::{
-    DurableMemoryStatus, DurableMemoryType, MemoryRetrievalInput, MemoryScope,
+    DurableMemoryStatus, DurableMemoryType, MemoryRetrievalInput, MemoryScope, MAX_MAX_CHARS,
 };
 
 #[tokio::test]
@@ -107,16 +107,53 @@ async fn cold_project_source_discovery_never_creates_the_native_root() {
     let missing = root.path().join("absent-jiandu");
     let facade = MemoryStore::new(&missing);
     let project: bamboo_domain::ProjectId = "cold-source-project".parse().unwrap();
-    assert!(facade
+    let error = facade
         .query_project_sources_read_only(&project, "source")
         .await
-        .unwrap()
-        .items
-        .is_empty());
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     assert!(!missing.exists());
     assert!(facade
         .query_project_sources_read_only(&project, " ")
         .await
         .is_err());
     assert!(!missing.exists());
+}
+
+#[tokio::test]
+async fn oversized_native_project_source_is_explicitly_non_content() {
+    let root = tempfile::tempdir().unwrap();
+    let project: bamboo_domain::ProjectId = "large-source-project".parse().unwrap();
+    let native_project = project
+        .as_str()
+        .parse::<jiandu_memory::ProjectId>()
+        .unwrap();
+    let native =
+        jiandu_memory::memory_store::MemoryStore::new(root.path()).for_project(&native_project);
+    let document = native
+        .write_memory(
+            MemoryScope::Project,
+            Some(project.as_str()),
+            DurableMemoryType::Reference,
+            "Oversized adopted source",
+            &"界".repeat(MAX_MAX_CHARS + 1),
+            &[],
+            None,
+            "fixture",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    let pin = ProjectMemoryRef::from_document(&document).unwrap();
+    assert_eq!(
+        MemoryStore::new(root.path())
+            .read_project_source_read_only(&project, pin.memory_id(), pin.content_version())
+            .await
+            .unwrap(),
+        ProjectMemoryRead::OverBudget {
+            required_chars: MAX_MAX_CHARS + 1,
+            max_chars: MAX_MAX_CHARS,
+        }
+    );
 }

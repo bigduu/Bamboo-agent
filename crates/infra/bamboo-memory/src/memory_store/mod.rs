@@ -141,6 +141,7 @@ impl MemoryStore {
             .parse::<jiandu_memory::ProjectId>()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         self.store
+            .for_project(&project)
             .query_project_sources_read_only(&project, query)
             .await
     }
@@ -157,7 +158,10 @@ impl MemoryStore {
             .parse::<jiandu_memory::ProjectId>()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
         let reference = ProjectMemoryRef::new(project, memory_id, content_version)?;
-        self.store.get_project_source_read_only(&reference).await
+        self.store
+            .for_project(reference.project_id())
+            .get_project_source_read_only(&reference)
+            .await
     }
 
     /// The active Jiandu canonical root, including an explicitly selected root.
