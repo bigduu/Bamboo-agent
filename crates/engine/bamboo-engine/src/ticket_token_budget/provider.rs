@@ -223,7 +223,7 @@ impl BudgetedProvider {
                     return Ok(Some(Admission {
                         budget: self.budget.clone(),
                         authority,
-                        record,
+                        record: *record,
                         transport: Default::default(),
                     }))
                 }

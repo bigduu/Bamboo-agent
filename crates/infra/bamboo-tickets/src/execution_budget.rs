@@ -119,7 +119,7 @@ pub enum WorkTokenBlock {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkTokenAdmission {
-    Reserved(WorkTokenReservation),
+    Reserved(Box<WorkTokenReservation>),
     Blocked(WorkTokenBlock),
 }
 
@@ -512,7 +512,7 @@ impl TicketService {
             .ok_or_else(|| Error::ResourceBlocked("Work token limits are not configured".into()))?;
         if let Some(record) = budget.reservations.get(&request.operation_id) {
             return if record.request == *request {
-                Ok(WorkTokenAdmission::Reserved(record.clone()))
+                Ok(WorkTokenAdmission::Reserved(Box::new(record.clone())))
             } else {
                 Err(Error::IdempotencyConflict)
             };
@@ -596,7 +596,7 @@ impl TicketService {
         next.seq = next.seq.checked_add(1).ok_or(Error::RevisionConflict)?;
         crate::service::validate_snapshot(&next)?;
         store.publish_accounting(next)?;
-        Ok(WorkTokenAdmission::Reserved(record))
+        Ok(WorkTokenAdmission::Reserved(Box::new(record)))
     }
 
     /// Reconcile only the original receipt. Unknown usage retains all caps;

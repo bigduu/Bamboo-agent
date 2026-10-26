@@ -85,7 +85,7 @@ fn input_request(service: &TicketService, work: &str, id: &str) -> WorkTokenRequ
 }
 fn reserved(admission: WorkTokenAdmission) -> WorkTokenReservation {
     match admission {
-        WorkTokenAdmission::Reserved(record) => record,
+        WorkTokenAdmission::Reserved(record) => *record,
         other => panic!("expected reservation: {other:?}"),
     }
 }
