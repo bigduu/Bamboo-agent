@@ -630,6 +630,10 @@ async fn failed_observer_reports_without_wait_and_restart_never_replays_it() {
     .await;
     let failed_source = source(&child).unwrap();
     assert_eq!(failed_source.status, "error");
+    let failed_error = child
+        .last_run_error()
+        .expect("canonical failed source error");
+    assert!(failed_error.contains(FAILURE));
     let parent = wait_saved(&f.state, &f.reference.session_id, |parent| {
         parent.last_run_status().as_deref() == Some("completed")
             && parent
@@ -683,7 +687,7 @@ async fn failed_observer_reports_without_wait_and_restart_never_replays_it() {
             parent_session_id: reference.session_id.clone(),
             child_session_id: OBSERVER.into(),
             status: failed_source.status.clone(),
-            error: Some(FAILURE.into()),
+            error: Some(failed_error),
             completed_at: chrono::Utc::now(),
             source: Some(failed_source),
         })
