@@ -489,7 +489,7 @@ fn verify_view(
         serde_json::to_vec(&caller).map_err(|error| invalid(error.to_string()))?,
     ));
     let expected = json!({"caller_session_id":child.id,"root_session_id":reference.session_id,"target_session_id":target.id,
-        "project_id":target.project_id_meta(),"authority":{"caller_sha256":caller_sha256,
+        "project_id":link.target_project_id.to_string(),"authority":{"caller_sha256":caller_sha256,
         "route":{"route":"observer","registration":SupervisorObserverContext{
             supervisor:reference.clone(),parent_created_at:registration.parent_created_at,child_created_at:registration.child_created_at,
             operation_id:registration.operation_id,registration_revision:registration.revision,target_link:link.clone()}},

@@ -26,6 +26,11 @@ pub struct ObserverSubscriptionStart {
     pub min_interval_ms: u32,
 }
 
+#[derive(serde::Deserialize)]
+struct PublishedViewSelector {
+    revision: String,
+}
+
 pub(super) struct ObserverSubscriptionCoordinator {
     store: Arc<SessionStoreV2>,
     inbox: Arc<FileSessionInbox>,
@@ -178,16 +183,12 @@ impl ObserverSubscriptionCoordinator {
                 else {
                     continue;
                 };
-                let receipt: serde_json::Value = serde_json::from_str(&view.result)
+                // Deserialize only the selector. Absolute paths and the raw
+                // ToolResult are never forwarded to Inbox/provider messages.
+                let receipt: PublishedViewSelector = serde_json::from_str(&view.result)
                     .map_err(|error| (Failure::PublicationUnavailable, error.to_string()))?;
-                let revision = receipt["revision"].as_str().ok_or_else(|| {
-                    (
-                        Failure::PublicationUnavailable,
-                        "view selector missing".into(),
-                    )
-                })?;
                 self.store
-                    .stage_supervisor_observation(reference, id, target, revision, now)
+                    .stage_supervisor_observation(reference, id, target, &receipt.revision, now)
                     .await
                     .map_err(|error| (Failure::PublicationUnavailable, error.to_string()))?;
                 break;

@@ -1,5 +1,6 @@
 //! Real V2, immutable publication, Maildir and native Host activation. The
 //! ordinary Work wait below is deliberately not a stand-in for Planner #1059.
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 use super::*;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
@@ -283,20 +284,28 @@ impl Fixture {
             .subscriptions[OBSERVER]
             .clone()
     }
-    async fn publish(&self, target: &str) -> Value {
+    async fn filtered(
+        &self,
+        target: &str,
+        filter: &BTreeSet<ObserverChangeKind>,
+        previous: Option<&str>,
+    ) -> Option<Value> {
         let child = load(&self.state, OBSERVER).await;
         let mut ctx = ToolCtx::none("subscription-test");
         ctx.session_id = Some(Arc::from(child.id.as_str()));
         ctx.executing_caller = Some(Arc::new(SessionCallerReference::from(&child)));
-        let view = self
-            .state
+        self.state
             .observer_subscriptions
             .inspector
-            .observe_context(&ctx, target, &self.subscription().await.filter, None)
+            .observe_context(&ctx, target, filter, previous)
             .await
             .unwrap()
-            .unwrap();
-        serde_json::from_str(&view.result).unwrap()
+            .map(|view| serde_json::from_str(&view.result).unwrap())
+    }
+    async fn publish(&self, target: &str) -> Value {
+        self.filtered(target, &self.subscription().await.filter, None)
+            .await
+            .unwrap()
     }
     async fn stage(&self, target: &str, view: &Value, now: DateTime<Utc>) -> ObserverStageOutcome {
         self.state
@@ -805,6 +814,24 @@ async fn subscription_status_filter_ignores_question_and_task_noise_but_tracks_r
     f.register(BTreeSet::from([ObserverChangeKind::Status]))
         .await;
     let initial = f.publish(ROOT_A).await;
+    let mut invalid = load(&f.state, &f.reference.session_id)
+        .await
+        .supervisor_management
+        .unwrap();
+    invalid
+        .subscriptions
+        .get_mut(OBSERVER)
+        .unwrap()
+        .window
+        .enqueued_fingerprints
+        .insert("unassigned-root".into(), "a".repeat(64));
+    assert!(invalid.validate(f.reference.incarnation_id).is_err());
+    let mut old_writer = load(&f.state, &f.reference.session_id)
+        .await
+        .supervisor_management
+        .unwrap();
+    old_writer.schema_version = 2;
+    assert!(old_writer.validate(f.reference.incarnation_id).is_err());
     let mut source = load(&f.state, ROOT_A).await;
     source.pending_question = Some(bamboo_domain::PendingQuestion {
         tool_call_id: "question-1".into(),
@@ -814,6 +841,18 @@ async fn subscription_status_filter_ignores_question_and_task_noise_but_tracks_r
         allow_custom: true,
         source: Default::default(),
     });
+    source.task_list = Some(bamboo_domain::session::task::TaskList {
+        session_id: source.id.clone(),
+        title: "source tasks".into(),
+        items: vec![bamboo_domain::session::task::TaskItem {
+            id: "task-1".into(),
+            description: "allowed task description".into(),
+            notes: "PRIVATE-TASK-NOTES".into(),
+            ..Default::default()
+        }],
+        created_at: source.created_at,
+        updated_at: source.updated_at,
+    });
     source.updated_at += chrono::Duration::seconds(1);
     source
         .agent_runtime_state
@@ -821,39 +860,51 @@ async fn subscription_status_filter_ignores_question_and_task_noise_but_tracks_r
         .round
         .total_prompt_tokens += 9;
     f.state.storage.save_session(&source).await.unwrap();
-    let child = load(&f.state, OBSERVER).await;
-    let mut ctx = ToolCtx::none("filter-test");
-    ctx.session_id = Some(Arc::from(child.id.as_str()));
-    ctx.executing_caller = Some(Arc::new(SessionCallerReference::from(&child)));
     let filter = BTreeSet::from([ObserverChangeKind::Status]);
     assert!(f
-        .state
-        .observer_subscriptions
-        .inspector
-        .observe_context(
-            &ctx,
-            ROOT_A,
-            &filter,
-            initial["source_fingerprint"].as_str()
-        )
+        .filtered(ROOT_A, &filter, initial["source_fingerprint"].as_str())
         .await
-        .unwrap()
         .is_none());
+    let needs = BTreeSet::from([ObserverChangeKind::NeedsInput]);
+    let question = f.filtered(ROOT_A, &needs, None).await.unwrap();
+    source.pending_question.as_mut().unwrap().tool_call_id = "question-2".into();
+    f.state.storage.save_session(&source).await.unwrap();
+    assert!(
+        f.filtered(ROOT_A, &needs, question["source_fingerprint"].as_str())
+            .await
+            .is_some(),
+        "question ID change while still pending must be meaningful"
+    );
+    let tasks = BTreeSet::from([ObserverChangeKind::Tasks]);
+    let task = f.filtered(ROOT_A, &tasks, None).await.unwrap();
+    source.task_list.as_mut().unwrap().items[0].notes = "NEW-PRIVATE-NOTES".into();
+    f.state.storage.save_session(&source).await.unwrap();
+    assert!(f
+        .filtered(ROOT_A, &tasks, task["source_fingerprint"].as_str())
+        .await
+        .is_none());
+    source.task_list.as_mut().unwrap().items[0].description =
+        "changed allowed task description".into();
+    f.state.storage.save_session(&source).await.unwrap();
+    assert!(f
+        .filtered(ROOT_A, &tasks, task["source_fingerprint"].as_str())
+        .await
+        .is_some());
     source.agent_runtime_state.as_mut().unwrap().execution_id = Some("new-run-same-status".into());
     f.state.storage.save_session(&source).await.unwrap();
     assert!(f
-        .state
-        .observer_subscriptions
-        .inspector
-        .observe_context(
-            &ctx,
-            ROOT_A,
-            &filter,
-            initial["source_fingerprint"].as_str()
-        )
+        .filtered(ROOT_A, &filter, initial["source_fingerprint"].as_str())
         .await
-        .unwrap()
         .is_some());
+    let disabled = ObserverSubscriptionCoordinator::new(
+        f.state.session_store.clone(),
+        f.state.observer_subscriptions.inbox.clone(),
+        f.state.session_activation_router.clone(),
+        f.state.storage.clone(),
+        false,
+    );
+    disabled.tick(Utc::now()).await;
+    assert_eq!(f.subscription().await.window.enqueued_sequence, 0);
     assert_eq!(f.probe.calls.load(Ordering::SeqCst), 0);
     f.state.shutdown().await;
 }

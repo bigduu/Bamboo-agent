@@ -415,7 +415,7 @@ pub(crate) fn publish_observer_change_snapshot(
     }
     // Count the retained directory, never a path that could be swapped after
     // checking it. Abandoned publications consume quota and fail visibly.
-    let duplicate = unsafe { libc::dup(parent.as_raw_fd()) };
+    let duplicate = unsafe { libc::fcntl(parent.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -433,6 +433,9 @@ pub(crate) fn publish_observer_change_snapshot(
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
         if name != b"." && name != b".." && name != b".publish.lock" {
             count += 1;
+            if count >= MAX_CONTEXT_SNAPSHOTS_PER_ROOT {
+                break;
+            }
         }
     }
     unsafe { libc::closedir(entries) };

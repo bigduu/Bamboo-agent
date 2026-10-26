@@ -166,6 +166,28 @@ impl SupervisorManagementState {
                 .get(id)
                 .ok_or("subscription has no Observer registration")?;
             subscription.validate()?;
+            if subscription
+                .window
+                .enqueued_fingerprints
+                .keys()
+                .chain(
+                    subscription
+                        .window
+                        .history
+                        .iter()
+                        .map(|change| &change.target_session_id),
+                )
+                .chain(
+                    subscription
+                        .window
+                        .pending
+                        .iter()
+                        .map(|change| &change.target_session_id),
+                )
+                .any(|target| !registration.target_links.contains_key(target))
+            {
+                return Err("subscription contains an unassigned Observer target");
+            }
             if subscription.window.scope_epoch > registration.revision
                 || (registration.enabled
                     && subscription.window.scope_epoch != registration.revision)
@@ -304,6 +326,13 @@ mod tests {
             subscriptions: BTreeMap::new(),
         };
         state.validate(incarnation_id).unwrap();
+        assert_eq!(
+            serde_json::to_string(&state).unwrap(),
+            format!(
+                r#"{{"schema_version":1,"incarnation_id":"{incarnation_id}","revision":1,"allowed_projects":["project-a"],"links":{{}}}}"#
+            ),
+            "legacy empty fields retain the exact original encoding"
+        );
         root.supervisor_management = Some(state);
         let encoded = serde_json::to_value(&root).unwrap();
         let decoded: Session = serde_json::from_value(encoded).unwrap();
