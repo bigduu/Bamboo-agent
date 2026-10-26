@@ -96,8 +96,8 @@ cargo test -- --nocapture
 cargo test test_bamboo_config_default
 ```
 
-Full GitHub CI runs [one Test and E2E job per crate](docs/testing/ci-test-blocks.md).
-Use GitHub's failed-job rerun to retry a crate independently.
+Feature GitHub CI runs [one shared Unit/E2E executor](docs/testing/ci-test-blocks.md).
+Native-platform and retained historical release jobs can be rerun independently.
 
 For opt-in local groups, compile once per explicit input profile and retain
 independent group evidence with the [grouped test controller](docs/testing/test-groups.md).
@@ -181,8 +181,8 @@ bamboo/
 - Add or update regression coverage for changed behavior, including relevant
   normal and failure cases; record source SHA/tree, commands, selection and results
 - Missing or failing relevant local tests block merge; compilation is not test evidence
-- Dev CI requires successful compilation and normal review; complete build/test
-  acceptance is mandatory through the frozen candidate's main promotion checks
+- Dev CI requires disjoint Unit/E2E runtime success and normal review; fix
+  failures in the feature branch before merging into dev
 - Use descriptive test names
 - Include edge cases in tests
 - Use `#[tokio::test]` for async tests
@@ -211,36 +211,33 @@ for the source-selected platform assets, source/version provenance, browser host
 and consumer hash verification contract. These assets retain all release gates
 described below.
 
-Follow [Parallel Development](./gitflow.md) for branch ownership, bounded batches
-and evidence. Batch integration and standalone PRs target `dev`. Its required
-`Test` gate runs `cargo build --locked` in compile-only mode; `Quick Checks`
-remains auxiliary.
-Before merge, owners must run affected tests locally and add or update coverage
-for changed behavior, recording exact source, commands and results. Dev CI does
-not execute the full test suite for every PR. Complete validation runs on a
-fixed batch for release; its failures remain visible and owned. Existing review
-and security requirements still apply.
+Follow [Parallel Development](./gitflow.md) for ownership and evidence. Every
+feature PR into `dev` runs required `Test`, aggregating Unit, E2E and the live SSH
+fixture. One physical Linux executor uses one all-features package set and target
+directory. Cargo runs library/binary, integration and documentation tests once;
+the ignored SSH case reuses its compiled executable. Applicable native
+acceptance also runs before dev admission. Before merge, owners must run affected tests locally and add or update coverage
+for changed behavior, recording exact source, commands and results. Failures are
+repaired in the feature branch before it enters dev; `Quick Checks` is auxiliary.
 
-Keep the existing required `Test` check name. Its dev mode must actually compile
-and propagate source-verification or Cargo failures; it must not be skipped.
-A green dev `Test` means compilation passed, not that the full suite ran. The
-same check retains full validation for release PRs and explicit snapshots.
-Main-push admission verifies the completed release evidence and actual merge;
-it does not repeat the full Rust suite. The [CI and publication flow](docs/releases/ci-publication-flow.md)
-defines the separate phase contracts, activation and recovery.
-Main's required checks are unchanged.
+The target train is `feature → dev → release/<40-character-cut-SHA> → main`. Freeze the
+exact accepted dev commit, reserve one version with the existing allocator, then
+build/package/publish the three native binaries once on that release source.
+Release branches do not rerun Unit/E2E or carry product repairs. Main promotes
+published stable code and records its immutable tag, manifest/provenance hashes
+and publisher run in the promotion description; it does not rebuild or retest.
+Keep source manifests at `0.0.0`; stamp disposable formal-build checkouts only.
+Repairs return through feature/dev tests and a fresh cut.
 
-A normal fast-forward direct push may be used once dev's actual branch rule
-permits it, with the same compilation, local test/coverage and applicable review
-requirements. The current compile job is PR-triggered; obtain valid candidate
-checks through that existing path before direct admission, or keep the normal
-PR route when exact-source equivalence is unproven. Do not force push or treat
-removal of the PR requirement as permission to bypass required checks. See
-[direct-push evidence](./gitflow.md#normal-direct-pushes-to-dev).
+**Cutover dependency:** #2311 installs feature admission only. The paragraphs
+below describe the temporary legacy release/main publication route, retained
+until the separate release-source admission change is accepted. Its checks,
+source proof and historical recovery must not be bypassed. Before the first new
+cut, integrate current main ancestry into dev through a normally tested feature
+PR. See [CI and publication flow](docs/releases/ci-publication-flow.md) for the
+implemented and pending phase boundaries. No new production dispatch is implied.
 
-Each release follows
-`dev → release/<40-character-cut-SHA> → main` in this repository. Never promote
-the moving `dev` branch directly to `main`.
+### Temporary legacy release gates
 
 ### Validate a fixed snapshot
 
@@ -531,24 +528,15 @@ must finish before independent main publication is activated.
 Bamboo uses GitHub Actions for continuous integration and publishing:
 
 - **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run the required
-  `Test` check in compile-only mode (`cargo build --locked`) and auxiliary
-  `Quick Checks` (Node policy tests and Rust formatting). A compile pass does not
-  replace the owner's
-  pre-merge local affected-test and regression-coverage evidence. The same `Test`
-  check runs the complete test job for fixed-snapshot manual validation
-  and frozen release PRs into `main`; dev mode does not execute
-  the full suite. Release PRs and manual full-validation routes
-  retain the comprehensive checks and all-feature `E2E Tests`. Same-repository
-  frozen release PRs and manual full validation run the Linux/macOS/Windows
-  `Platform Tests` matrix, preserving the native Supervisor, portable Skill and
-  frontend contract checks. They do not run `cargo build --release`; versioned
-  executable builds belong to the automatic main publisher. Main pushes retain
-  their CI/publication queue and
-  authenticate the complete pre-merge release evidence against the actual merge
-  through lightweight admission; they do not repeat the full Rust suite.
-  Required-check configuration is separate from these workflow triggers; verify
-  the intended dev compilation gate and preserve all main requirements before declaring
-  the policy active. PR cache cleanup remains scoped to that same-repository PR.
+  `Test` check over one physical Linux all-features Cargo invocation for the
+  selected packages, including library/binary, integration and documentation
+  tests; the live SSH fixture reuses its already compiled executable.
+  `Quick Checks` remains auxiliary. Fix failed feature tests before dev admission.
+  The existing release suite, native platform checks and lightweight main
+  admission remain active until release-source publication cutover; that pending
+  change moves one versioned build/publication to release and leaves main with
+  read-only promotion records. Preserve the currently required gates meanwhile.
+
 - **CodeQL** (`.github/workflows/codeql.yml`) -- Runs the Actions, JavaScript/TypeScript, Python, and Rust analyses for pull requests into `main`, pushes to `main`, and explicit manual dispatches. Routine `dev` activity does not run CodeQL.
 - **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes successful main CI source commits to crates.io and GitHub Releases with verified same-source recovery. Manual/Zenith dispatches retain explicit versions, the exact locked frontend and `dry_run`.
   One authenticated preparation feeds concurrent crate publication and native

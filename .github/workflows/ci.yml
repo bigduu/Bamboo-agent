@@ -49,6 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       full: ${{ steps.scope.outputs.full }}
+      feature: ${{ steps.scope.outputs.feature }}
     steps:
       - name: Bind full validation to the actual event snapshot
         id: scope
@@ -59,6 +60,7 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
           full=false
+          feature=false
           case "$GITHUB_EVENT_NAME" in
             workflow_dispatch)
               [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -68,7 +70,7 @@ jobs:
             pull_request)
               case "$GITHUB_BASE_REF" in
                 main) full=true ;;
-                dev) ;;
+                dev) feature=true ;;
                 *) exit 1 ;;
               esac
               ;;
@@ -78,7 +80,7 @@ jobs:
             *) exit 1 ;;
           esac
           printf 'Event source: %s; full validation: %s\n' "$GITHUB_SHA" "$full"
-          printf 'full=%s\n' "$full" >> "$GITHUB_OUTPUT"
+          printf 'full=%s\nfeature=%s\n' "$full" "$feature" >> "$GITHUB_OUTPUT"
 
   main-release-admission:
     name: Main Release Admission
@@ -96,7 +98,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "4ccc047bbaeedab71e93db9b6470f5a3131c1b395260f852baebef19ff9109b7"
+          ADMISSION_HELPER_SHA256: "726ee6fd89e23d65f79328e9262c33ae349fa1f29cb98976834468add69ea7bb"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -148,7 +150,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Test fast workflow and release policies
-        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs
+        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs scripts/run-feature-tests.test.cjs
 
       - name: Test Supervisor driver and owned loopback process binding
         run: node --test scripts/supervisor-native-acceptance.test.cjs
@@ -244,7 +246,7 @@ jobs:
       actions: read
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
-    needs: [validation-source, main-release-admission, test-crates, test-ssh]
+    needs: [validation-source, main-release-admission, quick-checks, feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]
     # A source-gate failure must fail required Test, never turn it into a skip.
     if: always() && !cancelled()
     runs-on: ubuntu-latest
@@ -255,14 +257,27 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           MAIN_ADMISSION_RESULT: ${{ needs.main-release-admission.result }}
+          FEATURE_VALIDATION: ${{ needs.validation-source.outputs.feature }}
+          FEATURE_RESULT: ${{ needs.feature-tests.result }}
+          QUICK_RESULT: ${{ needs.quick-checks.result }}
+          TLS_RESULT: ${{ needs.tls-fixture-test.result }}
+          RECORDER_RESULT: ${{ needs.tool-event-recorder-e2e.result }}
         shell: bash
         run: |
           set -euo pipefail
           test "$SOURCE_RESULT" = success
           case "$GITHUB_EVENT_NAME:${GITHUB_BASE_REF:-}:$FULL_VALIDATION" in
-            pull_request:dev:false|pull_request:main:true|workflow_dispatch::true) ;;
+            pull_request:dev:false)
+              test "$FEATURE_VALIDATION" = true
+              test "$FEATURE_RESULT" = success
+              test "$QUICK_RESULT" = success
+              test "$TLS_RESULT" = success
+              test "$RECORDER_RESULT" = success
+              ;;
+            pull_request:main:true|workflow_dispatch::true) test "$FEATURE_VALIDATION" = false ;;
             push::false)
               test "$GITHUB_REF" = refs/heads/main
+              test "$FEATURE_VALIDATION" = false
               test "$MAIN_ADMISSION_RESULT" = success
               ;;
             *) exit 1 ;;
@@ -290,7 +305,7 @@ jobs:
 
       - name: Test CI workflow policy
         if: needs.validation-source.outputs.full == 'true'
-        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs
+        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs scripts/run-feature-tests.test.cjs
 
       - name: Test Supervisor driver and owned loopback process binding
         if: needs.validation-source.outputs.full == 'true'
@@ -350,17 +365,15 @@ jobs:
             fi
           done
 
-      - name: Build locked Rust workspace
-        if: github.event_name == 'pull_request' && github.base_ref == 'dev'
-        run: cargo build --locked
-
       - name: Require all crate tests and the SSH fixture
         if: needs.validation-source.outputs.full == 'true'
         env:
           CRATE_RESULT: ${{ needs.test-crates.result }}
+          E2E_RESULT: ${{ needs.e2e-crates.result }}
           SSH_RESULT: ${{ needs.test-ssh.result }}
         run: |
           test "$CRATE_RESULT" = success
+          test "$E2E_RESULT" = success
           test "$SSH_RESULT" = success
 
       - name: Preserve failed synthetic Ticket fixture evidence
@@ -385,6 +398,76 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           source_status="$(git status --porcelain --untracked-files=all)"
           test -z "$source_status"
+
+  feature-tests:
+    name: Feature Unit and E2E
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/feature-all-features
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-feature-all-features-${{ runner.os }}
+          workspaces: . -> target/feature-all-features
+          save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
+      - name: Require exact feature source and committed frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          node scripts/frontend-package.cjs verify
+      - name: Record feature profile, toolchain and available disk
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            rustc -vV
+            cargo -V
+            printf 'Target: %s\nDev debug: %s\nTest debug: %s\nIncremental: %s\n' "$CARGO_TARGET_DIR" "$CARGO_PROFILE_DEV_DEBUG" "$CARGO_PROFILE_TEST_DEBUG" "$CARGO_INCREMENTAL"
+            df -Pk "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          } | tee "$RUNNER_TEMP/bamboo-feature-profile.log"
+      - name: Run Unit, E2E, doctests and compiled live SSH once
+        run: node scripts/run-feature-tests.cjs
+      - name: Record final feature disk usage
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -Pk "$GITHUB_WORKSPACE" "$RUNNER_TEMP" | tee -a "$RUNNER_TEMP/bamboo-feature-profile.log"
+          if [[ -d "$CARGO_TARGET_DIR" ]]; then
+            du -sk "$CARGO_TARGET_DIR" | tee -a "$RUNNER_TEMP/bamboo-feature-profile.log"
+          fi
+      - name: Require source to remain exact and clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Preserve feature Cargo evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: feature-unit-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/bamboo-feature-tests-*/cargo.log
+            ${{ runner.temp }}/bamboo-feature-profile.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   test-crates:
     name: Test (${{ matrix.crate }}${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }})
@@ -685,7 +768,7 @@ jobs:
   tls-fixture-test:
     name: TLS Fixture (${{ matrix.os }})
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.full == 'true' || needs.validation-source.outputs.feature == 'true'
     # Keep the test-only certificate generator portable across the OpenSSL and
     # LibreSSL variants on every supported host. The release build matrix below
     # does not compile or execute #[cfg(test)] code.
@@ -720,11 +803,11 @@ jobs:
   tool-event-recorder-e2e:
     name: ToolEvent Recorder E2E (${{ matrix.os }})
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.full == 'true' || needs.validation-source.outputs.feature == 'true'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(needs.validation-source.outputs.feature == 'true' && '["macos-latest","windows-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -739,18 +822,31 @@ jobs:
           save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Run native recorder contract and lifecycle tests
+        if: needs.validation-source.outputs.full == 'true'
         run: cargo test --locked --no-fail-fast -p bamboo-tool-event-recorder-example -- --nocapture --test-threads=1
+      - name: Run native recorder lifecycle integration
+        if: needs.validation-source.outputs.feature == 'true'
+        run: cargo test --locked --no-fail-fast -p bamboo-tool-event-recorder-example --all-features --test tool_event_lifecycle -- --nocapture --test-threads=1
 
   e2e-test:
     name: E2E Tests
-    needs: [validation-source, e2e-crates]
-    if: always() && !cancelled() && needs.validation-source.outputs.full == 'true'
+    needs: [validation-source, feature-tests, e2e-crates, test-ssh]
+    if: always() && !cancelled() && (needs.validation-source.outputs.full == 'true' || needs.validation-source.outputs.feature == 'true')
     runs-on: ubuntu-latest
     steps:
       - name: Require all E2E crate tests
         env:
           CRATE_RESULT: ${{ needs.e2e-crates.result }}
-        run: test "$CRATE_RESULT" = success
+          SSH_RESULT: ${{ needs.test-ssh.result }}
+          FEATURE_VALIDATION: ${{ needs.validation-source.outputs.feature }}
+          FEATURE_RESULT: ${{ needs.feature-tests.result }}
+        run: |
+          if test "$FEATURE_VALIDATION" = true; then
+            test "$FEATURE_RESULT" = success
+          else
+            test "$CRATE_RESULT" = success
+            test "$SSH_RESULT" = success
+          fi
 
   lint:
     name: Lint

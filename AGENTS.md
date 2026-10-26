@@ -14,29 +14,37 @@ Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream sn
 
 Follow [Parallel Development](./gitflow.md). Give each bounded Issue one owner,
 branch and isolated worktree; only the named integrator writes a shared batch
-branch. Dev CI admission requires the `Test` check to pass its compile-only mode.
-Before admission, run the affected tests locally, add or update coverage for changed
-behavior, and record exact source, commands and results in the PR. Auxiliary
-`Quick Checks` do not replace compilation or local test evidence. Dev CI does
-not run the full test suite on every PR. Freeze a recorded batch for complete
-release acceptance; `release → main` must pass the full required suite and
-platform matrix. Keep one release owner and one writer per build output; never
-cancel or clean another worker's resources. Verify the separately approved
-protection configuration and never bypass current gates. Normal direct pushes
-must be fast-forward and satisfy the same evidence and checks; never force push.
-Use the authoritative
-[Release Process](./CONTRIBUTING.md#release-process) for cuts, repairs and publication.
-The [CI and publication flow](./docs/releases/ci-publication-flow.md) records
-the phase contracts: validate the frozen release before merge, authenticate
-that evidence on the actual main merge, then publish that source. A successful
-lightweight main admission is evidence reuse, not another full test run. Never
-replace dev compilation or release acceptance with skipped/stub checks, or
-substitute another commit's binary for a versioned release build.
-After one authenticated version/frontend preparation, crate publication and
-the source-selected native matrix run concurrently. Native workers consume
-hash-bound same-run frontend transport without publication credentials. Only
-the final publisher joins completed crates and all required native receipts;
-parallel builds never create another allocator or publication queue.
+branch. Every feature PR to `dev` must pass required `Test`, which aggregates
+Unit, E2E and the live SSH fixture on its actual merge source. One Linux Cargo
+executor uses one all-features package selection and owned target directory;
+Cargo runs library/binary, integration and documentation tests once. The ignored
+SSH case reuses its already compiled executable. Unit/E2E are logical target
+groups, not separate compilation jobs. All agents add ordinary cases to that
+Cargo target catalog, instead of creating another Linux workflow for a covered
+case subset. CI policy rejects unregistered Rust test producers; native OS,
+containment-boundary, explicit manual diagnostics and pinned legacy routes are
+scoped exceptions with named owners. Preserve
+applicable native-platform acceptance before dev admission. Fix failures in the
+feature branch before merging; record exact source, commands and results.
+`Quick Checks` remains auxiliary and never substitutes for runtime tests.
+
+The intended release contract is feature tests -> accepted dev cut -> one version
+reservation and release build/publication -> main promotion of the published
+source. Release branches do not repair product code or rerun Unit/E2E; main
+records stable code through immutable tags, Release manifests/provenance and the
+promotion description, without another build or test run. Keep source manifests
+at `0.0.0` and stamp only disposable formal-build checkouts. Repairs return
+through feature/dev tests and produce a new frozen cut.
+
+Cutover dependency: #2311 installs feature admission only. Existing frozen
+release acceptance and main-triggered publication remain active until the
+separate release-source admission change is accepted. Do not bypass those live
+gates or dispatch the new release route before that cutover. Before the first
+new cut, normally integrate current main ancestry into dev through a tested
+feature PR. Preserve historical signed receipts and immutable tags. Use the
+[Release Process](./CONTRIBUTING.md#release-process) and
+[CI and publication flow](./docs/releases/ci-publication-flow.md) to distinguish
+implemented feature admission from the pending release protocol.
 
 ## Pull Request Review
 
@@ -46,9 +54,10 @@ For the #791 multi-agent epic, the user's 2026-09-28 delivery instruction takes
 precedence over the per-Issue PR and review steps below. Inventory all related
 PR heads and existing work first, then merge implemented work into one local
 integration baseline. Review integration changes locally and use focused checks
-while assembling it. Submit one PR to `dev` with the required compilation gate
-and local test/coverage evidence under the current gate policy. Run the complete affected regression once
-on the frozen release snapshot before promotion to `main`. Do not request or
+while assembling it. Submit one PR to `dev` with required Unit/E2E and local
+test/coverage evidence under the current feature-admission policy. Complete
+affected regression before dev admission; the target release path builds the
+accepted product without repeating those tests. Do not request or
 wait for GitHub Codex PR review for this epic. Close superseded component PRs and clean only safely merged worktrees after the final
 integration is accepted. Preserve dirty or uncertain worktrees.
 
@@ -70,14 +79,12 @@ integration is accepted. Preserve dirty or uncertain worktrees.
 
 ## Release Branches
 
-Follow the authoritative [Release Process](./CONTRIBUTING.md#release-process):
-cut a same-repository `release/<40-character-cut-SHA>` from the freshly read
-actual protected-`dev` HEAD after the Release Process prerequisites have merged.
-Its bounded early-cut route permits a known pending frontend consumer only when
-recorded at the cut and later admitted through the full separate `F`/`U` procedure.
-Record the cut timestamp, SHA, tree, fresh-read receipt, and bounded scope;
-review must verify the receipt and normal branch creation. Promote that frozen
-branch to `main`. Keep `dev` open; never chase its moving tip in a release. Necessary
-release-based fixes must pass normal review/checks into protected `dev` with
-exact ancestry preserved before fast-forwarding the release. Keep frozen tags
-immutable and retain all required checks, platform coverage, and protection.
+Follow the authoritative [Release Process](./CONTRIBUTING.md#release-process).
+After release-source admission is enabled, cut a same-repository
+`release/<40-character-cut-SHA>` exactly at the freshly read, tested protected-dev
+commit. Record its timestamp, SHA, tree and source receipt. Keep that product
+source fixed through version reservation, native builds and publication; normal
+dev advancement does not change it. Promote only the exact published source to
+main. A needed product repair gets a feature branch, passing tests and dev
+admission, then a fresh cut. Existing frozen release/recovery contracts remain
+unchanged during the explicitly documented cutover dependency.
