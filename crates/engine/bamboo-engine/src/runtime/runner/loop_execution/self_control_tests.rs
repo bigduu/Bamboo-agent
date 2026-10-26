@@ -326,7 +326,7 @@ impl Fixture {
         provider: Arc<dyn LLMProvider>,
         cancel: CancellationToken,
     ) -> (Result<(), AgentError>, Vec<AgentEvent>) {
-        let (tx, mut rx) = mpsc::channel(512);
+        let (tx, rx) = mpsc::channel(512);
         let tools = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
         let storage = self.storage.clone();
         let config = self.config.take().expect("one activation per fixture");
@@ -339,6 +339,14 @@ impl Fixture {
             cancel,
             config,
         );
+        Self::drive_and_observe(run, storage, rx).await
+    }
+
+    async fn drive_and_observe(
+        run: impl std::future::Future<Output = Result<(), AgentError>>,
+        storage: Arc<dyn Storage>,
+        mut rx: mpsc::Receiver<AgentEvent>,
+    ) -> (Result<(), AgentError>, Vec<AgentEvent>) {
         tokio::pin!(run);
         let mut events = Vec::new();
         let result = loop {
@@ -395,6 +403,109 @@ impl Fixture {
     async fn close(mut self) {
         self.registration.take().unwrap().abandon().await;
     }
+}
+
+struct ObserverReadBarrierStorage {
+    inner: Arc<dyn Storage>,
+    writer: tokio::sync::Mutex<()>,
+    read_entered: Notify,
+}
+
+#[async_trait]
+impl Storage for ObserverReadBarrierStorage {
+    async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+        self.inner.save_session(session).await
+    }
+
+    async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+        self.read_entered.notify_one();
+        let _reader = self.writer.lock().await;
+        self.inner.load_session(id).await
+    }
+
+    async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+        self.inner.delete_session(id).await
+    }
+}
+
+#[tokio::test]
+async fn observer_pending_read_keeps_runner_polled_and_drains_completed_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner: Arc<dyn Storage> = Arc::new(
+        bamboo_storage::SessionStoreV2::new(dir.path().join("sessions"))
+            .await
+            .unwrap(),
+    );
+    let result = bamboo_agent_core::tools::ToolResult::text(
+        true,
+        json!({"loop": {"generation": null}}).to_string(),
+    );
+    let mut session = Session::new(SESSION_ID, "synthetic-only");
+    let calls = ["blocked-observation", "terminal-observation"]
+        .map(|id| ToolCall {
+            id: id.into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "loop_control".into(),
+                arguments: json!({"action": "status"}).to_string(),
+            },
+        })
+        .to_vec();
+    session.add_message(Message::assistant("", Some(calls)));
+    for id in ["blocked-observation", "terminal-observation"] {
+        session.add_message(Message::tool_result_with_status(
+            id,
+            result.result.clone(),
+            result.success,
+        ));
+    }
+    inner.save_session(&session).await.unwrap();
+    let storage = Arc::new(ObserverReadBarrierStorage {
+        inner,
+        writer: tokio::sync::Mutex::new(()),
+        read_entered: Notify::new(),
+    });
+    let (tx, rx) = mpsc::channel(2);
+    // A retained sender must not prevent observation from finishing.
+    let retained_sender = tx.clone();
+    let runner_storage = storage.clone();
+    let run = async move {
+        let writer = runner_storage.writer.lock().await;
+        tx.send(AgentEvent::ToolComplete {
+            tool_call_id: "blocked-observation".into(),
+            result: result.clone(),
+        })
+        .await
+        .unwrap();
+        // The observer now needs this lock; only another runner poll can
+        // release it. An await inside the old select branch strands both.
+        runner_storage.read_entered.notified().await;
+        drop(writer);
+        tx.send(AgentEvent::ToolComplete {
+            tool_call_id: "terminal-observation".into(),
+            result,
+        })
+        .await
+        .unwrap();
+        Err(AgentError::Cancelled)
+    };
+    let (outcome, events) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        Fixture::drive_and_observe(run, storage, rx),
+    )
+    .await
+    .expect("an observer waiting on storage must not stop runner progress");
+    assert!(matches!(outcome, Err(AgentError::Cancelled)));
+    assert_eq!(events.len(), 2, "all durable observations must complete");
+    assert!(
+        matches!(&events[0], AgentEvent::ToolComplete { tool_call_id, .. }
+        if tool_call_id == "blocked-observation")
+    );
+    assert!(
+        matches!(&events[1], AgentEvent::ToolComplete { tool_call_id, .. }
+        if tool_call_id == "terminal-observation")
+    );
+    drop(retained_sender);
 }
 
 fn assert_terminal_integrity(
