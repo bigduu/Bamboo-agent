@@ -43,6 +43,23 @@ function fingerprint(job) {
   return JSON.stringify([job.id, job.run_id, job.name, job.head_sha, job.head_branch, job.status, job.conclusion,
     job.started_at, job.completed_at, job.check_run_url, job.steps]);
 }
+function executionKey(job) {
+  if (job.status !== "completed" || job.conclusion !== "success" || !Array.isArray(job.steps) || !job.steps.length) return null;
+  const start = Date.parse(job.started_at), end = Date.parse(job.completed_at), numbers = new Set(), steps = [];
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end) return null;
+  for (const step of job.steps) {
+    if (!positive(step.number) || numbers.has(step.number) || typeof step.name !== "string" || !step.name ||
+      step.status !== "completed" || !["success", "skipped", "neutral"].includes(step.conclusion)) return null;
+    numbers.add(step.number);
+    if (!(step.conclusion === "skipped" && step.started_at === null && step.completed_at === null)) {
+      const first = Date.parse(step.started_at), last = Date.parse(step.completed_at);
+      if (!Number.isFinite(first) || !Number.isFinite(last) || first < start || last > end || first > last) return null;
+    }
+    steps.push({ number: step.number, name: step.name, status: step.status, conclusion: step.conclusion,
+      started_at: step.started_at, completed_at: step.completed_at });
+  }
+  return JSON.stringify({ started_at: job.started_at, completed_at: job.completed_at, steps });
+}
 function runIdentity(run) {
   return JSON.stringify([run.id, run.run_attempt, run.workflow_id, run.check_suite_id, run.check_suite_node_id,
     run.event, run.head_sha, run.head_branch, run.status, run.conclusion, run.created_at, run.updated_at]);
@@ -69,15 +86,20 @@ async function resolveFrozenSource(input, reads, policy = {}) {
   const mainHistoryAnchor = revision(policy.mainHistoryAnchor);
   const get = async route => checkedJSON(await reads.json(route));
   const paged = async (route, key) => {
-    const values = [], seen = new Set();
+    const values = [], seen = new Set(); let total;
     for (let page = 1; page <= 20; page++) {
       const result = await get(`${route}${route.includes("?") ? "&" : "?"}per_page=100&page=${page}`);
       assert.ok(Array.isArray(result[key]) && result[key].length <= 100, "Invalid API page");
+      assert.ok(Number.isSafeInteger(result.total_count) && result.total_count >= 0, "Missing API total_count");
+      if (total === undefined) total = result.total_count;
+      assert.equal(result.total_count, total, "API page total changed");
       for (const value of result[key]) {
         assert.ok(positive(value.id) && !seen.has(value.id), "Duplicate API identity");
         seen.add(value.id); values.push(value);
       }
-      if (result[key].length < 100) return values;
+      assert.ok(values.length <= total, "API page exceeded total_count");
+      if (values.length === total) return values;
+      assert.equal(result[key].length, 100, "API evidence is truncated");
     }
     assert.fail("API pagination limit exceeded");
   };
@@ -90,6 +112,19 @@ async function resolveFrozenSource(input, reads, policy = {}) {
     const value = await get(`branches/${encodeURIComponent(name)}`);
     assert.equal(value.name, name);
     if (protectedBranch) assert.equal(value.protected, true, `${name} must remain protected`);
+    if (name === "dev") {
+      const required = policy.requiredDevChecks ?? ["Test", "E2E Tests"];
+      assert.ok(Array.isArray(required) && required.length && new Set(required).size === required.length);
+      const status = value.protection?.required_status_checks;
+      assert.equal(status?.enforcement_level, "everyone", "Dev administrators must follow admission");
+      assert.ok(Array.isArray(status.contexts) && Array.isArray(status.checks), "Missing required feature checks");
+      for (const context of required) {
+        assert.ok(typeof context === "string" && context && status.contexts.includes(context), "Required dev context absent");
+        const checks = status.checks.filter(check => check.context === context);
+        assert.equal(checks.length, 1, "Missing/ambiguous required dev app check");
+        assert.equal(checks[0].app_id, 15368, "Required dev check must use GitHub Actions");
+      }
+    }
     return revision(value.commit?.sha);
   };
   const mainBefore = await branch("main", true);
@@ -179,25 +214,44 @@ async function resolveFrozenSource(input, reads, policy = {}) {
   };
   await latestRun();
   const latest = await paged(`actions/runs/${run.id}/jobs?filter=latest`, "jobs");
-  const attempts = new Map(), originals = [];
+  const all = await paged(`actions/runs/${run.id}/jobs?filter=all`, "jobs");
+  const attempts = new Map();
   const steps = (job, names) => {
     assert.equal(job.status, "completed"); assert.equal(job.conclusion, "success");
     assert.ok(Array.isArray(job.steps) && job.steps.length && Array.isArray(names) && names.length);
-    for (const step of job.steps) assert.ok(step.status === "completed" && ["success", "skipped"].includes(step.conclusion), "Failed job step");
+    for (const step of job.steps) assert.ok(step.status === "completed" && ["success", "skipped", "neutral"].includes(step.conclusion), "Failed job step");
     for (const name of names) {
       const selected = job.steps.filter(step => step.name === name);
       assert.equal(selected.length, 1, "Missing/duplicate required step");
       assert.equal(selected[0].conclusion, "success", "Required step skipped");
     }
   };
-  for (const name of contract.requiredJobs) {
-    const matches = latest.filter(job => job.name === name); assert.equal(matches.length, 1, `Missing/duplicate feature job: ${name}`);
-    const logical = matches[0], physical = await get(`actions/jobs/${logical.id}`);
-    assert.equal(fingerprint(logical), fingerprint(physical), "Logical job differs from original physical execution");
+  const select = (latestRows, allRows) => contract.requiredJobs.map(name => {
+    const matches = latestRows.filter(job => job.name === name); assert.equal(matches.length, 1, `Missing/duplicate feature job: ${name}`);
+    const logical = matches[0], family = allRows.filter(job => job.name === name);
+    for (const job of family) {
+      assert.equal(job.run_id, run.id); assert.equal(job.head_sha, F); assert.equal(job.head_branch, pr.head.ref);
+      assert.ok(positive(job.run_attempt) && job.run_attempt <= run.run_attempt);
+    }
+    assert.equal(new Set(family.map(job => job.run_attempt)).size, family.length, "Ambiguous job attempt");
+    const newest = [...family].sort((a, b) => b.run_attempt - a.run_attempt)[0];
+    assert.ok(newest && newest.run_attempt === logical.run_attempt && fingerprint(newest) === fingerprint(logical), "Latest logical job is not the complete latest attempt");
+    steps(logical, contract.requiredSteps?.[name]);
+    const key = executionKey(logical); assert.notEqual(key, null, "Invalid complete execution times/steps");
+    // GitHub may give a copied success a new job ID/attempt. Only the complete
+    // execution projection identifies the earlier physical job; direct GET of
+    // the copied ID cannot recover its original execution.
+    const physical = family.filter(job => executionKey(job) === key).sort((a, b) => a.run_attempt - b.run_attempt)[0];
+    assert.ok(physical, "Original physical execution missing"); steps(physical, contract.requiredSteps?.[name]);
+    return { logical, physical };
+  });
+  const originals = select(latest, all);
+  for (const { logical, physical } of originals) {
+    const direct = await get(`actions/jobs/${physical.id}`);
+    assert.equal(direct.run_attempt, physical.run_attempt); assert.equal(fingerprint(direct), fingerprint(physical), "Original physical job changed");
     assert.equal(physical.run_id, run.id); assert.equal(physical.head_sha, F); assert.equal(physical.head_branch, pr.head.ref);
     assert.ok(positive(physical.run_attempt) && positive(logical.run_attempt) &&
       physical.run_attempt <= logical.run_attempt && logical.run_attempt <= run.run_attempt);
-    steps(physical, contract.requiredSteps?.[name]);
     assert.ok(date(physical.started_at) >= date(run.created_at) && date(physical.completed_at) >= date(physical.started_at)
       && date(physical.completed_at) <= mergedAt, "Required execution was not complete before dev admission");
     if (!attempts.has(physical.run_attempt)) attempts.set(physical.run_attempt,
@@ -206,7 +260,6 @@ async function resolveFrozenSource(input, reads, policy = {}) {
     assert.equal(members.length, 1, "Missing original physical attempt");
     assert.equal(members[0].run_attempt, physical.run_attempt);
     assert.equal(fingerprint(members[0]), fingerprint(physical), "Original physical attempt changed");
-    originals.push({ logical, physical });
   }
   const sourceJob = originals.find(value => value.physical.name === "Validation Source").physical;
   const log = await reads.jobLog(sourceJob.id);
@@ -253,6 +306,8 @@ async function resolveFrozenSource(input, reads, policy = {}) {
   assert.deepEqual(checkedJSON(await reads.checkSuite(run.check_suite_node_id)), official, "Official check-suite changed during proof");
   await latestRun();
   const freshJobs = await paged(`actions/runs/${run.id}/jobs?filter=latest`, "jobs");
+  const freshAll = await paged(`actions/runs/${run.id}/jobs?filter=all`, "jobs");
+  assert.deepEqual(select(freshJobs, freshAll), originals, "Original/latest physical projection changed");
   for (const { logical, physical } of originals) {
     const fresh = freshJobs.filter(job => job.name === physical.name);
     assert.equal(fresh.length, 1); assert.equal(fingerprint(fresh[0]), fingerprint(logical));
@@ -275,8 +330,8 @@ async function resolveFrozenSource(input, reads, policy = {}) {
       runId: run.id, logicalAttempt: run.run_attempt, workflowId: run.workflow_id, checkSuiteId: run.check_suite_id,
       workflowDefinitionRevision: Q, producerDigest: definition.sha256,
       physicalJobs: originals.map(({ logical, physical }) => ({ name: physical.name, jobId: physical.id,
-        logicalAttempt: logical.run_attempt, physicalAttempt: physical.run_attempt,
-        startedAt: physical.started_at, completedAt: physical.completed_at, stepsFingerprint: hash(fingerprint(physical)) })) },
+        logicalJobId: logical.id, logicalAttempt: logical.run_attempt, physicalAttempt: physical.run_attempt,
+        startedAt: physical.started_at, completedAt: physical.completed_at, stepsFingerprint: hash(executionKey(physical)) })) },
     controller: { revision: C, workflowPath: CONTROLLER, event: env.GITHUB_EVENT_NAME, ref: env.GITHUB_REF, mainObservedBefore: mainBefore, mainObservedAfter: mainAfter },
     inputs,
   };

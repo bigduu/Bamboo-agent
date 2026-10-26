@@ -196,10 +196,26 @@ test("frozen source foundation retains original physical jobs across mixed faile
   for (const job of model.latest) { job.run_attempt = 2; job.id += 1000; job.check_run_url += "-copied" }
   model.attempts[2] = structuredClone(model.latest); model.physical.push(...structuredClone(model.latest))
   const rerun = model.physical[6]; rerun.run_attempt = 2; rerun.id = 206
+  rerun.started_at = "2026-10-27T01:02:01Z"; rerun.completed_at = "2026-10-27T01:02:40Z"
+  rerun.steps[0].started_at = rerun.started_at; rerun.steps[0].completed_at = "2026-10-27T01:02:30Z"
   model.latest[6] = structuredClone(rerun); model.attempts[2][6] = structuredClone(rerun)
   const proof = await model.resolve()
   assert.equal(proof.feature.logicalAttempt, 2); assert.equal(proof.feature.physicalJobs[0].physicalAttempt, 1)
+  assert.equal(proof.feature.physicalJobs[0].jobId, 100); assert.equal(proof.feature.physicalJobs[0].logicalJobId, 1100)
   assert.equal(proof.feature.physicalJobs[6].physicalAttempt, 2)
+})
+test("frozen source foundation never hides a later failed logical job behind an original success", async () => {
+  const model = frozenSourceFixture(); model.run.run_attempt = 2; model.suite.workflowRun.runAttempt = 2
+  const failed = { ...structuredClone(model.latest[3]), id: 1300, run_attempt: 2, conclusion: "failure" }
+  model.latest[3] = failed; model.attempts[2] = [structuredClone(failed)]; model.physical.push(structuredClone(failed))
+  await assert.rejects(model.resolve())
+})
+test("frozen source foundation consumes complete multiple pages of original job records", async () => {
+  const model = frozenSourceFixture(), rows = model.attempts[1]
+  while (rows.length <= 100) rows.push({ ...structuredClone(rows[0]), id: 2000 + rows.length, name: "Historical unused job " + rows.length })
+  await model.resolve()
+  assert.ok(model.calls.some(route => route.includes("filter=all") && route.endsWith("page=2")))
+  assert.ok(model.calls.some(route => route.includes("attempts/1/jobs") && route.endsWith("page=2")))
 })
 test("frozen source foundation reads original Git blob bytes without downloading executable artifacts", async () => {
   const model = frozenSourceFixture(); model.largeBlob = true

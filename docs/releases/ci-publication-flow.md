@@ -49,7 +49,12 @@ an OPEN PR despite a Git merge, missing logs or ambiguous identity fail closed.
 The selected CI run must remain the latest matching feature run. Each required
 physical job must have completed before dev admission with its required steps
 successful. Logical copies in a later attempt retain their original physical
-attempt; a copied logical entry is not another execution. Re-read PR, run,
+attempt and may have a different job ID. Select the earliest matching complete
+job/step execution projection, excluding ID, attempt and runner metadata;
+validate every step's time bounds and original attempt membership before
+reading that original job's log. A copied logical entry is not another execution.
+Paginated lists require stable, complete `total_count` and unique IDs, so a
+truncated later run/job cannot disappear from the proof. Re-read PR, run,
 check-suite, latest jobs, original jobs and refs before returning. The result is
 an observed source context, not permission for a later publication write.
 
@@ -59,7 +64,11 @@ GETs, `checkSuite(nodeId)` using the existing read-only check-suite query and
 the library adds no HTTP/credential/polling or artifact-execution mechanism.
 `policy` belongs to reviewed controller code, never dispatch inputs or a PR.
 It pins a complete workflow digest, workflow ID, critical jobs/steps, helper
-closure and main-history anchor. Fixture policy is inert unit-test data; it is
+closure and main-history anchor. Dev protection must enforce the reviewed
+required contexts for everyone with GitHub Actions app 15368; a deletion-only
+`protected: true` flag is insufficient. The inactive default requires `Test`
+and `E2E Tests`; a future reviewed producer policy may pin its actual complete
+gate names. This check changes no protection settings. Fixture policy is inert unit-test data; it is
 not evidence that a real complete producer has run. The source-selected native
 contract is read as bytes, without importing publication/signing helpers.
 
