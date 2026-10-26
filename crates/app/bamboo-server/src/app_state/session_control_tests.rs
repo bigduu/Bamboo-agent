@@ -702,6 +702,13 @@ async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_de
         );
         let reactivated = f.reload().await;
         assert_eq!(reactivated.created_at, after.created_at);
+        assert_eq!(reactivated.kind, f.original.kind);
+        assert_eq!(reactivated.parent_session_id, f.original.parent_session_id);
+        assert_eq!(
+            reactivated.root_thinking_mode(),
+            f.original.root_thinking_mode()
+        );
+        assert!(reactivated.supervisor_incarnation_id().is_none());
         assert_eq!(reactivated.project_id_meta(), f.original.project_id_meta());
         assert_eq!(
             reactivated.workspace_path_meta(),
