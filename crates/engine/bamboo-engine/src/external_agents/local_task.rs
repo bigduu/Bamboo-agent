@@ -736,7 +736,8 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         }
         let mut tools: Arc<dyn ToolExecutor> = runtime.tools.clone();
         let store = lock(&self.bindings).store.clone().ok_or_else(||failure("local store unavailable"))?;
-        let factory = if strict { None } else { lock(&self.bindings).skills.clone() };
+        let observer = store.supervisor_observer_activation(session).await.map_err(failure)?;
+        let factory = if strict || observer { None } else { lock(&self.bindings).skills.clone() };
         let mut child_skill_host = None;
         let mut child_skill_authority = None;
         if let Some(factory) = factory {
@@ -747,7 +748,8 @@ impl ExternalChildRunner for LocalTaskChildRunner {
             child_skill_host = Some(binding.host);
         }
         let names = names.unwrap_or_else(||tools.list_tools().into_iter().map(|s|s.function.name).collect());
-        tools = Arc::new(tool_policy::LocalChildTools::new(tools, names.clone(), session, store.clone(), execution.owner.clone(), job.disabled_tools.as_deref())?.with_canonical_subagent(lock(&self.bindings).subagent.clone()));
+        let local_tools = tool_policy::LocalChildTools::new(tools, names.clone(), session, store.clone(), execution.owner.clone(), job.disabled_tools.as_deref())?.with_canonical_subagent(lock(&self.bindings).subagent.clone());
+        tools = Arc::new(if observer { local_tools.restrict_to_observer() } else { local_tools });
         if session.metadata.contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY) {
             tools = Arc::new(crate::ticket_worker_plan::files::LocalFileExecutor::new(
                 tools, tickets.clone().ok_or_else(||failure("Ticket authority unavailable"))?, session.clone(), run_id.clone(), &names
@@ -758,7 +760,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         let mut request = ExecuteRequestBuilder::new("", local_event_tx.clone(), cancel_token.clone())
             .tools(tools)
             .model(job.model.clone());
-        if strict { request = request.selected_skill_ids(Vec::new()); }
+        if strict || observer { request = request.selected_skill_ids(Vec::new()); }
         else {
             if let Some(ids) = session.metadata.get("selected_skill_ids").and_then(|raw|bamboo_skills::selection::parse_selected_skill_ids_metadata(raw)) { request = request.selected_skill_ids(ids); }
             if let Some(mode) = session.metadata.get("skill_mode").or_else(||session.metadata.get("mode")).map(|v|v.trim()).filter(|v|!v.is_empty()) { request = request.selected_skill_mode(mode); }
@@ -768,6 +770,13 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         }
         if let Some(disabled) = &job.disabled_tools {
             request = request.disabled_tools(disabled.iter().cloned().collect());
+        }
+        if observer {
+            request = request.run_budget(bamboo_config::RunBudgetConfig {
+                max_rounds: Some(4),
+                max_tool_calls: Some(8),
+                ..Default::default()
+            });
         }
         if let Some(reference) = crate::session_app::provider_model::session_effective_model_ref(session) {
             if let Some(router) = &runtime.provider_router {

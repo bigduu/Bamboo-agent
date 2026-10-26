@@ -103,6 +103,7 @@ fn empty_state(incarnation_id: Uuid) -> SupervisorManagementState {
         revision: 0,
         allowed_projects: BTreeSet::new(),
         links: BTreeMap::new(),
+        observers: BTreeMap::new(),
     }
 }
 
@@ -165,6 +166,395 @@ fn link_authorizes_target(
 }
 
 impl SessionStoreV2 {
+    async fn observer_guards(
+        &self,
+        child_id: &str,
+        targets: impl IntoIterator<Item = String>,
+        absence: Option<crate::host_session_scope::HostSessionScopeAbsence>,
+    ) -> io::Result<Arc<SupervisorManagementGuards>> {
+        validate_supervisor_target_id(child_id).map_err(invalid)?;
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let mut roots: BTreeSet<String> = targets.into_iter().collect();
+        roots.insert(DEFAULT_SUPERVISOR_SESSION_ID.into());
+        let mut sessions = Vec::with_capacity(roots.len() + 1);
+        for id in roots {
+            sessions.push(self.acquire_session_maintenance_lock(&id).await?);
+        }
+        sessions.push(self.acquire_session_maintenance_lock(child_id).await?);
+        Ok(Arc::new(SupervisorManagementGuards {
+            sessions,
+            _task: task,
+            _lifecycle: lifecycle,
+            _host_namespace: absence,
+        }))
+    }
+
+    /// Trusted two-stage Host API. The existing Creator has already saved a
+    /// fresh read-only Child with auto_run=false. This operation allocates no
+    /// Child, so retries always identify the original Child and registration.
+    pub async fn register_supervisor_observer(
+        &self,
+        reference: &SupervisorReference,
+        expected_revision: u64,
+        operation_id: Uuid,
+        child_id: &str,
+        targets: BTreeSet<String>,
+    ) -> io::Result<bamboo_domain::SupervisorObserverReceipt> {
+        use bamboo_domain::{
+            SupervisorObserverRegistration, MAX_SUPERVISOR_OBSERVERS,
+            MAX_SUPERVISOR_OBSERVER_TARGETS, SUPERVISOR_OBSERVER_SCHEMA_VERSION,
+        };
+        reference_is_valid(reference)?;
+        target_id_is_valid(child_id)?;
+        if operation_id.is_nil()
+            || targets.is_empty()
+            || targets.len() > MAX_SUPERVISOR_OBSERVER_TARGETS
+        {
+            return Err(invalid("invalid bounded Observer registration"));
+        }
+        for id in &targets {
+            target_id_is_valid(id)?;
+            if id == child_id {
+                return Err(denied("an Observer cannot observe itself"));
+            }
+        }
+        let guards = self
+            .observer_guards(child_id, targets.iter().cloned(), None)
+            .await?;
+        let mut parent = self.management_supervisor_locked(reference).await?;
+        self.check_management_session_compatibility(&parent).await?;
+        let mut state = parent
+            .supervisor_management
+            .clone()
+            .unwrap_or_else(|| empty_state(reference.incarnation_id));
+        let child = self
+            .load_child_wait_session(&parent, child_id, true)
+            .await?
+            .ok_or_else(|| denied("Observer Child is missing"))?;
+        if let Some(old) = state.observers.get(child_id) {
+            if old.operation_id != operation_id
+                || old.parent_created_at != parent.created_at
+                || old.child_created_at != child.created_at
+                || old.target_links.keys().cloned().collect::<BTreeSet<_>>() != targets
+            {
+                return Err(denied(
+                    "Observer registration retry conflicts with its original request",
+                ));
+            }
+            return Ok(observer_receipt(
+                reference,
+                child_id,
+                state.revision,
+                old,
+                false,
+            ));
+        }
+        if state.revision != expected_revision {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Supervisor changed before Observer registration",
+            ));
+        }
+        if state.observers.len() >= MAX_SUPERVISOR_OBSERVERS
+            || state
+                .observers
+                .values()
+                .any(|old| old.operation_id == operation_id)
+        {
+            return Err(denied(
+                "Observer registration capacity or operation conflict",
+            ));
+        }
+        let runtime = child
+            .agent_runtime_state
+            .as_ref()
+            .ok_or_else(|| denied("Observer requires typed read-only runtime state"))?;
+        if !observer_native_child(&child)
+            || child.child_launch_generation() != 1
+            || child.recoverable_child_launch_generation().is_some()
+            || child.last_run_status().as_deref() != Some("pending")
+            || !runtime.run_id.is_empty()
+            || runtime.round.current_round != 0
+            || runtime.round.total_tool_calls != 0
+            || parent
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.waiting_for_children.as_ref())
+                .is_some_and(|wait| wait.child_session_ids.iter().any(|id| id == child_id))
+        {
+            return Err(denied(
+                "only a fresh unqueued read-only native Child may become an Observer",
+            ));
+        }
+        let mut links = BTreeMap::new();
+        for id in &targets {
+            let link = state
+                .links
+                .get(id)
+                .ok_or_else(|| denied("Observer target is not managed"))?;
+            let target = self
+                .load_root_authority_unchecked(id)
+                .await?
+                .ok_or_else(|| denied("Observer target is missing"))?;
+            if !link_authorizes_target(&state, link, &target) {
+                return Err(denied("Observer target scope changed"));
+            }
+            links.insert(id.clone(), link.clone());
+        }
+        state.revision = next_revision(state.revision)?;
+        state.schema_version = SUPERVISOR_OBSERVER_SCHEMA_VERSION;
+        let registration = SupervisorObserverRegistration {
+            operation_id,
+            revision: state.revision,
+            enabled: true,
+            parent_created_at: parent.created_at,
+            child_created_at: child.created_at,
+            target_links: links,
+        };
+        state
+            .observers
+            .insert(child_id.into(), registration.clone());
+        state.validate(reference.incarnation_id).map_err(invalid)?;
+        self.publish_management_state(&mut parent, &state, &guards)
+            .await?;
+        Ok(observer_receipt(
+            reference,
+            child_id,
+            state.revision,
+            &registration,
+            true,
+        ))
+    }
+
+    /// A disabled exact-birth tombstone is never implicitly re-enabled.
+    pub async fn revoke_supervisor_observer(
+        &self,
+        reference: &SupervisorReference,
+        expected_revision: u64,
+        child_id: &str,
+    ) -> io::Result<bamboo_domain::SupervisorObserverReceipt> {
+        reference_is_valid(reference)?;
+        target_id_is_valid(child_id)?;
+        let guards = self.observer_guards(child_id, [], None).await?;
+        let mut parent = self.management_supervisor_locked(reference).await?;
+        self.check_management_session_compatibility(&parent).await?;
+        let mut state = parent
+            .supervisor_management
+            .clone()
+            .unwrap_or_else(|| empty_state(reference.incarnation_id));
+        let old = state
+            .observers
+            .get(child_id)
+            .ok_or_else(|| denied("Observer is not registered"))?
+            .clone();
+        if !old.enabled {
+            return Ok(observer_receipt(
+                reference,
+                child_id,
+                state.revision,
+                &old,
+                false,
+            ));
+        }
+        if state.revision != expected_revision {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Supervisor changed before Observer revocation",
+            ));
+        }
+        state.revision = next_revision(state.revision)?;
+        let mut revoked = old;
+        revoked.enabled = false;
+        revoked.revision = state.revision;
+        state.observers.insert(child_id.into(), revoked.clone());
+        self.publish_management_state(&mut parent, &state, &guards)
+            .await?;
+        Ok(observer_receipt(
+            reference,
+            child_id,
+            state.revision,
+            &revoked,
+            true,
+        ))
+    }
+
+    pub(super) async fn observer_classification(
+        &self,
+        expected_parent: &Session,
+        child_id: &str,
+    ) -> io::Result<bool> {
+        let Some(reference) = observer_parent_reference(expected_parent) else {
+            return Ok(false);
+        };
+        let _guards = self.observer_guards(child_id, [], None).await?;
+        let parent = self.management_supervisor_locked(&reference).await?;
+        if parent.created_at != expected_parent.created_at {
+            return Err(denied("Observer parent lifetime changed"));
+        }
+        let Some(state) = parent.supervisor_management.as_ref() else {
+            return Ok(false);
+        };
+        if !state.observers.contains_key(child_id) {
+            return Ok(false);
+        }
+        let child = self
+            .load_child_wait_session(&parent, child_id, false)
+            .await?
+            .ok_or_else(|| denied("registered Observer Child is unavailable"))?;
+        Ok(state.classifies_observer(&parent, &child))
+    }
+
+    pub(super) async fn observer_activation(&self, expected: &Session) -> io::Result<bool> {
+        if expected.kind != SessionKind::Child
+            || expected.parent_session_id.as_deref() != Some(DEFAULT_SUPERVISOR_SESSION_ID)
+        {
+            return Ok(false);
+        }
+        let caller = bamboo_domain::SessionCallerReference::from(expected);
+        // An installed/revoked Host namespace is sticky. Do not reinstall a
+        // scope or turn a failed lookup into canonical-registration fallback.
+        let token = self.host_scope_registry.lookup(&caller).await?;
+        let _host_scope = match token.as_ref() {
+            Some(token) => Some(self.host_scope_registry.retain(token, &caller).await?),
+            None => None,
+        };
+        let _absence = if token.is_none() {
+            Some(
+                self.host_scope_registry
+                    .retain_never_installed(&caller.session_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        // Discover IDs only; they grant nothing. The complete set is checked
+        // again while the physical authority guards are retained below.
+        let Some(preview) =
+            Storage::load_root_authority(self, DEFAULT_SUPERVISOR_SESSION_ID).await?
+        else {
+            return Ok(false);
+        };
+        let Some(reference) = observer_parent_reference(&preview) else {
+            return Ok(false);
+        };
+        let Some(registration) = preview
+            .supervisor_management
+            .as_ref()
+            .and_then(|state| state.observers.get(&expected.id))
+        else {
+            return Ok(false);
+        };
+        let ids = registration
+            .target_links
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let _guards = self.observer_guards(&expected.id, ids, None).await?;
+        let parent = self.management_supervisor_locked(&reference).await?;
+        let state = parent
+            .supervisor_management
+            .as_ref()
+            .ok_or_else(|| denied("Observer state is missing"))?;
+        let child = self
+            .load_child_wait_session(&parent, &expected.id, false)
+            .await?
+            .ok_or_else(|| denied("Observer Child is missing"))?;
+        if !caller.matches_session(&child)
+            || !observer_native_child(&child)
+            || !state.classifies_observer(&parent, &child)
+        {
+            return Err(denied(
+                "Observer activation identity or native route changed",
+            ));
+        }
+        let registration = state
+            .observers
+            .get(&child.id)
+            .expect("classified registration");
+        if !registration.enabled {
+            return Err(denied("Observer was revoked"));
+        }
+        for (id, link) in &registration.target_links {
+            let target = self
+                .load_root_authority_unchecked(id)
+                .await?
+                .ok_or_else(|| denied("Observer target is missing"))?;
+            if state.links.get(id) != Some(link) || !link_authorizes_target(state, link, &target) {
+                return Err(denied("Observer activation target scope changed"));
+            }
+        }
+        Ok(true)
+    }
+
+    pub(super) async fn observer_context_target(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<(Session, bamboo_domain::SupervisorObserverContext)> {
+        if caller.kind != SessionKind::Child
+            || caller.parent_session_id.as_deref() != Some(DEFAULT_SUPERVISOR_SESSION_ID)
+        {
+            return Err(denied("an explicitly registered Observer is required"));
+        }
+        target_id_is_valid(target_id)?;
+        let absence = self
+            .host_scope_registry
+            .retain_never_installed(&caller.session_id)
+            .await?;
+        let _guards = self
+            .observer_guards(&caller.session_id, [target_id.into()], Some(absence))
+            .await?;
+        let parent = self
+            .load_root_authority_unchecked(DEFAULT_SUPERVISOR_SESSION_ID)
+            .await?
+            .ok_or_else(|| denied("Observer parent is missing"))?;
+        let reference = observer_parent_reference(&parent)
+            .ok_or_else(|| denied("Observer parent is not the canonical Supervisor"))?;
+        let state = parent
+            .supervisor_management
+            .as_ref()
+            .ok_or_else(|| denied("Observer state is missing"))?;
+        let child = self
+            .load_child_wait_session(&parent, &caller.session_id, false)
+            .await?
+            .ok_or_else(|| denied("Observer Child is missing"))?;
+        if !caller.matches_session(&child)
+            || !observer_native_child(&child)
+            || !state.classifies_observer(&parent, &child)
+        {
+            return Err(denied("Observer original caller changed"));
+        }
+        let registration = state
+            .observers
+            .get(&child.id)
+            .expect("classified registration");
+        let link = registration
+            .target_links
+            .get(target_id)
+            .filter(|_| registration.enabled)
+            .ok_or_else(|| denied("Observer has no current view grant"))?;
+        let target = self
+            .load_root_authority_unchecked(target_id)
+            .await?
+            .ok_or_else(|| denied("Observer target is missing"))?;
+        if state.links.get(target_id) != Some(link) || !link_authorizes_target(state, link, &target)
+        {
+            return Err(denied("Observer view grant changed"));
+        }
+        Ok((
+            target,
+            bamboo_domain::SupervisorObserverContext {
+                supervisor: reference,
+                parent_created_at: parent.created_at,
+                child_created_at: child.created_at,
+                operation_id: registration.operation_id,
+                registration_revision: registration.revision,
+                target_link: link.clone(),
+            },
+        ))
+    }
+
     /// Retain the existing lifecycle/Task/Session authority while staging a
     /// decision for this exact Supervisor, without managing itself as a Root.
     pub(crate) async fn lock_supervisor_patrol_notice(
@@ -805,6 +1195,17 @@ impl SessionStoreV2 {
         };
         if changed {
             state.revision = next_revision(state.revision)?;
+            for observer in state.observers.values_mut() {
+                if observer.enabled
+                    && observer
+                        .target_links
+                        .iter()
+                        .any(|(id, link)| state.links.get(id) != Some(link))
+                {
+                    observer.enabled = false;
+                    observer.revision = state.revision;
+                }
+            }
             self.publish_management_state(&mut current, &state, &guards)
                 .await?;
         }
@@ -847,4 +1248,48 @@ impl SessionStoreV2 {
             authorized,
         })
     }
+}
+
+fn observer_receipt(
+    reference: &SupervisorReference,
+    child_id: &str,
+    state_revision: u64,
+    registration: &bamboo_domain::SupervisorObserverRegistration,
+    changed: bool,
+) -> bamboo_domain::SupervisorObserverReceipt {
+    bamboo_domain::SupervisorObserverReceipt {
+        supervisor: reference.clone(),
+        child_session_id: child_id.into(),
+        operation_id: registration.operation_id,
+        state_revision,
+        registration_revision: registration.revision,
+        enabled: registration.enabled,
+        changed,
+    }
+}
+
+fn observer_parent_reference(parent: &Session) -> Option<SupervisorReference> {
+    match parent.authority_identity {
+        SessionAuthorityIdentity::Supervisor { incarnation_id }
+            if parent.id == DEFAULT_SUPERVISOR_SESSION_ID && parent.kind == SessionKind::Root =>
+        {
+            Some(SupervisorReference {
+                session_id: parent.id.clone(),
+                incarnation_id,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn observer_native_child(child: &Session) -> bool {
+    child.kind == SessionKind::Child
+        && child.authority_identity.is_ordinary()
+        && child
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| state.read_only && state.plan_mode.is_none())
+        && !child.metadata.keys().any(|key| {
+            key.starts_with("external.") || key == "runtime.kind" || key == "child.named_profile.v1"
+        })
 }

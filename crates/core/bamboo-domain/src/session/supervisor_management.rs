@@ -10,7 +10,7 @@ use crate::{ProjectId, SupervisorBootstrapReceipt, DEFAULT_SUPERVISOR_SESSION_ID
 
 pub const SUPERVISOR_MANAGEMENT_SCHEMA_VERSION: u32 = 1;
 pub const SUPERVISOR_OBSERVER_SCHEMA_VERSION: u32 = 2;
-pub const MAX_SUPERVISOR_OBSERVERS: usize = 16;
+pub const MAX_SUPERVISOR_OBSERVERS: usize = 8;
 pub const MAX_SUPERVISOR_OBSERVER_TARGETS: usize = 8;
 pub const MAX_SUPERVISOR_PROJECTS: usize = 64;
 /// Includes disabled tombstones. Entries are never evicted or implicitly revived.
@@ -149,6 +149,15 @@ impl SupervisorManagementState {
                     return Err("enabled Supervisor Observer has a stale target link");
                 }
             }
+        }
+        // Leave room for the enclosing canonical proof within its 256 KiB cap.
+        if self.schema_version == SUPERVISOR_OBSERVER_SCHEMA_VERSION
+            && serde_json::to_vec_pretty(self)
+                .map_err(|_| "invalid Supervisor Observer encoding")?
+                .len()
+                > 224 * 1024
+        {
+            return Err("Supervisor Observer state exceeds its canonical byte budget");
         }
         Ok(())
     }

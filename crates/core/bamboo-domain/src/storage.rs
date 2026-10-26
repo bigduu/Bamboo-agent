@@ -551,6 +551,39 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Exact historical Observer classification from protected canonical state.
+    /// Cosmetic roles never exempt work, and revoked registrations classify
+    /// only their original Child and parent lifetimes.
+    async fn is_supervisor_observer_child(
+        &self,
+        parent: &Session,
+        child_id: &str,
+    ) -> std::io::Result<bool> {
+        let _ = (parent, child_id);
+        Ok(false)
+    }
+
+    /// Current admission, separate from historical classification. A disabled
+    /// or stale registered Observer returns an error, never ordinary fallback.
+    async fn supervisor_observer_activation(&self, child: &Session) -> std::io::Result<bool> {
+        let _ = child;
+        Ok(false)
+    }
+
+    /// A fixed-view read under an explicit durable Observer registration.
+    /// Called only after the Host namespace proves never-installed absence.
+    async fn load_supervisor_observer_context_target(
+        &self,
+        caller: &crate::SessionCallerReference,
+        target_id: &str,
+    ) -> std::io::Result<(Session, crate::SupervisorObserverContext)> {
+        let _ = (caller, target_id);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support Supervisor Observer context",
+        ))
+    }
+
     /// A strict control-plane source and its exact relationship epoch, read
     /// under one retained canonical Supervisor/target authority lock set.
     /// The projection receives no messages; strict authority checks may read Main.
