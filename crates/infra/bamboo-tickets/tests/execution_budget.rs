@@ -308,6 +308,72 @@ fn over_cap_report_is_retained_across_reopen_and_halts_new_admission() {
 }
 
 #[test]
+fn total_only_over_cap_proof_reopens_without_a_refund_or_new_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = open(dir.path());
+    let work = create(&service);
+    configure(&service, &work, 300, 300, 300);
+    let request = input_request(&service, &work, "total-only-over-cap");
+    let record = reserved(
+        service
+            .reserve_work_tokens(&runtime(), &request, 1)
+            .unwrap(),
+    );
+    let report = ExecutionTokenOverCapUsage {
+        input_tokens: None,
+        output_tokens: None,
+        total_tokens: Some(101),
+    };
+    service
+        .report_work_token_over_cap(
+            &runtime(),
+            &request.operation_id,
+            &request.request_hash,
+            &record.receipt,
+            report,
+        )
+        .unwrap();
+    drop(service);
+    let service = open(dir.path());
+    let budget = service.work_token_budget(&runtime()).unwrap().unwrap();
+    assert_eq!(budget.total_charged, 100);
+    assert_eq!(
+        budget.reservations[&request.operation_id].over_cap_usage,
+        Some(report)
+    );
+    assert_eq!(
+        service
+            .reserve_work_tokens(
+                &runtime(),
+                &input_request(&service, &work, "after-total-only-over-cap"),
+                2
+            )
+            .unwrap(),
+        WorkTokenAdmission::Blocked(WorkTokenBlock::Accounting)
+    );
+    assert!(service
+        .settle_work_tokens(
+            &runtime(),
+            &request.operation_id,
+            &request.request_hash,
+            &record.receipt,
+            ExecutionTokenUsage::Known {
+                input_tokens: 0,
+                output_tokens: 0
+            }
+        )
+        .is_err());
+    assert_eq!(
+        service
+            .work_token_budget(&runtime())
+            .unwrap()
+            .unwrap()
+            .total_charged,
+        100
+    );
+}
+
+#[test]
 fn accounting_preserves_fact_revision_but_real_work_mutation_advances_it() {
     let dir = tempfile::tempdir().unwrap();
     let service = open(dir.path());
