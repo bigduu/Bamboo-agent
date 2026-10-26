@@ -212,8 +212,23 @@ async fn two_project_supervisor_views_are_bounded_immutable_and_survive_reopen()
             target.project_id_meta().unwrap()
         );
         assert!(receipt.get("status_path").is_none());
+        let bundle = f.directory(&f.supervisor, &receipt);
+        let status = std::fs::read_to_string(bundle.join("status.md")).unwrap();
+        let source_lines: Vec<_> = status.lines().collect();
+        assert!(
+            source_lines.len() > 4,
+            "fixture needs two bounded continuations"
+        );
+        assert_eq!(
+            source_lines[1], "",
+            "keep the empty source line in this regression"
+        );
         let view = f.read(&f.supervisor, index, &receipt).await;
-        assert_eq!(view["content"].as_str().unwrap().lines().count(), 2);
+        // A final empty selected line becomes a trailing newline after join;
+        // String::lines() on that result does not count the empty selected line.
+        assert_eq!(view["content"], source_lines[..2].join("\n"));
+        assert_eq!(view["offset"], 0);
+        assert_eq!(view["total_lines"], source_lines.len());
         assert_eq!(view["next_offset"], 2);
         let mut header = request(target, &receipt);
         header["limit"] = json!(40);
@@ -234,8 +249,10 @@ async fn two_project_supervisor_views_are_bounded_immutable_and_survive_reopen()
                 .await
                 .unwrap(),
         );
-        assert_ne!(view["content"], later["content"]);
-        let bundle = f.directory(&f.supervisor, &receipt);
+        assert_eq!(later["content"], source_lines[2..4].join("\n"));
+        assert_eq!(later["offset"], 2);
+        assert_eq!(later["total_lines"], source_lines.len());
+        assert_eq!(later["next_offset"], 4);
         for file in ["status.md", "brief.md", "manifest.json"] {
             let content = std::fs::read_to_string(bundle.join(file)).unwrap();
             for private in [
