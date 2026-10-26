@@ -162,6 +162,30 @@ insufficient for desktop consumption until every asset required by its source
 contract and the final manifest have been uploaded and verified. Downstream
 consumers pin the actual version, source and hashes after that point.
 
+### Crate worker disk lifecycle
+
+The credential-free Cargo worker measures free space and its private debug
+scratch before and after packaging. It reclaims only that worker's
+`data/target/debug` tree when free space drops below 2 GiB or debug scratch
+exceeds 8 GiB. It preserves source, staged `.crate` archives, package output,
+registry cache and signed publication receipts. Startup measurements describe
+the same private target filesystem; this is separate from GitHub's persistent
+Actions cache storage.
+
+A package command that exits normally with Cargo status 101 and an explicit
+ENOSPC diagnostic may reclaim debug scratch and retry the same package once.
+Other errors, interrupted or unknown container outcomes, and a second ENOSPC
+remain failures. This recovery does not repeat an upload, reserve a version or
+change the archive checksum. Worker permission cleanup covers only its own
+non-symlink files and preserves Cargo's exit status.
+
+`Release Cargo Isolation` exercises this path with a tiny Cargo package and a
+private 128 MiB Linux tmpfs. It fills that mount to real ENOSPC, checks one
+successful recovery and exact reserved bytes, and replaces only the final
+network uploader with a fixture. Ordinary sandbox tests also cover bounded
+retry, non-space failures and symlink rejection. Release timing improvements
+must be measured on a later accepted production run.
+
 ## Failure and recovery
 
 - Preserve the original failed run, source and reservation. Retry the same
