@@ -49,8 +49,10 @@ jobs:
           set -euo pipefail
           [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$EXPECTED_SNAPSHOT_SHA" = "$GITHUB_SHA"
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SNAPSHOT_SHA"
-          test -z "$(git status --porcelain --untracked-files=all)"
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SNAPSHOT_SHA"
+          test -z "$status"
           git show -s --format='Acceptance source: %H tree: %T' HEAD
           sha256sum Cargo.lock
 
@@ -143,8 +145,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SNAPSHOT_SHA"
-          test -z "$(git status --porcelain --untracked-files=all)"
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SNAPSHOT_SHA"
+          test -z "$status"
 
   windows:
     name: Ticket Platform Adapter (Windows)
