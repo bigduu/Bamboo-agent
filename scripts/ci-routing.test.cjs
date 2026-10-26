@@ -153,7 +153,7 @@ function assertMainAdmission(source) {
   const [, admissionStep, ...sourceSteps] = full.split(/(?=^      - )/m);
   assert.match(admissionStep, /name: Require validation admission/);
   for (const step of sourceSteps) {
-    assert.match(step, /^        if: (?:needs.validation-source.outputs.full == 'true'(?: && github.base_ref != 'dev')?|(?:always\(\) && |failure\(\) && )?github.event_name != 'push'|github.event_name == 'pull_request' && github.base_ref == 'dev')$/m,
+    assert.match(step, /^        if: (?:(?:always|failure)\(\) && )?needs.validation-source.outputs.full == 'true'$/m,
       "main must perform admission only, without checkout, compilation or duplicate tests");
   }
 }
@@ -163,7 +163,7 @@ test("main Test reports real admission while the full suite remains on pre-merge
   for (const [from, to] of [
     ["ADMISSION_MODE: main", "ADMISSION_MODE: publication"],
     ['test "$MAIN_ADMISSION_RESULT" = success', 'true'],
-    ["if: github.event_name != 'push'", "if: always()"],
+    ["if: needs.validation-source.outputs.full == 'true'", "if: always()"],
     ["contents: read\n      actions: read", "contents: write\n      actions: read"],
   ]) assert.throws(() => assertMainAdmission(ci.replace(from, to)));
 });

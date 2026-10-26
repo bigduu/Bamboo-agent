@@ -12,6 +12,15 @@ doctests without combining incompatible `--doc`/target flags or compiling the
 same server library test binary in separate crate/filter workers. Unit and E2E
 are logical target/reporting groups, not separate Cargo build jobs.
 
+The Root birth/storage authority Unit selectors keep their original serial
+runtime requirement, including the matching session-merge regression. The Cargo
+invocation skips only their qualified selectors; the same compiled storage
+library-test executable then runs the original filters with `--test-threads=1`.
+Its discovered catalog and exact success log must match, including all five
+required families and four Root birth regressions. No case runs in both paths and no
+second Cargo invocation compiles it. The path-scoped Root Birth workflow retains
+its original strict Clippy policy, without another runtime test producer.
+
 Only this feature job sets dev/test debug info to `0`; it keeps debug assertions,
 the existing optimization settings and `CARGO_INCREMENTAL=0`. Formal release
 profiles are unchanged. All selected-package artifacts coexist in the owned

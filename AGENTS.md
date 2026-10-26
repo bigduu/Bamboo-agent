@@ -26,6 +26,8 @@ containment-boundary, explicit manual diagnostics and pinned legacy routes are
 scoped exceptions with named owners. Preserve
 applicable native-platform acceptance before dev admission. Fix failures in the
 feature branch before merging; record exact source, commands and results.
+Keep the storage authority families' serial runtime selection in that same
+executor, reusing its compiled library-test executable without repeating cases.
 `Quick Checks` remains auxiliary and never substitutes for runtime tests.
 
 The intended release contract is feature tests -> accepted dev cut -> one version

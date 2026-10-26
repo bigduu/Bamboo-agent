@@ -295,6 +295,38 @@ test("the feature executor bounds debug artifacts and records capacity without c
   assert.doesNotMatch(readFileSync(".github/workflows/publish-crate.yml", "utf8"), /CARGO_PROFILE_(?:DEV|TEST)_DEBUG/u)
 })
 
+test("required Test performs only result admission for feature PRs without an unused checkout, toolchain or cache", () => {
+  const assertOwnership = (source) => {
+    const steps = source.split(/\n      - /u).slice(1)
+    assert.ok(steps.length > 1)
+    assert.match(steps[0], /^name: Require validation admission\n/u)
+    for (const step of steps.slice(1)) {
+      assert.match(step, /^        if: (?:(?:always|failure)\(\) && )?needs\.validation-source\.outputs\.full == 'true'$/mu)
+    }
+  }
+  const aggregate = job("test")
+  assertOwnership(aggregate)
+  for (const name of ["Install Rust", "Record the full validation toolchain", "Rust cache"]) {
+    assert.throws(() => assertOwnership(aggregate.replace(`name: ${name}\n        if: needs.validation-source.outputs.full == 'true'`,
+      `name: ${name}\n        if: github.event_name != 'push'`)))
+  }
+})
+
+test("serial Root birth selectors reuse canonical storage compilation and preserve strict lint ownership", () => {
+  const { SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES, cargoArguments } = require("./run-feature-tests.cjs")
+  assert.deepEqual(SERIAL_STORAGE_FAMILIES, ["v2::root_birth_tests::", "v2::host_root_create::tests::",
+    "v2::supervisor_management_tests::", "v2::supervisor_management_lifetime_tests::", "v2::supervisor_proof_tests::"])
+  assert.deepEqual(SERIAL_STORAGE_FILTERS, ["root_birth_tests", "host_root_create::tests", "supervisor_management", "supervisor_proof"])
+  const source = readFileSync("crates/infra/bamboo-storage/src/v2/root_birth_tests.rs", "utf8")
+  assert.deepEqual([...source.matchAll(/async fn (root_birth_[a-z_]+)\(/gu)].map(match => match[1]).sort(), [...ROOT_BIRTH_CASES].sort())
+  const args = cargoArguments([{ name: "bamboo-storage" }])
+  assert.deepEqual(args.slice(args.indexOf("--") + 1), SERIAL_STORAGE_SELECTORS.flatMap(prefix => ["--skip", prefix]))
+  const lint = readFileSync(".github/workflows/root-birth-acceptance.yml", "utf8")
+  assert.doesNotMatch(lint, /cargo test/u)
+  assert.match(lint, /cargo clippy --locked --all-features --lib -p bamboo-storage -- -D warnings/u)
+  assert.match(lint, /test "\$actual" = "\$EXPECTED_SOURCE"/u)
+})
+
 function assertLinuxTestOwnership(definitions) {
   const registered = {
     "ci.yml": {

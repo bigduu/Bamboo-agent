@@ -98,7 +98,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "726ee6fd89e23d65f79328e9262c33ae349fa1f29cb98976834468add69ea7bb"
+          ADMISSION_HELPER_SHA256: "cfed0ee23810e25fe086660fb94ba7806450255878c7f3da6f68a738f5ba4ff4"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -284,10 +284,10 @@ jobs:
           esac
 
       - uses: actions/checkout@v7
-        if: github.event_name != 'push'
+        if: needs.validation-source.outputs.full == 'true'
 
       - name: Require the exact clean event source
-        if: github.event_name != 'push'
+        if: needs.validation-source.outputs.full == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -298,7 +298,7 @@ jobs:
           sha256sum Cargo.lock
 
       - name: Setup Node.js
-        if: github.event_name != 'push'
+        if: needs.validation-source.outputs.full == 'true'
         uses: actions/setup-node@v7
         with:
           node-version: '24'
@@ -324,13 +324,13 @@ jobs:
           node -e "for (const file of ['crates/app/bamboo-server/frontend_package/lotus-frontend.zip', 'crates/app/bamboo-server/frontend_package/frontend-manifest.json']) require('node:fs').accessSync(file)"
 
       - name: Install Rust
-        if: github.event_name != 'push'
+        if: needs.validation-source.outputs.full == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
       - name: Record the full validation toolchain
-        if: github.event_name != 'push'
+        if: needs.validation-source.outputs.full == 'true'
         run: |
           rustc --version --verbose
           cargo --version --verbose
@@ -340,12 +340,12 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Rust cache
-        if: github.event_name != 'push'
+        if: needs.validation-source.outputs.full == 'true'
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-test-${{ runner.os }}
           workspaces: . -> target/grouped-default
-          # Keep iterative dev PR caches; main PRs restore from their base branch.
+          # This legacy cache runs only for full release/manual validation.
           save-if: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'dev')) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Verify published server crate owns the frontend package
@@ -377,7 +377,7 @@ jobs:
           test "$SSH_RESULT" = success
 
       - name: Preserve failed synthetic Ticket fixture evidence
-        if: failure() && github.event_name != 'push'
+        if: failure() && needs.validation-source.outputs.full == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: ticket-fixture-failure-${{ github.run_id }}-${{ github.run_attempt }}
@@ -391,7 +391,7 @@ jobs:
           retention-days: 7
 
       - name: Require the exact clean source after full validation
-        if: always() && github.event_name != 'push'
+        if: always() && needs.validation-source.outputs.full == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -464,7 +464,7 @@ jobs:
         with:
           name: feature-unit-e2e-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/bamboo-feature-tests-*/cargo.log
+            ${{ runner.temp }}/bamboo-feature-tests-*/*.log
             ${{ runner.temp }}/bamboo-feature-profile.log
           if-no-files-found: ignore
           retention-days: 7
