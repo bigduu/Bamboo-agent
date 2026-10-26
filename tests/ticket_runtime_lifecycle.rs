@@ -241,7 +241,7 @@ async fn actual_host_loss_fences_unknown_run_without_automatic_redispatch() {
         project
     );
     f.finish().await;
-    eprintln!("native Project crash: Host {previous_pid} -> {recovered_pid}; real Task then SIGKILL, unknown stop/claims retained through owner Cancel, same claim denied, disjoint Work submitted; local provider=4 external=0");
+    eprintln!("native Project crash: Host {previous_pid} -> {recovered_pid}; real Task then SIGKILL, unknown stop/claims retained through owner Cancel, same claim denied, disjoint Work submitted; Work provider calls=4 (existing probe), external=0");
 }
 
 impl Fixture {
