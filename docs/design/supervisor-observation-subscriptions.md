@@ -77,3 +77,5 @@ retries the same semantic event. `reported` is producer enqueue truth, not
 consumer ACK. Fault delivery has its own eight-error finite exponential backoff;
 exhaustion remains visibly unreported and exact retries never reset it. Inbox
 or canonical storage failure is never represented as a successful notification.
+A deleted/replaced Child likewise permits only the original Supervisor's bounded
+failure counter update; it cannot borrow the replacement's lifetime or authority.

@@ -54,21 +54,6 @@ impl SessionStoreV2 {
             .host_scope_registry
             .retain_never_installed(child_id)
             .await?;
-        self.lock_subscription_state(reference, child_id, require_targets, Some(absence))
-            .await
-    }
-
-    // Used without a Host namespace only by the private diagnostic failure
-    // writer. Such a guard cannot authorize a view or physical Inbox admission.
-    async fn lock_subscription_state(
-        &self,
-        reference: &SupervisorReference,
-        child_id: &str,
-        require_targets: bool,
-        absence: Option<crate::host_session_scope::HostSessionScopeAbsence>,
-    ) -> io::Result<LockedObserver> {
-        reference_is_valid(reference)?;
-        target_id_is_valid(child_id)?;
         let preview = Storage::load_root_authority(self, &reference.session_id)
             .await?
             .ok_or_else(|| denied("Observer Supervisor is missing"))?;
@@ -83,7 +68,7 @@ impl SessionStoreV2 {
             Vec::new()
         };
         let guards = self
-            .observer_guards(child_id, targets.clone(), absence, false)
+            .observer_guards(child_id, targets.clone(), Some(absence), false)
             .await?;
         let parent = self.management_supervisor_locked(reference).await?;
         self.check_management_session_compatibility(&parent).await?;
@@ -413,19 +398,51 @@ impl SessionStoreV2 {
         child_id: &str,
         now: DateTime<Utc>,
     ) -> io::Result<()> {
-        let mut locked = self
-            .lock_subscription_state(reference, child_id, false, None)
-            .await?;
-        let subscription = locked
-            .state
+        reference_is_valid(reference)?;
+        target_id_is_valid(child_id)?;
+        // Only the current Supervisor's own relationship changes. No current
+        // Child (which may be gone/replaced), Host grant or target is borrowed.
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let sessions = self.management_session_locks(None).await?;
+        let guards = Arc::new(SupervisorManagementGuards {
+            sessions,
+            _task: task,
+            _lifecycle: super::LifecycleGuard::Shared { _guard: lifecycle },
+            _host_namespace: None,
+        });
+        let mut parent = self.management_supervisor_locked(reference).await?;
+        self.check_management_session_compatibility(&parent).await?;
+        let mut state = parent
+            .supervisor_management
+            .clone()
+            .ok_or_else(|| denied("Observer state missing"))?;
+        let registration = state
+            .observers
+            .get(child_id)
+            .ok_or_else(|| denied("Observer registration missing"))?;
+        let subscription = state
             .subscriptions
             .get_mut(child_id)
             .ok_or_else(|| denied("Observer has no subscription"))?;
-        if subscription.window.scope_epoch != locked.registration.revision {
-            return Err(denied("Observer diagnostic epoch changed"));
+        if !registration.enabled
+            || registration.parent_created_at != parent.created_at
+            || subscription.window.scope_epoch != registration.revision
+        {
+            return Err(denied(
+                "Observer diagnostic registration was revoked or changed",
+            ));
         }
         subscription
-            .capture_terminal_fault(&owner(reference, &locked.child), now)
+            .capture_terminal_fault(
+                &ObserverSubscriptionOwner {
+                    supervisor_incarnation: reference.incarnation_id,
+                    supervisor_created_at: registration.parent_created_at,
+                    observer_session_id: child_id,
+                    observer_created_at: registration.child_created_at,
+                },
+                now,
+            )
             .map_err(invalid)?;
         let fault = subscription
             .terminal_fault
@@ -435,12 +452,11 @@ impl SessionStoreV2 {
             return Ok(());
         }
         fault.delivery_failed(now);
-        locked.state.schema_version = locked
-            .state
+        state.schema_version = state
             .schema_version
             .max(bamboo_domain::SUPERVISOR_OBSERVER_FAULT_SCHEMA_VERSION);
-        locked.state.revision = next_revision(locked.state.revision)?;
-        self.publish_management_state(&mut locked.parent, &locked.state, &locked.guards)
+        state.revision = next_revision(state.revision)?;
+        self.publish_management_state(&mut parent, &state, &guards)
             .await
     }
 

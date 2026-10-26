@@ -354,6 +354,42 @@ async fn fault_missing_source_can_report_but_revoked_registration_cannot() {
     assert!(!fault(&f).await.reported);
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 0);
     f.state.shutdown().await;
+    let f = Fixture::new().await;
+    f.register(all()).await;
+    let original = exhaust(&f, Failure::AuthorityUnavailable, now).await;
+    assert!(f.state.storage.delete_session(OBSERVER).await.unwrap());
+    let replacement = f.child(OBSERVER, true, READER).await;
+    assert_ne!(replacement.created_at, original.payload.observer_created_at);
+    for attempt in 0..8 {
+        assert!(f
+            .state
+            .observer_subscriptions
+            .inbox
+            .deliver_supervisor_observer_fault(
+                &f.reference,
+                OBSERVER,
+                now + chrono::Duration::minutes(attempt * 6 + 1)
+            )
+            .await
+            .is_err());
+    }
+    assert_eq!(fault(&f).await.delivery_failures, 8);
+    assert!(!fault(&f).await.reported);
+    assert_eq!(fault(&f).await.payload, original.payload);
+    assert_eq!(
+        f.state
+            .session_inbox
+            .backlog(&f.reference.session_id)
+            .await
+            .unwrap()
+            .generation,
+        0
+    );
+    assert_eq!(
+        serde_json::to_value(load(&f.state, OBSERVER).await).unwrap(),
+        serde_json::to_value(replacement).unwrap()
+    );
+    f.state.shutdown().await;
 }
 
 #[tokio::test]
