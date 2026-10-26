@@ -2169,6 +2169,7 @@ fn valid_effect_transition(from: EffectState, to: EffectState) -> bool {
 }
 
 pub(crate) fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
+    crate::execution_budget::validate(snapshot)?;
     crate::project::validate(snapshot)?;
     crate::sprint::validate(snapshot)?;
     crate::planning::validate(snapshot)?;

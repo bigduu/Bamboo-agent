@@ -21,7 +21,7 @@ struct FencedJournal {
     store: PatrolCheckpointStore,
     fence: ReadyAdmissionFence,
     service: std::sync::Arc<bamboo_tickets::TicketService>,
-    commit: String,
+    facts_revision: u64,
     scopes: Vec<Scope>,
 }
 
@@ -35,8 +35,9 @@ impl FencedJournal {
             .service
             .published()
             .map_err(|_| PortError::Unavailable)?
-            .0
-            != self.commit
+            .1
+            .execution_facts_revision()
+            != self.facts_revision
         {
             return Err(PortError::Conflict);
         }
@@ -75,7 +76,8 @@ impl TicketApplication {
     ) -> Result<()> {
         fence.check()?;
         let (service, authority) = self.authority(Principal::Runtime).await?;
-        let (commit, snapshot) = service.published()?;
+        let (_, snapshot) = service.published()?;
+        let facts_revision = snapshot.execution_facts_revision();
         let expected_binding = snapshot.binding.clone();
         let binding =
             bamboo_tickets::content_hash(&bamboo_tickets::canonical_bytes(&snapshot.binding)?);
@@ -95,7 +97,7 @@ impl TicketApplication {
                 store,
                 fence,
                 service: service.clone(),
-                commit,
+                facts_revision,
                 scopes: Vec::new(),
             };
             journal.current().map_err(patrol_error)?;

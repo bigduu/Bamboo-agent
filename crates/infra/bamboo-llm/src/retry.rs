@@ -89,6 +89,45 @@ impl InitialHttpRetryObserver {
 
 tokio::task_local! {
     static INITIAL_HTTP_RETRY_OBSERVER: Arc<InitialHttpRetryObserver>;
+    static WORK_PHYSICAL_REQUEST: Arc<AtomicBool>;
+}
+
+/// One durable Work reservation permits one physical model request. The same
+/// handle follows bootstrap and stream polls; fallbacks share its spent bit.
+/// A retry must return through the Host for another durable reservation.
+#[derive(Clone, Default)]
+pub struct WorkPhysicalRequest(Arc<AtomicBool>);
+
+impl WorkPhysicalRequest {
+    pub async fn scope<F: Future>(&self, future: F) -> F::Output {
+        WORK_PHYSICAL_REQUEST.scope(self.0.clone(), future).await
+    }
+}
+
+pub(crate) fn work_request_budget_active() -> bool {
+    WORK_PHYSICAL_REQUEST.try_with(|_| ()).is_ok()
+}
+
+pub(crate) fn claim_work_physical_request() -> Result<(), LLMError> {
+    WORK_PHYSICAL_REQUEST.try_with(|spent| {
+        spent.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map(|_| ())
+            .map_err(|_| LLMError::RequestFailed("Work token reservation permits one physical model send; a new Host reservation is required".into()))
+    }).unwrap_or(Ok(()))
+}
+
+pub(crate) async fn send_provider_request<F>(
+    config: &RetryConfig,
+    provider: &str,
+    build: F,
+) -> Result<Response, LLMError>
+where
+    F: Fn() -> RequestBuilder,
+{
+    claim_work_physical_request()?;
+    send_with_retry(config, provider, build)
+        .await
+        .map_err(LLMError::Http)
 }
 
 pub async fn observe_initial_http_retries<F: Future>(
@@ -344,7 +383,11 @@ where
     Fut: Future<Output = RetryAttempt<T>>,
     D: Fn(&mut RetryAttempt<T>, RetryDecision),
 {
-    let max_attempts = config.max_attempts.max(1);
+    let max_attempts = if work_request_budget_active() {
+        1
+    } else {
+        config.max_attempts.max(1)
+    };
     let mut index = 0;
     loop {
         let mut outcome = attempt().await;
@@ -565,6 +608,7 @@ pub(crate) async fn send_anthropic_with_retry<F>(
 where
     F: Fn() -> RequestBuilder,
 {
+    claim_work_physical_request()?;
     let _ = INITIAL_HTTP_RETRY_OBSERVER
         .try_with(|observer| observer.budget_managed.store(true, Ordering::Relaxed));
     let mut cancellation = CancellationObservation {
@@ -763,6 +807,58 @@ mod tests {
             client.post(&url).json(&serde_json::json!({"a": 1}))
         })
         .await
+    }
+
+    #[tokio::test]
+    async fn work_budget_permits_one_physical_send_across_retry_and_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::new();
+        let config = fast_config(4);
+        let scope = WorkPhysicalRequest::default();
+        let response = scope
+            .scope(send_provider_request(&config, "local-budget", || {
+                client.post(server.uri())
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let retry = scope
+            .scope(send_provider_request(
+                &config,
+                "local-budget-fallback",
+                || client.post(server.uri()),
+            ))
+            .await;
+        assert!(matches!(retry, Err(LLMError::RequestFailed(_))));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn work_budget_unknown_headers_timeout_never_resends() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(200)))
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(30))
+            .build()
+            .unwrap();
+        let scope = WorkPhysicalRequest::default();
+        let response = scope
+            .scope(send_provider_request(
+                &fast_config(4),
+                "local-budget-timeout",
+                || client.post(server.uri()),
+            ))
+            .await;
+        assert!(matches!(response, Err(LLMError::Http(error)) if error.is_timeout()));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

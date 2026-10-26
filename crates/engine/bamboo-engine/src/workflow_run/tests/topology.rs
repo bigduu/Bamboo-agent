@@ -170,13 +170,13 @@ async fn topology_preserves_unexpanded_map_prefix_without_fabricating_item_zero(
     let WorkflowPlan::Map { body, .. } = &mut outer else {
         unreachable!()
     };
-    *body = Box::new(choice_plan(
+    **body = choice_plan(
         ValueRef::Literal {
             value: json!(false),
         },
         *body.clone(),
         choice_leaf("other"),
-    ));
+    );
     flow.plan = outer;
     let result = engine(directory.path(), MockDefinitions::default())
         .run(request(

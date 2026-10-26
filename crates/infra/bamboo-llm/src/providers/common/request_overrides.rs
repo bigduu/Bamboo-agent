@@ -107,6 +107,25 @@ pub fn apply_overrides_to_body(
     apply_overrides_to_body_with_env(body, overrides, endpoint, model, &env_vars);
 }
 
+/// A configured Work budget cannot accept arbitrary wire body patches (which
+/// may replace/remove token limits, model, prompts or candidate counts). Reject
+/// the resolved patch before any model request; header-only overrides remain.
+pub(crate) fn validate_budgeted_overrides(
+    overrides: Option<&RequestOverridesConfig>,
+    endpoint: &str,
+    model: Option<&str>,
+) -> crate::provider::Result<()> {
+    if crate::retry::work_request_budget_active()
+        && overrides
+            .is_some_and(|config| !resolve_scope(config, endpoint, model).body_patch.is_empty())
+    {
+        return Err(crate::provider::LLMError::RequestFailed(
+            "Configured Work token accounting does not permit request body patches".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn apply_overrides_to_body_with_env(
     body: &mut Value,
     overrides: Option<&RequestOverridesConfig>,
@@ -457,6 +476,73 @@ mod tests {
         BodyPatch, GeneratedValue, ModelRequestRule, RequestOverridesConfig, RequestScopeOverride,
         TemplateExpr, TemplateExprSpec,
     };
+
+    #[tokio::test]
+    async fn work_budget_rejects_resolved_body_patch_and_keeps_legacy_behavior() {
+        for (path, op, value) in [
+            ("max_tokens", BodyPatchOp::Remove, None),
+            (
+                "max_output_tokens",
+                BodyPatchOp::Set,
+                Some(PatchValue::Json(Value::from(999999))),
+            ),
+            (
+                "generationConfig.maxOutputTokens",
+                BodyPatchOp::Set,
+                Some(PatchValue::Json(Value::from(999999))),
+            ),
+            (
+                "n",
+                BodyPatchOp::Set,
+                Some(PatchValue::Json(Value::from(10))),
+            ),
+        ] {
+            let overrides = RequestOverridesConfig {
+                common: RequestScopeOverride {
+                    headers: Default::default(),
+                    body_patch: vec![BodyPatch {
+                        path: path.into(),
+                        op,
+                        value,
+                    }],
+                },
+                ..Default::default()
+            };
+            assert!(validate_budgeted_overrides(
+                Some(&overrides),
+                ENDPOINT_RESPONSES,
+                Some("local-model")
+            )
+            .is_ok());
+            let scoped = crate::retry::WorkPhysicalRequest::default()
+                .scope(async {
+                    validate_budgeted_overrides(
+                        Some(&overrides),
+                        ENDPOINT_RESPONSES,
+                        Some("local-model"),
+                    )
+                })
+                .await;
+            assert!(matches!(
+                scoped,
+                Err(crate::provider::LLMError::RequestFailed(_))
+            ));
+        }
+        crate::retry::WorkPhysicalRequest::default()
+            .scope(async {
+                assert!(
+                    validate_budgeted_overrides(None, ENDPOINT_RESPONSES, Some("local-model"))
+                        .is_ok()
+                );
+                assert!(validate_budgeted_overrides(
+                    Some(&RequestOverridesConfig::default()),
+                    ENDPOINT_RESPONSES,
+                    Some("local-model")
+                )
+                .is_ok());
+            })
+            .await;
+    }
 
     #[test]
     fn model_rule_specificity_prefers_exact_over_prefix() {

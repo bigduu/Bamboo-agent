@@ -213,8 +213,8 @@ async fn assert_public_direct_retains_unknown_running(sequence: RunningSequence)
     assert_eq!(running_pair(&fixture.session).tool_success, Some(false));
     assert_no_running_wait(&fixture.session);
     let (provider_calls, expected_counts) = match sequence {
-        RunningSequence::SameBatchAsStart => (1, (0, 0, 1)),
-        RunningSequence::AfterStart => (2, (1, 0, 2)),
+        RunningSequence::SameBatch => (1, (0, 0, 1)),
+        RunningSequence::Later => (2, (1, 0, 2)),
         _ => unreachable!("this matrix covers only active management"),
     };
     assert_eq!(provider.calls.load(Ordering::SeqCst), provider_calls);
@@ -304,10 +304,7 @@ async fn assert_public_direct_retains_unknown_running(sequence: RunningSequence)
 #[tokio::test]
 async fn self_control_public_direct_unknown_running_retains_exact_owner_and_blocks_genuine_user_and_wakes(
 ) {
-    for sequence in [
-        RunningSequence::SameBatchAsStart,
-        RunningSequence::AfterStart,
-    ] {
+    for sequence in [RunningSequence::SameBatch, RunningSequence::Later] {
         assert_public_direct_retains_unknown_running(sequence).await;
     }
 }
