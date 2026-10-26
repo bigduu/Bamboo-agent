@@ -116,6 +116,18 @@ impl SessionInspectorTool {
         }
     }
 
+    /// Trusted Host subscription adapter. It reuses the exact scoped reader and
+    /// safe publisher, skipping publication when selected meaningful facts match.
+    pub async fn observe_context(
+        &self,
+        ctx: &ToolCtx,
+        target_id: &str,
+        filter: &std::collections::BTreeSet<bamboo_domain::ObserverChangeKind>,
+        previous: Option<&str>,
+    ) -> Result<Option<bamboo_agent_core::tools::ToolResult>, ToolError> {
+        scoped_context::observe(self, ctx, target_id, filter, previous).await
+    }
+
     pub(super) async fn load_session(
         &self,
         session_id: &str,

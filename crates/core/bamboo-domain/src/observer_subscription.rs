@@ -5,10 +5,11 @@
 //! only a real SessionInbox enqueue receipt permits advancing the producer
 //! cursor. Consumer admission/ACK stays exclusively in the existing Inbox.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::session::inbox::{canonical_json_bytes, SessionInboxReceipt, SessionMessageId};
@@ -27,6 +28,28 @@ pub enum ObserverChangeKind {
     Tasks,
 }
 
+pub fn observer_filtered_fingerprint(
+    filter: &BTreeSet<ObserverChangeKind>,
+    values: &BTreeMap<ObserverChangeKind, String>,
+) -> Result<String, &'static str> {
+    if filter.is_empty() {
+        return Err("empty Observer filter");
+    }
+    let selected: BTreeMap<_, _> = filter
+        .iter()
+        .map(|kind| {
+            let value = values
+                .get(kind)
+                .filter(|value| digest_shape(value))
+                .ok_or("missing Observer fingerprint")?;
+            Ok((kind, value))
+        })
+        .collect::<Result<_, &'static str>>()?;
+    Ok(hex::encode(Sha256::digest(canonical_json_bytes(
+        &serde_json::to_value(selected).map_err(|_| "fingerprint encoding")?,
+    ))))
+}
+
 /// The view is already published. These selectors confer no file/read right.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,7 +59,7 @@ pub struct ObserverViewChange {
     pub target_session_id: String,
     pub view_revision: String,
     pub source_fingerprint: String,
-    pub kind: ObserverChangeKind,
+    pub observed_kinds: BTreeSet<ObserverChangeKind>,
     pub observed_at: DateTime<Utc>,
     pub event_id: SessionMessageId,
 }
@@ -92,6 +115,7 @@ impl ObserverViewChange {
         crate::validate_supervisor_target_id(&self.target_session_id)?;
         if self.scope_epoch == 0
             || self.sequence == 0
+            || self.observed_kinds.is_empty()
             || !digest_shape(&self.view_revision)
             || !digest_shape(&self.source_fingerprint)
             || canonical_json_bytes(&serde_json::to_value(self).map_err(|_| "change encoding")?)
@@ -115,7 +139,7 @@ impl ObserverViewChange {
                 "target_session_id":self.target_session_id,
                 "view_revision":self.view_revision,
                 "source_fingerprint":self.source_fingerprint,
-                "kind":self.kind, "observed_at":self.observed_at,
+                "observed_kinds":self.observed_kinds, "observed_at":self.observed_at,
             }),
         )
     }
@@ -207,7 +231,7 @@ impl ObserverSubscriptionWindow {
         target: &str,
         view_revision: &str,
         source_fingerprint: &str,
-        kind: ObserverChangeKind,
+        observed_kinds: BTreeSet<ObserverChangeKind>,
         observed_at: DateTime<Utc>,
     ) -> Result<ObserverStageOutcome, &'static str> {
         self.validate_for_owner(owner)?;
@@ -231,7 +255,7 @@ impl ObserverSubscriptionWindow {
             target_session_id: target.into(),
             view_revision: view_revision.into(),
             source_fingerprint: source_fingerprint.into(),
-            kind,
+            observed_kinds,
             observed_at,
             event_id: SessionMessageId::new(),
         };
@@ -331,6 +355,75 @@ impl ObserverSubscriptionWindow {
     }
 }
 
+/// One bounded producer policy, persisted with its canonical registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObserverSubscription {
+    pub filter: BTreeSet<ObserverChangeKind>,
+    pub min_interval_ms: u32,
+    pub window: ObserverSubscriptionWindow,
+    pub failures: u8,
+    pub retry_at: Option<DateTime<Utc>>,
+    pub last_error: Option<ObserverSubscriptionFailure>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObserverSubscriptionFailure {
+    PublicationUnavailable,
+    InboxUnavailable,
+    AuthorityUnavailable,
+}
+
+impl ObserverSubscription {
+    pub fn new(
+        epoch: u64,
+        filter: BTreeSet<ObserverChangeKind>,
+        min_interval_ms: u32,
+    ) -> Result<Self, &'static str> {
+        let value = Self {
+            filter,
+            min_interval_ms,
+            window: ObserverSubscriptionWindow::new(epoch)?,
+            failures: 0,
+            retry_at: None,
+            last_error: None,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.window.validate()?;
+        if self.filter.is_empty()
+            || !(1_000..=3_600_000).contains(&self.min_interval_ms)
+            || self.failures > 8
+            || self
+                .window
+                .history
+                .iter()
+                .chain(self.window.pending.iter())
+                .any(|change| !change.observed_kinds.is_subset(&self.filter))
+        {
+            return Err("invalid Observer subscription policy");
+        }
+        Ok(())
+    }
+    pub fn ready(&self, now: DateTime<Utc>) -> bool {
+        self.failures < 8 && self.retry_at.is_none_or(|at| at <= now)
+    }
+    pub fn record_failure(&mut self, now: DateTime<Utc>, code: ObserverSubscriptionFailure) {
+        self.failures = self.failures.saturating_add(1).min(8);
+        self.last_error = Some(code);
+        self.retry_at = (self.failures < 8)
+            .then(|| now + chrono::Duration::seconds((1_i64 << self.failures).min(300)));
+    }
+    pub fn delivered(&mut self, now: DateTime<Utc>) {
+        self.failures = 0;
+        self.last_error = None;
+        self.retry_at = Some(now + chrono::Duration::milliseconds(i64::from(self.min_interval_ms)));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,7 +445,7 @@ mod tests {
                 "root-a",
                 &format!("{:064x}", n + 1),
                 &format!("{n:064x}"),
-                ObserverChangeKind::Status,
+                BTreeSet::from([ObserverChangeKind::Status]),
                 Utc.timestamp_opt(1_700_000_002, 0).unwrap(),
             )
             .unwrap()
@@ -382,7 +475,7 @@ mod tests {
                 "root-b",
                 &"b".repeat(64),
                 &"c".repeat(64),
-                ObserverChangeKind::NeedsInput,
+                BTreeSet::from([ObserverChangeKind::NeedsInput]),
                 Utc::now(),
             )
             .unwrap();
@@ -423,7 +516,7 @@ mod tests {
                 "root-a",
                 &"a".repeat(64),
                 &pending.source_fingerprint,
-                ObserverChangeKind::Status,
+                BTreeSet::from([ObserverChangeKind::Status]),
                 Utc::now(),
             )
             .unwrap();

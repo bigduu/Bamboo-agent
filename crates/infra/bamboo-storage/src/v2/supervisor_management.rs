@@ -104,6 +104,7 @@ fn empty_state(incarnation_id: Uuid) -> SupervisorManagementState {
         allowed_projects: BTreeSet::new(),
         links: BTreeMap::new(),
         observers: BTreeMap::new(),
+        subscriptions: BTreeMap::new(),
     }
 }
 
@@ -368,7 +369,7 @@ impl SessionStoreV2 {
             links.insert(id.clone(), link.clone());
         }
         state.revision = next_revision(state.revision)?;
-        state.schema_version = SUPERVISOR_OBSERVER_SCHEMA_VERSION;
+        state.schema_version = state.schema_version.max(SUPERVISOR_OBSERVER_SCHEMA_VERSION);
         let registration = SupervisorObserverRegistration {
             operation_id,
             revision: state.revision,
