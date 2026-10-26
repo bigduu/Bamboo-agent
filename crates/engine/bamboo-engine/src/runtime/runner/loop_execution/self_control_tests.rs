@@ -347,24 +347,34 @@ impl Fixture {
         storage: Arc<dyn Storage>,
         mut rx: mpsc::Receiver<AgentEvent>,
     ) -> (Result<(), AgentError>, Vec<AgentEvent>) {
-        tokio::pin!(run);
-        let mut events = Vec::new();
-        let result = loop {
-            tokio::select! {
-                result = &mut run => break result,
-                event = rx.recv() => {
-                    if let Some(event) = event {
+        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+        let run = async move {
+            let result = run.await;
+            let _ = finished_tx.send(());
+            result
+        };
+        // A durable observation can wait on a lock held by the next runner
+        // checkpoint. Keep polling both futures while either one is waiting.
+        let observe = async move {
+            let mut events = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = &mut finished_rx => break,
+                    event = rx.recv() => {
+                        let Some(event) = event else { break };
                         Self::observe_event(storage.as_ref(), &event).await;
                         events.push(event);
                     }
                 }
             }
+            // Completion does not require every cloned event sender to close.
+            while let Ok(event) = rx.try_recv() {
+                Self::observe_event(storage.as_ref(), &event).await;
+                events.push(event);
+            }
+            events
         };
-        while let Ok(event) = rx.try_recv() {
-            Self::observe_event(storage.as_ref(), &event).await;
-            events.push(event);
-        }
-        (result, events)
+        tokio::join!(run, observe)
     }
 
     async fn observe_event(storage: &dyn Storage, event: &AgentEvent) {
