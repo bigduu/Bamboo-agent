@@ -136,8 +136,13 @@ impl SupervisorFollowupGuard {
 pub(super) struct SupervisorManagementGuards {
     sessions: Vec<SessionWriteGuard>,
     _task: RuntimeTaskTransactionReadGuard,
-    _lifecycle: SessionLifecycleReadGuard,
+    _lifecycle: ManagementLifecycleGuard,
     _host_namespace: Option<crate::host_session_scope::HostSessionScopeAbsence>,
+}
+
+enum ManagementLifecycleGuard {
+    Shared { _guard: SessionLifecycleReadGuard },
+    Exclusive { _guard: SessionLifecycleWriteGuard },
 }
 
 impl Drop for SupervisorManagementGuards {
@@ -189,11 +194,46 @@ impl SessionStoreV2 {
         child_id: &str,
         targets: impl IntoIterator<Item = String>,
         absence: Option<crate::host_session_scope::HostSessionScopeAbsence>,
+        registering: bool,
     ) -> io::Result<Arc<SupervisorManagementGuards>> {
         target_id_is_valid(child_id)?;
         let lifecycle = self.lock_session_lifecycle_shared().await?;
         let task = self.lock_runtime_task_sidecar_shared().await?;
+        {
+            // Never put an existing Root in the later Child lock position.
+            // Reserved Root creation holds exclusive lifecycle, so an absent
+            // candidate cannot become a Root while these guards are retained.
+            let _child = self.acquire_session_maintenance_lock(child_id).await?;
+            if self
+                .load_root_authority_unchecked(child_id)
+                .await?
+                .is_some()
+            {
+                return Err(denied("an independent Root cannot become an Observer"));
+            }
+            if registering {
+                let parent = self
+                    .load_root_authority_unchecked(DEFAULT_SUPERVISOR_SESSION_ID)
+                    .await?
+                    .ok_or_else(|| denied("Observer parent is missing"))?;
+                let child = self
+                    .strict_observer_child(&parent, child_id)
+                    .await?
+                    .ok_or_else(|| denied("Observer Child is missing"))?;
+                if !observer_native_child(&child) {
+                    return Err(denied(
+                        "Observer registration requires a read-only native Child",
+                    ));
+                }
+            }
+        }
         let mut roots: BTreeSet<String> = targets.into_iter().collect();
+        for id in &roots {
+            target_id_is_valid(id)?;
+            if !self.preview_management_root(id).await? {
+                return Err(denied("Observer target Root does not exist"));
+            }
+        }
         roots.insert(DEFAULT_SUPERVISOR_SESSION_ID.into());
         let mut sessions = Vec::with_capacity(roots.len() + 1);
         for id in roots {
@@ -203,7 +243,7 @@ impl SessionStoreV2 {
         Ok(Arc::new(SupervisorManagementGuards {
             sessions,
             _task: task,
-            _lifecycle: lifecycle,
+            _lifecycle: ManagementLifecycleGuard::Shared { _guard: lifecycle },
             _host_namespace: absence,
         }))
     }
@@ -238,7 +278,7 @@ impl SessionStoreV2 {
             }
         }
         let guards = self
-            .observer_guards(child_id, targets.iter().cloned(), None)
+            .observer_guards(child_id, targets.iter().cloned(), None, true)
             .await?;
         let mut parent = self.management_supervisor_locked(reference).await?;
         self.check_management_session_compatibility(&parent).await?;
@@ -361,7 +401,7 @@ impl SessionStoreV2 {
     ) -> io::Result<bamboo_domain::SupervisorObserverReceipt> {
         reference_is_valid(reference)?;
         target_id_is_valid(child_id)?;
-        let guards = self.observer_guards(child_id, [], None).await?;
+        let guards = self.observer_guards(child_id, [], None, false).await?;
         let mut parent = self.management_supervisor_locked(reference).await?;
         self.check_management_session_compatibility(&parent).await?;
         let mut state = parent
@@ -412,7 +452,7 @@ impl SessionStoreV2 {
         let Some(reference) = observer_parent_reference(expected_parent) else {
             return Ok(false);
         };
-        let _guards = self.observer_guards(child_id, [], None).await?;
+        let _guards = self.observer_guards(child_id, [], None, false).await?;
         let parent = self.management_supervisor_locked(&reference).await?;
         if parent.created_at != expected_parent.created_at {
             return Err(denied("Observer parent lifetime changed"));
@@ -481,7 +521,7 @@ impl SessionStoreV2 {
         } else {
             None
         };
-        let _guards = self.observer_guards(&expected.id, ids, None).await?;
+        let _guards = self.observer_guards(&expected.id, ids, None, false).await?;
         let parent = self.management_supervisor_locked(&reference).await?;
         let state = parent
             .supervisor_management
@@ -534,7 +574,7 @@ impl SessionStoreV2 {
             .retain_never_installed(&caller.session_id)
             .await?;
         let _guards = self
-            .observer_guards(&caller.session_id, [target_id.into()], Some(absence))
+            .observer_guards(&caller.session_id, [target_id.into()], Some(absence), false)
             .await?;
         let parent = self
             .load_root_authority_unchecked(DEFAULT_SUPERVISOR_SESSION_ID)
@@ -830,7 +870,7 @@ impl SessionStoreV2 {
         let guards = Arc::new(SupervisorManagementGuards {
             sessions,
             _task: task,
-            _lifecycle: lifecycle,
+            _lifecycle: ManagementLifecycleGuard::Shared { _guard: lifecycle },
             _host_namespace: None,
         });
         // The physical job owns the guards through every file publication,
@@ -865,7 +905,33 @@ impl SessionStoreV2 {
         Ok(current)
     }
 
+    /// Caller retains lifecycle and Task guards. A malformed Child ID must
+    /// never select a Root-level lock position. Hold only that target's lock
+    /// during preflight, then release it before acquiring the sorted Root set.
+    /// The retained lifecycle prevents Root deletion/rebirth; the existing
+    /// lifetime fence also forbids replacing a former Root ID with a Child.
+    /// Every caller still revalidates its authority under the final lock set.
+    async fn preview_management_root(&self, target: &str) -> io::Result<bool> {
+        let _target = self.acquire_session_maintenance_lock(target).await?;
+        Ok(self.load_root_authority_unchecked(target).await?.is_some())
+    }
+
     async fn management_session_locks(
+        &self,
+        target: Option<&str>,
+    ) -> io::Result<Vec<SessionWriteGuard>> {
+        if let Some(target) = target {
+            if !self.preview_management_root(target).await? {
+                return Err(denied("target Root does not exist"));
+            }
+        }
+        self.management_root_session_locks(target).await
+    }
+
+    /// Existing targets have passed strict Root preflight. Only trusted new
+    /// Root creation may skip it, while retaining exclusive lifecycle ownership
+    /// through publication so its vacant candidate cannot race a Child writer.
+    async fn management_root_session_locks(
         &self,
         target: Option<&str>,
     ) -> io::Result<Vec<SessionWriteGuard>> {
@@ -1012,13 +1078,15 @@ impl SessionStoreV2 {
             Some(_) => return Err(denied("host_session_legacy_caller_mismatch")),
             None => None,
         };
-        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let task = self.lock_runtime_task_sidecar_shared().await?;
-        let sessions = self.management_session_locks(Some(&candidate.id)).await?;
+        let sessions = self
+            .management_root_session_locks(Some(&candidate.id))
+            .await?;
         let guards = Arc::new(SupervisorManagementGuards {
             sessions,
             _task: task,
-            _lifecycle: lifecycle,
+            _lifecycle: ManagementLifecycleGuard::Exclusive { _guard: lifecycle },
             _host_namespace: host_namespace,
         });
         let mut current = self.management_supervisor_locked(supervisor).await?;
@@ -1139,7 +1207,7 @@ impl SessionStoreV2 {
         let guards = Arc::new(SupervisorManagementGuards {
             sessions,
             _task: task,
-            _lifecycle: lifecycle,
+            _lifecycle: ManagementLifecycleGuard::Shared { _guard: lifecycle },
             _host_namespace: None,
         });
         let mut current = self
@@ -1259,14 +1327,32 @@ impl SessionStoreV2 {
         target_id_is_valid(target_id)?;
         let _lifecycle = self.lock_session_lifecycle_shared().await?;
         let _task = self.lock_runtime_task_sidecar_shared().await?;
-        let _sessions = self.management_session_locks(Some(target_id)).await?;
+        // Revoked links remain observable even when their target is corrupt or
+        // deleted. Only an enabled link needs a canonical Root lock location;
+        // an absent preflight can report unauthorized, never grant a later
+        // replacement that appeared without belonging to the final lock set.
+        let enabled = {
+            let _supervisor = self
+                .acquire_session_maintenance_lock(&reference.session_id)
+                .await?;
+            self.management_supervisor_locked(reference)
+                .await?
+                .supervisor_management
+                .as_ref()
+                .and_then(|state| state.links.get(target_id))
+                .is_some_and(|link| link.enabled)
+        };
+        let target_present = enabled && self.preview_management_root(target_id).await?;
+        let _sessions = self
+            .management_root_session_locks(target_present.then_some(target_id))
+            .await?;
         let current = self.management_supervisor_locked(reference).await?;
         let state = current
             .supervisor_management
             .unwrap_or_else(|| empty_state(reference.incarnation_id));
         let link = state.links.get(target_id).cloned();
         let mut authorized = false;
-        if let Some(link) = link.as_ref().filter(|link| link.enabled) {
+        if let Some(link) = link.as_ref().filter(|link| link.enabled && target_present) {
             if let Some(target) = self.load_root_authority_unchecked(target_id).await? {
                 authorized = link_authorizes_target(&state, link, &target);
             }
@@ -1323,4 +1409,85 @@ fn observer_native_child(child: &Session) -> bool {
         && !child.metadata.keys().any(|key| {
             key.starts_with("external.") || key == "runtime.kind" || key == "child.named_profile.v1"
         })
+}
+
+#[cfg(test)]
+mod observer_lock_order_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn observer_lock_order_rejects_non_root_slots_before_waiting_for_supervisor() {
+        let home = tempfile::tempdir().unwrap();
+        let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let parent = store
+            .get_or_create_default_supervisor("model")
+            .await
+            .unwrap();
+        let reference = SupervisorReference::from(&parent);
+        let mut child = Session::new_child_of("a-observer", &parent, "model", "observe");
+        child
+            .agent_runtime_state
+            .get_or_insert_with(Default::default)
+            .read_only = true;
+        store.save_session(&child).await.unwrap();
+        let other = Session::new_child_of("a-invalid-target", &parent, "model", "work");
+        store.save_session(&other).await.unwrap();
+        let root = Session::new("a-independent-root", "model");
+        store.save_session(&root).await.unwrap();
+
+        // These IDs sort before the Supervisor. The previous Attach took its
+        // Child lock and waited for this Supervisor, while classification held
+        // the Supervisor and waited for that same Child. Every malformed call
+        // below must now finish before trying the held Supervisor lock.
+        let _supervisor = store
+            .acquire_session_maintenance_lock(&parent.id)
+            .await
+            .unwrap();
+        let wait = std::time::Duration::from_secs(2);
+        let request = SupervisorManagementRequest {
+            supervisor: reference.clone(),
+            expected_state_revision: 0,
+            mutation: SupervisorManagementMutation::Attach {
+                target_session_id: child.id.clone(),
+            },
+        };
+        assert!(
+            tokio::time::timeout(wait, store.management_mutate(&request))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(tokio::time::timeout(
+            wait,
+            store.register_supervisor_observer(
+                &reference,
+                0,
+                Uuid::new_v4(),
+                &child.id,
+                BTreeSet::from([other.id.clone()]),
+            ),
+        )
+        .await
+        .unwrap()
+        .is_err());
+        assert!(tokio::time::timeout(
+            wait,
+            store.register_supervisor_observer(
+                &reference,
+                0,
+                Uuid::new_v4(),
+                "a-missing-child",
+                BTreeSet::from([root.id.clone()]),
+            ),
+        )
+        .await
+        .unwrap()
+        .is_err());
+        assert!(
+            tokio::time::timeout(wait, store.observer_guards(&root.id, [], None, false),)
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
 }
