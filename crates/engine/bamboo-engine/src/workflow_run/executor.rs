@@ -1435,10 +1435,7 @@ impl WorkflowRunEngine {
         // acquisition also reaps abandoned/failed callers' inactive entries.
         self.commit_fences
             .retain(|_, fence| fence.strong_count() > 0);
-        let mut entry = self
-            .commit_fences
-            .entry(run_id.to_owned())
-            .or_default();
+        let mut entry = self.commit_fences.entry(run_id.to_owned()).or_default();
         if let Some(fence) = entry.upgrade() {
             return fence;
         }
