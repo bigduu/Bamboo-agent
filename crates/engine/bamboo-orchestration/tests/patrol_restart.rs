@@ -958,3 +958,120 @@ fn checkpoint_keeps_original_pending_diagnostic_request_and_budget_receipt_on_re
     assert_eq!(recovered.checkpoint, cp);
     assert_eq!(recovered.checkpoint.incident.unwrap().attempts, 1);
 }
+
+#[test]
+fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation() {
+    use bamboo_tickets::WorkTokenLimits;
+    let mut fixture = Fixture::new();
+    let owner = fixture.authority(Principal::User {
+        user_id: "budget-owner".into(),
+    });
+    fixture
+        .service()
+        .configure_work_token_budget(
+            &owner,
+            0,
+            WorkTokenLimits {
+                work_tokens: BTreeMap::from([(fixture.scope.work_id.clone(), 120)]),
+                utc_day_tokens: 120,
+                total_tokens: 120,
+            },
+        )
+        .unwrap();
+    let observation = fixture
+        .observation()
+        .observation(&fixture.scope, 0)
+        .unwrap();
+    let request = DiagnosticRequest {
+        operation: OperationId {
+            incident: IncidentId {
+                scope: fixture.scope.clone(),
+                progress_sequence: 0,
+            },
+            kind: OperationKind::Diagnostic(1),
+        },
+        model: Model {
+            provider: "unexecuted-provider".into(),
+            model: "unexecuted-model".into(),
+            max_input_tokens: 100,
+            max_output_tokens: 20,
+            max_evidence_bytes: 1024,
+            max_evidence_refs: 2,
+        },
+        deadline_ms: 1000,
+        input: DiagnosticInput {
+            scope: fixture.scope.clone(),
+            source_revision: observation.source_revision,
+            since_cursor: observation.cursor,
+            through_cursor: observation.cursor,
+            summary: "Authoritative scoped facts".into(),
+            references: vec![],
+            input_tokens: 10,
+        },
+    };
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(100),
+    };
+    let receipt = budget.reserve(&request).unwrap();
+    budget.settle(&receipt, Usage::Unknown).unwrap();
+    drop(budget);
+    fixture.reopen();
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(101),
+    };
+    assert_eq!(budget.reserve(&request).unwrap(), receipt);
+    assert_eq!(
+        fixture
+            .service()
+            .work_token_budget(&authority)
+            .unwrap()
+            .unwrap()
+            .total_charged,
+        120
+    );
+    let mut changed = request.clone();
+    changed.model.max_output_tokens += 1;
+    assert_eq!(budget.reserve(&changed), Err(BudgetBlock::Unavailable));
+    drop(budget);
+    let work_id = fixture.scope.work_id.clone();
+    fixture.apply(
+        Principal::Supervisor {
+            session_id: "supervisor".into(),
+        },
+        vec![Operation::Cancel { work_id }],
+    );
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(102),
+    };
+    budget
+        .settle(
+            &receipt,
+            Usage::Known {
+                input_tokens: 10,
+                output_tokens: 5,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .service()
+            .work_token_budget(&authority)
+            .unwrap()
+            .unwrap()
+            .total_charged,
+        15
+    );
+    assert_eq!(
+        fixture.service().published().unwrap().1.tickets[&fixture.scope.work_id].state,
+        WorkState::Cancelled
+    );
+}

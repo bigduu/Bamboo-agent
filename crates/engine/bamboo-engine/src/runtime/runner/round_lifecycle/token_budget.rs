@@ -22,6 +22,44 @@ fn model_limits_path(config: &AgentLoopConfig) -> PathBuf {
     bamboo_compression::limits::get_default_config_path(&data_dir)
 }
 
+/// Durable accounting reserves actual configured/reported ceilings. A prompt
+/// estimator or the chat/summarizer's compatibility fallback is not evidence of
+/// a provider's maximum input size.
+pub(crate) async fn resolve_known_token_ceilings(
+    config: &AgentLoopConfig,
+    model: &str,
+    provider: &dyn LLMProvider,
+) -> Option<(u32, u32)> {
+    let configured = resolve_configured_model_limit(
+        config,
+        model,
+        &model_limits_path(config),
+        "work_accounting",
+    )
+    .await;
+    let reported = if configured
+        .as_ref()
+        .is_none_or(|limit| limit.max_output_tokens.is_none())
+    {
+        provider
+            .list_model_info()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|info| info.id == model)
+    } else {
+        None
+    };
+    let input = configured
+        .as_ref()
+        .map(|limit| limit.max_context_tokens)
+        .or_else(|| reported.as_ref()?.max_context_tokens)?;
+    let output = configured
+        .and_then(|limit| limit.max_output_tokens)
+        .or_else(|| reported?.max_output_tokens)?;
+    (input > 0 && output > 0).then_some((input, output))
+}
+
 /// Resolve the budget for an auxiliary model/provider pair without touching the
 /// chat model's session cache. Compression can route to a completely different
 /// provider and must therefore never inherit the triggering model's limits.

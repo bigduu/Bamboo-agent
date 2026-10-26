@@ -399,17 +399,18 @@ async fn reject_start_before_unknown_hook_reserves_generation(call_id: &'static 
     }
     assert!(control.generation().is_none());
     assert!(control.active_counted().is_none());
-    let witnessed = hook.witnessed.lock().unwrap();
-    assert_eq!(witnessed.len(), 1);
-    assert!(
-        witnessed[0].0.is_none(),
-        "no managed state exists when the real hook runs"
-    );
-    assert!(
-        witnessed[0].1.is_none(),
-        "no active OnceLock generation was reserved"
-    );
-    drop(witnessed);
+    {
+        let witnessed = hook.witnessed.lock().unwrap();
+        assert_eq!(witnessed.len(), 1);
+        assert!(
+            witnessed[0].0.is_none(),
+            "no managed state exists when the real hook runs"
+        );
+        assert!(
+            witnessed[0].1.is_none(),
+            "no active OnceLock generation was reserved"
+        );
+    }
     if call_id == INSPECT_CALL {
         assert_eq!(
             *provider.start_observed_accepted.lock().unwrap(),

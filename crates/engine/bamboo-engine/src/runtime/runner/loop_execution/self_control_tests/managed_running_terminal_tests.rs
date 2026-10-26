@@ -237,10 +237,10 @@ impl Tool for UnadmittedSiblingTool {
 
 #[derive(Clone, Copy, Debug)]
 enum RunningSequence {
-    SameBatchAsStart,
-    AfterStart,
-    WithoutStart,
-    BeforeStart,
+    SameBatch,
+    Later,
+    Unmanaged,
+    Earlier,
 }
 
 struct RunningProviderObservation {
@@ -298,7 +298,7 @@ impl LLMProvider for RunningProvider {
             durable,
         });
         let chunk = match (self.sequence, round) {
-            (RunningSequence::SameBatchAsStart, 1) => {
+            (RunningSequence::SameBatch, 1) => {
                 let LLMChunk::ToolCalls(mut calls) = start_call(2, 8) else {
                     unreachable!("existing Start helper emits ToolCalls")
                 };
@@ -308,12 +308,10 @@ impl LLMProvider for RunningProvider {
                 }
                 LLMChunk::ToolCalls(calls)
             }
-            (RunningSequence::AfterStart, 1) | (RunningSequence::BeforeStart, 2) => {
-                start_call(2, 8)
-            }
-            (RunningSequence::AfterStart, 2)
-            | (RunningSequence::WithoutStart, 1)
-            | (RunningSequence::BeforeStart, 1) => {
+            (RunningSequence::Later, 1) | (RunningSequence::Earlier, 2) => start_call(2, 8),
+            (RunningSequence::Later, 2)
+            | (RunningSequence::Unmanaged, 1)
+            | (RunningSequence::Earlier, 1) => {
                 let mut calls = vec![running_call()];
                 if self.with_sibling {
                     calls.push(sibling_call());
@@ -551,9 +549,9 @@ async fn assert_managed_running_fails(
             if tool_call_id == SIBLING_CALL && result.success
     )));
     let (invocation_round, expected_counts, expected_objectives) = match sequence {
-        RunningSequence::SameBatchAsStart => (1, (0, 0, 1), vec![]),
-        RunningSequence::AfterStart => (2, (1, 0, 2), vec![(FIRST_OBJECTIVE, 1)]),
-        RunningSequence::WithoutStart | RunningSequence::BeforeStart => unreachable!(),
+        RunningSequence::SameBatch => (1, (0, 0, 1), vec![]),
+        RunningSequence::Later => (2, (1, 0, 2), vec![(FIRST_OBJECTIVE, 1)]),
+        RunningSequence::Unmanaged | RunningSequence::Earlier => unreachable!(),
     };
     assert_eq!(
         provider.calls.load(Ordering::SeqCst),
@@ -562,17 +560,18 @@ async fn assert_managed_running_fails(
     );
     assert_eq!(provider.peak.load(Ordering::SeqCst), 1);
     assert_eq!(provider.active.load(Ordering::SeqCst), 0);
-    let observations = provider.seen.lock().unwrap();
-    assert_eq!(observations.len(), invocation_round);
-    for observation in observations.iter() {
-        assert!(observation.round <= invocation_round);
-        assert_eq!(
-            observation.cleanup.kills, 0,
-            "all model calls precede the returned RunningHandle"
-        );
-        assert_no_running_wait(&observation.durable);
+    {
+        let observations = provider.seen.lock().unwrap();
+        assert_eq!(observations.len(), invocation_round);
+        for observation in observations.iter() {
+            assert!(observation.round <= invocation_round);
+            assert_eq!(
+                observation.cleanup.kills, 0,
+                "all model calls precede the returned RunningHandle"
+            );
+            assert_no_running_wait(&observation.durable);
+        }
     }
-    drop(observations);
     let paired = running_pair(&fixture.session);
     assert_eq!(paired.tool_success, Some(false));
     assert_ne!(paired.content, RUNNING_ACK);
@@ -590,43 +589,44 @@ async fn assert_managed_running_fails(
         assert!(!result.success);
         assert_eq!(result.result, paired.content);
     }
-    let publication_witnesses = probe.publications.lock().unwrap();
-    let failure_index = events.iter().position(|event| matches!(event,
-        AgentEvent::ToolComplete { tool_call_id, .. } | AgentEvent::ToolError { tool_call_id, .. }
-            if tool_call_id == RUNNING_CALL
-    )).unwrap();
-    assert_eq!(probe.cleanup_event_failures.load(Ordering::SeqCst), 0);
-    for (marker, expected) in [
-        (KILL_MARKER, 1),
-        (
-            DROP_MARKER,
-            usize::from(matches!(flavor, CompletionFlavor::Driven)),
-        ),
-    ] {
-        let positions = events
-            .iter()
-            .enumerate()
-            .filter_map(|(index, event)| match event {
-                AgentEvent::ToolToken {
-                    tool_call_id,
-                    content,
-                } if tool_call_id == RUNNING_CALL && content == marker => Some(index),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(positions.len(), expected, "one real callback/Drop marker");
-        assert!(
-            positions.iter().all(|index| *index < failure_index),
-            "cleanup request/Drop must precede false result publication"
-        );
+    {
+        let publication_witnesses = probe.publications.lock().unwrap();
+        let failure_index = events.iter().position(|event| matches!(event,
+            AgentEvent::ToolComplete { tool_call_id, .. } | AgentEvent::ToolError { tool_call_id, .. }
+                if tool_call_id == RUNNING_CALL
+        )).unwrap();
+        assert_eq!(probe.cleanup_event_failures.load(Ordering::SeqCst), 0);
+        for (marker, expected) in [
+            (KILL_MARKER, 1),
+            (
+                DROP_MARKER,
+                usize::from(matches!(flavor, CompletionFlavor::Driven)),
+            ),
+        ] {
+            let positions = events
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| match event {
+                    AgentEvent::ToolToken {
+                        tool_call_id,
+                        content,
+                    } if tool_call_id == RUNNING_CALL && content == marker => Some(index),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(positions.len(), expected, "one real callback/Drop marker");
+            assert!(
+                positions.iter().all(|index| *index < failure_index),
+                "cleanup request/Drop must precede false result publication"
+            );
+        }
+        assert_eq!(publication_witnesses.len(), 1);
+        for snapshot in publication_witnesses.iter() {
+            // Receiver-boundary witness complements the production order. It does
+            // not pretend that a callback return is a third-party join receipt.
+            assert_running_cleanup(*snapshot, flavor);
+        }
     }
-    assert_eq!(publication_witnesses.len(), 1);
-    for snapshot in publication_witnesses.iter() {
-        // Receiver-boundary witness complements the production order. It does
-        // not pretend that a callback return is a third-party join receipt.
-        assert_running_cleanup(*snapshot, flavor);
-    }
-    drop(publication_witnesses);
     assert_eq!(
         events
             .iter()
@@ -673,7 +673,7 @@ async fn assert_managed_running_fails(
     );
     // Keep the unfinished counted input fence when one was already admitted.
     // It is different from pending_question, which must remain absent.
-    if matches!(sequence, RunningSequence::AfterStart) {
+    if matches!(sequence, RunningSequence::Later) {
         assert!(crate::runtime::counted_loop::reject_recovery(&fixture.session).is_err());
     }
     let runtime = fixture.session.agent_runtime_state.as_ref().unwrap();
@@ -735,7 +735,7 @@ async fn assert_managed_running_fails(
     assert_eq!(durable_start.len(), 1);
     assert_eq!(durable_start[0].content, start_pair[0].content);
     assert_eq!(durable_start[0].tool_success, Some(true));
-    if matches!(sequence, RunningSequence::AfterStart) {
+    if matches!(sequence, RunningSequence::Later) {
         assert!(crate::runtime::counted_loop::reject_recovery(&durable).is_err());
     }
     fixture.close().await;
@@ -744,20 +744,14 @@ async fn assert_managed_running_fails(
 #[tokio::test]
 async fn self_control_returned_detached_or_driven_handle_fails_before_later_rounds() {
     for flavor in [CompletionFlavor::Detached, CompletionFlavor::Driven] {
-        assert_managed_running_fails(flavor, RunningSequence::AfterStart, ResultWrapping::Raw)
-            .await;
+        assert_managed_running_fails(flavor, RunningSequence::Later, ResultWrapping::Raw).await;
     }
 }
 
 #[tokio::test]
 async fn self_control_start_same_batch_running_fails_without_admitting_iteration_or_sibling() {
     for flavor in [CompletionFlavor::Detached, CompletionFlavor::Driven] {
-        assert_managed_running_fails(
-            flavor,
-            RunningSequence::SameBatchAsStart,
-            ResultWrapping::Raw,
-        )
-        .await;
+        assert_managed_running_fails(flavor, RunningSequence::SameBatch, ResultWrapping::Raw).await;
     }
 }
 
@@ -765,7 +759,7 @@ async fn self_control_start_same_batch_running_fails_without_admitting_iteration
 async fn self_control_running_collapse_then_forged_completed_cannot_hide_host_violation() {
     assert_managed_running_fails(
         CompletionFlavor::Driven,
-        RunningSequence::AfterStart,
+        RunningSequence::Later,
         ResultWrapping::CollapseThenForgeSuccess,
     )
     .await;
@@ -790,7 +784,7 @@ async fn self_control_opt_in_without_start_preserves_ordinary_detached_ack() {
         })
         .unwrap();
     let provider = Arc::new(RunningProvider {
-        sequence: RunningSequence::WithoutStart,
+        sequence: RunningSequence::Unmanaged,
         with_sibling: false,
         probe: probe.clone(),
         storage: fixture.storage.clone(),
@@ -883,7 +877,7 @@ async fn self_control_observed_pre_start_running_refuses_start_without_changing_
             })
             .unwrap();
         let provider = Arc::new(RunningProvider {
-            sequence: RunningSequence::BeforeStart,
+            sequence: RunningSequence::Earlier,
             with_sibling: false,
             probe: probe.clone(),
             storage: fixture.storage.clone(),

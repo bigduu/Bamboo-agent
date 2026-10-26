@@ -2,6 +2,12 @@ name: Ticket Platform Adapter
 
 on:
   workflow_dispatch:
+    inputs:
+      snapshot_sha:
+        description: Exact source SHA for Native Work budget acceptance; empty runs Windows only
+        required: false
+        default: ''
+        type: string
   pull_request:
     branches: [dev, main]
     paths:
@@ -19,6 +25,135 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  native-budget:
+    name: Native Work Budget Acceptance (Linux)
+    if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
+      RUST_MIN_STACK: '8388608'
+      BAMBOO_FRONTEND_BUILD_MODE: api-only
+      EXPECTED_SNAPSHOT_SHA: ${{ inputs.snapshot_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Bind acceptance to the exact clean source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_SNAPSHOT_SHA" = "$GITHUB_SHA"
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SNAPSHOT_SHA"
+          test -z "$status"
+          git show -s --format='Acceptance source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Record compiler and available disk
+        run: |
+          rustc -vV
+          cargo -V
+          df -h .
+
+      - name: Restore existing dependencies without writing cache storage
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-test-${{ runner.os }}
+          workspaces: . -> target/grouped-default
+          save-if: false
+
+      - name: Verify the actual Native Host and Ready assembly
+        run: >-
+          cargo test --locked -p bamboo-server
+          --test native_work_token_budget --test native_work_acceptance
+          --test native_work_project_isolation --test patrol_ready_assembly
+          -- --test-threads=1 --nocapture
+
+      - name: Verify metering, auxiliary consumers and the bounded lint regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          filters=(
+            ticket_runtime::tests::token_budget llm_summarizer::
+            runtime::runner::image_fallback::tests::
+            execute_external_child_rejects_direct_remote_worker
+            owned_glob_collector_requires_actual_ordered_tool_trace_and_typed_tail
+            resolve_disabled_filters_ queue_capacity_revalidation
+            scoped_native_root_tail_io_failure_preserves_real_stop_and_never_acks_or_admits_tail
+            bash_gate_arranges_self_resume_hook_on_suspend bash_gate_no_suspend_when_all_shells_finished
+            suspension_contract_tests managed_interaction_runner_tests managed_running_terminal_tests
+            external_memory_includes_ledger_agenda_when_records_are_open
+            retrieval_window_capped_trigger_stays_above_capped_target
+            context_pressure_notification_refires_only_on_level_transition
+            live_disabled_resolver_filters_tools_on_the_next_round
+            exact_legacy_denials_constrain_a_canonical_only_catalog
+            hook_ask_hides_focused_browser_resource_and_fails_closed_on_check_error
+            browser_download_hook_ask namespaced_browser_select_hook_ask
+            observation_progress_failures_mutations_and_polling_reset_streak
+            progress_hint_tests runtime::runner::tool_execution::task::tests
+            session_repository::tests topology_preserves_unexpanded_map_prefix_without_fabricating_item_zero
+          )
+          log=$(mktemp)
+          printf 'Selected regression groups: %s\n' "${filters[*]}"
+          # libtest accepts multiple filters after -- and runs their union.
+          # One Cargo invocation avoids repeating the same engine compilation.
+          timeout --kill-after=30s 20m cargo test --locked -p bamboo-engine --lib -- \
+            "${filters[@]}" --test-threads=1 --format=pretty --color=never --show-output | tee "$log"
+          python3 - "$log" "${filters[@]}" <<'PY'
+          import pathlib, re, sys
+          log = pathlib.Path(sys.argv[1]).read_text()
+          result = re.findall(r'test result: ok\. (\d+) passed; (\d+) failed;', log)
+          assert result and sum(int(passed) for passed, _ in result) > 0, 'Selected regression must execute tests'
+          assert all(int(failed) == 0 for _, failed in result)
+          progress = log.split('\nsuccesses:\n', 1)[0]
+          passed = set(re.findall(r'^test (\S+) \.\.\. ok$', progress, re.MULTILINE))
+          coverage = {name: sum(name in test for test in passed) for name in sys.argv[2:]}
+          assert all(coverage.values()), f'Selected group did not pass tests: {coverage}'
+          print(f'Passed group coverage: {coverage}')
+          PY
+          rm "$log"
+
+      - name: Check affected libraries and test targets under the existing CI lint policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy=(-D warnings -A deprecated -A clippy::module_inception
+            -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
+            -A clippy::too-many-arguments -A clippy::while-let-loop
+            -A clippy::type_complexity -A dead-code)
+          cargo clippy --locked --all-features --lib \
+            -p bamboo-tickets -p bamboo-orchestration -p bamboo-llm \
+            -p bamboo-engine -p bamboo-server -- "${policy[@]}"
+          cargo clippy --locked --all-features -p bamboo-server \
+            --test native_work_token_budget --test native_work_acceptance \
+            --test native_work_project_isolation --test patrol_ready_assembly -- "${policy[@]}"
+          cargo clippy --locked --all-features -p bamboo-tickets \
+            --test execution_budget -- "${policy[@]}"
+          cargo clippy --locked --all-features -p bamboo-engine \
+            --lib --tests -- "${policy[@]}"
+
+      - name: Verify the source stayed exact and clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SNAPSHOT_SHA"
+          test -z "$status"
+
   windows:
     name: Ticket Platform Adapter (Windows)
     runs-on: windows-latest

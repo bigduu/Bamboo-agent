@@ -792,6 +792,11 @@ impl ExternalChildRunner for LocalTaskChildRunner {
             }
             request = request.ticket_worker_plan(plan);
         }
+        if let Some(budget) = crate::ticket_token_budget::NativeWorkTokenBudget::capture(
+            tickets.clone(), store.clone(), session
+        ).await.map_err(failure)? {
+            request = request.ticket_token_budget(budget);
+        }
         let mut owned_session = session.clone();
         // The question fact survives its answer for replay/deduplication. The
         // handoff is only for the run that issued that fact, not every later

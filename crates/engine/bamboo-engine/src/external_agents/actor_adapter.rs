@@ -13691,7 +13691,7 @@ mod tests {
                 arguments: r#"{"pattern":"marker.txt"}"#.into(),
             },
         };
-        let messages = vec![
+        let messages = [
             bamboo_agent_core::Message::assistant("", Some(vec![call])),
             bamboo_agent_core::Message::tool_result("glob", "marker.txt"),
             bamboo_agent_core::Message::assistant("done", None),
@@ -18481,8 +18481,7 @@ mod tests {
         let error = runner
             .execute_external_child(&mut session, &job, event_tx, CancellationToken::new())
             .await
-            .err()
-            .expect("direct remote transport must fail closed");
+            .expect_err("direct remote transport must fail closed");
         assert!(error
             .to_string()
             .contains("remote_broker_activation_unavailable"));

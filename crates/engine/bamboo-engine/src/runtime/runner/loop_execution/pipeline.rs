@@ -12007,8 +12007,10 @@ mod tests {
         // background bash, it MUST arrange a self-resume hook so the session
         // is always eventually resumed — no suspend-forever.
         let session_id = "s-bash-liveness";
-        let mut config = AgentLoopConfig::default();
-        config.persistence = Some(Arc::new(StubBashPersistence));
+        let mut config = AgentLoopConfig {
+            persistence: Some(Arc::new(StubBashPersistence)),
+            ..Default::default()
+        };
         let hook = RecordingBashResumeHook {
             calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
@@ -12050,9 +12052,11 @@ mod tests {
         // Blocker 1: if all captured shells finish before the gate commits, the
         // gate returns None — no suspend-forever on a lost-wakeup.
         let session_id = "s-bash-toctou";
-        let mut config = AgentLoopConfig::default();
-        config.persistence = Some(Arc::new(StubBashPersistence));
-        config.bash_resume_hook = Some(Arc::new(NoopBashResumeHook));
+        let config = AgentLoopConfig {
+            persistence: Some(Arc::new(StubBashPersistence)),
+            bash_resume_hook: Some(Arc::new(NoopBashResumeHook)),
+            ..Default::default()
+        };
 
         let shell = bamboo_tools::tools::bash_runtime::spawn_background(
             "true",

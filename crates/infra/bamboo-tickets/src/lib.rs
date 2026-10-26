@@ -2,6 +2,7 @@
 //! This store owns contracts, not Session transcripts or Jiandu memory.
 mod claiming;
 mod controls;
+mod execution_budget;
 mod file_reconciliation;
 mod migration;
 mod model;
@@ -17,6 +18,7 @@ mod workspace_files;
 
 pub use claiming::*;
 pub use controls::WorkControlFacts;
+pub use execution_budget::*;
 pub use file_reconciliation::*;
 pub use migration::*;
 pub use model::*;
