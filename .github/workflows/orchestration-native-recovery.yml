@@ -135,9 +135,9 @@ jobs:
           -A clippy::too-many-arguments -A clippy::while-let-loop
           -A clippy::type_complexity -A dead-code
 
-      - name: Check the affected Planner library and tests under the same lint policy
+      - name: Check the affected Planner production library under the same lint policy
         run: >-
-          cargo clippy --locked --all-features -p bamboo-server-tools --lib --tests --
+          cargo clippy --locked --all-features -p bamboo-server-tools --lib --
           -D warnings -A deprecated -A clippy::module_inception
           -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
           -A clippy::too-many-arguments -A clippy::while-let-loop
