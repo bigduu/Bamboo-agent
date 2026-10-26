@@ -1001,6 +1001,7 @@ impl ConnectBridge {
             summarization_model_name: aux_summarization_model.clone(),
             background_model_provider: aux_background_provider.clone(),
             summarization_model_provider: aux_summarization_provider.clone(),
+            summarization_model_error: None,
         });
 
         spawn_session_execution(SessionExecutionArgs {

@@ -50,6 +50,8 @@ pub struct AuxiliaryModelConfig {
     pub summarization_model_name: Option<String>,
     pub background_model_provider: Option<Arc<dyn LLMProvider>>,
     pub summarization_model_provider: Option<Arc<dyn LLMProvider>>,
+    /// A rejected explicit summary role is different from an unset model.
+    pub summarization_model_error: Option<String>,
 }
 
 fn default_gold_max_output_tokens() -> u32 {
@@ -1190,6 +1192,7 @@ impl AgentLoopConfig {
                 summarization_model_name: self.summarization_model_name.clone(),
                 background_model_provider: self.background_model_provider.clone(),
                 summarization_model_provider: self.summarization_model_provider.clone(),
+                summarization_model_error: None,
             })
     }
 

@@ -1753,6 +1753,17 @@ async fn maybe_apply_summary_context_compression_with_budget(
     // Settings can change after execution starts. Resolve the name and provider
     // together for this whole compression pass instead of reading startup fields.
     let auxiliary_models = config.resolve_auxiliary_models();
+    if let Some(error) = auxiliary_models.summarization_model_error.as_deref() {
+        emit_context_compression_status(
+            event_tx,
+            phase_label,
+            &format!("failed_model_resolution:{error}"),
+        )
+        .await;
+        return Err(AgentError::Budget(format!(
+            "Task-summary model resolution failed: {error}"
+        )));
+    }
     // The live global resolver already applies task_summary -> fast -> chat.
     // An unresolved explicit summary route must not fall through to a separate
     // memory account or reuse stale startup routing. Keep background fallback
