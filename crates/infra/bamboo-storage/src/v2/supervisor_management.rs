@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::default_actor_context::LifecycleGuard;
 use super::*;
 use bamboo_domain::{
     validate_supervisor_target_id, SessionAuthorityConflict, SupervisorLinkObservation,
@@ -136,18 +137,19 @@ impl SupervisorFollowupGuard {
 pub(super) struct SupervisorManagementGuards {
     sessions: Vec<SessionWriteGuard>,
     _task: RuntimeTaskTransactionReadGuard,
-    _lifecycle: ManagementLifecycleGuard,
+    _lifecycle: LifecycleGuard,
     _host_namespace: Option<crate::host_session_scope::HostSessionScopeAbsence>,
-}
-
-enum ManagementLifecycleGuard {
-    Shared { _guard: SessionLifecycleReadGuard },
-    Exclusive { _guard: SessionLifecycleWriteGuard },
 }
 
 impl Drop for SupervisorManagementGuards {
     fn drop(&mut self) {
         while let Some(_guard) = self.sessions.pop() {}
+    }
+}
+
+impl SupervisorManagementGuards {
+    pub(super) fn retains_exclusive_lifecycle(&self) -> bool {
+        self._lifecycle.retains_exclusive()
     }
 }
 
@@ -243,7 +245,7 @@ impl SessionStoreV2 {
         Ok(Arc::new(SupervisorManagementGuards {
             sessions,
             _task: task,
-            _lifecycle: ManagementLifecycleGuard::Shared { _guard: lifecycle },
+            _lifecycle: LifecycleGuard::Shared { _guard: lifecycle },
             _host_namespace: absence,
         }))
     }
@@ -870,7 +872,7 @@ impl SessionStoreV2 {
         let guards = Arc::new(SupervisorManagementGuards {
             sessions,
             _task: task,
-            _lifecycle: ManagementLifecycleGuard::Shared { _guard: lifecycle },
+            _lifecycle: LifecycleGuard::Shared { _guard: lifecycle },
             _host_namespace: None,
         });
         // The physical job owns the guards through every file publication,
@@ -1086,7 +1088,7 @@ impl SessionStoreV2 {
         let guards = Arc::new(SupervisorManagementGuards {
             sessions,
             _task: task,
-            _lifecycle: ManagementLifecycleGuard::Exclusive { _guard: lifecycle },
+            _lifecycle: LifecycleGuard::Exclusive { _guard: lifecycle },
             _host_namespace: host_namespace,
         });
         let mut current = self.management_supervisor_locked(supervisor).await?;
@@ -1207,7 +1209,7 @@ impl SessionStoreV2 {
         let guards = Arc::new(SupervisorManagementGuards {
             sessions,
             _task: task,
-            _lifecycle: ManagementLifecycleGuard::Shared { _guard: lifecycle },
+            _lifecycle: LifecycleGuard::Shared { _guard: lifecycle },
             _host_namespace: None,
         });
         let mut current = self
