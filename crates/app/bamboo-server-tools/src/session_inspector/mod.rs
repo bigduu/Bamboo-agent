@@ -12,6 +12,7 @@ pub mod discovery;
 mod handlers;
 mod helpers;
 pub mod host_discovery;
+mod scoped_context;
 mod self_history;
 
 use args::SessionInspectorArgs;
@@ -146,7 +147,7 @@ impl Tool for SessionInspectorTool {
                 "Read-only viewer over local session history. A Supervisor can list only its explicitly authorized targets with a small limit and cursor, inspect bounded persisted progress, or read_messages/get_meta for an attached Root. Directory queries match target IDs or Projects; stale cursors require a new first page. Inspect reports session-scoped persisted evidence, never verified live or input-specific completion. Ordinary legacy viewers retain current-Session search/paging, local history listing and same-tree export_context. This viewer has no runtime control. Send follow-up through session_message(action=send) and its separately installed Host authority; a directory entry does not grant sending rights."
             }
             SessionHistoryAccess::HostRouted => {
-                "Read-only discovery through explicitly installed Host Session scopes. list returns metadata-only pages and inspect returns bounded persisted progress, never live/input-specific completion or full peer history. Scope is revalidated at the canonical read; IDs, Projects and cursors grant nothing. Use session_history_current or search_current/read_current/read_around for filtered current-Session history. Ordinary callers cannot read another Session's raw history, compressed cache or global search. Only an original real Supervisor with never-installed Host scope retains its existing managed read_messages/get_meta; installed/stale/revoked/unsupported scope never falls back. This tool attaches no history, sends no input and grants no create/send authority."
+                "Read-only discovery through explicitly installed Host Session scopes. list returns metadata-only pages and inspect returns bounded persisted progress, never live/input-specific completion or full peer history. Scoped export_context/read_context return immutable status/brief observations through fixed revision/file selectors with the independent ReadContextView right (or original managed Supervisor authority). Scope is revalidated at the canonical read; IDs, Projects and cursors grant nothing. Use session_history_current or search_current/read_current/read_around for filtered current-Session history. Ordinary callers cannot read another Session's raw history, compressed cache or global search. Only an original real Supervisor with never-installed Host scope retains its existing managed read_messages/get_meta; installed/stale/revoked/unsupported scope never falls back. This tool attaches no history, sends no input and grants no create/send authority."
             }
             SessionHistoryAccess::Authorized => {
                 "Read-only discovery of explicitly Host-authorized Sessions. list returns metadata-only pages (limit <=20, query matches target ID/Project); reuse the returned cursor with the same query and limit. inspect returns bounded persisted progress and a visible assistant excerpt, never verified live or input-specific completion. Caller identity and grants come from the installed Host adapter. Missing/stale authority is a blocker; this surface never falls back to all local Sessions, attaches history or sends work. Use session_message(action=send) with its own Host authority for delivery; this listing is not a sending grant."
@@ -230,7 +231,7 @@ impl Tool for SessionInspectorTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["search_current", "read_current", "read_around", "list", "inspect", "get_meta", "read_messages", "read_compressed_cache", "search", "export_context"],
+                    "enum": ["search_current", "read_current", "read_around", "list", "inspect", "get_meta", "read_messages", "read_compressed_cache", "search", "export_context", "read_context"],
                     "description": "Which inspection action to perform."
                 },
                 "query": { "type": "string", "description": "Search string (search_current/list/search)." },
@@ -248,7 +249,9 @@ impl Tool for SessionInspectorTool {
                 "before_turns": { "type": "number", "description": "Complete turns before the read_around anchor." },
                 "after_turns": { "type": "number", "description": "Complete turns after the read_around anchor." },
                 "offset": { "type": "number", "description": "Offset (list/read_messages)." },
-                "session_id": { "type": "string", "description": "Target session id. export_context requires a persisted Root caller and a target in its own tree with the same optional Project identity; output paths are runtime-owned." },
+                "session_id": { "type": "string", "description": "Target session ID. Legacy export_context is same-tree/same-Project; scoped export_context/read_context require the original caller and current explicit ReadContextView authority (or the original managed Supervisor route). Paths are runtime-derived." },
+                "revision": { "type":"string", "minLength":64, "maxLength":64, "description":"Exact immutable view revision returned by scoped export_context." },
+                "file": { "type":"string", "enum":["status","brief"], "description":"Fixed context file for read_context; no path is accepted." },
                 "from_end": { "type": "boolean", "description": "Read from end (read_messages)." },
                 "truncate_chars": { "type": "number", "description": "Max chars per message (read_messages)." },
                 "include_system": { "type": "boolean" },
@@ -274,10 +277,11 @@ impl Tool for SessionInspectorTool {
                 "get_meta",
                 "read_messages",
                 "read_compressed_cache",
-                "export_context"
+                "export_context",
+                "read_context"
             ]);
             schema["properties"]["session_id"]["description"] = json!(
-                "inspect uses explicit Host bounded-progress authority. Other actions are self-only, except existing managed get_meta/read_messages for a real Supervisor with never-installed Host scope."
+                "inspect requires InspectBoundedProgress; export_context/read_context separately require ReadContextView. An original managed Supervisor may use its independent never-installed-Host compatibility route. read_context accepts only exact revision, status/brief, offset<=120 and limit1..40. Other actions are self-only, except existing managed get_meta/read_messages for a real Supervisor with never-installed Host scope."
             );
             schema["properties"]["query"]["description"] = json!(
                 "Target ID/Project filter for list, or text in current-Session search_current."
@@ -320,6 +324,50 @@ impl Tool for SessionInspectorTool {
         })?;
 
         let action = args.get("action").and_then(serde_json::Value::as_str);
+        // Preserve the existing ordinary Root self-export. Intrinsic self
+        // history is not a fallback from a denied peer scope.
+        let legacy_self_export = self.access == SessionHistoryAccess::HostRouted
+            && action == Some("export_context")
+            && args.get("session_id").and_then(serde_json::Value::as_str)
+                == Some(caller_session_id)
+            && ctx.executing_supervisor.is_none()
+            && caller_session_id != bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID;
+        let context_route = (self.access == SessionHistoryAccess::HostRouted
+            && !legacy_self_export)
+            || (self.access == SessionHistoryAccess::Full
+                && (ctx.executing_supervisor.is_some()
+                    || caller_session_id == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID));
+        if context_route && matches!(action, Some("export_context" | "read_context")) {
+            if args.as_object().is_some_and(|fields| {
+                fields.keys().any(|key| {
+                    !matches!(key.as_str(), "action" | "session_id")
+                        && (action == Some("export_context")
+                            || !matches!(key.as_str(), "revision" | "file" | "offset" | "limit"))
+                })
+            }) {
+                return Err(ToolError::InvalidArguments("scoped context accepts only target, fixed revision/file and bounded offset/limit; identity and paths are runtime-derived".into()));
+            }
+            let parsed: SessionInspectorArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::InvalidArguments(format!("Invalid scoped context args: {e}"))
+            })?;
+            let result = match parsed {
+                SessionInspectorArgs::ExportContext { session_id } => {
+                    scoped_context::export(self, &ctx, &session_id).await?
+                }
+                SessionInspectorArgs::ReadContext {
+                    session_id,
+                    revision,
+                    file,
+                    offset,
+                    limit,
+                } => {
+                    scoped_context::read(self, &ctx, &session_id, &revision, &file, offset, limit)
+                        .await?
+                }
+                _ => unreachable!("fixed context actions checked"),
+            };
+            return Ok(ToolOutcome::Completed(result));
+        }
         let scoped_discovery = matches!(
             self.access,
             SessionHistoryAccess::Authorized | SessionHistoryAccess::HostRouted
@@ -600,6 +648,9 @@ impl Tool for SessionInspectorTool {
             SessionInspectorArgs::ExportContext { session_id } => {
                 context_view::export_context(self, caller_session_id, &session_id).await
             }
+            SessionInspectorArgs::ReadContext { .. } => Err(ToolError::Execution(
+                "read_context requires an original executing caller and explicit scoped context surface".into(),
+            )),
             SessionInspectorArgs::List {
                 query,
                 kind,

@@ -7211,6 +7211,16 @@ impl Storage for SessionStoreV2 {
             .await
     }
 
+    async fn load_host_scoped_context_target(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<Session> {
+        self.load_host_scoped_context_target_impl(token, caller, target_id)
+            .await
+    }
+
     async fn save_manual_title(&self, session: &Session) -> io::Result<()> {
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
@@ -7515,6 +7525,14 @@ impl Storage for SessionStoreV2 {
         target_session_id: &str,
     ) -> io::Result<Option<Session>> {
         self.management_history(supervisor, target_session_id).await
+    }
+
+    async fn load_supervisor_context_target(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target_id: &str,
+    ) -> io::Result<(Session, bamboo_domain::SupervisorLinkObservation)> {
+        self.management_context(supervisor, target_id).await
     }
 
     async fn save_session(&self, session: &Session) -> io::Result<()> {

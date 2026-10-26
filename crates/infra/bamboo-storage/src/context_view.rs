@@ -214,3 +214,97 @@ pub async fn publish_session_context_snapshot(
         .await
         .map_err(|error| io::Error::other(format!("context snapshot publisher failed: {error}")))?
 }
+
+/// Read only the three fixed files, with caps on actual I/O. The caller must
+/// independently authorize and verify manifest provenance before returning data.
+pub async fn read_session_context_snapshot(
+    home: &Path,
+    caller_id: &str,
+    revision: &str,
+) -> io::Result<ContextSnapshotFiles> {
+    if !is_revision(revision) {
+        return Err(invalid("context_snapshot_invalid: invalid revision"));
+    }
+    let home = home.to_path_buf();
+    let caller_id = caller_id.to_owned();
+    let revision = revision.to_owned();
+    tokio::task::spawn_blocking(move || retained_read(&home, &caller_id, &revision))
+        .await
+        .map_err(|error| io::Error::other(format!("context snapshot reader failed: {error}")))?
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn retained_read(home: &Path, caller: &str, revision: &str) -> io::Result<ContextSnapshotFiles> {
+    use std::{
+        ffi::CString,
+        io::Read,
+        os::fd::{AsRawFd, FromRawFd},
+        os::unix::ffi::OsStrExt,
+    };
+    fn open_at(parent: &File, name: &str, directory: bool) -> io::Result<File> {
+        let name = CString::new(name).map_err(|_| invalid("invalid context component"))?;
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if directory { libc::O_DIRECTORY } else { 0 };
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+    fn bounded(parent: &File, name: &str, limit: usize) -> io::Result<Vec<u8>> {
+        let file = open_at(parent, name, false)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > limit as u64 {
+            return Err(invalid("context_snapshot_corrupt: file type or byte limit"));
+        }
+        let mut bytes = Vec::new();
+        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(invalid(
+                "context_snapshot_corrupt: actual read exceeded limit",
+            ));
+        }
+        Ok(bytes)
+    }
+    // The configured data home is the trusted anchor. Every view component and
+    // file below its retained fd is opened without following links/reopening paths.
+    let home = fs::canonicalize(home)?;
+    let name =
+        CString::new(home.as_os_str().as_bytes()).map_err(|_| invalid("invalid data home"))?;
+    let fd = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut directory = unsafe { File::from_raw_fd(fd) };
+    let caller_hash = format!("{:x}", Sha256::digest(caller.as_bytes()));
+    for part in [
+        "coordination",
+        "session-context",
+        "v1",
+        &caller_hash,
+        revision,
+    ] {
+        directory = open_at(&directory, part, true)?;
+    }
+    Ok(ContextSnapshotFiles {
+        manifest: bounded(&directory, "manifest.json", MAX_CONTEXT_MANIFEST_BYTES)?,
+        status: bounded(&directory, "status.md", MAX_CONTEXT_STATUS_BYTES)?,
+        brief: bounded(&directory, "brief.md", MAX_CONTEXT_BRIEF_BYTES)?,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn retained_read(_: &Path, _: &str, _: &str) -> io::Result<ContextSnapshotFiles> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "context_snapshot_retained_read_unsupported: no path-check/reopen fallback",
+    ))
+}
