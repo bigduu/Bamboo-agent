@@ -174,7 +174,7 @@ fn exact_receipt_reopens_without_free_retry_and_changed_payload_is_rejected() {
 }
 
 #[test]
-fn known_usage_refunds_once_and_over_cap_usage_keeps_the_original_charge() {
+fn known_usage_refunds_once() {
     let dir = tempfile::tempdir().unwrap();
     let service = open(dir.path());
     let work = create(&service);
@@ -184,26 +184,6 @@ fn known_usage_refunds_once_and_over_cap_usage_keeps_the_original_charge() {
         service
             .reserve_work_tokens(&runtime(), &request, 1)
             .unwrap(),
-    );
-    assert!(service
-        .settle_work_tokens(
-            &runtime(),
-            &request.operation_id,
-            &request.request_hash,
-            &record.receipt,
-            ExecutionTokenUsage::Known {
-                input_tokens: 61,
-                output_tokens: 0
-            }
-        )
-        .is_err());
-    assert_eq!(
-        service
-            .work_token_budget(&runtime())
-            .unwrap()
-            .unwrap()
-            .total_charged,
-        100
     );
     let measured = ExecutionTokenUsage::Known {
         input_tokens: 10,
@@ -255,6 +235,129 @@ fn known_usage_refunds_once_and_over_cap_usage_keeps_the_original_charge() {
             .total_charged,
         15
     );
+}
+
+#[test]
+fn over_cap_report_is_retained_across_reopen_and_halts_new_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = open(dir.path());
+    let work = create(&service);
+    configure(&service, &work, 300, 300, 300);
+    let request = input_request(&service, &work, "over-cap");
+    let record = reserved(
+        service
+            .reserve_work_tokens(&runtime(), &request, 1)
+            .unwrap(),
+    );
+    let report = ExecutionTokenUsage::Known {
+        input_tokens: u64::from(u32::MAX) + 1,
+        output_tokens: 1,
+    };
+    assert!(matches!(
+        service.settle_work_tokens(
+            &runtime(),
+            &request.operation_id,
+            &request.request_hash,
+            &record.receipt,
+            report
+        ),
+        Err(Error::ResourceBlocked(_))
+    ));
+    let seq = service.published().unwrap().1.seq;
+    assert!(service
+        .settle_work_tokens(
+            &runtime(),
+            &request.operation_id,
+            &request.request_hash,
+            &record.receipt,
+            report
+        )
+        .is_err());
+    assert_eq!(service.published().unwrap().1.seq, seq);
+    drop(service);
+    let service = open(dir.path());
+    let budget = service.work_token_budget(&runtime()).unwrap().unwrap();
+    assert_eq!(budget.total_charged, 100);
+    assert_eq!(
+        budget.reservations[&request.operation_id].over_cap_usage,
+        Some(ExecutionTokenOverCapUsage {
+            input_tokens: Some(u64::from(u32::MAX) + 1),
+            output_tokens: Some(1)
+        })
+    );
+    assert!(service
+        .settle_work_tokens(
+            &runtime(),
+            &request.operation_id,
+            &request.request_hash,
+            &record.receipt,
+            ExecutionTokenUsage::Unknown
+        )
+        .is_err());
+    assert_eq!(
+        service
+            .reserve_work_tokens(
+                &runtime(),
+                &input_request(&service, &work, "after-over-cap"),
+                2
+            )
+            .unwrap(),
+        WorkTokenAdmission::Blocked(WorkTokenBlock::Accounting)
+    );
+}
+
+#[test]
+fn accounting_preserves_fact_revision_but_real_work_mutation_advances_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = open(dir.path());
+    let work = create(&service);
+    let facts = service.published().unwrap().1.execution_facts_revision();
+    configure(&service, &work, 300, 300, 300);
+    let request = input_request(&service, &work, "facts");
+    let record = reserved(
+        service
+            .reserve_work_tokens(&runtime(), &request, 1)
+            .unwrap(),
+    );
+    service
+        .settle_work_tokens(
+            &runtime(),
+            &request.operation_id,
+            &request.request_hash,
+            &record.receipt,
+            ExecutionTokenUsage::Known {
+                input_tokens: 10,
+                output_tokens: 5,
+            },
+        )
+        .unwrap();
+    let snapshot = service.published().unwrap().1;
+    assert!(snapshot.seq > facts);
+    assert_eq!(snapshot.execution_facts_revision(), facts);
+    drop(service);
+    let service = open(dir.path());
+    let reopened_facts = service.published().unwrap().1.execution_facts_revision();
+    assert!(
+        reopened_facts > facts,
+        "a new writer authority epoch is an execution fact"
+    );
+    let command = service
+        .prepare_command(
+            &user(),
+            "new-work-facts",
+            vec![Operation::Create {
+                temp_id: "second".into(),
+                kind: TicketKind::Work,
+                parent: None,
+                contract: snapshot.tickets[&work].contract.clone(),
+                depends_on: BTreeSet::new(),
+            }],
+        )
+        .unwrap();
+    service.execute(&user(), &command).unwrap();
+    let next = service.published().unwrap().1;
+    assert!(next.execution_facts_revision() > reopened_facts);
+    assert_eq!(next.execution_facts_revision(), next.seq);
 }
 
 #[test]

@@ -539,6 +539,16 @@ impl TicketApplication {
         if workspaces.len() > 64 {
             return Err(Error::ContextBudgetExceeded);
         }
+        if self.service()?.published()?.1.execution_budget.is_some()
+            && self
+                .adapter
+                .get()
+                .is_none_or(|adapter| !adapter.supports_native_ticket_budget())
+        {
+            return Err(Error::ResourceBlocked(
+                "configured token accounting requires the assembled Native backend".into(),
+            ));
+        }
         {
             let config = self.config.read().await;
             let subagents = config.subagents();

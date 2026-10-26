@@ -65,10 +65,27 @@ pub struct WorkTokenConfiguration {
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionTokenUsage {
     Known {
-        input_tokens: u32,
-        output_tokens: u32,
+        input_tokens: u64,
+        output_tokens: u64,
     },
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionTokenOverCapUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+impl ExecutionTokenOverCapUsage {
+    fn exceeds(&self, request: &WorkTokenRequest) -> bool {
+        self.input_tokens
+            .is_some_and(|input| input > u64::from(request.input_cap))
+            || self
+                .output_tokens
+                .is_some_and(|output| output > u64::from(request.output_cap))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +96,11 @@ pub struct WorkTokenReservation {
     pub utc_day: u64,
     /// None/Unknown both retain the full cap, including across process exit.
     pub usage: Option<ExecutionTokenUsage>,
+    /// An authoritative meter exceeded this request's submitted ceilings.
+    /// Retain the original full charge and halt new admissions; do not discard
+    /// the report, invent a refund or pretend the actual usage fits the cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub over_cap_usage: Option<ExecutionTokenOverCapUsage>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +109,7 @@ pub enum WorkTokenBlock {
     Daily,
     Total,
     Capacity,
+    Accounting,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,7 +163,10 @@ fn valid_request(request: &WorkTokenRequest) -> Result<()> {
     {
         return Err(invalid("invalid bounded Work token request"));
     }
-    if (request.purpose == ExecutionBudgetPurpose::Patrol && request.attempt.is_none())
+    if (matches!(
+        request.purpose,
+        ExecutionBudgetPurpose::Worker | ExecutionBudgetPurpose::Patrol
+    ) && request.attempt.is_none())
         || request.attempt.as_ref().is_some_and(|attempt| {
             attempt.assignment_id.is_empty()
                 || attempt.assignment_id.len() > 256
@@ -208,10 +234,14 @@ fn charge(record: &WorkTokenReservation) -> Result<u64> {
             input_tokens,
             output_tokens,
         }) => {
-            if input_tokens > request.input_cap || output_tokens > request.output_cap {
+            if input_tokens > u64::from(request.input_cap)
+                || output_tokens > u64::from(request.output_cap)
+            {
                 return Err(invalid("measured token usage exceeds the reserved caps"));
             }
-            Ok(u64::from(input_tokens) + u64::from(output_tokens))
+            input_tokens
+                .checked_add(output_tokens)
+                .ok_or_else(|| invalid("measured token overflow"))
         }
         None | Some(ExecutionTokenUsage::Unknown) => {
             Ok(u64::from(request.input_cap) + u64::from(request.output_cap))
@@ -245,6 +275,12 @@ fn limits_valid(limits: &WorkTokenLimits, snapshot: &Snapshot) -> Result<()> {
 /// Unknown charges are recomputed conservatively; limits never supply evidence
 /// that an execution stopped, completed, or can be admitted again.
 pub(crate) fn validate(snapshot: &Snapshot) -> Result<()> {
+    if snapshot
+        .execution_facts_seq
+        .is_some_and(|seq| snapshot.schema < 8 || seq > snapshot.seq)
+    {
+        return Err(invalid("invalid execution-facts revision"));
+    }
     let Some(budget) = &snapshot.execution_budget else {
         if snapshot.schema >= 8 {
             return Err(invalid("budget schema cannot erase its canonical ledger"));
@@ -290,6 +326,12 @@ pub(crate) fn validate(snapshot: &Snapshot) -> Result<()> {
     let mut works = BTreeMap::<String, u64>::new();
     for (id, record) in &budget.reservations {
         valid_request(&record.request)?;
+        if record.over_cap_usage.is_some_and(|usage| {
+            !usage.exceeds(&record.request)
+                || matches!(record.usage, Some(ExecutionTokenUsage::Known { .. }))
+        }) {
+            return Err(invalid("invalid retained over-cap provider report"));
+        }
         if id != &record.request.operation_id
             || record.receipt
                 != content_hash(&canonical_bytes(&(&snapshot.binding, &record.request))?)
@@ -411,7 +453,7 @@ impl TicketService {
                 },
             );
         crate::service::validate_snapshot(&next)?;
-        store.publish(next)?;
+        store.publish_accounting(next)?;
         Ok(revision)
     }
 
@@ -477,6 +519,13 @@ impl TicketService {
         if budget.last_reservation_ms.is_some_and(|last| now_ms < last) {
             return Err(Error::ResourceBlocked("Work token clock regressed".into()));
         }
+        if budget
+            .reservations
+            .values()
+            .any(|record| record.over_cap_usage.is_some())
+        {
+            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Accounting));
+        }
         if budget.reservations.len() >= MAX_RECORDS {
             return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Capacity));
         }
@@ -516,6 +565,7 @@ impl TicketService {
             receipt: content_hash(&canonical_bytes(&(&snapshot.binding, request))?),
             utc_day: day,
             usage: None,
+            over_cap_usage: None,
         };
         let mut next = snapshot.clone();
         let budget = next.execution_budget.as_mut().expect("configured");
@@ -540,7 +590,7 @@ impl TicketService {
             .insert(request.operation_id.clone(), record.clone());
         next.seq = next.seq.checked_add(1).ok_or(Error::RevisionConflict)?;
         crate::service::validate_snapshot(&next)?;
-        store.publish(next)?;
+        store.publish_accounting(next)?;
         Ok(WorkTokenAdmission::Reserved(record))
     }
 
@@ -578,11 +628,45 @@ impl TicketService {
         if old.receipt != receipt || old.request.request_hash != request_hash {
             return Err(Error::IdempotencyConflict);
         }
+        if old.over_cap_usage.is_some() {
+            return Err(Error::ResourceBlocked(
+                "provider usage exceeded reserved ceilings; accounting halted".into(),
+            ));
+        }
         if old.usage == Some(usage) {
             return Ok(old.clone());
         }
         if matches!(old.usage, Some(ExecutionTokenUsage::Known { .. })) {
             return Err(Error::IdempotencyConflict);
+        }
+        if matches!(usage, ExecutionTokenUsage::Known { input_tokens, output_tokens }
+            if input_tokens > u64::from(old.request.input_cap) || output_tokens > u64::from(old.request.output_cap))
+        {
+            let mut next = snapshot.clone();
+            let record = next
+                .execution_budget
+                .as_mut()
+                .expect("configured")
+                .reservations
+                .get_mut(operation_id)
+                .expect("checked");
+            let ExecutionTokenUsage::Known {
+                input_tokens,
+                output_tokens,
+            } = usage
+            else {
+                unreachable!("matched Known usage");
+            };
+            record.over_cap_usage = Some(ExecutionTokenOverCapUsage {
+                input_tokens: Some(input_tokens),
+                output_tokens: Some(output_tokens),
+            });
+            next.seq = next.seq.checked_add(1).ok_or(Error::RevisionConflict)?;
+            crate::service::validate_snapshot(&next)?;
+            store.publish_accounting(next)?;
+            return Err(Error::ResourceBlocked(
+                "provider usage exceeded reserved ceilings; accounting halted".into(),
+            ));
         }
         let mut record = old.clone();
         record.usage = Some(usage);
@@ -613,7 +697,66 @@ impl TicketService {
             .insert(operation_id.into(), record.clone());
         next.seq = next.seq.checked_add(1).ok_or(Error::RevisionConflict)?;
         crate::service::validate_snapshot(&next)?;
-        store.publish(next)?;
+        store.publish_accounting(next)?;
+        Ok(record)
+    }
+
+    /// A single authoritative dimension exceeding its ceiling suffices to halt
+    /// admission. Missing/inconsistent totals never erase this positive proof.
+    pub fn report_work_token_over_cap(
+        &self,
+        authority: &Authority,
+        operation_id: &str,
+        request_hash: &str,
+        receipt: &str,
+        report: ExecutionTokenOverCapUsage,
+    ) -> Result<WorkTokenReservation> {
+        let mut store = self.inner.lock().expect("store mutex");
+        let snapshot = &store
+            .published
+            .as_ref()
+            .ok_or_else(|| Error::AuthorityUnavailable("no Ticket snapshot".into()))?
+            .1;
+        validate_authority(authority, snapshot)?;
+        runtime(authority)?;
+        if store.health != Health::Writable {
+            return Err(Error::AuthorityUnavailable(
+                "token ledger is not writable".into(),
+            ));
+        }
+        let old = snapshot
+            .execution_budget
+            .as_ref()
+            .and_then(|budget| budget.reservations.get(operation_id))
+            .ok_or_else(|| Error::ScopeDenied("unknown token receipt".into()))?;
+        if old.receipt != receipt || old.request.request_hash != request_hash {
+            return Err(Error::IdempotencyConflict);
+        }
+        if let Some(previous) = old.over_cap_usage {
+            return if previous == report {
+                Ok(old.clone())
+            } else {
+                Err(Error::IdempotencyConflict)
+            };
+        }
+        if matches!(old.usage, Some(ExecutionTokenUsage::Known { .. }))
+            || !report.exceeds(&old.request)
+        {
+            return Err(invalid(
+                "report does not prove an unsettled reservation exceeded its ceilings",
+            ));
+        }
+        let mut record = old.clone();
+        record.over_cap_usage = Some(report);
+        let mut next = snapshot.clone();
+        next.execution_budget
+            .as_mut()
+            .expect("configured")
+            .reservations
+            .insert(operation_id.into(), record.clone());
+        next.seq = next.seq.checked_add(1).ok_or(Error::RevisionConflict)?;
+        crate::service::validate_snapshot(&next)?;
+        store.publish_accounting(next)?;
         Ok(record)
     }
 }

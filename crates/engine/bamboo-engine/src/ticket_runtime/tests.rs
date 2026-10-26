@@ -6,6 +6,7 @@ use bamboo_domain::{SessionInboxLimits, DEFAULT_SUPERVISOR_SESSION_ID};
 use bamboo_storage::{FileSessionInbox, LockedSessionStore, SessionStoreV2};
 use bamboo_tickets::{Contract, FaultPoint, TicketKind};
 use std::collections::BTreeSet;
+mod token_budget;
 
 fn save_owned_stop_fixture(child: &mut Session, completed: bool) {
     let receipt = read_dispatch(child).unwrap().unwrap().receipt.unwrap();
@@ -276,6 +277,10 @@ async fn only_canonical_ticket_child_of_the_current_supervisor_avoids_orphan_wai
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_project(false).await
+    }
+
+    async fn with_project(project: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let storage = Arc::new(SessionStoreV2::new(dir.path().join("host")).await.unwrap());
         storage
@@ -300,35 +305,38 @@ impl Fixture {
                 session_id: supervisor.id.clone(),
             },
         );
+        let mut operations = vec![Operation::Create {
+            temp_id: "work".into(),
+            kind: TicketKind::Work,
+            parent: None,
+            depends_on: BTreeSet::new(),
+            contract: Contract {
+                title: "Own work".into(),
+                objective: "One result".into(),
+                constraints: vec!["Root private".into()],
+                acceptance: vec!["Exact evidence".into()],
+                user_acceptance_required: true,
+                allowed_tools: BTreeSet::from(["Task".into()]),
+            },
+        }];
+        if project {
+            operations.push(Operation::AssociateProject {
+                ticket_id: "work".into(),
+                project_id: "budget-fixture-project".parse().unwrap(),
+            });
+        }
+        operations.extend([
+            Operation::Ready {
+                work_id: "work".into(),
+            },
+            Operation::Start {
+                work_id: "work".into(),
+                temp_id: "assignment".into(),
+                workspace: None,
+            },
+        ]);
         let command = service
-            .prepare_command(
-                &authority,
-                "create",
-                vec![
-                    Operation::Create {
-                        temp_id: "work".into(),
-                        kind: TicketKind::Work,
-                        parent: None,
-                        depends_on: BTreeSet::new(),
-                        contract: Contract {
-                            title: "Own work".into(),
-                            objective: "One result".into(),
-                            constraints: vec!["Root private".into()],
-                            acceptance: vec!["Exact evidence".into()],
-                            user_acceptance_required: true,
-                            allowed_tools: BTreeSet::from(["Task".into()]),
-                        },
-                    },
-                    Operation::Ready {
-                        work_id: "work".into(),
-                    },
-                    Operation::Start {
-                        work_id: "work".into(),
-                        temp_id: "assignment".into(),
-                        workspace: None,
-                    },
-                ],
-            )
+            .prepare_command(&authority, "create", operations)
             .unwrap();
         let receipt = service.execute(&authority, &command).unwrap();
         let snapshot = service.published().unwrap().1;

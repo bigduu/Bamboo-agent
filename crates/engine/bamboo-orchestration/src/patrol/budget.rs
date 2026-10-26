@@ -17,7 +17,7 @@ pub struct TicketBudget<'a> {
     pub clock: &'a dyn Clock,
 }
 
-fn request(request: &DiagnosticRequest) -> Result<WorkTokenRequest, PortError> {
+fn request(request: &DiagnosticRequest, observed_seq: u64) -> Result<WorkTokenRequest, PortError> {
     let scope = &request.operation.incident.scope;
     if request.input.scope != *scope
         || !matches!(request.operation.kind, OperationKind::Diagnostic(n) if (1..=8).contains(&n))
@@ -40,7 +40,7 @@ fn request(request: &DiagnosticRequest) -> Result<WorkTokenRequest, PortError> {
         request_hash: bamboo_tickets::content_hash(
             &bamboo_tickets::canonical_bytes(request).map_err(host::ticket_error)?,
         ),
-        observed_seq: request.input.source_revision,
+        observed_seq,
         input_cap: request.model.max_input_tokens,
         output_cap: request.model.max_output_tokens,
         attempt: Some(WorkTokenAttempt {
@@ -59,15 +59,18 @@ impl BudgetPort for TicketBudget<'_> {
         let observation = source
             .observation(scope, 0)
             .map_err(|_| BudgetBlock::Unavailable)?;
-        let request = request(diagnostic).map_err(|_| BudgetBlock::Unavailable)?;
+        let identity = request(diagnostic, 0).map_err(|_| BudgetBlock::Unavailable)?;
         // Exact old receipts reconcile accounting only, never provider permission.
         if let Some(record) = self
             .service
             .work_token_budget(self.authority)
             .map_err(|_| BudgetBlock::Unavailable)?
-            .and_then(|budget| budget.reservations.get(&request.operation_id).cloned())
+            .and_then(|budget| budget.reservations.get(&identity.operation_id).cloned())
         {
-            if record.request != request {
+            if record.request
+                != request(diagnostic, record.request.observed_seq)
+                    .map_err(|_| BudgetBlock::Unavailable)?
+            {
                 return Err(BudgetBlock::Unavailable);
             }
             return Ok(Reservation {
@@ -77,12 +80,21 @@ impl BudgetPort for TicketBudget<'_> {
             });
         }
         if diagnostic.input.source_revision != observation.source_revision
-            || diagnostic.input.through_cursor != observation.cursor
+            || diagnostic.input.through_cursor > observation.cursor
             || diagnostic.input.since_cursor > diagnostic.input.through_cursor
             || self.clock.now_ms() >= diagnostic.deadline_ms
         {
             return Err(BudgetBlock::Unavailable);
         }
+        let snapshot = self
+            .service
+            .published()
+            .map_err(|_| BudgetBlock::Unavailable)?
+            .1;
+        if snapshot.execution_facts_revision() != diagnostic.input.source_revision {
+            return Err(BudgetBlock::Unavailable);
+        }
+        let request = request(diagnostic, snapshot.seq).map_err(|_| BudgetBlock::Unavailable)?;
         match self
             .service
             .reserve_work_tokens(self.authority, &request, self.clock.now_ms())
@@ -97,7 +109,7 @@ impl BudgetPort for TicketBudget<'_> {
                 WorkTokenBlock::Work => BudgetBlock::Work,
                 WorkTokenBlock::Daily => BudgetBlock::Daily,
                 WorkTokenBlock::Total => BudgetBlock::Total,
-                WorkTokenBlock::Capacity => BudgetBlock::Unavailable,
+                WorkTokenBlock::Capacity | WorkTokenBlock::Accounting => BudgetBlock::Unavailable,
             }),
         }
     }
@@ -106,7 +118,17 @@ impl BudgetPort for TicketBudget<'_> {
         if reservation.operation != reservation.request.operation {
             return Err(PortError::Denied);
         }
-        let request = request(&reservation.request)?;
+        let identity = request(&reservation.request, 0)?;
+        let record = self
+            .service
+            .work_token_budget(self.authority)
+            .map_err(host::ticket_error)?
+            .and_then(|budget| budget.reservations.get(&identity.operation_id).cloned())
+            .ok_or(PortError::Denied)?;
+        let request = request(&reservation.request, record.request.observed_seq)?;
+        if record.request != request || record.receipt != reservation.receipt {
+            return Err(PortError::Denied);
+        }
         // The original Assignment need not remain active. A fresh Runtime proof
         // for this binding may settle its old receipt after restart/Submitted/
         // generation changes, without granting another provider admission.
@@ -115,8 +137,8 @@ impl BudgetPort for TicketBudget<'_> {
                 input_tokens,
                 output_tokens,
             } => ExecutionTokenUsage::Known {
-                input_tokens,
-                output_tokens,
+                input_tokens: u64::from(input_tokens),
+                output_tokens: u64::from(output_tokens),
             },
             Usage::Unknown => ExecutionTokenUsage::Unknown,
         };

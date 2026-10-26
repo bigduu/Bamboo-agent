@@ -72,6 +72,14 @@ impl RoleReasoningProvider {
 
 #[async_trait]
 impl LLMProvider for RoleReasoningProvider {
+    fn resource_allocation_identity(&self) -> Option<usize> {
+        Some(
+            self.inner
+                .resource_allocation_identity()
+                .unwrap_or_else(|| Arc::as_ptr(&self.inner) as *const () as usize),
+        )
+    }
+
     async fn vision_support_override(&self, model: &str) -> Option<bool> {
         self.inner.vision_support_override(model).await
     }

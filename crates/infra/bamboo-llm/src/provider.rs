@@ -274,6 +274,12 @@ pub(crate) fn required_tool_from_options<'a>(
 /// ```
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
+    /// Transparent Host decorators retain the original provider allocation's
+    /// process-wide concurrency identity. This is never a model/client ID.
+    fn resource_allocation_identity(&self) -> Option<usize> {
+        None
+    }
+
     /// Effective Vision support. Missing declarations default to enabled;
     /// only an explicit false disables it. Never infer from model names.
     async fn supports_vision(&self, model: &str) -> bool {
