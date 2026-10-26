@@ -172,6 +172,26 @@ pub async fn publish_completion(
     if !uses_artifact_contract(child) {
         return Ok(None);
     }
+    // A trusted watchdog may persist a terminal failure without a report seal.
+    // Its already-owned control-plane outcome may release the existing wait;
+    // no unsealed text, evidence reference or successful artifact is exposed.
+    if completion.source.is_none()
+        && matches!(
+            completion.status.as_str(),
+            "error" | "timeout" | "cancelled" | "skipped"
+        )
+        && child.kind == bamboo_domain::SessionKind::Child
+        && child.id == completion.child_session_id
+        && parent.id == completion.parent_session_id
+        && child.parent_session_id.as_deref() == Some(parent.id.as_str())
+        && child.last_run_status().as_deref() == Some(completion.status.as_str())
+    {
+        return Ok(Some(
+            json!({"view":"planner_artifact","version":1,"available":false,
+            "reason":"planner_terminal_failure","terminal_status":completion.status,
+            "execution_approved":false,"report_source_available":false}),
+        ));
+    }
     if completion.source.as_ref().is_none_or(|s| {
         !s.matches_completion(completion)
             || ChildCompletionSource::from_committed_session(child).as_ref() != Some(s)

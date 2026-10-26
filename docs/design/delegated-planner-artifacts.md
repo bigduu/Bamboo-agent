@@ -23,6 +23,13 @@ The ordinary completion coordinator publishes before durable Inbox delivery,
 including recovery of an already terminal sibling. Replayed delivery retains
 the original completion identity and cannot create another Child.
 
+A trusted boot watchdog can persist a failed terminal outcome without a report
+seal when the worker disappears. For the same owned Child and canonical failed
+status, that outcome resumes the existing parent wait with a bounded
+`available:false` result. It exposes no unsealed text, evidence, read selector or
+artifact file, and does not claim execution approval or successful completion.
+A source-less success still fails the report seal check.
+
 The automatic resume contains only a bounded artifact reference and summary.
 Call `Plan` with its `read` object to get section IDs; add `section_id` to read
 one section. Reads require the exact Child birth, assignment digest and revision,
@@ -37,10 +44,13 @@ unchanged. The first native acceptance target is Linux. Neither component tests
 nor compile-only Windows CI constitute native Windows acceptance.
 
 Acceptance is finite: existing Plan contracts plus selected-context positive and
-denial components; seven artifact/completion/recovery tests; and one actual CLI
-Host/current-exe worker test using only a bounded loopback fake provider. That
-native case must prove source Read, denied Write even with a permissive parent,
+denial components; nine artifact/completion/recovery tests; and two actual CLI
+Host/current-exe worker tests using only a bounded loopback fake provider. The
+healthy case must prove source Read, denied Write even with a permissive parent,
 one Child, automatic parent resume without the full plan, partial section read,
-and the same immutable revision after a real Host restart. Existing #2294
+and the same immutable revision after a real Host restart. The failure case
+kills the actual Host while the Planner model request is in flight, then proves
+boot recovery resumes the parent with an unavailable result, no artifact and no
+worker redispatch. Existing #2294
 authority evidence is retained separately; no old run is relabeled for this
 source. The encompassing #1048/#1968 Epics remain open.
