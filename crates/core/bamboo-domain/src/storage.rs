@@ -479,7 +479,8 @@ pub trait Storage: Send + Sync {
     }
 
     /// Strict metadata/runtime-only Root source for a bounded immutable view.
-    /// This is the same installed inspection authority, never raw history.
+    /// Requires the independent installed ReadContextView right, never raw
+    /// history or the older InspectBoundedProgress projection authority.
     /// Authority validation may inspect Main; this is not a total-I/O cap.
     async fn load_host_scoped_context_target(
         &self,

@@ -5,6 +5,7 @@ on:
     branches: [dev]
     paths:
       - 'crates/core/bamboo-domain/src/storage.rs'
+      - 'crates/core/bamboo-domain/src/host_session_scope.rs'
       - 'crates/infra/bamboo-storage/**'
       - 'crates/app/bamboo-server-tools/src/session_inspector/**'
       - 'crates/app/bamboo-server-tools/tests/scoped_context_view.rs'

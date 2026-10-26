@@ -337,20 +337,31 @@ async fn publish_context(
     }
     let files = json!({ "status": file_info(&status), "brief": file_info(&brief) });
     let schema = if scoped { SCOPED_SCHEMA } else { SCHEMA };
-    let mut manifest = json!({
-        "schema_version": schema, "source_digest": source_digest,
-        "scope": source.scope, "source_observed_at": source.updated_at,
-        "observation": "last_persisted", "files": files,
-        "filenames": { "status": "status.md", "brief": "brief.md" },
-    });
     // Scoped selectors commit to the scope and every file digest, so editing
     // both a file and its manifest cannot retain the same requested revision.
-    let revision = if scoped {
-        digest(&serde_json::to_vec(&manifest).map_err(|e| ToolError::Execution(e.to_string()))?)
+    let (revision, manifest) = if scoped {
+        let mut manifest = json!({
+            "schema_version": schema, "source_digest": source_digest,
+            "scope": source.scope, "source_observed_at": source.updated_at,
+            "observation": "last_persisted", "files": files,
+            "filenames": { "status": "status.md", "brief": "brief.md" },
+        });
+        let revision = digest(
+            &serde_json::to_vec(&manifest).map_err(|e| ToolError::Execution(e.to_string()))?,
+        );
+        manifest["revision"] = json!(revision);
+        (revision, manifest)
     } else {
-        source_revision
+        // Existing publishers compare manifest bytes, including JSON insertion
+        // order with preserve_order. Keep the original legacy encoding exactly.
+        let manifest = json!({
+            "schema_version": schema, "revision": source_revision, "source_digest": source_digest,
+            "scope": source.scope, "source_observed_at": source.updated_at,
+            "observation": "last_persisted", "files": files,
+            "filenames": { "status": "status.md", "brief": "brief.md" },
+        });
+        (source_revision, manifest)
     };
-    manifest["revision"] = json!(revision);
     let published = publish_session_context_snapshot(
         tool.session_store.bamboo_home_dir(),
         &caller.id,

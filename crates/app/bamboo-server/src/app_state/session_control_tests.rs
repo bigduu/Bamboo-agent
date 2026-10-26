@@ -193,6 +193,11 @@ impl Fixture {
         let probe = Arc::new(Probe::default());
         let mut config = Config::from_data_dir(Some(home.path().to_path_buf()));
         config.provider = "followup-provider".into();
+        // Keep this provider probe dedicated to the native Root turns.
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = false;
         let mut state =
             AppState::new_with_provider(home.path().to_path_buf(), config, probe.clone())
                 .await
@@ -606,6 +611,135 @@ async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_de
         assert_eq!(
             serde_json::to_value(&f.reload().await.messages).unwrap(),
             serde_json::to_value(&after.messages).unwrap()
+        );
+
+        // A retained exact-target tool permission cannot replace current
+        // Project/management authority. Start with a live link, then exercise
+        // the canonical owner's revoke/regrant operations through the Host
+        // service. Regrant must leave the disabled link disabled.
+        let current = service.inspect_scope(&f.reference).await.unwrap();
+        service
+            .attach(&f.reference, current.state_revision, TARGET)
+            .await
+            .unwrap();
+        assert!(
+            service
+                .inspect_link(&f.reference, TARGET)
+                .await
+                .unwrap()
+                .authorized
+        );
+        let target_before = serde_json::to_value(f.reload().await).unwrap();
+        for (operation, allowed_projects) in [
+            ("native-scope-revoked-followup", Default::default()),
+            (
+                "native-scope-regranted-without-attach",
+                scope.allowed_projects.clone(),
+            ),
+        ] {
+            let current = service.inspect_scope(&f.reference).await.unwrap();
+            service
+                .configure_project_scope(&f.reference, current.state_revision, allowed_projects)
+                .await
+                .unwrap();
+            let link = service.inspect_link(&f.reference, TARGET).await.unwrap();
+            assert!(!link.authorized);
+            assert!(!link.link.unwrap().enabled);
+            let denied = Box::pin(f.model_followup(operation, ultra)).await;
+            assert!(serde_json::from_str::<Value>(&denied).is_err(), "{denied}");
+            assert_eq!(
+                f.state
+                    .session_inbox
+                    .inspect(TARGET)
+                    .await
+                    .unwrap()
+                    .generation,
+                before.generation
+            );
+            assert_eq!(
+                f.probe
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(model, _)| model == "original-target-model")
+                    .count(),
+                target_calls
+            );
+            assert_eq!(
+                serde_json::to_value(f.reload().await).unwrap(),
+                target_before
+            );
+        }
+
+        // Fresh explicit Host attachment is the positive control. Do not
+        // reinstall or widen the existing typed tool permission to obtain it.
+        let current = service.inspect_scope(&f.reference).await.unwrap();
+        service
+            .attach(&f.reference, current.state_revision, TARGET)
+            .await
+            .unwrap();
+        let calls_before = f.probe.requests.lock().unwrap().len();
+        let restored = Box::pin(f.model_followup("native-scope-explicit-reattach", ultra)).await;
+        let restored: Value = serde_json::from_str(&restored).expect(&restored);
+        assert_eq!(restored["admitted"], true);
+        f.settled(calls_before + 3).await;
+        assert_eq!(
+            f.probe
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(model, _)| model == "original-target-model")
+                .count(),
+            target_calls + 1
+        );
+        assert_eq!(
+            f.state
+                .session_inbox
+                .inspect(TARGET)
+                .await
+                .unwrap()
+                .generation,
+            before.generation + 1
+        );
+        let reactivated = f.reload().await;
+        assert_eq!(reactivated.created_at, after.created_at);
+        assert_eq!(reactivated.kind, f.original.kind);
+        assert_eq!(reactivated.parent_session_id, f.original.parent_session_id);
+        assert_eq!(
+            reactivated.root_thinking_mode(),
+            f.original.root_thinking_mode()
+        );
+        assert!(reactivated.supervisor_incarnation_id().is_none());
+        assert_eq!(reactivated.project_id_meta(), f.original.project_id_meta());
+        assert_eq!(
+            reactivated.workspace_path_meta(),
+            f.original.workspace_path_meta()
+        );
+        assert_eq!(reactivated.model, f.original.model);
+        assert_eq!(
+            reactivated.metadata.get("provider"),
+            f.original.metadata.get("provider")
+        );
+        for message in &after.messages {
+            assert!(reactivated.messages.iter().any(|retained| {
+                retained.id == message.id && retained.content == message.content
+            }));
+        }
+        assert_eq!(
+            reactivated
+                .messages
+                .iter()
+                .filter(|message| message.content == STEER)
+                .count(),
+            2
+        );
+        eprintln!(
+            "native Supervisor scope: mode={:?}; revoke and regrant denied without target mutation; explicit attach admitted; target model requests {} -> {}",
+            bamboo_domain::RootThinkingMode::from_enabled(ultra),
+            target_calls,
+            target_calls + 1
         );
         f.state.shutdown().await;
     }
