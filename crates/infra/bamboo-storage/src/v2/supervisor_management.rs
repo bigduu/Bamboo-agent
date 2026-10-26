@@ -1425,11 +1425,16 @@ mod observer_lock_order_tests {
     async fn observer_lock_order_rejects_non_root_slots_before_waiting_for_supervisor() {
         let home = tempfile::tempdir().unwrap();
         let store = SessionStoreV2::new(home.path().into()).await.unwrap();
-        let parent = store
+        let receipt = store
             .get_or_create_default_supervisor("model")
             .await
             .unwrap();
-        let reference = SupervisorReference::from(&parent);
+        let reference = SupervisorReference::from(&receipt);
+        let parent = store
+            .load_root_authority(&receipt.session_id)
+            .await
+            .unwrap()
+            .unwrap();
         let mut child = Session::new_child_of("a-observer", &parent, "model", "observe");
         child
             .agent_runtime_state

@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use bamboo_agent_core::tools::{FunctionCall, Tool, ToolCall, ToolCtx, ToolSchema};
 use bamboo_domain::{
     ActorAncestorObservation, ActorDirectoryPort, HostScopeSessionObservation, HostSessionRight,
-    HostSessionScopeBinding, HostSessionTargetScope, Message, PermissionMode, ProviderModelRef,
-    Session, SessionCallerReference, SessionMessageEnvelope, HOST_SESSION_SCOPE_VERSION,
+    HostSessionScopeBinding, HostSessionTargetScope, Message, ProviderModelRef, Session,
+    SessionCallerReference, SessionMessageEnvelope, SessionPermissionMode,
+    HOST_SESSION_SCOPE_VERSION,
 };
 use bamboo_engine::execution::{ChildCompletion, ChildCompletionHandler, ChildCompletionSource};
 use bamboo_engine::session_app::child_session::{create_child_action, CreateChildInput};
@@ -249,7 +250,7 @@ impl Fixture {
         parent
             .agent_runtime_state
             .get_or_insert_with(Default::default)
-            .set_permission_mode(PermissionMode::BypassPermissions);
+            .set_permission_mode(SessionPermissionMode::Bypass);
         state.storage.save_session(&parent).await.unwrap();
         let mut projects = BTreeSet::new();
         let mut targets = Vec::new();
@@ -361,7 +362,7 @@ async fn native_case(with_work_wait: bool) {
             .agent_runtime_state
             .as_mut()
             .unwrap()
-            .set_permission_mode(PermissionMode::Auto);
+            .set_permission_mode(SessionPermissionMode::Auto);
         f.state.storage.save_session(&parent).await.unwrap();
     }
     let wait = if with_work_wait {

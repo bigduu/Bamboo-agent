@@ -5,8 +5,8 @@ use super::*;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
 use bamboo_domain::{
-    Message, ObserverStageOutcome, ObserverViewChange, PermissionMode, ProviderModelRef, Session,
-    SessionInboxPort,
+    Message, ObserverStageOutcome, ObserverViewChange, ProviderModelRef, Session, SessionInboxPort,
+    SessionPermissionMode,
 };
 use bamboo_engine::session_app::child_session::{
     create_child_action, ChildSessionPort, CreateChildInput,
@@ -177,7 +177,7 @@ impl Fixture {
             .agent_runtime_state
             .as_mut()
             .unwrap()
-            .set_permission_mode(PermissionMode::BypassPermissions);
+            .set_permission_mode(SessionPermissionMode::Bypass);
         state.storage.save_session(&parent).await.unwrap();
         let mut projects = BTreeSet::new();
         for id in [ROOT_A, ROOT_B] {
@@ -549,6 +549,49 @@ async fn subscription_rotates_derived_shards_has_gap_and_revocation_is_final() {
         .await
         .unwrap();
     assert_eq!(rebuilt.shard_revision, read.shard_revision);
+    // A corrupt FIFO must fail before blocking open can retain the complete
+    // canonical authority indefinitely. Release a regressed blocking reader
+    // before asserting, so a RED never leaves the test runtime wedged.
+    for name in ["0.jsonl", "manifest.json"] {
+        use std::os::unix::ffi::OsStrExt;
+        let file = rebuilt.shard_directory.join(name);
+        let original = std::fs::read(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        let path = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let before = f.subscription().await.window.enqueued_sequence;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            f.state.session_store.read_supervisor_observer_changes(
+                &f.reference,
+                OBSERVER,
+                epoch,
+                0,
+            ),
+        )
+        .await;
+        let writer = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if writer >= 0 {
+            unsafe { libc::close(writer) };
+        }
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, original).unwrap();
+        tokio::time::timeout(WAIT, f.state.storage.inspect_supervisor_scope(&f.reference))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.subscription().await.window.enqueued_sequence, before);
+        assert!(result.is_ok(), "FIFO {name} blocked canonical authority");
+        assert!(
+            result.unwrap().is_err(),
+            "FIFO {name} must not become a valid shard"
+        );
+    }
     #[cfg(unix)]
     {
         let file = rebuilt.shard_directory.join("0.jsonl");
@@ -566,6 +609,8 @@ async fn subscription_rotates_derived_shards_has_gap_and_revocation_is_final() {
             std::fs::read_to_string(outside).unwrap(),
             read.jsonl_shards[0]
         );
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, &read.jsonl_shards[0]).unwrap();
     }
     assert!(f
         .state
