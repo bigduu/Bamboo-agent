@@ -249,7 +249,7 @@ impl BudgetedProvider {
         let Some(admission) = admission else {
             return stream;
         };
-        Box::pin(futures::stream::unfold(
+        let metered = futures::stream::unfold(
             (
                 stream,
                 Some(admission),
@@ -347,7 +347,8 @@ impl BudgetedProvider {
                     }
                 }
             },
-        ))
+        );
+        Box::pin(metered.fuse())
     }
 }
 
