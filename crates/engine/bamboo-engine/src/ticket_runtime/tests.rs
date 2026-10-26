@@ -282,6 +282,66 @@ impl Fixture {
 
     async fn with_project(project: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
+        let workspace = if project {
+            let repo = dir.path().join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args([
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "-c",
+                        "commit.gpgsign=false",
+                    ])
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).unwrap().trim().to_owned()
+            };
+            git(&["init", "-b", "fixture"]);
+            git(&[
+                "-c",
+                "user.name=Budget fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ]);
+            let base_commit = git(&["rev-parse", "HEAD"]);
+            let worktree = dir.path().join("worktree");
+            git(&[
+                "worktree",
+                "add",
+                "-b",
+                "budget-work",
+                worktree.to_str().unwrap(),
+                &base_commit,
+            ]);
+            let worktree = worktree
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            Some(bamboo_tickets::ExecutionWorkspace {
+                repo: repo.canonicalize().unwrap().to_string_lossy().into_owned(),
+                base_commit,
+                branch: "budget-work".into(),
+                worktree: worktree.clone(),
+                write_roots: vec![worktree.clone()],
+                claims: BTreeSet::from([format!("worktree:{worktree}")]),
+            })
+        } else {
+            None
+        };
         let storage = Arc::new(SessionStoreV2::new(dir.path().join("host")).await.unwrap());
         storage
             .get_or_create_default_supervisor("fixture-model")
@@ -335,12 +395,7 @@ impl Fixture {
                     project_revision: 1,
                     resource_revision: 1,
                     workspace_binding: bamboo_domain::WorkspaceBinding {
-                        path: dir
-                            .path()
-                            .canonicalize()
-                            .unwrap()
-                            .to_string_lossy()
-                            .into_owned(),
+                        path: workspace.as_ref().unwrap().repo.clone(),
                         label: None,
                         git_common_dir: None,
                     },
@@ -357,7 +412,7 @@ impl Fixture {
             Operation::Start {
                 work_id: "work".into(),
                 temp_id: "assignment".into(),
-                workspace: None,
+                workspace,
             },
         ]);
         let command = service

@@ -244,7 +244,9 @@ async fn native_host_reserves_before_calls_and_blocks_exhausted_continuation() {
         tokio::time::timeout(WAIT, async {
             loop {
                 let snapshot = service.published().unwrap().1;
-                if snapshot.assignments[&assignment].process_stopped {
+                if snapshot.assignments[&assignment].process_stopped
+                    && (exhausted || snapshot.tickets[&work].state == WorkState::Submitted)
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
