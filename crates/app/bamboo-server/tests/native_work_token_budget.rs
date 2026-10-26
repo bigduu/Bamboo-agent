@@ -5,8 +5,8 @@ use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
 use bamboo_domain::{Message, WorkspaceBinding};
 use bamboo_llm::{provider::ProviderModelInfo, LLMChunk, LLMError, LLMProvider, LLMStream};
 use bamboo_tickets::{
-    Authority, Contract, Operation, Principal, ProjectContextSnapshot, TicketKind, WorkState,
-    WorkTokenBudget, WorkTokenLimits,
+    Authority, Contract, Operation, Principal, ProjectContextSnapshot, StepStatus, TicketKind,
+    WorkState, WorkTokenBudget, WorkTokenLimits,
 };
 use futures::StreamExt;
 use serde_json::json;
@@ -244,8 +244,27 @@ async fn native_host_reserves_before_calls_and_blocks_exhausted_continuation() {
         tokio::time::timeout(WAIT, async {
             loop {
                 let snapshot = service.published().unwrap().1;
+                let failed_terminal = if exhausted {
+                    let child = &snapshot.assignments[&assignment]
+                        .runtime
+                        .as_ref()
+                        .unwrap()
+                        .session_id;
+                    state
+                        .storage
+                        .load_runtime_control_plane(child)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .last_run_status()
+                        .as_deref()
+                        == Some("error")
+                } else {
+                    false
+                };
                 if snapshot.assignments[&assignment].process_stopped
-                    && (exhausted || snapshot.tickets[&work].state == WorkState::Submitted)
+                    && (failed_terminal
+                        || (!exhausted && snapshot.tickets[&work].state == WorkState::Submitted))
                 {
                     break;
                 }
@@ -256,11 +275,36 @@ async fn native_host_reserves_before_calls_and_blocks_exhausted_continuation() {
         .unwrap();
         let snapshot = service.published().unwrap().1;
         let budget = ledger(&service, &owner);
+        assert_eq!(
+            snapshot.assignments[&assignment].plan.steps[0].status,
+            Some(StepStatus::Completed),
+            "actual Task committed before the continuation"
+        );
         if exhausted {
             assert_eq!(local.calls.load(Ordering::SeqCst), 1);
             assert_eq!(budget.reservations.len(), 1);
             assert_eq!(budget.total_charged, 30);
             assert!(snapshot.tickets[&work].current_submission.is_none());
+            let child = state
+                .storage
+                .load_runtime_control_plane(
+                    &snapshot.assignments[&assignment]
+                        .runtime
+                        .as_ref()
+                        .unwrap()
+                        .session_id,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                child
+                    .last_run_error()
+                    .is_some_and(|error| error.contains("Work token budget")
+                        && error.contains("admission blocked: Work")),
+                "actual terminal cause: {:?}",
+                child.last_run_error()
+            );
         } else {
             assert_eq!(local.calls.load(Ordering::SeqCst), 2);
             assert_eq!(budget.total_charged, 60);

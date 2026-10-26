@@ -348,7 +348,7 @@ async fn token_budget_unknown_model_and_revoked_root_block_before_provider() {
 }
 
 #[tokio::test]
-async fn token_budget_native_descendant_uses_original_work_and_rejects_reparenting() {
+async fn token_budget_native_descendant_uses_original_work_and_rejects_lost_ancestry() {
     let (f, _registration) = admitted().await;
     configure(&f, 500);
     let mut descendant = Session::new_child_of(
@@ -380,7 +380,10 @@ async fn token_budget_native_descendant_uses_original_work_and_rejects_reparenti
     }
     assert_eq!(ledger(&f).total_charged, 30);
     descendant.parent_session_id = Some(f.supervisor.id.clone());
-    f.storage.save_session(&descendant).await.unwrap();
+    // Storage already refuses reparenting. Loss of the original canonical
+    // child independently closes the provider capability without a bypass.
+    assert!(f.storage.save_session(&descendant).await.is_err());
+    f.storage.delete_session(&descendant.id).await.unwrap();
     assert!(decorated
         .chat_stream(&[], &[], None, "fixture-model")
         .await
