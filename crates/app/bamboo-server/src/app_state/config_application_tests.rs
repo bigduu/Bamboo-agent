@@ -395,15 +395,18 @@ fn actual_provider_and_mcp_publications_preserve_unrelated_receipts() {
             assert_eq!(consumer(&defaults, id)["applied_dependencies"], Value::Null);
         }
         let serialized = serde_json::to_string(&defaults).unwrap();
-        for forbidden in [
-            "application-secret-sentinel",
-            "old-model",
-            "next-model",
-            "credential_ref",
-            "digest",
-            "9876",
+        for (fixture_marker, forbidden) in [
+            ("provider-secret", "application-secret-sentinel"),
+            ("previous-model", "old-model"),
+            ("updated-model", "next-model"),
+            ("credential-reference-field", "credential_ref"),
+            ("private-digest-field", "digest"),
+            ("provider-endpoint-port", "9876"),
         ] {
-            assert!(!serialized.contains(forbidden));
+            assert!(
+                !serialized.contains(forbidden),
+                "application diagnostics contain forbidden fixture marker: {fixture_marker}"
+            );
         }
     });
 }
