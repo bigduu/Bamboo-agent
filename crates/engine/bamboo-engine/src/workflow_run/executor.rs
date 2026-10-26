@@ -179,6 +179,9 @@ pub struct WorkflowRunEngine {
     ceilings: WorkflowBudgets,
     active: DashMap<String, Arc<ActiveRun>>,
     events: DashMap<String, broadcast::Sender<WorkflowRunEvent>>,
+    // An owned commit can outlive ActiveRun. Weak entries preserve that exact
+    // fence without retaining completed runs or granting execution ownership.
+    commit_fences: DashMap<String, Weak<Mutex<()>>>,
     session_permissions: std::sync::RwLock<Option<Arc<dyn WorkflowSessionPermissionPort>>>,
 }
 
@@ -208,6 +211,11 @@ impl Drop for RuntimeRegistration {
             if !pending {
                 engine.active.remove(&self.run_id);
                 engine.events.remove(&self.run_id);
+                // Never remove a live fence by run ID: an owned commit or a
+                // waiting finalizer can still hold it after this registration.
+                engine
+                    .commit_fences
+                    .retain(|_, fence| fence.strong_count() > 0);
             }
         }
     }
@@ -283,6 +291,7 @@ impl WorkflowRunEngine {
             ceilings,
             active: DashMap::new(),
             events: DashMap::new(),
+            commit_fences: DashMap::new(),
             session_permissions: std::sync::RwLock::new(None),
         })
     }
@@ -884,7 +893,7 @@ impl WorkflowRunEngine {
             }
         }
         if result.is_err() {
-            if let Some(durable) = self.repository.load(&run_id).await.map_err(storage)? {
+            if let Some(durable) = self.load_committed_snapshot(&run_id).await? {
                 *snapshot.lock().await = durable;
             }
         }
@@ -945,7 +954,7 @@ impl WorkflowRunEngine {
                 // from the journal/temp recovery protocol before allocating the
                 // next sequence, so a partially committed StepStarted cannot
                 // make the timeout terminal transition skip a sequence.
-                if let Some(durable) = self.repository.load(&run_id).await.map_err(storage)? {
+                if let Some(durable) = self.load_committed_snapshot(&run_id).await? {
                     *final_snapshot = durable;
                 }
                 let step_failure = failure(
@@ -1021,10 +1030,8 @@ impl WorkflowRunEngine {
         run_id: &str,
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
         let snapshot = self
-            .repository
-            .load(run_id)
-            .await
-            .map_err(storage)?
+            .load_committed_snapshot(run_id)
+            .await?
             .ok_or(WorkflowRunError::NotFound)?;
         if snapshot.status == WorkflowRunStatus::Cancelled {
             return Ok(snapshot);
@@ -1423,6 +1430,28 @@ impl WorkflowRunEngine {
         Ok(())
     }
 
+    fn commit_fence(&self, run_id: &str) -> Arc<Mutex<()>> {
+        // Use the same weak-lock lifetime pattern as the File repository. Each
+        // acquisition also reaps abandoned/failed callers' inactive entries.
+        self.commit_fences
+            .retain(|_, fence| fence.strong_count() > 0);
+        let mut entry = self.commit_fences.entry(run_id.to_owned()).or_default();
+        if let Some(fence) = entry.upgrade() {
+            return fence;
+        }
+        let fence = Arc::new(Mutex::new(()));
+        *entry = Arc::downgrade(&fence);
+        fence
+    }
+
+    async fn load_committed_snapshot(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<WorkflowRunSnapshot>, WorkflowRunError> {
+        let _commit_guard = self.commit_fence(run_id).lock_owned().await;
+        self.repository.load(run_id).await.map_err(storage)
+    }
+
     async fn transition(
         &self,
         snapshot: &mut WorkflowRunSnapshot,
@@ -1430,10 +1459,11 @@ impl WorkflowRunEngine {
         kind: WorkflowRunEventKind,
         mutate: impl FnOnce(&mut WorkflowRunSnapshot),
     ) -> Result<(), WorkflowRunError> {
-        // Always derive a candidate from durable state. The commit itself runs
-        // in an owned task, so dropping this caller at a timeout/cancel boundary
-        // cannot interrupt rename/fsync halfway through. In-memory state advances
-        // only after that task confirms the durable commit.
+        // Acquire before deriving the next sequence, then transfer the fence
+        // to the owned commit. Dropping this caller cannot let a finalizer read
+        // or allocate against the prior sequence while that commit is pending.
+        let commit_guard = self.commit_fence(&snapshot.run_id).lock_owned().await;
+        // In-memory state advances only after the task confirms durability.
         let mut candidate = self
             .repository
             .load(&snapshot.run_id)
@@ -1447,10 +1477,10 @@ impl WorkflowRunEngine {
         let repository = self.repository.clone();
         let durable_candidate = candidate.clone();
         let durable_event = event.clone();
-        let commit =
-            tokio::spawn(
-                async move { repository.commit(&durable_candidate, &durable_event).await },
-            );
+        let commit = tokio::spawn(async move {
+            let _commit_guard = commit_guard;
+            repository.commit(&durable_candidate, &durable_event).await
+        });
         commit
             .await
             .map_err(|error| {

@@ -1,0 +1,106 @@
+name: Native Jiandu Project Sources
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - 'Cargo.lock'
+      - 'crates/infra/bamboo-memory/**'
+      - 'crates/app/bamboo-server/src/app_state/ticket_application*'
+      - 'crates/app/bamboo-server/src/app_state/ticket_application/**'
+      - 'crates/app/bamboo-server/tests/native_work_memory_source.rs'
+      - '.github/workflows/jiandu-project-source.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jiandu-project-source-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  sources:
+    name: Native Jiandu registry and public Host acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_TARGET_DIR: target/grouped-default
+      CARGO_TERM_COLOR: always
+      RUST_MIN_STACK: '8388608'
+      EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Bind acceptance to the exact clean source
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SOURCE"
+          test -z "$status"
+          git show -s --format='Acceptance source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Restore existing dependencies without saving cache storage
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-test-${{ runner.os }}
+          workspaces: . -> target/grouped-default
+          save-if: false
+
+      - name: Verify the actual locked registry dependency
+        run: |
+          rustc -vV
+          cargo -V
+          cargo metadata --locked --all-features --format-version 1 > "$RUNNER_TEMP/jiandu-metadata.json"
+          python3 - <<'PY'
+          import json, os, pathlib, tomllib
+          metadata = json.loads((pathlib.Path(os.environ['RUNNER_TEMP']) / 'jiandu-metadata.json').read_text())
+          packages = [p for p in metadata['packages'] if p['name'] == 'jiandu-memory']
+          locked = [p for p in tomllib.loads(pathlib.Path('Cargo.lock').read_text())['package'] if p['name'] == 'jiandu-memory']
+          assert len(packages) == len(locked) == 1
+          package, lock = packages[0], locked[0]
+          assert package['source'] == lock['source'] == 'registry+https://github.com/rust-lang/crates.io-index'
+          assert package['version'] == lock['version'] == '0.3.4'
+          assert lock['checksum'] == '99fddb6c604e7e6d782caf670160435e57b84ad8858d00f6544aef3f2a5f2411'
+          vcs = json.loads(pathlib.Path(package['manifest_path']).with_name('.cargo_vcs_info.json').read_text())
+          assert vcs['git']['sha1'] == '82b4bb69f8b69648fe70660e493d65b626ce2139'
+          assert not vcs['git'].get('dirty', False)
+          print(json.dumps({'registry_package': lock, 'vcs': vcs}, sort_keys=True))
+          PY
+
+      - name: Verify native memory and actual public Host reads
+        run: |
+          cargo test --locked -p bamboo-memory --test project_sources -- --test-threads=1
+          cargo test --locked -p bamboo-server --test native_work_memory_source -- --test-threads=1 --nocapture
+
+      - name: Check the affected libraries and integration targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy=(-D warnings -A deprecated -A clippy::module_inception
+            -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
+            -A clippy::too-many-arguments -A clippy::while-let-loop
+            -A clippy::type_complexity -A dead-code)
+          cargo clippy --locked --all-features --lib -p bamboo-memory -p bamboo-server -- "${policy[@]}"
+          cargo clippy --locked --all-features -p bamboo-memory --test project_sources -- "${policy[@]}"
+          cargo clippy --locked --all-features -p bamboo-server --test native_work_memory_source -- "${policy[@]}"
+
+      - name: Verify the source stayed exact and clean
+        if: always()
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SOURCE"
+          test -z "$status"
+          git show -s --format='Final source: %H tree: %T' HEAD
