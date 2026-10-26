@@ -949,17 +949,30 @@ async fn reopened_ready_host_stages_one_patrol_decision_without_a_model_activati
         host.state().session_inbox.inspect(target).await.unwrap(),
         delivered
     );
-    let claims = host.state().session_inbox.claim(target, 128).await.unwrap();
-    let notices: Vec<_> = claims
-        .iter()
-        .filter(|claim| {
-            matches!(&claim.envelope.source,
-        bamboo_domain::SessionMessageSource::Runtime { subsystem } if subsystem == "ticket_patrol")
-        })
-        .collect();
+    // The staged notice is deliberately ineligible for a reasoning claim.
+    // Inspect this disposable fixture's actual canonical Maildir transport,
+    // then verify its exact receipt through the production Inbox API.
+    let mut notices = Vec::new();
+    for entry in std::fs::read_dir(root.join("sessions").join(target).join("inbox/new")).unwrap() {
+        let transport: bamboo_subagent::InboxMessage =
+            serde_json::from_slice(&std::fs::read(entry.unwrap().path()).unwrap()).unwrap();
+        let notice: bamboo_domain::SessionMessageEnvelope =
+            serde_json::from_value(transport.body).unwrap();
+        if matches!(&notice.source, bamboo_domain::SessionMessageSource::Runtime { subsystem }
+            if subsystem == "ticket_patrol")
+        {
+            notices.push(notice);
+        }
+    }
     assert_eq!(notices.len(), 1);
+    assert!(host
+        .state()
+        .session_inbox
+        .existing_staged_delivery(&notices[0])
+        .await
+        .unwrap()
+        .is_some());
     assert!(notices[0]
-        .envelope
         .to_provider_message()
         .unwrap()
         .content

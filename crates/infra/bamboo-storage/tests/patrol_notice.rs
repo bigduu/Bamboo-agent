@@ -56,6 +56,14 @@ async fn real_inbox_stages_one_notice_reopens_and_dedupes_without_activation() {
     assert_eq!(before.pending, 1);
     assert!(!before.activation_pending());
     assert!(!before.interrupt_pending());
+    assert!(
+        inbox
+            .claim(&bootstrap.session_id, 128)
+            .await
+            .unwrap()
+            .is_empty(),
+        "staged notice has no reasoning activation permission"
+    );
     drop(inbox);
     drop(store);
     let reopened = Arc::new(SessionStoreV2::new(directory.path().into()).await.unwrap());
