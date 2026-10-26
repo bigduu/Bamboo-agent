@@ -16,6 +16,7 @@ mod helpers;
 mod inspection;
 pub mod named_profile;
 pub mod owned_tree;
+pub mod planner_artifact;
 pub(crate) mod result_projection;
 mod shared_workspace;
 

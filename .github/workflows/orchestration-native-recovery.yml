@@ -7,7 +7,6 @@ on:
       - 'tests/ticket_runtime_lifecycle.rs'
       - 'tests/support/ticket_runtime.rs'
       - 'crates/app/bamboo-server/src/app_state/session_control_tests.rs'
-      - 'crates/app/bamboo-server-tools/src/plan.rs'
       - '.github/workflows/orchestration-native-recovery.yml'
 
 permissions:
@@ -101,21 +100,6 @@ jobs:
           run_nonempty owner cargo test --locked -p bamboo-server --lib \
             handlers::agent::supervisor::project_scope -- --test-threads=1
 
-      - name: Verify selected Planner context through the canonical Child creator
-        shell: bash
-        run: |
-          set -euo pipefail
-          result="$RUNNER_TEMP/planner-selected-context.log"
-          cargo test --locked -p bamboo-server-tools --lib plan::tests:: \
-            -- --test-threads=1 2>&1 | tee "$result"
-          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed' "$result"
-          for case in \
-            selected_context_uses_canonical_child_binding_without_changing_parent_authority \
-            invalid_selected_context_never_saves_a_child_or_arms_a_wait \
-            unsupported_selected_context_route_fails_before_persist_without_legacy_fallback; do
-            grep -Fq "plan::tests::$case ... ok" "$result"
-          done
-
       - name: Check the affected target under the original CI lint policy
         run: >-
           cargo clippy --locked --all-features -p bamboo-agent
@@ -130,14 +114,6 @@ jobs:
       - name: Check the affected Supervisor production library under the same lint policy
         run: >-
           cargo clippy --locked --all-features -p bamboo-server --lib --
-          -D warnings -A deprecated -A clippy::module_inception
-          -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
-          -A clippy::too-many-arguments -A clippy::while-let-loop
-          -A clippy::type_complexity -A dead-code
-
-      - name: Check the affected Planner production library under the same lint policy
-        run: >-
-          cargo clippy --locked --all-features -p bamboo-server-tools --lib --
           -D warnings -A deprecated -A clippy::module_inception
           -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
           -A clippy::too-many-arguments -A clippy::while-let-loop

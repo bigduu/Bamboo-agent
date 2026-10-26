@@ -6,6 +6,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome};
+use bamboo_engine::session_app::child_session::planner_artifact;
 use bamboo_engine::session_app::child_session::{
     self, ChildSessionError, ChildSessionPort, CreateChildInput, SubagentResolutionPort,
 };
@@ -53,6 +54,7 @@ struct PlanArgs {
 pub struct PlanTool {
     sessions: Arc<dyn ChildSessionPort>,
     resolver: Arc<dyn SubagentResolutionPort>,
+    artifact_home: Option<std::path::PathBuf>,
 }
 
 impl PlanTool {
@@ -60,7 +62,16 @@ impl PlanTool {
         sessions: Arc<dyn ChildSessionPort>,
         resolver: Arc<dyn SubagentResolutionPort>,
     ) -> Self {
-        Self { sessions, resolver }
+        Self {
+            sessions,
+            resolver,
+            artifact_home: None,
+        }
+    }
+
+    pub fn with_artifact_home(mut self, home: std::path::PathBuf) -> Self {
+        self.artifact_home = Some(home);
+        self
     }
 }
 
@@ -217,6 +228,7 @@ impl Tool for PlanTool {
         json!({
             "type": "object",
             "properties": {
+                "action": {"type":"string","enum":["create","read"],"description":"Defaults to create. read uses the exact versioned artifact reference returned on parent resume."},
                 "task": {
                     "type": "string",
                     "description": "Self-contained planning request, including scope, constraints, and expected decision or deliverable."
@@ -251,9 +263,15 @@ impl Tool for PlanTool {
                     },
                     "required": ["version", "objective", "constraints", "acceptance", "non_goals", "necessary_user_instructions", "recorded_decisions"],
                     "additionalProperties": false
-                }
+                },
+                "child_session_id": {"type":"string"},
+                "expected_child_created_at": {"type":"string"},
+                "expected_assignment_sha256": {"type":"string"},
+                "revision": {"type":"string"},
+                "section_id": {"type":"string","description":"Omit to list bounded section IDs; supply one to read only that section."},
+                "offset": {"type":"integer","minimum":0},
+                "max_bytes": {"type":"integer","minimum":4,"maximum":4096}
             },
-            "required": ["task"],
             "additionalProperties": false
         })
     }
@@ -266,7 +284,31 @@ impl Tool for PlanTool {
         let parent_session_id = ctx.session_id().ok_or_else(|| {
             ToolError::Execution("Plan requires a session_id in tool context".to_string())
         })?;
+        if args.get("action").and_then(|v| v.as_str()) == Some("read") {
+            let args: planner_artifact::ReadArgs = serde_json::from_value(args)
+                .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+            let home = self.artifact_home.as_ref().ok_or_else(|| {
+                ToolError::Execution(
+                    "versioned planner artifacts are unavailable in this runtime".into(),
+                )
+            })?;
+            let value =
+                planner_artifact::read(self.sessions.as_ref(), home, parent_session_id, args)
+                    .await
+                    .map_err(child_error)?;
+            return Ok(ToolOutcome::Completed(
+                bamboo_agent_core::tools::ToolResult::text(true, value.to_string()),
+            ));
+        }
+        if args.get("action").is_some_and(|v| v != "create") {
+            return Err(ToolError::InvalidArguments("unknown Plan action".into()));
+        }
         let parsed = parse_plan_args(args)?;
+        if parsed.context_packet.is_some() && !cfg!(unix) {
+            return Err(ToolError::Execution(
+                "required_child_context_unsupported: versioned Plan publication requires the nofollow directory-FD route".into(),
+            ));
+        }
         let task = normalize_task(parsed.task)?;
         if !bamboo_agent_core::tools::suspension_allowed() {
             return Err(ToolError::Execution(
@@ -320,6 +362,10 @@ impl Tool for PlanTool {
                     )
                 })?,
             );
+            runtime_metadata.insert(
+                planner_artifact::CONTRACT_KEY.into(),
+                planner_artifact::CONTRACT_VERSION.into(),
+            );
         }
         let child_id = Uuid::new_v4().to_string();
         let result = child_session::create_child_action(
@@ -329,7 +375,15 @@ impl Tool for PlanTool {
                 child_id: child_id.clone(),
                 title: title.clone(),
                 responsibility: PLANNER_RESPONSIBILITY.to_string(),
-                assignment_prompt: planner_assignment(&task),
+                assignment_prompt: if parsed.context_packet.is_some() {
+                    format!(
+                        "{}\n{}",
+                        planner_assignment(&task),
+                        planner_artifact::REPORT_INSTRUCTION
+                    )
+                } else {
+                    planner_assignment(&task)
+                },
                 subagent_type: PLANNER_ROLE.to_string(),
                 workspace,
                 workspace_source,
@@ -694,6 +748,7 @@ mod tests {
         port
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn selected_context_uses_canonical_child_binding_without_changing_parent_authority() {
         let dir = tempfile::tempdir().unwrap();

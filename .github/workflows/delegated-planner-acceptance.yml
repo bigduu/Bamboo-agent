@@ -1,0 +1,111 @@
+name: Delegated Planner Acceptance
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - 'crates/app/bamboo-server-tools/src/plan.rs'
+      - 'crates/app/bamboo-server/src/app_state/tools.rs'
+      - 'crates/engine/bamboo-engine/src/session_app/child_session/planner_artifact.rs'
+      - 'crates/engine/bamboo-engine/src/session_app/child_session/result_projection.rs'
+      - 'crates/engine/bamboo-engine/src/session_app/child_completion_coordinator.rs'
+      - 'crates/infra/bamboo-memory/src/plan_store.rs'
+      - 'tests/required_child_context_packet.rs'
+      - 'tests/support/delegated_planner.rs'
+      - '.github/workflows/delegated-planner-acceptance.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: delegated-planner-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  planner:
+    name: Native Delegated Plan (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
+      RUST_MIN_STACK: '8388608'
+      BAMBOO_FRONTEND_BUILD_MODE: api-only
+      EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Record exact clean source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git show -s --format='Planner source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-test-${{ runner.os }}
+          workspaces: . -> target/grouped-default
+          save-if: false
+      - name: Verify selected context and original read-only Plan contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/planner-tools.log"
+          cargo test --locked -p bamboo-server-tools --lib plan::tests:: \
+            -- --test-threads=1 2>&1 | tee "$result"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed' "$result"
+          for case in \
+            selected_context_uses_canonical_child_binding_without_changing_parent_authority \
+            invalid_selected_context_never_saves_a_child_or_arms_a_wait \
+            unsupported_selected_context_route_fails_before_persist_without_legacy_fallback; do
+            grep -Fq "plan::tests::$case ... ok" "$result"
+          done
+      - name: Verify immutable artifacts and durable completion recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/planner-artifacts.log"
+          cargo test --locked -p bamboo-engine --lib planner_artifact \
+            -- --test-threads=1 2>&1 | tee "$result"
+          grep -Fq 'test result: ok. 6 passed; 0 failed; 0 ignored' "$result"
+      - name: Verify actual CLI worker, publication, automatic resume and cold partial reads
+        shell: bash
+        run: |
+          set -euo pipefail
+          result="$RUNNER_TEMP/planner-native.log"
+          cargo test --locked -p bamboo-agent --test required_child_context_packet \
+            delegated_planner::real_cli_planner_publishes_versioned_artifact_and_resumes_with_partial_cold_reads \
+            -- --exact --test-threads=1 --nocapture 2>&1 | tee "$result"
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored' "$result"
+          grep -Fq 'actual delegated Plan: source-bound Host+worker;' "$result"
+      - name: Check affected production libraries under original CI lint policy
+        run: >-
+          cargo clippy --locked --all-features
+          -p bamboo-engine -p bamboo-server-tools -p bamboo-server --lib --
+          -D warnings -A deprecated -A clippy::module_inception
+          -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
+          -A clippy::too-many-arguments -A clippy::while-let-loop
+          -A clippy::type_complexity -A dead-code
+      - name: Check affected native integration target under original CI lint policy
+        run: >-
+          cargo clippy --locked --all-features -p bamboo-agent
+          --test required_child_context_packet --
+          -D warnings -A deprecated -A clippy::module_inception
+          -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
+          -A clippy::too-many-arguments -A clippy::while-let-loop
+          -A clippy::type_complexity -A dead-code
+      - name: Verify source stayed exact and clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"

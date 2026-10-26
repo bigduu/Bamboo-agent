@@ -195,6 +195,12 @@ pub(crate) fn decode_report(content: &str) -> Result<Value, &'static str> {
     Ok(value)
 }
 
+pub(super) fn unique_json(content: &str) -> Result<Value, &'static str> {
+    serde_json::from_str::<Unique>(content)
+        .map(|value| value.0)
+        .map_err(|_| "report_malformed")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
