@@ -495,10 +495,90 @@ const recoveryTest = stalledStop => test(
 recoveryTest(false);
 recoveryTest(true);
 
-test('bounded download returns exact bytes and cleans unsolicited, oversized, and timed-out artifacts', async () => {
+test('bounded download returns exact bytes and cleans unsolicited, oversized, and timed-out artifacts', async t => {
   const bytes = Buffer.from(Array.from({ length: 4096 }, (_, index) => index % 256));
   const maximumBytes = Buffer.alloc(256 * 1024, 0x5a);
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-download-test-'));
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-download-test-'));
+  const prepareRoot = name => {
+    const root = path.join(fixtureRoot, name);
+    const directories = Object.fromEntries(['downloads', 'tmp'].map(part => [part, path.join(root, part)]));
+    for (const directory of Object.values(directories)) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    return { root, ...directories };
+  };
+  const primaryRoot = prepareRoot('native-race');
+  const tempRoot = primaryRoot.downloads;
+  const clients = [];
+  // This client owns only the Node child and its pipes. Node close is never a
+  // proof that Chromium or every native writer stopped; unknown scratch stays.
+  const startHost = (directories, budget, overrides) => {
+    const environment = Object.fromEntries(['PATH', 'HOME', 'USERPROFILE', 'NODE_PATH', 'SystemRoot', 'WINDIR', 'COMSPEC',
+      'PLAYWRIGHT_BROWSERS_PATH', 'BAMBOO_BROWSER_EXECUTABLE']
+      .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
+    const child = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath, [path.join(__dirname, 'host.cjs')], {
+      env: { ...environment, TMPDIR: directories.tmp, TEMP: directories.tmp, TMP: directories.tmp,
+        BAMBOO_BROWSER_DOWNLOAD_ROOT: directories.downloads, NODE_ENV: 'test',
+        BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000', ...overrides },
+      stdio: ['pipe', 'pipe', 'inherit'],
+    });
+    const pending = new Map(); let nextId = 1, outcome, deadline;
+    const rejectPending = reason => {
+      for (const [id, item] of pending) { clearTimeout(item.timer); item.reject(new Error(`${item.action}#${id}: ${reason}`)); }
+      pending.clear();
+    };
+    const lines = readline.createInterface({ input: child.stdout });
+    const closed = new Promise(resolve => child.once('close', (code, signal) => {
+      outcome = { code, signal }; rejectPending(`Node closed ${code}/${signal}; native writers unconfirmed`);
+      lines.close(); resolve(outcome);
+    }));
+    child.on('error', () => rejectPending('Node fixture failed to start'));
+    child.stdin.on('error', () => rejectPending('Node fixture input closed'));
+    lines.on('line', line => {
+      let message;
+      try { message = JSON.parse(line); } catch { rejectPending('Invalid fixture response'); return; }
+      if (message.event) return;
+      const item = pending.get(message.id);
+      if (item) { pending.delete(message.id); clearTimeout(item.timer); item.resolve(message); }
+    });
+    const waitForNodeClose = async (until = deadline) => {
+      let timer;
+      try {
+        return await Promise.race([closed, new Promise((resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('Node close exceeded the existing IPC budget; native writers unconfirmed')),
+            Math.max(0, until - performance.now()));
+        })]);
+      } finally { clearTimeout(timer); }
+    };
+    const client = { ...directories,
+      call: (action, args = {}) => new Promise((resolve, reject) => {
+        const id = nextId++; deadline = performance.now() + budget;
+        if (outcome) { reject(new Error(`${action}#${id}: Node already closed ${outcome.code}/${outcome.signal}`)); return; }
+        const timer = setTimeout(() => { pending.delete(id); reject(new Error(`${action}#${id} host response timed out`)); }, budget);
+        pending.set(id, { action, resolve, reject, timer });
+        child.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
+      }),
+      directory() {
+        const entries = fs.readdirSync(directories.downloads, { withFileTypes: true }).filter(entry => entry.name.startsWith('bamboo-browser-download-'));
+        assert.equal(entries.length, 1, 'one independently owned download directory');
+        assert.ok(entries[0].isDirectory() && !entries[0].isSymbolicLink());
+        return path.join(directories.downloads, entries[0].name);
+      },
+      waitForNodeClose,
+      async finish() {
+        if (!outcome) {
+          child.stdin.end();
+          try { await waitForNodeClose(performance.now() + budget); }
+          catch {
+            if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+            await waitForNodeClose(performance.now() + budget).catch(() => {});
+          }
+        }
+        // Do not turn even a clean Node exit into permission to erase a native
+        // writer's TMP/download roots. The isolated executor owns teardown.
+        lines.close(); child.stdin.destroy(); child.stdout.destroy();
+      },
+    };
+    clients.push(client); return client;
+  };
   const temporaryFilesIn = directory => fs.readdirSync(directory, { withFileTypes: true })
     .flatMap(entry => entry.isDirectory()
       ? temporaryFilesIn(path.join(directory, entry.name))
@@ -837,37 +917,11 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
   fixture.listen(0, '127.0.0.1');
   await once(fixture, 'listening');
   const base = `http://127.0.0.1:${fixture.address().port}`;
-  const host = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath, [path.join(__dirname, 'host.cjs')], {
-    env: {
-      ...process.env,
-      NODE_ENV: 'test',
-      BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
-      BAMBOO_BROWSER_TEST_DOWNLOAD_CLICK_DELAY_MS: '200',
-      TMPDIR: os.tmpdir(),
-      BAMBOO_BROWSER_DOWNLOAD_ROOT: tempRoot,
-    },
-    stdio: ['pipe', 'pipe', 'inherit'],
-  });
-  const pending = new Map();
-  let nextId = 1;
-  const lines = readline.createInterface({ input: host.stdout });
-  lines.on('line', line => {
-    const message = JSON.parse(line);
-    if (message.event) return;
-    const resolve = pending.get(message.id);
-    if (resolve) { pending.delete(message.id); resolve(message); }
-  });
-  const call = (action, args = {}) => new Promise((resolve, reject) => {
-    const id = nextId++;
-    const timer = setTimeout(() => {
-      pending.delete(id);
-      reject(new Error(`${action} host response timed out`));
-    }, 30_000);
-    pending.set(id, message => { clearTimeout(timer); resolve(message); });
-    host.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
-  });
+  const host = startHost(primaryRoot, 30_000, { BAMBOO_BROWSER_TEST_DOWNLOAD_CLICK_DELAY_MS: '200' });
+  const call = host.call;
   try {
     const initial = (await call('state')).result;
+    const primaryDirectory = host.directory();
     assert.ok(fs.readdirSync(tempRoot).some(name => name.startsWith('bamboo-browser-download-')),
       'an explicit session-owned root overrides Node platform temp defaults');
     const ready = (await call('navigate', { url: base + '/', expected_epoch: initial.page_epoch })).result;
@@ -1175,41 +1229,21 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     });
     assert.equal(nativeRace.code, 'download_unverifiable', JSON.stringify(nativeRace));
     assert.equal(nativeRace.result, undefined);
-    if (host.exitCode === null) await once(host, 'exit');
-    assert.deepEqual(fs.readdirSync(tempRoot), [],
-      'an ambiguous native download retires the host and its temporary directory');
+    assert.deepEqual(await host.waitForNodeClose(), { code: 1, signal: null }, 'the ambiguous host retired');
+    assert.ok(fs.lstatSync(primaryDirectory).isDirectory(),
+      'ambiguous retirement retains its scratch; Node exit does not confirm native writers');
 
-    // Failed cleanup/private-page creation must retire with no temp artifact.
+    // Each forced retirement keeps its own unconfirmed native writer's scratch.
     for (const mode of ['cleanup', 'reject', 'timeout', 'script-helper-tamper', 'script-navigate']) {
-      const retiringHost = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath,
-        [path.join(__dirname, 'host.cjs')], {
-          env: {
-            ...process.env, NODE_ENV: 'test', TMPDIR: os.tmpdir(),
-            BAMBOO_BROWSER_DOWNLOAD_ROOT: tempRoot,
-            BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
-            BAMBOO_BROWSER_TEST_DOWNLOAD_CLEANUP_DELAY_MS: mode === 'cleanup' ? '2000' : '0',
-            BAMBOO_BROWSER_TEST_PRIVATE_PAGE_FAILURE: mode === 'cleanup' ? '' : mode,
-            BAMBOO_BROWSER_TEST_RETIRE_CLOSE_DELAY_MS: mode === 'reject' ? '500' : '0',
-          },
-          stdio: ['pipe', 'pipe', 'inherit'],
-        });
-      const retiringPending = new Map();
-      let retiringId = 1;
-      const retiringLines = readline.createInterface({ input: retiringHost.stdout });
-      retiringLines.on('line', line => {
-        const message = JSON.parse(line);
-        if (message.event) return;
-        const resolve = retiringPending.get(message.id);
-        if (resolve) { retiringPending.delete(message.id); resolve(message); }
+      const retiringHost = startHost(prepareRoot(mode), 10_000, {
+        BAMBOO_BROWSER_TEST_DOWNLOAD_CLEANUP_DELAY_MS: mode === 'cleanup' ? '2000' : '0',
+        BAMBOO_BROWSER_TEST_PRIVATE_PAGE_FAILURE: mode === 'cleanup' ? '' : mode,
+        BAMBOO_BROWSER_TEST_RETIRE_CLOSE_DELAY_MS: mode === 'reject' ? '500' : '0',
       });
-      const retiringCall = (action, args = {}) => new Promise((resolve, reject) => {
-        const id = retiringId++;
-        const timer = setTimeout(() => reject(new Error(`${action} on retiring host timed out`)), 10_000);
-        retiringPending.set(id, message => { clearTimeout(timer); resolve(message); });
-        retiringHost.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
-      });
+      const retiringCall = retiringHost.call;
       try {
         const initial = (await retiringCall('state')).result;
+        const retiringDirectory = retiringHost.directory();
         const ready = (await retiringCall('navigate', {
           url: base + (mode.startsWith('script-') ? `/${mode}` : '/'),
           expected_epoch: initial.page_epoch,
@@ -1229,22 +1263,23 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
             `${mode}: ${JSON.stringify(result)}`);
         }
         assert.ok(performance.now() - startedAt <= 5_500, `${mode} exceeded total 5-second budget`);
-        if (retiringHost.exitCode === null) await once(retiringHost, 'exit');
-        assert.notEqual(retiringHost.exitCode, null, `${mode} retired the old host`);
-        assert.deepEqual(fs.readdirSync(tempRoot), [], `${mode} removed private download files`);
+        assert.deepEqual(await retiringHost.waitForNodeClose(), { code: 1, signal: null }, `${mode} retired the old host`);
+        assert.ok(fs.lstatSync(retiringDirectory).isDirectory(), `${mode} retained its own unconfirmed writer scratch`);
       } finally {
-        retiringLines.close();
-        retiringHost.stdin.destroy();
-        retiringHost.kill();
+        await retiringHost.finish();
       }
     }
+    const ordinary = startHost(prepareRoot('ordinary-close'), 30_000, {});
+    await ordinary.call('state');
+    const ordinaryDirectory = ordinary.directory();
+    assert.equal((await ordinary.call('close')).ok, true);
+    assert.deepEqual(await ordinary.waitForNodeClose(), { code: 0, signal: null });
+    assert.equal(fs.existsSync(ordinaryDirectory), false, 'ordinary production close removed its owned download directory');
   } finally {
-    host.stdin.end();
-    host.kill();
+    await Promise.all(clients.map(client => client.finish()));
     fixture.closeAllConnections();
-    fixture.close();
-    await once(fixture, 'close');
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    await new Promise(resolve => fixture.close(resolve));
+    t.diagnostic(`Retained synthetic fixture root; native teardown belongs to the isolated executor: ${fixtureRoot}`);
   }
 });
 
