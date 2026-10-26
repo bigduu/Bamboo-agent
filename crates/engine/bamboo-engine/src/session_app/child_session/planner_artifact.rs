@@ -536,6 +536,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn planner_artifact_large_report_metadata_is_not_limited_by_resume_budget() {
+        let (parent, mut child) = fixture();
+        let mut report: Value =
+            serde_json::from_str(&child.messages.last().unwrap().content).unwrap();
+        report["reported_evidence"] = json!((0..9)
+            .map(|index| json!({
+                "description":format!("{index}{}", "x".repeat(999)),
+                "reference":null,"sha256":null
+            }))
+            .collect::<Vec<_>>());
+        let raw = report.to_string();
+        assert!(raw.len() > 8192 && raw.len() < MAX_REPORT_BYTES);
+        child.messages.last_mut().unwrap().content = raw;
+        ChildCompletionSource::prepare(&mut child, "large-planner-report", &Default::default());
+        let built = artifact(&child, &parent)
+            .expect("legal report metadata is stored in the artifact, not inlined on resume");
+        assert!(built.markdown.len() > 16 * 1024);
+        assert!(serde_json::to_vec(&built.reference).unwrap().len() < 4096);
+    }
+
     #[cfg(unix)]
     #[test]
     fn planner_artifact_file_is_rebuildable_immutable_and_nofollow() {

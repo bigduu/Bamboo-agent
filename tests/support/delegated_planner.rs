@@ -42,13 +42,13 @@ async fn planner_response(body: web::Json<Value>, probe: web::Data<PlannerProbe>
     let is_root = body["tools"]
         .as_array()
         .is_some_and(|tools| tools.iter().any(|t| t["function"]["name"] == "Plan"));
-    let is_planner = body.to_string().contains("Work only as the planning child");
+    let is_planner = body["model"] == "child-packet-test";
     let (delta, finish) = if !is_root && !is_planner {
         (
             json!({"content":"isolated fixture auxiliary response"}),
             "stop",
         )
-    } else if !is_root {
+    } else if is_planner {
         let round = probe.child_calls.fetch_add(1, Ordering::SeqCst);
         match round {
             0 => (
@@ -234,8 +234,9 @@ async fn planner_fixture() {
     actix_web::rt::spawn(running);
     let config = json!({"provider":"openai","features":{"provider_model_ref":true},
         "providers":{"openai":{"api_key":"isolated-fixture","base_url":url,
-            "model":"root-packet-test","runtime_models":["root-packet-test"]}},
-        "defaults":{"chat":{"provider":"openai","model":"root-packet-test"}},
+            "model":"root-packet-test","runtime_models":["root-packet-test","child-packet-test"]}},
+        "defaults":{"chat":{"provider":"openai","model":"root-packet-test"},
+            "subagent_models":{"planner":{"provider":"openai","model":"child-packet-test"}}},
         "subagents":{"runtime":"actor","executor":"bamboo_runtime","max_concurrent":1}});
     std::fs::write(
         data.join("config.json"),

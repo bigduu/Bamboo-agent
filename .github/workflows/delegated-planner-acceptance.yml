@@ -75,7 +75,7 @@ jobs:
           result="$RUNNER_TEMP/planner-artifacts.log"
           cargo test --locked -p bamboo-engine --lib planner_artifact \
             -- --test-threads=1 2>&1 | tee "$result"
-          grep -Fq 'test result: ok. 6 passed; 0 failed; 0 ignored' "$result"
+          grep -Fq 'test result: ok. 7 passed; 0 failed; 0 ignored' "$result"
       - name: Verify actual CLI worker, publication, automatic resume and cold partial reads
         shell: bash
         run: |

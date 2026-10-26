@@ -36,7 +36,7 @@ unchanged. The first native acceptance target is Linux. Neither component tests
 nor compile-only Windows CI constitute native Windows acceptance.
 
 Acceptance is finite: existing Plan contracts plus selected-context positive and
-denial components; six artifact/completion/recovery tests; and one actual CLI
+denial components; seven artifact/completion/recovery tests; and one actual CLI
 Host/current-exe worker test using only a bounded loopback fake provider. That
 native case must prove source Read, denied Write even with a permissive parent,
 one Child, automatic parent resume without the full plan, partial section read,

@@ -755,7 +755,7 @@ mod tests {
         for mode in [
             bamboo_domain::PermissionMode::Default,
             bamboo_domain::PermissionMode::Auto,
-            bamboo_domain::PermissionMode::Bypass,
+            bamboo_domain::PermissionMode::BypassPermissions,
         ] {
             let mut port = selected_plan_port(&dir.path().to_string_lossy());
             port.parent
@@ -886,7 +886,11 @@ mod tests {
             .contains("required_child_context_unsupported"));
         assert!(port.child.lock().unwrap().is_none());
         assert!(!port.wait_armed.load(Ordering::SeqCst));
-        assert!(port.calls().contains(&"validate_required_context_route"));
+        assert_eq!(
+            port.calls().contains(&"validate_required_context_route"),
+            cfg!(unix),
+            "unsupported platforms reject before querying the worker route"
+        );
         assert!(!port.calls().contains(&"save_child"));
     }
 
