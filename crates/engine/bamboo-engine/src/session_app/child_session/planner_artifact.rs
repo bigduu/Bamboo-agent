@@ -2,7 +2,7 @@
 //! No writer tool, new outcome store, queue, or execution approval is involved.
 //! Files can be rebuilt from that commit; reads always revalidate its identity.
 
-use super::result_projection::{decode_report, plain_child_report_message, unique_json};
+use super::result_projection::{decode_report_with_limit, plain_child_report_message, unique_json};
 use super::{ChildSessionError, ChildSessionPort};
 use crate::runtime::execution::{ChildCompletion, ChildCompletionSource};
 use bamboo_domain::{ChildContextBinding, Session};
@@ -22,13 +22,14 @@ const MAX_READ_BYTES: usize = 4096;
 /// Appended only to an explicitly selected-context Plan assignment. The worker
 /// returns data; the trusted runtime publishes it after its normal terminal save.
 pub const REPORT_INSTRUCTION: &str = r#"
-Return one plain JSON final response, without fences or tool calls. Its exact
-members are: version:1, outcome (completed/partial/blocked/failed), summary
+Return one plain JSON final response, without fences or tool calls, at most
+81920 UTF-8 bytes in total. Its exact members are: version:1,
+outcome (completed/partial/blocked/failed), summary
 (at most 2048 UTF-8 bytes), reported_evidence (at most 16 objects with exact
 description/reference/sha256 members; absent reference and sha256 are null),
 reported_verification (at most 16 exact check/reported_status/details objects;
 status passed/failed/not_run/unknown), proposals, blockers, open_decisions
-(each at most 16 strings of 1024 bytes), and plan_markdown (nonempty Markdown,
+(each at most 16 strings of 1024 bytes), and plan_markdown (Markdown beginning with a heading,
 at most 65536 UTF-8 bytes, at most 32 headings with short titles). Include a
 concrete ordered plan and label proposals separately from observed evidence.
 Do not Write a file or request a Write grant: the runtime publishes the final
@@ -92,7 +93,8 @@ fn artifact(child: &Session, parent: &Session) -> Result<Artifact, ChildSessionE
         .ok_or_else(|| invalid("invalid_plan_markdown"))?;
     // Reuse the exact ChildReport contract, including duplicate detection,
     // unknown-field denial and explicit nulls. Reported facts stay claims.
-    let report = decode_report(&report.to_string()).map_err(invalid)?;
+    let report =
+        decode_report_with_limit(&report.to_string(), MAX_REPORT_BYTES).map_err(invalid)?;
     let mut markdown = format!("{plan}\n\n## Reported evidence\n");
     for entry in report["reported_evidence"]
         .as_array()
@@ -555,6 +557,12 @@ mod tests {
             .expect("legal report metadata is stored in the artifact, not inlined on resume");
         assert!(built.markdown.len() > 16 * 1024);
         assert!(serde_json::to_vec(&built.reference).unwrap().len() < 4096);
+        report.as_object_mut().unwrap().remove("plan_markdown");
+        assert_eq!(
+            super::super::result_projection::decode_report(&report.to_string()),
+            Err("result_budget_exceeded"),
+            "compact result delivery must retain its original cap"
+        );
     }
 
     #[cfg(unix)]

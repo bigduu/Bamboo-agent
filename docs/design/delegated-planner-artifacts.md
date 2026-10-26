@@ -7,7 +7,8 @@ permission mode, Project, and ordinary orchestration posture do not change.
 Legacy task/fork calls keep their existing result path.
 
 The selected-context planner returns the strict ChildReport v1 JSON plus one
-`plan_markdown` member (64 KiB maximum, short headings). It does not call Write.
+`plan_markdown` member (64 KiB maximum, beginning with a heading). The complete
+JSON report has an 80 KiB cap; the compact resume retains its separate 8 KiB cap. It does not call Write.
 The runtime validates the committed Child completion seal, assignment, selected
 source contents and parent/Child lifetimes before publishing. Evidence and
 verification in the report remain model claims; publication grants no execution

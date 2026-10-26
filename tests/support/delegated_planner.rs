@@ -198,6 +198,27 @@ async fn completed(data: &Path, marker: &str) -> bamboo_domain::Session {
     })
 }
 
+async fn execute_only_legacy_chat(client: &reqwest::Client, base: &str, receipt: &Value) {
+    assert_eq!(receipt["session_id"], "planner-root");
+    if !receipt["message_id"].is_null() {
+        // Current native Chat commits its own activation intent. This receipt
+        // is data, not proof of execution: the persisted marker and bounded
+        // provider-count assertions remain required below.
+        return;
+    }
+    let response = client
+        .post(format!("{base}/execute/planner-root"))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+}
+
 async fn planner_fixture() {
     let temp = tempfile::Builder::new()
         .prefix("bamboo-1059-native-plan-")
@@ -221,7 +242,9 @@ async fn planner_fixture() {
             .route(
                 "/v1/models",
                 web::get().to(|| async {
-                    HttpResponse::Ok().json(json!({"data":[{"id":"root-packet-test"}]}))
+                    HttpResponse::Ok().json(
+                        json!({"data":[{"id":"root-packet-test"},{"id":"child-packet-test"}]}),
+                    )
                 }),
             )
     })
@@ -270,19 +293,10 @@ async fn planner_fixture() {
         "{}",
         response.text().await.unwrap()
     );
+    let receipt: Value = response.json().await.unwrap();
     let disk = SessionStoreV2::new(data.clone()).await.unwrap();
     let original = disk.load_session("planner-root").await.unwrap().unwrap();
-    let response = client
-        .post(format!("{base}/execute/planner-root"))
-        .json(&json!({}))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        response.status().is_success(),
-        "{}",
-        response.text().await.unwrap()
-    );
+    execute_only_legacy_chat(&client, &base, &receipt).await;
     let parent = completed(&data, "REAL_PLANNER_ROOT_FINISHED").await;
     assert_eq!(probe.root_calls.load(Ordering::SeqCst), 4);
     assert_eq!(probe.child_calls.load(Ordering::SeqCst), 3);
@@ -349,24 +363,15 @@ async fn planner_fixture() {
         "{}",
         response.text().await.unwrap()
     );
-    let response = client
-        .post(format!("{base}/execute/planner-root"))
-        .json(&json!({}))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        response.status().is_success(),
-        "{}",
-        response.text().await.unwrap()
-    );
+    let receipt: Value = response.json().await.unwrap();
+    execute_only_legacy_chat(&client, &base, &receipt).await;
     completed(&data, "REAL_PLANNER_COLD_READ_FINISHED").await;
     assert_eq!(probe.root_calls.load(Ordering::SeqCst), 6);
     assert_eq!(probe.child_calls.load(Ordering::SeqCst), 3);
     assert_eq!(std::fs::read(file).unwrap(), bytes);
     drop(host);
     handle.stop(false).await;
-    eprintln!("actual delegated Plan: source-bound Host+worker; selected context; read-only denial; versioned artifact; automatic parent resume; partial and cold section reads; 9 bounded fake provider requests; 0 paid calls");
+    eprintln!("actual delegated Plan: source-bound Host+worker; selected context; read-only denial; versioned artifact; automatic parent resume; partial and cold section reads; 6 Root + 3 Child primary requests; {} total bounded fake provider requests; 0 paid calls", probe.requests.lock().unwrap().len());
 }
 
 #[test]
