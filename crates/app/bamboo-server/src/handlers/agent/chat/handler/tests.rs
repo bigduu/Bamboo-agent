@@ -399,8 +399,13 @@ async fn ticket_review_queued_ingress_does_not_requeue_activated_root_history() 
     );
 }
 
-#[actix_web::test]
-async fn activated_root_chat_preserves_handoff_and_commits_multimodal_input_once() {
+#[test]
+fn activated_root_chat_preserves_handoff_and_commits_multimodal_input_once() {
+    // Box before Actix's by-value wrappers consume the default test stack.
+    actix_web::rt::System::new().block_on(Box::pin(activated_root_chat_handoff_fixture()));
+}
+
+async fn activated_root_chat_handoff_fixture() {
     use actix_web::{test, web};
     use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
     let home = tempfile::tempdir().unwrap();
@@ -5776,6 +5781,12 @@ mod native_chat_scope {
                 model: Some("test-model".into()),
                 ..Default::default()
             });
+            // Count only Chat admission calls; the default-on first Dream tick
+            // can otherwise extract this persisted fixture via the same provider.
+            config
+                .memory_mut()
+                .get_or_insert_with(Default::default)
+                .auto_dream_enabled = false;
             let provider = Arc::new(NoModelCalls::default());
             let mut state =
                 crate::AppState::new_with_provider(home.path().into(), config, provider.clone())
