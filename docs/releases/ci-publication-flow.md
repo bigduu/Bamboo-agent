@@ -26,6 +26,13 @@ cancelled or missing matrix result. Actor/Ticket standalone workflows no longer
 start another dev-PR producer. Explicit manual and full legacy release checks
 remain available; this change does not activate release-source publication.
 
+The three portable Node suites register 46 Supervisor, 6 Lotus artifact and
+9 frontend policy cases. Ubuntu `Quick Checks` runs these 61 registrations once;
+each Windows/macOS native feature job runs them once before Cargo. Windows
+retains the explicit unsupported-platform refusal assertions. These counts
+describe registration, not hosted execution or the separate `browser-runtime`
+Node suites; that class still needs an automatic feature owner.
+
 | Native configuration | Cases currently selected from source | Runtime owner |
 | --- | --- | --- |
 | Windows Rust 1.99/MSVC/API-only, independent storage/server/tools defaults | 41: 9 snapshot + 3 gateway + 19 directory + 5 scoped + 5 initial processes | Existing Actor immutable-executable controller inside the Windows owner |
@@ -40,7 +47,7 @@ These are source/cfg expectations, not a claim of hosted runtime success. The
 driver enumerates actual compiled names and requires the selected runtime count
 with zero failures/ignores, recording source/tree, compiler, features/profile,
 frontend mode, executable hashes and compatible-unit freshness. Expected totals
-are 145 on Windows and 107 on macOS. The original 41 Actor names, real junction
+are 145 Cargo runtime cases on Windows and 107 on macOS. The original 41 Actor names, real junction
 and process evidence remain guarded. Default storage cannot acquire server
 test-utils; different frontend modes and macOS dev/test profiles do not share
 incompatible executables. Compatible dependencies share the owned target.

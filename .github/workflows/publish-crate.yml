@@ -398,7 +398,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           ADMISSION_MODE: publication
-          ADMISSION_HELPER_SHA256: "b789dd1c57550268d071b455e7d6384a17fb13cfa5a9a81fcc7ed89f4741ba54"
+          ADMISSION_HELPER_SHA256: "a68d346e1851e26b4b27e8d67ddbd27084be0e1e25415280b8183542a1d590e8"
         run: |
           python3 - <<'PYTHON'
           import base64

@@ -1514,6 +1514,31 @@ test("Supervisor driver self-tests cover dev, full validation and release platfo
   assert.throws(() => verify(quick, full.replace(command, "true"), platform))
 })
 
+test("feature portable Node suites have one owner per OS without duplicating Ubuntu", () => {
+  const scripts = ["supervisor-native-acceptance.test.cjs", "lotus-next-artifact.test.cjs", "release-frontend-policy.test.cjs"]
+  const counts = (source) => scripts.map((name) => [...source.matchAll(/run: node --test ([^\n]+)/gu)]
+    .reduce((count, [, args]) => count + args.split(/\s+/u).filter((arg) => arg === `scripts/${name}`).length, 0))
+  const verify = (quick, native, linux) => {
+    assert.deepEqual(counts(quick), [1, 1, 1], "Ubuntu Quick owns each portable suite once")
+    assert.deepEqual(counts(native), [1, 1, 1], "each native matrix entry owns each portable suite once")
+    assert.deepEqual(counts(linux), [0, 0, 0], "the Linux Cargo executor does not repeat Quick Node suites")
+    assert.match(native, /if: needs\.validation-source\.outputs\.feature == 'true'/u)
+    assert.match(native, /os: \[windows-2025, macos-latest\]/u)
+    const step = actorWindowsStep(native, "Test portable Supervisor and frontend policies")
+    assert.doesNotMatch(step, /\bif:|continue-on-error:|\|\||--test-(?:name|skip)-pattern/u)
+    assert.ok(native.indexOf(step) < native.indexOf("Run fixed native ownership"), "Node failures cannot be hidden after Cargo")
+  }
+  const quick = job("quick-checks"), native = job("native-feature-tests"), linux = job("feature-tests")
+  verify(quick, native, linux)
+  for (const script of scripts) {
+    assert.throws(() => verify(quick.replace(` scripts/${script}`, ""), native, linux))
+    assert.throws(() => verify(quick, native.replace(` scripts/${script}`, ""), linux))
+  }
+  assert.throws(() => verify(quick, native, linux + "\nrun: node --test scripts/lotus-next-artifact.test.cjs"))
+  assert.throws(() => verify(quick, native.replace("os: [windows-2025, macos-latest]", "os: [macos-latest]"), linux))
+  assert.throws(() => verify(quick, native.replace("- name: Test portable Supervisor and frontend policies", "- name: Test portable Supervisor and frontend policies\n        continue-on-error: true"), linux))
+})
+
 test("native Windows paths retain native sources while policy and release edits stay fast", () => {
   assert.match(actorWindowsWorkflow, /on:\n  workflow_dispatch:\n  pull_request:\n    branches: \[main\]\n    paths:\n/u)
   assert.match(job("quick-checks"), /run: node --test scripts\/ci-policy\.test\.cjs(?: |\n)/u)

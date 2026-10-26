@@ -29,6 +29,11 @@ containment-boundary, explicit manual diagnostics and pinned legacy routes are
 scoped exceptions with named owners. Preserve
 applicable native-platform acceptance before dev admission. Fix failures in the
 feature branch before merging; record exact source, commands and results.
+Ubuntu `Quick Checks` owns the 46 Supervisor component/protocol registrations
+and 15 frontend artifact/policy registrations once. Each native feature job
+runs the same 61 portable Node registrations once on its own OS; retain the
+Windows unsupported-platform assertions. These do not execute the separate
+`browser-runtime` Node suites, whose missing automatic owner is pending.
 Keep the standalone default storage authority families' serial selection in that same
 executor, reusing its compiled library-test executable without repeating cases.
 `Quick Checks` remains auxiliary and never substitutes for runtime tests.

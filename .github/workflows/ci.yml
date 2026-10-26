@@ -98,7 +98,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "b789dd1c57550268d071b455e7d6384a17fb13cfa5a9a81fcc7ed89f4741ba54"
+          ADMISSION_HELPER_SHA256: "a68d346e1851e26b4b27e8d67ddbd27084be0e1e25415280b8183542a1d590e8"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -154,6 +154,9 @@ jobs:
 
       - name: Test Supervisor driver and owned loopback process binding
         run: node --test scripts/supervisor-native-acceptance.test.cjs
+
+      - name: Test portable frontend artifact and release policies
+        run: node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
 
   promotion-source:
     name: Promotion Source
@@ -488,6 +491,8 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
+      - name: Test portable Supervisor and frontend policies
+        run: node --test scripts/supervisor-native-acceptance.test.cjs scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
       - uses: dtolnay/rust-toolchain@stable
       - name: Preserve the Actor acceptance compiler
         if: runner.os == 'Windows'
