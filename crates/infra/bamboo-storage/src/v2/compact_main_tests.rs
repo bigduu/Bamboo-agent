@@ -224,6 +224,7 @@ fn compact_max_management_receipts_preserve_tombstones_and_bound_rejects() {
     let project = projects.first().unwrap().clone();
     session.supervisor_management = Some(SupervisorManagementState {
         schema_version: 1,
+        observers: Default::default(),
         incarnation_id,
         revision: u64::MAX,
         allowed_projects: projects,

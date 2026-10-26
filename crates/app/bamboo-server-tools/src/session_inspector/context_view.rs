@@ -199,7 +199,12 @@ fn safe_source(caller: &Session, target: &Session, project: Option<String>) -> S
     }
 }
 
-fn render(source: &SafeSource, revision: &str, scoped: bool) -> (String, String) {
+fn render(
+    source: &SafeSource,
+    revision: &str,
+    scoped: bool,
+    target_root: &str,
+) -> (String, String) {
     let id_line = |id: &str| preview(id, 360).text;
     let schema = if scoped { SCOPED_SCHEMA } else { SCHEMA };
     let label = if scoped { "Source digest" } else { "Revision" };
@@ -211,7 +216,12 @@ fn render(source: &SafeSource, revision: &str, scoped: bool) -> (String, String)
          - Has pending question: {}\n- Task count: {}\n\n\
          Read brief.md for bounded task previews. No transcript is included.\n",
         id_line(&source.scope.target_session_id),
-        id_line(&source.scope.root_session_id),
+        // Scope records the caller's tree; a scoped target can be another Root.
+        id_line(if scoped {
+            target_root
+        } else {
+            &source.scope.root_session_id
+        }),
         source
             .parent_session_id
             .as_deref()
@@ -323,7 +333,7 @@ async fn publish_context(
     } else {
         digest(format!("{SCHEMA}:{source_digest}").as_bytes())
     };
-    let (status, brief) = render(&source, &source_revision, scoped);
+    let (status, brief) = render(&source, &source_revision, scoped, root_id(target));
     if status.lines().count() > 40
         || brief.lines().count() > 120
         || status
