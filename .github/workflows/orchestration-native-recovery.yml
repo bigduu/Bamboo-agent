@@ -125,9 +125,11 @@ jobs:
           -A clippy::too-many-arguments -A clippy::while-let-loop
           -A clippy::type_complexity -A dead-code
 
-      - name: Check the affected Supervisor test library under the same lint policy
+      # Match ci.yml's production-target lint contract. The cfg(test) cases
+      # above execute for real; this does not lint unrelated test modules.
+      - name: Check the affected Supervisor production library under the same lint policy
         run: >-
-          cargo clippy --locked --all-features -p bamboo-server --lib --tests --
+          cargo clippy --locked --all-features -p bamboo-server --lib --
           -D warnings -A deprecated -A clippy::module_inception
           -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
           -A clippy::too-many-arguments -A clippy::while-let-loop
