@@ -1,5 +1,8 @@
 //! One canonical Supervisor relationship writer. No target mutation or registry.
 
+#[path = "observer_subscriptions.rs"]
+pub(super) mod subscriptions;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;

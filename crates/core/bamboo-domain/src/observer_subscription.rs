@@ -103,6 +103,17 @@ pub struct ObserverChangePage {
     pub changes: Vec<ObserverViewChange>,
 }
 
+/// A bounded derived read, never an Inbox admission/ACK log. On a gap the
+/// reader must request fresh scoped snapshots for the named assigned targets.
+#[derive(Debug, Clone, Serialize)]
+pub struct ObserverChangeRead {
+    pub page: ObserverChangePage,
+    pub jsonl_shards: Vec<String>,
+    pub snapshot_targets: Vec<String>,
+    pub shard_revision: String,
+    pub shard_directory: std::path::PathBuf,
+}
+
 fn digest_shape(value: &str) -> bool {
     value.len() == 64
         && value

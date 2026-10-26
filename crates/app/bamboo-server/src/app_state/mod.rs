@@ -299,6 +299,7 @@ pub struct AppState {
     /// Durable logical-session delivery plane. These are internal runtime
     /// capabilities; no public messaging endpoint is registered.
     pub session_inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+    pub(super) observer_subscriptions: Arc<observer_subscriptions::ObserverSubscriptionCoordinator>,
     pub session_activation_router: Arc<bamboo_engine::SessionActivationRouter>,
     pub session_messenger: Arc<bamboo_engine::SessionMessenger>,
 
@@ -614,10 +615,12 @@ mod wake_reconciler;
 // `session_events::NotificationRelayDeps`, so external callers that build a
 // `ScheduleContext` by hand (e.g. integration tests) need to name it.
 pub(crate) mod mutation_idempotency;
+mod observer_subscriptions;
 pub(crate) mod session_create_operations;
 pub mod session_events;
 mod session_loader;
 mod supervisor_observers;
+pub use observer_subscriptions::ObserverSubscriptionStart;
 pub mod supervisor_owner_authorization;
 pub mod ticket_application;
 mod tools;

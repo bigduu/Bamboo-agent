@@ -218,6 +218,8 @@ pub struct FileSessionInbox {
     root_owner: Option<bamboo_domain::RootActorRuntimeWrite>,
     child_owner: Option<bamboo_domain::ChildActorRuntimeWrite>,
     limits: SessionInboxLimits,
+    #[cfg(any(test, feature = "test-utils"))]
+    observer_cursor_failure: Arc<std::sync::atomic::AtomicBool>,
     /// Runtime-owned path registry. Clones of this adapter share it, while
     /// independent AppState/SDK runtimes remain fully isolated.
     operation_locks: Arc<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>>,
@@ -256,6 +258,8 @@ impl FileSessionInbox {
             root_owner: None,
             child_owner: None,
             limits,
+            #[cfg(any(test, feature = "test-utils"))]
+            observer_cursor_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
             scoped_runtime: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -281,6 +285,55 @@ impl FileSessionInbox {
             #[cfg(test)]
             owned_scope_drop: None,
         }
+    }
+
+    /// Deliver only the currently persisted canonical pending observation. The
+    /// same authority guard spans physical admission and producer publication.
+    pub async fn deliver_supervisor_observation(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        observer_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
+        let authority = self
+            .sessions
+            .begin_observer_notice(supervisor, observer_id, now)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        let receipt = self
+            .deliver_with_lifecycle_held_state(
+                &authority.envelope,
+                InboxAuthority::Observer {
+                    _guard: Arc::clone(&authority),
+                },
+                None,
+                Some(SessionInboxActivationIntent::new(
+                    SessionActivationPolicy::RespectSpecificWait,
+                )),
+            )
+            .await?;
+        #[cfg(any(test, feature = "test-utils"))]
+        if self
+            .observer_cursor_failure
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(SessionInboxError::Storage(
+                "injected interruption after Observer Inbox receipt".into(),
+            ));
+        }
+        self.sessions
+            .finish_observer_notice(&authority, &receipt.delivery, now)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        Ok(receipt)
+    }
+
+    /// Deterministic crash boundary for real-Maildir integration fixtures. It
+    /// never fabricates a receipt or changes the production transition.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn interrupt_next_observer_cursor_for_testing(&self) {
+        self.observer_cursor_failure
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn bind_root_owner(
@@ -1340,6 +1393,15 @@ impl FileSessionInbox {
         intent: Option<SessionInboxActivationIntent>,
         expected: Option<ExpectedRunAdmission>,
     ) -> Result<StoredDeliveryState, SessionInboxError> {
+        let observer_notice = matches!(&envelope.source,
+            SessionMessageSource::Runtime { subsystem } if subsystem == "supervisor_observation")
+            || matches!(&envelope.body, bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction)
+                if instruction.instruction == "observer_view_available_v1");
+        if observer_notice && !matches!(&authority, InboxAuthority::Observer { .. }) {
+            return Err(SessionInboxError::InvalidClaim(
+                "Observer notice requires canonical integrated admission".into(),
+            ));
+        }
         if bamboo_domain::is_scoped_loop_control(envelope)
             && expected
                 .as_ref()
