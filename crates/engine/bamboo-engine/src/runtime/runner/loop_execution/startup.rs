@@ -95,20 +95,7 @@ pub(super) struct LoopRunState {
 }
 
 pub(super) fn resolve_auxiliary_models(config: &AgentLoopConfig) -> AuxiliaryModelConfig {
-    config
-        .auxiliary_model_resolver
-        .as_ref()
-        .map(|resolver| resolver())
-        .unwrap_or_else(|| AuxiliaryModelConfig {
-            fast_model_name: config.fast_model_name.clone(),
-            fast_model_provider: config.fast_model_provider.clone(),
-            background_model_name: config.background_model_name.clone(),
-            planning_model_name: config.planning_model_name.clone(),
-            search_model_name: config.search_model_name.clone(),
-            summarization_model_name: config.summarization_model_name.clone(),
-            background_model_provider: config.background_model_provider.clone(),
-            summarization_model_provider: config.summarization_model_provider.clone(),
-        })
+    config.resolve_auxiliary_models()
 }
 
 pub(super) async fn initialize_loop_state(

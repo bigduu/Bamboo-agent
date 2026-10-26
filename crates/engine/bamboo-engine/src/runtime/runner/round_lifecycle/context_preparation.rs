@@ -1750,10 +1750,22 @@ async fn maybe_apply_summary_context_compression_with_budget(
         return Ok(changed > 0);
     }
 
-    let Some(summary_model) = config
+    // Settings can change after execution starts. Resolve the name and provider
+    // together for this whole compression pass instead of reading startup fields.
+    let auxiliary_models = config.resolve_auxiliary_models();
+    // The live global resolver already applies task_summary -> fast -> chat.
+    // An unresolved explicit summary route must not fall through to a separate
+    // memory account or reuse stale startup routing. Keep background fallback
+    // only for standalone/SDK callers that have no live resolver.
+    let legacy_background_fallback = config.auxiliary_model_resolver.is_none();
+    let Some(summary_model) = auxiliary_models
         .summarization_model_name
         .as_deref()
-        .or(config.background_model_name.as_deref())
+        .or_else(|| {
+            legacy_background_fallback
+                .then_some(auxiliary_models.background_model_name.as_deref())
+                .flatten()
+        })
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
@@ -1826,10 +1838,14 @@ async fn maybe_apply_summary_context_compression_with_budget(
     let compression_instructions =
         merge_compression_instructions(compression_instructions, hook_compression_instructions);
 
-    let summary_provider = config
+    let summary_provider = auxiliary_models
         .summarization_model_provider
         .as_ref()
-        .or(config.background_model_provider.as_ref())
+        .or_else(|| {
+            legacy_background_fallback
+                .then_some(auxiliary_models.background_model_provider.as_ref())
+                .flatten()
+        })
         .unwrap_or(llm);
     let summary_model_budget = super::token_budget::resolve_auxiliary_token_budget(
         config,

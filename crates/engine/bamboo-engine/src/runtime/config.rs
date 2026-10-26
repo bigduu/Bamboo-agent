@@ -1174,6 +1174,25 @@ impl Default for AgentLoopConfig {
 }
 
 impl AgentLoopConfig {
+    /// Resolve one coherent global auxiliary-model snapshot. A live resolver's
+    /// empty result is authoritative; only callers without one use the startup
+    /// fields (SDK and standalone-loop compatibility).
+    pub(crate) fn resolve_auxiliary_models(&self) -> AuxiliaryModelConfig {
+        self.auxiliary_model_resolver
+            .as_ref()
+            .map(|resolver| resolver())
+            .unwrap_or_else(|| AuxiliaryModelConfig {
+                fast_model_name: self.fast_model_name.clone(),
+                fast_model_provider: self.fast_model_provider.clone(),
+                background_model_name: self.background_model_name.clone(),
+                planning_model_name: self.planning_model_name.clone(),
+                search_model_name: self.search_model_name.clone(),
+                summarization_model_name: self.summarization_model_name.clone(),
+                background_model_provider: self.background_model_provider.clone(),
+                summarization_model_provider: self.summarization_model_provider.clone(),
+            })
+    }
+
     pub fn bind_ticket_worker_plan(
         &mut self,
         plan: Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>,
