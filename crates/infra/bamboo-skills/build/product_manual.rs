@@ -87,8 +87,8 @@ pub fn source_identity(manifest_dir: &Path) -> Value {
     // Cargo's recorded source wins over any unrelated parent Git checkout into
     // which an extracted crate may have been placed.
     let vcs = manifest_dir.join(".cargo_vcs_info.json");
-    println!("cargo:rerun-if-changed={}", vcs.display());
     if vcs.exists() {
+        println!("cargo:rerun-if-changed={}", vcs.display());
         if let Ok(value) = fs::read(&vcs)
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).map_err(invalid))
         {
@@ -102,14 +102,37 @@ pub fn source_identity(manifest_dir: &Path) -> Value {
     let workspace = manifest_dir.join("../../..");
     if workspace.join("builtin_skills").is_dir() {
         if let Some(sha) = git(&workspace, &["rev-parse", "HEAD"]).filter(|sha| revision(sha)) {
-            for entry in ["HEAD", "index", "packed-refs"] {
+            for entry in ["HEAD", "packed-refs"] {
                 if let Some(path) = git(&workspace, &["rev-parse", "--git-path", entry]) {
-                    println!("cargo:rerun-if-changed={}", workspace.join(path).display());
+                    let path = workspace.join(path);
+                    if path.exists() {
+                        println!("cargo:rerun-if-changed={}", path.display());
+                    }
                 }
             }
             if let Some(reference) = git(&workspace, &["symbolic-ref", "-q", "HEAD"]) {
                 if let Some(path) = git(&workspace, &["rev-parse", "--git-path", &reference]) {
-                    println!("cargo:rerun-if-changed={}", workspace.join(path).display());
+                    let path = workspace.join(path);
+                    if path.exists() {
+                        println!("cargo:rerun-if-changed={}", path.display());
+                    } else if let Some(refs) = git(&workspace, &["rev-parse", "--git-path", "refs"])
+                    {
+                        let refs = workspace.join(refs);
+                        let mut parent = path.parent();
+                        // A packed ref can become loose again. Watch only its
+                        // nearest existing refs parent, never all of .git.
+                        // Sibling changes in that narrow parent can also rerun.
+                        while let Some(directory) = parent {
+                            if !directory.starts_with(&refs) {
+                                break;
+                            }
+                            if directory.is_dir() {
+                                println!("cargo:rerun-if-changed={}", directory.display());
+                                break;
+                            }
+                            parent = directory.parent();
+                        }
+                    }
                 }
             }
             // Cargo does not rerun this script for every unrelated worktree edit.
