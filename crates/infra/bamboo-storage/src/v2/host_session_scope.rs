@@ -344,6 +344,37 @@ impl SessionStoreV2 {
         .await
     }
 
+    pub(super) async fn load_host_scoped_context_target_impl(
+        &self,
+        token: &HostSessionScopeToken,
+        caller: &SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<Session> {
+        let scope = self.host_scope_registry.retain(token, caller).await?;
+        let binding = scope.token().binding();
+        let target = binding
+            .target(target_id, HostSessionRight::InspectBoundedProgress)
+            .map_err(|error| denied(error.to_string()))?
+            .observation
+            .clone();
+        if target.identity.session_id != target.identity.root_session_id {
+            return Err(denied("context view requires an independent Root target"));
+        }
+        let observations = [binding.caller.clone(), target];
+        let _guards = self
+            .lock_host_scope_observations(&observations, Some(scope), &[])
+            .await?;
+        let current = self
+            .peer_delivery_session(&caller.session_id, &caller.root_session_id)
+            .await?;
+        if !caller.matches_session(&current) {
+            return Err(denied("host_session_operation_caller_changed"));
+        }
+        self.load_root_authority_unchecked(target_id)
+            .await?
+            .ok_or_else(|| denied("context view target disappeared"))
+    }
+
     pub(crate) async fn lock_host_scoped_peer_delivery(
         &self,
         token: &HostSessionScopeToken,

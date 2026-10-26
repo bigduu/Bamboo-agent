@@ -389,12 +389,7 @@ async fn metadata_and_bounded_progress_rights_remain_distinct_read_only_and_non_
         )
         .unwrap()
     );
-    for action in [
-        "read_messages",
-        "get_meta",
-        "read_compressed_cache",
-        "export_context",
-    ] {
+    for action in ["read_messages", "get_meta", "read_compressed_cache"] {
         assert!(fixture
             .tool()
             .invoke(

@@ -56,6 +56,17 @@ pub(super) enum SessionInspectorArgs {
     /// Materialize a bounded, immutable observation of this root or its tree.
     ExportContext { session_id: String },
 
+    /// Read a fixed file from an authorized immutable view; no path is accepted.
+    ReadContext {
+        session_id: String,
+        revision: String,
+        file: String,
+        #[serde(default)]
+        offset: Option<usize>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+
     /// Bounded persisted progress for one explicitly authorized target.
     Inspect {
         session_id: String,
