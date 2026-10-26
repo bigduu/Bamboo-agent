@@ -27,6 +27,9 @@ enum Script {
     CanonicalCacheOnlyOverCap,
     CanonicalReasoningOnlyOverCap,
     CanonicalTotalOnlyOverCap,
+    LegacySplitInputOverCap,
+    CanonicalSplitCacheOverCap,
+    SplitTotalMismatch,
 }
 struct Provider {
     script: Script,
@@ -81,6 +84,44 @@ impl LLMProvider for Provider {
             Script::Partial => vec![Ok(LLMChunk::Done), Ok(usage(None, Some(10)))],
             Script::OverCap => vec![Ok(usage(Some(101), Some(10)))],
             Script::PartialOverCap => vec![Ok(usage(Some(101), None))],
+            Script::LegacySplitInputOverCap => vec![
+                Ok(LLMChunk::CacheUsage {
+                    input_tokens: 80,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 10,
+                }),
+                Ok(LLMChunk::CacheUsage {
+                    input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 40,
+                }),
+            ],
+            Script::CanonicalSplitCacheOverCap => {
+                let mut first = usage(None, None);
+                let mut second = usage(None, None);
+                if let LLMChunk::ProviderUsage {
+                    cache_creation_input_tokens,
+                    ..
+                } = &mut first
+                {
+                    *cache_creation_input_tokens = Some(80);
+                }
+                if let LLMChunk::ProviderUsage {
+                    cache_read_input_tokens,
+                    ..
+                } = &mut second
+                {
+                    *cache_read_input_tokens = Some(40);
+                }
+                vec![Ok(first), Ok(second)]
+            }
+            Script::SplitTotalMismatch => {
+                let mut total = usage(None, None);
+                if let LLMChunk::ProviderUsage { total_tokens, .. } = &mut total {
+                    *total_tokens = Some(100);
+                }
+                vec![Ok(usage(Some(20), Some(10))), Ok(LLMChunk::Done), Ok(total)]
+            }
             Script::CanonicalCacheOnlyOverCap
             | Script::CanonicalReasoningOnlyOverCap
             | Script::CanonicalTotalOnlyOverCap => {
@@ -136,19 +177,31 @@ impl LLMProvider for Provider {
                 }),
                 Ok(LLMChunk::Done),
             ],
-            Script::MixedKnown => vec![
-                Ok(LLMChunk::CacheUsage {
-                    input_tokens: 5,
-                    cache_creation_input_tokens: 10,
-                    cache_read_input_tokens: 5,
-                }),
-                Ok(LLMChunk::UsageSummary {
-                    output_tokens: 10,
-                    thinking_tokens: 5,
-                }),
-                Ok(usage(Some(20), Some(10))),
-                Ok(LLMChunk::Done),
-            ],
+            Script::MixedKnown => {
+                let mut canonical = usage(Some(20), Some(10));
+                if let LLMChunk::ProviderUsage {
+                    cache_creation_input_tokens,
+                    cache_read_input_tokens,
+                    ..
+                } = &mut canonical
+                {
+                    *cache_creation_input_tokens = Some(10);
+                    *cache_read_input_tokens = Some(5);
+                }
+                vec![
+                    Ok(LLMChunk::CacheUsage {
+                        input_tokens: 5,
+                        cache_creation_input_tokens: 10,
+                        cache_read_input_tokens: 5,
+                    }),
+                    Ok(LLMChunk::UsageSummary {
+                        output_tokens: 10,
+                        thinking_tokens: 5,
+                    }),
+                    Ok(canonical),
+                    Ok(LLMChunk::Done),
+                ]
+            }
             Script::InconsistentOverCap => {
                 let mut chunk = usage(Some(101), Some(10));
                 if let LLMChunk::ProviderUsage { total_tokens, .. } = &mut chunk {
@@ -324,6 +377,8 @@ async fn token_budget_over_cap_report_halts_subsequent_provider_entry() {
         Script::CanonicalCacheOnlyOverCap,
         Script::CanonicalReasoningOnlyOverCap,
         Script::CanonicalTotalOnlyOverCap,
+        Script::LegacySplitInputOverCap,
+        Script::CanonicalSplitCacheOverCap,
     ] {
         let (f, _registration) = admitted().await;
         configure(&f, 500);
@@ -333,7 +388,17 @@ async fn token_budget_over_cap_report_halts_subsequent_provider_entry() {
             .chat_stream(&[], &[], None, "fixture-model")
             .await
             .unwrap();
-        assert!(stream.next().await.unwrap().is_err());
+        let mut saw_error = false;
+        while let Some(chunk) = stream.next().await {
+            if chunk.is_err() {
+                saw_error = true;
+                break;
+            }
+        }
+        assert!(
+            saw_error,
+            "overrun must fail while consuming its real stream"
+        );
         let budget = ledger(&f);
         assert_eq!(budget.total_charged, 140);
         assert!(budget
@@ -352,10 +417,11 @@ async fn token_budget_over_cap_report_halts_subsequent_provider_entry() {
 }
 
 #[tokio::test]
-async fn token_budget_legacy_usage_keeps_caps_and_mixed_usage_never_double_counts() {
+async fn token_budget_incomplete_or_inconsistent_usage_keeps_caps_without_double_counting() {
     for (script, charged, known) in [
         (Script::LegacyWithinCap, 140, false),
         (Script::MixedKnown, 30, true),
+        (Script::SplitTotalMismatch, 140, false),
     ] {
         let (f, _registration) = admitted().await;
         configure(&f, 500);

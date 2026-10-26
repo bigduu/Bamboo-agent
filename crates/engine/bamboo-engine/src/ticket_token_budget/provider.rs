@@ -290,10 +290,13 @@ impl BudgetedProvider {
 struct Usage {
     input: Option<u64>,
     output: Option<u64>,
-    // Legacy events lose optional-field presence. Positive counts are still
-    // authoritative lower bounds, independently useful for stopping overruns.
-    reported_input_floor: Option<u64>,
-    reported_output_floor: Option<u64>,
+    // Distinct positive counts remain lower bounds even when the native
+    // parser loses optional-field presence. Keep each across split events.
+    fresh_input: Option<u64>,
+    cache_creation: Option<u64>,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
+    output_floor: Option<u64>,
     reported_total: Option<u64>,
     done: bool,
     inconsistent: bool,
@@ -316,55 +319,56 @@ impl Usage {
                 {
                     self.inconsistent |= input.checked_add(*output) != Some(*total);
                 }
-                if let Some(input) = input_tokens {
-                    self.input = Some(self.input.unwrap_or(0).max(*input));
-                }
-                if let Some(output) = output_tokens {
-                    self.output = Some(self.output.unwrap_or(0).max(*output));
-                }
+                self.input = self.input.max(*input_tokens);
+                self.output = self.output.max(*output_tokens);
                 self.reported_total = self.reported_total.max(*total_tokens);
-                // Positive subsets prove a lower bound even when the full
-                // input/output total was omitted by the provider.
-                let cached = cache_creation_input_tokens
-                    .unwrap_or(0)
-                    .saturating_add(cache_read_input_tokens.unwrap_or(0));
-                self.reported_input_floor = self
-                    .reported_input_floor
-                    .max(Some(cached))
-                    .max(*cache_write_input_tokens);
-                self.reported_output_floor = self.reported_output_floor.max(*reasoning_tokens);
-                // Reasoning/cache are subsets of these canonical totals.
+                self.cache_creation = self.cache_creation.max(*cache_creation_input_tokens);
+                self.cache_read = self.cache_read.max(*cache_read_input_tokens);
+                self.cache_write = self.cache_write.max(*cache_write_input_tokens);
+                self.output_floor = self.output_floor.max(*reasoning_tokens);
             }
             LLMChunk::CacheUsage {
                 input_tokens,
                 cache_creation_input_tokens,
                 cache_read_input_tokens,
             } => {
-                // These normalized fields are disjoint fresh/read/creation
-                // counts. Saturation still proves a finite cap was exceeded.
-                let floor = input_tokens
-                    .saturating_add(*cache_creation_input_tokens)
-                    .saturating_add(*cache_read_input_tokens);
-                self.reported_input_floor = Some(self.reported_input_floor.unwrap_or(0).max(floor));
+                // Normalized fresh/read/creation dimensions are disjoint. A
+                // later event may omit fresh input, so max the dimensions
+                // individually before summing rather than maxing event sums.
+                self.fresh_input = self.fresh_input.max(Some(*input_tokens));
+                self.cache_creation = self.cache_creation.max(Some(*cache_creation_input_tokens));
+                self.cache_read = self.cache_read.max(Some(*cache_read_input_tokens));
             }
             LLMChunk::UsageSummary {
                 output_tokens,
                 thinking_tokens,
             } => {
-                // Thinking may be a subset of output, so never add it. Either
-                // positive dimension alone supplies an output lower bound.
-                let floor = (*output_tokens).max(*thinking_tokens);
-                self.reported_output_floor =
-                    Some(self.reported_output_floor.unwrap_or(0).max(floor));
+                // Thinking can be a subset of output. Either positive count
+                // proves a lower bound; adding them would invent a charge.
+                self.output_floor = self
+                    .output_floor
+                    .max(Some((*output_tokens).max(*thinking_tokens)));
             }
             _ => {}
         }
     }
+    fn input_floor(&self) -> Option<u64> {
+        let disjoint = (self.fresh_input.is_some()
+            || self.cache_creation.is_some()
+            || self.cache_read.is_some())
+        .then(|| {
+            self.fresh_input
+                .unwrap_or(0)
+                .saturating_add(self.cache_creation.unwrap_or(0))
+                .saturating_add(self.cache_read.unwrap_or(0))
+        });
+        // Canonical input already includes cache. Cache-write has no disjoint
+        // relationship to the legacy counters, so compare it independently.
+        self.input.max(disjoint).max(self.cache_write)
+    }
     fn over_cap_report(&self, request: &WorkTokenRequest) -> Option<ExecutionTokenOverCapUsage> {
-        // Canonical totals already include cache/reasoning: use max, not sum,
-        // when the provider emits both canonical and legacy representations.
-        let input_tokens = self.input.max(self.reported_input_floor);
-        let output_tokens = self.output.max(self.reported_output_floor);
+        let input_tokens = self.input_floor();
+        let output_tokens = self.output.max(self.output_floor);
         (input_tokens.is_some_and(|v| v > u64::from(request.input_cap))
             || output_tokens.is_some_and(|v| v > u64::from(request.output_cap))
             || self
@@ -377,19 +381,19 @@ impl Usage {
         })
     }
     fn measured(&self) -> Option<ExecutionTokenUsage> {
+        let (input_tokens, output_tokens) = (self.input?, self.output?);
         if self.inconsistent
-            || self
-                .reported_input_floor
-                .is_some_and(|floor| self.input.is_some_and(|actual| floor > actual))
-            || self
-                .reported_output_floor
-                .is_some_and(|floor| self.output.is_some_and(|actual| floor > actual))
+            || self.input_floor().is_some_and(|floor| floor > input_tokens)
+            || self.output_floor.is_some_and(|floor| floor > output_tokens)
+            // Total may arrive separately, including after Done. Incomplete
+            // or inconsistent canonical evidence never authorizes a refund.
+            || self.reported_total.is_some_and(|total| input_tokens.checked_add(output_tokens) != Some(total))
         {
             return None;
         }
         Some(ExecutionTokenUsage::Known {
-            input_tokens: self.input?,
-            output_tokens: self.output?,
+            input_tokens,
+            output_tokens,
         })
     }
 }
