@@ -1185,7 +1185,7 @@ fn resolve_run_config_from_config(
         .filter(|v| !v.is_empty())
         .map(|v| v.to_string());
 
-    let target = requested_model
+    let mut target = requested_model
         .map(|model| {
             bamboo_domain::ProviderModelRef::new(
                 config_snapshot.effective_default_provider(),
@@ -1207,6 +1207,9 @@ fn resolve_run_config_from_config(
             }
         })
         .filter(|_| snapshot_error.is_none());
+    if let (Some(target), Some(effort)) = (target.as_mut(), job.run_config.reasoning_effort) {
+        target.reasoning_effort = Some(effort);
+    }
     let model = target.as_ref().map(|target| target.model.clone());
     let provider_name = Some(
         target
@@ -1254,7 +1257,9 @@ fn resolve_run_config_from_config(
     );
 
     let requested_reasoning_effort = job.run_config.reasoning_effort;
-    let reasoning_effort = requested_reasoning_effort.or(config_snapshot.get_reasoning_effort());
+    let reasoning_effort = requested_reasoning_effort
+        .or_else(|| target.as_ref().and_then(|target| target.reasoning_effort))
+        .or(config_snapshot.get_reasoning_effort());
 
     let global_default_prompt =
         bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
