@@ -22,9 +22,10 @@ server resources. The relevant checks belong in feature CI; a standalone manual
 run is diagnosis, not another automatic release or Main test. Lotus browser E2E
 is a separate frontend test.
 
-The shared `observer-api-lint.yml` owns the five-library API-only Clippy check
-for both Observer workflows. Their distinct runtime cases remain with their
-respective feature workflows.
+The shared `observer-api-lint.yml` owns the five-library API-only Clippy check.
+`trusted-observer.yml` runs both Observer runtime selections in one feature job,
+reusing compatible compiled output and running the shared serde case once. The
+original subscription workflow remains available for manual diagnosis.
 
 ## Release: build the final artifacts
 
