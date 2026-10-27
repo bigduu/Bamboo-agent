@@ -38,15 +38,13 @@ async fn real_inbox_stages_one_notice_reopens_and_dedupes_without_activation() {
         .await
         .unwrap()
         .unwrap();
-    session.set_root_orchestration_only(true).unwrap();
-    store.save_session(&session).await.unwrap();
     let envelope = notice(&bootstrap.session_id);
     let gate = bamboo_domain::AdmissionGate::default();
     let inbox = FileSessionInbox::new(store.clone(), SessionInboxLimits::default());
     let first = inbox
         .stage_supervisor_patrol_notice(
             &supervisor,
-            session.root_tool_authority_revision,
+            session.supervisor_orchestration_revision().unwrap(),
             &envelope,
             &gate,
         )
@@ -64,6 +62,21 @@ async fn real_inbox_stages_one_notice_reopens_and_dedupes_without_activation() {
             .is_empty(),
         "staged notice has no reasoning activation permission"
     );
+    for ultra in [true, false, true, false] {
+        session.set_root_orchestration_only(ultra).unwrap();
+        store.save_session(&session).await.unwrap();
+        let replay = inbox
+            .stage_supervisor_patrol_notice(
+                &supervisor,
+                session.supervisor_orchestration_revision().unwrap(),
+                &envelope,
+                &gate,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(inbox.inspect(&bootstrap.session_id).await.unwrap(), before);
+    }
     drop(inbox);
     drop(store);
     let reopened = Arc::new(SessionStoreV2::new(directory.path().into()).await.unwrap());
@@ -75,7 +88,7 @@ async fn real_inbox_stages_one_notice_reopens_and_dedupes_without_activation() {
     let retry = inbox
         .stage_supervisor_patrol_notice(
             &supervisor,
-            session.root_tool_authority_revision,
+            session.supervisor_orchestration_revision().unwrap(),
             &envelope,
             &gate,
         )
@@ -86,7 +99,7 @@ async fn real_inbox_stages_one_notice_reopens_and_dedupes_without_activation() {
 }
 
 #[tokio::test]
-async fn stale_incarnation_revision_mode_and_forged_origin_leave_no_notice() {
+async fn stale_incarnation_business_revision_and_forged_origin_leave_no_notice() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(SessionStoreV2::new(directory.path().into()).await.unwrap());
     let bootstrap = store
@@ -108,7 +121,7 @@ async fn stale_incarnation_revision_mode_and_forged_origin_leave_no_notice() {
         .is_err());
     session.set_root_orchestration_only(true).unwrap();
     store.save_session(&session).await.unwrap();
-    let revision = session.root_tool_authority_revision;
+    let revision = session.supervisor_orchestration_revision().unwrap();
     let cancelled = bamboo_domain::AdmissionGate::default();
     cancelled.cancel_if_pending();
     assert!(inbox
@@ -147,7 +160,7 @@ async fn stale_incarnation_revision_mode_and_forged_origin_leave_no_notice() {
     session.set_root_orchestration_only(false).unwrap();
     store.save_session(&session).await.unwrap();
     assert!(inbox
-        .stage_supervisor_patrol_notice(&reference, revision, &envelope, &gate)
+        .stage_supervisor_patrol_notice(&reference, revision + 1, &envelope, &gate)
         .await
         .is_err());
     assert_eq!(

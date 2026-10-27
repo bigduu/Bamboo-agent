@@ -55,12 +55,11 @@ const PLANNER_SERIAL = {
 };
 
 const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_without_transport_feature_fails_without_starting_exporter";
-// Audited changes since CI2ff retain session_inbox.rs fault-injection guards.
-// #2364 owns cancellation registration/drain in TicketApplication without new
-// feature gates or manifest changes. Its two cancellation cases and the five
-// Host fault cases belong to the default server library, not FEATURE_CONTEXTS.
-// Preserve all31 default owners, all19 additions and their required targets.
-const FEATURE_SOURCE_SHA256 = "57bbd03303ee7b49c3f9efe8178ef3183158018595384d41a0de7e7bbab9b413";
+// The merged source retains FileInbox fault guards, the current-user/Work
+// migration and #2364 cancellation registration/drain in TicketApplication.
+// Recompute its source floor with the original algorithm; all31 default
+// owners, all19 additions, features and required targets remain unchanged.
+const FEATURE_SOURCE_SHA256 = "7494972b594de30075a4dceff5e9765f6c73149f5e093516fa3ba9eba298c740";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [

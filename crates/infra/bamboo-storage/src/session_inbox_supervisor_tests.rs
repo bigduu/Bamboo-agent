@@ -77,8 +77,19 @@ fn envelope(reference: &SupervisorReference) -> SessionMessageEnvelope {
     message
 }
 
+fn bound_envelope(
+    reference: &SupervisorReference,
+    target: &bamboo_domain::SupervisorCurrentUserTarget,
+) -> SessionMessageEnvelope {
+    let mut message = envelope(reference);
+    let operation = uuid::Uuid::new_v4().to_string();
+    message.id = bamboo_domain::supervisor_current_user_message_id(reference, target, &operation);
+    message.correlation_id = Some(operation);
+    message
+}
+
 #[tokio::test]
-async fn supervisor_followup_final_admission_rejects_changed_authority_without_a_receipt() {
+async fn supervisor_current_user_followup_rejects_changed_target_but_not_legacy_acl() {
     for change in [
         "detach",
         "scope",
@@ -89,6 +100,18 @@ async fn supervisor_followup_final_admission_rejects_changed_authority_without_a
         "damage",
     ] {
         let (_home, store, inbox, reference) = fixture().await;
+        let caller = bamboo_domain::SessionCallerReference::from(
+            &store
+                .load_session(&reference.session_id)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let target = store
+            .inspect_supervisor_current_user_target(&reference, "target")
+            .await
+            .unwrap();
+        let message = bound_envelope(&reference, &target);
         assert!(
             store
                 .inspect_supervisor_link(&reference, "target")
@@ -162,17 +185,16 @@ async fn supervisor_followup_final_admission_rejects_changed_authority_without_a
             }
             _ => unreachable!(),
         }
-        assert!(
-            inbox
-                .deliver_supervisor_followup(&reference, &envelope(&reference))
-                .await
-                .is_err(),
-            "{change}"
-        );
-        assert!(
-            !tokio::fs::try_exists(store.sessions_root_dir().join("target/inbox/generation"))
+        let delivered = inbox
+            .deliver_supervisor_current_user_followup(&caller, &reference, &target, &message)
+            .await;
+        let legacy_only = matches!(change, "detach" | "scope");
+        assert_eq!(delivered.is_ok(), legacy_only, "{change}: {delivered:?}");
+        assert_eq!(
+            tokio::fs::try_exists(store.sessions_root_dir().join("target/inbox/generation"))
                 .await
                 .unwrap(),
+            legacy_only,
             "{change}"
         );
     }
@@ -188,16 +210,34 @@ async fn supervisor_followup_retains_relationship_and_project_locks_until_receip
                 .unwrap(),
         );
         let target_for_mutation = independent.load_session("target").await.unwrap().unwrap();
+        let caller = bamboo_domain::SessionCallerReference::from(
+            &store
+                .load_session(&reference.session_id)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        let target = store
+            .inspect_supervisor_current_user_target(&reference, "target")
+            .await
+            .unwrap();
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         inbox.followup_authority_pause = Some((entered.clone(), release.clone()));
-        let message = envelope(&reference);
+        let message = bound_envelope(&reference, &target);
         let pending_inbox = inbox.clone();
         let pending_ref = reference.clone();
         let pending_message = message.clone();
+        let pending_caller = caller.clone();
+        let pending_target = target.clone();
         let delivery = tokio::spawn(async move {
             pending_inbox
-                .deliver_supervisor_followup(&pending_ref, &pending_message)
+                .deliver_supervisor_current_user_followup(
+                    &pending_caller,
+                    &pending_ref,
+                    &pending_target,
+                    &pending_message,
+                )
                 .await
         });
         entered.notified().await;
@@ -259,12 +299,16 @@ async fn supervisor_followup_retains_relationship_and_project_locks_until_receip
         assert_eq!(inbox.inspect("target").await.unwrap().pending, 1);
         // A later invocation must revalidate even when an exact receipt already exists.
         inbox.followup_authority_pause = None;
-        assert!(inbox
-            .deliver_supervisor_followup(&reference, &message)
-            .await
-            .is_err());
+        let replay = inbox
+            .deliver_supervisor_current_user_followup(&caller, &reference, &target, &message)
+            .await;
+        if matches!(change, "detach" | "scope") {
+            assert_eq!(replay.unwrap().generation, receipt.generation);
+        } else {
+            assert!(replay.is_err());
+        }
         assert!(
-            !store
+            store
                 .inspect_supervisor_link(&reference, "target")
                 .await
                 .unwrap()
@@ -280,9 +324,15 @@ async fn supervisor_followup_held_lifecycle_does_not_reenter_behind_a_waiting_wr
     let release = Arc::new(Notify::new());
     inbox.followup_authority_pause = Some((entered.clone(), release.clone()));
     let message = envelope(&reference);
+    let target_birth = store
+        .load_session("target")
+        .await
+        .unwrap()
+        .unwrap()
+        .created_at;
     let delivery = tokio::spawn(async move {
         inbox
-            .deliver_supervisor_followup(&reference, &message)
+            .deliver_supervisor_followup(&reference, target_birth, &message)
             .await
     });
     entered.notified().await;
@@ -309,11 +359,68 @@ async fn supervisor_followup_held_lifecycle_does_not_reenter_behind_a_waiting_wr
 }
 
 #[tokio::test]
+async fn supervisor_observed_followup_rejects_old_birth_after_reopen() {
+    let (home, store, inbox, reference) = fixture().await;
+    let caller = bamboo_domain::SessionCallerReference::from(
+        &store
+            .load_session(&reference.session_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    let birth = store
+        .load_session("target")
+        .await
+        .unwrap()
+        .unwrap()
+        .created_at;
+    let message = envelope(&reference);
+    let first = inbox
+        .deliver_unscoped_supervisor_followup(&caller, &reference, birth, &message)
+        .await
+        .unwrap();
+    assert_eq!(first.generation, 1);
+    store.delete_session("target").await.unwrap();
+    store
+        .recreate_root_session("target", "replacement")
+        .await
+        .unwrap();
+
+    // A reopened adapter has neither the old Inbox receipt nor an in-memory
+    // operation map. The original caller's birth still fences the new target.
+    let reopened = Arc::new(
+        SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let fresh_inbox = FileSessionInbox::new(reopened, SessionInboxLimits::default());
+    let before = fresh_inbox.inspect("target").await.unwrap();
+    assert_eq!(before.generation, 0);
+    let error = fresh_inbox
+        .deliver_unscoped_supervisor_followup(&caller, &reference, birth, &message)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("target lifetime changed"),
+        "{error}"
+    );
+    let after = fresh_inbox.inspect("target").await.unwrap();
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.pending, before.pending);
+}
+
+#[tokio::test]
 async fn supervisor_followup_cannot_impersonate_user_runtime_or_another_session() {
-    let (_home, _store, inbox, reference) = fixture().await;
+    let (_home, store, inbox, reference) = fixture().await;
+    let target_birth = store
+        .load_session("target")
+        .await
+        .unwrap()
+        .unwrap()
+        .created_at;
     let mut user = SessionMessageEnvelope::user_input("target", "not a peer");
     assert!(inbox
-        .deliver_supervisor_followup(&reference, &user)
+        .deliver_supervisor_followup(&reference, target_birth, &user)
         .await
         .is_err());
     user.source = SessionMessageSource::Session {
@@ -321,14 +428,14 @@ async fn supervisor_followup_cannot_impersonate_user_runtime_or_another_session(
     };
     user.kind = SessionMessageKind::PeerMessage;
     assert!(inbox
-        .deliver_supervisor_followup(&reference, &user)
+        .deliver_supervisor_followup(&reference, target_birth, &user)
         .await
         .is_err());
     user.source = SessionMessageSource::Runtime {
         subsystem: "supervisor".into(),
     };
     assert!(inbox
-        .deliver_supervisor_followup(&reference, &user)
+        .deliver_supervisor_followup(&reference, target_birth, &user)
         .await
         .is_err());
     assert_eq!(inbox.inspect("target").await.unwrap().generation, 0);

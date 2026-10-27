@@ -3120,6 +3120,12 @@ async fn run_pipeline_inner(
         ));
     }
 
+    // A trusted Supervisor may journal one observation reasoning turn while
+    // its original work/Planner wait remains armed. A newly discovered or
+    // replaced wait must not inherit that intermediate-publication allowance.
+    let supervisor_inherited_wait = session
+        .supervisor_incarnation_id()
+        .and_then(|_| state.runtime_state.waiting_for_children.clone());
     let mut sent_complete = false;
     let mut turn_counter: u32 = 0;
     // One-shot sentinel for the max_rounds summary turn (see the guard at the
@@ -3756,10 +3762,18 @@ async fn run_pipeline_inner(
                     .await
                 {
                     Ok(Some(suspend)) => {
-                        if inherited_untagged_wait {
+                        let supervisor_reasoning_reply = supervisor_inherited_wait
+                            .as_ref()
+                            .is_some_and(|wait| {
+                                state.runtime_state.waiting_for_children.as_ref() == Some(wait)
+                            });
+                        if inherited_untagged_wait || supervisor_reasoning_reply {
                             // This safety-net wait can also survive a real user
                             // input. Keep its answer as an intermediate message
                             // while the remaining children still prevent Complete.
+                            // The Supervisor's tagged Planner wait has the same
+                            // bounded journal need; ordinary tagged/Guardian
+                            // final-message deferral remains unchanged.
                             let reasoning = (!stream_output.reasoning_content.trim().is_empty())
                                 .then_some(stream_output.reasoning_content);
                             let reasoning_signature = reasoning
@@ -4602,7 +4616,7 @@ async fn supervisor_delegation_first_discovery_is_readonly_bounded_and_keeps_ord
                 .iter()
                 .map(|entry| entry.execution_name())
                 .collect::<Vec<_>>(),
-            ["Read", "SubAgent"]
+            ["SubAgent"]
         );
         let request = serde_json::from_value(
             serde_json::json!({"query":"SubAgent","kinds":["tool"],"limit":1}),
@@ -11400,6 +11414,25 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Storage for ChildIndexStorage {
+        async fn load_root_authority(&self, id: &str) -> std::io::Result<Option<Session>> {
+            // This unit fixture's locked map is its sole canonical store.
+            // Keep the strict authority observation separate from history.
+            let mut observed = self.inner.load_session(id).await?;
+            if let Some(root) = observed.as_mut() {
+                if root.kind != bamboo_domain::SessionKind::Root
+                    || root.parent_session_id.is_some()
+                    || root.root_session_id != root.id
+                    || root.spawn_depth != 0
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unit authority observation is not a canonical Root",
+                    ));
+                }
+                root.messages.clear();
+            }
+            Ok(observed)
+        }
         async fn save_session(&self, session: &Session) -> std::io::Result<()> {
             self.inner.save_session(session).await
         }
@@ -11741,10 +11774,13 @@ mod tests {
 
     #[tokio::test]
     async fn partial_child_outcome_can_drive_tool_work_before_resuspending_exact_inherited_wait() {
-        for (tagged, buffered) in [true, false].into_iter().flat_map(|tagged| {
-            [false, true]
-                .into_iter()
-                .map(move |buffered| (tagged, buffered))
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for (supervisor, tagged, buffered) in [false, true].into_iter().flat_map(|supervisor| {
+            [true, false].into_iter().flat_map(move |tagged| {
+                [false, true]
+                    .into_iter()
+                    .map(move |buffered| (supervisor, tagged, buffered))
+            })
         }) {
             let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
                 inner: Arc::new(TestStorage::default()),
@@ -11754,7 +11790,19 @@ mod tests {
             config.model_name = Some("model".into());
             config.prompt_memory_flags = delegation_loop_config().prompt_memory_flags;
             config.features_final_evidence_check = buffered;
-            let mut session = Session::new("partial-parent", "model");
+            let mut session = Session::new(
+                if supervisor {
+                    DEFAULT_SUPERVISOR_SESSION_ID
+                } else {
+                    "partial-parent"
+                },
+                "model",
+            );
+            if supervisor {
+                session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: uuid::Uuid::new_v4(),
+                };
+            }
             let mut outcome = Message::user("fast child outcome");
             outcome.metadata = Some(serde_json::json!({
                 "runtime_kind": "child_completion_resume"
@@ -11808,7 +11856,8 @@ mod tests {
                 .iter()
                 .filter(|message| message.content == "continued after child")
                 .collect();
-            assert_eq!(replies.len(), usize::from(!tagged));
+            let journal_reply = !tagged || supervisor;
+            assert_eq!(replies.len(), usize::from(journal_reply));
             let mut events = Vec::new();
             while let Ok(event) = rx.try_recv() {
                 assert!(
@@ -11822,8 +11871,8 @@ mod tests {
                     .iter()
                     .filter(|event| matches!(event, AgentEvent::Token { content } if content == "continued after child"))
                     .count(),
-                usize::from(!buffered || !tagged),
-                "the untagged reply is published once in either streaming mode"
+                usize::from(!buffered || journal_reply),
+                "an eligible intermediate reply is published exactly once"
             );
             if let Some(reply) = replies.first() {
                 assert_eq!(reply.reasoning.as_deref(), Some("remaining child work"));
@@ -11853,6 +11902,71 @@ mod tests {
                 assert_eq!(groups[0].items().len(), 3);
                 assert_eq!(groups[0].items()[2].payload()["id"], "partial-native-reply");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_new_orphan_wait_keeps_terminal_reply_deferred() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for buffered in [false, true] {
+            let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
+                inner: Arc::new(TestStorage::default()),
+                children: vec![("slow-child".into(), Some("running".into()))],
+            });
+            let mut config = config_with_storage(storage.clone());
+            config.model_name = Some("model".into());
+            config.prompt_memory_flags = delegation_loop_config().prompt_memory_flags;
+            config.features_final_evidence_check = buffered;
+            let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+            session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: uuid::Uuid::new_v4(),
+            };
+            let mut outcome = Message::user("fast child outcome");
+            outcome.metadata = Some(serde_json::json!({"runtime_kind":"child_completion_resume"}));
+            session.add_message(outcome);
+            let mut state = e2e_loop_state(&session.id);
+            assert!(state.runtime_state.waiting_for_children.is_none());
+            session.agent_runtime_state = Some(state.runtime_state.clone());
+            storage.save_session(&session).await.unwrap();
+            let provider = Arc::new(PartialChildWorkProvider {
+                calls: AtomicUsize::new(0),
+                outcome_seen: AtomicBool::new(false),
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let sent_complete = super::run_pipeline(
+                &mut session,
+                &tx,
+                provider.clone(),
+                Arc::new(PartialChildWorkExecutor::default()),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await
+            .unwrap();
+            assert!(provider.outcome_seen.load(Ordering::SeqCst));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            assert!(!sent_complete);
+            assert_eq!(state.runtime_state.status, AgentStatusState::Suspended);
+            let wait = state.runtime_state.waiting_for_children.as_ref().unwrap();
+            assert_eq!(wait.child_session_ids, vec!["slow-child"]);
+            assert!(wait.registered_by_tool_call_id.is_none());
+            assert!(
+                !session
+                    .messages
+                    .iter()
+                    .any(|message| message.content == "continued after child"),
+                "new orphan discovery is not an inherited Supervisor reasoning turn"
+            );
+            let mut tokens = 0;
+            while let Ok(event) = rx.try_recv() {
+                assert!(!matches!(event, AgentEvent::Complete { .. }));
+                if matches!(event, AgentEvent::Token { content } if content=="continued after child")
+                {
+                    tokens += 1;
+                }
+            }
+            assert_eq!(tokens, usize::from(!buffered));
         }
     }
 

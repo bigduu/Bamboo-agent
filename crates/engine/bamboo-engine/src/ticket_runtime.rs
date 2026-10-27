@@ -70,20 +70,38 @@ pub async fn verified_scope_binding(
     else {
         return Err(Error::ScopeDenied("canonical Supervisor required".into()));
     };
-    if supervisor.kind != SessionKind::Root
-        || !supervisor.root_orchestration_only_enabled()
-        || supervisor.root_tool_authority_revision == 0
-    {
+    let Some(orchestration_revision) = supervisor.supervisor_orchestration_revision() else {
         return Err(Error::ScopeDenied(
             "Supervisor orchestration authority required".into(),
         ));
-    }
+    };
     let binding = ScopeBinding {
         scope_id: format!("supervisor/{incarnation_id}"),
         supervisor_session_id: supervisor.id.clone(),
-        binding_revision: supervisor.root_tool_authority_revision,
+        binding_revision: orchestration_revision,
     };
     Ok((binding, supervisor))
+}
+
+/// Existing Work keeps its sealed binding revision across thinking-mode changes.
+/// Only the strict canonical Supervisor reader can authorize that same namespace;
+/// a different incarnation, Supervisor id or a zero revision remains denied.
+pub async fn verified_scope_binding_for_service(
+    storage: &dyn Storage,
+    service: &TicketService,
+    supervisor_id: &str,
+) -> Result<(ScopeBinding, Session)> {
+    let (expected, supervisor) = verified_scope_binding(storage, supervisor_id).await?;
+    let actual = service.published()?.1.binding;
+    if actual.scope_id != expected.scope_id
+        || actual.supervisor_session_id != expected.supervisor_session_id
+        || actual.binding_revision == 0
+    {
+        return Err(Error::ScopeDenied(
+            "Supervisor scope binding changed".into(),
+        ));
+    }
+    Ok((actual, supervisor))
 }
 
 pub fn dispatch_binding(
@@ -167,6 +185,9 @@ pub fn read_dispatch(session: &Session) -> Result<Option<TicketDispatchBinding>>
 /// must not acquire the ordinary SubAgent orphan wait on its behalf. Inspect
 /// the canonical Host control plane; a model label or a cached replica cannot
 /// confer this exemption. Explicit SubAgent waits keep their existing policy.
+/// This classifies the durable owner, not a model action: parent thinking-mode
+/// changes must not transfer an independent Work child into orphan cleanup.
+/// Final model operations still validate their complete original generation.
 pub(crate) async fn is_independent_ticket_child(
     storage: &dyn Storage,
     parent: &Session,
@@ -175,9 +196,11 @@ pub(crate) async fn is_independent_ticket_child(
     let Ok((binding, canonical_parent)) = verified_scope_binding(storage, &parent.id).await else {
         return false;
     };
-    if canonical_parent.created_at != parent.created_at
+    if parent.kind != SessionKind::Root
+        || parent.parent_session_id.is_some()
+        || parent.root_session_id != parent.id
+        || canonical_parent.created_at != parent.created_at
         || canonical_parent.authority_identity != parent.authority_identity
-        || canonical_parent.root_tool_authority_revision != parent.root_tool_authority_revision
     {
         return false;
     }
@@ -189,10 +212,14 @@ pub(crate) async fn is_independent_ticket_child(
     };
     child.kind == SessionKind::Child
         && child.parent_session_id.as_deref() == Some(parent.id.as_str())
+        && child.parent_created_at == Some(parent.created_at)
+        && child.root_session_id == parent.id
         && child.id == ticket_child_id(&dispatch.dispatch_key)
         && !dispatch.dispatch_key.is_empty()
         && !dispatch.assignment_id.is_empty()
-        && dispatch.binding == binding
+        && dispatch.binding.scope_id == binding.scope_id
+        && dispatch.binding.supervisor_session_id == binding.supervisor_session_id
+        && dispatch.binding.binding_revision > 0
         && child
             .metadata
             .get(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
@@ -206,8 +233,12 @@ pub async fn query_dispatch(
     spec: &DispatchSpec,
 ) -> Result<DispatchObservation> {
     let expected = dispatch_binding(service, key, spec)?;
-    let (binding, _) =
-        verified_scope_binding(storage, &expected.binding.supervisor_session_id).await?;
+    let (binding, _) = verified_scope_binding_for_service(
+        storage,
+        service,
+        &expected.binding.supervisor_session_id,
+    )
+    .await?;
     if binding != expected.binding {
         return Err(Error::ScopeDenied("Supervisor binding changed".into()));
     }
@@ -329,8 +360,9 @@ pub async fn admit_ticket_run(
     let dispatch = read_dispatch(session)?
         .ok_or_else(|| Error::ScopeDenied("dispatch binding missing".into()))?;
     require_dispatch_permission(service, &dispatch)?;
-    let (binding, _) = verified_scope_binding(
+    let (binding, _) = verified_scope_binding_for_service(
         runtime.storage.as_ref(),
+        service,
         &dispatch.binding.supervisor_session_id,
     )
     .await?;

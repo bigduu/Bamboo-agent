@@ -492,11 +492,6 @@ impl Fixture {
             "SubAgent",
             "Plan",
             "Task",
-            "Read",
-            "Grep",
-            "Glob",
-            "GetFileInfo",
-            "ViewImage",
             "work_overview",
             "work_search",
             "work_inspect",
@@ -508,10 +503,15 @@ impl Fixture {
         ] {
             assert!(
                 supervisor.allows_model_tool_execution(execution_name),
-                "Supervisor retains bounded orchestration/read evidence: {execution_name}"
+                "Supervisor retains bounded delegation and Session evidence: {execution_name}"
             );
         }
         for execution_name in [
+            "Read",
+            "Grep",
+            "Glob",
+            "GetFileInfo",
+            "ViewImage",
             "Bash",
             "exec_command",
             "write_stdin",

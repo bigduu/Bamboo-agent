@@ -903,7 +903,10 @@ async fn ticket_application_flags_preserve_records_and_never_double_write_old_ta
         .await
         .unwrap()
         .unwrap();
-    assert!(canonical.root_orchestration_only_enabled());
+    assert!(
+        !canonical.root_orchestration_only_enabled(),
+        "optional Work initialization must not change thinking mode"
+    );
     assert!(canonical.task_list.is_none());
     config.write().await.features.ticket_mutation = false;
     assert!(app.update(user, &command).await.is_err());
@@ -1001,7 +1004,7 @@ async fn ticket_application_store_init_failure_preserves_ordinary_supervisor_aut
 }
 
 #[tokio::test]
-async fn ticket_application_changed_root_authority_fences_every_call() {
+async fn ticket_application_mode_changes_preserve_business_binding_and_incarnation_still_fences() {
     let root = tempfile::tempdir().unwrap();
     let storage = Arc::new(SessionStoreV2::new(root.path().join("host")).await.unwrap());
     let app = TicketApplication::open(root.path(), storage.clone(), config(true)).await;
@@ -1011,8 +1014,18 @@ async fn ticket_application_changed_root_authority_fences_every_call() {
         .await
         .unwrap()
         .unwrap();
-    canonical.set_root_orchestration_only(false).unwrap();
-    storage.save_session(&canonical).await.unwrap();
+    let initial = app.service().unwrap().published().unwrap().1.binding;
+    for ultra in [true, false, true, false] {
+        canonical.set_root_orchestration_only(ultra).unwrap();
+        storage.save_session(&canonical).await.unwrap();
+        let (service, _) = app.authority(Principal::Runtime).await.unwrap();
+        assert_eq!(service.published().unwrap().1.binding, initial);
+    }
+    storage.delete_session(&canonical.id).await.unwrap();
+    storage
+        .get_or_create_default_supervisor("replacement")
+        .await
+        .unwrap();
     assert!(matches!(
         app.authority(Principal::Runtime).await,
         Err(Error::ScopeDenied(_))
@@ -1632,14 +1645,22 @@ async fn native_result_recovery_rejects_incomplete_or_wrong_canonical_evidence()
                 assert!(f.storage.delete_session(&f.child.id).await.unwrap());
             }
             "revoked-supervisor" => {
-                let mut supervisor = f
+                let supervisor = f
                     .storage
                     .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
                     .await
                     .unwrap()
                     .unwrap();
-                supervisor.set_root_orchestration_only(false).unwrap();
-                f.storage.save_session(&supervisor).await.unwrap();
+                assert!(f.storage.delete_session(&supervisor.id).await.unwrap());
+                let replacement = f
+                    .storage
+                    .get_or_create_default_supervisor("replacement")
+                    .await
+                    .unwrap();
+                assert_ne!(
+                    supervisor.supervisor_incarnation_id().unwrap(),
+                    replacement.incarnation_id
+                );
             }
             _ => {}
         }
@@ -1813,7 +1834,7 @@ fn scope_payload(supervisor: &bamboo_domain::Session) -> ScopeInitialization {
     ScopeInitialization {
         supervisor_session_id: supervisor.id.clone(),
         incarnation_id: supervisor.supervisor_incarnation_id().unwrap(),
-        binding_revision: supervisor.root_tool_authority_revision,
+        binding_revision: supervisor.supervisor_orchestration_revision().unwrap(),
     }
 }
 
@@ -1909,7 +1930,7 @@ async fn ticket_scope_initialization_is_explicit_empty_idempotent_and_survives_r
 async fn ticket_scope_initialization_refuses_gates_stale_identity_and_non_owner_without_effects() {
     for scenario in [
         "disabled",
-        "standard",
+        "zero-revision",
         "revision",
         "incarnation",
         "non-owner",
@@ -1923,10 +1944,8 @@ async fn ticket_scope_initialization_refuses_gates_stale_identity_and_non_owner_
                 app.config.write().await.features.ticket_mutation = false;
                 (503, "ticket_mutation_disabled")
             }
-            "standard" => {
-                supervisor.set_root_orchestration_only(false).unwrap();
-                storage.save_session(&supervisor).await.unwrap();
-                payload = scope_payload(&supervisor);
+            "zero-revision" => {
+                payload.binding_revision = 0;
                 (403, "supervisor_mode_required")
             }
             "revision" => {
@@ -2026,13 +2045,13 @@ async fn ticket_scope_initialization_never_recovers_unknown_partial_or_symlinked
 }
 
 #[tokio::test]
-async fn ticket_scope_status_reports_binding_mismatch_without_rebinding_old_head() {
+async fn ticket_scope_status_preserves_business_binding_across_mode_changes_and_restart() {
     let (root, storage, app, mut supervisor) = uninitialized_work_fixture().await;
     let payload = scope_payload(&supervisor);
     app.initialize_scope(scope_owner(), payload.clone())
         .await
         .unwrap();
-    let head = std::fs::read(app.scope_root(payload.incarnation_id).join("HEAD")).unwrap();
+    let before = app.service().unwrap().published().unwrap().1;
     drop(app);
     supervisor.set_root_orchestration_only(false).unwrap();
     storage.save_session(&supervisor).await.unwrap();
@@ -2040,23 +2059,16 @@ async fn ticket_scope_status_reports_binding_mismatch_without_rebinding_old_head
     storage.save_session(&supervisor).await.unwrap();
     let app = TicketApplication::open(root.path(), storage, config(true)).await;
     let status = app.status().await;
-    assert_eq!(status["availability"]["kind"], "forbidden");
-    assert_eq!(
-        status["availability"]["reason_code"],
-        "scope_binding_mismatch"
-    );
-    assert_eq!(status["readable"], false);
+    assert_eq!(status["availability"]["kind"], "ready");
+    assert_eq!(status["readable"], true);
     assert_eq!(status["can_initialize"], false);
-    assert_eq!(
-        app.initialize_scope(scope_owner(), scope_payload(&supervisor))
-            .await
-            .unwrap_err()
-            .code,
-        "scope_binding_mismatch"
-    );
-    assert_eq!(
-        std::fs::read(app.scope_root(payload.incarnation_id).join("HEAD")).unwrap(),
-        head
+    assert!(!app.initialize_scope(scope_owner(), payload).await.unwrap());
+    let after = app.service().unwrap().published().unwrap().1;
+    assert_eq!(after.binding, before.binding);
+    assert_eq!(after.receipts, before.receipts);
+    assert!(
+        after.authority_epoch > before.authority_epoch,
+        "restart must still revoke old Worker leases"
     );
 }
 

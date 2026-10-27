@@ -3071,6 +3071,10 @@ mod hook_tests {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
         let names = [
             "Read",
+            "Grep",
+            "Glob",
+            "GetFileInfo",
+            "ViewImage",
             "SubAgent",
             "Plan",
             "Task",
@@ -3129,8 +3133,7 @@ mod hook_tests {
                 .unwrap();
                 let allowed = matches!(
                     name,
-                    "Read"
-                        | "SubAgent"
+                    "SubAgent"
                         | "Plan"
                         | "Task"
                         | "session_control"
@@ -3144,7 +3147,6 @@ mod hook_tests {
                 }
             }
             let expected = vec![
-                "Read",
                 "SubAgent",
                 "Plan",
                 "Task",

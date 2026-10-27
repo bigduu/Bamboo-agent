@@ -161,10 +161,25 @@ async fn finite_host_path_creates_independent_roots_for_all_roles_without_manage
         let port = f.creator.with_host_first_input(mock.clone());
         let scope = port.scope(&original).await.unwrap();
         assert!(scope.success);
-        assert_eq!(value(scope)["authority"], "host_finite");
+        let is_supervisor = role == "supervisor";
+        assert_eq!(
+            value(scope)["authority"],
+            if is_supervisor {
+                "current_user"
+            } else {
+                "host_finite"
+            }
+        );
         let result = port.create(&original, request.clone()).await.unwrap();
-        assert!(!result.success);
-        assert_eq!(value(result)["code"], "first_input_pending");
+        assert_eq!(result.success, is_supervisor);
+        assert_eq!(
+            value(result)["code"],
+            if is_supervisor {
+                "admitted"
+            } else {
+                "first_input_pending"
+            }
+        );
         let (digest, id) = host_session_create_identity(&original, request.operation_id).unwrap();
         let target = f.creator.store.load_session(&id).await.unwrap().unwrap();
         assert_eq!(target.kind, bamboo_domain::SessionKind::Root);
@@ -189,8 +204,15 @@ async fn finite_host_path_creates_independent_roots_for_all_roles_without_manage
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(record.status, StoredOperationStatus::Pending);
-        assert!(record.supervised_delivery.is_none());
+        assert_eq!(
+            record.status,
+            if is_supervisor {
+                StoredOperationStatus::Succeeded
+            } else {
+                StoredOperationStatus::Pending
+            }
+        );
+        assert_eq!(record.supervised_delivery.is_some(), is_supervisor);
         assert!(token.binding().targets.is_empty());
         let supervisor = f
             .creator
@@ -206,22 +228,24 @@ async fn finite_host_path_creates_independent_roots_for_all_roles_without_manage
             .contains_key(&id));
         assert_eq!(
             f.activation.calls.load(Ordering::SeqCst),
-            0,
-            "Host must not fall back to Supervisor delivery"
+            if is_supervisor { 1 } else { 0 },
+            "only the verified Supervisor role uses its canonical input channel"
         );
         let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, original);
-        assert_eq!(calls[0].1, request.operation_id);
-        assert_eq!(calls[0].2.created_at, record.created_at);
-        assert_eq!(calls[0].3, request.message);
+        assert_eq!(calls.len(), if is_supervisor { 0 } else { 1 });
+        if let Some(call) = calls.first() {
+            assert_eq!(call.0, original);
+            assert_eq!(call.1, request.operation_id);
+            assert_eq!(call.2.created_at, record.created_at);
+            assert_eq!(call.3, request.message);
+        }
     }
 }
 
 #[tokio::test]
-async fn absent_create_input_port_blocks_before_reservation_even_for_explicit_host_supervisor() {
+async fn absent_create_input_port_blocks_ordinary_host_before_reservation() {
     let f = Fixture::new().await;
-    let (source, ancestors) = caller(&f, "supervisor").await;
+    let (source, ancestors) = caller(&f, "root").await;
     let original = SessionCallerReference::from(&source);
     let request = request(&f);
     install(&f, &source, ancestors, &request, 1, BTreeSet::new()).await;
@@ -245,14 +269,14 @@ async fn absent_create_input_port_blocks_before_reservation_even_for_explicit_ho
 }
 
 #[tokio::test]
-async fn only_never_installed_supervisor_has_the_legacy_fallback() {
+async fn canonical_supervisor_has_default_input_without_granting_it_to_ordinary_callers() {
     let f = Fixture::new().await;
     let (source, _) = caller(&f, "supervisor").await;
     let port = f.creator.caller_port();
     let original = SessionCallerReference::from(&source);
     assert!(port.scope(&original).await.unwrap().success);
     let result = port.create(&original, f.request.clone()).await.unwrap();
-    assert_eq!(accepted(result)["linked"], true);
+    assert!(accepted(result)["linked"].is_null());
     let (ordinary, _) = caller(&f, "root").await;
     let error = port
         .scope(&SessionCallerReference::from(&ordinary))
@@ -387,7 +411,7 @@ async fn acknowledged_first_input_replay_does_not_activate_a_fresh_router() {
 }
 
 #[tokio::test]
-async fn captured_legacy_scope_cannot_return_after_host_namespace_installation() {
+async fn captured_supervisor_role_ignores_legacy_host_namespace_but_keeps_original_caller() {
     let f = Fixture::new().await;
     let (source, ancestors) = caller(&f, "supervisor").await;
     let legacy = CreationAuthority::Supervisor {
@@ -396,19 +420,28 @@ async fn captured_legacy_scope_cannot_return_after_host_namespace_installation()
     };
     let request = request(&f);
     install(&f, &source, ancestors, &request, 1, BTreeSet::new()).await;
-    assert!(legacy.scope(&f.creator).await.is_err());
+    assert!(legacy.scope(&f.creator).await.unwrap().success);
     f.creator
         .store
         .revoke_host_session_scope(&source.id, 1)
         .await
         .unwrap();
-    assert!(legacy.scope(&f.creator).await.is_err());
+    assert!(legacy.scope(&f.creator).await.unwrap().success);
     assert!(
         CreationAuthority::legacy_supervisor(f.supervisor.clone())
             .scope(&f.creator)
             .await
             .unwrap()
             .success
+    );
+    let mut changed = source.clone();
+    changed
+        .set_root_orchestration_only(!source.root_orchestration_only_enabled())
+        .unwrap();
+    f.creator.store.save_session(&changed).await.unwrap();
+    assert!(
+        legacy.scope(&f.creator).await.is_err(),
+        "capturing a role is not permission for another executing generation"
     );
 }
 
@@ -445,9 +478,9 @@ async fn pending_legacy_supervisor_creation_resumes_through_host_with_one_real_i
 }
 
 #[tokio::test]
-async fn revoked_host_scope_never_falls_back_to_the_supervisor_scope() {
+async fn revoked_ordinary_host_scope_never_borrows_the_supervisor_role() {
     let f = Fixture::new().await;
-    let (source, ancestors) = caller(&f, "supervisor").await;
+    let (source, ancestors) = caller(&f, "root").await;
     let original = SessionCallerReference::from(&source);
     let request = request(&f);
     install(&f, &source, ancestors, &request, 1, BTreeSet::new()).await;
@@ -738,7 +771,7 @@ async fn ungranted_operation_project_workspace_and_new_revision_refuse_before_re
 }
 
 #[tokio::test]
-async fn supervisor_none_to_host_scope_retry_keeps_the_legacy_reservation_and_raw_payload() {
+async fn supervisor_retry_keeps_its_reservation_and_raw_payload_across_legacy_host_installation() {
     let f = Fixture::new().await;
     f.activation.fail.store(true, Ordering::SeqCst);
     let (source, _) = caller(&f, "supervisor").await;
@@ -785,30 +818,48 @@ async fn supervisor_none_to_host_scope_retry_keeps_the_legacy_reservation_and_ra
         .create(&current, raw_request.clone())
         .await
         .unwrap();
-    assert!(!result.success);
-    assert_eq!(value(result)["code"], "first_input_pending");
+    assert!(result.success);
+    let result = value(result);
+    assert_eq!(result["code"], "activation_pending");
     assert_eq!(
         f.count().await,
         before_count,
         "scope replacement allocated another Root"
     );
+    let after = f
+        .creator
+        .operations
+        .load_for_status(&stored.key_digest)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.session_id, stored.session_id);
+    assert_eq!(after.created_at, stored.created_at);
+    assert_eq!(after.payload_fingerprint, stored.payload_fingerprint);
+    assert_eq!(after.supervised_delivery, stored.supervised_delivery);
+    {
+        let calls = mock.calls.lock().unwrap();
+        assert!(
+            calls.is_empty(),
+            "Supervisor keeps its canonical input port rather than borrowing a finite Host mock"
+        );
+    }
     assert_eq!(
-        f.creator
-            .operations
-            .load_for_status(&stored.key_digest)
+        f.inbox
+            .inspect(&stored.session_id)
             .await
-            .unwrap(),
-        Some(stored.clone())
+            .unwrap()
+            .generation,
+        1
     );
-    let calls = mock.calls.lock().unwrap();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].2.id, stored.session_id);
-    assert_eq!(calls[0].2.created_at, stored.created_at);
-    assert_eq!(calls[0].3, raw_request.message);
+    assert_eq!(
+        f.inbox.inspect(&stored.session_id).await.unwrap().pending,
+        1
+    );
 }
 
 #[tokio::test]
-async fn host_replay_pins_the_legacy_terminal_receipt_without_redelivery() {
+async fn observed_supervisor_replay_pins_the_legacy_terminal_receipt_without_redelivery() {
     let f = Fixture::new().await;
     let original_request = f.request.clone();
     let legacy = accepted(f.create(original_request.clone()).await);
@@ -822,7 +873,7 @@ async fn host_replay_pins_the_legacy_terminal_receipt_without_redelivery() {
     assert_eq!(legacy_record.status, StoredOperationStatus::Succeeded);
     assert!(legacy_record.expires_at.is_some());
     // A retained legacy receipt can already be past the client-visible window
-    // when the first Host retry claims it. Do not prune/reinterpret its truth.
+    // when the first observed retry claims it. Do not prune/reinterpret truth.
     legacy_record.expires_at = Some(chrono::Utc::now() - chrono::Duration::seconds(1));
     f.creator.operations.save(&legacy_record).await.unwrap();
     let source = f

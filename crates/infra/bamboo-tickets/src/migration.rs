@@ -289,12 +289,34 @@ impl TicketService {
     /// Inspection takes the writer OS lock but grants no runtime permission,
     /// increments no epoch, and requires an existing verified HEAD.
     pub fn open_offline(root: impl AsRef<Path>, binding: ScopeBinding) -> Result<Self> {
-        if !root.as_ref().join("HEAD").exists() {
+        Self::open_offline_with_policy(root.as_ref(), binding, false)
+    }
+
+    /// Canonical Supervisor Host inspection may retain an existing positive
+    /// binding revision in its exact namespace. Like ordinary offline opening,
+    /// this never reconciles a writer restart or publishes an epoch/HEAD.
+    pub fn open_offline_supervisor_mode_compatible(
+        root: impl AsRef<Path>,
+        binding: ScopeBinding,
+    ) -> Result<Self> {
+        Self::open_offline_with_policy(root.as_ref(), binding, true)
+    }
+
+    fn open_offline_with_policy(
+        root: &Path,
+        binding: ScopeBinding,
+        preserve_supervisor_revision: bool,
+    ) -> Result<Self> {
+        if !root.join("HEAD").exists() {
             return Err(Error::AuthorityUnavailable(
                 "offline inspection requires existing HEAD".into(),
             ));
         }
-        let mut store = FileStore::open(root.as_ref(), binding)?;
+        let mut store = if preserve_supervisor_revision {
+            FileStore::open_supervisor_mode_compatible(root, binding)?
+        } else {
+            FileStore::open(root, binding)?
+        };
         let (_, snapshot) = store
             .published
             .as_ref()

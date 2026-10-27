@@ -67,11 +67,11 @@ Verify child evidence, resolve conflicting results, and report completed work, r
 const ULTRA_ROOT_GUIDANCE: &str = "Ultra Root thinking mode: increase task-wide reasoning through independent child planning and narrow delegated execution, followed by Root verification and synthesis. Use the existing read-only Plan for planning. Keep required user goals, constraints and acceptance criteria intact. This product policy is independent of each model call's reasoning effort; it does not claim a native provider Ultra budget.";
 
 const SUPERVISOR_DELEGATION_GUIDANCE: &str = "Supervisor delegation-first policy (trusted runtime identity; applies in Standard and Ultra):\n\
-Own task boundaries, planning, dispatch, progress, coordination, verification and the final synthesis. Delegate execution, including simple implementation tasks, to an authorized worker. Perform only necessary read-only information gathering here, using the dedicated Read/Grep/Glob/GetFileInfo/ViewImage and scoped history tools. A shell command, executable, Skill, Workflow or external tool is not a read-only shortcut.\n\
-Existing-session-first: before assigning main execution, use session_history list to find existing managed Sessions, then bounded inspect of the suitable targets. Prefer a task-aligned existing independent Root and continue or correct that same target rather than creating an overlapping worker. Use session_control followup only for an explicitly attached independent Root whose current scope authorizes it, or the separately authorized session_message send route with explicit trigger_turn. Preserve that target's own history, model, Project, workspace and permissions; a listing is not a sending grant. When no suitable managed Root exists and the assignment requires a new worker, use session_control create only when the Host advertises it: first inspect scope, then create a new independent Ordinary Root only in an explicit already-authorized Project and Host-bound workspace. Reuse the entire creation request and operation UUID after an uncertain response; creation/admission is not completion. This creates neither a Child nor a formal Work/Ticket or isolated worktree. Never discover or attach unrelated Sessions, infer a Project/workspace grant, or inherit Supervisor permissions into a worker. Inspect authoritative progress and verify result evidence before claiming completion; an admitted dispatch is not completed work.\n\
+Own task boundaries, planning, dispatch, progress, coordination, verification and the final synthesis. Delegate execution, including simple implementation tasks, to an authorized worker. Use only bounded Session/Work/plan views here. Delegate every direct workspace/file read, search, image read, write, shell or process operation to another Session; read-only file tools are not an exception. A Skill, Workflow, browser or external tool is not a shortcut.\n\
+Existing-session-first: discover the current application user's Projects and Sessions through canonical Host views. Use session_history list to find existing Sessions, then bounded inspect of suitable targets. The trusted Supervisor role has default management within this user-data domain; do not ask for per-Project UI authorization. It has no authority over other users, data domains or external accounts. Prefer a task-aligned existing independent Root and continue or correct that same target rather than creating an overlapping worker. Use the canonical session_control followup or separately authorized session_message route; preserve the target's own history, model, Project, workspace, run and permissions. A pending target approval still requires its real decision. When no suitable Root exists, use session_control create only when the Host advertises it, in a canonical current-user Project with a Host-bound workspace. Reuse the complete request and operation UUID after an uncertain response; creation/admission is not completion. This creates neither a Child nor a formal Work/Ticket or isolated worktree. Never inherit Supervisor management into a worker or Observer. Inspect authoritative progress and result evidence before claiming completion.\n\
 Compare each returned artifact and its evidence against the assigned acceptance criteria. Missing, stale or mismatching evidence is not a pass: identify the failed criterion, reject the exact current submission when applicable, and send a bounded correction through the existing assignment or Work rework path. Reinspect the corrected result before reporting technical verification. Technical verification does not replace final User acceptance: preserve user_acceptance_required and, when it is true, wait for explicit User acceptance of the exact current submission.\n\
 Use a bounded SubAgent or read-only Plan child only for auxiliary planning, review or verification; keep main execution with an independent managed Session. Continue or correct the same child by its returned ActorId. Use work_dispatch only within an existing explicit Work authority; do not introduce Work as a fallback for missing Session scope. Do not delegate the entire Supervisor role. Give implementation workers concrete acceptance and non-goals. Children do not inherit this Supervisor policy; nested delegation requires explicit assignment authorization and necessity.\n\
-No suitable managed Session and no already-authorized creation route is an actionable blocker; an empty/denied scope is also blocked: the owner must explicitly attach the intended existing Root in an allowed Project, or authorize a new independent Root through the existing creation route. If a worker or tool is unavailable, an assignment fails, or scope is denied, report a recoverable blocker with the actual reason and the specific owner/configuration/authorization step needed to continue; never self-execute or substitute a main-execution Child. Inspect the owned tree or dispatch receipt for an existing or uncertain assignment before retrying. Reuse that assignment where possible. Do not silently execute it here, create repeated overlapping assignments, retry unchanged failures indefinitely, change gates or permissions, auto-attach Sessions, or restore a broker/cluster. This role policy takes precedence over generic advice to handle simple tasks directly.";
+No suitable Session and no available canonical creation route is an actionable blocker. If the Host still exposes an older per-Project restriction, report the missing current-user management capability as a Host migration blocker instead of requesting one grant per Project. If a worker or tool is unavailable, a target requires a human decision, or an assignment fails, report the actual recoverable blocker; never self-execute or substitute a main-execution Child. Inspect the owned tree or dispatch receipt for an existing or uncertain assignment before retrying and reuse it where possible. Do not create overlapping assignments, retry unchanged failures indefinitely, change target permissions or restore a broker/cluster. This role policy takes precedence over generic advice to handle simple tasks directly.";
 
 pub(crate) fn build_root_orchestration_context_block(session: &Session) -> Option<ContextBlock> {
     if session.supervisor_incarnation_id().is_some() {
@@ -226,8 +226,8 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
         for concept in [
             "Supervisor",
             "Delegate execution",
-            "necessary read-only",
-            "attached",
+            "bounded Session/Work/plan views",
+            "current application user",
             "unavailable",
             "blocker",
             "same child",
@@ -239,6 +239,8 @@ fn supervisor_delegation_first_guidance_is_identity_derived_and_survives_mode_ch
         ] {
             assert!(block.content.contains(concept), "missing {concept}");
         }
+        assert!(!block.content.contains("dedicated Read/Grep/Glob"));
+        assert!(!block.content.contains("owner must explicitly attach"));
         let child = Session::new_child_of("child", &restored, "model", "worker");
         assert!(build_root_orchestration_context_block(&child).is_none());
     }
@@ -928,12 +930,13 @@ fn supervisor_existing_session_first_policy_keeps_children_auxiliary_and_scope_e
             "main execution",
             "auxiliary planning",
             "same target",
-            "explicitly attach",
-            "No suitable managed Session",
+            "current application user",
+            "No suitable Session",
             "never self-execute",
         ] {
             assert!(guidance.contains(concept), "missing {concept}");
         }
+        assert!(!guidance.contains("explicitly attach"));
         assert!(
             guidance.find("session_history list").unwrap()
                 < guidance.find("auxiliary planning").unwrap()
