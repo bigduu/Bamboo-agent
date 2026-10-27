@@ -185,6 +185,7 @@ struct Fixture {
     reference: SupervisorReference,
     original: Session,
     followup_tools: Option<Arc<dyn ToolExecutor>>,
+    followup_targets: Mutex<HashMap<String, Value>>,
 }
 
 impl Fixture {
@@ -283,6 +284,7 @@ impl Fixture {
             reference,
             original,
             followup_tools: None,
+            followup_targets: Mutex::new(HashMap::new()),
         }
     }
 
@@ -315,6 +317,34 @@ impl Fixture {
             .set_ask_rules(["Bash(echo followup-permission-probe)".into()]);
     }
 
+    async fn followup_arguments(&self, operation: &str, message: &str) -> Value {
+        let cached = self.followup_targets.lock().unwrap().get(operation).cloned();
+        let target_ref = if let Some(cached) = cached {
+            cached
+        } else {
+            let page = self
+                .state
+                .storage
+                .list_supervisor_current_user_targets(&self.reference, None, None, 20)
+                .await
+                .unwrap();
+            let observed = page
+                .targets
+                .into_iter()
+                .find(|target| target.session_id == TARGET)
+                .expect("canonical target observation");
+            let observed = serde_json::to_value(observed).unwrap();
+            self.followup_targets
+                .lock()
+                .unwrap()
+                .entry(operation.to_owned())
+                .or_insert(observed)
+                .clone()
+        };
+        json!({"action":"followup", "target_session_id":TARGET, "target_ref":target_ref,
+            "operation_id":operation, "message":message})
+    }
+
     async fn call(
         &self,
         operation: &str,
@@ -323,24 +353,34 @@ impl Fixture {
         let supervisor = self
             .state
             .storage
-            .load_session(&self.reference.session_id)
+            .load_execution_admission_snapshot(&self.reference.session_id)
             .await
             .unwrap()
             .unwrap();
-        let call = ToolCall { id: format!("call-{operation}"), tool_type: "function".into(), function: FunctionCall {
-            name: "session_control".into(), arguments: json!({"action":"followup", "target_session_id":TARGET, "operation_id":operation, "message":message}).to_string(),
-        }};
+        let arguments = self.followup_arguments(operation, message).await.to_string();
+        let call = ToolCall {
+            id: format!("call-{operation}"),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "session_control".into(),
+                arguments,
+            },
+        };
         let mut ctx = ToolExecutionContext::none(&call.id);
         ctx.session_id = Some(&supervisor.id);
         ctx.root_session_id = Some(&supervisor.id);
         ctx = ctx.with_executing_supervisor(
             ExecutingSupervisorObservation::capture_from_executing_session(&supervisor),
         );
-        self.followup_tools
+        let tools = self
+            .followup_tools
             .clone()
-            .unwrap_or_else(|| self.state.tools_for(ToolSurface::Root))
-            .execute_with_context_outcome(&call, ctx)
-            .await
+            .unwrap_or_else(|| self.state.tools_for(ToolSurface::Root));
+        bamboo_agent_core::tools::with_executing_session_caller(
+            Some(Arc::new(bamboo_domain::SessionCallerReference::from(&supervisor))),
+            tools.execute_with_context_outcome(&call, ctx),
+        )
+        .await
     }
 
     async fn model_followup(&self, operation: &str, ultra: bool) -> String {
@@ -356,11 +396,13 @@ impl Fixture {
         std::fs::create_dir_all(&workspace).unwrap();
         supervisor.set_workspace_path_meta(workspace.to_string_lossy());
         self.state.storage.save_session(&supervisor).await.unwrap();
+        let arguments = self.followup_arguments(operation, STEER).await.to_string();
         *self.probe.next.lock().unwrap() = Some(ToolCall {
-            id: operation.into(), tool_type: "function".into(),
+            id: operation.into(),
+            tool_type: "function".into(),
             function: FunctionCall {
                 name: "session_control".into(),
-                arguments: json!({"action":"followup", "target_session_id":TARGET, "operation_id":operation, "message":STEER}).to_string(),
+                arguments,
             },
         });
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
@@ -540,7 +582,7 @@ impl Fixture {
 }
 
 #[actix_web::test]
-async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_detached_target() {
+async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_stale_target() {
     for ultra in [false, true] {
         let f = Box::pin(Fixture::new()).await;
         let content = Box::pin(f.model_followup("native-attached-followup", ultra)).await;
@@ -587,7 +629,23 @@ async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_de
             .detach(&f.reference, scope.state_revision, TARGET)
             .await
             .unwrap();
-        let denied = Box::pin(f.model_followup("native-detached-followup", ultra)).await;
+        assert!(service.inspect_link(&f.reference, TARGET).await.unwrap().authorized);
+        let observed = f
+            .followup_targets
+            .lock()
+            .unwrap()
+            .get("native-attached-followup")
+            .unwrap()
+            .clone();
+        let mut changed = f.reload().await;
+        changed.metadata_version += 1;
+        changed.model = "changed-target-model".into();
+        f.state.storage.save_session(&changed).await.unwrap();
+        f.followup_targets
+            .lock()
+            .unwrap()
+            .insert("native-stale-followup".into(), observed);
+        let denied = Box::pin(f.model_followup("native-stale-followup", ultra)).await;
         assert!(serde_json::from_str::<Value>(&denied).is_err(), "{denied}");
         assert_eq!(
             f.state
