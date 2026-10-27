@@ -74,6 +74,27 @@ jobs:
           cargo test --locked -p bamboo-tickets --test service_contract supervisor_mode_compatibility_ \
             -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/supervisor-work-mode.log"
           grep -Fq 'test result: ok. 2 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-work-mode.log"
+      - name: Verify actual Host Work initialization and mode-independent recovery
+        run: |
+          set -euo pipefail
+          for case in \
+            ticket_application_flags_preserve_records_and_never_double_write_old_tasks \
+            ticket_application_default_off_does_not_bootstrap_or_attach_existing_supervisor \
+            ticket_application_store_init_failure_preserves_ordinary_supervisor_authority \
+            ticket_application_mode_changes_preserve_business_binding_and_incarnation_still_fences \
+            ticket_scope_status_distinguishes_empty_uninitialized_and_disabled \
+            ticket_scope_initialization_is_explicit_empty_idempotent_and_survives_restart \
+            ticket_scope_initialization_refuses_gates_stale_identity_and_non_owner_without_effects \
+            ticket_scope_initialization_never_recovers_unknown_partial_or_symlinked_stores \
+            ticket_scope_status_preserves_business_binding_across_mode_changes_and_restart \
+            ticket_scope_status_distinguishes_forged_identity_and_io_authority_failure \
+            ticket_scope_platform_contract_denies_get_eligibility_and_post_without_effects \
+            ticket_scope_initialization_publishes_runtime_service_once_after_authorized_creation; do
+            cargo test --locked -p bamboo-server --lib \
+              "app_state::ticket_application::tests::$case" -- --exact --test-threads=1 \
+              2>&1 | tee "$RUNNER_TEMP/supervisor-work-$case.log"
+            grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-work-$case.log"
+          done
       - name: Verify direct file and process denial in both modes
         run: |
           set -euo pipefail

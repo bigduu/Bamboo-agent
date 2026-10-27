@@ -539,6 +539,20 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Return history and its target selector from one retained canonical read.
+    /// A second unguarded load must not pair old progress with a replacement
+    /// Session's new selector. Custom stores fail closed until implemented.
+    async fn load_supervisor_current_user_observed_session(
+        &self,
+        _supervisor: &crate::SupervisorReference,
+        _target: &str,
+    ) -> std::io::Result<(Session, crate::SupervisorCurrentUserTarget)> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic current-user Session observation is unsupported",
+        ))
+    }
+
     /// Legacy host scope metadata, retained for compatibility and Observer CAS.
     async fn inspect_supervisor_scope(
         &self,

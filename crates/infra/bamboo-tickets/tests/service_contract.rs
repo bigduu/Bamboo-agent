@@ -107,7 +107,10 @@ fn supervisor_mode_compatibility_preserves_sealed_binding_work_and_receipts() {
     let after = reopened.published().unwrap().1;
     assert_eq!(reopened.health(), Health::Writable);
     assert_eq!(after.binding, before.binding);
-    assert_eq!(after.tickets[&work_id], before.tickets[&work_id]);
+    assert_eq!(
+        canonical_bytes(&after.tickets[&work_id]).unwrap(),
+        canonical_bytes(&before.tickets[&work_id]).unwrap()
+    );
     assert_eq!(after.receipts, before.receipts);
     // Compatibility retains normal writer-restart fencing, not an old Worker lease.
     assert!(after.authority_epoch > before.authority_epoch);

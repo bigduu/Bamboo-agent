@@ -72,6 +72,14 @@ async fn assert_default_read(
     assert_eq!(read.authority_identity, target.authority_identity);
     assert_eq!(read.messages.len(), target.messages.len());
     assert_eq!(read.messages[0].content, target.messages[0].content);
+    let (observed, selector) = store
+        .load_supervisor_current_user_observed_session(supervisor, &target.id)
+        .await
+        .unwrap();
+    assert_eq!(observed.created_at, selector.created_at);
+    assert_eq!(observed.metadata_version, selector.metadata_version);
+    assert_eq!(observed.id, selector.session_id);
+    assert_eq!(observed.kind, selector.kind);
 }
 
 #[tokio::test]
