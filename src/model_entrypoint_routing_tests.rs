@@ -572,3 +572,94 @@ async fn entrypoint_routing_sdk_run_keeps_existing_session_model_without_builder
         "{calls:?}"
     );
 }
+
+#[tokio::test]
+async fn entrypoint_routing_sdk_injected_client_keeps_declared_account_default_in_both_orders() {
+    let mut observations = Vec::new();
+    for flag in [false, true] {
+        for before in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = config(flag, "chat-a");
+            c.defaults.as_mut().unwrap().chat =
+                bamboo_domain::ProviderModelRef::new("chat-b", "main-b");
+            c.provider_instances.insert("chat-b".into(), serde_json::from_value(serde_json::json!({
+                "provider_type":"openai","enabled":true,"model":"main-b","runtime_models":["main-b"],
+            })).unwrap());
+            std::fs::write(
+                dir.path().join("config.json"),
+                serde_json::to_vec(&c).unwrap(),
+            )
+            .unwrap();
+            let shared = Arc::new(RwLock::new(c));
+            let main = Arc::new(Capture::default());
+            let mut builder = bamboo_sdk::Agent::builder()
+                .provider(main.clone())
+                .tools(std::iter::empty());
+            if before {
+                builder = builder.config(shared.clone());
+            }
+            builder = builder
+                .with_defaults_for_data_dir(dir.path().to_path_buf())
+                .await
+                .unwrap();
+            if !before {
+                builder = builder.config(shared);
+            }
+            let agent = builder.build().unwrap();
+            let mut session = agent.new_session("synthetic-injected-client").unwrap();
+            session.add_message(Message::user("Synthetic injected client witness"));
+            agent.run_session(&mut session).await.unwrap();
+            let calls = main.calls.lock().unwrap().clone();
+            observations.push((flag, before, calls));
+        }
+    }
+    assert!(
+        observations.iter().all(|(_, _, calls)| !calls.is_empty()
+            && calls.iter().all(|(model, _, _)| model == "main-a")),
+        "{observations:?}"
+    );
+}
+
+#[tokio::test]
+async fn entrypoint_routing_sdk_native_client_rejects_replacement_invalid_chat_before_dispatch() {
+    let mut observations = Vec::new();
+    for case in ["cross-account", "disabled", "unadmitted"] {
+        let server = vision_server(200).await;
+        let mut c = config(true, "chat-a");
+        let mut value = serde_json::to_value(c.provider_instances.get("chat-a").unwrap()).unwrap();
+        value["api_key"] = "synthetic-no-real-key".into();
+        value["base_url"] = server.uri().into();
+        c.provider_instances
+            .insert("chat-a".into(), serde_json::from_value(value).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&c).unwrap(),
+        )
+        .unwrap();
+        let builder = bamboo_sdk::Agent::builder()
+            .tools(std::iter::empty())
+            .with_defaults_for_data_dir(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        match case {
+            "cross-account" => c.defaults.as_mut().unwrap().chat.provider = "chat-b".into(),
+            "disabled" => c.provider_instances.get_mut("chat-a").unwrap().enabled = false,
+            "unadmitted" => c.defaults.as_mut().unwrap().chat.model = "absent-model".into(),
+            _ => unreachable!(),
+        }
+        observations.push((
+            case,
+            builder
+                .config(Arc::new(RwLock::new(c)))
+                .build()
+                .err()
+                .map(|e| e.to_string()),
+        ));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+    assert!(
+        observations.iter().all(|(_, error)| error.is_some()),
+        "{observations:?}"
+    );
+}
