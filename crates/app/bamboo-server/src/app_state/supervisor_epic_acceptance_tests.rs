@@ -105,6 +105,25 @@ fn artifact(messages: &[Message]) -> Option<Value> {
         (result["view"] == "planner_artifact").then_some(result)
     })
 }
+fn recent_messages(messages: &[Message]) -> Vec<Value> {
+    messages
+        .iter()
+        .rev()
+        .take(12)
+        .rev()
+        .map(|message| {
+            json!({"id":message.id,"role":message.role,
+                "call_id":message.tool_call_id,"success":message.tool_success,
+                "compressed":message.compressed,
+                "markers":[BLOCKER,DURING_PLAN,DONE,USER,COLD,"EPIC_ROOT_B_PERSISTED_STATUS_OBSERVED"]
+                    .into_iter().filter(|marker|message.content.contains(*marker)).collect::<Vec<_>>(),
+                "preview":message.content.chars().take(180).collect::<String>(),
+                "metadata":serde_json::to_string(&message.metadata).unwrap().chars().take(256).collect::<String>(),
+                "calls":message.tool_calls.iter().flatten().take(3)
+                    .map(|call|json!({"id":call.id,"name":call.function.name})).collect::<Vec<_>>()})
+        })
+        .collect()
+}
 
 struct Probe {
     workspace: PathBuf,
@@ -121,6 +140,8 @@ struct Probe {
     observed: Mutex<BTreeSet<String>>,
     control_revision: Mutex<Option<String>>,
     followup_target: Mutex<Option<Value>>,
+    parent_requests: Mutex<Vec<(Vec<Message>, Value)>>,
+    reported_changes: Mutex<Vec<ObserverViewChange>>,
     denied_control_exports: Mutex<BTreeSet<String>>,
     denied_control_reads: Mutex<BTreeSet<String>>,
 }
@@ -141,6 +162,8 @@ impl Probe {
             observed: Mutex::new(BTreeSet::new()),
             control_revision: Mutex::new(None),
             followup_target: Mutex::new(None),
+            parent_requests: Mutex::new(Vec::new()),
+            reported_changes: Mutex::new(Vec::new()),
             denied_control_exports: Mutex::new(BTreeSet::new()),
             denied_control_reads: Mutex::new(BTreeSet::new()),
         }
@@ -451,6 +474,7 @@ impl Probe {
             } else {
                 "EPIC_ROOT_B_PERSISTED_STATUS_OBSERVED"
             };
+            self.reported_changes.lock().unwrap().push(change.clone());
             return LLMChunk::Token(format!(
                 "{summary}; bounded observation {} of {}",
                 change.sequence, change.target_session_id
@@ -571,7 +595,18 @@ impl LLMProvider for Probe {
                     )),
                     "Supervisor provider catalog must require delegation"
                 );
-                self.parent(messages)
+                let chunk = self.parent(messages);
+                let output = match &chunk {
+                    LLMChunk::Token(text) => json!({"token":text}),
+                    LLMChunk::ToolCalls(calls) => json!({"calls":calls.iter()
+                        .map(|call|json!({"id":call.id,"name":call.function.name})).collect::<Vec<_>>()}),
+                    _ => json!({"kind":"other"}),
+                };
+                self.parent_requests
+                    .lock()
+                    .unwrap()
+                    .push((messages.to_vec(), output));
+                chunk
             }
             TRACKER => self.tracker(messages, tools).await,
             PLANNER => self.planner(messages).await,
@@ -675,7 +710,13 @@ async fn user(state: &AppState, id: &str, content: &str) {
         .await
         .unwrap();
 }
-async fn wait(state: &AppState, id: &str, predicate: impl Fn(&Session) -> bool) -> Session {
+async fn wait(
+    state: &AppState,
+    id: &str,
+    stage: &str,
+    probe: &Probe,
+    predicate: impl Fn(&Session) -> bool,
+) -> Session {
     match tokio::time::timeout(WAIT, async {
         loop {
             let session = load(state, id).await;
@@ -691,8 +732,90 @@ async fn wait(state: &AppState, id: &str, predicate: impl Fn(&Session) -> bool) 
         Err(_) => {
             let session = load(state, id).await;
             let inbox = state.session_inbox.inspect(id).await.unwrap();
+            let requests = {
+                let requests = probe.parent_requests.lock().unwrap();
+                requests
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .take(3)
+                    .map(|(index, (messages, output))| {
+                        json!({"index":index,"total_messages":messages.len(),
+                        "input":recent_messages(messages),"output":output})
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let reports: Vec<_> = probe
+                .reported_changes
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .take(8)
+                .map(|change| {
+                    json!({"event_id":change.event_id,"sequence":change.sequence,
+                    "target":change.target_session_id})
+                })
+                .collect();
+            let observer =
+                tokio::time::timeout(Duration::from_secs(2), state.storage.load_session(OBSERVER))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .flatten();
+            let child_ids: Vec<_> = session
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|runtime| runtime.waiting_for_children.as_ref())
+                .map(|wait| wait.child_session_ids.iter().take(2).cloned().collect())
+                .unwrap_or_default();
+            let mut waited_children = Vec::new();
+            for child_id in child_ids {
+                let snapshot = tokio::time::timeout(Duration::from_secs(2), async {
+                    let child = state.storage.load_session(&child_id).await
+                        .map_err(|error|error.to_string())?
+                        .ok_or_else(|| "canonical waited Child missing".to_string())?;
+                    let inbox = state.session_inbox.inspect(&child_id).await
+                        .map_err(|error|error.to_string())?;
+                    let owner = state.session_activation_router.current_run_id(&child_id).await;
+                    let raw_source = child.metadata.get("runtime.child_completion_source_v1");
+                    Ok::<Value,String>(json!({"status":child.last_run_status(),"error":child.last_run_error(),
+                        "active_owner":owner,"parent":child.parent_session_id,
+                        "completion_source_metadata":{"present":raw_source.is_some(),
+                            "raw_unvalidated":raw_source.filter(|raw|raw.len()<=4096),
+                            "validation":"diagnostic only; not an authority or publisher result"},
+                        "planner_contract":bamboo_engine::session_app::child_session::planner_artifact::uses_artifact_contract(&child),
+                        "messages":recent_messages(&child.messages),
+                        "inbox":{"pending":inbox.pending,"claimed":inbox.claimed,
+                            "generation":inbox.generation,"activation_generation":inbox.activation_generation}}))
+                }).await;
+                waited_children.push(match snapshot {
+                    Ok(Ok(snapshot)) => json!({"id":child_id,"snapshot":snapshot}),
+                    Ok(Err(error)) => json!({"id":child_id,"unavailable":error}),
+                    Err(_) => json!({"id":child_id,"unavailable":"diagnostic read timeout"}),
+                });
+            }
+            eprintln!(
+                "EPIC_CHAIN_DIAGNOSTIC {}",
+                json!({"stage":stage,
+                "requests":probe.requests.load(Ordering::SeqCst),
+                "tracker_calls":probe.tracker_calls.load(Ordering::SeqCst),
+                "planner_calls":probe.planner_calls.load(Ordering::SeqCst),
+                "worker_calls":probe.worker_calls.load(Ordering::SeqCst),
+                "parent_requests":requests,"emitted_tracker_reports":reports,
+                "waited_children":waited_children,
+                "parent_artifact":artifact(&session.messages),
+                "canonical_parent_messages":recent_messages(&session.messages),
+                "observer":observer.as_ref().map(|child|json!({"status":child.last_run_status(),
+                    "error":child.last_run_error(),"messages":recent_messages(&child.messages)})),
+                "subscription":session.supervisor_management.as_ref()
+                    .and_then(|management|management.subscriptions.get(OBSERVER)).map(|subscription|
+                        json!({"enqueued":subscription.window.enqueued_sequence,
+                            "pending":subscription.window.pending,"failures":subscription.failures,
+                            "last_error":subscription.last_error}))})
+            );
             panic!(
-                "epic chain timeout id={id} status={:?} error={:?} wait={:?} inbox={inbox:?}",
+                "epic chain timeout stage={stage} id={id} status={:?} error={:?} wait={:?} inbox={inbox:?}",
                 session.last_run_status(),
                 session.last_run_error(),
                 session
@@ -815,13 +938,19 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         "Ask the existing owner which bounded approach is authorized; wait for their answer.",
     )
     .await;
-    let paused = wait(&state, ROOT_A, |session| {
-        session.last_run_status().as_deref() == Some("suspended")
-            && session
-                .pending_question
-                .as_ref()
-                .is_some_and(|question| question.tool_call_id == "epic-existing-owner-question")
-    })
+    let paused = wait(
+        &state,
+        ROOT_A,
+        "original-root-question",
+        &probe,
+        |session| {
+            session.last_run_status().as_deref() == Some("suspended")
+                && session
+                    .pending_question
+                    .as_ref()
+                    .is_some_and(|question| question.tool_call_id == "epic-existing-owner-question")
+        },
+    )
     .await;
     tokio::time::timeout(WAIT, async {
         while state
@@ -899,10 +1028,16 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         BTreeSet::from([ROOT_A.to_string(), ROOT_B.to_string()]),
         "Tracker registration stays narrower than the Supervisor current-user catalog"
     );
-    let idle = wait(&state, parent_id, |s| {
-        s.last_run_status().as_deref() == Some("completed")
-            && marker(s, "EPIC_IDLE_PARENT_FINISHED_WITH_ACTIVE_TRACKER")
-    })
+    let idle = wait(
+        &state,
+        parent_id,
+        "idle-parent-active-tracker",
+        &probe,
+        |s| {
+            s.last_run_status().as_deref() == Some("completed")
+                && marker(s, "EPIC_IDLE_PARENT_FINISHED_WITH_ACTIVE_TRACKER")
+        },
+    )
     .await;
     assert!(idle
         .agent_runtime_state
@@ -915,7 +1050,7 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
     tokio::time::timeout(WAIT, probe.planner_entered.notified())
         .await
         .unwrap();
-    let planning = wait(&state, parent_id, |s| {
+    let planning = wait(&state, parent_id, "planner-wait-registered", &probe, |s| {
         s.agent_runtime_state
             .as_ref()
             .is_some_and(|r| r.waiting_for_children.is_some())
@@ -933,7 +1068,14 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         .observer_subscriptions
         .tick(chrono::Utc::now() + chrono::Duration::seconds(2))
         .await;
-    let during = wait(&state, parent_id, |s| marker(s, DURING_PLAN)).await;
+    let during = wait(
+        &state,
+        parent_id,
+        "report-during-planner-wait",
+        &probe,
+        |s| marker(s, DURING_PLAN),
+    )
+    .await;
     assert_eq!(
         during
             .agent_runtime_state
@@ -963,11 +1105,15 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         serde_json::to_value(&original_b).unwrap()
     );
     probe.planner_release.notify_one();
-    let finished = wait(&state, parent_id, |s| {
-        s.last_run_status().as_deref() == Some("completed") && marker(s, DONE)
-    })
+    let finished = wait(
+        &state,
+        parent_id,
+        "planner-artifact-followup",
+        &probe,
+        |s| s.last_run_status().as_deref() == Some("completed") && marker(s, DONE),
+    )
     .await;
-    let worker = wait(&state, ROOT_B, |s| {
+    let worker = wait(&state, ROOT_B, "original-worker-finished", &probe, |s| {
         s.last_run_status().as_deref() == Some("completed")
             && marker(s, "EPIC_ORIGINAL_WORKER_FINISHED")
     })
@@ -1084,9 +1230,13 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         "startup must not replay acknowledged work"
     );
     user(&reopened, parent_id, COLD).await;
-    wait(&reopened, parent_id, |s| {
-        s.last_run_status().as_deref() == Some("completed") && marker(s, COLD_DONE)
-    })
+    wait(
+        &reopened,
+        parent_id,
+        "cold-identical-followup-retry",
+        &probe,
+        |s| s.last_run_status().as_deref() == Some("completed") && marker(s, COLD_DONE),
+    )
     .await;
     quiet(&reopened, OBSERVER).await;
     let final_worker = quiet(&reopened, ROOT_B).await;
