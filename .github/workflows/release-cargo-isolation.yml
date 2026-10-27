@@ -2,7 +2,7 @@ name: Release Cargo Isolation
 
 on:
   pull_request:
-    branches: [dev, main]
+    branches: [dev]
     paths:
       - scripts/release-cargo-sandbox*
       - scripts/release-cargo-upload*

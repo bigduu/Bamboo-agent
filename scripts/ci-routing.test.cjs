@@ -5,113 +5,132 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const { test } = require("node:test");
-const ci = fs.readFileSync(".github/workflows/ci.yml", "utf8");
-const frontend = fs.readFileSync(".github/workflows/frontend-acceptance.yml", "utf8");
-const publisher = fs.readFileSync(".github/workflows/publish-crate.yml", "utf8");
+const read = file => fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
+const ci = read(".github/workflows/ci.yml");
+const frontend = read(".github/workflows/frontend-acceptance.yml");
 function job(source, id) {
   const marker = `\n  ${id}:\n`;
-  const start = source.indexOf(marker); assert.notEqual(start, -1);
-  const tail = source.slice(start + marker.length);
-  const next = tail.search(/\n  [a-z][a-z0-9-]*:\n/);
+  const start = source.indexOf(marker); assert.notEqual(start, -1, `missing ${id}`);
+  const tail = source.slice(start + marker.length), next = tail.search(/\n  [a-z][a-z0-9-]*:\n/);
   return next < 0 ? tail : tail.slice(0, next);
 }
 function script(step) {
   const match = step.match(/        run: \|\n([\s\S]*?)(?=\n      - |$)/);
   assert.ok(match);
-  return match[1].split("\n").map((line) => line.replace(/^          /, "")).join("\n");
+  return match[1].split("\n").map(line => line.replace(/^          /, "")).join("\n");
 }
+const featureJobs = ["quick-checks", "feature-tests", "native-feature-tests", "browser-runtime-tests", "msrv", "lint", "docs", "security", "deny"];
 function assertRouting(source) {
-  assert.match(source, /^permissions:\n  contents: read\n/m);
-  assertSharedBuild(source);
-  assertMainAdmission(source);
-  const quick = job(source, "quick-checks");
-  assert.match(quick, /^    name: Quick Checks$/m);
-  assert.match(quick, /^    if: github.event_name == 'pull_request' && github.base_ref == 'dev'$/m);
-  assert.match(quick, /run: cargo fmt --all -- --check/);
-  assert.match(quick, /run: node --test scripts\/ci-policy.test.cjs scripts\/crate-release.test.cjs scripts\/ci-routing.test.cjs/);
-  assert.doesNotMatch(quick, /cargo (build|test|check|clippy)|continue-on-error|--test-skip/);
-  const full = job(source, "test");
-  assert.match(full, /^    name: Test$/m);
-  assert.match(full, /^    needs: \[validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
-  assert.match(full, /^    if: always\(\) && !cancelled\(\)$/m);
-  assert.match(full, /- name: Require validation admission\n        env:\n          SOURCE_RESULT: \$\{\{ needs.validation-source.result \}\}\n          FULL_VALIDATION: \$\{\{ needs.validation-source.outputs.full \}\}/);
-  assert.match(full, /test "\$SOURCE_RESULT" = success/);
-  assert.match(full, /\*\) exit 1 ;;/);
-  assert.doesNotMatch(full, /cargo build/);
-  assert.match(full, /test "\$E2E_RESULT" = success/);
-  assert.match(full, /test "\$CRATE_RESULT" = success/);
-  assert.doesNotMatch(full, /run: cargo test/);
-  for (const id of ["msrv", "tls-fixture-test", "tool-event-recorder-e2e", "lint", "build", "docs", "security", "deny"]) {
+  const header = source.split("\njobs:\n")[0];
+  assert.match(header, /pull_request:\n    branches: \[ dev, main \]/);
+  assert.doesNotMatch(header, /^  push:/m);
+  assert.match(job(source, "validation-source"), /if: github.event_name != 'pull_request' \|\| github.base_ref == 'dev'/);
+  for (const id of featureJobs) {
     const block = job(source, id);
     assert.match(block, /^    needs: validation-source$/m);
-    assert.ok(block.includes("needs.validation-source.outputs.full == 'true'"));
+    assert.match(block, /^    if: needs.validation-source.outputs.feature == 'true'$/m);
     assert.doesNotMatch(block, /continue-on-error:/);
-    // Do not pin a PR full gate to the head instead of the actual merge result.
-    assert.doesNotMatch(block, /^          ref:/m);
   }
-  assert.match(job(source, "build"), /^    name: Platform Tests \(\$\{\{ matrix\.os \}\}\)$/m);
-  assert.doesNotMatch(source, /cargo build[^\n]*--release/);
-  assert.doesNotMatch(source, /continue-on-error:|paths-ignore:/);
-  assert.match(source, /queue: .*github.event_name == 'push'.*refs\/heads\/main.*'max'/);
-  assert.match(source, /cancel-in-progress: .*github.event_name != 'push'.*refs\/heads\/main/);
-  assert.match(source, /group:.*inputs.snapshot_sha/);
+  assert.deepEqual([...source.matchAll(/^  ([a-z][a-z0-9-]*):$/gm)].map(row => row[1]).sort(),
+    ["validation-source", "promotion-source", "test", "e2e-test", ...featureJobs].sort());
+  assert.match(job(source, "promotion-source"), /if: github.event_name == 'pull_request' && github.base_ref == 'main'/);
+  assert.doesNotMatch(job(source, "promotion-source"), /actions\/checkout|cargo |node |contents: write/);
+  for (const id of ["test", "e2e-test"]) {
+    const block = job(source, id);
+    assert.match(block, /if: always\(\) && !cancelled\(\) && \(github.event_name == 'workflow_dispatch' \|\| \(github.event_name == 'pull_request' && github.base_ref == 'dev'\)\)/);
+    assert.doesNotMatch(block.split('    steps:')[0], /outputs\.feature/, 'a failed source gate must fail the real summary instead of skipping it');
+    assert.doesNotMatch(block, /uses:|cargo |node |continue-on-error:/);
+    assert.match(block, /test "\$FEATURE_RESULT" = success|FEATURE_RESULT NATIVE_RESULT/);
+  }
+  assert.equal((source.match(/run: cargo fmt --all -- --check/g) || []).length, 1);
+  assert.equal((source.match(/run: node scripts\/run-feature-tests.cjs/g) || []).length, 1);
+  assert.equal((source.match(/run: node scripts\/native-test-owner.cjs/g) || []).length, 1);
+  assert.match(job(source, "native-feature-tests"), /os: \[windows-2025, macos-latest\]/);
+  assert.match(job(source, "msrv"), /cargo check --locked --workspace --all-targets --all-features/);
+  assert.match(job(source, "lint"), /cargo clippy --all-features --/);
+  assert.match(job(source, "security"), /cargo audit --deny warnings/);
+  assert.match(job(source, "deny"), /command: check/);
+  const browser = job(source, "browser-runtime-tests");
+  assert.match(browser, /cli.js install --with-deps chromium-headless-shell/);
+  assert.match(browser, /readdirSync\('browser-runtime'\)\.filter\(file => file\.endsWith\('\.test\.cjs'\)\)/);
+  assert.match(browser, /spawnSync\(process.execPath, \['--test', '--test-concurrency=1', \.\.\.files\]/);
+  assert.match(browser, /for \(const name of \['fail', 'cancelled', 'skipped', 'todo'\]\)/);
+  assert.ok(job(source, "test").includes('test "${!key}" = success'));
+  assert.match(job(source, "e2e-test"), /test "\$BROWSER_RESULT" = success/);
+  assert.doesNotMatch(source, /outputs.full == 'true'|cargo build[^\n]*--release/);
 }
-
-test("required Test runs feature tests, validates snapshots fully and authenticates main admission", () => {
+test("feature CI owns tests and quality once; main has only read-only promotion", () => {
   assertRouting(ci);
-  for (const [from, to] of [
-    ["name: Quick Checks", "name: Test"],
-    ["name: Platform Tests (${{ matrix.os }})", "name: Build (${{ matrix.os }})"],
-    ["run: cargo test --locked --no-fail-fast -p bamboo-skills progressive::source_tests -- --test-threads=1", "run: cargo build --release --verbose"],
-    ["run: cargo fmt --all -- --check", "run: cargo test --locked --no-fail-fast"],
-    ["if: always() && !cancelled()", "if: needs.validation-source.outputs.full == 'true'"],
-    ['test "$SOURCE_RESULT" = success', 'true # ignored source result'],
-    ["if: needs.validation-source.outputs.full == 'true'", "if: true"],
-    ['test "$E2E_RESULT" = success', 'true # ignored E2E result'],
-  ]) assert.throws(() => assertRouting(ci.replace(from, to)), `reject ${to}`);
+  for (const [before, after] of [
+    ["  workflow_dispatch:", "  push:\n    branches: [main]\n  workflow_dispatch:"],
+    ["needs.validation-source.outputs.feature == 'true'", "always()"],
+    ["run: node scripts/run-feature-tests.cjs", "run: cargo test"],
+    ["os: [windows-2025, macos-latest]", "os: [windows-2025]"],
+    ["run: cargo fmt --all -- --check", "run: true"],
+  ]) assert.throws(() => assertRouting(ci.replace(before, after)));
 });
 
-test("snapshot controller executes positive and fail-closed routing cases", (t) => {
+test("feature source controller preserves the official log and rejects main or release execution", t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-ci-routing-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const shell = script(job(ci, "validation-source"));
-  assert.doesNotMatch(shell, /\$\{\{|eval|git checkout|git fetch/);
-  const sha = "a".repeat(40);
-  const run = (overrides) => {
+  const shell = script(job(ci, "validation-source")), sha = "a".repeat(40);
+  const run = (overrides = {}) => {
     const output = path.join(directory, "output"); fs.writeFileSync(output, "");
     const result = spawnSync("bash", ["-c", shell], { encoding: "utf8", env: { ...process.env,
       GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_SHA: sha, EXPECTED_SNAPSHOT_SHA: sha,
       GITHUB_REF: "refs/heads/dev", GITHUB_BASE_REF: "", GITHUB_OUTPUT: output, ...overrides } });
     return { ...result, output: fs.readFileSync(output, "utf8") };
   };
-  for (const overrides of [ {}, { GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "main" } ]) {
-    const result = run(overrides); assert.equal(result.status, 0, result.stderr); assert.equal(result.output, "full=true\nfeature=false\n");
+  for (const overrides of [{}, { GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev" }]) {
+    const result = run(overrides); assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.output, "full=false\nfeature=true\n");
+    assert.equal(result.stdout, `Event source: ${sha}; full validation: false\n`);
   }
-  const main = run({ GITHUB_EVENT_NAME: "push", GITHUB_REF: "refs/heads/main" });
-  assert.equal(main.status, 0); assert.equal(main.output, "full=false\nfeature=false\n");
-  const dev = run({ GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev" });
-  assert.equal(dev.status, 0); assert.equal(dev.output, "full=false\nfeature=true\n");
   for (const overrides of [
     { EXPECTED_SNAPSHOT_SHA: "" }, { EXPECTED_SNAPSHOT_SHA: "dev" }, { EXPECTED_SNAPSHOT_SHA: "b".repeat(40) },
-    { EXPECTED_SNAPSHOT_SHA: "A".repeat(40) }, { EXPECTED_SNAPSHOT_SHA: `${sha}\nfull=true` },
+    { EXPECTED_SNAPSHOT_SHA: "A".repeat(40) }, { EXPECTED_SNAPSHOT_SHA: `${sha}\nfeature=true` },
     { EXPECTED_SNAPSHOT_SHA: "$(touch injected)" }, { GITHUB_SHA: "" },
-    { GITHUB_EVENT_NAME: "push" }, { GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "integration/batch" },
+    { GITHUB_REF: "refs/heads/main" }, { GITHUB_REF: "refs/heads/release/" + sha },
+    { GITHUB_EVENT_NAME: "push" }, { GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "main" },
+    { GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "integration/batch" },
     { GITHUB_EVENT_NAME: "pull_request_target" }, { GITHUB_EVENT_NAME: "unknown" },
   ]) { const result = run(overrides); assert.notEqual(result.status, 0); assert.equal(result.output, ""); }
 });
 
-test("full Test binds immutable merge/event source and fails on dirty source", () => {
-  const full = job(ci, "test");
-  assert.doesNotMatch(full, /^          ref:/m);
-  assert.equal((full.match(/test "\$\(git rev-parse HEAD\)" = "\$GITHUB_SHA"/g) || []).length, 2);
-  assert.equal((full.match(/git status --porcelain --untracked-files=all/g) || []).length, 2);
-  assert.match(full, /name: Require the exact clean source after full validation\n        if: always\(\)/);
-  assert.match(full, /sha256sum Cargo.lock/);
-  assert.match(full, /rustc --version --verbose\n          cargo --version --verbose/);
+test("required feature summaries reject every unsuccessful selected owner", () => {
+  const defaults = { SOURCE_RESULT: "success", FEATURE_VALIDATION: "true", GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev" };
+  const fields = ["QUICK_RESULT", "FEATURE_RESULT", "NATIVE_RESULT", "BROWSER_RESULT", "LINT_RESULT", "MSRV_RESULT", "DOCS_RESULT", "SECURITY_RESULT", "DENY_RESULT"];
+  for (const field of fields) defaults[field] = "success";
+  const run = (id, overrides = {}) => spawnSync("bash", ["-c", script(job(ci, id))], { encoding: "utf8", env: { ...process.env, ...defaults, ...overrides } });
+  assert.equal(run("test").status, 0);
+  assert.equal(run("test", { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "" }).status, 0);
+  for (const field of ["SOURCE_RESULT", ...fields]) for (const value of ["failure", "cancelled", "skipped", "", "unknown"]) {
+    assert.notEqual(run("test", { [field]: value }).status, 0, `${field}:${value}`);
+  }
+  for (const overrides of [{ FEATURE_VALIDATION: "false" }, { GITHUB_BASE_REF: "main" }, { GITHUB_EVENT_NAME: "push" }]) assert.notEqual(run("test", overrides).status, 0);
+  assert.equal(run("e2e-test").status, 0);
+  for (const field of ["FEATURE_RESULT", "NATIVE_RESULT", "BROWSER_RESULT"]) for (const value of ["failure", "cancelled", "skipped", "", "unknown"]) assert.notEqual(run("e2e-test", { [field]: value }).status, 0);
+});
+
+test("standalone duplicate acceptances are manual and unique isolation and CodeQL remain on feature", () => {
+  for (const name of ["frontend-acceptance.yml", "actor-snapshot-windows.yml", "ticket-platform-adapter.yml"]) {
+    const source = read(".github/workflows/" + name), header = source.split("\njobs:\n")[0];
+    assert.match(header, /on:\n  workflow_dispatch:/);
+    assert.doesNotMatch(header, /pull_request:|push:/);
+  }
+  const codeql = read(".github/workflows/codeql.yml");
+  assert.match(codeql, /pull_request:\n    branches: \[ dev \]/);
+  assert.match(codeql, /language: \[ actions, javascript-typescript, python, rust \]/);
+  assert.match(codeql, /build-mode: none/);
+  const isolation = read(".github/workflows/release-cargo-isolation.yml");
+  assert.match(isolation, /pull_request:\n    branches: \[dev\]/);
+  assert.doesNotMatch(isolation, /branches: \[[^\]]*main/);
+  // These accepted joint/API-only configurations are intentionally distinct.
+  for (const name of ["trusted-observer.yml", "delegated-planner-acceptance.yml", "observer-subscriptions.yml"]) assert.match(read(".github/workflows/" + name), /BAMBOO_FRONTEND_BUILD_MODE: api-only/);
 });
 
 test("frontend source acceptance retains the exact-head build and focused frontend tests", () => {
-  assert.match(frontend, /pull_request:\n    branches: \[main\]/);
+  assert.doesNotMatch(frontend.split("\njobs:\n")[0], /pull_request:|push:/);
   assert.doesNotMatch(frontend, /branches: \[dev\]|paths:/);
   assert.match(frontend, /snapshot_sha:\n.*\n        required: true\n        type: string/);
   for (const id of ["lint", "build", "test"]) {
@@ -134,40 +153,6 @@ test("frontend source acceptance retains the exact-head build and focused fronte
   assert.match(job(frontend, "lint"), /cargo clippy --all-features --/);
 });
 
-test("publication still requires the actual successful same-repository main push CI", () => {
-  assert.match(publisher, /workflow_run:\n    workflows: \[CI\]/);
-  for (const condition of ["github.event.workflow_run.event == 'push'", "github.event.workflow_run.conclusion == 'success'", "github.event.workflow_run.head_branch == 'main'", "github.event.workflow_run.head_repository.full_name == github.repository"]) assert.ok(publisher.includes(condition));
-});
-
-function assertMainAdmission(source) {
-  const admission = job(source, "main-release-admission");
-  assert.match(admission, /name: Main Release Admission/);
-  assert.match(admission, /needs: validation-source/);
-  assert.match(admission, /if: always\(\) && !cancelled\(\) && github.event_name == 'push' && github.ref == 'refs\/heads\/main'/);
-  assert.match(admission, /permissions:\n      contents: read\n      actions: read/);
-  assert.match(admission, /ADMISSION_MODE: main/);
-  assert.doesNotMatch(admission, /actions\/checkout|contents: write|cargo |secrets\./);
-  const full = job(source, "test");
-  assert.match(full, /MAIN_ADMISSION_RESULT: \$\{\{ needs.main-release-admission.result \}\}/);
-  assert.match(full, /test "\$MAIN_ADMISSION_RESULT" = success/);
-  const [, admissionStep, ...sourceSteps] = full.split(/(?=^      - )/m);
-  assert.match(admissionStep, /name: Require validation admission/);
-  for (const step of sourceSteps) {
-    assert.match(step, /^        if: (?:(?:always|failure)\(\) && )?needs.validation-source.outputs.full == 'true'$/m,
-      "main must perform admission only, without checkout, compilation or duplicate tests");
-  }
-}
-
-test("main Test reports real admission while the full suite remains on pre-merge/manual sources", () => {
-  assertMainAdmission(ci);
-  for (const [from, to] of [
-    ["ADMISSION_MODE: main", "ADMISSION_MODE: publication"],
-    ['test "$MAIN_ADMISSION_RESULT" = success', 'true'],
-    ["if: needs.validation-source.outputs.full == 'true'", "if: always()"],
-    ["contents: read\n      actions: read", "contents: write\n      actions: read"],
-  ]) assert.throws(() => assertMainAdmission(ci.replace(from, to)));
-});
-
 test("source guards propagate Git inspection errors and reject dirty or mismatched sources", (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-ci-source-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -184,12 +169,12 @@ test("source guards propagate Git inspection errors and reject dirty or mismatch
   const tree = git("rev-parse", "HEAD^{tree}");
   fs.writeFileSync(path.join(bin, "git"), '#!/bin/bash\nif [[ "$1" == status && "$FAIL_STATUS" == 1 ]]; then echo "fatal: inspection failed" >&2; exit 23; fi\nexec "$REAL_GIT" "$@"\n', { mode: 0o755 });
   const guards = [];
-  for (const source of [job(ci, "test"), job(frontend, "lint"), job(frontend, "build"), job(frontend, "test")]) {
+  for (const source of [job(frontend, "lint"), job(frontend, "build"), job(frontend, "test")]) {
     for (const step of source.split(/(?=^      - )/m)) {
       if (step.includes("source_status=")) guards.push(script(step));
     }
   }
-  assert.equal(guards.length, 7);
+  assert.equal(guards.length, 5);
   for (const shell of guards) {
     const run = (overrides = {}) => spawnSync("bash", ["-c", shell], { cwd: repo, encoding: "utf8", env: { ...process.env,
       PATH: `${bin}${path.delimiter}${process.env.PATH}`, REAL_GIT: realGit, FAIL_STATUS: "0",
@@ -205,96 +190,57 @@ test("source guards propagate Git inspection errors and reject dirty or mismatch
   }
 });
 
+const pythonBody = (body, delimiter) => body.split(`<<'${delimiter}'\n`)[1].split(`\n${delimiter}`)[0];
 
-function assertSharedBuild(source) {
-  assert.doesNotMatch(source, /^  dev-build:|^    name: Dev Build$/m);
-  assert.equal((source.match(/^    name: Test$/gm) || []).length, 1);
-  const build = job(source, "test");
-  const [settings, ...steps] = build.split(/(?=^      - )/m);
-  assert.match(settings, /^    name: Test$/m);
-  assert.match(settings, /^    if: always\(\) && !cancelled\(\)$/m);
-  assert.match(settings, /^    needs: \[validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
-  assert.ok(settings.includes("timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"));
-  assert.doesNotMatch(settings, /^    continue-on-error:/m);
-  assert.doesNotMatch(build, /cargo build/);
-  assert.match(build, /test "\$E2E_RESULT" = success/);
-  assert.doesNotMatch(build, /continue-on-error:|\|\| true|\|\| exit 0/);
-  assert.doesNotMatch(build, /^          ref:/m, "retain the actual event merge source");
-  for (const name of ["Test CI workflow policy", "Check formatting", "Require all crate tests and the SSH fixture"]) {
-    const step = steps.find((item) => item.startsWith(`      - name: ${name}\n`));
-    assert.ok(step);
-    assert.ok(step.includes("if: needs.validation-source.outputs.full == 'true'"));
-
-  }
-  const admission = steps.find((step) => step.startsWith("      - name: Require validation admission\n"));
-  assert.equal(steps.indexOf(admission), 0);
-  assert.doesNotMatch(admission, /^        (?:if|continue-on-error):/m);
-}
-
-test("one required Test requires successful Unit, E2E and SSH jobs", () => {
-  assertSharedBuild(ci);
-  for (const [from, to] of [
-    ["name: Test\n", "name: Dev Build\n"],
-    ['test "$E2E_RESULT" = success', 'true'],
-    ["needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]", "needs: quick-checks"],
-    ["name: Test CI workflow policy\n        if: needs.validation-source.outputs.full == 'true'", "name: Test CI workflow policy"],
-    ["name: Check formatting\n        if: needs.validation-source.outputs.full == 'true'", "name: Check formatting"],
-    ["name: Require all crate tests and the SSH fixture\n        if: needs.validation-source.outputs.full == 'true'", "name: Require all crate tests and the SSH fixture"],
-  ]) assert.throws(() => assertSharedBuild(ci.replace(from, to)), `reject ${to}`);
+test("main deploys only the retained accepted feature site and never recompiles missing docs", t => {
+  const docs = read(".github/workflows/docs.yml"), producer = job(ci, "docs");
+  assert.doesNotMatch(docs, /cargo |rust-toolchain|rust-cache|pull_request:/);
+  assert.match(producer, /cargo doc --no-deps --all-features --document-private-items/);
+  assert.match(producer, /name: documentation-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}/);
+  const steps = docs.split(/(?=^      - )/m), locate = pythonBody(script(steps.find(s => s.includes("name: Locate the accepted"))), "PYDOC");
+  const verify = pythonBody(script(steps.find(s => s.includes("name: Verify the accepted"))), "PYDOC");
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-ci-docs-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(directory, "doc"));
+  const repository = "bigduu/Bamboo-agent", main = "a".repeat(40), cut = "b".repeat(40), head = "c".repeat(40), tree = "d".repeat(40);
+  const pr = (base, merge, ref, sha) => ({ number: 29, merged_at: "2026-10-28T01:00:00Z", merge_commit_sha: merge, base: { ref: base }, head: { ref, sha, repo: { full_name: repository } } });
+  const routes = {
+    [`commits/${main}/pulls?per_page=100`]: [pr("main", main, "release/" + cut, cut)],
+    [`commits/${cut}/pulls?per_page=100`]: [pr("dev", cut, "feature/example", head)],
+    [`actions/workflows/ci.yml/runs?event=pull_request&head_sha=${head}&status=success&per_page=100`]: { workflow_runs: [{ id: 123, run_attempt: 2, head_sha: head, event: "pull_request", conclusion: "success", head_repository: { full_name: repository }, updated_at: "2026-10-28T00:59:00Z" }] },
+    "actions/runs/123/artifacts?per_page=100": { total_count: 1, artifacts: [{ name: "documentation-123-1", expired: false }] },
+  };
+  const output = path.join(directory, "outputs"), env = { ...process.env, GITHUB_REPOSITORY: repository, GITHUB_SHA: main, GITHUB_OUTPUT: output,
+    EXPECTED_RUN: "123", EXPECTED_ATTEMPT: "1", EXPECTED_PR: "29", EXPECTED_HEAD: head, EXPECTED_TREE: tree };
+  const run = (body, model = routes) => spawnSync("python3", ["-c", `import json, subprocess, sys\npayload=json.load(sys.stdin)\ndef read(args, **kwargs):\n    if args[0]=='gh': return json.dumps(payload['routes'][args[-1].split('/', 3)[3]])\n    assert args==['git', 'rev-parse', '${cut}^{tree}']\n    return '${tree}\\n'\nsubprocess.check_output=read\nsubprocess.check_call=lambda args: 0 if args==['git', 'merge-base', '--is-ancestor', '${cut}', '${main}'] else sys.exit(1)\nexec(compile(payload['body'], '<actual-docs-workflow>', 'exec'))`], { cwd: directory, env, encoding: "utf8", input: JSON.stringify({ body, routes: model }) });
+  assert.equal(run(locate).status, 0);
+  assert.match(fs.readFileSync(output, "utf8"), /run=123\nattempt=1\nartifact=documentation-123-1/);
+  for (const mutate of [
+    model => { model[`commits/${main}/pulls?per_page=100`][0].head.sha = head; },
+    model => { model[`commits/${cut}/pulls?per_page=100`] = []; },
+    model => { Object.values(model).find(value => value.workflow_runs).workflow_runs[0].conclusion = "failure"; },
+    model => { model["actions/runs/123/artifacts?per_page=100"].artifacts[0].expired = true; },
+    model => { model["actions/runs/123/artifacts?per_page=100"].artifacts = []; },
+  ]) { const model = structuredClone(routes); mutate(model); assert.notEqual(run(locate, model).status, 0); }
+  const original = { GITHUB_REPOSITORY: repository, GITHUB_SHA: "e".repeat(40), GITHUB_RUN_ID: "123", GITHUB_RUN_ATTEMPT: "1", PR_NUMBER: "29", PR_HEAD_SHA: head, tree };
+  const check = source => { fs.writeFileSync(path.join(directory, "doc/_bamboo-ci-source.json"), JSON.stringify(source)); return run(verify); };
+  assert.equal(check(original).status, 0);
+  for (const field of Object.keys(original)) assert.notEqual(check({ ...original, [field]: "changed" }).status, 0, field);
 });
 
-test("required Test admits only successful feature execution or the matching legacy release/main proof", () => {
-  const shell = script(job(ci, "test").split("      - uses:")[0]);
-  const run = (overrides = {}) => spawnSync("bash", ["-c", shell], { encoding: "utf8", env: { ...process.env,
-    SOURCE_RESULT: "success", FULL_VALIDATION: "false", FEATURE_VALIDATION: "true", FEATURE_RESULT: "success",
-    QUICK_RESULT: "success", NATIVE_RESULT: "success", MAIN_ADMISSION_RESULT: "success",
-    GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev", GITHUB_REF: "refs/pull/1/merge", ...overrides } });
-  for (const overrides of [{}, { GITHUB_BASE_REF: "main", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false" },
-    { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false" },
-    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", FEATURE_VALIDATION: "false" }]) assert.equal(run(overrides).status, 0);
-  for (const field of ["SOURCE_RESULT", "FEATURE_RESULT", "QUICK_RESULT", "NATIVE_RESULT"]) {
-    for (const value of ["failure", "cancelled", "skipped", "", "unknown"]) assert.notEqual(run({ [field]: value }).status, 0);
-  }
-  for (const overrides of [
-    { FULL_VALIDATION: "true" }, { FULL_VALIDATION: "" }, { FEATURE_VALIDATION: "false" },
-    { GITHUB_BASE_REF: "main" }, { GITHUB_BASE_REF: "integration/batch" },
-    { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "" },
-    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/dev" },
-    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main" },
-    ...["failure", "cancelled", "skipped", "", "unknown"].map(MAIN_ADMISSION_RESULT => ({ GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", FEATURE_VALIDATION: "false", MAIN_ADMISSION_RESULT })),
-    { GITHUB_EVENT_NAME: "pull_request_target" }, { GITHUB_EVENT_NAME: "unknown" },
-  ]) assert.notEqual(run(overrides).status, 0);
-});
-
-test("required E2E rejects failed or skipped native feature ownership", () => {
-  const shell = script(job(ci, "e2e-test"));
-  const run = (overrides = {}) => spawnSync("bash", ["-c", shell], { encoding: "utf8", env: { ...process.env,
-    FEATURE_VALIDATION: "true", FEATURE_RESULT: "success", NATIVE_RESULT: "success", CRATE_RESULT: "success", SSH_RESULT: "success", ...overrides } });
+test("main promotion requires an unchanged cut and completed three-platform release", () => {
+  const body = pythonBody(script(job(ci, "promotion-source")), "PYTHON"), sha = "a".repeat(40), dev = "b".repeat(40);
+  const release = { id: 4, tag_name: "v2026.10.28", target_commitish: sha, draft: false, prerelease: false, published_at: "2026-10-28T00:00:00Z",
+    assets: ["bamboo-aarch64-apple-darwin", "bamboo-x86_64-unknown-linux-gnu", "bamboo-x86_64-pc-windows-msvc.exe", "bamboo-sidecars-v2.json", "bamboo-executables-provenance-v2.json", "release-provenance.json"].map(name => ({ name, state: "uploaded", size: 1 })) };
+  const routes = { [`branches/release%2F${sha}`]: { name: "release/" + sha, commit: { sha } }, "branches/dev": { name: "dev", protected: true, commit: { sha: dev } },
+    [`compare/${sha}...${sha}`]: { status: "identical", base_commit: { sha }, merge_base_commit: { sha } },
+    [`compare/${sha}...${dev}`]: { status: "ahead", base_commit: { sha }, merge_base_commit: { sha } },
+    "releases?per_page=100": [release], "releases/4": release, "git/ref/tags/v2026.10.28": { object: { type: "commit", sha } } };
+  const run = (model = routes, override = {}) => spawnSync("python3", ["-c", "import io,json,sys,urllib.request\npayload=json.load(sys.stdin)\nclass Opener:\n def open(self,request,timeout): return io.StringIO(json.dumps(payload['routes'][request.full_url.split('/',6)[6]]))\nurllib.request.build_opener=lambda *args: Opener()\nexec(compile(payload['body'],'<actual-promotion-workflow>','exec'))"], { encoding: "utf8", input: JSON.stringify({ body, routes: model }), env: { ...process.env, GITHUB_REPOSITORY: "bigduu/Bamboo-agent", HEAD_REPOSITORY: "bigduu/Bamboo-agent", GH_TOKEN: "inert-fixture", HEAD_REF: "release/" + sha, HEAD_SHA: sha, ...override } });
   assert.equal(run().status, 0);
-  assert.equal(run({ FEATURE_VALIDATION: "false", FEATURE_RESULT: "skipped", NATIVE_RESULT: "skipped" }).status, 0);
-  for (const field of ["FEATURE_RESULT", "NATIVE_RESULT"]) for (const value of ["failure", "cancelled", "skipped", "", "unknown"]) {
-    assert.notEqual(run({ [field]: value }).status, 0, field + ":" + value);
+  assert.notEqual(run(routes, { HEAD_SHA: dev }).status, 0);
+  for (const mutate of [model => { model["releases/4"].draft = true; }, model => { model["releases/4"].assets.pop(); },
+    model => { model["git/ref/tags/v2026.10.28"].object.sha = dev; }, model => { model["branches/dev"].protected = false; }]) {
+    const model = structuredClone(routes); mutate(model); assert.notEqual(run(model).status, 0);
   }
-  for (const field of ["CRATE_RESULT", "SSH_RESULT"]) assert.notEqual(run({ FEATURE_VALIDATION: "false", [field]: "skipped" }).status, 0);
-});
-
-test("feature execution shares owned outputs across explicit configurations and excludes duplicate Linux fixtures", () => {
-  const feature = job(ci, "feature-tests");
-  assert.match(feature, /if: needs.validation-source.outputs.feature == 'true'/);
-  assert.match(feature, /CARGO_TARGET_DIR: \$\{\{ github.workspace \}\}\/target\/feature-tests/);
-  assert.match(feature, /run: node scripts\/run-feature-tests.cjs/);
-  assert.match(feature, /node scripts\/frontend-package.cjs verify/);
-  assert.doesNotMatch(feature, /cargo build|cargo test|continue-on-error|secrets\./);
-  const recorder = job(ci, "tool-event-recorder-e2e");
-  assert.match(recorder, /^    if: needs.validation-source.outputs.full == 'true'$/m);
-  const native = job(ci, 'native-feature-tests');
-  assert.match(native, /os: \[windows-2025, macos-latest\]/);
-  assert.match(native, /run: node scripts\/native-test-owner.cjs/);
-  assert.match(native, /PR_HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}/);
-  assert.doesNotMatch(native, /secrets\.|continue-on-error|cargo test/);
-  assert.equal(fs.existsSync('.github/workflows/orchestration-native-recovery.yml'), false);
-  assert.equal(fs.existsSync('.github/workflows/scoped-context-view.yml'), false);
-  const identity = fs.readFileSync('.github/workflows/jiandu-project-source.yml', 'utf8');
-  assert.match(identity, /cargo metadata --locked --all-features/);
-  assert.doesNotMatch(identity, /cargo (test|clippy|build)/);
 });
