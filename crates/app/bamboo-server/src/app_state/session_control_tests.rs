@@ -318,7 +318,12 @@ impl Fixture {
     }
 
     async fn followup_arguments(&self, operation: &str, message: &str) -> Value {
-        let cached = self.followup_targets.lock().unwrap().get(operation).cloned();
+        let cached = self
+            .followup_targets
+            .lock()
+            .unwrap()
+            .get(operation)
+            .cloned();
         let target_ref = if let Some(cached) = cached {
             cached
         } else {
@@ -357,7 +362,10 @@ impl Fixture {
             .await
             .unwrap()
             .unwrap();
-        let arguments = self.followup_arguments(operation, message).await.to_string();
+        let arguments = self
+            .followup_arguments(operation, message)
+            .await
+            .to_string();
         let call = ToolCall {
             id: format!("call-{operation}"),
             tool_type: "function".into(),
@@ -377,7 +385,9 @@ impl Fixture {
             .clone()
             .unwrap_or_else(|| self.state.tools_for(ToolSurface::Root));
         bamboo_agent_core::tools::with_executing_session_caller(
-            Some(Arc::new(bamboo_domain::SessionCallerReference::from(&supervisor))),
+            Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+                &supervisor,
+            ))),
             tools.execute_with_context_outcome(&call, ctx),
         )
         .await
@@ -629,7 +639,13 @@ async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_st
             .detach(&f.reference, scope.state_revision, TARGET)
             .await
             .unwrap();
-        assert!(service.inspect_link(&f.reference, TARGET).await.unwrap().authorized);
+        assert!(
+            service
+                .inspect_link(&f.reference, TARGET)
+                .await
+                .unwrap()
+                .authorized
+        );
         let observed = f
             .followup_targets
             .lock()

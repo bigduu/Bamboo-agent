@@ -87,7 +87,10 @@ async fn owner_scope_cas_is_explicit_restartable_and_does_not_initialize_work() 
     assert_eq!(observed["scope"]["state_revision"], 0);
     assert_eq!(observed["scope"]["allowed_projects"], json!([]));
     assert_eq!(observed["code"], "current_user_scope_ready");
-    assert_eq!(observed["management_access"]["requires_project_authorization"], false);
+    assert_eq!(
+        observed["management_access"]["requires_project_authorization"],
+        false
+    );
     let request = f.update(0, vec![f.project.clone()]);
     let (status, configured) = f.call(Method::PUT, Some(request.clone())).await;
     assert_eq!(status, StatusCode::OK, "{configured}");

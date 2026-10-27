@@ -253,7 +253,10 @@ async fn supervisor_followup_exact_retry_survives_activation_failure_reopen_and_
     assert_eq!(after_ack["receipt_id"], pending["receipt_id"]);
     assert_eq!(inbox.inspect("a").await.unwrap().pending, 0);
     assert!(tool
-        .invoke(f.args("a", "operation-1", "Different payload"), f.ctx.clone())
+        .invoke(
+            f.args("a", "operation-1", "Different payload"),
+            f.ctx.clone()
+        )
         .await
         .is_err());
     let history = SessionInspectorTool::new(store.clone(), store.clone());

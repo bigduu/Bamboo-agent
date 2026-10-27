@@ -146,7 +146,10 @@ async fn native_host_reserves_before_calls_and_blocks_exhausted_continuation() {
             initial_supervisor.root_orchestration_only_enabled(),
             initial_ultra
         );
-        assert_eq!(initial_supervisor.supervisor_orchestration_revision(), Some(1));
+        assert_eq!(
+            initial_supervisor.supervisor_orchestration_revision(),
+            Some(1)
+        );
         let manifest = state
             .project_store
             .create("Native token budget", None)

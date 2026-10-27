@@ -603,10 +603,9 @@ async fn token_budget_unknown_model_and_revoked_root_block_before_provider() {
         .get_or_create_default_supervisor("fixture-model")
         .await
         .unwrap();
-    let (mut foreign_binding, _) =
-        verified_scope_binding(&foreign_storage, &bootstrap.session_id)
-            .await
-            .unwrap();
+    let (mut foreign_binding, _) = verified_scope_binding(&foreign_storage, &bootstrap.session_id)
+        .await
+        .unwrap();
     foreign_binding.binding_revision = 7;
     assert_eq!(
         foreign_binding.supervisor_session_id,
