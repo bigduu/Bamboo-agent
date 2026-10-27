@@ -393,3 +393,135 @@ test("Controller2354 locator accepts only a controller source locator without re
   for(const extra of [{releaseRun:900},{version:"2026.10.27"},{controlPaths:["src/lib.rs"]},{approved:true}])
     assert.throws(()=>proof.mainLocator(text({...value,...extra})));
 });
+function controllerFixture(){
+  const f=frozenSourceFixture(),D=f.input.sourceRevision,B=C,F="a".repeat(40),M="0".repeat(40),baseTree="8".repeat(40),headTree="9".repeat(40);
+  const file=(path,bytes)=>({path,mode:"100644",type:"blob",sha:oid(bytes)});
+  for(const name of proof.MAIN_CONTROLS)if(!(name in f.files[D]))f.files[D][name]="inert accepted D control "+name;
+  f.files[D][proof.MAIN_WORKFLOW]=readFileSync(path.join(__dirname,"..",proof.MAIN_WORKFLOW),"utf8");
+  f.files[B]=Object.fromEntries(proof.MAIN_CONTROLS.map(name=>[name,name===proof.MAIN_WORKFLOW?f.files[D][name]:"trusted B control "+name]));
+  const product={"src/lib.rs":"stable product","Cargo.toml":'version = "0.0.0"',"Cargo.lock":"stable lock",
+    "scripts/frontend-package-lock.json":"stable locked frontend","frontend/zip":"stable published frontend bytes"};
+  const base=new Map([...Object.entries(f.files[B]),...Object.entries(product)].map(([name,bytes])=>[name,file(name,bytes)]));
+  base.set("vendor/module",{path:"vendor/module",mode:"160000",type:"commit",sha:"7".repeat(40)});
+  base.set("bin/launch",{path:"bin/launch",mode:"100755",type:"blob",sha:"6".repeat(40)});
+  const selected=new Map(Object.entries(f.files[D]).map(([name,bytes])=>[name,file(name,bytes)]));
+  selected.set("src/lib.rs",file("src/lib.rs","unreleased D product; never copied"));
+  selected.set("new-product.rs",file("new-product.rs","unreleased new file; never copied"));
+  const head=new Map(base);for(const name of proof.MAIN_CONTROLS)head.set(name,selected.get(name));
+  const rows=(sha,map)=>({sha,truncated:false,tree:clone([...map.values()])});
+  const routes=new Map([["git/commits/"+B,{sha:B,tree:{sha:baseTree},parents:[{sha:anchor}]}],
+    ["git/commits/"+F,{sha:F,tree:{sha:headTree},parents:[{sha:B}]}],["git/commits/"+M,{sha:M,tree:{sha:headTree},parents:[{sha:B},{sha:F}]}],
+    ["git/trees/"+baseTree+"?recursive=1",rows(baseTree,base)],["git/trees/"+f.accepted.tree.sha+"?recursive=1",rows(f.accepted.tree.sha,selected)],
+    ["git/trees/"+headTree+"?recursive=1",rows(headTree,head)]]);
+  f.main.protection={required_status_checks:{enforcement_level:"everyone",contexts:[proof.MAIN_JOB],checks:[{context:proof.MAIN_JOB,app_id:15368}]}};
+  const locator={mode:"controller",sourceRevision:D,featurePr:f.input.featurePr,ciRun:f.input.ciRun};
+  const pr={number:88,state:"open",merged:false,draft:false,mergeable:true,merge_commit_sha:M,
+    body:"<!-- bamboo-main-locator/v1\n"+JSON.stringify(locator)+"\n-->",base:{ref:"main",sha:B,repo:clone(f.run.repository)},head:{ref:"controller/test",sha:F,repo:clone(f.run.repository)}};
+  const original=f.reads,state={afterRead:null,counts:new Map(),logReads:[]},calls=[];
+  const reads={...original,json:async route=>{
+    calls.push(route);const n=(state.counts.get(route)||0)+1;state.counts.set(route,n);let value;
+    if(route==="")value={id:1164779771,full_name:source.REPOSITORY,default_branch:"main"};
+    else if(route==="pulls/88")value=pr;
+    else if(routes.has(route))value=routes.get(route);
+    else value=await original.json(route);
+    value=clone(value);if(state.afterRead)state.afterRead(route,value,n);return value;
+  },jobLog:async id=>{state.logReads.push(id);return original.jobLog(id)}};
+  const input={sourceRevision:D,featurePr:f.input.featurePr,ciRun:f.input.ciRun,pullRequest:88,baseRevision:B,headRevision:F,snapshotRevision:M};
+  return {f,D,B,F,M,baseTree,headTree,base,selected,head,routes,pr,locator,state,reads,calls,input,
+    verify:()=>proof.verifyControllerMaintenance(input,reads,f.policy),updateSelected:()=>routes.set("git/trees/"+f.accepted.tree.sha+"?recursive=1",rows(f.accepted.tree.sha,selected))};
+}
+test("Controller2354 copies complete accepted D controls and preserves every B product/version/lock/gitlink/mode",async()=>{
+  const f=controllerFixture(),result=await f.verify();
+  assert.equal(result.kind,proof.CONTROLLER_KIND);assert.equal(result.publicationAuthorized,false);
+  assert.equal(result.controllerSource.revision,f.D);assert.equal(result.controllerSource.featureSnapshotRevision,fixtures.identities.M);
+  assert.equal(result.maintenance.baseProductTree,f.baseTree);assert.equal(result.maintenance.snapshotRevision,f.M);
+  assert.notEqual(f.M,fixtures.identities.M);assert.ok(f.f.calls.includes("pulls/2333"));
+  assert.equal(new Set(f.state.logReads).size,f.state.logReads.length,"Only immutable original logs may be reused across final fresh Source proof");
+  assert.ok(!f.calls.some(route=>/^(releases|git\/ref\/tags|branches\/release)/.test(route)),"Maintenance needs no frozen ref, artifact or publication");
+  for(const [name,entry]of f.base)if(!proof.MAIN_CONTROLS.includes(name))assert.deepEqual(f.head.get(name),entry);
+  assert.equal(f.head.has("new-product.rs"),false);
+});
+for(const fault of ["product","version","lock","frontend-lock","frontend-bytes","gitlink","mode","new-product","partial-controls","missing-control","symlink-control",
+  "B-control-missing","M-parents","M-tree","no-B-history","unknown-Main-entrypoint","unknown-recipe","unknown-helper","unmerged-D","failed-source-job","source-rerun",
+  "head-race","locator-race","base-race","dev-rewrite","default-dev","required-app","caller-paths","release-locator"])
+test("Controller2354 rejects "+fault,async()=>{
+  const f=controllerFixture(),rows=f.routes.get("git/trees/"+f.headTree+"?recursive=1").tree;
+  const change=name=>rows.find(row=>row.path===name).sha="1".repeat(40);
+  if(fault==="product")change("src/lib.rs");if(fault==="version")change("Cargo.toml");if(fault==="lock")change("Cargo.lock");
+  if(fault==="frontend-lock")change("scripts/frontend-package-lock.json");if(fault==="frontend-bytes")change("frontend/zip");if(fault==="gitlink")change("vendor/module");
+  if(fault==="mode")rows.find(row=>row.path==="bin/launch").mode="100644";
+  if(fault==="new-product")rows.push({path:"new-product.rs",mode:"100644",type:"blob",sha:"1".repeat(40)});
+  if(fault==="partial-controls")change(proof.MAIN_CONTROLS[3]);
+  if(fault==="missing-control"){const tree=f.routes.get("git/trees/"+f.f.accepted.tree.sha+"?recursive=1").tree;tree.splice(tree.findIndex(row=>row.path===proof.MAIN_CONTROLS[1]),1)}
+  if(fault==="symlink-control")f.routes.get("git/trees/"+f.f.accepted.tree.sha+"?recursive=1").tree.find(row=>row.path===proof.MAIN_WORKFLOW).mode="120000";
+  if(fault==="B-control-missing")f.routes.get("git/trees/"+f.baseTree+"?recursive=1").tree.shift();
+  if(fault==="M-parents")f.routes.get("git/commits/"+f.M).parents.reverse();
+  if(fault==="M-tree")f.routes.get("git/commits/"+f.M).tree.sha=f.baseTree;
+  if(fault==="no-B-history")f.state.afterRead=(route,value)=>{if(route===`compare/${f.B}...${f.F}`)value.status="diverged"};
+  if(fault==="unknown-Main-entrypoint")f.f.files[f.D][proof.MAIN_WORKFLOW]+="\n# unregistered entrypoint version";
+  if(fault==="unknown-recipe")f.f.files[fixtures.identities.F][source.WORKFLOW]+="\n# unknown recipe";
+  if(fault==="unknown-helper")f.f.files[fixtures.identities.M][source.REQUIRED_HELPERS[0]]+="drift";
+  if(fault==="unmerged-D")f.f.pr.merged=false;
+  if(fault==="failed-source-job")f.f.latest[2].conclusion="failure";
+  if(fault==="source-rerun")f.state.afterRead=(route,value,n)=>{if(route==="actions/runs/123"&&n>2)value.run_attempt++};
+  if(fault==="head-race")f.state.afterRead=(route,value,n)=>{if(route==="pulls/88"&&n>1)value.head.sha=f.D};
+  if(fault==="locator-race")f.state.afterRead=(route,value,n)=>{if(route==="pulls/88"&&n>1)value.body=value.body.replace('"ciRun":123','"ciRun":124')};
+  if(fault==="base-race")f.state.afterRead=(route,value,n)=>{if(route==="branches/main"&&n>1)value.commit.sha=f.D};
+  if(fault==="dev-rewrite")f.state.afterRead=(route,value,n)=>{
+    if(route==="branches/dev"&&n>=2)value.commit.sha=n===2?"7".repeat(40):"8".repeat(40);
+    if(route===`compare/${"7".repeat(40)}...${"8".repeat(40)}`)value.status="diverged";
+  };
+  if(fault==="default-dev")f.state.afterRead=(route,value)=>{if(route==="")value.default_branch="dev"};
+  if(fault==="required-app")f.f.main.protection.required_status_checks.checks[0].app_id=99;
+  if(fault==="caller-paths")f.f.policy.controlPaths=["src/lib.rs"];
+  if(fault==="release-locator")f.pr.body=f.pr.body.replace('"ciRun":123','"ciRun":123,"releaseRun":900');
+  await assert.rejects(f.verify());
+});
+test("Controller2354 permits normal dev advancement while keeping original D and Source execution",async()=>{
+  const f=controllerFixture();f.state.afterRead=(route,value,n)=>{if(route==="branches/dev"&&n>=2)value.commit.sha=n===2?"7".repeat(40):"8".repeat(40)};
+  assert.equal((await f.verify()).controllerSource.revision,f.D);
+});
+test("Controller2354 default registry stays inactive and production readers receive no caller authority",async()=>{
+  const f=controllerFixture();await assert.rejects(proof.verifyControllerMaintenance(f.input,f.reads),/inactive/);
+  assert.deepEqual(source.ACCEPTED_PRODUCERS,{});assert.deepEqual(proof.ACCEPTED_RELEASE_PRODUCERS,{});
+});
+test("Controller2354 registration first permits known P0 controls then explicitly known P1 without unknown fallback",async()=>{
+  const before=controllerFixture(),registryFile="scripts/frozen-source-admission.cjs";
+  // Inert future-registration control text, copied as data. P0 definition/helpers stay unchanged.
+  before.f.files[before.D][registryFile]="// P0 + reviewed P1 registration; not executed fixture code";
+  const changed={path:registryFile,mode:"100644",type:"blob",sha:oid(before.f.files[before.D][registryFile])};
+  for(const map of [before.selected,before.head])map.set(registryFile,changed);
+  for(const tree of [before.f.accepted.tree.sha,before.headTree])before.routes.get("git/trees/"+tree+"?recursive=1").tree.find(row=>row.path===registryFile).sha=changed.sha;
+  assert.equal((await before.verify()).controllerSource.revision,before.D);
+  const next=controllerFixture(),text=fixtures.workflowText+"# explicitly reviewed P1\n",helper=source.REQUIRED_HELPERS[0],helperText=fixtures.helperText+"// reviewed P1 helper\n";
+  for(const ref of [fixtures.identities.F,fixtures.identities.M,next.D]){next.f.files[ref][source.WORKFLOW]=text;next.f.files[ref][helper]=helperText}
+  for(const [name,bytes]of[[source.WORKFLOW,text],[helper,helperText]]){
+    const entry={path:name,mode:"100644",type:"blob",sha:oid(bytes)};
+    next.selected.set(name,entry);if(proof.MAIN_CONTROLS.includes(name))next.routes.get("git/trees/"+next.headTree+"?recursive=1").tree.find(row=>row.path===name).sha=entry.sha;
+  }
+  next.updateSelected();await assert.rejects(next.verify(),/Unknown|incomplete/);
+  const contract=clone(next.f.contract);contract.helpers[helper]=hash(Buffer.from(helperText));
+  next.f.policy.producers[hash(Buffer.from(text))]=contract; // Trusted B1 fixture registration, never PR policy or a live producer.
+  assert.equal((await next.verify()).controllerSource.revision,next.D);
+  const pinned=controllerFixture();pinned.f.contract.helpers[registryFile]=hash(Buffer.from("old pinned validator"));
+  pinned.f.files[fixtures.identities.M][registryFile]=pinned.f.files[pinned.D][registryFile];
+  await assert.rejects(pinned.verify(),/helper/); // Registration-first is blocked if P0 pins the changed registration helper.
+});
+test("Controller2354 distinct controller frame cannot satisfy publication or merged promotion proof",async()=>{
+  const f=controllerFixture(),facts=await f.verify(),m=await mergedFixture();
+  const record={...facts,repository:{id:1164779771,fullName:source.REPOSITORY},locatorSha256:hash(Buffer.from(core.canonicalJson(f.locator))),
+    execution:{revision:f.B,metadataRevision:f.F,workflowPath:proof.MAIN_WORKFLOW,workflowId:701,runId:700,physicalAttempt:1,jobId:703,checkSuiteId:702,checkSuiteNodeId:"CS_inert_main"}};
+  const line=clock(499)+" "+proof.controllerFrameLine(record);assert.deepEqual(proof.controllerLogFrame(line),record);
+  const forbidden=value=>Object.entries(value).some(([key,value])=>["release","releaseRun","version","tag"].includes(key)||(value&&typeof value==="object"&&forbidden(value)));
+  assert.equal(forbidden(record),false);assert.throws(()=>proof.logFrame(line));
+  const before=m.f.calls.length;m.state.log=line;m.f.state.extraPr.body=f.pr.body;
+  await assert.rejects(m.verify(),/frame/);assert.ok(!m.f.calls.slice(before).some(route=>route.startsWith("releases/")));
+  await assert.rejects(proof.verifyPublishedSource(record,f.reads),/fields/);
+  assert.throws(()=>core.sourceDispatchContract(record,"700"));
+  for(const invalid of [{...record,release:{}},{...record,version:"2026.10.27"},{...record,publicationAuthorized:true},
+    {...record,controllerSource:{...record.controllerSource,releaseRun:900}}])assert.throws(()=>proof.controllerFrameLine(invalid));
+  assert.throws(()=>proof.controllerLogFrame(line+"\n"+line));
+  assert.throws(()=>proof.controllerLogFrame(proof.controllerFrameLine(record)));
+  assert.equal((await mergedFixture()).state.record.kind,proof.MAIN_KIND);
+  assert.equal((await (await mergedFixture()).verify()).kind,"bamboo-merged-main-promotion/v1");
+});

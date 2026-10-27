@@ -669,3 +669,72 @@ Original wrapper assets have a 1 MiB role. New Source intentionally accepts ZIP
 blobs only up to 16 MiB (and bounded JSON/base64 reads), while the legacy carrier
 supports up to 256 MiB. This child does not expand Source or claim larger ZIP
 admission. Hashes, Git blobs, asset IDs/size/digest and fresh rechecks remain strict.
+
+## Protected controller maintenance prepared by #2354
+
+`verifyControllerMaintenance` prepares a read-only control update path alongside
+release promotion. The actual Main workflow, check name, step and `9794` workflow
+digest remain unchanged. The same B execution validates both allowed modes;
+candidate D is read as Git/source evidence and is never executed by Main.
+
+```text
+<!-- bamboo-main-locator/v1
+{"mode":"controller","sourceRevision":"<D>","featurePr":123,"ciRun":456}
+-->
+```
+
+This locator is data. The real `verifyAcceptedDevFacts` must prove exact normal
+accepted dev D, original feature M/run/jobs, pinned known producer/helpers and
+enforced dev admission. Main authority/protection, current B, exact PR F/M and
+the immutable ordinary control trees are checked separately. The control branch
+inherits B; it need not import unreleased D product ancestry. F must equal the
+entire B tree overlaid with all fixed ordinary D controls, M.parents must be
+[B,F] and M.tree must equal F.tree. Every non-control B leaf/mode/gitlink remains
+exact, including Cargo placeholders/lock and committed frontend identity/bytes.
+Extra runtime files, partial controls, symlinks and candidate path policy fail.
+
+After reading the trees, the real Source verifier runs fresh again. Only original
+immutable job logs are memoized; mutable PR/run/jobs/suite/protection/refs are
+checked again. Source facts must remain stable while observed dev can advance
+normally; an intervening rewrite is rejected. The actual Main job and PR/locator
+are rechecked before emitting its bounded canonical controller-only record.
+
+The separate prefix is `Bamboo Main controller maintenance:` and kind is
+`bamboo-main-controller-maintenance/v1`. The record binds D/tree/feature M and
+Source-facts digest, preserved B product tree, B/F/Main M, complete controls and
+real physical execution. It contains no release, version or tag fields. The
+ordinary publication frame/parser, `verifyPublishedSource`,
+`verifyMergedPromotion` and the Source-dispatch discriminator cannot consume
+this controller record as product publication. A green Main Admission name is
+not a downstream release proof. Legacy bootstrap stays outside the normal CLI.
+
+Recipe changes use the existing Source registry in two stages, not a new trust
+store. Let Main B0 know complete recipe P0. D1 still runs and passes P0 with the
+same pinned helpers, while carrying reviewed P1 definition/helper registration
+as dormant control data. B0 can verify D1 under P0 and maintain its full controls
+to B1. Only then may D2 switch to P1, earn its real feature evidence, and be
+verified by B1. An unknown P1 before registration fails. If P0 pins a helper that
+D1 must change (including the registration module), D1 cannot pass that known
+recipe: stop and split a focused registration/compatibility unit. Do not loosen
+pins or add an unknown-helper/JSON-approval fallback. Fixture policies in tests
+do not activate a producer; both real registries remain empty in this child.
+
+This bounded path retains the known Main entrypoint/frame version. Changing that
+workflow/hash/schema, or adding control paths, requires a separate explicit
+historical-proof/closure contract. Docs/Docker control paths will be added only
+by the owning reviewed cutover; this child edits neither consumer. It normally
+inherits #2355's zero-argument public factory and `artifactBytes(id,max)` port without
+repeating its three tiny tests. Main default/protection/collision probes and
+legacy producer retirement remain separately pending Ops work. No compiler,
+package, browser, hosted dispatch, settings or publication runs here.
+
+Focused local validation:
+
+```bash
+node --test --test-name-pattern='^Controller2354' scripts/published-source-admission.test.cjs
+node --test --test-name-pattern='^Controller2354' scripts/main-admission.test.cjs
+node --test --test-name-pattern='^Controller2354 keeps' scripts/ci-policy.test.cjs
+```
+
+Keep the original locator RED and subsequent exact-source results. Tiny Git and
+inert API/registration-first fixtures prove contracts, not actual P0/P1 acceptance.

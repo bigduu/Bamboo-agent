@@ -22,6 +22,8 @@ const MAIN_WORKFLOW = ".github/workflows/main-admission.yml";
 const MAIN_WORKFLOW_SHA256 = "9794f9b3ca4398adc4e1da1eb4aca3ef3df05713d2fcc67a8085bbbd13240b5a";
 const MAIN_JOB = "Main Admission", MAIN_STEP = "Verify completed publication and exact Main postimage";
 const MAIN_PREFIX = "Bamboo Main admission: ", MAIN_KIND = "bamboo-main-admission/v1";
+const CONTROLLER_PREFIX = "Bamboo Main controller maintenance: ";
+const CONTROLLER_KIND = "bamboo-main-controller-maintenance/v1";
 // These are whole ordinary B controls, never a candidate-supplied path policy.
 // Legacy automatic Main compilers must be retired by the separate Ops cutover.
 const MAIN_CONTROLS = Object.freeze([MAIN_WORKFLOW, source.WORKFLOW, source.CONTROLLER,
@@ -331,12 +333,63 @@ async function verifyPromotion(input, reads, policy = {}) {
   same(prIdentity(await get("pulls/" + input.pullRequest)), prIdentity(pr)); assert.equal(await branch("main", true), B);
   return { ...facts, kind: "bamboo-main-promotion-facts/v1", promotion };
 }
+async function controllerTree(input, facts, reads) {
+  const { get, ancestor, blob } = source.sourceReads(reads, {});
+  const { baseRevision: B, headRevision: F, snapshotRevision: M } = input;
+  await ancestor(B, F); // A control branch inherits B, not unreleased D product history.
+  const commits = await Promise.all([B,F,M].map(sha => get("git/commits/" + revision(sha))));
+  commits.forEach((commit,i) => assert.equal(commit.sha, [B,F,M][i]));
+  same(commits[2].parents.map(parent => parent.sha), [B,F]);
+  const [base, controls, head, snapshot] = await Promise.all([commits[0].tree.sha, facts.source.tree, commits[1].tree.sha, commits[2].tree.sha].map(tree => treeLeaves(get, tree)));
+  closure(base); const selected = closure(controls), expected = new Map(base);
+  for (const { path, ...entry } of selected) expected.set(path, entry);
+  const key = map => core.canonicalJson([...map].sort(([a],[b]) => a.localeCompare(b)));
+  assert.equal(key(head), key(expected), "Controller maintenance changed stable product/lock/mode or copied partial controls");
+  assert.equal(key(snapshot), key(head), "Controller merge differs from the exact reviewed postimage");
+  // This bounded maintenance contract keeps the known entrypoint/frame version.
+  // New Main workflow versions require a separate explicit compatibility slice.
+  for (const ref of [B, facts.source.revision]) assert.equal((await blob(MAIN_WORKFLOW, ref)).sha256, MAIN_WORKFLOW_SHA256, "Unknown Main entrypoint; no helper fallback");
+  return { pullRequest: input.pullRequest, baseRevision: B, headRevision: F, snapshotRevision: M,
+    snapshotTree: commits[2].tree.sha, baseProductTree: commits[0].tree.sha, controlsSha256: digest(selected) };
+}
+async function verifyControllerMaintenance(input, reads, policy = {}) {
+  keys(input, ["sourceRevision", "featurePr", "ciRun", "pullRequest", "baseRevision", "headRevision", "snapshotRevision"]);
+  for (const field of ["sourceRevision", "baseRevision", "headRevision", "snapshotRevision"]) revision(input[field]);
+  for (const field of ["featurePr", "ciRun", "pullRequest"]) positive(input[field]);
+  assert.equal(policy.controlPaths, undefined, "Caller-selected control paths are forbidden");
+  const { get, ancestor } = source.sourceReads(reads, policy), B = input.baseRevision;
+  assert.equal(await mainAuthority(get), B);
+  const pr = await get("pulls/" + input.pullRequest);
+  assert.equal(pr.number, input.pullRequest); assert.equal(pr.state, "open"); assert.equal(pr.merged, false); assert.equal(pr.draft, false); assert.equal(pr.mergeable, true);
+  repo(pr.base.repo); repo(pr.head.repo); assert.equal(pr.base.ref, "main"); assert.equal(pr.base.sha, B);
+  assert.equal(pr.head.sha, input.headRevision); assert.equal(pr.merge_commit_sha, input.snapshotRevision);
+  assert.match(pr.head.ref, /^[A-Za-z0-9_./-]{1,255}$/);
+  const selected = { sourceRevision: input.sourceRevision, featurePr: input.featurePr, ciRun: input.ciRun };
+  const locator = { mode: "controller", ...selected }; same(mainLocator(pr.body), locator);
+  // Both reads use the real verifier. Only immutable original logs are memoized;
+  // mutable run/jobs/PR/protection/refs are freshly checked after tree reads.
+  const logs = new Map(), cached = { ...reads, jobLog: async id => {
+    if (!logs.has(id)) logs.set(id, Promise.resolve(reads.jobLog(id))); return logs.get(id);
+  } };
+  const facts = await source.verifyAcceptedDevFacts(selected, cached, policy);
+  const maintenance = await controllerTree(input, facts, reads);
+  const fresh = await source.verifyAcceptedDevFacts(selected, cached, policy);
+  const stable = value => { const copy = structuredClone(value); delete copy.source.devObservedBefore; delete copy.source.devObservedAfter; return copy; };
+  same(stable(fresh), stable(facts), "Controller Source facts changed during admission");
+  await ancestor(facts.source.devObservedAfter, fresh.source.devObservedBefore);
+  const current = await get("pulls/" + input.pullRequest);
+  same(prIdentity(current), prIdentity(pr)); assert.equal(current.mergeable, true); same(mainLocator(current.body), locator);
+  assert.equal(await mainAuthority(get), B);
+  return { schemaVersion: 1, kind: CONTROLLER_KIND, publicationAuthorized: false,
+    controllerSource: { revision: facts.source.revision, tree: facts.source.tree, featurePr: selected.featurePr, ciRun: selected.ciRun,
+      featureSnapshotRevision: facts.feature.snapshotRevision, sourceFactsSha256: digest(stable(facts)) }, maintenance };
+}
 function mainLocator(body) {
   assert.ok(typeof body === "string" && Buffer.byteLength(body) <= 128 * 1024);
   const matches = [...body.matchAll(/<!-- bamboo-main-locator\/v1\n([\s\S]*?)\n-->/g)];
   assert.equal(matches.length, 1, "Require one Main locator; PR text is data only");
   const value = JSON.parse(matches[0][1]);
-  assert.ok(["promotion", "bootstrap"].includes(value.mode));
+  assert.ok(["promotion", "bootstrap", "controller"].includes(value.mode));
   keys(value, ["mode", "sourceRevision", "featurePr", "ciRun", ...(value.mode === "promotion" ? ["releaseRun"] : [])]);
   revision(value.sourceRevision); positive(value.featurePr); positive(value.ciRun);
   if (value.mode === "promotion") positive(value.releaseRun);
@@ -352,14 +405,18 @@ async function mainAuthority(get) {
   same(checks.checks.filter(check => check.context === MAIN_JOB), [{ context: MAIN_JOB, app_id: 15368 }]);
   return revision(branch.commit?.sha);
 }
-function logFrame(log) {
+function canonicalLogFrame(log, prefix) {
   assert.ok(typeof log === "string" && Buffer.byteLength(log) <= 64 * 1024 * 1024);
-  const rows = log.split(/\r?\n/).filter(line => /^\d{4}-\d\d-\d\dT\S+Z /.test(line) && line.slice(line.indexOf(" ") + 1).startsWith(MAIN_PREFIX));
+  const rows = log.split(/\r?\n/).filter(line => /^\d{4}-\d\d-\d\dT\S+Z /.test(line) && line.slice(line.indexOf(" ") + 1).startsWith(prefix));
   assert.equal(rows.length, 1, "Missing or duplicate physical Main admission frame");
-  const encoded = rows[0].slice(rows[0].indexOf(MAIN_PREFIX) + MAIN_PREFIX.length);
+  const encoded = rows[0].slice(rows[0].indexOf(prefix) + prefix.length);
   assert.ok(/^[A-Za-z0-9+/]+={0,2}$/.test(encoded) && encoded.length <= 87384);
   const bytes = Buffer.from(encoded, "base64"); assert.ok(bytes.length <= 65536); assert.equal(bytes.toString("base64"), encoded);
   const value = JSON.parse(bytes.toString("utf8")); assert.equal(core.canonicalJson(value), bytes.toString("utf8"));
+  return value;
+}
+function logFrame(log) {
+  const value = canonicalLogFrame(log, MAIN_PREFIX);
   keys(value, ["schemaVersion", "kind", "publicationAuthorized", "repository", "locatorSha256", "source", "release", "promotion", "execution"]);
   assert.equal(value.schemaVersion, 1); assert.equal(value.kind, MAIN_KIND); assert.equal(value.publicationAuthorized, false);
   same(value.repository, { id: REPOSITORY_ID, fullName: source.REPOSITORY }); assert.match(value.locatorSha256, DIGEST);
@@ -369,11 +426,33 @@ function logFrame(log) {
   positive(value.promotion.pullRequest);
   for (const key of ["baseRevision", "headRevision", "snapshotRevision", "snapshotTree"]) revision(value.promotion[key]);
   assert.ok(["released-source", "complete-trusted-base"].includes(value.promotion.controlMode)); assert.match(value.promotion.controlsSha256, DIGEST);
-  keys(value.execution, ["revision", "metadataRevision", "workflowPath", "workflowId", "runId", "physicalAttempt", "jobId", "checkSuiteId", "checkSuiteNodeId"]);
-  revision(value.execution.revision); revision(value.execution.metadataRevision); assert.equal(value.execution.workflowPath, MAIN_WORKFLOW);
-  for (const key of ["workflowId", "runId", "physicalAttempt", "jobId", "checkSuiteId"]) positive(value.execution[key]);
-  assert.match(value.execution.checkSuiteNodeId, /^[A-Za-z0-9_=-]{1,128}$/);
+  executionFields(value.execution);
   return value;
+}
+function executionFields(value) {
+  keys(value, ["revision", "metadataRevision", "workflowPath", "workflowId", "runId", "physicalAttempt", "jobId", "checkSuiteId", "checkSuiteNodeId"]);
+  revision(value.revision); revision(value.metadataRevision); assert.equal(value.workflowPath, MAIN_WORKFLOW);
+  for (const key of ["workflowId", "runId", "physicalAttempt", "jobId", "checkSuiteId"]) positive(value[key]);
+  assert.match(value.checkSuiteNodeId, /^[A-Za-z0-9_=-]{1,128}$/);
+}
+function controllerLogFrame(log) {
+  const value = canonicalLogFrame(log, CONTROLLER_PREFIX);
+  keys(value, ["schemaVersion", "kind", "publicationAuthorized", "controllerSource", "maintenance", "repository", "locatorSha256", "execution"]);
+  assert.equal(value.schemaVersion, 1); assert.equal(value.kind, CONTROLLER_KIND); assert.equal(value.publicationAuthorized, false);
+  same(value.repository, { id: REPOSITORY_ID, fullName: source.REPOSITORY }); assert.match(value.locatorSha256, DIGEST);
+  keys(value.controllerSource, ["revision", "tree", "featurePr", "ciRun", "featureSnapshotRevision", "sourceFactsSha256"]);
+  for (const key of ["revision", "tree", "featureSnapshotRevision"]) revision(value.controllerSource[key]);
+  positive(value.controllerSource.featurePr); positive(value.controllerSource.ciRun); assert.match(value.controllerSource.sourceFactsSha256, DIGEST);
+  keys(value.maintenance, ["pullRequest", "baseRevision", "headRevision", "snapshotRevision", "snapshotTree", "baseProductTree", "controlsSha256"]);
+  positive(value.maintenance.pullRequest);
+  for (const key of ["baseRevision", "headRevision", "snapshotRevision", "snapshotTree", "baseProductTree"]) revision(value.maintenance[key]);
+  assert.match(value.maintenance.controlsSha256, DIGEST); executionFields(value.execution);
+  assert.equal(value.execution.revision, value.maintenance.baseRevision); assert.equal(value.execution.metadataRevision, value.maintenance.headRevision);
+  return value;
+}
+function controllerFrameLine(value) {
+  const line = CONTROLLER_PREFIX + Buffer.from(core.canonicalJson(value)).toString("base64");
+  controllerLogFrame("2000-01-01T00:00:00.000Z " + line); return line;
 }
 function mainFrameLine(value) {
   const line = MAIN_PREFIX + Buffer.from(core.canonicalJson(value)).toString("base64");
@@ -461,4 +540,5 @@ async function verifyMergedPromotion(input, reads, policy = {}) {
 }
 module.exports = { PREFIX, KIND, CONTROLLER_HELPERS, ACCEPTED_RELEASE_PRODUCERS, frame, assetReference, selectJobs, treeLeaves,
   verifyPublishedSource, verifyPromotion, MAIN_WORKFLOW, MAIN_WORKFLOW_SHA256, MAIN_JOB, MAIN_STEP, MAIN_PREFIX, MAIN_KIND,
-  MAIN_CONTROLS, closure, promotionTree, mainLocator, mainAuthority, logFrame, mainFrameLine, mainSuite, mainExecution, verifyMergedPromotion };
+  MAIN_CONTROLS, closure, promotionTree, mainLocator, mainAuthority, logFrame, mainFrameLine, mainSuite, mainExecution, verifyMergedPromotion,
+  CONTROLLER_PREFIX, CONTROLLER_KIND, controllerTree, verifyControllerMaintenance, controllerLogFrame, controllerFrameLine };

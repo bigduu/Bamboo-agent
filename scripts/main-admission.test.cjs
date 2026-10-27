@@ -196,3 +196,38 @@ test("Main2351 wrapper emits one frame only after successful proof and fresh run
   f.state.pr.head.sha = f.S;
   await assert.rejects(m.exports.executeMain(f.env, f.event, git.root, f.reads)); assert.equal(calls, 1);
 });
+test("Controller2354 trusted B wrapper dispatches only maintenance and emits a distinct source-only record", async t => {
+  const git=tiny(t),f=model(git.B),filename=path.join(__dirname,"main-admission.cjs");let calls=0;
+  const locator={mode:"controller",sourceRevision:f.S,featurePr:99,ciRun:100};
+  f.event.pull_request.body=f.state.pr.body=body(locator);
+  const normal=Module.createRequire(filename),m=new Module(filename,module);m.filename=filename;
+  m.require=name=>name==="./published-source-admission.cjs"?{...proof,
+    verifyPromotion:async()=>assert.fail("Controller mode cannot select publication"),
+    verifyControllerMaintenance:async function(input,reads){
+      assert.equal(arguments.length,2);assert.equal(reads,f.reads);assert.equal(input.releaseRun,undefined);assert.equal(input.baseRevision,git.B);calls++;
+      return {controllerSource:{revision:f.S,tree:h("e"),featurePr:99,ciRun:100,featureSnapshotRevision:h("3"),sourceFactsSha256:"d".repeat(64)},
+        maintenance:{pullRequest:88,baseRevision:git.B,headRevision:f.F,snapshotRevision:f.M,snapshotTree:h("9"),baseProductTree:h("8"),controlsSha256:"c".repeat(64)}};
+    }}:normal(name);
+  m._compile(fs.readFileSync(filename,"utf8"),filename);
+  const line=await m.exports.executeMain(f.env,f.event,git.root,f.reads),record=proof.controllerLogFrame("2026-10-27T00:00:00Z "+line);
+  assert.equal(calls,1);assert.equal(record.kind,proof.CONTROLLER_KIND);assert.equal(record.execution.revision,git.B);assert.equal(record.execution.metadataRevision,f.F);
+  assert.notEqual(record.controllerSource.featureSnapshotRevision,record.maintenance.snapshotRevision);
+  for(const field of ["release","releaseRun","version","tag","promotion"])assert.equal(field in record,false);
+  assert.throws(()=>proof.logFrame("2026-10-27T00:00:00Z "+line));
+  f.state.pr.body=body({...locator,ciRun:101});
+  await assert.rejects(m.exports.executeMain(f.env,f.event,git.root,f.reads),/Locator changed/);assert.equal(calls,1);
+});
+test("Controller2354 actual wrapper remains stopped by the empty producer registry without caller policy",async t=>{
+  const git=tiny(t),f=model(git.B);f.event.pull_request.body=f.state.pr.body=body({mode:"controller",sourceRevision:f.S,featurePr:99,ciRun:100});
+  await assert.rejects(controller.executeMain(f.env,f.event,git.root,f.reads),/inactive/);
+  assert.ok(!f.calls.some(route=>/^(?:releases|actions\/runs\/900|git\/ref\/tags)/.test(route)));
+});
+test("Controller2354 bootstrap stays outside the ordinary CLI and cross-mode policy cannot be injected",()=>{
+  const f=model();f.event.pull_request.body=body({mode:"bootstrap",sourceRevision:f.S,featurePr:99,ciRun:100});
+  assert.throws(()=>controller.eventIdentity(f.env,f.event),/one-time trusted-D Ops/);
+  assert.throws(()=>controller.createPublicReads({approved:true}),/no policy/);
+  for(const extra of [{releaseRun:900},{version:"2026.10.27"},{policy:{approved:true}}]){
+    f.event.pull_request.body=body({mode:"controller",sourceRevision:f.S,featurePr:99,ciRun:100,...extra});
+    assert.throws(()=>controller.eventIdentity(f.env,f.event));
+  }
+});

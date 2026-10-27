@@ -2748,3 +2748,12 @@ test("Main2351 workflow contract", () => {
   assert.deepEqual(admission.ACCEPTED_RELEASE_PRODUCERS, {})
   assert.deepEqual(frozenSource.ACCEPTED_PRODUCERS, {})
 })
+test("Controller2354 keeps the existing trusted Main workflow and no writer or recipe fallback",()=>{
+  const admission=require("./published-source-admission.cjs")
+  assert.equal(sourceHash(readFileSync(admission.MAIN_WORKFLOW)),"9794f9b3ca4398adc4e1da1eb4aca3ef3df05713d2fcc67a8085bbbd13240b5a")
+  assert.notEqual(admission.CONTROLLER_PREFIX,admission.MAIN_PREFIX)
+  assert.notEqual(admission.CONTROLLER_KIND,admission.MAIN_KIND)
+  assert.deepEqual(frozenSource.ACCEPTED_PRODUCERS,{})
+  assert.deepEqual(admission.ACCEPTED_RELEASE_PRODUCERS,{})
+  assert.equal((readFileSync("scripts/ci-policy.test.cjs","utf8").match(/^require\("\.\/main-admission\.test\.cjs"\)/gm)||[]).length,1)
+})

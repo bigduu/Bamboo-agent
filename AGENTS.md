@@ -294,3 +294,35 @@ frames stay 64 KiB. Wrapper assets stay 1 MiB. New Source accepts ZIP blobs only
 up to 16 MiB, despite the broader legacy frontend carrier. Keep all original
 hash/ID/size and fresh-read checks. Use the focused #2351 commands in the local
 guide; do not repeat historical Source or product suites for this loader.
+
+## Controller maintenance prepared by #2354
+
+Normal Main promotion retains B controls; the separate `controller` locator
+maintains those controls without moving unreleased product code to Main. It
+requires real accepted-dev D facts under a known complete producer, actual
+trusted default-Main B execution and the same fresh PR/Git identity checks.
+Only the entire fixed ordinary D closure replaces B controls. Every other B
+product, version, lock, frontend byte, mode and gitlink stays exact. A Main
+workflow/record version change or additional control/helper path needs its own
+explicit compatibility/closure review; do not infer a path list from D.
+
+Controller maintenance emits `Bamboo Main controller maintenance:` with kind
+`bamboo-main-controller-maintenance/v1`, independently of publication frames.
+It has no release/version/tag fields and grants no publication, Docs or Docker
+permission. Consumers still require a normally merged completed-release
+promotion. Ordinary CLI bootstrap remains forbidden; the fixed legacy Ops
+bootstrap is a separate one-time source-only operation.
+
+For a future recipe P1, first accept D1 under already known P0 while keeping P0
+definition/helper pins unchanged; D1 may carry reviewed P1 registration in the
+existing Source registry. Maintain those complete controls to Main before D2
+switches to P1 and earns its own real acceptance. If D1 changes a helper pinned
+by P0, that first step cannot pass: stop and split the registration/compatibility
+work. Never accept unknown definitions, omit helper pins, install fixture policy
+or create another registry/store/key as a fallback. Current registries are
+still empty, so real controller maintenance remains inactive.
+
+Preserve the shared zero-argument public read factory and the inherited bounded
+artifact ZIP port. This child changes no Main YAML/hash, protection/default,
+publisher, Docs/Docker worker or production state. Only focused `Controller2354`
+mock/tiny-Git contracts run locally; their fixtures are not accepted producers.

@@ -89,7 +89,7 @@ function eventIdentity(env, event) {
   assert.equal(event.pull_request.base.ref, "main");
   assert.ok(["opened", "synchronize", "reopened", "edited", "ready_for_review"].includes(event.action));
   const locator = proof.mainLocator(event.pull_request.body);
-  assert.equal(locator.mode, "promotion", "Bootstrap requires the separate one-time trusted-D Ops export");
+  assert.ok(["promotion", "controller"].includes(locator.mode), "Bootstrap requires the separate one-time trusted-D Ops export");
   return { B, F: sha(event.pull_request.head.sha), pullRequest: id(event.number), locator,
     runId: id(env.GITHUB_RUN_ID), attempt: id(env.GITHUB_RUN_ATTEMPT) };
 }
@@ -121,14 +121,18 @@ async function runtime(env, event, reads) {
 async function executeMain(env, event, root, reads) {
   eventIdentity(env, event); checkout(root, env.GITHUB_WORKFLOW_SHA, env);
   const before = await runtime(env, event, reads), { mode, ...selected } = before.locator;
-  const facts = await proof.verifyPromotion({ ...selected, pullRequest: before.pullRequest,
-    baseRevision: before.B, headRevision: before.F, snapshotRevision: before.M }, reads);
+  const input = { ...selected, pullRequest: before.pullRequest, baseRevision: before.B, headRevision: before.F, snapshotRevision: before.M };
+  const facts = mode === "controller" ? await proof.verifyControllerMaintenance(input, reads) : await proof.verifyPromotion(input, reads);
   assert.deepEqual(await runtime(env, event, reads), before, "Main execution or PR changed during admission");
   checkout(root, before.B, env);
-  return proof.mainFrameLine({ schemaVersion: 1, kind: proof.MAIN_KIND, publicationAuthorized: false,
+  const identity = { schemaVersion: 1, publicationAuthorized: false,
     repository: { id: REPOSITORY_ID, fullName: source.REPOSITORY }, locatorSha256: hash(before.locator),
+    execution: before.execution };
+  if (mode === "controller") return proof.controllerFrameLine({ ...identity, kind: proof.CONTROLLER_KIND,
+    controllerSource: facts.controllerSource, maintenance: facts.maintenance });
+  return proof.mainFrameLine({ ...identity, kind: proof.MAIN_KIND,
     source: { revision: facts.source.revision, tree: facts.source.tree }, release: { runId: selected.releaseRun, completionSha256: facts.completionSha256 },
-    promotion: facts.promotion, execution: before.execution });
+    promotion: facts.promotion });
 }
 // Exported component for a separate guarded Ops bootstrap, not a normal CLI
 // mode, status check, consumer proof or publication permission.
