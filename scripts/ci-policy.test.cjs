@@ -2722,3 +2722,26 @@ test("actual source identity keeps unchanged Cargo fingerprints fresh", { timeou
 
 // The existing Quick Checks owner executes this read-only contract exactly once.
 require("./published-source-admission.test.cjs")
+require("./main-admission.test.cjs")
+
+test("Main2351 workflow contract", () => {
+  const main = readFileSync(".github/workflows/main-admission.yml", "utf8")
+  const admission = require("./published-source-admission.cjs")
+  assert.match(main, /pull_request_target:\n    branches: \[main\]/)
+  assert.doesNotMatch(main, /^  (?:push|pull_request|workflow_dispatch|workflow_run):/m)
+  assert.ok(main.indexOf('test "$DEFAULT_BRANCH" != main') < main.indexOf("uses: actions/checkout"))
+  assert.match(main, /ref: \$\{\{ github\.workflow_sha \}\}/)
+  assert.match(main, /persist-credentials: false/)
+  assert.equal((main.match(/run: node scripts\/main-admission\.cjs/g) || []).length, 1)
+  assert.doesNotMatch(main, /\b(?:cargo|npm|npx|tsc|vite|docker)\b|environment:|secrets\.|write|pull_request\.head\.sha/)
+  for (const capability of ["contents", "actions", "pull-requests"]) assert.match(main, new RegExp(capability + ": read"))
+  assert.equal(sourceHash(main), admission.MAIN_WORKFLOW_SHA256)
+  assert.equal(Object.isFrozen(admission.MAIN_CONTROLS), true)
+  assert.equal(new Set(admission.MAIN_CONTROLS).size, admission.MAIN_CONTROLS.length)
+  assert.equal(admission.MAIN_CONTROLS.length, 23)
+  for (const file of admission.CONTROLLER_HELPERS) assert.ok(admission.MAIN_CONTROLS.includes(file))
+  const source = readFileSync("scripts/ci-policy.test.cjs", "utf8")
+  assert.equal((source.match(/^require\("\.\/main-admission\.test\.cjs"\)/gm) || []).length, 1)
+  assert.deepEqual(admission.ACCEPTED_RELEASE_PRODUCERS, {})
+  assert.deepEqual(frozenSource.ACCEPTED_PRODUCERS, {})
+})

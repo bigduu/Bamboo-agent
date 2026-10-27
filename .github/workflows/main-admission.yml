@@ -1,0 +1,49 @@
+name: Bamboo Main Admission
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bamboo-main-admission-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  main-admission:
+    name: Main Admission
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    steps:
+      - name: Require the trusted Main execution reference
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          MAIN_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if test "$DEFAULT_BRANCH" != main; then
+            echo 'Main admission stopped: the separate Ops cutover must select default Main.'
+            exit 1
+          fi
+          test "$GITHUB_EVENT_NAME" = pull_request_target
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
+          test "$GITHUB_SHA" = "$MAIN_BASE_SHA"
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Verify completed publication and exact Main postimage
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/main-admission.cjs
