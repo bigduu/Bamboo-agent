@@ -1,38 +1,23 @@
-name: Supervisor Delegation Boundary
+name: Supervisor API-only Snapshot Diagnostic
 
 on:
-  pull_request:
-    branches: [dev]
-    paths:
-      - 'crates/core/bamboo-domain/src/session/tool_authority.rs'
-      - 'crates/core/bamboo-agent-core/src/tools/result_handler.rs'
-      - 'crates/engine/bamboo-engine/src/runtime/runner/session_setup/**'
-      - 'crates/engine/bamboo-engine/src/runtime/runner/loop_execution/pipeline.rs'
-      - 'crates/engine/bamboo-engine/src/runtime/runner/round_lifecycle.rs'
-      - 'crates/engine/bamboo-engine/src/runtime/runner/tool_execution/per_call.rs'
-      - 'crates/engine/bamboo-engine/src/runtime/runner/tool_execution/supervisor_dispatch_tests.rs'
-      - 'crates/engine/bamboo-engine/src/session_app/approval_replay.rs'
-      - 'crates/app/bamboo-server-tools/src/skill_runtime/catalog_tests.rs'
-      - 'crates/infra/bamboo-storage/tests/supervisor_current_user_scope.rs'
-      - 'crates/infra/bamboo-storage/src/v2/supervisor_management.rs'
-      - 'crates/infra/bamboo-storage/src/v2/supervisor_current_user.rs'
-      - 'crates/app/bamboo-server-tools/src/session_inspector/**'
-      - 'crates/engine/bamboo-engine/src/ticket_runtime.rs'
-      - 'crates/infra/bamboo-tickets/src/service.rs'
-      - 'crates/infra/bamboo-tickets/src/store.rs'
-      - 'crates/infra/bamboo-tickets/tests/service_contract.rs'
-      - '.github/workflows/supervisor-role-acceptance.yml'
+  workflow_dispatch:
+    inputs:
+      snapshot_sha:
+        description: Exact 40-character source SHA matching this dispatch; diagnostic only
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: supervisor-role-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: supervisor-role-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   boundary:
-    name: Supervisor role catalog and native dispatch (Linux)
+    name: Manual Supervisor API-only snapshot (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -41,11 +26,20 @@ jobs:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
       RUST_MIN_STACK: '8388608'
       BAMBOO_FRONTEND_BUILD_MODE: api-only
-      EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      EXPECTED_SOURCE_SHA: ${{ inputs.snapshot_sha }}
+      DISPATCH_SOURCE_SHA: ${{ github.sha }}
     steps:
+      - name: Validate exact diagnostic source
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Diagnostic source must be a full lowercase commit SHA' >&2
+            exit 1
+          fi
+          test "$EXPECTED_SOURCE_SHA" = "$DISPATCH_SOURCE_SHA"
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ inputs.snapshot_sha }}
           persist-credentials: false
       - name: Bind the exact clean source
         run: |
@@ -137,7 +131,8 @@ jobs:
             -- --exact --test-threads=1
           run_nonempty engine cargo test --locked -p bamboo-engine --lib supervisor_ \
             -- --test-threads=1 \
-            --skip supervisor_native_direct_files_and_processes_never_enter_executor_in_both_modes
+            --skip supervisor_native_direct_files_and_processes_never_enter_executor_in_both_modes \
+            --skip only_canonical_ticket_child_of_the_current_supervisor_avoids_orphan_wait
           for case in \
             supervisor_retained_once_cannot_override_role_or_consume_replay_markers \
             supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standard_and_ultra \

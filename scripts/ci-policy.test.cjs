@@ -484,6 +484,36 @@ test("all agents share canonical feature tests instead of adding ordinary Linux 
     .replace("if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''", "if: github.event_name == 'pull_request'") }), /workflow_dispatch/u)
 })
 
+test("Supervisor API-only diagnostics are manual and bind the exact dispatch before checkout", () => {
+  const source = readFileSync(".github/workflows/supervisor-role-acceptance.yml", "utf8")
+  assert.match(source, /^  workflow_dispatch:$/mu)
+  assert.doesNotMatch(source, /^  (?:pull_request|push):/mu)
+  assert.match(source, /snapshot_sha:\n        description: .+\n        required: true\n        type: string/u)
+  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ inputs\.snapshot_sha \}\}/u)
+  assert.match(source, /DISPATCH_SOURCE_SHA: \$\{\{ github\.sha \}\}/u)
+  assert.match(source, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
+  assert.match(source, /cancel-in-progress: false/u)
+  assert.doesNotMatch(source, /continue-on-error: true|\|\| true/u)
+  const marker = "      - name: Validate exact diagnostic source\n        run: |\n"
+  assert.ok(source.indexOf(marker) < source.indexOf("      - uses: actions/checkout@"))
+  const script = source.split(marker)[1].split("\n      - ")[0].split("\n")
+    .map(line => line.replace(/^          /u, "")).join("\n")
+  const sha = "a".repeat(40)
+  for (const [snapshot, dispatched, valid] of [[sha, sha, true], [sha, "b".repeat(40), false],
+    ["A".repeat(40), "A".repeat(40), false], ["a".repeat(39), "a".repeat(39), false],
+    ["", "", false], [sha + "\n", sha, false], ["$(exit 0)", sha, false]]) {
+    const result = spawnSync("bash", ["-c", script], { encoding: "utf8",
+      env: { PATH: process.env.PATH, EXPECTED_SOURCE_SHA: snapshot, DISPATCH_SOURCE_SHA: dispatched } })
+    assert.equal(result.status === 0, valid, "foreign/malformed diagnostic source must fail closed")
+  }
+  const ownerCase = "only_canonical_ticket_child_of_the_current_supervisor_avoids_orphan_wait"
+  const ownerBlock = source.split("run_nonempty work-owner")[1].split("run_nonempty engine")[0]
+  assert.ok(ownerBlock.includes(`ticket_runtime::tests::${ownerCase}`))
+  assert.ok(ownerBlock.includes("-- --exact --test-threads=1"))
+  assert.ok(source.includes(`--skip ${ownerCase}`), "the explicit case cannot run twice in the broad selector")
+  assert.equal((source.match(/test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SOURCE_SHA"/gu) || []).length, 2)
+})
+
 test("subscription exception retains exact F API-only graph without becoming merge-source evidence", () => {
   const source = readFileSync(".github/workflows/observer-subscriptions.yml", "utf8")
   assertLinuxTestOwnership({ "observer-subscriptions.yml": source })
