@@ -27,6 +27,22 @@ pub struct TicketApplication {
     messenger: OnceLock<Arc<bamboo_engine::SessionMessenger>>,
     workspace: String,
     ready_scheduler: Arc<bamboo_orchestration::ReadyWorkScheduler>,
+    // Registration and close share a short, synchronous gate. TaskTracker's
+    // close alone does not prevent a new task from retaining the writer.
+    cancellation_tasks: parking_lot::Mutex<tokio_util::task::TaskTracker>,
+    #[cfg(test)]
+    cancellation_probe: parking_lot::Mutex<CancellationProbe>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CancellationProbe {
+    tail: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+    registered: Option<tokio::sync::oneshot::Sender<tokio::task::JoinHandle<()>>>,
+    draining: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 mod admission;
@@ -70,7 +86,25 @@ impl TicketApplication {
                 Arc::new(FileReadyRetryStore::new(root)),
                 Arc::new(bamboo_orchestration::ready_recovery::SystemReadyRetryClock),
             )),
+            cancellation_tasks: parking_lot::Mutex::new(tokio_util::task::TaskTracker::new()),
+            #[cfg(test)]
+            cancellation_probe: parking_lot::Mutex::new(CancellationProbe::default()),
         }
+    }
+
+    pub(in crate::app_state) fn close_cancellation_tasks(&self) {
+        self.cancellation_tasks.lock().close();
+    }
+
+    pub(in crate::app_state) async fn drain_cancellation_tasks(&self) {
+        let tasks = self.cancellation_tasks.lock().clone();
+        #[cfg(test)]
+        if let Some(draining) = self.cancellation_probe.lock().draining.take() {
+            let _ = draining.send(());
+        }
+        // Waiting is cancellation safe and includes the tracked futures'
+        // destructors. Neither a cancelled waiter nor a retry aborts the work.
+        tasks.wait().await;
     }
 
     async fn open_scope(
@@ -640,6 +674,10 @@ impl TicketApplication {
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
+        let tasks = self.cancellation_tasks.lock();
+        if tasks.is_closed() {
+            return;
+        }
         for assignment in snapshot.assignments.values().filter(|assignment| {
             !assignment.process_stopped
                 && (assignment.state == AssignmentState::Cancelling
@@ -656,7 +694,12 @@ impl TicketApplication {
             let assignment = assignment.clone();
             let service = service.clone();
             let adapter = adapter.clone();
-            tokio::spawn(async move {
+            #[cfg(test)]
+            let (tail, registered) = {
+                let mut probe = self.cancellation_probe.lock();
+                (probe.tail.take(), probe.registered.take())
+            };
+            let _task = tasks.spawn(async move {
                 let child_id = ticket_runtime::ticket_child_id(&assignment.dispatch_key);
                 // Hold the same launch fence as ensure/admission while proving
                 // canonical absence. The committed cancellation already denies
@@ -681,6 +724,11 @@ impl TicketApplication {
                         tracing::warn!(assignment_id = %assignment.id, %error, "Ticket cancellation retained for reconciliation");
                         return;
                     }
+                }
+                #[cfg(test)]
+                if let Some((entered, release)) = tail {
+                    let _ = entered.send(());
+                    let _ = release.await;
                 }
                 let Ok(current) = service.published() else {
                     return;
@@ -739,6 +787,10 @@ impl TicketApplication {
                     }
                 }
             });
+            #[cfg(test)]
+            if let Some(registered) = registered {
+                let _ = registered.send(_task);
+            }
         }
     }
 

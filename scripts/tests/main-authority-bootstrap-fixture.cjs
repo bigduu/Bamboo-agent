@@ -16,9 +16,9 @@ const FULL = ['Validation Source', 'Test', 'E2E Tests', 'Lint',
 const PLATFORMS = ['Build (ubuntu-latest)', 'Build (macos-latest)', 'Build (windows-latest)']
 
 async function verify(t, bootstrap, producer = 'v1', mode = 'publication', options = {}) {
-  assert.match(producer, /^v(?:[1234567]|4-main-3488)$/)
+  assert.match(producer, /^v(?:[1234568]|4-main-3488)$/)
   assert.ok(['publication', 'main'].includes(mode))
-  const current = producer === 'v7', grouped = producer === 'v3'
+  const current = producer === 'v8', grouped = producer === 'v3'
   const serverPartitioned = current || producer === 'v6'
   const actualMain = producer === 'v4-main-3488'
   const legacyCrates = producer === 'v4' || actualMain
@@ -127,8 +127,8 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
     ? ['Validation Source', 'Test', 'Main Release Admission', 'Quick Checks', 'Promotion Source',
       'E2E Tests', 'Lint', 'MSRV (Rust 1.95)', 'Security Audit', 'cargo-deny (licenses/bans/advisories/sources)',
       'Documentation', 'TLS Fixture (${{ matrix.os }})', 'ToolEvent Recorder E2E (${{ matrix.os }})', platformLabel + ' (${{ matrix.os }})', ...mainSkipped,
-      ...(current ? ['Feature Unit and E2E'] : [])]
-    : [...FULL, ...(grouped ? groupedNames : crates ? crateNames : []), ...(current ? ['Feature Unit and E2E'] : []),
+      ...(current ? ['Feature Unit and E2E', 'Native Feature (${{ matrix.os }})'] : [])]
+    : [...FULL, ...(grouped ? groupedNames : crates ? crateNames : []), ...(current ? ['Feature Unit and E2E', 'Native Feature (${{ matrix.os }})'] : []),
       ...(promotion ? [...platforms, 'Promotion Source'] : [])]).map((name, i) => ({
     id: id * 100 + i, name, run_id: id, run_attempt: 1,
     head_sha: promotion ? head : source, head_branch: promotion ? release : 'main',
@@ -136,7 +136,7 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
       : name.startsWith('Test (') ? (name.includes('bamboo-server/') ? 'Test server block' : 'Test crate')
       : (name.includes('bamboo-server/') ? 'Run E2E server block' : 'Run E2E crate tests'), 'Complete job']
       .map((name, i) => ({ name, number: i + 1, status: 'completed', conclusion: 'success' })) : steps,
-    status: 'completed', conclusion: name === 'Feature Unit and E2E' || (promotion && grouped && emptyNames.includes(name)) ||
+    status: 'completed', conclusion: name === 'Feature Unit and E2E' || name === 'Native Feature (${{ matrix.os }})' || (promotion && grouped && emptyNames.includes(name)) ||
       (!promotion && light && !['Validation Source', 'Test', 'Main Release Admission'].includes(name)) ? 'skipped' : 'success',
     completed_at: '2026-10-20T02:59:00Z' })) })
   const commitObject = (sha) => ({ sha, tree: { sha: git('rev-parse', `${sha}^{tree}`) },
@@ -297,12 +297,14 @@ with patch('subprocess.check_output', output):
       }
       if (!job.name.includes('${{ matrix.os }}')) return [job]
       const platforms = job.name.startsWith('TLS Fixture') ? ['macos-latest', 'windows-latest']
+        : job.name.startsWith('Native Feature') ? ['windows-2025', 'macos-latest']
         : ['ubuntu-latest', 'macos-latest', 'windows-latest']
       return platforms.map((platform, index) => ({ ...copy(job), id: job.id * 10 + index,
         name: job.name.replace('${{ matrix.os }}', platform) }))
     })
     for (const route of ['actions/runs/111/jobs?filter=latest&per_page=10&page=1',
-      'actions/runs/111/attempts/1/jobs?per_page=10&page=1']) x.routes[route].jobs = expand(x.routes[route].jobs)
+      'actions/runs/111/attempts/1/jobs?per_page=10&page=1',
+      ...(current ? ['actions/runs/222/jobs?filter=latest&per_page=10&page=1', 'actions/runs/222/attempts/1/jobs?per_page=10&page=1'] : [])]) x.routes[route].jobs = expand(x.routes[route].jobs)
   }
   for (const [name, change] of [
     ['empty association uses authenticated historical source job', empty],
@@ -430,6 +432,21 @@ with patch('subprocess.check_output', output):
       x.routes['actions/runs/222/attempts/2/jobs?per_page=10&page=1'] = { jobs: [] }
     }],
   ]
+  if (current) for (const [runId, label] of [[222, 'legacy premerge'], ...(mode === 'publication' ? [[111, 'main admission']] : [])]) {
+    const route = `actions/runs/${runId}/jobs?filter=latest&per_page=10&page=1`
+    for (const state of ['missing', 'success', 'failure', 'in_progress']) negatives.push([`${label} native skip must be complete: ${state}`, x => {
+      const jobs = x.routes[route].jobs
+      const index = jobs.findIndex(job => job.name === 'Native Feature (${{ matrix.os }})')
+      if (state === 'missing') jobs.splice(index, 1)
+      else if (state === 'in_progress') jobs[index].status = state
+      else jobs[index].conclusion = state
+    }])
+    negatives.push([`${label} cannot accept a partial expanded native skip`, x => {
+      expandedSkipped(x)
+      const jobs = x.routes[route].jobs
+      jobs.splice(jobs.findIndex(job => job.name === 'Native Feature (macos-latest)'), 1)
+    }])
+  }
   for (const name of light ? ['Validation Source', 'Test', 'Main Release Admission'] : FULL) negatives.push([`main CI cannot skip ${name}`, x => {
     x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs.find(job => job.name === name).conclusion = 'skipped'
   }])
@@ -545,6 +562,9 @@ with patch('subprocess.check_output', output):
       if (current) negatives.push(['unpublished prior current pin is not a historical producer', x =>
         changeDefinition(x, text => text.replace(producerHelperDigest,
           'cf8c4f01856f32da8fd5f3d824cbe367a458b8e38d4feac85107b84ab6f864ef'))])
+      if (current) negatives.push(['unpublished v7 cannot become complete v8 native evidence', x =>
+        changeDefinition(x, text => text.replace(producerHelperDigest,
+          'cfed0ee23810e25fe086660fb94ba7806450255878c7f3da6f68a738f5ba4ff4'))])
     }
     if (mode === 'publication') {
       negatives.push(['light main admission cannot hide a full test failure', x => {

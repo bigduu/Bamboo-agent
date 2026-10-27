@@ -1448,7 +1448,7 @@ test('historical server blocks retain their complete original test contract', as
 
 test('current feature workflow preserves authenticated legacy release acceptance', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
-    workflowPython('Authorize the exact source before checkout'), 'v7')
+    workflowPython('Authorize the exact source before checkout'), 'v8')
 })
 
 test('job pagination retains its bounded capacity and leaves other API routes unchanged', () => {
@@ -1532,7 +1532,7 @@ test('eighty native CI jobs require every latest and original-attempt page', asy
 
 test('main-push admission executes the same pinned verifier with read-only authority', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
-    workflowPython('Authenticate completed release acceptance before checkout', '.github/workflows/ci.yml'), 'v7', 'main')
+    workflowPython('Authenticate completed release acceptance before checkout', '.github/workflows/ci.yml'), 'v8', 'main')
 })
 
 test('temporary manifest stamping uses exact internal dependency versions and real package versions', (t) => {
