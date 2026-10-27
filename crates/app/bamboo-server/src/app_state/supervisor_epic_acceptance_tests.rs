@@ -1,5 +1,8 @@
 //! Prepared #1048 composition. This file is deliberately not wired into mod.rs
-//! until the separately owned Planner and Observer dependencies are accepted.
+//! until the Observer and current-user default resolver dependencies are accepted.
+//! Planner API was checked against accepted a64a852810b7104954e9fd1f60230df09b48eef2.
+//! Supervisor's delegation-only policy is independently owned by #2334/#2335;
+//! default-all resolution/legacy-scope migration remains an unaccepted dependency.
 //! No runtime PASS is claimed by its presence. Store, Inbox, tools and native
 //! execution below are production implementations; only model replies are held.
 #![cfg(any(target_os = "linux", target_os = "macos"))]
@@ -127,6 +130,73 @@ impl Probe {
         assert!(!messages
             .iter()
             .any(|m| m.content.contains(PRIVATE_A) || m.content.contains(PRIVATE_B)));
+        // Real native calls must be rejected by the Supervisor role, even
+        // though its isolated parent permission mode is permissive. The same
+        // source.txt must later be readable by its ordinary read-only Planner.
+        for (id, name, args) in [
+            (
+                "epic-supervisor-denied-read",
+                "Read",
+                json!({"file_path":self.workspace.join("source.txt")}),
+            ),
+            (
+                "epic-supervisor-denied-write",
+                "Write",
+                json!({"file_path":self.workspace.join("supervisor-must-not-write.txt"),"content":"forbidden"}),
+            ),
+            (
+                "epic-supervisor-denied-bash",
+                "Bash",
+                json!({"command":format!("printf forbidden > '{}'",self.workspace.join("supervisor-must-not-run.txt").display())}),
+            ),
+        ] {
+            let Some(result) = messages
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some(id))
+            else {
+                return call(name, id, args);
+            };
+            assert_eq!(
+                result.tool_success,
+                Some(false),
+                "Supervisor must delegate {name}: {}",
+                result.content
+            );
+        }
+        assert!(!self
+            .workspace
+            .join("supervisor-must-not-write.txt")
+            .exists());
+        assert!(!self.workspace.join("supervisor-must-not-run.txt").exists());
+        // DEFAULT_CURRENT_USER_RESOLVER: sole catalog contract consumption
+        // point. The existing native business-view surface must see both
+        // current-user Projects without configure/attach/UI clicks. This is
+        // expected to remain RED until the owning resolver migration ships;
+        // no fallback grant, guessed API or hand-written catalog is supplied.
+        let Some(directory) = tool_json(messages, "epic-default-current-user-catalog") else {
+            return call(
+                "session_history",
+                "epic-default-current-user-catalog",
+                json!({"action":"list","query":"epic-existing-","limit":8}),
+            );
+        };
+        let entries = directory["sessions"]
+            .as_array()
+            .expect("canonical bounded current-user catalog");
+        let targets: BTreeSet<_> = entries
+            .iter()
+            .map(|entry| entry["session_id"].as_str().unwrap())
+            .collect();
+        let projects: BTreeSet<_> = entries
+            .iter()
+            .map(|entry| entry["project_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(targets, BTreeSet::from([ROOT_A, ROOT_B]));
+        assert_eq!(
+            projects.len(),
+            2,
+            "default catalog spans both current-user Projects"
+        );
         let cold = messages.iter().any(|m| m.content == COLD);
         if let Some(reference) = artifact(messages) {
             assert_eq!(reference["available"], true);
@@ -275,9 +345,17 @@ impl Probe {
                 json!({"file_path":self.workspace.join("source.txt")}),
             );
         }
-        assert!(messages
+        let source = messages
             .iter()
-            .any(|m| m.content.contains("EPIC_SOURCE_EVIDENCE")));
+            .find(|message| message.tool_call_id.as_deref() == Some("epic-planner-read"))
+            .expect("actual delegated Planner Read result");
+        assert_ne!(
+            source.tool_success,
+            Some(false),
+            "Supervisor file prohibition must not leak into ordinary Planner permissions: {}",
+            source.content
+        );
+        assert!(source.content.contains("EPIC_SOURCE_EVIDENCE"));
         if request == 1 {
             return call(
                 "Write",
@@ -349,7 +427,16 @@ impl LLMProvider for Probe {
             "bounded full-chain model request count"
         );
         let chunk = match model {
-            PARENT => self.parent(messages),
+            PARENT => {
+                assert!(
+                    !tools.iter().any(|tool| matches!(
+                        tool.function.name.as_str(),
+                        "Read" | "Write" | "Bash" | "exec_command"
+                    )),
+                    "Supervisor provider catalog must require delegation"
+                );
+                self.parent(messages)
+            }
             TRACKER => self.tracker(messages, tools).await,
             PLANNER => self.planner(messages).await,
             BLOCKED_MODEL => {
@@ -533,10 +620,8 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         .get_or_insert_with(Default::default)
         .set_permission_mode(SessionPermissionMode::Bypass);
     state.storage.save_session(&parent).await.unwrap();
-    let mut projects = BTreeSet::new();
     for (id, private) in [(ROOT_A, PRIVATE_A), (ROOT_B, PRIVATE_B)] {
         let project = state.project_store.create(id, None).unwrap();
-        projects.insert(project.id.clone());
         let directory = home.path().join(id);
         std::fs::create_dir(&directory).unwrap();
         let model = if id == ROOT_A { BLOCKED_MODEL } else { WORKER };
@@ -553,7 +638,7 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         state.storage.save_session(&root).await.unwrap();
     }
     // Produce the original blocker through a real provider tool call and
-    // runtime clarification persistence, before attaching either existing Root.
+    // runtime clarification persistence, on the already independent Root.
     // The question itself is never assigned into Session by the fixture.
     let mut blocked = load(&state, ROOT_A).await;
     let tools = Arc::new(crate::tools::OverlayToolExecutor::new(
@@ -576,12 +661,11 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
     .await;
     assert_eq!(paused.last_run_status().as_deref(), Some("suspended"));
     assert_eq!(probe.blocked_calls.load(Ordering::SeqCst), 1);
-    service
-        .configure_project_scope(&reference, 0, projects)
-        .await
-        .unwrap();
-    service.attach(&reference, 1, ROOT_A).await.unwrap();
-    service.attach(&reference, 2, ROOT_B).await.unwrap();
+    // No configure_project_scope or attach call: Supervisor management is
+    // required to cover this application's current user by default. The owner
+    // must make the existing catalog/control/Observer registration resolver
+    // consume that contract; this fixture cannot manufacture it. Tracker
+    // registration below deliberately retains its explicit fixed target set.
     let original_a = load(&state, ROOT_A).await;
     let original_b = load(&state, ROOT_B).await;
     let parent = load(&state, parent_id).await;
