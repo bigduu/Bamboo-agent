@@ -4602,7 +4602,7 @@ async fn supervisor_delegation_first_discovery_is_readonly_bounded_and_keeps_ord
                 .iter()
                 .map(|entry| entry.execution_name())
                 .collect::<Vec<_>>(),
-            ["Read", "SubAgent"]
+            ["SubAgent"]
         );
         let request = serde_json::from_value(
             serde_json::json!({"query":"SubAgent","kinds":["tool"],"limit":1}),

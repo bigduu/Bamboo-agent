@@ -207,6 +207,13 @@ async fn supervisor_native_direct_files_and_processes_never_enter_executor_in_bo
         .get_or_create_default("model")
         .await
         .unwrap();
+    let mut initial = store
+        .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    initial.agent_runtime_state = Some(AgentRuntimeState::new("supervisor-dispatch"));
+    store.save_session(&initial).await.unwrap();
     let names = [
         "Read",
         "Grep",
