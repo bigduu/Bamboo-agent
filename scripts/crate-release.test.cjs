@@ -980,12 +980,17 @@ test('interrupted initial frontend upload can recover before any crate, while pa
   assert.deepEqual(calls, ['atomic-body', 'upload'])
 })
 
-test('complete publication keeps canonical main CI authority and authenticates empty-association evidence', () => {
+test('minimal frozen publisher keeps Dev admission separate from historical main recovery', () => {
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
   const automatic = workflow.split('  automatic:\n')[1]
   const loader = automatic.split('      - uses: actions/checkout')[0]
-  assert.match(loader, /contents\/scripts\/main-release-admission\.py\?ref=/)
-  assert.match(loader, /hashlib\.sha256\(body\)\.hexdigest\(\) == expected/)
+  assert.match(loader, /pr\['base'\]\['ref'\] == 'dev'/)
+  assert.match(loader, /pr\['merge_commit_sha'\] == source/)
+  assert.match(loader, /dev\['protected'\] is True/)
+  assert.match(automatic, /bamboo-release-controller\/scripts\/release-source\.cjs"/)
+  assert.ok(automatic.indexOf("- &release-controller") < automatic.indexOf("id: source"))
+  assert.ok(automatic.indexOf("id: source") < automatic.indexOf("ref: ${{ steps.source.outputs.revision }}"))
+  assert.match(loader, /GITHUB_REF_PROTECTED.*== 'true'/)
   const preflight = fs.readFileSync('scripts/main-release-admission.py', 'utf8')
   assert.match(preflight, /assert event_name == "workflow_run"/)
   assert.match(preflight, /run = event\["workflow_run"\]/)
@@ -1036,114 +1041,49 @@ test('complete publication keeps canonical main CI authority and authenticates e
   assert.match(platform, /name: Platform Tests \(\$\{\{ matrix\.os \}\}\)/)
 })
 
-test('trusted manual publication and automatic receipts share a queue while dry runs stay credential-free', () => {
+test('minimal frozen publisher has one dispatcher, allocator and three-target producer', () => {
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
-  const manual = workflow.split('  manual:\n')[1].split('  dry-run:\n')[0]
-  const dry = workflow.split('  dry-run:\n')[1].split('  automatic:\n')[0]
-  const automatic = workflow.split('  automatic:\n')[1].split('  executables:\n')[0]
-  assert.match(workflow, /workflow_run:\n    workflows: \[CI\]\n    types: \[completed\]\n    branches: \[main\]/)
+  const header = workflow.split('\npermissions:')[0]
+  assert.match(header, /workflow_dispatch:/); assert.doesNotMatch(header, /workflow_run:|push:|dry_run:|version:/)
+  assert.deepEqual([...workflow.matchAll(/^  ([a-z][a-z-]*):$/gm)].map(m => m[1]).filter(name =>
+    !['workflow_dispatch', 'contents', 'group', 'queue', 'cancel-in-progress'].includes(name)),
+    ['automatic', 'publish-crates', 'executables', 'publish-executables'])
   assert.match(workflow, /group: bamboo-crate-publication\n  queue: max\n  cancel-in-progress: false/)
-  assert.match(workflow, /permissions:\n  contents: read/)
-  assert.match(manual, /if: github.event_name == 'workflow_dispatch' && !inputs\.dry_run/)
-  assert.match(manual, /environment: bamboo-release/)
-  assert.match(manual, /GH_TOKEN: \$\{\{ github\.token \}\}/)
-  assert.ok(manual.indexOf('Authorize the trusted manual') < manual.indexOf('uses: actions/checkout'))
-  assert.ok(manual.indexOf('Require the exact accepted') < manual.indexOf('node scripts/'))
-  assert.match(manual, /expected_source_sha/)
-  assert.doesNotMatch(manual, /contents: write|secrets\.BAMBOO_RELEASE_|crate-release.cjs (?:plan|publish)/)
-  assert.equal(manual.split('CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}').length - 1, 1)
-  assert.match(manual, /if: github.event.inputs.dry_run != 'true'/)
-  assert.match(manual, /cargo publish --locked --allow-dirty -p/)
-  assert.match(dry, /if: github.event_name == 'workflow_dispatch' && inputs\.dry_run/)
-  assert.doesNotMatch(dry, /environment:|secrets\.|cargo publish|crate-release.cjs (?:plan|publish)/)
-  for (const name of ['GH_TOKEN', 'CARGO_REGISTRY_TOKEN', 'BAMBOO_RELEASE_TOKEN',
-    'BAMBOO_RELEASE_SIGNING_KEY', 'BAMBOO_RELEASE_SIGNING_KEY_SHA256']) {
-    assert.ok(dry.includes(`${name}: ""`), `${name} must be explicitly empty in dry runs`)
-  }
-  const aliases = [...dry.matchAll(/^      - \*([a-z-]+)$/gm)].map(match => match[1])
-  assert.deepEqual(aliases, ['manual-checkout', 'manual-source', 'manual-node', 'manual-frontend',
-    'manual-stage', 'manual-isolation', 'manual-version', 'manual-stamp', 'manual-lock'])
-  for (const alias of aliases) {
-    const step = workflow.match(new RegExp(`      - &${alias}\\n([\\s\\S]*?)(?=\\n      - |\\n  [a-z-]+:|$)`))?.[1]
-    assert.ok(step, `Missing shared preparation step ${alias}`)
-    assert.doesNotMatch(step, /secrets\.|BAMBOO_RELEASE_|CARGO_REGISTRY_TOKEN|cargo publish/)
-  }
-  assert.match(automatic, /github.event_name == 'workflow_run'/)
-  assert.match(automatic, /environment: bamboo-release\n    permissions:\n      contents: write/)
-  assert.match(automatic, /ref: \$\{\{ steps.source.outputs.revision \}\}\n          fetch-depth: 0\n          persist-credentials: false/)
-  assert.ok(automatic.indexOf('Authorize the exact source') < automatic.indexOf('uses: actions/checkout'))
-  assert.ok(automatic.indexOf('Verify checkout matches') < automatic.indexOf('node scripts/'))
-  assert.doesNotMatch(automatic, /inputs\.version/)
-  assert.doesNotMatch(automatic, /workflow_dispatch|inputs\.complete_release|accepted_ci_run/)
-  assert.match(automatic, /SOURCE_VALIDATION: \$\{\{ steps.source.outputs.validation \}\}/)
-  for (const name of ['BAMBOO_RELEASE_TOKEN', 'BAMBOO_RELEASE_SIGNING_KEY']) {
-    assert.equal(automatic.split(`secrets.${name}`).length - 1, 3, 'Preparation plus signed crate resume and publication share existing authority')
-  }
-  assert.doesNotMatch(workflow, /VERSION="\$\{\{ github.event.inputs.version/)
-  const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8')
-  assert.match(ci, /group: ci-\$\{\{ github.event_name \}\}/)
-  assert.match(ci, /queue: \$\{\{ github.event_name == 'push' && github.ref == 'refs\/heads\/main' && 'max' \|\| 'single' \}\}/)
-  assert.match(ci, /cancel-in-progress: \$\{\{ github.event_name != 'push' \|\| github.ref != 'refs\/heads\/main' \}\}/)
-  assert.match(ci, /node --test scripts\/ci-policy.test.cjs scripts\/crate-release.test.cjs/)
+  assert.equal(workflow.split('crate-release.cjs" plan').length - 1, 1)
+  assert.doesNotMatch(workflow, /cargo test|cargo check|manual:|dry-run:/)
+  assert.match(workflow, /original_executables: \$\{\{ steps.version.outputs.original_executables \}\}/)
+  assert.ok(workflow.indexOf('sidecar-build.cjs" guard') < workflow.indexOf('uses: dtolnay/rust-toolchain'))
+  assert.match(workflow, /native target|native release dependencies/)
+  const finalizer = workflow.split('  publish-executables:\n')[1]
+  assert.ok(finalizer.indexOf('sidecar-release.cjs" publish') < finalizer.indexOf('bamboo-completed-release-${{ github.run_id }}'))
+  assert.match(finalizer, /source: process.env.COMPLETED_SOURCE, version: process.env.COMPLETED_VERSION, runId: process.env.GITHUB_RUN_ID/)
+  assert.match(finalizer, /bamboo-completed-release\/release.json/)
 })
 
-test('automatic publication grants only job-local Actions reads for its CI proof', () => {
+test('minimal frozen publisher limits CI reads and native credentials', () => {
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
-  const automatic = workflow.split('  automatic:\n')[1].split('  executables:\n')[0]
-  const permissionBlock = automatic.match(/^    permissions:\n((?:      [a-z-]+: [a-z]+\n)+)/m)?.[1]
-  assert.ok(permissionBlock, 'automatic publication must declare its token permissions')
-  const verify = block => assert.deepEqual(Object.fromEntries(block.trim().split('\n')
-    .map(line => line.trim().split(': '))), { contents: 'write', actions: 'read' })
-  verify(permissionBlock)
-  for (const invalid of [
-    '      contents: write\n',
-    '      contents: write\n      actions: write\n',
-    '      contents: write\n      actions: read\n      checks: write\n',
-  ]) assert.throws(() => verify(invalid))
-  assert.match(automatic, /GH_TOKEN: \$\{\{ github\.token \}\}/)
-  const admission = fs.readFileSync('scripts/main-release-admission.py', 'utf8')
-  assert.match(admission, /actions\/runs\/\{/)
-  assert.match(admission, /actions\/jobs\/\{job_id\}\/logs/)
+  const automatic = workflow.split('  automatic:\n')[1].split('  publish-crates:\n')[0]
+  const permissionBlock = automatic.match(/^    permissions:\n((?:      [a-z-]+: [a-z]+\n)+)/m)[1]
+  assert.deepEqual(Object.fromEntries(permissionBlock.trim().split('\n').map(line => line.trim().split(': '))),
+    { contents: 'write', actions: 'read', checks: 'read', 'pull-requests': 'read' })
+  const native = workflow.split('  executables:\n')[1].split('  publish-executables:\n')[0]
+  assert.doesNotMatch(native, /contents: write|secrets\.|environment:/)
+  assert.match(native, /GH_TOKEN: \$\{\{ github.token \}\}/)
+  const env = require('./sidecar-build.cjs').buildEnvironment({ PATH: '/bin', GH_TOKEN: 'private',
+    CARGO_REGISTRY_TOKEN: 'private', BAMBOO_RELEASE_SIGNING_KEY: 'private' }, '/tmp/owned')
+  for (const key of ['GH_TOKEN', 'CARGO_REGISTRY_TOKEN', 'BAMBOO_RELEASE_SIGNING_KEY']) assert.equal(env[key], undefined)
 })
 
-test('the real manual version resolver has no signing or API dependency and never emits invalid output', (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-manual-version-'))
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
-  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
-  const inline = workflow.split("          node - <<'JS'\n")[1].split('\n          JS')[0]
-    .split('\n').map(line => line.replace(/^ {10}/, '')).join('\n')
-    .replace("'./scripts/crate-release.cjs'", JSON.stringify(path.join(__dirname, 'crate-release.cjs')))
-  const clock = "const RealDate = Date; global.Date = class extends RealDate { constructor(...args) { super(...(args.length ? args : ['2026-10-07T12:00:00Z'])) } };\n"
-  const output = path.join(directory, 'output')
-  const check = (requested, sourceVersion = '0.0.0') => {
-    fs.writeFileSync(path.join(directory, 'Cargo.toml'), `[package]\nversion = "${sourceVersion}"\n`)
-    fs.writeFileSync(output, '')
-    return spawnSync(process.execPath, ['-e', clock + inline], { cwd: directory, encoding: 'utf8',
-      env: { PUBLISH_VERSION: requested, GITHUB_OUTPUT: output } })
-  }
-  for (const version of ['1.2.3', '2026.10.18446744073709551615', '9999.1.1-rc.0']) {
-    const result = check(version)
-    assert.equal(result.status, 0, result.stderr)
-    assert.equal(fs.readFileSync(output, 'utf8'), `version=${version}\n`)
-  }
-  for (const requested of ['', 'latest']) {
-    assert.equal(check(requested, '1.2.3').status, 0)
-    assert.equal(fs.readFileSync(output, 'utf8'), 'version=1.2.3\n')
-    assert.notEqual(check(requested).status, 0)
-    assert.equal(fs.readFileSync(output, 'utf8'), '')
-  }
-  for (const version of ['0.0.0', '9999.1.1', '2026.11.1', '1.2.3\npoison=true', '1.2.3;false']) {
-    assert.notEqual(check(version).status, 0)
-    assert.equal(fs.readFileSync(output, 'utf8'), '')
-  }
-})
 
 function workflowPython(name, filename = '.github/workflows/publish-crate.yml') {
-  const step = fs.readFileSync(filename, 'utf8').split(`      - name: ${name}`)[1]
+  const archived = name === 'Authorize the exact source before checkout' ||
+    (name === 'Authenticate completed release acceptance before checkout' && filename === '.github/workflows/ci.yml')
+  const source = archived ? require('./tests/main-authority-bootstrap-fixture.cjs').legacyData()[
+    filename === '.github/workflows/ci.yml' ? 'ci' : 'publisher'] : fs.readFileSync(filename, 'utf8')
+  const step = source.split(`      - name: ${name}`)[1]
   const match = step.match(/          python3 - <<'(PY(?:THON)?)'\n([\s\S]*?)\n          \1\n/)
   assert.ok(match, `missing Python body: ${name}`)
-  return match[2]
-    .split('\n').map((line) => line.replace(/^ {10}/, '')).join('\n')
+  return match[2].split('\n').map(line => line.replace(/^ {10}/, '')).join('\n')
 }
 
 test('Environment readiness checks authentication without executing source or uploading, and rejects invalid authority', (t) => {
@@ -1229,127 +1169,6 @@ finally:
   ]) assert.notEqual(run(overrides).status, 0, 'Unavailable or unverified authentication must fail closed')
 })
 
-test('manual inline bootstrap accepts only protected branches and exact annotated trusted source tags before checkout', (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-manual-bootstrap-'))
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
-  const git = (...args) => {
-    const result = spawnSync('git', ['-c', 'user.name=Manual fixture', '-c', 'user.email=fixture@example.invalid', ...args],
-      { cwd: directory, encoding: 'utf8' })
-    assert.equal(result.status, 0, result.stderr)
-    return result.stdout.trim()
-  }
-  git('init', '-q')
-  const commit = (value) => {
-    fs.writeFileSync(path.join(directory, 'source'), value)
-    git('add', 'source')
-    git('commit', '-qm', value)
-    return git('rev-parse', 'HEAD')
-  }
-  const historical = commit('historical')
-  const main = commit('main')
-  const dev = commit('dev')
-  git('checkout', '--detach', historical)
-  const feature = commit('feature')
-  const tagName = source => `bamboo-release-source-${source}`
-  const tagRef = source => `refs/tags/${tagName(source)}`
-  git('tag', '-a', tagName(historical), historical, '-m', 'Accepted source')
-  git('tag', '-a', tagName(feature), feature, '-m', 'Unaccepted source')
-  const bin = path.join(directory, 'bin')
-  fs.mkdirSync(bin)
-  const calls = path.join(directory, 'api-calls')
-  fs.writeFileSync(path.join(bin, 'gh'), `#!/usr/bin/env python3
-import base64, json, os, pathlib, subprocess, sys
-route = sys.argv[2]
-with open(os.environ['FIXTURE_CALLS'], 'a') as stream: stream.write(route + '\\n')
-if os.environ.get('FIXTURE_API_FAILURE') == 'true': sys.exit(1)
-responses = json.loads(os.environ.get('FIXTURE_RESPONSES', '{}'))
-if route in responses:
-    print(json.dumps(responses[route]))
-    sys.exit(0)
-def git(*args):
-    return subprocess.check_output(['git', *args], cwd=os.environ['FIXTURE_REPOSITORY'], text=True).strip()
-if '/branches/' in route:
-    name = route.rsplit('/', 1)[-1]
-    result = {'name': name, 'protected': os.environ.get('FIXTURE_UNPROTECTED') != 'true', 'commit': {'sha': json.loads(os.environ['FIXTURE_TIPS'])[name]}}
-elif '/compare/' in route:
-    source, tip = route.rsplit('/', 1)[-1].split('...')
-    base = git('merge-base', source, tip)
-    status = 'identical' if source == tip else 'ahead' if base == source else 'behind' if base == tip else 'diverged'
-    result = {'status': status, 'merge_base_commit': {'sha': base}}
-elif '/git/ref/tags/' in route:
-    ref = 'refs/tags/' + route.split('/git/ref/tags/')[1]
-    sha = git('rev-parse', ref)
-    result = {'ref': ref, 'object': {'type': git('cat-file', '-t', sha), 'sha': sha}}
-elif '/git/tags/' in route:
-    sha = route.rsplit('/', 1)[-1]
-    headers = dict(line.split(' ', 1) for line in git('cat-file', '-p', sha).split('\\n\\n')[0].splitlines())
-    result = {'sha': sha, 'tag': headers['tag'], 'object': {'type': headers['type'], 'sha': headers['object']}}
-elif '/contents/' in route:
-    content = pathlib.Path(os.environ['FIXTURE_POLICY']).read_bytes()
-    if os.environ.get('FIXTURE_OLD_POLICY') == 'true': content = content.replace(b'# BAMBOO_TRUSTED_PUBLICATION_POLICY_V1', b'# old policy')
-    result = {'type': 'file', 'path': '.github/workflows/publish-crate.yml', 'encoding': 'base64', 'content': base64.b64encode(content).decode()}
-else: raise AssertionError('Unexpected route: ' + route)
-print(json.dumps(result))
-`, { mode: 0o755 })
-  const bootstrap = workflowPython('Authorize the trusted manual publication ref before checkout')
-  const run = (source = historical, ref = tagRef(source), overrides = {}) => {
-    fs.writeFileSync(calls, '')
-    const result = spawnSync('python3', ['-c', bootstrap], { cwd: directory, encoding: 'utf8', env: {
-      PATH: `${bin}:${process.env.PATH}`, GH_TOKEN: 'dummy-readonly',
-      GITHUB_REPOSITORY: 'bigduu/Bamboo-agent', GITHUB_EVENT_NAME: 'workflow_dispatch',
-      EXPECTED_SOURCE_SHA: source, GITHUB_SHA: source, GITHUB_WORKFLOW_SHA: source,
-      GITHUB_REF: ref, GITHUB_REF_TYPE: ref.startsWith('refs/tags/') ? 'tag' : 'branch', GITHUB_REF_PROTECTED: 'true',
-      GITHUB_WORKFLOW_REF: `bigduu/Bamboo-agent/.github/workflows/publish-crate.yml@${ref}`,
-      FIXTURE_REPOSITORY: directory, FIXTURE_CALLS: calls, FIXTURE_TIPS: JSON.stringify({ dev, main }),
-      FIXTURE_POLICY: path.resolve('.github/workflows/publish-crate.yml'), ...overrides,
-    } })
-    return { ...result, calls: fs.readFileSync(calls, 'utf8') }
-  }
-  for (const [source, ref] of [[historical, tagRef(historical)], [dev, 'refs/heads/dev'],
-    [main, 'refs/heads/main'], [historical, 'refs/heads/dev']]) {
-    const result = run(source, ref)
-    assert.equal(result.status, 0, result.stderr)
-    assert.match(result.calls, new RegExp(`contents/.github/workflows/publish-crate.yml\\?ref=${source}`))
-  }
-  for (const [ref, overrides] of [
-    ['refs/heads/feature', {}], ['refs/tags/bamboo-bodhi-source-2026.10.9', {}],
-    [tagRef(dev), {}], [tagRef(historical) + '-extra', {}],
-    [tagRef(historical), { GITHUB_REF_TYPE: 'branch' }],
-    [tagRef(historical), { GITHUB_REF_PROTECTED: 'false' }],
-    [tagRef(historical), { GITHUB_WORKFLOW_SHA: dev }],
-    [tagRef(historical), { GITHUB_SHA: dev }],
-    [tagRef(historical), { EXPECTED_SOURCE_SHA: 'not-a-sha' }],
-    [tagRef(historical), { GITHUB_REPOSITORY: 'foreign/repository' }],
-    [tagRef(historical), { GITHUB_EVENT_NAME: 'workflow_run' }],
-    [tagRef(historical), { GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/other.yml@' + tagRef(historical) }],
-  ]) {
-    const result = run(historical, ref, overrides)
-    assert.notEqual(result.status, 0, `${ref} must not authorize checkout`)
-    assert.equal(result.calls, '', 'Untrusted dispatch must fail before API or repository execution')
-  }
-  for (const overrides of [{ FIXTURE_API_FAILURE: 'true' }, { FIXTURE_UNPROTECTED: 'true' }, { FIXTURE_OLD_POLICY: 'true' }]) {
-    const result = run(historical, tagRef(historical), overrides)
-    assert.notEqual(result.status, 0, 'Unavailable API, unprotected history or pre-policy source must fail closed')
-  }
-  assert.notEqual(run(feature).status, 0, 'A protected tag cannot admit unrelated source history')
-  const annotation = git('rev-parse', tagRef(historical))
-  const tagRoute = `repos/bigduu/Bamboo-agent/git/tags/${annotation}`
-  for (const response of [
-    { sha: annotation, tag: tagName(historical), object: { type: 'commit', sha: dev } },
-    { sha: annotation, tag: tagName(historical), object: { type: 'tag', sha: annotation } },
-    { sha: annotation, tag: 'another-tag', object: { type: 'commit', sha: historical } },
-    { sha: dev, tag: tagName(historical), object: { type: 'commit', sha: historical } },
-  ]) {
-    const result = run(historical, tagRef(historical), { FIXTURE_RESPONSES: JSON.stringify({ [tagRoute]: response }) })
-    assert.notEqual(result.status, 0, 'Malformed, moved and nested annotation identities cannot authorize checkout')
-    assert.doesNotMatch(result.calls, /contents\//)
-  }
-  git('tag', '-d', tagName(historical))
-  git('tag', tagName(historical), historical)
-  assert.notEqual(run().status, 0, 'A real lightweight tag must fail')
-  git('tag', '-fa', tagName(historical), dev, '-m', 'Moved source')
-  assert.notEqual(run().status, 0, 'A real moved annotated tag must fail')
-})
 
 test('automatic inline bootstrap requires actual normal merge and CI evidence without main protection', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t, workflowPython('Authorize the exact source before checkout'))
@@ -1374,9 +1193,8 @@ test('historical server producer and verifier remain byte-pinned', () => {
   assert.ok(current.includes(`LEGACY_SERVER_BLOCK_HELPER = "${sha256(helper)}"`))
 })
 
-test('current admission pins the complete workflow and helper without a circular hash', () => {
-  const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8')
-  const publisher = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+test('historical v8 admission pins the archived workflow and helper without a circular hash', () => {
+  const { ci, publisher } = require('./tests/main-authority-bootstrap-fixture.cjs').legacyData()
   const helper = fs.readFileSync('scripts/main-release-admission.py', 'utf8')
   const pin = /ADMISSION_HELPER_SHA256: "([0-9a-f]{64})"/g
   assert.deepEqual([...ci.matchAll(pin)].map(match => match[1]), [sha256(helper)])
@@ -1446,7 +1264,7 @@ test('historical server blocks retain their complete original test contract', as
     workflowPython('Authorize the exact source before checkout'), 'v6')
 })
 
-test('current feature workflow preserves authenticated legacy release acceptance', async (t) => {
+test('historical v8 feature workflow preserves authenticated legacy release acceptance', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
     workflowPython('Authorize the exact source before checkout'), 'v8')
 })
@@ -1530,7 +1348,7 @@ test('eighty native CI jobs require every latest and original-attempt page', asy
     })
 })
 
-test('main-push admission executes the same pinned verifier with read-only authority', async (t) => {
+test('historical main-push admission executes the same pinned verifier with read-only authority', async (t) => {
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t,
     workflowPython('Authenticate completed release acceptance before checkout', '.github/workflows/ci.yml'), 'v8', 'main')
 })
@@ -1665,7 +1483,8 @@ test('automatic current-main guard fails closed before allocation, credentials o
 
 test('automatic adapters guard every write and keep historical recovery on its existing path', () => {
   const code = fs.readFileSync('scripts/crate-release.cjs', 'utf8')
-  assert.match(code, /makeVerifiedContext\(env, repository, sourceRevision, validation\?\.ciRun \|\| event.workflow_run, automatic, true\)/)
+  assert.match(code, /frozenGuard\(JSON.parse\(env.SOURCE_VALIDATION\), env\)/)
+  assert.match(code, /const frozen = requireCurrentMain && env.GITHUB_EVENT_NAME === 'workflow_dispatch'/)
   assert.match(code, /makeVerifiedContext\(env, env.GITHUB_REPOSITORY, source, run, true\)/)
   for (const fragment of ["write(() => github(repository, 'releases'", "write(() => github(repository, 'git/refs'",
     "write(() => github(repository, `releases/${release.id}`", "write(() => command(['gh', 'release', 'upload'",
@@ -1673,4 +1492,100 @@ test('automatic adapters guard every write and keep historical recovery on its e
   const sidecar = fs.readFileSync('scripts/sidecar-release.cjs', 'utf8')
   assert.ok(sidecar.indexOf('await guard()') < sidecar.indexOf('const { release, receipt } = publishedRelease'))
   assert.match(sidecar, /upload: \(file\) => currentMainWrite\(guard,/)
+})
+
+function minimalFrozenFixture(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-frozen-source-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const [S, B, F, M, T, C] = ['a', 'b', 'c', 'd', 'e', '1'].map(value => value.repeat(40))
+  const repository = 'bigduu/Bamboo-agent', repo = { full_name: repository }
+  const event = { inputs: { expected_source_sha: S, feature_pr: '9', accepted_ci_run: '123' } }
+  const file = path.join(directory, 'event.json'); fs.writeFileSync(file, JSON.stringify(event))
+  const env = { GITHUB_REPOSITORY: repository, GITHUB_EVENT_NAME: 'workflow_dispatch', GITHUB_EVENT_PATH: file,
+    GITHUB_SHA: C, GITHUB_WORKFLOW_SHA: C, GITHUB_REF: 'refs/heads/dev', GITHUB_REF_PROTECTED: 'true',
+    GITHUB_WORKFLOW_REF: repository + '/.github/workflows/publish-crate.yml@refs/heads/dev' }
+  const routes = {
+    'branches/dev': { name: 'dev', protected: true, commit: { sha: S } },
+    ['git/ref/heads/release/' + S]: { ref: 'refs/heads/release/' + S, object: { type: 'commit', sha: S } },
+    ['compare/' + S + '...' + S]: { status: 'identical', base_commit: { sha: S }, merge_base_commit: { sha: S } },
+    ['compare/' + C + '...' + S]: { status: 'ahead', base_commit: { sha: C }, merge_base_commit: { sha: C } },
+    'pulls/9': { number: 9, state: 'closed', merged: true, draft: false, merge_commit_sha: S,
+      merged_at: '2026-10-28T00:02:00Z', base: { ref: 'dev', repo }, head: { ref: 'feature', sha: F, repo } },
+    'actions/runs/123': { id: 123, run_attempt: 1, workflow_id: 7, check_suite_id: 8, name: 'CI',
+      path: '.github/workflows/ci.yml', status: 'completed', conclusion: 'success', event: 'pull_request',
+      head_sha: F, head_branch: 'feature', repository: repo, head_repository: repo,
+      html_url: 'https://github.com/' + repository + '/actions/runs/123' },
+    'actions/workflows/ci.yml': { id: 7 },
+    'check-suites/8': { app: { id: 15368 }, head_sha: F, status: 'completed', conclusion: 'success' },
+    'actions/runs/123/jobs?filter=latest&per_page=100&page=1': { total_count: 4,
+      jobs: ['Validation Source', 'Test', 'E2E Tests', 'Feature Unit and E2E'].map((name, index) => ({
+        id: 20 + index, name, status: 'completed', conclusion: 'success', completed_at: '2026-10-28T00:01:00Z' })) },
+    ['git/commits/' + S]: { sha: S, parents: [{ sha: B }, { sha: F }], tree: { sha: T } },
+    ['git/commits/' + M]: { sha: M, parents: [{ sha: B }, { sha: F }], tree: { sha: T } },
+  }
+  const log = () => '2026-10-28T00:00:00Z Event source: ' + M + '; full validation: false\n'
+  const read = route => { assert.ok(routes[route], 'Unexpected source read: ' + route); return clone(routes[route]) }
+  return { env, routes, read, log, S, M, C }
+}
+
+test('minimal frozen publisher accepts an exact feature-tested normal Dev cut and rechecks mutable refs', t => {
+  const x = minimalFrozenFixture(t), source = require('./release-source.cjs')
+  const accepted = source.authorizeFrozenRelease(x.env, x.read, x.log)
+  assert.equal(accepted.sourceRevision, x.S); assert.equal(accepted.validatedRevision, x.M)
+  assert.equal(accepted.ciRun.head_sha, x.routes['pulls/9'].head.sha)
+  assert.doesNotThrow(() => source.frozenGuard(accepted, x.env, x.read))
+  x.routes['git/ref/heads/release/' + x.S].object.sha = 'f'.repeat(40)
+  assert.throws(() => source.frozenGuard(accepted, x.env, x.read))
+})
+
+test('minimal frozen publisher rejects incomplete, foreign, late and changed feature acceptance', t => {
+  const source = require('./release-source.cjs')
+  for (const change of [
+    x => { x.env.GITHUB_REF = 'refs/heads/main' },
+    x => { x.env.GITHUB_REF = 'refs/heads/release/' + x.S },
+    x => { x.env.GITHUB_REF_PROTECTED = 'false' },
+    x => { x.env.GITHUB_SHA = x.S },
+    x => { x.routes['compare/' + x.C + '...' + x.S].merge_base_commit.sha = x.S },
+    x => { x.routes['branches/dev'].protected = false },
+    x => { x.routes['pulls/9'].merged = false },
+    x => { x.routes['pulls/9'].base.ref = 'main' },
+    x => { x.routes['pulls/9'].head.repo.full_name = 'foreign/repository' },
+    x => { x.routes['actions/runs/123'].conclusion = 'failure' },
+    x => { x.routes['actions/runs/123'].workflow_id = 99 },
+    x => { x.routes['check-suites/8'].app.id = 99 },
+    x => { x.routes['actions/runs/123/jobs?filter=latest&per_page=100&page=1'].jobs[2].conclusion = 'skipped' },
+    x => { x.routes['actions/runs/123/jobs?filter=latest&per_page=100&page=1'].jobs[1].completed_at = '2026-10-28T00:03:00Z' },
+    x => { x.routes['git/commits/' + x.M].tree.sha = 'f'.repeat(40) },
+    x => { x.routes['git/commits/' + x.M].parents.reverse() },
+  ]) {
+    const x = minimalFrozenFixture(t); change(x)
+    assert.throws(() => source.authorizeFrozenRelease(x.env, x.read, x.log))
+  }
+})
+
+test('minimal frozen publisher never recompiles a successful or unverifiable native original', () => {
+  const { assertNoNativeRebuild } = require('./sidecar-build.cjs'), target = 'aarch64-apple-darwin'
+  const identity = { version: '2026.10.28', runId: '77', runAttempt: 2, validation: { kind: 'bamboo-frozen-dev-release/v1' } }
+  const prior = { total_count: 1, jobs: [{ name: 'Complete executable (' + target + ')', steps: [
+    { name: 'Build and verify the standard versioned Bamboo executable', conclusion: 'success' }] }] }
+  const preparation = { receipt: { publisherRunId: '77' } }
+  const read = route => { assert.ok(route.startsWith('actions/runs/77/attempts/')); return prior }
+  assert.throws(() => assertNoNativeRebuild(identity, target, read, preparation), /already succeeded or remains unknown/)
+  prior.jobs[0].steps[0].conclusion = 'failure'
+  assert.doesNotThrow(() => assertNoNativeRebuild(identity, target, read, preparation))
+  prior.total_count = 0; prior.jobs = []
+  assert.throws(() => assertNoNativeRebuild(identity, target, read, preparation))
+  assert.throws(() => assertNoNativeRebuild({ ...identity, runAttempt: 1 }, target,
+    () => { throw new Error('No metadata read for another publisher run') }, { receipt: { publisherRunId: '88' } }), /original publisher run 88/)
+})
+
+test('minimal frozen publisher seals the original run and requires failed-job recovery until the native checkpoint exists', async () => {
+  const { context } = fixture({ publisherRunId: '77' })
+  const result = await plan(context)
+  const { assertFrozenPublisherRun } = require('./crate-release.cjs')
+  assert.equal(result.receipt.publisherRunId, '77')
+  assert.doesNotThrow(() => assertFrozenPublisherRun(result.receipt, '77', false))
+  assert.throws(() => assertFrozenPublisherRun(result.receipt, '88', false), /original publisher run 77/)
+  assert.doesNotThrow(() => assertFrozenPublisherRun(result.receipt, '88', true))
+  assert.throws(() => assertFrozenPublisherRun({ publisherRunId: '' }, '77', true))
 })

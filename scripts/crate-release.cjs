@@ -96,6 +96,13 @@ function assertManualVersion(version, now = new Date()) {
 
 function validateSource({ eventName, event, repository, sourceRevision, sourceTree, validation }) {
   assert.match(sourceRevision, SHA)
+  if (eventName === 'workflow_dispatch' && validation?.kind === 'bamboo-frozen-dev-release/v1') {
+    assert.equal(event.inputs.expected_source_sha, sourceRevision)
+    assert.equal(validation.repository, repository); assert.equal(validation.sourceRevision, sourceRevision)
+    assert.equal(validation.sourceTree, sourceTree)
+    assert.equal(validation.ciRun.event, 'pull_request'); assert.equal(validation.ciRun.conclusion, 'success')
+    return true // Production callers independently re-read GitHub through release-source.cjs.
+  }
   // A caller-supplied historical dispatch proof is not new publication authority.
   assert.equal(eventName, 'workflow_run', 'Unsupported release trigger')
   const run = event.workflow_run
@@ -291,6 +298,7 @@ async function plan(context) {
   const receipt = { schemaVersion: 1, version, identity, crates,
     frontendBytes: context.frontendBytes, automatic: true, completed: false,
     ciRun: context.ciRun || null, packageChecksums: {},
+    ...(context.publisherRunId ? { publisherRunId: context.publisherRunId } : {}),
     ...(context.validation ? { validation: context.validation } : {}) }
   // Reserve before uploading any crate. An uncertain GitHub write is recovered
   // by reading this exact tag on a rerun, never by allocating another version.
@@ -312,7 +320,7 @@ async function publish(context, release, receipt) {
   for (const crate of receipt.crates) {
     let existing = await context.registry(crate, receipt.version)
     if (!existing) {
-      const checksum = await context.package(crate, receipt.version)
+      const checksum = await context.package(crate, receipt.version, receipt.packageChecksums[crate], release)
       assert.match(checksum, DIGEST)
       if (receipt.packageChecksums[crate]) {
         assert.equal(checksum, receipt.packageChecksums[crate], `Previously reserved package bytes changed for ${crate}`)
@@ -619,10 +627,13 @@ function makeContext(env = process.env) {
   assert.equal(repository, 'bigduu/Bamboo-agent')
   const sourceRevision = command(['git', 'rev-parse', 'HEAD']).trim()
   const event = JSON.parse(fs.readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))
-  const validation = env.SOURCE_VALIDATION ? JSON.parse(env.SOURCE_VALIDATION) : undefined
+  const supplied = env.SOURCE_VALIDATION ? JSON.parse(env.SOURCE_VALIDATION) : undefined
+  const validation = env.GITHUB_EVENT_NAME === 'workflow_dispatch'
+    ? require('./release-source.cjs').authorizeFrozenRelease(env) : supplied
+  if (env.GITHUB_EVENT_NAME === 'workflow_dispatch' && supplied) assert.deepEqual(supplied, validation)
   const automatic = validateSource({ eventName: env.GITHUB_EVENT_NAME, event, repository, sourceRevision,
     sourceTree: command(['git', 'rev-parse', 'HEAD^{tree}']).trim(), validation })
-  const context = makeVerifiedContext(env, repository, sourceRevision, validation?.ciRun || event.workflow_run, automatic, true)
+  const context = makeVerifiedContext({ ...env, ...(validation ? { SOURCE_VALIDATION: JSON.stringify(validation) } : {}) }, repository, sourceRevision, validation?.ciRun || event.workflow_run, automatic, true)
   if (validation) context.validation = validation
   return context
 }
@@ -670,9 +681,15 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
     fs.writeFileSync(archive, bytes)
     return { bytes, entry: (file) => command(['tar', '-xOf', archive, `${name}-${version}/${file}`], { encoding: null }) }
   }
-  const guard = requireCurrentMain ? () => assertCurrentMain(repository, sourceRevision) : async () => {}
+  const frozen = requireCurrentMain && env.GITHUB_EVENT_NAME === 'workflow_dispatch'
+  if (frozen) assert.match(env.GITHUB_RUN_ID || '', /^[1-9][0-9]*$/)
+  const originals = new Map()
+  const guard = requireCurrentMain ? frozen
+    ? () => require('./release-source.cjs').frozenGuard(JSON.parse(env.SOURCE_VALIDATION), env)
+    : () => assertCurrentMain(repository, sourceRevision) : async () => {}
   const write = (action) => currentMainWrite(guard, action)
   const context = { automatic, identity, frontendBytes, crates, receiptFile,
+    ...(frozen ? { publisherRunId: env.GITHUB_RUN_ID } : {}),
     assertCurrentMain: guard,
     ciRun: run.html_url,
     releases: async () => paginated('releases?per_page=100'),
@@ -749,12 +766,46 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
       const response = await registryFetch(`https://crates.io/api/v1/crates/${name}/${version}`, true)
       return response ? (await response.json()).version : null
     },
-    package: async (name, version) => {
+    package: async (name, version, expected, release) => {
+      if (frozen) {
+        const filename = name + '-' + version + '.crate', assets = github(repository, 'releases/' + release.id).assets
+        const matches = assets.filter(asset => asset.name === filename); assert.ok(matches.length <= 1)
+        let bytes
+        if (expected) {
+          assert.equal(matches.length, 1, 'Previously verified crate original is missing; do not rebuild')
+          bytes = command(['gh', 'api', 'repos/' + repository + '/releases/assets/' + matches[0].id,
+            '-H', 'Accept: application/octet-stream'], { encoding: null, maxBuffer: 64 * 1024 * 1024 })
+          assert.equal(sha256(bytes), expected, 'Retained crate archive changed')
+        } else {
+          assert.equal(matches.length, 0, 'Unrecorded crate original needs explicit recovery')
+          command(['cargo', 'package', '--locked', '--allow-dirty', '-p', name]) // One isolated verification compile.
+          const target = jsonCommand(['cargo', 'metadata', '--format-version', '1', '--no-deps']).target_directory
+          bytes = fs.readFileSync(path.join(target, 'package', filename))
+        }
+        const file = path.join(directory, filename)
+        fs.writeFileSync(file, bytes, { flag: 'wx' })
+        const upload = require('./release-cargo-upload.cjs')
+        originals.set(name, { bytes, metadata: upload.describeArchive(bytes, name, version), file,
+          tag: release.tag_name, releaseId: release.id, retained: Boolean(expected) })
+        return sha256(bytes)
+      }
       command(['cargo', 'package', '--locked', '--allow-dirty', '--no-verify', '-p', name])
       const target = jsonCommand(['cargo', 'metadata', '--format-version', '1', '--no-deps']).target_directory
       return sha256(fs.readFileSync(path.join(target, 'package', `${name}-${version}.crate`)))
     },
     cargoPublish: async (name) => {
+      if (frozen) {
+        const original = originals.get(name); assert.ok(original, 'Require the original verified crate Buffer')
+        if (!original.retained) {
+          await write(() => command(['gh', 'release', 'upload', original.tag, original.file, '--repo', repository]))
+          const asset = github(repository, 'releases/' + original.releaseId).assets.find(asset => asset.name === path.basename(original.file))
+          assert.ok(asset)
+          const bytes = command(['gh', 'api', 'repos/' + repository + '/releases/assets/' + asset.id,
+            '-H', 'Accept: application/octet-stream'], { encoding: null, maxBuffer: 64 * 1024 * 1024 })
+          assert.equal(sha256(bytes), sha256(original.bytes)); original.retained = true
+        }
+        return write(() => require('./release-cargo-upload.cjs').uploadArchive(original.bytes, original.metadata, env.CARGO_REGISTRY_TOKEN))
+      }
       const result = await write(() => spawnCommand(['cargo', 'publish', '--locked', '--allow-dirty', '-p', name], {
         encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
       }))
@@ -789,8 +840,13 @@ async function main() {
     const prepared = createPreparation(result, identity, Number(process.env.BAMBOO_EXECUTABLE_CONTRACT_VERSION))
     const output = JSON.stringify(prepared)
     assert.ok(Buffer.byteLength(output) <= 64 * 1024, 'Release preparation exceeds its job-output bound')
-    fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\nreceipt_file=${context.receiptFile}\nprepared_release=${output}\n`)
-    console.log(`Resolved automatic main release: ${version}`)
+    const originalExecutables = context.validation?.kind === 'bamboo-frozen-dev-release/v1'
+      && require('./sidecar-release.cjs').completedNativeOriginals(result.release, identity, process.env.BAMBOO_RELEASE_SIGNING_KEY)
+    if (context.validation?.kind === 'bamboo-frozen-dev-release/v1') {
+      assertFrozenPublisherRun(result.receipt, process.env.GITHUB_RUN_ID, originalExecutables)
+    }
+    fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\nreceipt_file=${context.receiptFile}\nprepared_release=${output}\noriginal_executables=${originalExecutables}\n`)
+    console.log(`Resolved exact release: ${version}`)
   } else if (process.argv[2] === 'resume') {
     const prepared = JSON.parse(process.env.PREPARED_RELEASE)
     const result = await resumePrepared(context, prepared, preparationIdentity(context, process.env.TARGET_VERSION),
@@ -805,6 +861,12 @@ async function main() {
   }
 }
 
+function assertFrozenPublisherRun(receipt, runId, complete) {
+  assert.match(receipt.publisherRunId || '', /^[1-9][0-9]*$/)
+  assert.ok(complete || receipt.publisherRunId === runId,
+    'Native checkpoint is incomplete; rerun failed jobs of original publisher run ' + receipt.publisherRunId)
+}
+
 function preparationIdentity(context, version, env = process.env) {
   return { ...context.identity, version, sourceTree: command(['git', 'rev-parse', 'HEAD^{tree}']).trim(),
     workflowRevision: env.GITHUB_WORKFLOW_SHA, runId: env.GITHUB_RUN_ID, runAttempt: Number(env.GITHUB_RUN_ATTEMPT),
@@ -816,5 +878,5 @@ module.exports = { assertVersion, assertManualVersion, validateSource, validateR
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
   verifyRegistrySource, highestStableVersion, spawnCommand, command, createPreparation, validatePreparation, resumePrepared,
-  assertAdmissionCompatibility }
+  assertAdmissionCompatibility, assertFrozenPublisherRun }
 if (require.main === module) main().catch((error) => { console.error(error); process.exitCode = 1 })
