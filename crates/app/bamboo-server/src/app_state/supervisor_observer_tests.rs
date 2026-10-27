@@ -332,7 +332,7 @@ async fn saved(state: &AppState, id: &str) -> Session {
 }
 
 async fn wait_saved(state: &AppState, id: &str, predicate: impl Fn(&Session) -> bool) -> Session {
-    tokio::time::timeout(WAIT, async {
+    let settled = tokio::time::timeout(WAIT, async {
         loop {
             let session = saved(state, id).await;
             if predicate(&session) {
@@ -341,8 +341,45 @@ async fn wait_saved(state: &AppState, id: &str, predicate: impl Fn(&Session) -> 
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| panic!("canonical state did not settle for {id}"))
+    .await;
+    match settled {
+        Ok(session) => session,
+        Err(_) => {
+            let current = saved(state, id).await;
+            let child = state.storage.load_session(OBSERVER).await.unwrap();
+            let child_diagnostic = child.as_ref().map(|child| {
+                let final_message = child
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| matches!(message.role, bamboo_agent_core::Role::Assistant))
+                    .map(|message| {
+                        (
+                            format!("{:?}", message.phase),
+                            message.content.chars().take(256).collect::<String>(),
+                        )
+                    });
+                (
+                    child.last_run_status(),
+                    child.last_run_error(),
+                    child.metadata.get("runtime.completion_reason"),
+                    source(child),
+                    final_message,
+                    child.agent_runtime_state.as_ref().map(|runtime| {
+                        (
+                            runtime.round.total_tool_calls,
+                            runtime.round.total_prompt_tokens,
+                        )
+                    }),
+                )
+            });
+            panic!("canonical state did not settle for {id}; status={:?}; error={:?}; wait={:?}; user_seen={}; report_seen={}; child={child_diagnostic:?}",
+                current.last_run_status(), current.last_run_error(),
+                current.agent_runtime_state.as_ref().and_then(|runtime| runtime.waiting_for_children.as_ref()),
+                current.messages.iter().any(|message| message.content.contains(USER)),
+                current.messages.iter().any(|message| message.content.contains(REPORT)));
+        }
+    }
 }
 
 fn source(session: &Session) -> Option<ChildCompletionSource> {
@@ -423,6 +460,18 @@ async fn native_case(with_work_wait: bool) {
     f.probe.release.notify_one();
     let observer = wait_saved(&f.state, OBSERVER, complete).await;
     let original_source = source(&observer).unwrap();
+    assert_eq!(f.probe.turns.load(Ordering::SeqCst), 5,
+        "the completed Observer must execute its two exports, two reads and final report; source={original_source:?}");
+    let sealed_report = observer
+        .messages
+        .iter()
+        .find(|message| Some(&message.id) == original_source.result_message_id.as_ref())
+        .expect("the current terminal source must seal the actual Observer report");
+    assert!(
+        sealed_report.content.contains(REPORT),
+        "the sealed Observer result must retain its report: {}",
+        sealed_report.content
+    );
     let parent = wait_saved(&f.state, parent_id, |parent| {
         parent
             .messages
