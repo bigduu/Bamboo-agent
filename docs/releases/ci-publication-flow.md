@@ -1,5 +1,12 @@
 # CI and publication flow
 
+Read the complete local [delivery-flow/v1](../delivery-workflow.md) and
+[Actions audit](../ci-workflow-audit.md) first. These shared copies come from
+Zenith `874ee7c`; this guide adds Bamboo's commands, configurations and test map.
+Use the same source checkpoint and original evidence when another agent takes
+over. Check current activation and actual runs; a prepared owner is not an
+accepted or published artifact.
+
 This is the operating guide for Bamboo's CI and automatic release path. The
 [Release Process](../../CONTRIBUTING.md#release-process) remains authoritative
 for cuts, original-source repairs, protected admission and credentials.
@@ -153,55 +160,187 @@ allocator/store/signer, import Main promotion authority, or dispatch production
 while those dependencies remain pending. Genuine v6 and frozen recovery bytes
 and the active legacy route remain unchanged.
 
-## Phase contracts
+## Phase contracts and activation
 
-| Phase | Trigger and owner | Required result |
+Feature admission is implemented by #2311. Required `Test` aggregates Unit, E2E
+and SSH runtime results on every dev PR. One physical Linux executor preserves
+independent default package configurations plus the recorder in one owned target
+directory. Ordinary library/binary, integration and documentation cases run once;
+explicit feature owners run only catalogued additions. The controller records
+each configuration's features/profile and actual compiled-artifact freshness.
+Serial storage and ignored SSH reuse their default context executables.
+Unit/E2E remain logical reporting groups. Applicable native acceptance runs before dev
+admission; the recorder's Linux lifecycle is already in the canonical executor.
+Ordinary Linux orchestration/context tests do not get separate compilation jobs.
+Fix failures in feature branches.
+
+## Feature quality owners prepared by #2331
+
+All rows below use CI's actual dev-PR merge M with clean checkout checks before
+and after execution. Both required summaries consume every selected result;
+missing, skipped, cancelled and failed owners block admission. This candidate
+combines A95 with C2330's native/browser WIP; it requires hosted acceptance on
+its own final source and does not establish success for the earlier candidates.
+
+| Owner | Configuration and real command | Output and boundary |
 | --- | --- | --- |
-| Development admission | A bounded PR to `dev`; its owner | Required `Test` compiles the locked workspace; affected local tests, regression coverage and current review pass. |
-| Frozen release acceptance | Same-repository `release/<cut-SHA>` PR to `main`; one release owner | Full tests, all-feature checks, lint, security and Linux/macOS/Windows native tests pass on the actual PR merge source. The frontend workflow separately validates the original release head. |
-| Main admission | Normal release merge pushes `main`; CI | Authenticate the completed release acceptance against the actual ordered merge parents, reviewed release tree, source ancestry and original job attempts. |
-| Publication preparation | Successful main-push CI; the canonical publisher | Independently authenticate source/evidence, reserve one version and transport its exact sealed frontend bytes. |
-| Crate publication | Isolated Cargo publisher, concurrent with native builds | Resume the same reservation, stamp disposable manifests, publish in dependency order, then verify registry checksums, source and embedded frontend. |
-| Native builds | Source-selected native runners, concurrent with crate publication | Verify prepared frontend transport and perform the release executable build of the actual versioned main source without publication credentials. |
-| Final assets | The existing final publisher, after both branches succeed | Authenticate completed crates and all required native receipts, then verify immutable uploads. The final manifest signals complete binary availability. |
+| Lint | Ubuntu/stable/dev: `cargo clippy --locked --all-features`, `cargo clippy --locked --workspace --all-features`, `CARGO_BUILD_JOBS=1 cargo clippy --locked --all-features --lib -p bamboo-storage` | Three distinct feature graphs, one owned analysis target; original strict `-D warnings` and reviewed exceptions. JSON diagnostics retain actual compatible-unit freshness and each failure, per attempt. |
+| MSRV (Rust 1.95) | Ubuntu/Rust 1.95.0: Python check-msrv unit tests, `python3 scripts/check-msrv.py`, `cargo check --locked --workspace --all-targets --all-features` | Full resolved locked metadata plus workspace/dependency MSRV checks; no substitution with stable/default compilation. |
+| Security Audit | Ubuntu/stable: install pinned cargo-audit 0.22.2, `cargo audit --deny warnings` | Original `.cargo/audit.toml`; no new exemptions. |
+| cargo-deny | Pinned action `3c634983`, cargo-deny 0.20.2: `check` | The action defaults to `--all-features` in its Rust 1.85/Alpine container; original targets/licenses/bans/advisories/sources remain. This is distinct from audit and MSRV. |
+| Feature CodeQL | Ubuntu, actions/javascript-typescript/python/rust, init/analyze v4, `build-mode: none` | Four analyses with no product compilation, browser execution or repeated Node tests. |
+| Documentation (#2321 staged producer) | Ubuntu/stable: `cargo doc --locked --no-deps --all-features --document-private-items` | One supported site configuration on the 30 default members; both required summaries consume the real job result. Original tar and complete integrity receipt retained per physical attempt. |
+| Frontend Package Inventory | Ubuntu: committed bytes verification; stable Cargo only for `cargo package --locked -p bamboo-server --allow-dirty --list` | Inventory requires build.rs, frontend_build.rs, manifest and zip. No additional product compilation, runtime suite, build target/cache, version stamping or final archive. |
 
-```mermaid
-flowchart TD
-  dev[Reviewed dev admission] --> frozen[Full frozen release acceptance]
-  frozen --> main[Normal main merge and lightweight admission]
-  main --> prepare[One signed version and sealed frontend preparation]
-  prepare --> crates[Publish and verify crate closure]
-  prepare --> native[Build required native targets]
-  crates --> final[Verify both branches and publish final manifest]
-  native --> final
-```
+Ordinary embedded compilation/runtime, including the real `CARGO_BIN_EXE_bamboo`
+frontend case, belongs to A's canonical default-package executor. Inventory adds
+no extra dev opt-1/server opt-z or combined-member build configuration. MSRV
+check artifacts, all-feature graphs, API-only Actor and npm-staged release
+consumers remain distinct valid inputs. Share compiled outputs only within a
+compatible compiler/features/profile/frontend identity; a restored cache is not
+execution evidence. Quick Checks owns feature formatting once. All three
+focused frontend runtime targets remain in A's canonical default-package tests.
 
-The full Rust suite belongs to frozen release acceptance. Main admission is a
-real verification gate that reuses that result; it is not a claim that tests ran
-again on main. A missing or failed proof stops publication. A successful dev
-compile does not establish release acceptance.
+Before converting Root Birth Strict Lint to a manual exact-snapshot diagnostic,
+the A95 and C2330 definitions were checked: blob
+`02f8bb8f7b40a238cc77bc11be71f4e6ef256451` contains zero runtime commands.
+Its only command is standalone storage strict Clippy on Ubuntu/stable,
+all-features/lib/dev, with one build job. Feature Lint retains that selection
+on M. The four exact Root-birth cases and all other serial authority families
+still execute once using A's default-storage test executable; the old workflow
+comment about all-feature Unit execution was not execution evidence.
 
-The release PR's three `Platform Tests` jobs retain native Supervisor, portable
-Skill and frontend contract coverage. They do not run `cargo build --release`.
-The three optimized executable builds happen only in the automatic main
-publisher, after the actual main source, version and frontend bytes are bound.
-Historical producers keep their original build-job acceptance requirements.
+The existing main/manual CodeQL, original release frontend-head contract and
+full legacy quality routes remain active until #2318 cutover. Thus this slice
+fills feature ownership without claiming release/main repetition is already
+removed. Rustdoc is staged below; Docker/ABI, native release outputs and final
+crate archives belong to their separate slices; #2331 neither creates nor activates source
+authority, version allocation, publication or promotion protocols.
 
-Unit and E2E retain ordinary native Cargo jobs for the other 29 crates. Server
-jobs use eight static matrix rows: seven library blocks and one integration tail.
-Library blocks assign each name to the first matching namespace in the order
-browser, chat, execute, settings, app-state, remaining handlers, then remaining
-library tests; each block skips every earlier filter, including nested matches.
-The integration tail has no library-name filters. Unit selects the default
-integration targets, compiles examples and runs doctests; E2E selects all-feature
-integration targets. Failed jobs can be rerun independently. Each library block
-still compiles the server test binary, so more jobs alone do not prove a net
-speedup; record compile, execution, queue and complete-CI timings separately.
+## Documentation originals and pending Main consumer
 
-Keep required check names stable. Do not use empty success jobs, synthesized
-statuses, `[skip ci]`, or workflow-level path filters to bypass required gates.
-The current repository's verified capabilities, rather than an assumed merge
-queue or auto-merge setting, determine its admission route.
+#2321 stages the sole dev-PR site producer in CI's `Documentation` job. It checks
+the actual merge M and clean source before/after generation, clears only its
+owned `target/doc`, and preserves the `bamboo_agent/index.html` redirect. The
+supported configuration uses all features and private items on Cargo's 30
+default members, excluding Analytics and the recorder example. Doctests remain
+with their runtime owners; CodeQL remains a separate analysis without a build.
+
+`feature-docs-<run>-<physicalAttempt>` retains `artifact.tar` and `receipt.json`
+for 90 days. The receipt includes every site file's path/size/SHA-256, the raw
+tar hash, actual M/tree, distinct workflow controller SHA/ref, repository/run/
+attempt, toolchain, selected manifests, configuration and lock/workflow hashes.
+Bounded regular-file reads and real tar verification reject links, unsafe paths,
+missing/changed files and source drift. Receipt integrity does not establish
+publication authority: the future consumer must separately authenticate the
+official workflow/run/jobs, original artifact API ID/digest and promoted source
+through the shared v2 Main admission interface. Equal trees are insufficient.
+
+Only the producer is implemented here, pending its own hosted acceptance. The
+read-only Main consumer is not connected; legacy `docs.yml` still builds
+main/master PRs and pushes and retains its existing main-only Pages permissions
+and environment. Full legacy CI keeps its old `cargo doc --no-deps` route until
+the coordinated authority cutover. These repetitions are pending, not removed.
+The future consumer must copy the original tar rather than rebuild or repackage;
+its Pages transfer has a separate one-day retention boundary. Missing, expired
+or changed originals stop deployment. There is no new store or allocator, and
+bootstrap never authorizes Pages deployment.
+
+## Native and browser feature owners
+
+#2319 consolidates feature native acceptance into `Native Feature
+(windows-2025)` and `Native Feature (macos-latest)`. Each owns one workspace and
+`target/native-feature`; both required summaries reject a failed, skipped,
+cancelled or missing matrix result. Actor/Ticket standalone workflows no longer
+start another dev-PR producer. Explicit manual and full legacy release checks
+remain available; this change does not activate release-source publication.
+
+The three portable Node suites register 46 Supervisor, 6 Lotus artifact and
+9 frontend policy cases. Ubuntu `Quick Checks` runs these 61 registrations once;
+each Windows/macOS native feature job runs them once before Cargo. Windows
+retains the explicit unsupported-platform refusal assertions. These counts
+describe registration, not hosted execution or the separate `browser-runtime`
+Node suites.
+
+#2330 prepares one Ubuntu Node 24 `Browser Runtime Unit and E2E` feature job.
+Both required summaries consume that same job result. It installs the locked
+`playwright-core` 1.62.1 with package scripts disabled, installs only its matching
+headless shell once, then runs `npm --prefix browser-runtime run test:runtime`.
+That serial command lists all thirteen files: original host/profile/checkpoint/
+writer-close/shared-host/shared-failclosed/storage-runtime/native-root-tracker,
+plus busy-response, ephemeral-clean, launch-admission, storage-preparation and
+working-directory. The final TAP summary must contain real passing cases and
+zero failures, cancellation, skips or TODOs. There is no Cargo/Vite or portable
+61-case repetition, and release/main/legacy full paths skip the new suite.
+
+The Node child receives only runtime paths and actual M identity, without
+workflow credentials/write channels; Git source/clean checks bracket execution.
+Per-attempt TAP evidence preserves failures. #2329's unknown writer scratch is
+retained for isolated-runner teardown. Its diagnostic `40422761407` passed one
+bounded download case plus eight close fixtures; it is not thirteen-file or
+combined feature acceptance. C7c552 + F772468 are explicit WIP prerequisites;
+refresh only through normal accepted A/C integration and require final-source
+CI before claiming this owner accepted. This does not activate publication.
+
+| Native configuration | Cases currently selected from source | Runtime owner |
+| --- | --- | --- |
+| Windows Rust 1.99/MSVC/API-only, independent storage/server/tools defaults | 41: 9 snapshot + 3 gateway + 19 directory + 5 scoped + 5 initial processes | Existing Actor immutable-executable controller inside the Windows owner |
+| Windows stable/default server, embedded frontend, test opt-0 | 7 TLS + 7 frontend contract | One server Cargo invocation, two enumerated test targets |
+| Recorder default package on both OSes | 2 Unit + 2 native lifecycle | Actual Cargo binary plus original `CARGO_BIN_EXE` and cwd |
+| Windows default Ticket | 1 unsupported-filesystem case | Windows owner, exact selection |
+| Portable Skill source/read/catalog | Windows 22/17/46; macOS 24/17/47 | Independent default skills/server-tools contexts |
+| macOS TLS dev/all-features, server opt-z | 8 including real backtrace | macOS owner with oversized-unwind diagnostic rejection |
+| macOS frontend default/test opt-0 | 7 | macOS owner; distinct from dev-profile server |
+
+These are source/cfg expectations, not a claim of hosted runtime success. The
+driver enumerates actual compiled names and requires the selected runtime count
+with zero failures/ignores, recording source/tree, compiler, features/profile,
+frontend mode, executable hashes and compatible-unit freshness. Expected totals
+are 145 Cargo runtime cases on Windows and 107 on macOS. The original 41 Actor names, real junction
+and process evidence remain guarded. Default storage cannot acquire server
+test-utils; different frontend modes and macOS dev/test profiles do not share
+incompatible executables. Compatible dependencies share the owned target.
+
+Run `node --test scripts/native-test-owner.test.cjs scripts/ci-routing.test.cjs`
+for controller fixtures. Native execution is
+`node scripts/native-test-owner.cjs` on the matching disposable runner, with
+`CARGO_TARGET_DIR` set to its own `target/native-feature`; it deliberately has no
+cross-platform or compilation fallback. Per-attempt evidence includes partial
+command logs and `native-owner.json`. Never publish raw host process/env logs.
+
+New source authority #2318 must wait for accepted #2311 plus complete #2319
+native receipts. Its release path must not repeat these cases. A339/v7 was not
+published or present in the audited frozen sources; retain its commit/run as
+runtime evidence without treating it as complete v8 native acceptance. Actual
+v6 and earlier frozen workflow/helper contracts remain unchanged.
+
+| Phase | Target contract | Activation |
+| --- | --- | --- |
+| Feature -> dev | Disjoint Unit/E2E, native acceptance and current review pass on the feature merge source. | Prepared by #2311/#2319; activation requires their exact-source hosted runs and protected dev admission. |
+| Release source | Freeze the exact tested dev cut and reserve one formal version with the existing allocator. | Pending release-source admission. |
+| Release artifacts | Stamp disposable checkouts; build/package/publish each native product once. No Unit/E2E repetition or product repairs. | Pending release-source admission. |
+| Main promotion | Verify the exact published source and retain tag, manifest/provenance hashes and publisher run in the promotion description. No build/test. | Pending release-source admission. |
+
+Keep source manifests at `0.0.0`. Immutable tags and Release manifests/provenance
+are the version/artifact record; do not move release HEAD to add a post-build
+JSON record. Before the first new cut, normally integrate current main ancestry
+into dev through a feature PR passing Unit/E2E. A repair returns through
+feature/dev and creates a fresh cut.
+
+The existing release suite and main-triggered publisher remain active until the
+separate source-admission cutover is accepted. The remaining sections document
+that temporary legacy route and historical recovery, not permission to skip its
+live gates. In that route release PRs still run complete acceptance, main CI
+reuses it, and the canonical publisher reserves the version and builds native
+assets after main. Preserve original proof/source/run identities throughout the
+migration. Do not trigger an unimplemented release route or add another publisher.
+
+Keep required check names stable. A missing, skipped, cancelled or failed
+selected dependency fails required `Test`. Native Cargo matrices keep
+`fail-fast: false` and independent failed-job reruns. More jobs or a cache hit
+alone do not prove a speedup; report compile/execution/queue timing separately.
+
+## Temporary legacy release and recovery procedure
 
 ## Freeze once and preserve source identities
 

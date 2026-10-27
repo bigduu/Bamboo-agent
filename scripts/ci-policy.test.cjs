@@ -557,6 +557,192 @@ const job = (id) => {
     : workflow.slice(contentStart, contentStart + nextJob)
 }
 
+const docsStep = (name, source = workflow) => {
+  const block = source.slice(source.indexOf("\n  docs:\n")).split(/\n  security:\n/u)[0]
+  const step = block.split(`      - name: ${name}\n`)[1]?.split(/\n      - /u)[0]
+  assert.ok(step, name)
+  return step
+}
+const docsShell = (name) => docsStep(name).match(/        run: \|\n([\s\S]*)/u)[1].replace(/^          /gmu, "").trimEnd()
+
+test("feature Docs has one canonical producer and both required summaries reject incomplete Docs", () => {
+  const assertOwner = (source) => {
+    const block = source.slice(source.indexOf("\n  docs:\n")).split(/\n  security:\n/u)[0]
+    assert.match(block, /^    if: needs.validation-source.outputs.feature == 'true' \|\| needs.validation-source.outputs.full == 'true'$/mu)
+    const build = docsStep("Build feature documentation once", source)
+    assert.match(build, /^        if: needs.validation-source.outputs.feature == 'true'$/mu)
+    assert.match(build, /^          cargo doc --locked --no-deps --all-features --document-private-items$/mu)
+    assert.doesNotMatch(build, /--workspace|--no-verify|continue-on-error|\|\| true/u)
+    assert.match(docsStep("Build documentation", source), /if: needs.validation-source.outputs.full == 'true'\n        run: cargo doc --no-deps/u)
+    const freeze = docsStep("Freeze original feature documentation tar and receipt", source)
+    assert.match(freeze, /^        if: needs.validation-source.outputs.feature == 'true'$/mu)
+    const upload = docsStep("Retain original feature documentation tar and receipt", source)
+    assert.match(upload, /if: success\(\) && needs.validation-source.outputs.feature == 'true'/u)
+    assert.match(upload, /name: feature-docs-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}/u)
+    assert.match(upload, /if-no-files-found: error\n          retention-days: 90/u)
+    assert.ok(block.indexOf("Verify feature documentation source stayed clean") < block.indexOf("Retain original feature documentation"))
+    assert.match(docsStep("Verify feature documentation source stayed clean", source), /if: always\(\) && needs.validation-source.outputs.feature == 'true'/u)
+    assert.doesNotMatch(block, /continue-on-error|pages: write|id-token: write|deploy-pages|cargo (?:test|build)/u)
+    for (const id of ["test", "e2e-test"]) {
+      const summary = source.split(`\n  ${id}:\n`)[1].split(/\n  [a-z][a-z0-9-]*:\n/u)[0]
+      assert.match(summary, /^    needs: \[[^\]]*\bdocs\b[^\]]*\]$/mu)
+      assert.match(summary, /DOCS_RESULT: \$\{\{ needs.docs.result \}\}/u)
+      assert.equal((summary.match(/"\$DOCS_RESULT"/gu) || []).length, 2)
+    }
+  }
+  assertOwner(workflow)
+  for (const [from, to] of [
+    ["cargo doc --locked --no-deps --all-features --document-private-items", "cargo doc --workspace"],
+    ["if: success() && needs.validation-source.outputs.feature == 'true'", "if: always()"],
+    ["retention-days: 90", "retention-days: 1"],
+    ['"$DOCS_RESULT"', '"success"'],
+    ["DOCS_RESULT: ${{ needs.docs.result }}", "DOCS_RESULT: success"],
+  ]) assert.throws(() => assertOwner(workflow.replace(from, to)))
+  const legacy = readFileSync(".github/workflows/docs.yml", "utf8")
+  assert.match(legacy, /branches: \[ main, master \]/u)
+  assert.match(legacy, /cargo doc --no-deps --all-features --document-private-items/u)
+  assert.match(legacy, /if: github.event_name == 'push' && github.ref == 'refs\/heads\/main'/u)
+  assert.doesNotMatch(legacy, /branches:.*dev|feature-docs-/u)
+})
+
+test("feature Docs real tiny tar and source receipt reject changed, unsafe and incomplete inputs", (t) => {
+  const shell = docsShell("Freeze original feature documentation tar and receipt")
+  const producer = shell.match(/^python3 - <<'PY'\n([\s\S]*)\nPY$/u)[1]
+  const rootManifest = readFileSync("Cargo.toml", "utf8")
+  const defaults = [...rootManifest.match(/default-members = \[([\s\S]*?)\]/u)[1].matchAll(/^\s*"([^"]+)",/gmu)].map(match => match[1])
+  assert.equal(defaults.length, 30)
+  const sources = Object.fromEntries(["Cargo.toml", "Cargo.lock", ".cargo/config.toml", ".github/workflows/ci.yml",
+    ...defaults.map(member => path.posix.join(member, "Cargo.toml"))].map(file => [file, readFileSync(file, "utf8")]))
+  const members = defaults.map(member => ({ manifest: path.posix.join(member, "Cargo.toml"),
+    name: sources[path.posix.join(member, "Cargo.toml")].match(/^name\s*=\s*"([^"]+)"/mu)[1] }))
+  const env = Object.fromEntries(["PATH", "HOME", "TMPDIR", "SYSTEMROOT", "LANG"].filter(key => process.env[key]).map(key => [key, process.env[key]]))
+  const python = ["python3.12", "python3"].find(candidate => spawnSync(candidate, ["-c", "import pathlib; assert hasattr(pathlib.Path(), 'is_relative_to')"], { env }).status === 0)
+  assert.ok(python)
+  const result = spawnSync(python, ["-c", String.raw`
+import copy, io, json, os, pathlib, shutil, subprocess, sys, tarfile, tempfile
+payload = json.load(sys.stdin)
+ns = {"__name__": "fixture"}; exec(compile(payload["producer"], "actual-ci-docs-producer", "exec"), ns)
+checks = []
+def reject(name, call):
+    try: call()
+    except (AssertionError, KeyError, ValueError, OSError, tarfile.TarError): checks.append(name)
+    else: raise AssertionError("Accepted negative: " + name)
+with tempfile.TemporaryDirectory(prefix="bamboo-feature-docs-") as scratch:
+    base = pathlib.Path(scratch).resolve(); root = base / "source"; root.mkdir(); os.chdir(root)
+    for name, text in payload["sources"].items():
+        file = root / name; file.parent.mkdir(parents=True, exist_ok=True); file.write_text(text)
+    (root / ".gitignore").write_text("/target/\n")
+    def git(*args): return subprocess.check_output(["git", "-c", "core.hooksPath=/dev/null", *args], text=True).strip()
+    git("init", "-q"); git("add", "."); git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "tiny docs source")
+    temporary = base / "runner"; temporary.mkdir()
+    packages = [{"id": item["name"], "name": item["name"], "manifest_path": str(root / item["manifest"])} for item in payload["members"]]
+    metadata = {"workspace_root": str(root), "target_directory": str(root / "target"), "workspace_default_members": [item["id"] for item in packages], "packages": packages}
+    metadata_file = temporary / "feature-docs-metadata.json"
+    metadata_file.write_text(json.dumps(metadata))
+    for tool in ["rustc", "cargo", "rustdoc"]: (temporary / ("feature-docs-" + tool + ".txt")).write_text(tool + " fixture-version\n")
+    os.environ.update(GITHUB_SHA=git("rev-parse", "HEAD"), GITHUB_EVENT_NAME="pull_request", GITHUB_BASE_REF="dev", GITHUB_REF="refs/pull/42/merge",
+        GITHUB_REPOSITORY="bigduu/Bamboo-agent", GITHUB_WORKFLOW_SHA="c" * 40, GITHUB_WORKFLOW_REF="bigduu/Bamboo-agent/.github/workflows/ci.yml@refs/pull/42/merge",
+        GITHUB_RUN_ID="12345", GITHUB_RUN_ATTEMPT="2", RUNNER_TEMP=str(temporary), RUNNER_OS="Linux", RUNNER_ARCH="X64")
+    site = root / "target/doc"; (site / "bamboo_agent").mkdir(parents=True); (site / "static.files/nested").mkdir(parents=True)
+    (site / "bamboo_agent/index.html").write_text("<h1>tiny docs 中文</h1>")
+    (site / "static.files/nested/app.js").write_text("const docs = true;\n"); (site / "static.files/empty").write_bytes(b"")
+    ns["produce"](); output = temporary / "feature-docs-12345-2"; archive = output / "artifact.tar"
+    receipt = json.loads((output / "receipt.json").read_text())
+    context = {key: copy.deepcopy(receipt[key]) for key in ["source", "controller", "run", "artifactName", "configuration", "inputs", "toolchain", "runner"]}
+    assert receipt["source"]["sha"] != receipt["controller"]["sha"] and receipt["source"]["tree"] == git("rev-parse", "HEAD^{tree}")
+    assert receipt["fileCount"] == 4 and len(receipt["configuration"]["defaultMembers"]) == 30
+    assert receipt["configuration"]["command"] == ["cargo", "doc", "--locked", "--no-deps", "--all-features", "--document-private-items"]
+    assert (site / "index.html").read_text() == '<meta http-equiv="refresh" content="0;url=bamboo_agent/index.html">\n'
+    copied = output / "original-copy.tar"; shutil.copyfile(archive, copied); ns["verify_receipt"](receipt, copied, context)
+    checks += ["real tar roundtrip and full manifest", "actual clean source with distinct controller", "original tar copied byte for byte"]
+    def changed(parts, value):
+        item = copy.deepcopy(receipt); target = item
+        for part in parts[:-1]: target = target[part]
+        target[parts[-1]] = value; ns["verify_receipt"](item, archive, context)
+    for route, value in [("schema", "foreign"), ("complete", False), ("source/sha", "b"*40), ("source/tree", "b"*40),
+        ("controller/sha", "b"*40), ("controller/ref", "refs/heads/main"), ("run/repository", "foreign/repo"), ("run/id", 12346),
+        ("run/physicalAttempt", 3), ("run/event", "push"), ("run/ref", "refs/pull/43/merge"), ("artifactName", "other"),
+        ("configuration/command", ["cargo", "doc"]), ("configuration/defaultMembers", []), ("configuration/sourceConfigSha256", {}),
+        ("configurationSha256", "0"*64), ("inputs/cargoLockSha256", "0"*64), ("inputs/sourceWorkflowSha256", "0"*64),
+        ("toolchain/rustdoc", "changed"), ("runner/os", "Windows"), ("tar/file", "other.tar"), ("tar/sha256", "0"*64),
+        ("tar/sizeBytes", 1), ("files", receipt["files"][:-1]), ("fileCount", 0), ("siteBytes", 0)]:
+        reject("receipt " + route, lambda route=route, value=value: changed(route.split("/"), value))
+    for field in receipt:
+        item = copy.deepcopy(receipt); del item[field]
+        reject("missing " + field, lambda item=item: ns["verify_receipt"](item, archive, context))
+    for label, mutate in [("unknown field", lambda item: item.update(extra=True)),
+        ("manifest hash", lambda item: item["files"][0].update(sha256="0"*64)),
+        ("manifest size", lambda item: item["files"][0].update(sizeBytes=1)),
+        ("manifest order", lambda item: item["files"].reverse())]:
+        item = copy.deepcopy(receipt); mutate(item); item["siteBytes"] = sum(file["sizeBytes"] for file in item["files"])
+        reject(label, lambda: ns["verify_receipt"](item, archive, context))
+    for limit in ["MAX_FILES", "MAX_ENTRIES", "MAX_SITE_BYTES", "MAX_TAR_BYTES", "MAX_RECEIPT_BYTES"]:
+        original = ns[limit]; ns[limit] = 1
+        reject("bounded " + limit, lambda: ns["verify_receipt"](receipt, archive, context)); ns[limit] = original
+    for name in ["../escape", "/absolute", "a/../escape", "a//b", "./a", ".", "C:/escape", "a\\b", "a\nname"]:
+        reject("unsafe path " + repr(name), lambda name=name: ns["safe_path"](name))
+    raw = archive.read_bytes(); corrupt = output / "corrupt.tar"
+    for label, data in [("truncated tar", raw[:700]), ("changed tar bytes", b"X" + raw[1:])]:
+        corrupt.write_bytes(data); reject(label, lambda: ns["verify_receipt"](receipt, corrupt, context))
+    for label, name, kind in [("traversal", "../escape", tarfile.REGTYPE), ("symlink", "evil", tarfile.SYMTYPE),
+        ("hardlink", "evil", tarfile.LNKTYPE), ("unexpected", "extra", tarfile.REGTYPE), ("duplicate", receipt["files"][0]["path"], tarfile.DIRTYPE),
+        ("missing file", "", None), ("changed content", "", None)]:
+        with tarfile.open(corrupt, "w") as tar:
+            with tarfile.open(archive, "r:") as good:
+                for member in good:
+                    if label == "missing file" and member.name == receipt["files"][0]["path"]: continue
+                    stream = good.extractfile(member) if member.isfile() else None
+                    if label == "changed content" and member.name == receipt["files"][0]["path"]:
+                        data = stream.read(); stream.close(); stream = io.BytesIO(b"X" + data[1:])
+                    tar.addfile(member, stream)
+            if kind is not None:
+                member = tarfile.TarInfo(name); member.type = kind; member.linkname = "bamboo_agent/index.html" if kind in [tarfile.SYMTYPE, tarfile.LNKTYPE] else ""
+                tar.addfile(member, io.BytesIO(b"") if member.isfile() else None)
+        item = copy.deepcopy(receipt); item["tar"].update(sha256=ns["file_hash"](corrupt, output), sizeBytes=corrupt.stat().st_size)
+        reject("tar " + label, lambda: ns["verify_receipt"](item, corrupt, context))
+    outside = base / "outside"; outside.mkdir(); (outside / "file").write_text("outside")
+    for label, create in [("input symlink", lambda link: link.symlink_to(outside / "file")), ("input hardlink", lambda link: os.link(outside / "file", link))]:
+        link = temporary / "unsafe"; create(link); reject(label, lambda: ns["read_text"](link, temporary, 65536)); link.unlink()
+    link = temporary / "parent-link"; link.symlink_to(outside, target_is_directory=True)
+    reject("input ancestor symlink", lambda: ns["read_text"](link / "file", temporary, 65536)); link.unlink()
+    reject("input parent traversal", lambda: ns["read_text"](temporary / "../outside/file", temporary, 65536))
+    os.environ["GITHUB_RUN_ATTEMPT"] = "3"
+    redirect = site / "index.html"; redirect_bytes = redirect.read_bytes(); redirect.unlink(); os.link(outside / "file", redirect)
+    reject("redirect hardlink before write", ns["produce"]); assert (outside / "file").read_text() == "outside"
+    redirect.unlink(); redirect.write_bytes(redirect_bytes)
+    link = site / "linked"; link.symlink_to(outside / "file")
+    reject("site symlink", ns["produce"]); link.unlink()
+    for route, value in [("workspace_root", str(outside)), ("target_directory", str(outside)), ("workspace_default_members", metadata["workspace_default_members"] * 2), ("packages", packages[:-1])]:
+        changed_metadata = copy.deepcopy(metadata); changed_metadata[route] = value; metadata_file.write_text(json.dumps(changed_metadata))
+        reject("metadata " + route, ns["produce"])
+    metadata_file.write_text(json.dumps(metadata))
+    for key, value in [("GITHUB_SHA", "0"*40), ("GITHUB_EVENT_NAME", "push"), ("GITHUB_BASE_REF", "main"), ("GITHUB_REF", "refs/heads/dev"),
+        ("GITHUB_REPOSITORY", "foreign/repo"), ("GITHUB_WORKFLOW_SHA", "latest"), ("GITHUB_WORKFLOW_REF", "refs/heads/main"), ("GITHUB_RUN_ID", "0"), ("GITHUB_RUN_ATTEMPT", "0")]:
+        original = os.environ[key]; os.environ[key] = value; reject("source context " + key, ns["produce"]); os.environ[key] = original
+    (root / "dirty").write_text("untracked"); reject("dirty source", ns["produce"]); (root / "dirty").unlink()
+    original_verify = ns["verify_receipt"]
+    def dirty_after_verify(*args): original_verify(*args); (root / "dirty").write_text("post-build drift")
+    ns["verify_receipt"] = dirty_after_verify; reject("post-build source drift", ns["produce"]); (root / "dirty").unlink(); ns["verify_receipt"] = original_verify
+    os.environ["GITHUB_RUN_ATTEMPT"] = "2"; reject("completed attempt overwrite", ns["produce"]); assert archive.read_bytes() == raw
+    # Only a failing compiler stub is executed: this proves failure propagation, never compilation acceptance.
+    tools = base / "tools"; tools.mkdir(); (tools / "python3").symlink_to(sys.executable)
+    for tool in ["rustc", "rustdoc"]:
+        file = tools / tool; file.write_text("#!/bin/sh\nprintf fixture-version\\n\n"); file.chmod(0o755)
+    cargo = tools / "cargo"; cargo.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$RUNNER_TEMP/cargo-calls"\ncase "$1" in metadata) printf "{}";; -V) printf fixture-version;; doc) exit 29;; *) exit 99;; esac\n'); cargo.chmod(0o755)
+    child = {key: os.environ[key] for key in ["HOME", "PATH", "GITHUB_SHA", "GITHUB_EVENT_NAME", "GITHUB_BASE_REF", "GITHUB_REF", "GITHUB_REPOSITORY", "GITHUB_WORKFLOW_SHA", "GITHUB_WORKFLOW_REF", "GITHUB_RUN_ID", "RUNNER_TEMP", "RUNNER_OS", "RUNNER_ARCH"]}
+    child.update(PATH=str(tools) + os.pathsep + child["PATH"], GITHUB_RUN_ATTEMPT="99")
+    failed = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", payload["build"] + "\n" + payload["freeze"]], env=child, capture_output=True, text=True)
+    assert failed.returncode == 29, failed.stderr
+    assert (temporary / "cargo-calls").read_text().splitlines() == ["metadata --locked --format-version 1 --no-deps", "-V", "doc --locked --no-deps --all-features --document-private-items"]
+    assert not (temporary / "feature-docs-12345-99").exists(); checks.append("compiler failure creates no retained receipt")
+print(json.dumps(checks))
+`], { env, input: JSON.stringify({ producer, sources, members, build: docsShell("Build feature documentation once"), freeze: shell }), encoding: "utf8", timeout: 30000, maxBuffer: 2 << 20 })
+  assert.equal(result.status, 0, result.stderr + result.stdout)
+  const checks = JSON.parse(result.stdout)
+  assert.ok(checks.length >= 80, checks.length)
+  t.diagnostic(`${checks.length} actual tiny-tar/source integrity cases; no Cargo/Rustdoc executed`)
+})
+
 const comprehensiveOnly =
   "if: needs.validation-source.outputs.full == 'true'"
 
@@ -690,13 +876,14 @@ test("main-push validation remains reachable by the existing automatic publisher
   assert.match(testJob, /name: Test\n/u)
   assert.match(testJob, /runs-on: ubuntu-latest\n/u)
   assert.ok(testJob.includes("    timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"))
-  assert.match(testJob, /run: cargo build --locked\n/u)
+  assert.doesNotMatch(testJob, /cargo build/u)
+  assert.match(testJob, /test "\$FEATURE_RESULT" = success/u)
   assert.match(testJob, /test "\$CRATE_RESULT" = success/u)
   assert.match(testJob, /test "\$SSH_RESULT" = success/u)
   assert.doesNotMatch(testJob, /run: cargo test/u)
   assert.match(
     testJob,
-    /- name: Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs scripts\/sidecar-release\.test\.cjs scripts\/test-groups\.test\.cjs\n/u,
+    /- name: Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs scripts\/sidecar-release\.test\.cjs scripts\/test-groups\.test\.cjs scripts\/run-feature-tests\.test\.cjs scripts\/native-test-owner\.test\.cjs\n/u,
   )
   assert.match(
     testJob,
@@ -722,7 +909,7 @@ test("main-push validation remains reachable by the existing automatic publisher
 
   assert.match(
     contributing,
-    /Pull requests into `dev` run the required\s+`Test` check in compile-only mode \(`cargo build --locked`\) and auxiliary\s+`Quick Checks`/u,
+    /feature PR into `dev` runs required `Test`/u,
   )
   assert.match(contributing, /Before merge, owners must run affected tests locally and add or update coverage/u)
   assert.match(contributing, /for changed behavior, recording exact source, commands and results/u)
@@ -742,7 +929,7 @@ function serverMatrix(source) {
     .map((match) => ({ crate: match[1], block: match[2] }))
 }
 
-test("native matrices cover ordinary crates once and server through eight appended rows", () => {
+test("legacy release matrices retain their original crate and server coverage", () => {
   const manifest = readFileSync("Cargo.toml", "utf8")
   const members = manifest.match(/^default-members = \[([\s\S]*?)^\]/mu)
   assert.ok(members)
@@ -771,6 +958,305 @@ test("native matrices cover ordinary crates once and server through eight append
   assert.doesNotMatch(workflow, /test-build:|e2e-build:|test-blocks:|test-doctests:|grouped-tests|ci-artifacts|plan-id:/u)
   assert.match(workflow, /^permissions:\n  contents: read\n/mu)
   assert.match(job("main-release-admission"), /^    permissions:\n      contents: read\n      actions: read\n/mu)
+})
+
+test("one feature executor preserves default configurations and complete explicit additive case ownership", () => {
+  const { selectedPackages, sourceFeatureHash, FEATURE_SOURCE_SHA256, FEATURE_CONTEXTS, cargoArguments } = require('./run-feature-tests.cjs')
+  const result = spawnSync('cargo', ['metadata', '--locked', '--format-version', '1', '--no-deps'], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
+  assert.equal(result.status, 0, result.stderr)
+  const metadata = JSON.parse(result.stdout), packages = selectedPackages(metadata)
+  const expected = metadata.packages.filter(item => metadata.workspace_default_members.includes(item.id) || item.name === 'bamboo-tool-event-recorder-example')
+  assert.deepEqual(packages.map(item => item.name).sort(), expected.map(item => item.name).sort())
+  assert.ok(!packages.some(item => item.name === 'bamboo-analytics'))
+  const kinds = packages.flatMap(item => item.targets.filter(target => target.test).map(target => ({ id: `${item.id}/${target.name}/${target.kind}`, kind: target.kind })))
+  const unit = kinds.filter(target => target.kind.some(kind => ['lib', 'bin'].includes(kind))).map(target => target.id)
+  const e2e = kinds.filter(target => target.kind.includes('test')).map(target => target.id)
+  assert.ok(unit.length > 0 && e2e.length > 0)
+  assert.deepEqual(unit.filter(id => e2e.includes(id)), [])
+  for (const owner of packages) {
+    const args = cargoArguments(owner)
+    assert.equal(args.filter(arg => arg === '-p').length, 1)
+    assert.equal(args[args.indexOf('-p') + 1], owner.name)
+    assert.ok(!args.some(arg => ['--all-features','--features','--lib','--bins','--test','--tests','--doc','--all-targets'].includes(arg)))
+  }
+  assert.equal(sourceFeatureHash(packages, require('node:fs').realpathSync('.')), FEATURE_SOURCE_SHA256,
+    'New feature-sensitive source requires a reviewed ownership update')
+  assert.equal(FEATURE_CONTEXTS.flatMap(context => context.targets.flatMap(target => target.added)).length, 18)
+  assert.deepEqual(FEATURE_CONTEXTS.map(context => [context.package, context.features]), [
+    ['bamboo-infrastructure', ['otel-otlp', 'test-utils']], ['bamboo-tickets', ['test-utils']],
+    ['bamboo-server', ['test-utils']], ['bamboo-agent', ['ticket-runtime-fixtures']]])
+  for (const context of FEATURE_CONTEXTS) {
+    assert.ok(packages.some(owner => owner.name === context.package))
+    assert.ok(!cargoArguments({ name: context.package }, context).includes('--all-features'))
+  }
+  assert.match(job('feature-tests'), /target\/feature-tests/u)
+  assert.match(job('feature-tests'), /run: node scripts\/run-feature-tests.cjs/u)
+})
+
+test("the feature executor bounds debug artifacts and records capacity without changing release profiles", () => {
+  const feature = job("feature-tests")
+  assert.match(feature, /^    timeout-minutes: 90$/mu)
+  for (const profile of ["DEV", "TEST"]) {
+    const setting = `CARGO_PROFILE_${profile}_DEBUG: "0"`
+    assert.ok(feature.includes(setting))
+    assert.equal(workflow.split(setting).length - 1, 1, "debug override belongs only to the feature job")
+  }
+  assert.match(workflow, /^  CARGO_INCREMENTAL: "0"$/mu)
+  assert.match(feature, /rustc -vV\n            cargo -V/u)
+  assert.match(feature, /df -Pk "\$GITHUB_WORKSPACE" "\$RUNNER_TEMP"/u)
+  assert.match(feature, /- name: Record final feature disk usage\n        if: always\(\)/u)
+  assert.match(feature, /du -sk "\$CARGO_TARGET_DIR"/u)
+  assert.match(feature, /\$\{\{ runner.temp \}\}\/bamboo-feature-profile.log/u)
+  assert.doesNotMatch(feature, /cargo (?:build|check|clean|test)|--release|CARGO_PROFILE_RELEASE_|rm -[a-z]*r/u)
+  assert.doesNotMatch(readFileSync(".github/workflows/publish-crate.yml", "utf8"), /CARGO_PROFILE_(?:DEV|TEST)_DEBUG/u)
+})
+
+const browserRuntimeFiles = ["host", "profile", "profile-checkpoint", "writer-close", "shared-host", "shared-failclosed",
+  "storage-runtime", "native-root-tracker", "busy-response", "ephemeral-clean", "launch-admission", "storage-preparation", "working-directory"]
+  .map(name => `${name}.test.cjs`)
+test("one feature Node24 owner runs all thirteen browser runtime files without another producer", () => {
+  const metadata = JSON.parse(readFileSync("browser-runtime/package.json", "utf8"))
+  const lock = JSON.parse(readFileSync("browser-runtime/package-lock.json", "utf8"))
+  assert.equal(metadata.dependencies["playwright-core"], "1.62.1"); assert.equal(lock.packages["node_modules/playwright-core"].version, "1.62.1")
+  const command = metadata.scripts["test:runtime"]
+  const verify = (source, runtimeCommand) => {
+    const owner = source.match(/\n  browser-runtime-tests:\n([\s\S]*?)(?=\n  [a-z][a-z0-9-]*:\n)/u)?.[1]
+    assert.ok(owner)
+    assert.match(owner, /if: needs\.validation-source\.outputs\.feature == 'true'/u)
+    assert.match(owner, /runs-on: ubuntu-latest/u); assert.match(owner, /node-version: '24'/u)
+    assert.match(owner, /persist-credentials: false/u)
+    assert.match(owner, /npm ci --prefix browser-runtime --ignore-scripts/u)
+    assert.match(owner, /playwright-core\/package\.json'\)\.version, '1\.62\.1'/u)
+    assert.equal(owner.split("cli.js install --with-deps chromium-headless-shell").length - 1, 1)
+    assert.equal(owner.split("PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/bamboo-browser-runtime-browsers").length - 1, 2, "install and execution share one shell directory")
+    assert.doesNotMatch(owner, /\bcargo\b|\brust\b|\bvite\b|supervisor-native|lotus-next-artifact\.test|release-frontend-policy\.test|\bnpx\b|rm -|continue-on-error:|\|\| true/u)
+    assert.equal((owner.match(/test "\$\(git rev-parse HEAD\)" = "\$GITHUB_SHA"/gu) || []).length, 2)
+    assert.equal((owner.match(/test -z "\$\(git status --porcelain --untracked-files=all\)"/gu) || []).length, 2)
+    assert.match(owner, /set -euo pipefail\n          node <<'NODE' \| tee/u)
+    assert.match(owner, /if: always\(\)[\s\S]*name: browser-runtime-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}/u)
+    assert.deepEqual(runtimeCommand.split(" "), ["node", "--test", "--test-concurrency=1", "--test-reporter=tap", ...browserRuntimeFiles])
+    for (const id of ["test", "e2e-test"]) {
+      const body = source.split(`\n  ${id}:\n`)[1].split(/\n  [a-z][a-z0-9-]*:\n/u)[0]
+      assert.match(body, /needs: \[[^\n]*browser-runtime-tests/u)
+      assert.match(body, /BROWSER_RUNTIME_RESULT: \$\{\{ needs.browser-runtime-tests.result \}\}/u)
+      assert.match(body, /test "\$BROWSER_RUNTIME_RESULT" = success/u)
+    }
+    assert.equal(source.split("'test:runtime'").length - 1, 1, "one physical runtime command")
+  }
+  verify(workflow, command)
+  assert.deepEqual(readdirSync("browser-runtime").filter(file => file.endsWith(".test.cjs")).sort(), [...browserRuntimeFiles].sort())
+  for (const file of browserRuntimeFiles) assert.match(readFileSync(`browser-runtime/${file}`, "utf8"), /\btest\(/u, file + " must register cases")
+  for (const [from, to] of [["feature == 'true'", "full == 'true'"], ["node-version: '24'", "node-version: '22'"],
+    ["--ignore-scripts", ""], ["chromium-headless-shell", "chromium"], ['test "$BROWSER_RUNTIME_RESULT" = success', "true"]]) {
+    const owner = job("browser-runtime-tests")
+    const changed = from === 'test "$BROWSER_RUNTIME_RESULT" = success' ? workflow.replaceAll(from, to)
+      : workflow.replace(owner, owner.replace(from, to))
+    assert.throws(() => verify(changed, command))
+  }
+  assert.throws(() => verify(workflow, command.replace(" working-directory.test.cjs", "")))
+  assert.throws(() => verify(workflow, command + " host.test.cjs"))
+})
+
+test("browser runtime child keeps paths and actual M but never inherits workflow credentials", () => {
+  const block = job("browser-runtime-tests").match(/node <<'NODE' \| tee[^\n]*\n([\s\S]*?)\n          NODE/u)[1]
+  const script = block.split("\n").map(line => line.replace(/^          /u, "")).join("\n")
+  for (const [result, expected] of [[{ status: 0 }, 0], [{ status: 7 }, 7], [{ status: null }, 1]]) {
+    let received, exitCode
+    runInNewContext(script, { require: () => ({ spawnSync: (command, args, options) => { received = { command, args, options }; return result } }),
+      process: { env: { PATH: "/real-node-git", HOME: "/isolated-home", GITHUB_SHA: "a".repeat(40), GITHUB_RUN_ID: "12",
+        PLAYWRIGHT_BROWSERS_PATH: "/pinned-shell", GH_TOKEN: "private", ACTIONS_RUNTIME_TOKEN: "private", GITHUB_ENV: "/write-channel", NODE_OPTIONS: "--unsafe" },
+      exit: value => { exitCode = value } } })
+    assert.equal(received.command, "npm"); assert.deepEqual(Array.from(received.args), ["--prefix", "browser-runtime", "run", "test:runtime"])
+    assert.equal(received.options.env.GITHUB_SHA, "a".repeat(40)); assert.equal(received.options.env.PATH, "/real-node-git")
+    for (const key of ["GH_TOKEN", "ACTIONS_RUNTIME_TOKEN", "GITHUB_ENV", "NODE_OPTIONS"]) assert.equal(received.options.env[key], undefined)
+    assert.equal(exitCode, expected)
+  }
+})
+
+test("browser runtime TAP cannot report empty, partial, skipped or failed execution as success", () => {
+  const script = job("browser-runtime-tests").match(/          node <<'NODE'\n([\s\S]*?)\n          NODE/u)[1]
+    .split("\n").map(line => line.replace(/^          /u, "")).join("\n")
+  const good = "# tests 128\n# pass 128\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n"
+  const check = log => runInNewContext(script, { require: name => name === "node:assert/strict" ? assert : { readFileSync: () => log }, process: { env: { RUNNER_TEMP: "/isolated" } } })
+  check(good)
+  for (const log of ["", good.replace("tests 128", "tests 0"), good.replace("pass 128", "pass 0"),
+    good.replace("tests 128", "tests 127"), good + "# pass 128\n",
+    ...["fail", "cancelled", "skipped", "todo"].map(name => good.replace(`# ${name} 0`, `# ${name} 1`))]) assert.throws(() => check(log))
+})
+
+test("required Test performs only result admission for feature PRs without an unused checkout, toolchain or cache", () => {
+  const assertOwnership = (source) => {
+    const steps = source.split(/\n      - /u).slice(1)
+    assert.ok(steps.length > 1)
+    assert.match(steps[0], /^name: Require validation admission\n/u)
+    for (const step of steps.slice(1)) {
+      assert.match(step, /^        if: (?:(?:always|failure)\(\) && )?needs\.validation-source\.outputs\.full == 'true'$/mu)
+    }
+  }
+  const aggregate = job("test")
+  assertOwnership(aggregate)
+  for (const name of ["Install Rust", "Record the full validation toolchain", "Rust cache"]) {
+    assert.throws(() => assertOwnership(aggregate.replace(`name: ${name}\n        if: needs.validation-source.outputs.full == 'true'`,
+      `name: ${name}\n        if: github.event_name != 'push'`)))
+  }
+})
+
+test("serial Root birth selectors reuse canonical storage compilation and preserve strict lint ownership", () => {
+  const { SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES, cargoArguments } = require("./run-feature-tests.cjs")
+  assert.deepEqual(SERIAL_STORAGE_FAMILIES, ["v2::root_birth_tests::", "v2::host_root_create::tests::",
+    "v2::supervisor_management_tests::", "v2::supervisor_management_lifetime_tests::", "v2::supervisor_proof_tests::"])
+  assert.deepEqual(SERIAL_STORAGE_FILTERS, ["root_birth_tests", "host_root_create::tests", "supervisor_management", "supervisor_proof"])
+  const source = readFileSync("crates/infra/bamboo-storage/src/v2/root_birth_tests.rs", "utf8")
+  assert.deepEqual([...source.matchAll(/async fn (root_birth_[a-z_]+)\(/gu)].map(match => match[1]).sort(), [...ROOT_BIRTH_CASES].sort())
+  const args = cargoArguments({ name: "bamboo-storage" })
+  assert.deepEqual(args.slice(args.indexOf("--") + 1), SERIAL_STORAGE_SELECTORS.flatMap(prefix => ["--skip", prefix]))
+  const lint = readFileSync(".github/workflows/root-birth-acceptance.yml", "utf8")
+  assert.doesNotMatch(lint, /cargo test/u)
+  assert.match(lint, /cargo clippy --locked --all-features --lib -p bamboo-storage -- -D warnings/u)
+  assert.match(lint, /test "\$actual" = "\$EXPECTED_SOURCE"/u)
+  assert.match(lint, /workflow_dispatch:/u)
+  assert.match(lint, /test "\$EXPECTED_SOURCE" = "\$GITHUB_SHA"/u)
+  assert.doesNotMatch(lint, /pull_request:|head\.sha|cargo (?:build|test)/u)
+})
+
+test("feature quality keeps strict analysis and read-only inventory without another product build", () => {
+  for (const id of ["lint", "msrv", "security", "deny", "feature-codeql", "frontend-inventory"]) {
+    const block = job(id)
+    assert.match(block, /^    runs-on: ubuntu-latest$/mu)
+    assert.match(block, /needs\.validation-source\.outputs\.feature == 'true'/u)
+    assert.doesNotMatch(block, /ref:|head\.sha|secrets\.|continue-on-error|cargo test|npm (?:ci|install|test)/u)
+    assert.equal((block.match(/test "\$\(git rev-parse HEAD\)" = "\$GITHUB_SHA"/gu) || []).length, 2)
+  }
+  assert.match(job("msrv"), /toolchain: 1\.95\.0/u)
+  for (const command of ["python3 -m unittest discover -s scripts/tests -p 'test_*.py'", "python3 scripts/check-msrv.py", "cargo check --locked --workspace --all-targets --all-features"]) assert.ok(job("msrv").includes(command))
+  assert.match(job("security"), /cargo install cargo-audit --version 0\.22\.2 --locked/u)
+  assert.match(job("security"), /cargo audit --deny warnings/u)
+  assert.match(job("deny"), /EmbarkStudios\/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25/u)
+  assert.match(job("deny"), /command: check/u)
+  const codeql = job("feature-codeql")
+  assert.match(codeql, /language: \[actions, javascript-typescript, python, rust\]/u)
+  assert.match(codeql, /build-mode: none/u)
+  assert.match(codeql, /fail-fast: false/u)
+  assert.match(codeql, /security-events: write/u)
+  assert.doesNotMatch(codeql, /cargo |autobuild|contents: write/u)
+  const frontend = job("frontend-inventory")
+  assert.match(frontend, /name: Frontend Package Inventory/u)
+  assert.match(frontend, /LOTUS_SOURCE: committed/u)
+  assert.match(frontend, /run: node scripts\/frontend-package.cjs verify/u)
+  assert.doesNotMatch(frontend, /cargo (?:build|test|check|clippy)|rust-cache|CARGO_TARGET_DIR|BAMBOO_FRONTEND_BUILD_MODE/u)
+  assert.match(frontend, /cargo package --locked -p bamboo-server --allow-dirty --list/u)
+  assert.doesNotMatch(frontend, /--all-features|--no-default-features|--release|PROFILE_|test:|--test|stage/u)
+  assert.equal((job("quick-checks").match(/cargo fmt --all -- --check/gu) || []).length, 1)
+  assert.match(job("lint"), /name: Check formatting\n        if: needs.validation-source.outputs.full == 'true'/u)
+})
+
+test("strict Clippy preserves all three configurations and every failure after collecting diagnostics", (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-quality-clippy-"))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const marker = "      - name: Check all three feature Clippy configurations\n"
+  const step = job("lint").split(marker)[1].split("\n      - name:")[0]
+  const shell = step.split("        run: |\n")[1].split("\n").map(line => line.replace(/^          /u, "")).join("\n")
+  writeFileSync(path.join(directory, "rustc"), "#!/bin/bash\nexit 0\n", { mode: 0o755 })
+  writeFileSync(path.join(directory, "cargo"), '#!/bin/bash\nif [[ "$1" == --version ]]; then exit 0; fi\n[[ "$1" == clippy ]] || exit 97\nprintf "%s\\n" "$*" >> "$COMMANDS"\ncall_index=$(wc -l < "$COMMANDS" | tr -d " ")\n[[ "$call_index" != "$FAIL_INDEX" ]] || exit 23\n', { mode: 0o755 })
+  const policy = "-D warnings -A deprecated -A clippy::module_inception -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args -A clippy::too-many-arguments -A clippy::while-let-loop -A clippy::type_complexity -A dead-code"
+  const selectors = ["--locked --all-features", "--locked --workspace --all-features", "--locked --all-features --lib -p bamboo-storage"]
+  assert.match(job("lint"), /CARGO_TARGET_DIR: \$\{\{ github.workspace \}\}\/target\/quality-clippy/u)
+  assert.match(shell, /CARGO_BUILD_JOBS=1 cargo clippy/u)
+  assert.match(job("lint"), /name: feature-clippy-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}/u)
+  for (const fail of ["0", "1", "2", "3"]) {
+    const commands = path.join(directory, "commands")
+    writeFileSync(commands, "")
+    const result = spawnSync("bash", ["-c", shell], { encoding: "utf8", env: {
+      PATH: `${directory}:/usr/bin:/bin`, RUNNER_TEMP: directory, COMMANDS: commands, FAIL_INDEX: fail } })
+    assert.equal(result.status, fail === "0" ? 0 : 23, result.stderr)
+    assert.deepEqual(readFileSync(commands, "utf8").trim().split("\n"), selectors.map(selector => `clippy ${selector} --message-format=json-render-diagnostics -- ${policy}`))
+  }
+})
+
+test("frontend package inventory rejects a missing entry or Cargo failure without another runtime suite", (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-quality-package-"))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const step = job("frontend-inventory").split("      - name: Verify server package inventory\n")[1].split("\n      - name:")[0]
+  const shell = step.split("        run: |\n")[1].split("\n").map(line => line.replace(/^          /u, "")).join("\n")
+  const entries = ["build.rs", "frontend_build.rs", "frontend_package/frontend-manifest.json", "frontend_package/lotus-frontend.zip"]
+  writeFileSync(path.join(directory, "cargo"), '#!/bin/bash\n[[ "$*" == "package --locked -p bamboo-server --allow-dirty --list" ]] || exit 97\ncat "$INVENTORY"\nexit "$CARGO_STATUS"\n', { mode: 0o755 })
+  const run = (files, status = "0") => {
+    const inventory = path.join(directory, "inventory")
+    writeFileSync(inventory, files.join("\n") + "\n")
+    return spawnSync("bash", ["-c", shell], { env: { PATH: `${directory}:/usr/bin:/bin`, INVENTORY: inventory, CARGO_STATUS: status } })
+  }
+  assert.equal(run(entries).status, 0)
+  for (const entry of entries) assert.notEqual(run(entries.filter(file => file !== entry)).status, 0)
+  assert.notEqual(run(entries, "23").status, 0)
+})
+
+function assertLinuxTestOwnership(definitions) {
+  const registered = {
+    "ci.yml": {
+      "feature-tests": "The canonical isolated-default and explicit-feature test executor",
+      "quick-checks": "Small synthetic workflow/controller policy fixtures",
+      test: "Pinned legacy release policy fixtures; feature mode is admission only",
+      "test-crates": "Pinned legacy release Unit acceptance until source cutover",
+      "e2e-crates": "Pinned legacy release E2E acceptance until source cutover",
+      "test-ssh": "Pinned legacy release live SSH fixture until source cutover",
+      build: "Pinned legacy release native-platform tests until source cutover",
+      "tool-event-recorder-e2e": "Pinned legacy recorder coverage; feature runs in its owned native matrix",
+    },
+    "frontend-acceptance.yml": {
+      build: "Pinned legacy original-release-head build and policy fixtures",
+      test: "Pinned legacy original-release-head consumer contract",
+    },
+    "release-cargo-isolation.yml": { isolation: "Synthetic credential/ENOSPC containment boundary" },
+    "ticket-platform-adapter.yml": { "native-budget": "Explicit manual snapshot diagnosis; normal PR job is Windows" },
+  }
+  for (const [file, source] of Object.entries(definitions)) {
+    if (!/^  pull_request:\s*$/mu.test(source)) continue
+    const jobs = source.slice(source.indexOf("\njobs:\n") + 7)
+      .split(/(?=^  [a-z][a-z0-9-]*:\n)/mu).filter(Boolean)
+    for (const block of jobs) {
+      if (!/ubuntu|linux\//iu.test(block)) continue
+      const id = block.match(/^  ([a-z][a-z0-9-]*):/u)?.[1]
+      const scripts = [...block.matchAll(/(?:node(?: --test)?|bash|python3?) (scripts\/[a-zA-Z0-9_./-]+\.(?:cjs|mjs|js|py|sh))/gu)]
+        .map(match => match[1]).filter(name => existsSync(name)).map(name => readFileSync(name, "utf8"))
+      const code = [block, ...scripts].join("\n")
+      if (!/\bcargo(?: \+[^\s]+)? test\b/u.test(code) &&
+          !(/["']cargo["']/u.test(code) && /["']test["']/u.test(code))) continue
+      assert.ok(registered[file]?.[id], `Ordinary Linux Rust tests must join the canonical feature executor: ${file}:${id}; consolidate targets or review an explicit scoped exception`)
+      if (file === "ticket-platform-adapter.yml") {
+        assert.match(block, /^    if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''$/mu)
+      }
+      if (file === "frontend-acceptance.yml") assert.match(source, /pull_request:\n    branches: \[main\]/u)
+      if (file === "ci.yml" && ["test-crates", "e2e-crates", "test-ssh"].includes(id)) {
+        assert.match(block, /^    if: needs.validation-source.outputs.full == 'true'$/mu)
+      }
+      if (file === "ci.yml" && id === "build") {
+        assert.match(block, /^    if: >-\n      needs.validation-source.outputs.full == 'true' &&\n/mu)
+        assert.doesNotMatch(block, /outputs\.feature|base_ref == 'dev'/u)
+      }
+      if (file === "ci.yml" && id === "feature-tests") {
+        assert.equal([...block.matchAll(/run: node scripts\/run-feature-tests\.cjs$/gmu)].length, 1)
+        assert.doesNotMatch(block, /cargo test/u)
+        const paths = [...block.matchAll(/\bscripts\/[a-zA-Z0-9_./-]+\.(?:cjs|mjs|js|py|sh)/gu)].map(match => match[0])
+        assert.ok(paths.every(name => ["scripts/run-feature-tests.cjs", "scripts/frontend-package.cjs"].includes(name)))
+      }
+      if (file === "ci.yml" && id === "tool-event-recorder-e2e") {
+        assert.match(block, /^    if: needs.validation-source.outputs.full == 'true'$/mu)
+      }
+    }
+  }
+}
+
+test("all agents share canonical feature tests instead of adding ordinary Linux PR producers", () => {
+  const directory = ".github/workflows"
+  const definitions = Object.fromEntries(readdirSync(directory).filter(file => /\.ya?ml$/u.test(file))
+    .map(file => [file, readFileSync(path.join(directory, file), "utf8")]))
+  assertLinuxTestOwnership(definitions)
+  const duplicate = "name: New delegated planner acceptance\non:\n  pull_request:\n    branches: [dev]\njobs:\n  planner:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test --locked -p bamboo-agent --test required_child_context_packet\n"
+  assert.throws(() => assertLinuxTestOwnership({ ...definitions, "delegated-planner-acceptance.yml": duplicate }), /must join the canonical feature executor/u)
+  const unregistered = workflow + "\n  extra-linux-tests:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test --locked -p bamboo-server --lib\n"
+  assert.throws(() => assertLinuxTestOwnership({ ...definitions, "ci.yml": unregistered }), /must join the canonical feature executor/u)
+  assert.throws(() => assertLinuxTestOwnership({ ...definitions, "ticket-platform-adapter.yml": definitions["ticket-platform-adapter.yml"]
+    .replace("if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''", "if: github.event_name == 'pull_request'") }), /workflow_dispatch/u)
 })
 
 function serverCommand(id) {
@@ -877,8 +1363,8 @@ test("server Cargo target layout keeps the unfiltered integration tail complete"
 
 test("native summaries reject failed, cancelled, skipped and missing crate results", () => {
   for (const [id, stepName, variables] of [
-    ["test", "Require all crate tests and the SSH fixture", ["CRATE_RESULT", "SSH_RESULT"]],
-    ["e2e-test", "Require all E2E crate tests", ["CRATE_RESULT"]],
+    ["test", "Require all crate tests and the SSH fixture", ["CRATE_RESULT", "E2E_RESULT", "SSH_RESULT"]],
+    ["e2e-test", "Require all E2E crate tests", ["CRATE_RESULT", "SSH_RESULT"]],
   ]) {
     const step = job(id).split(`      - name: ${stepName}\n`)[1]?.split(/\n      - /u)[0]
     assert.ok(step)
@@ -887,7 +1373,8 @@ test("native summaries reject failed, cancelled, skipped and missing crate resul
     assert.ok(command)
     const results = Object.fromEntries(variables.map((name) => [name, "success"]))
     const run = (overrides = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", command], {
-      env: { ...process.env, ...results, ...overrides }, encoding: "utf8",
+      env: { ...process.env, SOURCE_RESULT: "success", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false",
+        LINT_RESULT: "success", MSRV_RESULT: "success", SECURITY_RESULT: "success", DENY_RESULT: "success", DOCS_RESULT: "success", ...results, ...overrides }, encoding: "utf8",
     })
     assert.equal(run().status, 0)
     for (const variable of variables) {
@@ -944,7 +1431,7 @@ test("promotion retains required checks without repeating platform coverage", ()
 test("all-feature E2E crates retain the workspace stack and required summary", () => {
   assert.match(workflow, /^  RUST_MIN_STACK: "8388608"$/mu)
   assert.match(job("e2e-crates"), /--all-features --lib --tests/u)
-  assert.match(job("e2e-test"), /needs: \[validation-source, e2e-crates\]/u)
+  assert.match(job("e2e-test"), /needs: \[validation-source, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, e2e-crates, test-ssh\]/u)
   assert.match(job("e2e-test"), /always\(\) && !cancelled\(\)/u)
 })
 
@@ -984,7 +1471,7 @@ test("ordinary PR caches remain reusable and frozen validation restores without 
   assert.doesNotMatch(cacheCleanupWorkflow, /actions\/checkout|pull_request_target/u)
 })
 
-test("expensive validation jobs stay off dev pull requests", () => {
+test("legacy release jobs retain explicit full-validation selection", () => {
   for (const id of [
     "msrv",
     "tls-fixture-test",
@@ -1368,7 +1855,7 @@ test("this frozen batch cannot save cache on source, integration, promotion or m
     assert.equal(source.split(header).length, 2, "one shared batch predicate must govern each workflow")
     for (const [name, github, expected] of cases) assert.equal(evaluate(expression, github, true), expected, name)
   }
-  assert.equal(caches, 14, "all planned source/dev/main cache actions remain covered")
+  assert.equal(caches, 16, "all planned source/dev/main cache actions remain covered")
   assert.ok(actor.includes(cacheSaveIf("github.event_name == 'pull_request' && github.base_ref == 'dev'")))
   assert.match(docs, /cache-on-failure: true\n          save-if: \$\{\{ env\.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' \}\}/u)
   const publisher = readFileSync(".github/workflows/publish-crate.yml", "utf8")
@@ -1878,8 +2365,33 @@ test("Supervisor driver self-tests cover dev, full validation and release platfo
   assert.throws(() => verify(quick, full.replace(command, "true"), platform))
 })
 
+test("feature portable Node suites have one owner per OS without duplicating Ubuntu", () => {
+  const scripts = ["supervisor-native-acceptance.test.cjs", "lotus-next-artifact.test.cjs", "release-frontend-policy.test.cjs"]
+  const counts = (source) => scripts.map((name) => [...source.matchAll(/run: node --test ([^\n]+)/gu)]
+    .reduce((count, [, args]) => count + args.split(/\s+/u).filter((arg) => arg === `scripts/${name}`).length, 0))
+  const verify = (quick, native, linux) => {
+    assert.deepEqual(counts(quick), [1, 1, 1], "Ubuntu Quick owns each portable suite once")
+    assert.deepEqual(counts(native), [1, 1, 1], "each native matrix entry owns each portable suite once")
+    assert.deepEqual(counts(linux), [0, 0, 0], "the Linux Cargo executor does not repeat Quick Node suites")
+    assert.match(native, /if: needs\.validation-source\.outputs\.feature == 'true'/u)
+    assert.match(native, /os: \[windows-2025, macos-latest\]/u)
+    const step = actorWindowsStep(native, "Test portable Supervisor and frontend policies")
+    assert.doesNotMatch(step, /\bif:|continue-on-error:|\|\||--test-(?:name|skip)-pattern/u)
+    assert.ok(native.indexOf(step) < native.indexOf("Run fixed native ownership"), "Node failures cannot be hidden after Cargo")
+  }
+  const quick = job("quick-checks"), native = job("native-feature-tests"), linux = job("feature-tests")
+  verify(quick, native, linux)
+  for (const script of scripts) {
+    assert.throws(() => verify(quick.replace(` scripts/${script}`, ""), native, linux))
+    assert.throws(() => verify(quick, native.replace(` scripts/${script}`, ""), linux))
+  }
+  assert.throws(() => verify(quick, native, linux + "\nrun: node --test scripts/lotus-next-artifact.test.cjs"))
+  assert.throws(() => verify(quick, native.replace("os: [windows-2025, macos-latest]", "os: [macos-latest]"), linux))
+  assert.throws(() => verify(quick, native.replace("- name: Test portable Supervisor and frontend policies", "- name: Test portable Supervisor and frontend policies\n        continue-on-error: true"), linux))
+})
+
 test("native Windows paths retain native sources while policy and release edits stay fast", () => {
-  assert.match(actorWindowsWorkflow, /on:\n  workflow_dispatch:\n  pull_request:\n    branches: \[dev, main\]\n    paths:\n/u)
+  assert.match(actorWindowsWorkflow, /on:\n  workflow_dispatch:\n  pull_request:\n    branches: \[main\]\n    paths:\n/u)
   assert.match(job("quick-checks"), /run: node --test scripts\/ci-policy\.test\.cjs(?: |\n)/u)
   assert.match(job("test"), /Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs(?: |\n)/u)
   const nativeInputs = [
@@ -1946,9 +2458,13 @@ test("native Windows still uses cumulative PR changes after an unrelated last co
   assert.equal(needsActorWindows(changes(`${base}...HEAD`)), true, "PR three-dot diff retains the earlier native input")
 })
 
-const assertActorWindowsAcceptance = (source) => {
-  const compile = actorWindowsStep(source, actorWindowsCompileName)
-  const runtime = actorWindowsStep(source, actorWindowsRunName)
+const assertActorWindowsAcceptance = (source, controller = actorWindowsController) => {
+  const compileStep = actorWindowsStep(source, actorWindowsCompileName)
+  const runtimeStep = actorWindowsStep(source, actorWindowsRunName)
+  assert.match(compileStep, /-CompileAcceptance/u)
+  assert.match(runtimeStep, /-ExecuteAcceptance/u)
+  const compile = controller.split('function Compile-ActorNativeAcceptance(')[1].split('\nfunction ')[0]
+  const runtime = controller.split('function Run-ActorNativeAcceptance(')[1].split('\nforeach ')[0]
   const groups = [...compile.matchAll(/Assert-TestList '([^']+)' '([^']+)' @\(([\s\S]*?)\n\s*\) '([^']+)'/gu)]
     .map(([, packageName, filter, body, log]) => ({
       package: packageName, filter,
@@ -1963,8 +2479,8 @@ const assertActorWindowsAcceptance = (source) => {
   assert.deepEqual(runs, groups.map(({ package: packageName, filter, names }) => ({
     package: packageName, filter, count: names.length,
   })))
-  assert.match(compile, /timeout-minutes: 20\n/u)
-  assert.match(runtime, /timeout-minutes: 5\n/u)
+  assert.match(compileStep, /timeout-minutes: 20\n/u)
+  assert.match(runtimeStep, /timeout-minutes: 5\n/u)
   assert.doesNotMatch(runtime, /(?:&\s*|run:\s*)cargo\b/iu)
   assert.match(compile, /Save-ActorNativeManifest \$nativeContext/u)
   assert.match(runtime, /Read-ActorNativeManifest \$evidence/u)
@@ -1978,18 +2494,18 @@ test("native Windows retains the exact 41-case selection and original runtime bu
   assert.match(actorWindowsWorkflow, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
   assert.match(actorWindowsWorkflow, /RUST_MIN_STACK: '8388608'/u)
   assert.match(actorWindowsWorkflow, /toolchain: 1\.99\.0-x86_64-pc-windows-msvc/u)
-  assert.match(actorWindowsWorkflow, /RUNNER_OS -ne 'Windows'.*RUNNER_ARCH -ne 'X64'/u)
-  assert.match(actorWindowsWorkflow, /mklink \/J/u)
-  assert.match(actorWindowsWorkflow, /\$junction\.LinkType -ne 'Junction'/u)
-  assert.match(actorWindowsWorkflow, /fsutil reparsepoint query/u)
-  assert.match(actorWindowsWorkflow, /'host: x86_64-pc-windows-msvc'/u)
-  assert.match(actorWindowsWorkflow, /'release: 1\.99\.0'/u)
+  assert.match(actorWindowsController, /RUNNER_OS -ne 'Windows'.*RUNNER_ARCH -ne 'X64'/u)
+  assert.match(actorWindowsController, /mklink \/J/u)
+  assert.match(actorWindowsController, /\$junction\.LinkType -ne 'Junction'/u)
+  assert.match(actorWindowsController, /fsutil reparsepoint query/u)
+  assert.match(actorWindowsController, /'host: x86_64-pc-windows-msvc'/u)
+  assert.match(actorWindowsController, /'release: 1\.99\.0'/u)
   assert.match(actorWindowsWorkflow, /Retain native Windows evidence even on failure\n        if: always\(\)/u)
-  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
+  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow, actorWindowsController.replace(
     "'background_scope_drain'", "'missing_original_case'")), "dropping or replacing a case must fail")
   assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
     "timeout-minutes: 5\n", "timeout-minutes: 15\n")), "the runtime budget must not expand")
-  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
+  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow, actorWindowsController.replace(
     "$nativeContext = Read-ActorNativeManifest $evidence",
     "$nativeContext = Read-ActorNativeManifest $evidence\n          & cargo test --locked --no-fail-fast")),
   "runtime must not re-enter Cargo")

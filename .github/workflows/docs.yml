@@ -1,3 +1,7 @@
+# Legacy main/master producer and Pages deployment stay active until shared v2
+# Main authority authenticates source + featureDocs. CI now owns the only dev-PR
+# documentation producer. This workflow is not yet a read-only consumer; bootstrap
+# cannot authorize deployment and missing/expired originals must not be rebuilt.
 name: Documentation
 
 on:

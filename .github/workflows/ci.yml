@@ -49,6 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       full: ${{ steps.scope.outputs.full }}
+      feature: ${{ steps.scope.outputs.feature }}
     steps:
       - name: Bind full validation to the actual event snapshot
         id: scope
@@ -59,6 +60,7 @@ jobs:
           set -euo pipefail
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
           full=false
+          feature=false
           case "$GITHUB_EVENT_NAME" in
             workflow_dispatch)
               [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]
@@ -68,7 +70,7 @@ jobs:
             pull_request)
               case "$GITHUB_BASE_REF" in
                 main) full=true ;;
-                dev) ;;
+                dev) feature=true ;;
                 *) exit 1 ;;
               esac
               ;;
@@ -78,7 +80,7 @@ jobs:
             *) exit 1 ;;
           esac
           printf 'Event source: %s; full validation: %s\n' "$GITHUB_SHA" "$full"
-          printf 'full=%s\n' "$full" >> "$GITHUB_OUTPUT"
+          printf 'full=%s\nfeature=%s\n' "$full" "$feature" >> "$GITHUB_OUTPUT"
 
   main-release-admission:
     name: Main Release Admission
@@ -96,7 +98,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "4ccc047bbaeedab71e93db9b6470f5a3131c1b395260f852baebef19ff9109b7"
+          ADMISSION_HELPER_SHA256: "b87e7054a19a0a1d6fcda8d722d91059ec0d2838087dc0a27cefa7c8a73e7d54"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -148,10 +150,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Test fast workflow and release policies
-        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs
+        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs scripts/run-feature-tests.test.cjs scripts/native-test-owner.test.cjs
 
       - name: Test Supervisor driver and owned loopback process binding
         run: node --test scripts/supervisor-native-acceptance.test.cjs
+
+      - name: Test portable frontend artifact and release policies
+        run: node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
 
   promotion-source:
     name: Promotion Source
@@ -244,7 +249,7 @@ jobs:
       actions: read
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
-    needs: [validation-source, main-release-admission, test-crates, test-ssh]
+    needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]
     # A source-gate failure must fail required Test, never turn it into a skip.
     if: always() && !cancelled()
     runs-on: ubuntu-latest
@@ -255,24 +260,52 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           MAIN_ADMISSION_RESULT: ${{ needs.main-release-admission.result }}
+          FEATURE_VALIDATION: ${{ needs.validation-source.outputs.feature }}
+          FEATURE_RESULT: ${{ needs.feature-tests.result }}
+          QUICK_RESULT: ${{ needs.quick-checks.result }}
+          NATIVE_RESULT: ${{ needs.native-feature-tests.result }}
+          BROWSER_RUNTIME_RESULT: ${{ needs.browser-runtime-tests.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+          DENY_RESULT: ${{ needs.deny.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
+          CODEQL_RESULT: ${{ needs.feature-codeql.result }}
+          FRONTEND_INVENTORY_RESULT: ${{ needs.frontend-inventory.result }}
         shell: bash
         run: |
           set -euo pipefail
           test "$SOURCE_RESULT" = success
           case "$GITHUB_EVENT_NAME:${GITHUB_BASE_REF:-}:$FULL_VALIDATION" in
-            pull_request:dev:false|pull_request:main:true|workflow_dispatch::true) ;;
+            pull_request:dev:false)
+              test "$FEATURE_VALIDATION" = true
+              test "$FEATURE_RESULT" = success
+              test "$QUICK_RESULT" = success
+              test "$NATIVE_RESULT" = success
+              test "$BROWSER_RUNTIME_RESULT" = success
+              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$DOCS_RESULT" "$CODEQL_RESULT" "$FRONTEND_INVENTORY_RESULT"; do
+                test "$result" = success
+              done
+              ;;
+            pull_request:main:true|workflow_dispatch::true)
+              test "$FEATURE_VALIDATION" = false
+              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$DOCS_RESULT"; do
+                test "$result" = success
+              done
+              ;;
             push::false)
               test "$GITHUB_REF" = refs/heads/main
+              test "$FEATURE_VALIDATION" = false
               test "$MAIN_ADMISSION_RESULT" = success
               ;;
             *) exit 1 ;;
           esac
 
       - uses: actions/checkout@v7
-        if: github.event_name != 'push'
+        if: needs.validation-source.outputs.full == 'true'
 
       - name: Require the exact clean event source
-        if: github.event_name != 'push'
+        if: needs.validation-source.outputs.full == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -283,14 +316,14 @@ jobs:
           sha256sum Cargo.lock
 
       - name: Setup Node.js
-        if: github.event_name != 'push'
+        if: needs.validation-source.outputs.full == 'true'
         uses: actions/setup-node@v7
         with:
           node-version: '24'
 
       - name: Test CI workflow policy
         if: needs.validation-source.outputs.full == 'true'
-        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs
+        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs scripts/run-feature-tests.test.cjs scripts/native-test-owner.test.cjs
 
       - name: Test Supervisor driver and owned loopback process binding
         if: needs.validation-source.outputs.full == 'true'
@@ -309,13 +342,13 @@ jobs:
           node -e "for (const file of ['crates/app/bamboo-server/frontend_package/lotus-frontend.zip', 'crates/app/bamboo-server/frontend_package/frontend-manifest.json']) require('node:fs').accessSync(file)"
 
       - name: Install Rust
-        if: github.event_name != 'push'
+        if: needs.validation-source.outputs.full == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
       - name: Record the full validation toolchain
-        if: github.event_name != 'push'
+        if: needs.validation-source.outputs.full == 'true'
         run: |
           rustc --version --verbose
           cargo --version --verbose
@@ -325,12 +358,12 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Rust cache
-        if: github.event_name != 'push'
+        if: needs.validation-source.outputs.full == 'true'
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-test-${{ runner.os }}
           workspaces: . -> target/grouped-default
-          # Keep iterative dev PR caches; main PRs restore from their base branch.
+          # This legacy cache runs only for full release/manual validation.
           save-if: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'dev')) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Verify published server crate owns the frontend package
@@ -350,21 +383,19 @@ jobs:
             fi
           done
 
-      - name: Build locked Rust workspace
-        if: github.event_name == 'pull_request' && github.base_ref == 'dev'
-        run: cargo build --locked
-
       - name: Require all crate tests and the SSH fixture
         if: needs.validation-source.outputs.full == 'true'
         env:
           CRATE_RESULT: ${{ needs.test-crates.result }}
+          E2E_RESULT: ${{ needs.e2e-crates.result }}
           SSH_RESULT: ${{ needs.test-ssh.result }}
         run: |
           test "$CRATE_RESULT" = success
+          test "$E2E_RESULT" = success
           test "$SSH_RESULT" = success
 
       - name: Preserve failed synthetic Ticket fixture evidence
-        if: failure() && github.event_name != 'push'
+        if: failure() && needs.validation-source.outputs.full == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: ticket-fixture-failure-${{ github.run_id }}-${{ github.run_attempt }}
@@ -378,13 +409,211 @@ jobs:
           retention-days: 7
 
       - name: Require the exact clean source after full validation
-        if: always() && github.event_name != 'push'
+        if: always() && needs.validation-source.outputs.full == 'true'
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           source_status="$(git status --porcelain --untracked-files=all)"
           test -z "$source_status"
+
+  feature-tests:
+    name: Feature Unit and E2E
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/feature-tests
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-feature-configurations-${{ runner.os }}
+          workspaces: . -> target/feature-tests
+          save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
+      - name: Require exact feature source and committed frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          node scripts/frontend-package.cjs verify
+      - name: Record feature profile, toolchain and available disk
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            rustc -vV
+            cargo -V
+            printf 'Target: %s\nDev debug: %s\nTest debug: %s\nIncremental: %s\n' "$CARGO_TARGET_DIR" "$CARGO_PROFILE_DEV_DEBUG" "$CARGO_PROFILE_TEST_DEBUG" "$CARGO_INCREMENTAL"
+            df -Pk "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          } | tee "$RUNNER_TEMP/bamboo-feature-profile.log"
+      - name: Run default and additive Unit/E2E with shared outputs
+        run: node scripts/run-feature-tests.cjs
+      - name: Record final feature disk usage
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -Pk "$GITHUB_WORKSPACE" "$RUNNER_TEMP" | tee -a "$RUNNER_TEMP/bamboo-feature-profile.log"
+          if [[ -d "$CARGO_TARGET_DIR" ]]; then
+            du -sk "$CARGO_TARGET_DIR" | tee -a "$RUNNER_TEMP/bamboo-feature-profile.log"
+          fi
+      - name: Require source to remain exact and clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Preserve feature Cargo evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: feature-unit-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/bamboo-feature-tests-*/*
+            ${{ runner.temp }}/bamboo-feature-profile.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  browser-runtime-tests:
+    name: Browser Runtime Unit and E2E
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Bind the exact clean browser runtime source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git show -s --format='Browser runtime source: %H tree: %T' HEAD
+          sha256sum browser-runtime/package-lock.json
+      - name: Install the locked runtime without package scripts
+        run: npm ci --prefix browser-runtime --ignore-scripts
+      - name: Install only the matching headless shell
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/bamboo-browser-runtime-browsers
+        run: |
+          node -e "require('node:assert/strict').equal(require('./browser-runtime/node_modules/playwright-core/package.json').version, '1.62.1')"
+          node browser-runtime/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
+      - name: Run all thirteen runtime files once without workflow credentials
+        shell: bash
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/bamboo-browser-runtime-browsers
+        run: |
+          set -euo pipefail
+          node <<'NODE' | tee "$RUNNER_TEMP/browser-runtime.tap"
+          const { spawnSync } = require('node:child_process');
+          const environment = Object.fromEntries(['PATH', 'HOME', 'USERPROFILE', 'SystemRoot', 'TEMP', 'TMP', 'TMPDIR',
+            'LANG', 'LC_ALL', 'NODE_PATH', 'PLAYWRIGHT_BROWSERS_PATH', 'GITHUB_REPOSITORY', 'GITHUB_SHA',
+            'GITHUB_REF', 'GITHUB_EVENT_NAME', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_WORKFLOW_SHA']
+            .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
+          const result = spawnSync('npm', ['--prefix', 'browser-runtime', 'run', 'test:runtime'], { env: environment, stdio: 'inherit' });
+          if (result.error) throw result.error;
+          process.exit(result.status ?? 1);
+          NODE
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const log = require('node:fs').readFileSync(process.env.RUNNER_TEMP + '/browser-runtime.tap', 'utf8');
+          const count = name => {
+            const values = [...log.matchAll(new RegExp('^# ' + name + ' ([0-9]+)$', 'gm'))];
+            assert.equal(values.length, 1, 'Missing or duplicate runtime summary: ' + name);
+            return Number(values[0][1]);
+          };
+          assert.ok(count('tests') > 0 && count('pass') > 0, 'Runtime cases must actually execute');
+          for (const name of ['fail', 'cancelled', 'skipped', 'todo']) assert.equal(count(name), 0, 'Runtime suite did not fully pass: ' + name);
+          assert.equal(count('tests'), count('pass'), 'Every declared runtime case must pass');
+          NODE
+      - name: Require unchanged browser runtime source after execution
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Preserve browser runtime outcome including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/browser-runtime.tap
+          if-no-files-found: error
+          retention-days: 7
+
+  native-feature-tests:
+    name: Native Feature (${{ matrix.os }})
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/native-feature
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Test portable Supervisor and frontend policies
+        run: node --test scripts/supervisor-native-acceptance.test.cjs scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Preserve the Actor acceptance compiler
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0-x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target/native-feature
+          shared-key: bamboo-native-feature-${{ runner.os }}
+          cache-workspace-crates: false
+          save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
+      - name: Require the committed native inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          node scripts/frontend-package.cjs verify
+          openssl version
+      - name: Run fixed native ownership and record real compiled cases
+        run: node scripts/native-test-owner.cjs
+      - name: Preserve native ownership evidence including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-feature-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bamboo-native-owner-*/*
+          if-no-files-found: error
+          retention-days: 14
 
   test-crates:
     name: Test (${{ matrix.crate }}${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }})
@@ -657,10 +886,22 @@ jobs:
   msrv:
     name: MSRV (Rust 1.95)
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true' || needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind quality to the actual clean merge source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+          git show -s --format='Quality source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
 
       - name: Install Rust 1.95
         uses: dtolnay/rust-toolchain@stable
@@ -681,6 +922,15 @@ jobs:
 
       - name: Check workspace on MSRV
         run: cargo check --locked --workspace --all-targets --all-features
+
+      - name: Verify quality source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
 
   tls-fixture-test:
     name: TLS Fixture (${{ matrix.os }})
@@ -724,7 +974,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(needs.validation-source.outputs.feature == 'true' && '["macos-latest","windows-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -739,26 +989,74 @@ jobs:
           save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Run native recorder contract and lifecycle tests
+        if: needs.validation-source.outputs.full == 'true'
         run: cargo test --locked --no-fail-fast -p bamboo-tool-event-recorder-example -- --nocapture --test-threads=1
 
   e2e-test:
     name: E2E Tests
-    needs: [validation-source, e2e-crates]
-    if: always() && !cancelled() && needs.validation-source.outputs.full == 'true'
+    needs: [validation-source, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, e2e-crates, test-ssh]
+    if: always() && !cancelled() && (needs.validation-source.outputs.full == 'true' || needs.validation-source.outputs.feature == 'true')
     runs-on: ubuntu-latest
     steps:
       - name: Require all E2E crate tests
         env:
+          SOURCE_RESULT: ${{ needs.validation-source.result }}
+          FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           CRATE_RESULT: ${{ needs.e2e-crates.result }}
-        run: test "$CRATE_RESULT" = success
+          SSH_RESULT: ${{ needs.test-ssh.result }}
+          FEATURE_VALIDATION: ${{ needs.validation-source.outputs.feature }}
+          FEATURE_RESULT: ${{ needs.feature-tests.result }}
+          NATIVE_RESULT: ${{ needs.native-feature-tests.result }}
+          BROWSER_RUNTIME_RESULT: ${{ needs.browser-runtime-tests.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+          DENY_RESULT: ${{ needs.deny.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
+          CODEQL_RESULT: ${{ needs.feature-codeql.result }}
+          FRONTEND_INVENTORY_RESULT: ${{ needs.frontend-inventory.result }}
+        run: |
+          set -euo pipefail
+          case "$SOURCE_RESULT:$FEATURE_VALIDATION:$FULL_VALIDATION" in
+            success:true:false)
+              test "$FEATURE_RESULT" = success
+              test "$NATIVE_RESULT" = success
+              test "$BROWSER_RUNTIME_RESULT" = success
+              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$DOCS_RESULT" "$CODEQL_RESULT" "$FRONTEND_INVENTORY_RESULT"; do
+                test "$result" = success
+              done
+              ;;
+            success:false:true)
+              test "$CRATE_RESULT" = success
+              test "$SSH_RESULT" = success
+              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$DOCS_RESULT"; do
+                test "$result" = success
+              done
+              ;;
+            *) exit 1 ;;
+          esac
 
   lint:
     name: Lint
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true' || needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/quality-clippy
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind quality to the actual clean merge source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+          git show -s --format='Quality source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -769,12 +1067,15 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-lint-${{ runner.os }}
+          workspaces: . -> target/quality-clippy
           save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Check formatting
+        if: needs.validation-source.outputs.full == 'true'
         run: cargo fmt --all -- --check
 
       - name: Run clippy
+        if: needs.validation-source.outputs.full == 'true'
         run: |
           cargo clippy --all-features -- \
             -D warnings \
@@ -786,6 +1087,137 @@ jobs:
             -A clippy::while-let-loop \
             -A clippy::type_complexity \
             -A dead-code
+
+      - name: Check all three feature Clippy configurations
+        if: needs.validation-source.outputs.feature == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version --verbose
+          cargo --version --verbose
+          policy=(-D warnings -A deprecated -A clippy::module_inception -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args -A clippy::too-many-arguments -A clippy::while-let-loop -A clippy::type_complexity -A dead-code)
+          status=0
+          # Different default-member/workspace/storage feature unification remains separate.
+          cargo clippy --locked --all-features --message-format=json-render-diagnostics -- "${policy[@]}" | tee "$RUNNER_TEMP/quality-clippy-default.jsonl" || status=$?
+          cargo clippy --locked --workspace --all-features --message-format=json-render-diagnostics -- "${policy[@]}" | tee "$RUNNER_TEMP/quality-clippy-workspace.jsonl" || status=$?
+          CARGO_BUILD_JOBS=1 cargo clippy --locked --all-features --lib -p bamboo-storage --message-format=json-render-diagnostics -- "${policy[@]}" | tee "$RUNNER_TEMP/quality-clippy-storage.jsonl" || status=$?
+          exit "$status"
+
+      - name: Verify quality source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+
+      - name: Retain feature Clippy configuration and freshness diagnostics
+        if: always() && needs.validation-source.outputs.feature == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: feature-clippy-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/quality-clippy-*.jsonl
+
+  feature-codeql:
+    name: Feature CodeQL (${{ matrix.language }})
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, javascript-typescript, python, rust]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind quality to the actual clean merge source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+          git show -s --format='Quality source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
+
+      - name: Initialize CodeQL without a product build
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
+
+      - name: Verify quality source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+
+  frontend-inventory:
+    name: Frontend Package Inventory
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      LOTUS_SOURCE: committed
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind quality to the actual clean merge source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+          git show -s --format='Quality source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Verify the committed frontend
+        run: node scripts/frontend-package.cjs verify
+
+      # Cargo supplies the read-only package listing; compilation belongs to A.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify server package inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_files="$(cargo package --locked -p bamboo-server --allow-dirty --list)"
+          for required in build.rs frontend_build.rs frontend_package/frontend-manifest.json frontend_package/lotus-frontend.zip; do
+            grep -Fxq "$required" <<< "$package_files"
+          done
+
+      - name: Verify quality source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
 
   build:
     name: Platform Tests (${{ matrix.os }})
@@ -855,10 +1287,21 @@ jobs:
   docs:
     name: Documentation
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true' || needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind feature documentation to the actual clean merge source
+        if: needs.validation-source.outputs.feature == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -869,16 +1312,257 @@ jobs:
           shared-key: bamboo-ci-docs-${{ runner.os }}
           save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
+      # The old full-validation configuration remains independent until cutover.
       - name: Build documentation
+        if: needs.validation-source.outputs.full == 'true'
         run: cargo doc --no-deps
+
+      - name: Build feature documentation once
+        if: needs.validation-source.outputs.feature == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, shutil
+          root = pathlib.Path.cwd().resolve()
+          site = root / "target/doc"
+          assert not (root / "target").is_symlink() and not site.is_symlink() and site.resolve().is_relative_to(root)
+          if site.exists():
+              assert site.is_dir()
+              shutil.rmtree(site)  # Only this job's restored documentation output.
+          PY
+          cargo metadata --locked --format-version 1 --no-deps > "$RUNNER_TEMP/feature-docs-metadata.json"
+          rustc -vV > "$RUNNER_TEMP/feature-docs-rustc.txt"
+          cargo -V > "$RUNNER_TEMP/feature-docs-cargo.txt"
+          rustdoc -V > "$RUNNER_TEMP/feature-docs-rustdoc.txt"
+          cargo doc --locked --no-deps --all-features --document-private-items
+
+      - name: Freeze original feature documentation tar and receipt
+        if: needs.validation-source.outputs.feature == 'true'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import contextlib, hashlib, json, os, pathlib, re, stat, subprocess, tarfile
+
+          MAX_FILES, MAX_ENTRIES = 100000, 200000
+          MAX_SITE_BYTES, MAX_TAR_BYTES, MAX_RECEIPT_BYTES = 1 << 30, 2 << 30, 32 << 20
+          COMMAND = ["cargo", "doc", "--locked", "--no-deps", "--all-features", "--document-private-items"]
+
+          def digest(stream):
+              value = hashlib.sha256()
+              while block := stream.read(1 << 20):
+                  value.update(block)
+              return value.hexdigest()
+
+          @contextlib.contextmanager
+          def regular_file(file, base, limit):
+              relative = file.relative_to(base)
+              assert ".." not in relative.parts, "Input escapes owned directory"
+              cursor = base
+              for part in relative.parts:
+                  cursor /= part
+                  assert not cursor.is_symlink(), "No input symlinks"
+              info = file.lstat()
+              assert stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size <= limit
+              with os.fdopen(os.open(file, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+                  before = os.fstat(stream.fileno())
+                  identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_nlink)
+                  assert identity(before) == identity(info)
+                  yield stream
+                  assert identity(os.fstat(stream.fileno())) == identity(before), "Input changed while reading"
+
+          def file_hash(file, base, limit=MAX_SITE_BYTES):
+              with regular_file(file, base, limit) as stream:
+                  return digest(stream)
+
+          def read_text(file, base, limit):
+              with regular_file(file, base, limit) as stream:
+                  return stream.read(limit + 1).decode("utf-8")
+
+          def safe_path(name):
+              path = pathlib.PurePosixPath(name)
+              assert name and name != "." and not path.is_absolute() and ".." not in path.parts
+              assert not re.match("[A-Za-z]:", name)
+              assert path.as_posix() == name and "\\" not in name
+              assert len(name.encode()) <= 4096 and all(ord(char) >= 32 for char in name)
+
+          def verify_archive(archive, files):
+              assert isinstance(files, list) and 0 < len(files) <= MAX_FILES
+              for item in files:
+                  assert set(item) == {"path", "sizeBytes", "sha256"}
+                  safe_path(item["path"])
+                  assert type(item["sizeBytes"]) is int and 0 <= item["sizeBytes"] <= MAX_SITE_BYTES
+                  assert re.fullmatch("[0-9a-f]{64}", item["sha256"])
+              expected = {item["path"]: item for item in files}
+              assert len(expected) == len(files) and list(expected) == sorted(expected)
+              seen, found, total = set(), set(), 0
+              with regular_file(archive, archive.parent, MAX_TAR_BYTES) as raw, tarfile.open(fileobj=raw, mode="r:") as tar:
+                  for entry in tar:
+                      safe_path(entry.name)
+                      assert entry.name not in seen and len(seen) < MAX_ENTRIES
+                      seen.add(entry.name)
+                      assert entry.isdir() or entry.isfile(), "No links or special files"
+                      if entry.isdir():
+                          continue
+                      item = expected[entry.name]
+                      total += entry.size
+                      assert total <= MAX_SITE_BYTES and entry.size == item["sizeBytes"]
+                      with tar.extractfile(entry) as stream:
+                          assert digest(stream) == item["sha256"], "Changed documentation bytes"
+                      found.add(entry.name)
+              assert found == set(expected), "Missing documentation files"
+
+          def verify_receipt(receipt, archive, context):
+              # Integrity against held producer inputs, not Main source authorization.
+              assert set(receipt) == set(context) | {"schema", "complete", "configurationSha256", "tar", "files", "fileCount", "siteBytes"}
+              assert receipt["schema"] == "bamboo.feature-docs.v1" and receipt["complete"] is True
+              assert all(receipt[key] == value for key, value in context.items()), "Changed source or producer context"
+              assert receipt["configurationSha256"] == hashlib.sha256(json.dumps(context["configuration"], sort_keys=True).encode()).hexdigest()
+              assert set(receipt["tar"]) == {"file", "sha256", "sizeBytes"} and receipt["tar"]["file"] == "artifact.tar"
+              assert type(receipt["tar"]["sizeBytes"]) is int and receipt["tar"]["sizeBytes"] == archive.stat().st_size
+              assert receipt["tar"]["sha256"] == file_hash(archive, archive.parent, MAX_TAR_BYTES)
+              assert type(receipt["fileCount"]) is int and receipt["fileCount"] == len(receipt["files"])
+              assert type(receipt["siteBytes"]) is int and receipt["siteBytes"] == sum(item["sizeBytes"] for item in receipt["files"])
+              assert 0 < receipt["siteBytes"] <= MAX_SITE_BYTES
+              assert len(json.dumps(receipt).encode()) <= MAX_RECEIPT_BYTES
+              verify_archive(archive, receipt["files"])
+
+          def produce():
+              root = pathlib.Path.cwd().resolve()
+              git = lambda *args: subprocess.check_output(["git", *args], text=True).strip()
+              sha, tree = git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
+              assert re.fullmatch("[0-9a-f]{40}", sha) and os.environ["GITHUB_SHA"] == sha
+              assert not git("status", "--porcelain", "--untracked-files=all")
+              assert os.environ["GITHUB_EVENT_NAME"] == "pull_request" and os.environ["GITHUB_BASE_REF"] == "dev"
+              ref, repo = os.environ["GITHUB_REF"], os.environ["GITHUB_REPOSITORY"]
+              assert re.fullmatch(r"refs/pull/[1-9][0-9]*/merge", ref) and repo == "bigduu/Bamboo-agent"
+              workflow_sha, workflow_ref = os.environ["GITHUB_WORKFLOW_SHA"], os.environ["GITHUB_WORKFLOW_REF"]
+              assert re.fullmatch("[0-9a-f]{40}", workflow_sha)
+              assert workflow_ref == repo + "/.github/workflows/ci.yml@" + ref
+              run_id, attempt = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
+              assert re.fullmatch("[1-9][0-9]*", run_id) and re.fullmatch("[1-9][0-9]*", attempt)
+              temporary = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve()
+              metadata = json.loads(read_text(temporary / "feature-docs-metadata.json", temporary, 16 << 20))
+              assert metadata["workspace_root"] == str(root) and metadata["target_directory"] == str(root / "target")
+              assert isinstance(metadata["workspace_default_members"], list) and isinstance(metadata["packages"], list)
+              selected = set(metadata["workspace_default_members"])
+              assert len(metadata["workspace_default_members"]) == len(selected) == 30
+              members = []
+              for package in metadata["packages"]:
+                  if package["id"] not in selected:
+                      continue
+                  manifest = pathlib.Path(package["manifest_path"])
+                  assert manifest.is_absolute()
+                  members.append({"name": package["name"], "manifest": manifest.relative_to(root).as_posix(),
+                                  "manifestSha256": file_hash(manifest, root, 4 << 20)})
+              members.sort(key=lambda item: item["name"])
+              assert len(members) == len(selected) == 30 and len({item["name"] for item in members}) == 30
+              assert not {"bamboo-analytics", "bamboo-tool-event-recorder-example"} & {item["name"] for item in members}
+              configuration = {"command": COMMAND, "defaultMembers": members,
+                               "sourceConfigSha256": {name: file_hash(root / name, root, 4 << 20) for name in ["Cargo.toml", ".cargo/config.toml"]}}
+              configuration_digest = hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
+              toolchain = {}
+              for tool in ["rustc", "cargo", "rustdoc"]:
+                  text = read_text(temporary / ("feature-docs-" + tool + ".txt"), temporary, 65536)
+                  assert text.strip()
+                  toolchain[tool] = text.strip()
+              site = root / "target/doc"
+              assert not (root / "target").is_symlink() and site.is_dir() and not site.is_symlink() and site.resolve().is_relative_to(root)
+              with regular_file(site / "bamboo_agent/index.html", site, MAX_SITE_BYTES) as stream:
+                  assert stream.read(1), "Missing Bamboo documentation entry"
+              redirect = site / "index.html"
+              assert not redirect.is_symlink()
+              if redirect.exists():
+                  with regular_file(redirect, site, MAX_SITE_BYTES):
+                      pass  # Refuse a cached hard link before writing the redirect.
+              redirect.write_text('<meta http-equiv="refresh" content="0;url=bamboo_agent/index.html">\n')
+              entries, files, total = [], [], 0
+              for file in site.rglob("*"):
+                  name, info = file.relative_to(site).as_posix(), file.lstat()
+                  safe_path(name)
+                  assert not file.is_symlink() and (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode))
+                  assert len(entries) < MAX_ENTRIES
+                  entries.append((name, file, info))
+                  if stat.S_ISREG(info.st_mode):
+                      assert info.st_nlink == 1, "No hard links"
+                      total += info.st_size
+                      assert total <= MAX_SITE_BYTES and len(files) < MAX_FILES
+                      files.append({"path": name, "sizeBytes": info.st_size, "sha256": file_hash(file, site)})
+              files.sort(key=lambda item: item["path"])
+              artifact_name = "feature-docs-" + run_id + "-" + attempt
+              output = temporary / artifact_name
+              output.mkdir()  # A completed physical attempt is never overwritten.
+              archive = output / "artifact.tar"
+              with tarfile.open(archive, "w", format=tarfile.PAX_FORMAT) as tar:
+                  for name, file, info in sorted(entries):
+                      item = tarfile.TarInfo(name)
+                      item.uid = item.gid = item.mtime = 0
+                      item.mode = 0o755 if stat.S_ISDIR(info.st_mode) else 0o644
+                      item.type = tarfile.DIRTYPE if stat.S_ISDIR(info.st_mode) else tarfile.REGTYPE
+                      item.size = 0 if item.isdir() else info.st_size
+                      if item.isdir():
+                          tar.addfile(item)
+                      else:
+                          with regular_file(file, site, MAX_SITE_BYTES) as stream:
+                              tar.addfile(item, stream)
+              context = {"source": {"sha": sha, "tree": tree},
+                         "controller": {"sha": workflow_sha, "ref": workflow_ref},
+                         "run": {"repository": repo, "id": int(run_id), "physicalAttempt": int(attempt), "event": "pull_request", "ref": ref},
+                         "artifactName": artifact_name, "configuration": configuration,
+                         "inputs": {"cargoLockSha256": file_hash(root / "Cargo.lock", root, 16 << 20), "sourceWorkflowSha256": file_hash(root / ".github/workflows/ci.yml", root, 1 << 20)},
+                         "toolchain": toolchain, "runner": {"os": os.environ["RUNNER_OS"], "arch": os.environ["RUNNER_ARCH"]}}
+              receipt = {**context, "schema": "bamboo.feature-docs.v1", "complete": True, "configurationSha256": configuration_digest,
+                         "tar": {"file": "artifact.tar", "sha256": file_hash(archive, output, MAX_TAR_BYTES), "sizeBytes": archive.stat().st_size},
+                         "files": files, "fileCount": len(files), "siteBytes": total}
+              encoded = (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode()
+              assert len(encoded) <= MAX_RECEIPT_BYTES
+              (output / "receipt.json").write_bytes(encoded)
+              verify_receipt(json.loads(read_text(output / "receipt.json", output, MAX_RECEIPT_BYTES)), archive, context)
+              assert git("rev-parse", "HEAD") == sha and not git("status", "--porcelain", "--untracked-files=all")
+
+          if __name__ == "__main__":
+              produce()
+          PY
+
+      - name: Verify feature documentation source stayed clean
+        if: always() && needs.validation-source.outputs.feature == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+
+      - name: Retain original feature documentation tar and receipt
+        if: success() && needs.validation-source.outputs.feature == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: feature-docs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/feature-docs-${{ github.run_id }}-${{ github.run_attempt }}/artifact.tar
+            ${{ runner.temp }}/feature-docs-${{ github.run_id }}-${{ github.run_attempt }}/receipt.json
+          if-no-files-found: error
+          retention-days: 90
 
   security:
     name: Security Audit
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true' || needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind quality to the actual clean merge source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+          git show -s --format='Quality source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -908,13 +1592,34 @@ jobs:
         # this required security job green without an explicit review.
         run: cargo audit --deny warnings
 
+      - name: Verify quality source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+
   deny:
     name: cargo-deny (licenses/bans/advisories/sources)
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true' || needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind quality to the actual clean merge source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+          git show -s --format='Quality source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
 
       # Pinned by commit SHA (not just the `v2` tag) for supply-chain
       # reproducibility — deny.toml at the repo root is tuned to be green
@@ -930,3 +1635,12 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1 (cargo-deny 0.20.2)
         with:
           command: check
+
+      - name: Verify quality source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
