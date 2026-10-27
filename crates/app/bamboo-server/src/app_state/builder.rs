@@ -350,11 +350,11 @@ impl AppState {
             },
         )?);
         let persistence = Arc::new(LockedSessionStore::new(storage.clone()));
-        let session_inbox: Arc<dyn bamboo_domain::SessionInboxPort> =
-            Arc::new(bamboo_storage::FileSessionInbox::new(
-                session_store.clone(),
-                bamboo_domain::SessionInboxLimits::default(),
-            ));
+        let file_session_inbox = Arc::new(bamboo_storage::FileSessionInbox::new(
+            session_store.clone(),
+            bamboo_domain::SessionInboxLimits::default(),
+        ));
+        let session_inbox: Arc<dyn bamboo_domain::SessionInboxPort> = file_session_inbox.clone();
         let session_activation_router = bamboo_engine::SessionActivationRouter::new();
         let session_messenger = Arc::new(bamboo_engine::SessionMessenger::new(
             storage.clone(),
@@ -1304,13 +1304,24 @@ impl AppState {
         // terminal fanout after process restart.
         parent_question_coordinator.spawn();
 
+        let observer_subscriptions = Arc::new(
+            super::observer_subscriptions::ObserverSubscriptionCoordinator::new(
+                session_store.clone(),
+                file_session_inbox,
+                session_activation_router.clone(),
+                storage.clone(),
+                spawn_scheduler.supports_native_ticket_budget(),
+            ),
+        );
         if start_inbox_reconciler {
+            observer_subscriptions.tick(chrono::Utc::now()).await;
             // Reconcile exact Inbox wake readiness before serving, then pace
             // runtime recovery for due leases and missed activation handoffs.
-            let wake_report = super::wake_reconciler::reconcile_startup(
+            let wake_report = super::wake_reconciler::reconcile_startup_with_observers(
                 session_store.clone(),
                 session_activation_router.clone(),
                 mcp_proxy_shutdown.clone(),
+                observer_subscriptions.clone(),
             )
             .await;
             if wake_report.attempted > 0
@@ -1491,6 +1502,7 @@ impl AppState {
             session_repo,
             persistence,
             session_inbox,
+            observer_subscriptions,
             session_activation_router,
             session_messenger,
             spawn_scheduler,
