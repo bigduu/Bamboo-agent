@@ -126,12 +126,7 @@ async fn execute_gold(
         CancellationToken::new(),
     )
     .model("main-a")
-    .provider_name("chat-a")
-    .gold_config(GoldConfig {
-        enabled: true,
-        goal: Some("Synthetic goal".into()),
-        ..Default::default()
-    });
+    .provider_name("chat-a");
     if let Some(target) = override_target {
         builder = builder.auxiliary_model_resolver(Arc::new(move || AuxiliaryModelConfig {
             fast_model_name: Some("cheap".into()),
@@ -139,9 +134,15 @@ async fn execute_gold(
             ..Default::default()
         }));
     }
+    let mut request = builder.build();
+    request.gold_config = Some(GoldConfig {
+        enabled: true,
+        goal: Some("Synthetic goal".into()),
+        ..Default::default()
+    });
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        agent.execute(&mut session, builder.build()),
+        agent.execute(&mut session, request),
     )
     .await
     .expect("synthetic SDK consumer must finish")
