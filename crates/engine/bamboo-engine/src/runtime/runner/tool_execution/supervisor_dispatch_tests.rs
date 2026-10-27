@@ -295,15 +295,29 @@ async fn supervisor_native_direct_files_and_processes_never_enter_executor_in_bo
             .iter()
             .any(|event| matches!(event, AgentEvent::ToolStart { .. })));
         for call in calls {
+            let result = session
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.tool_call_id.as_deref() == Some(call.id.as_str()))
+                .unwrap_or_else(|| {
+                    panic!("missing result: mode={ultra}, tool={}", call.function.name)
+                });
+            assert_eq!(result.tool_success, Some(false), "{result:?}");
+            let legacy_alias =
+                call.function.name == "Bash" || call.function.name.starts_with("default::");
             assert!(
-                session.messages.iter().any(|message| {
-                    message.tool_call_id.as_deref() == Some(call.id.as_str())
-                        && message.tool_success == Some(false)
-                        && (call.function.name.starts_with("default::")
-                            || message.content.contains("supervisor_delegation_required"))
-                }),
-                "mode={ultra}, tool={}",
+                result.content.contains("supervisor_delegation_required")
+                    || (legacy_alias
+                        && result
+                            .content
+                            .contains("not callable at the current conversation position")),
+                "unexpected denial: mode={ultra}, tool={}, result={result:?}",
                 call.function.name
+            );
+            eprintln!(
+                "Supervisor native refusal: mode={ultra}; tool={}; reason={}",
+                call.function.name, result.content
             );
         }
     }

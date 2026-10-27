@@ -76,10 +76,14 @@ jobs:
             --skip supervisor_direct_files_and_processes_require_delegation_in_both_modes
           run_nonempty core cargo test --locked -p bamboo-agent-core --lib \
             supervisor_delegation_first -- --test-threads=1
+          run_nonempty native cargo test --locked -p bamboo-engine --lib \
+            runtime::runner::tool_execution::supervisor_dispatch_tests::supervisor_native_direct_files_and_processes_never_enter_executor_in_both_modes \
+            -- --exact --test-threads=1 --nocapture
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-role-native.log"
           run_nonempty engine cargo test --locked -p bamboo-engine --lib supervisor_ \
-            -- --test-threads=1
+            -- --test-threads=1 \
+            --skip supervisor_native_direct_files_and_processes_never_enter_executor_in_both_modes
           for case in \
-            supervisor_native_direct_files_and_processes_never_enter_executor_in_both_modes \
             supervisor_retained_once_cannot_override_role_or_consume_replay_markers \
             supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standard_and_ultra \
             supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials \
