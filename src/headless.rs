@@ -241,6 +241,12 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
     let state = AppState::new(args.data_dir.clone())
         .await
         .map_err(|e| format!("boot app state: {e}"))?;
+    run_with_state(args, state).await
+}
+
+// Keep one execution implementation; controlled tests inject an isolated Host
+// through this seam instead of booting real credentials or canonical memory.
+async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), String> {
     let requested_project = match args.project_id.as_deref() {
         Some(raw) => {
             let value = raw.trim();
@@ -699,6 +705,10 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
     }
     exit
 }
+
+#[cfg(test)]
+#[path = "headless_model_routing_tests.rs"]
+mod model_routing_tests;
 
 /// The tree is done when the root runner is not running, the root is not
 /// suspended waiting for children, and no child runner is still running.
