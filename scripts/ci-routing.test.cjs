@@ -32,12 +32,13 @@ function assertRouting(source) {
   assert.doesNotMatch(quick, /cargo (build|test|check|clippy)|continue-on-error|--test-skip/);
   const full = job(source, "test");
   assert.match(full, /^    name: Test$/m);
-  assert.match(full, /^    needs: \[validation-source, main-release-admission, test-crates, test-ssh\]$/m);
+  assert.match(full, /^    needs: \[validation-source, main-release-admission, quick-checks, feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
   assert.match(full, /^    if: always\(\) && !cancelled\(\)$/m);
   assert.match(full, /- name: Require validation admission\n        env:\n          SOURCE_RESULT: \$\{\{ needs.validation-source.result \}\}\n          FULL_VALIDATION: \$\{\{ needs.validation-source.outputs.full \}\}/);
   assert.match(full, /test "\$SOURCE_RESULT" = success/);
   assert.match(full, /\*\) exit 1 ;;/);
-  assert.ok(full.includes("        run: cargo build --locked\n"));
+  assert.doesNotMatch(full, /cargo build/);
+  assert.match(full, /test "\$E2E_RESULT" = success/);
   assert.match(full, /test "\$CRATE_RESULT" = success/);
   assert.doesNotMatch(full, /run: cargo test/);
   for (const id of ["msrv", "tls-fixture-test", "tool-event-recorder-e2e", "lint", "build", "docs", "security", "deny"]) {
@@ -56,7 +57,7 @@ function assertRouting(source) {
   assert.match(source, /group:.*inputs.snapshot_sha/);
 }
 
-test("required Test compiles dev, validates snapshots fully and authenticates main admission", () => {
+test("required Test runs feature tests, validates snapshots fully and authenticates main admission", () => {
   assertRouting(ci);
   for (const [from, to] of [
     ["name: Quick Checks", "name: Test"],
@@ -66,7 +67,7 @@ test("required Test compiles dev, validates snapshots fully and authenticates ma
     ["if: always() && !cancelled()", "if: needs.validation-source.outputs.full == 'true'"],
     ['test "$SOURCE_RESULT" = success', 'true # ignored source result'],
     ["if: needs.validation-source.outputs.full == 'true'", "if: true"],
-    ["        run: cargo build --locked\n", "        continue-on-error: true\n        run: cargo build --locked\n"],
+    ['test "$E2E_RESULT" = success', 'true # ignored E2E result'],
   ]) assert.throws(() => assertRouting(ci.replace(from, to)), `reject ${to}`);
 });
 
@@ -84,12 +85,12 @@ test("snapshot controller executes positive and fail-closed routing cases", (t) 
     return { ...result, output: fs.readFileSync(output, "utf8") };
   };
   for (const overrides of [ {}, { GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "main" } ]) {
-    const result = run(overrides); assert.equal(result.status, 0, result.stderr); assert.equal(result.output, "full=true\n");
+    const result = run(overrides); assert.equal(result.status, 0, result.stderr); assert.equal(result.output, "full=true\nfeature=false\n");
   }
   const main = run({ GITHUB_EVENT_NAME: "push", GITHUB_REF: "refs/heads/main" });
-  assert.equal(main.status, 0); assert.equal(main.output, "full=false\n");
+  assert.equal(main.status, 0); assert.equal(main.output, "full=false\nfeature=false\n");
   const dev = run({ GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev" });
-  assert.equal(dev.status, 0); assert.equal(dev.output, "full=false\n");
+  assert.equal(dev.status, 0); assert.equal(dev.output, "full=false\nfeature=true\n");
   for (const overrides of [
     { EXPECTED_SNAPSHOT_SHA: "" }, { EXPECTED_SNAPSHOT_SHA: "dev" }, { EXPECTED_SNAPSHOT_SHA: "b".repeat(40) },
     { EXPECTED_SNAPSHOT_SHA: "A".repeat(40) }, { EXPECTED_SNAPSHOT_SHA: `${sha}\nfull=true` },
@@ -152,7 +153,7 @@ function assertMainAdmission(source) {
   const [, admissionStep, ...sourceSteps] = full.split(/(?=^      - )/m);
   assert.match(admissionStep, /name: Require validation admission/);
   for (const step of sourceSteps) {
-    assert.match(step, /^        if: (?:needs.validation-source.outputs.full == 'true'|(?:always\(\) && |failure\(\) && )?github.event_name != 'push'|github.event_name == 'pull_request' && github.base_ref == 'dev')$/m,
+    assert.match(step, /^        if: (?:(?:always|failure)\(\) && )?needs.validation-source.outputs.full == 'true'$/m,
       "main must perform admission only, without checkout, compilation or duplicate tests");
   }
 }
@@ -162,7 +163,7 @@ test("main Test reports real admission while the full suite remains on pre-merge
   for (const [from, to] of [
     ["ADMISSION_MODE: main", "ADMISSION_MODE: publication"],
     ['test "$MAIN_ADMISSION_RESULT" = success', 'true'],
-    ["if: github.event_name != 'push'", "if: always()"],
+    ["if: needs.validation-source.outputs.full == 'true'", "if: always()"],
     ["contents: read\n      actions: read", "contents: write\n      actions: read"],
   ]) assert.throws(() => assertMainAdmission(ci.replace(from, to)));
 });
@@ -212,72 +213,72 @@ function assertSharedBuild(source) {
   const [settings, ...steps] = build.split(/(?=^      - )/m);
   assert.match(settings, /^    name: Test$/m);
   assert.match(settings, /^    if: always\(\) && !cancelled\(\)$/m);
-  assert.match(settings, /^    needs: \[validation-source, main-release-admission, test-crates, test-ssh\]$/m);
+  assert.match(settings, /^    needs: \[validation-source, main-release-admission, quick-checks, feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
   assert.ok(settings.includes("timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"));
   assert.doesNotMatch(settings, /^    continue-on-error:/m);
-  const cargo = steps.filter((step) => step.startsWith("      - name: Build locked Rust workspace\n"));
-  assert.equal(cargo.length, 1);
-  assert.equal(cargo[0].trimEnd(), "      - name: Build locked Rust workspace\n        if: github.event_name == 'pull_request' && github.base_ref == 'dev'\n        run: cargo build --locked");
+  assert.doesNotMatch(build, /cargo build/);
+  assert.match(build, /test "\$E2E_RESULT" = success/);
   assert.doesNotMatch(build, /continue-on-error:|\|\| true|\|\| exit 0/);
   assert.doesNotMatch(build, /^          ref:/m, "retain the actual event merge source");
   for (const name of ["Test CI workflow policy", "Check formatting", "Require all crate tests and the SSH fixture"]) {
     const step = steps.find((item) => item.startsWith(`      - name: ${name}\n`));
     assert.ok(step);
-    assert.match(step, /^        if: needs.validation-source.outputs.full == 'true'$/m, `${name} must not become a dev merge gate`);
+    assert.ok(step.includes("if: needs.validation-source.outputs.full == 'true'"));
+
   }
   const admission = steps.find((step) => step.startsWith("      - name: Require validation admission\n"));
   assert.equal(steps.indexOf(admission), 0);
   assert.doesNotMatch(admission, /^        (?:if|continue-on-error):/m);
 }
 
-test("one required Test honestly compiles dev without imposing auxiliary checks or full tests", () => {
+test("one required Test requires successful Unit, E2E and SSH jobs", () => {
   assertSharedBuild(ci);
   for (const [from, to] of [
     ["name: Test\n", "name: Dev Build\n"],
-    ["run: cargo build --locked", "run: cargo check --locked"],
-    ["run: cargo build --locked", "run: cargo test --locked --no-fail-fast"],
-    ["run: cargo build --locked", "run: cargo build --locked || true"],
-    ["run: cargo build --locked", "continue-on-error: true\n        run: cargo build --locked"],
-    ["run: cargo build --locked", "if: false\n        run: cargo build --locked"],
-    ["needs: [validation-source, main-release-admission, test-crates, test-ssh]", "needs: quick-checks"],
+    ['test "$E2E_RESULT" = success', 'true'],
+    ["needs: [validation-source, main-release-admission, quick-checks, feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]", "needs: quick-checks"],
     ["name: Test CI workflow policy\n        if: needs.validation-source.outputs.full == 'true'", "name: Test CI workflow policy"],
     ["name: Check formatting\n        if: needs.validation-source.outputs.full == 'true'", "name: Check formatting"],
     ["name: Require all crate tests and the SSH fixture\n        if: needs.validation-source.outputs.full == 'true'", "name: Require all crate tests and the SSH fixture"],
   ]) assert.throws(() => assertSharedBuild(ci.replace(from, to)), `reject ${to}`);
 });
 
-test("required Test admission accepts only the matching successful dev/full source proof", () => {
+test("required Test admits only successful feature execution or the matching legacy release/main proof", () => {
   const shell = script(job(ci, "test").split("      - uses:")[0]);
   const run = (overrides = {}) => spawnSync("bash", ["-c", shell], { encoding: "utf8", env: { ...process.env,
-    SOURCE_RESULT: "success", FULL_VALIDATION: "false", MAIN_ADMISSION_RESULT: "success", GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev", GITHUB_REF: "refs/pull/1/merge", ...overrides } });
-  for (const overrides of [{}, { GITHUB_BASE_REF: "main", FULL_VALIDATION: "true" },
-    { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", FULL_VALIDATION: "true" },
-    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", FULL_VALIDATION: "false" }]) assert.equal(run(overrides).status, 0);
+    SOURCE_RESULT: "success", FULL_VALIDATION: "false", FEATURE_VALIDATION: "true", FEATURE_RESULT: "success",
+    QUICK_RESULT: "success", TLS_RESULT: "success", RECORDER_RESULT: "success", MAIN_ADMISSION_RESULT: "success",
+    GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev", GITHUB_REF: "refs/pull/1/merge", ...overrides } });
+  for (const overrides of [{}, { GITHUB_BASE_REF: "main", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false" },
+    { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false" },
+    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", FEATURE_VALIDATION: "false" }]) assert.equal(run(overrides).status, 0);
+  for (const field of ["SOURCE_RESULT", "FEATURE_RESULT", "QUICK_RESULT", "TLS_RESULT", "RECORDER_RESULT"]) {
+    for (const value of ["failure", "cancelled", "skipped", "", "unknown"]) assert.notEqual(run({ [field]: value }).status, 0);
+  }
   for (const overrides of [
-    { FULL_VALIDATION: "true" }, { FULL_VALIDATION: "" }, { FULL_VALIDATION: "unknown" },
+    { FULL_VALIDATION: "true" }, { FULL_VALIDATION: "" }, { FEATURE_VALIDATION: "false" },
     { GITHUB_BASE_REF: "main" }, { GITHUB_BASE_REF: "integration/batch" },
     { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "" },
-    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/dev", FULL_VALIDATION: "true" },
-    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", FULL_VALIDATION: "true" },
-    ...["failure", "cancelled", "skipped", "", "unknown"].map(MAIN_ADMISSION_RESULT => ({ GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", MAIN_ADMISSION_RESULT })),
+    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/dev" },
+    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main" },
+    ...["failure", "cancelled", "skipped", "", "unknown"].map(MAIN_ADMISSION_RESULT => ({ GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", FEATURE_VALIDATION: "false", MAIN_ADMISSION_RESULT })),
     { GITHUB_EVENT_NAME: "pull_request_target" }, { GITHUB_EVENT_NAME: "unknown" },
   ]) assert.notEqual(run(overrides).status, 0);
-  for (const result of ["failure", "cancelled", "skipped", "", "unknown"]) {
-    assert.notEqual(run({ SOURCE_RESULT: result }).status, 0);
-    assert.notEqual(run({ SOURCE_RESULT: result, GITHUB_BASE_REF: "main", FULL_VALIDATION: "true" }).status, 0);
-  }
 });
 
-test("the shared compile command preserves Cargo failures under the Actions shell", (t) => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-compile-status-"));
-  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  fs.writeFileSync(path.join(directory, "cargo"), '#!/bin/bash\nprintf "%s\\n" "$*"\nexit "$CARGO_STATUS"\n', { mode: 0o755 });
-  const step = job(ci, "test").split(/(?=^      - )/m).find((item) => item.startsWith("      - name: Build locked Rust workspace\n"));
-  const command = step.match(/^        run: (.+)$/m)[1];
-  for (const status of [0, 23, 101]) {
-    const result = spawnSync("bash", ["-e", "-o", "pipefail", "-c", command], { encoding: "utf8", env: { ...process.env,
-      PATH: `${directory}${path.delimiter}${process.env.PATH}`, CARGO_STATUS: String(status) } });
-    assert.equal(result.stdout.trim(), "build --locked");
-    assert.equal(result.status, status);
-  }
+test("feature execution shares owned outputs across explicit configurations and excludes duplicate Linux fixtures", () => {
+  const feature = job(ci, "feature-tests");
+  assert.match(feature, /if: needs.validation-source.outputs.feature == 'true'/);
+  assert.match(feature, /CARGO_TARGET_DIR: \$\{\{ github.workspace \}\}\/target\/feature-tests/);
+  assert.match(feature, /run: node scripts\/run-feature-tests.cjs/);
+  assert.match(feature, /node scripts\/frontend-package.cjs verify/);
+  assert.doesNotMatch(feature, /cargo build|cargo test|continue-on-error|secrets\./);
+  const recorder = job(ci, "tool-event-recorder-e2e");
+  assert.ok(recorder.includes('fromJSON(needs.validation-source.outputs.feature'));
+  assert.ok(recorder.includes('["macos-latest","windows-latest"]'));
+  assert.equal(fs.existsSync('.github/workflows/orchestration-native-recovery.yml'), false);
+  assert.equal(fs.existsSync('.github/workflows/scoped-context-view.yml'), false);
+  const identity = fs.readFileSync('.github/workflows/jiandu-project-source.yml', 'utf8');
+  assert.match(identity, /cargo metadata --locked --all-features/);
+  assert.doesNotMatch(identity, /cargo (test|clippy|build)/);
 });
