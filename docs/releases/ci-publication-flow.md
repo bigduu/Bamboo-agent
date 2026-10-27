@@ -83,7 +83,8 @@ flow. GitHub selects a `workflow_run` listener from the default branch. At the
 time of this guide, the default is protected `dev`, so merging the listener into
 `dev` enables automatic Docker consumption even before Main is promoted. After
 the first publisher succeeds, check its corresponding Docker run before doing
-anything else. Do not manually dispatch a duplicate consumer.
+anything else. Do not manually dispatch a duplicate consumer. If that run
+failed, recover its failed jobs in the same run and reuse its verified outputs.
 
 If the expected automatic run is confirmed missing, recheck the live default
 branch and installed listener. Only when no consumer for this release is queued
