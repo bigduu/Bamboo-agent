@@ -360,6 +360,7 @@ function assertLinuxTestOwnership(definitions) {
     },
     "release-cargo-isolation.yml": { isolation: "Synthetic credential/ENOSPC containment boundary" },
     "trusted-observer.yml": { observer: "Accepted API-only/F multi-package Observer configuration; not M evidence" },
+    "delegated-planner-acceptance.yml": { planner: "New a64 API-only/F Planner targets; independent accepted configuration, not M evidence" },
     "ticket-platform-adapter.yml": { "native-budget": "Explicit manual snapshot diagnosis; normal PR job is Windows" },
   }
   for (const [file, source] of Object.entries(definitions)) {
@@ -375,6 +376,18 @@ function assertLinuxTestOwnership(definitions) {
       if (!/\bcargo(?: \+[^\s]+)? test\b/u.test(code) &&
           !(/["']cargo["']/u.test(code) && /["']test["']/u.test(code))) continue
       assert.ok(registered[file]?.[id], `Ordinary Linux Rust tests must join the canonical feature executor: ${file}:${id}; consolidate targets or review an explicit scoped exception`)
+      if (file === "delegated-planner-acceptance.yml") {
+        // Newly inherited #2304 owner, not part of the original A95 baseline.
+        assert.equal(createHash("sha256").update(source).digest("hex"), "318e924773ffdeb0407c5b73b15a70c330f7f64eb7ef3260c1a955782d12d912")
+        assert.match(block, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
+        assert.match(block, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+        assert.match(block, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+        assert.match(block, /test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SOURCE_SHA"/u)
+        for (const command of ["cargo test --locked -p bamboo-server-tools --lib plan::tests::",
+          "cargo test --locked -p bamboo-engine --lib planner_artifact",
+          "cargo test --locked -p bamboo-agent --test required_child_context_packet",
+          "cargo clippy --locked --all-features -p bamboo-agent"]) assert.ok(block.includes(command))
+      }
       if (file === "trusted-observer.yml") {
         // Preserve this separately accepted F/config exactly; never relabel it as M.
         assert.equal(createHash("sha256").update(source).digest("hex"), "7c26b1511759f5a40bad6a21dc44976a59f60c81f841cdf00396fa38e5d868ab")
@@ -421,8 +434,14 @@ test("all agents share canonical feature tests instead of adding ordinary Linux 
     assert.throws(() => assertLinuxTestOwnership({ ...definitions,
       "trusted-observer.yml": definitions["trusted-observer.yml"].replace(before, after) }))
   }
+  for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
+    ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
+    ["--test required_child_context_packet", "--lib"], ["--all-features", "--no-default-features"]]) {
+    assert.throws(() => assertLinuxTestOwnership({ ...definitions,
+      "delegated-planner-acceptance.yml": definitions["delegated-planner-acceptance.yml"].replace(before, after) }))
+  }
   const duplicate = "name: New delegated planner acceptance\non:\n  pull_request:\n    branches: [dev]\njobs:\n  planner:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test --locked -p bamboo-agent --test required_child_context_packet\n"
-  assert.throws(() => assertLinuxTestOwnership({ ...definitions, "delegated-planner-acceptance.yml": duplicate }), /must join the canonical feature executor/u)
+  assert.throws(() => assertLinuxTestOwnership({ ...definitions, "unregistered-planner-acceptance.yml": duplicate }), /must join the canonical feature executor/u)
   const unregistered = workflow + "\n  extra-linux-tests:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test --locked -p bamboo-server --lib\n"
   assert.throws(() => assertLinuxTestOwnership({ ...definitions, "ci.yml": unregistered }), /must join the canonical feature executor/u)
   assert.throws(() => assertLinuxTestOwnership({ ...definitions, "ticket-platform-adapter.yml": definitions["ticket-platform-adapter.yml"]
