@@ -6,7 +6,9 @@
 
 use super::AppState;
 use async_trait::async_trait;
-use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
+use bamboo_agent_core::tools::{
+    FunctionCall, Tool, ToolCall, ToolCtx, ToolError, ToolOutcome, ToolResult, ToolSchema,
+};
 use bamboo_domain::{
     Message, ObserverChangeKind, ObserverViewChange, PendingQuestion, PendingQuestionSource,
     ProviderModelRef, Session, SessionActivationPolicy, SessionInboxPort, SessionMessageEnvelope,
@@ -35,6 +37,8 @@ const PARENT: &str = "epic-supervisor";
 const TRACKER: &str = "epic-tracker";
 const PLANNER: &str = "epic-planner";
 const WORKER: &str = "epic-original-worker";
+const BLOCKED_MODEL: &str = "epic-original-blocked-worker";
+const QUESTION_TOOL: &str = "epic_fixture_ask_user";
 const OBSERVER: &str = "epic-fixed-tracker";
 const ROOT_A: &str = "epic-existing-a";
 const ROOT_B: &str = "epic-existing-b";
@@ -91,6 +95,7 @@ struct Probe {
     workspace: PathBuf,
     requests: AtomicUsize,
     worker_calls: AtomicUsize,
+    blocked_calls: AtomicUsize,
     planner_calls: AtomicUsize,
     tracker_calls: AtomicUsize,
     plan_started: AtomicBool,
@@ -106,6 +111,7 @@ impl Probe {
             workspace,
             requests: AtomicUsize::new(0),
             worker_calls: AtomicUsize::new(0),
+            blocked_calls: AtomicUsize::new(0),
             planner_calls: AtomicUsize::new(0),
             tracker_calls: AtomicUsize::new(0),
             plan_started: AtomicBool::new(false),
@@ -293,6 +299,42 @@ impl Probe {
                 format!("{APPENDIX} ").repeat(1000))}).to_string())
     }
 }
+/// Controlled input tool, using the same supported overlay and generic
+/// NeedsHuman protocol as the existing real SessionControl Host tests. It is
+/// not a claim that a retired AskUser builtin is registered in the product.
+struct ExistingOwnerQuestion;
+#[async_trait]
+impl Tool for ExistingOwnerQuestion {
+    fn name(&self) -> &str {
+        QUESTION_TOOL
+    }
+    fn description(&self) -> &str {
+        "Ask the existing Root owner to choose a bounded approach"
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({"type":"object","properties":{},"additionalProperties":false})
+    }
+    async fn invoke(&self, _: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
+        let question = "Which bounded Root A approach is authorized?";
+        Ok(ToolOutcome::NeedsHuman {
+            question: PendingQuestion {
+                tool_call_id: ctx.tool_call_id.to_string(),
+                tool_name: QUESTION_TOOL.into(),
+                question: question.into(),
+                options: vec!["A".into(), "B".into()],
+                allow_custom: true,
+                source: PendingQuestionSource::PauseTool,
+            },
+            result: ToolResult::text(
+                true,
+                json!({"status":"awaiting_user_input","question":question,
+                "options":["A","B"],"allow_custom":true})
+                .to_string(),
+            ),
+        })
+    }
+}
+
 #[async_trait]
 impl LLMProvider for Probe {
     async fn chat_stream(
@@ -310,6 +352,18 @@ impl LLMProvider for Probe {
             PARENT => self.parent(messages),
             TRACKER => self.tracker(messages, tools).await,
             PLANNER => self.planner(messages).await,
+            BLOCKED_MODEL => {
+                assert_eq!(
+                    self.blocked_calls.fetch_add(1, Ordering::SeqCst),
+                    0,
+                    "existing Root A must remain suspended without an answer"
+                );
+                assert!(messages
+                    .iter()
+                    .any(|message| message.content.contains(PRIVATE_A)));
+                assert!(tools.iter().any(|tool| tool.function.name == QUESTION_TOOL));
+                call(QUESTION_TOOL, "epic-existing-owner-question", json!({}))
+            }
             WORKER => {
                 assert_eq!(
                     self.worker_calls.fetch_add(1, Ordering::SeqCst),
@@ -485,9 +539,10 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         projects.insert(project.id.clone());
         let directory = home.path().join(id);
         std::fs::create_dir(&directory).unwrap();
-        let mut root = Session::new(id, WORKER);
+        let model = if id == ROOT_A { BLOCKED_MODEL } else { WORKER };
+        let mut root = Session::new(id, model);
         root.set_project_id_meta(project.id.to_string());
-        root.model_ref = Some(ProviderModelRef::new(PROVIDER, WORKER));
+        root.model_ref = Some(ProviderModelRef::new(PROVIDER, model));
         root.set_provider_name(PROVIDER);
         root.workspace = Some(directory.to_string_lossy().into());
         root.set_workspace_path_meta(directory.to_string_lossy());
@@ -495,18 +550,32 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
             .get_or_insert_with(Default::default)
             .set_permission_mode(SessionPermissionMode::Bypass);
         root.add_message(Message::user(private));
-        if id == ROOT_A {
-            root.pending_question = Some(PendingQuestion {
-                tool_call_id: "existing-owner-question".into(),
-                tool_name: "Pause".into(),
-                question: "Which bounded Root A approach is authorized?".into(),
-                options: vec!["A".into(), "B".into()],
-                allow_custom: true,
-                source: PendingQuestionSource::PauseTool,
-            });
-        }
         state.storage.save_session(&root).await.unwrap();
     }
+    // Produce the original blocker through a real provider tool call and
+    // runtime clarification persistence, before attaching either existing Root.
+    // The question itself is never assigned into Session by the fixture.
+    let mut blocked = load(&state, ROOT_A).await;
+    let tools = Arc::new(crate::tools::OverlayToolExecutor::new(
+        state.tools_for(crate::tools::ToolSurface::Root),
+        Arc::new(ExistingOwnerQuestion),
+    ));
+    let (events, mut receiver) = tokio::sync::mpsc::channel(100);
+    let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
+    state.agent.execute_direct(&mut blocked,bamboo_engine::ExecuteRequestBuilder::new(
+        "Ask the existing owner which bounded approach is authorized; wait for their answer.",
+        events,tokio_util::sync::CancellationToken::new()).tools(tools)
+        .provider_override(probe.clone()).model(BLOCKED_MODEL).build()).await.unwrap();
+    drain.await.unwrap();
+    let paused = wait(&state, ROOT_A, |session| {
+        session
+            .pending_question
+            .as_ref()
+            .is_some_and(|question| question.tool_call_id == "epic-existing-owner-question")
+    })
+    .await;
+    assert_eq!(paused.last_run_status().as_deref(), Some("suspended"));
+    assert_eq!(probe.blocked_calls.load(Ordering::SeqCst), 1);
     service
         .configure_project_scope(&reference, 0, projects)
         .await
@@ -618,6 +687,7 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
     })
     .await;
     assert_eq!(probe.worker_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.blocked_calls.load(Ordering::SeqCst), 1);
     assert_eq!(probe.planner_calls.load(Ordering::SeqCst), 3);
     assert_eq!(context_identity(&worker), context_identity(&original_b));
     assert!(!workspace.join("must-not-exist.txt").exists());
@@ -750,6 +820,7 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
     assert_eq!(artifact(&cold.messages).unwrap()["read"], selector);
     assert_eq!(context_identity(&cold), parent_identity);
     assert_eq!(probe.worker_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.blocked_calls.load(Ordering::SeqCst), 1);
     assert_eq!(probe.planner_calls.load(Ordering::SeqCst), 3);
     assert_eq!(
         cold.messages.iter().filter(|m| m.content == USER).count(),
