@@ -19,6 +19,17 @@ const PUSH = "Recheck source and push candidate digest", UPLOAD = "Retain this a
 const SOURCE_JOB = "Authenticate completed release", SOURCE_STEP = "Read original completed publication", SOURCE_PREFIX = "Bamboo Docker source: ";
 const ARM_JOB = "Produce Docker ARM executable original", ARM_UPLOAD = "Retain ARM binary and receipt";
 const IMAGE_STEPS = [SELECT, "Copy authenticated binary and Host originals", BUILD, SMOKE, PUSH, UPLOAD];
+const IMAGE_MATRIX_NAME = "Repackage originals (${{ matrix.platform }})";
+const IMAGE_MATRIX_DEFINITION = "d73e12ecbc812790eb16e488ae56db50691cf606249a6584ae9b8e983b621218";
+const SOURCE_KIND = "bamboo-docker-source-proof/v1", liveContexts = new WeakMap(), sourceFrames = new WeakMap();
+const hashData = value => core.sha256(Buffer.from(core.canonicalJson(value)));
+const jobDigest = job => core.sha256(Buffer.from(source.fingerprint(job)));
+const exact = (value, names) => assert.deepEqual(Object.keys(value || {}).sort(), [...names].sort());
+const stableRun = run => ({ ...Object.fromEntries(["id", "workflow_id", "check_suite_id", "check_suite_node_id", "event", "head_sha", "head_branch", "path", "name", "created_at"].map(key => [key, run[key]])),
+  repository: { id: run.repository.id, full_name: run.repository.full_name }, head_repository: { id: run.head_repository.id, full_name: run.head_repository.full_name } });
+const featurePr = pr => ({ number: pr.number, state: pr.state, draft: pr.draft, merged: pr.merged, merged_at: pr.merged_at,
+  merge_commit_sha: pr.merge_commit_sha, head: { ref: pr.head.ref, sha: pr.head.sha, repo: { id: pr.head.repo.id, full_name: pr.head.repo.full_name } },
+  base: { ref: pr.base.ref, repo: { id: pr.base.repo.id, full_name: pr.base.repo.full_name } } });
 const positive = value => { assert.match(String(value), /^[1-9][0-9]*$/); assert.ok(Number.isSafeInteger(Number(value))); return Number(value); };
 const safeEnv = () => Object.fromEntries(["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SystemRoot"].filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
 function command(program, args, options = {}) {
@@ -65,17 +76,231 @@ async function locate(reads, runId) {
 }
 async function authenticated() {
   assert.equal(arguments.length, 0, "No supplied proof, policy or authority override");
+  const state = await authenticatedSource(), record = sourceFrames.get(state);
+  if (record.mode === "reuse") await freshSourceFacts(state, record.data);
+  return state;
+}
+// Stage may read authenticated immutable originals into owned scratch before
+// checking mutable authority at its tail. This private loader grants no output
+// or write permission; the public factory always performs the full live guard.
+async function authenticatedSource() {
+  assert.equal(arguments.length, 0);
   const controller = caller(), env = process.env, event = JSON.parse(fs.readFileSync(env.GITHUB_EVENT_PATH, "utf8"));
   const runId = eventRun(env.GITHUB_EVENT_NAME, event, env.DOCKER_RELEASE_RUN);
   // The inherited trusted adapter has no policy/token/fixture override.
   const reads = require("./main-admission.cjs").createPublicReads();
+  const state = { controller, reads }, context = await consumerExecution(state, env.GITHUB_JOB);
+  const family = context.jobs.filter(job => job.name === SOURCE_JOB && job.id !== context.current.id);
+  let first = env.GITHUB_JOB === "source" && context.run.run_attempt === 1 && !family.length;
+  if (env.GITHUB_JOB === "source" && !first && !family.some(job => job.status === "completed" && job.conclusion === "success")) {
+    await unreadSourceRetry(context); first = true;
+  }
+  if (first) await firstSource(state, context, runId);
+  else {
+    const held = await readSourceHandoff(state, context, env.GITHUB_JOB === "source");
+    Object.assign(state, { input: held.data.input, facts: held.data.facts });
+    assert.equal(state.input.releaseRun, runId, "Original Source selected a different release run");
+    sourceFrames.set(state, { ...held, mode: "reuse", job: { id: context.current.id, attempt: context.current.run_attempt } });
+  }
+  assert.equal(state.facts.publicationAuthorized, false); core.assertVersion(state.facts.release.version);
+  liveContexts.set(state, context); return state;
+}
+async function unreadSourceRetry(context) {
+  // A failed read-only proof may retry only before any downstream execution.
+  // Unknown matrix placeholders/missing jobs are not proof of no output.
+  assert.ok(context.run.run_attempt >= 2 && context.run.run_attempt <= 20);
+  const fixed = [SOURCE_JOB, ARM_JOB, "Publish complete multi-arch manifest", "Scan exact published image (Trivy)"];
+  for (let attempt = 1; attempt < context.run.run_attempt; attempt++) {
+    const rows = context.jobs.filter(job => job.run_attempt === attempt);
+    const placeholder = rows.some(job => job.name === IMAGE_MATRIX_NAME);
+    if (placeholder) {
+      const file = path.join(ROOT, WORKFLOW), stat = fs.lstatSync(file); assert.ok(stat.isFile() && !stat.isSymbolicLink());
+      const text = fs.readFileSync(file, "utf8"), marker = "\n  image:\n"; assert.equal(text.split(marker).length, 2);
+      const start = text.indexOf(marker), end = text.indexOf("\n    env:\n", start); assert.ok(end > start);
+      // Exact name/needs/permissions/two-platform matrix from clean, bound D.
+      assert.equal(core.sha256(Buffer.from(text.slice(start, end))), IMAGE_MATRIX_DEFINITION, "Unproven image matrix definition");
+    }
+    const names = [...fixed, ...(placeholder ? [IMAGE_MATRIX_NAME] : PLATFORMS.map(platform => "Repackage originals (" + platform + ")"))].sort();
+    assert.deepEqual(rows.map(job => job.name).sort(), names, "Incomplete or unknown prior Source/downstream history");
+    const official = await context.paged(`actions/runs/${context.run.id}/attempts/${attempt}/jobs`, "jobs");
+    assert.equal(official.length, rows.length);
+    for (const job of rows) {
+      const matches = official.filter(value => value.id === job.id); assert.equal(matches.length, 1);
+      assert.equal(matches[0].run_attempt, attempt); assert.equal(jobDigest(matches[0]), jobDigest(job));
+      assert.equal(job.status, "completed");
+      if (job.name === SOURCE_JOB) {
+        assert.ok(["failure", "cancelled", "timed_out", "skipped"].includes(job.conclusion));
+        const direct = await context.get("actions/jobs/" + job.id);
+        assert.equal(direct.run_attempt, attempt); assert.equal(jobDigest(direct), jobDigest(job));
+      } else {
+        assert.equal(job.conclusion, "skipped", "A started worker forbids another full Source proof");
+        assert.ok(Array.isArray(job.steps) && job.steps.length === 0, "Skipped worker must have no executed steps");
+      }
+    }
+  }
+}
+function parseSourceFrame(log) {
+  assert.ok(typeof log === "string" && Buffer.byteLength(log) <= 64 * 1024 * 1024);
+  const rows = log.split(/\r?\n/).filter(line => /^\d{4}-\d\d-\d\dT\S+Z /.test(line) && line.slice(line.indexOf(" ") + 1).startsWith(SOURCE_PREFIX));
+  assert.equal(rows.length, 1, "Missing/ambiguous Source handoff");
+  const encoded = rows[0].slice(rows[0].indexOf(SOURCE_PREFIX) + SOURCE_PREFIX.length);
+  assert.ok(encoded.length <= 87384 && /^[A-Za-z0-9+/]+={0,2}$/.test(encoded));
+  const bytes = Buffer.from(encoded, "base64"); assert.ok(bytes.length <= 65536); assert.equal(bytes.toString("base64"), encoded);
+  const value = JSON.parse(bytes.toString("utf8")); assert.equal(core.canonicalJson(value), bytes.toString("utf8"));
+  exact(value, ["schemaVersion", "kind", "publicationAuthorized", "mode", "selection", "job", "origin", "data"]);
+  assert.equal(value.schemaVersion, 1); assert.equal(value.kind, SOURCE_KIND); assert.equal(value.publicationAuthorized, false);
+  assert.ok(["full", "reuse"].includes(value.mode));
+  for (const item of [value.job, value.origin]) { exact(item, ["id", "attempt"]); positive(item.id); positive(item.attempt); }
+  assert.equal(value.mode === "full", value.data !== null); return value;
+}
+function sourcePhysical(context, allowRecovery) {
+  const rows = context.jobs.filter(job => job.name === SOURCE_JOB && (!allowRecovery || job.id !== context.current.id));
+  assert.ok(rows.length, "No original successful Source; workers never run a full-proof fallback");
+  assert.equal(new Set(rows.map(job => job.run_attempt)).size, rows.length);
+  const latest = [...rows].sort((a,b) => b.run_attempt - a.run_attempt)[0];
+  if (!allowRecovery) passed(latest);
+  const candidates = allowRecovery ? rows.filter(job => job.status === "completed" && job.conclusion === "success") : [latest];
+  const selected = [...candidates].sort((a,b) => b.run_attempt - a.run_attempt)[0]; assert.ok(selected);
+  const key = source.executionKey(selected); assert.ok(key);
+  const physical = rows.filter(job => source.executionKey(job) === key).sort((a,b) => a.run_attempt - b.run_attempt)[0];
+  passed(physical); passed(step(physical, SOURCE_STEP)); return physical;
+}
+async function readSourceHandoff(state, context, allowRecovery = false) {
+  const { get, paged } = context, attempts = new Map();
+  const read = async physical => {
+    jobHeader(physical, context.run); passed(physical); passed(step(physical, SOURCE_STEP));
+    assert.equal(physical.name, SOURCE_JOB); assert.ok(Date.parse(physical.started_at) >= Date.parse(context.run.created_at));
+    const direct = await get("actions/jobs/" + physical.id); assert.equal(direct.run_attempt, physical.run_attempt); assert.equal(jobDigest(direct), jobDigest(physical));
+    if (!attempts.has(physical.run_attempt)) attempts.set(physical.run_attempt, await paged(`actions/runs/${context.run.id}/attempts/${physical.run_attempt}/jobs`, "jobs"));
+    const members = attempts.get(physical.run_attempt).filter(job => job.id === physical.id); assert.equal(members.length, 1);
+    assert.equal(members[0].run_attempt, physical.run_attempt); assert.equal(jobDigest(members[0]), jobDigest(physical));
+    const log = await state.reads.jobLog(physical.id), value = parseSourceFrame(log);
+    sourceLocator(log, context.run, physical);
+    assert.deepEqual(value.job, { id: physical.id, attempt: physical.run_attempt });
+    assert.equal(value.selection.controller, state.controller); assert.equal(value.selection.consumerRun, context.run.id);
+    return value;
+  };
+  const latest = await read(sourcePhysical(context, allowRecovery)); let full = latest;
+  if (latest.mode === "reuse") {
+    const originals = context.jobs.filter(job => job.id === latest.origin.id && job.run_attempt === latest.origin.attempt);
+    assert.equal(originals.length, 1, "Original full Source disappeared"); full = await read(originals[0]);
+    assert.equal(full.mode, "full", "Reuse cannot invent another origin chain"); assert.deepEqual(full.selection, latest.selection);
+  }
+  assert.deepEqual(full.origin, full.job); assert.ok(full.data && typeof full.data === "object");
+  assert.deepEqual(full.selection, { ...selected(full.data.facts), consumerRun: context.run.id, controller: state.controller });
+  assert.equal(full.data.facts.publicationAuthorized, false); return full;
+}
+async function firstSource(state, context, runId) {
+  assert.equal(process.env.GITHUB_JOB, "source"); assert.equal(step(context.current, SOURCE_STEP).status, "in_progress");
+  // Observe actual reads; never return a memoized response to either verifier.
+  const observed = new Map(), reads = { ...state.reads, json: async route => {
+    const value = await state.reads.json(route); observed.set(route, structuredClone(value)); return value;
+  } };
   const input = await locate(reads, runId), facts = await proof.verifyPublishedSource(input, reads);
-  assert.equal(facts.publicationAuthorized, false); core.assertVersion(facts.release.version);
-  return { controller, reads, input, facts };
+  const { get, ancestor } = source.sourceReads(state.reads, {}), H = await proof.mainAuthority(get);
+  if (H !== facts.mainObservedAfter) await ancestor(facts.mainObservedAfter, H);
+  await ancestor(state.controller, H);
+  const A = observed.get("branches/dev").commit.sha;
+  const physical = ids => [...new Set(ids)].map(id => {
+    const job = observed.get("actions/jobs/" + id); assert.ok(job, "Full verifier did not independently read original job");
+    return { id, attempt: job.run_attempt, digest: jobDigest(job) };
+  });
+  const list = prefix => [...observed].filter(([route]) => route.startsWith(prefix)).sort(([a],[b]) => Number(a.split("page=").at(-1)) - Number(b.split("page=").at(-1))).flatMap(([,rows]) => rows.jobs ?? rows);
+  const featureLatest = list(`actions/runs/${input.ciRun}/jobs?filter=latest&`);
+  const definition = observed.get(`contents/${source.CONTROLLER}?ref=${facts.controller.revision}`);
+  const body = definition.encoding === "base64" ? definition : observed.get("git/blobs/" + definition.sha);
+  const data = { input, facts, mainAnchor: H, devAnchor: A,
+    featureRun: source.runIdentity(observed.get("actions/runs/" + input.ciRun)), publisherRun: stableRun(observed.get("actions/runs/" + runId)),
+    producer: core.sha256(Buffer.from(body.content.replace(/[\r\n]/g, ""), "base64")), pr: featurePr(observed.get("pulls/" + input.featurePr)),
+    release: hashData(proof.releaseIdentity(observed.get("releases/" + facts.release.id))), assets: hashData(proof.assetIdentities(list(`releases/${facts.release.id}/assets?`))),
+    featurePhysical: physical(facts.feature.physicalJobs.map(job => job.jobId)),
+    featureLogical: featureLatest.map(job => ({ id: job.id, attempt: job.run_attempt, digest: jobDigest(job) })),
+    releasePhysical: physical([...facts.jobs.map(job => job.physical.id), facts.controller.finalizerJobId, ...facts.crates.map(crate => crate.origin.jobId)]) };
+  const direct = await get("actions/jobs/" + context.current.id); assert.equal(direct.run_attempt, context.current.run_attempt); assert.equal(jobDigest(direct), jobDigest(context.current));
+  Object.assign(state, { input, facts }); const origin = { id: context.current.id, attempt: context.current.run_attempt };
+  const value = { schemaVersion: 1, kind: SOURCE_KIND, publicationAuthorized: false, mode: "full",
+    selection: { ...selected(facts), consumerRun: context.run.id, controller: state.controller }, job: origin, origin, data };
+  parseSourceFrame("2000-01-01T00:00:00Z " + SOURCE_PREFIX + Buffer.from(core.canonicalJson(value)).toString("base64")); sourceFrames.set(state, value);
+}
+function officialRun(run, suite, path, definition) {
+  source.checkedJSON(suite); assert.equal(run.repository?.id, 1164779771); assert.equal(run.repository.full_name, sidecar.REPOSITORY);
+  assert.equal(run.head_repository?.id, 1164779771); assert.equal(run.head_repository.full_name, sidecar.REPOSITORY); assert.equal(run.path, path); passed(run); positive(run.run_attempt); assert.ok(run.run_attempt <= 20);
+  assert.equal(suite.databaseId, run.check_suite_id); assert.deepEqual(suite.repository, { databaseId: 1164779771, nameWithOwner: sidecar.REPOSITORY });
+  assert.deepEqual(suite.app, { databaseId: 15368, slug: "github-actions" }); assert.equal(suite.commit.oid, run.head_sha);
+  const value = suite.workflowRun; assert.equal(value.databaseId, run.id); assert.equal(value.event, run.event); assert.equal(value.runAttempt, run.run_attempt);
+  assert.deepEqual(value.workflow, { databaseId: run.workflow_id, name: run.name });
+  assert.deepEqual(value.file, { path, repositoryName: sidecar.REPOSITORY, repositoryFileUrl: `https://github.com/${sidecar.REPOSITORY}/blob/${definition}/${path}` });
+}
+async function freshSourceFacts(state, data) {
+  const { get, paged, ancestor, branch } = source.sourceReads(state.reads, {}), { facts, input } = state;
+  const featureContract = source.ACCEPTED_PRODUCERS[facts.feature.producerDigest], releaseContract = proof.ACCEPTED_RELEASE_PRODUCERS[data.producer];
+  assert.equal(featureContract?.complete, true); assert.equal(releaseContract?.complete, true);
+  // Long registry reads precede live authority metadata, never follow it.
+  for (const crate of facts.crates) assert.equal(await state.reads.registryChecksum(crate.name, facts.release.version), crate.registryChecksum);
+  const H = await proof.mainAuthority(get); if (H !== data.mainAnchor) await ancestor(data.mainAnchor, H);
+  const A = await branch("dev", true); if (A !== data.devAnchor) await ancestor(data.devAnchor, A);
+  assert.equal(await branch(facts.source.releaseRef), facts.source.revision);
+  assert.deepEqual(featurePr(await get("pulls/" + input.featurePr)), data.pr);
+  const feature = await get("actions/runs/" + input.ciRun); assert.equal(source.runIdentity(feature), data.featureRun);
+  officialRun(feature, await state.reads.checkSuite(feature.check_suite_node_id), source.WORKFLOW, facts.feature.workflowDefinitionRevision);
+  const fw = await get("actions/workflows/" + feature.workflow_id); assert.equal(fw.id, feature.workflow_id); assert.equal(fw.path, source.WORKFLOW); assert.equal(fw.state, "active");
+  const candidates = await paged(`actions/workflows/${feature.workflow_id}/runs?event=pull_request&head_sha=${feature.head_sha}`, "workflow_runs");
+  const sameHead = candidates.filter(run => run.event === "pull_request" && run.head_sha === feature.head_sha && run.head_branch === feature.head_branch);
+  assert.ok(sameHead.some(run => run.id === feature.id));
+  for (const run of sameHead) assert.ok(run.id <= feature.id && Number.isFinite(Date.parse(run.created_at)) && Date.parse(run.created_at) <= Date.parse(feature.created_at), "Newer feature evidence supersedes Source");
+  const checkPhysical = async (run, all, expected) => {
+    const attempts = new Map();
+    for (const row of expected) {
+      const found = all.filter(job => job.id === row.id); assert.equal(found.length, 1, "Original physical execution disappeared");
+      const job = found[0]; assert.equal(job.run_id, run.id); assert.equal(job.head_sha, run.head_sha); assert.equal(job.head_branch, run.head_branch);
+      assert.equal(job.run_attempt, row.attempt); assert.equal(jobDigest(job), row.digest, "Original physical fields changed");
+      if (!attempts.has(row.attempt)) attempts.set(row.attempt, await paged(`actions/runs/${run.id}/attempts/${row.attempt}/jobs`, "jobs"));
+      const members = attempts.get(row.attempt).filter(item => item.id === row.id); assert.equal(members.length, 1);
+      assert.equal(members[0].run_attempt, row.attempt); assert.equal(jobDigest(members[0]), row.digest);
+    }
+  };
+  const latest = await paged(`actions/runs/${feature.id}/jobs?filter=latest`, "jobs"), all = await paged(`actions/runs/${feature.id}/jobs?filter=all`, "jobs");
+  assert.equal(featureContract.requiredJobs.length, facts.feature.physicalJobs.length);
+  for (const held of facts.feature.physicalJobs) {
+    assert.ok(featureContract.requiredJobs.includes(held.name));
+    const matches = latest.filter(job => job.name === held.name); assert.equal(matches.length, 1);
+    const logical = matches[0], family = all.filter(job => job.name === held.name); assert.ok(family.length);
+    assert.equal(new Set(family.map(job => job.run_attempt)).size, family.length);
+    for (const job of family) { assert.equal(job.run_id, feature.id); assert.equal(job.head_sha, feature.head_sha); assert.equal(job.head_branch, feature.head_branch); positive(job.run_attempt); assert.ok(job.run_attempt <= feature.run_attempt); }
+    const newest = [...family].sort((a,b) => b.run_attempt - a.run_attempt)[0]; assert.equal(jobDigest(newest), jobDigest(logical)); assert.equal(newest.run_attempt, logical.run_attempt); passed(logical);
+    for (const name of featureContract.requiredSteps[held.name]) passed(step(logical, name));
+    const key = source.executionKey(logical); assert.ok(key);
+    const physical = family.filter(job => source.executionKey(job) === key).sort((a,b) => a.run_attempt - b.run_attempt)[0];
+    assert.equal(physical.id, held.jobId); assert.equal(physical.run_attempt, held.physicalAttempt); assert.equal(core.sha256(Buffer.from(key)), held.stepsFingerprint);
+    assert.equal(logical.id, held.logicalJobId); assert.equal(logical.run_attempt, held.logicalAttempt);
+    const original = data.featureLogical.filter(row => row.id === logical.id); assert.equal(original.length, 1); assert.equal(jobDigest(logical), original[0].digest);
+  }
+  await checkPhysical(feature, all, data.featurePhysical);
+  const publisher = await get("actions/runs/" + input.releaseRun); assert.deepEqual(stableRun(publisher), data.publisherRun);
+  officialRun(publisher, await state.reads.checkSuite(publisher.check_suite_node_id), source.CONTROLLER, facts.controller.revision);
+  const workflow = await get("actions/workflows/" + publisher.workflow_id); assert.equal(workflow.id, publisher.workflow_id); assert.equal(workflow.path, source.CONTROLLER); assert.equal(workflow.state, "active");
+  const releaseLatest = await paged(`actions/runs/${publisher.id}/jobs?filter=latest`, "jobs"), releaseAll = await paged(`actions/runs/${publisher.id}/jobs?filter=all`, "jobs");
+  for (const { physical } of proof.selectJobs(releaseLatest, releaseAll, publisher, releaseContract)) {
+    const held = data.releasePhysical.filter(row => row.id === physical.id); assert.equal(held.length, 1, "Whole completion changed");
+    assert.equal(held[0].attempt, physical.run_attempt); assert.equal(jobDigest(physical), held[0].digest);
+  }
+  await checkPhysical(publisher, releaseAll, data.releasePhysical);
+  assert.equal(hashData(proof.frame(await state.reads.jobLog(facts.controller.finalizerJobId))), facts.completionSha256,
+    "Original whole completion changed or disappeared");
+  assert.equal(hashData(proof.releaseIdentity(await get("releases/" + facts.release.id))), data.release);
+  const tag = await get("git/ref/tags/" + facts.release.tag); assert.equal(tag.object.type, "commit"); assert.equal(tag.object.sha, facts.source.revision);
+  const assets = []; for (let page = 1; page <= 20; page++) {
+    const rows = await get(`releases/${facts.release.id}/assets?per_page=100&page=${page}`); assert.ok(Array.isArray(rows) && rows.length <= 100); assets.push(...rows);
+    if (rows.length < 100) break; assert.ok(page < 20);
+  }
+  assert.equal(new Set(assets.map(row => row.id)).size, assets.length); assert.equal(new Set(assets.map(row => row.name)).size, assets.length); assert.equal(hashData(proof.assetIdentities(assets)), data.assets);
+  assert.equal(await branch(facts.source.releaseRef), facts.source.revision);
+  assert.equal(source.runIdentity(await get("actions/runs/" + publisher.id)), source.runIdentity(publisher), "Publisher changed during guard");
 }
 async function refreshPublication(held) {
-  // Re-run the real zero-argument caller/public verifier after long carrier
-  // reads. JSON, callbacks and the consumer run alone grant no write authority.
+  // Re-authenticate the official Source and every live guard after long reads;
+  // do not repeat its immutable full-proof downloads. No supplied JSON grants
+  // authority, and the actual consumer step is checked separately at the tail.
   const fresh = await authenticated(), identity = value => ({ consumerController: value.controller, input: value.input,
     source: value.facts.source, release: value.facts.release, controller: value.facts.controller, completionSha256: value.facts.completionSha256 });
   assert.deepEqual(identity(fresh), identity(held), "Completed publication changed before registry write");
@@ -140,7 +365,7 @@ function elfReport(report, platform) {
 function output(name, value) { assert.ok(!String(value).includes("\n")); fs.appendFileSync(process.env.GITHUB_OUTPUT, name + "=" + value + "\n"); }
 function selected(facts) { return { source: facts.source.revision, version: facts.release.version, releaseRun: facts.controller.runId, publisher: facts.controller.revision, releaseId: facts.release.id }; }
 async function stage() {
-  const platform = process.env.DOCKER_PLATFORM, triple = target(platform), state = await authenticated();
+  const platform = process.env.DOCKER_PLATFORM, triple = target(platform), state = await authenticatedSource();
   const execution = await consumerExecution(state, "image"); passed(step(execution.current, SELECT));
   assert.ok(!imageHistory(execution.jobs, execution.run, platform, execution.run.run_attempt).physical, "Stage cannot replace an original image");
   await noPriorCarrier(execution, platform);
@@ -159,6 +384,8 @@ async function stage() {
   fs.copyFileSync(path.join(ROOT, "docker/Dockerfile"), path.join(directory, "Dockerfile"), fs.constants.COPYFILE_EXCL);
   const descriptor = { ...selected(facts), platform, consumer: state.controller, binary: binaryRef, host: hostRef, abi, runtime: RUNTIME };
   fs.writeFileSync(path.join(directory, "originals.json"), JSON.stringify(descriptor, null, 2) + "\n", { flag: "wx" });
+  await refreshPublication(state);
+  await freshConsumer(execution, "Copy authenticated binary and Host originals");
   output("context", directory); output("version", facts.release.version); output("source", facts.source.revision);
   output("image", candidateImage(process.env.GITHUB_RUN_ID, process.env.GITHUB_RUN_ATTEMPT, platform));
 }
@@ -232,6 +459,7 @@ function consumerSuite(run, suite, exactController) {
   assert.equal(suite.workflowRun.databaseId, run.id); assert.equal(suite.workflowRun.workflow.databaseId, run.workflow_id);
   assert.equal(suite.workflowRun.event, run.event); assert.equal(suite.workflowRun.runAttempt, run.run_attempt);
   assert.equal(suite.workflowRun.file.path, WORKFLOW); assert.equal(suite.workflowRun.file.repositoryName, sidecar.REPOSITORY);
+  assert.equal(suite.workflowRun.file.repositoryFileUrl, `https://github.com/${sidecar.REPOSITORY}/blob/${run.head_sha}/${WORKFLOW}`);
   if (exactController) {
     assert.equal(run.head_sha, exactController, "Unproven prior controller metadata role; stop for Ops");
     assert.equal(suite.workflowRun.file.repositoryFileUrl, `https://github.com/${sidecar.REPOSITORY}/blob/${exactController}/${WORKFLOW}`);
@@ -240,6 +468,16 @@ function consumerSuite(run, suite, exactController) {
 async function consumerExecution(state, role) {
   assert.ok(["source", "image", "merge", "arm-originals"].includes(role), "Unknown Docker job role");
   const env = process.env; assert.equal(env.GITHUB_JOB, role, "Actual job key must match CLI phase");
+  if (liveContexts.has(state)) {
+    const context = liveContexts.get(state); liveContexts.delete(state);
+    // Consume this authentication's local projection once. Every refresh reads
+    // a new projection; actual compiler/write steps still use freshConsumer.
+    if (role !== "source") {
+      const fresh = await context.get("actions/runs/" + context.run.id);
+      assert.deepEqual(stableRun(fresh), stableRun(context.run)); assert.equal(fresh.run_attempt, context.run.run_attempt); assert.equal(fresh.status, "in_progress");
+    }
+    return context;
+  }
   const { get, paged } = source.sourceReads(state.reads, {}), run = await get("actions/runs/" + positive(env.GITHUB_RUN_ID));
   assert.equal(run.id, positive(env.GITHUB_RUN_ID)); assert.equal(run.run_attempt, positive(env.GITHUB_RUN_ATTEMPT)); assert.equal(run.status, "in_progress");
   assert.equal(run.repository?.id, 1164779771); assert.equal(run.repository.full_name, sidecar.REPOSITORY);
@@ -256,6 +494,11 @@ async function consumerExecution(state, role) {
   return { get, paged, run, jobs, current: current[0] };
 }
 function sourceLine(state, consumerRun) {
+  if (sourceFrames.has(state)) {
+    const held = sourceFrames.get(state), value = { ...held, data: held.mode === "full" ? held.data : null };
+    assert.equal(value.selection.consumerRun, consumerRun);
+    const line = SOURCE_PREFIX + Buffer.from(core.canonicalJson(value)).toString("base64"); parseSourceFrame("2000-01-01T00:00:00Z " + line); return line;
+  }
   return SOURCE_PREFIX + Buffer.from(core.canonicalJson({ ...selected(state.facts), consumerRun, controller: state.controller })).toString("base64");
 }
 function sourceLocator(log, run, physical) {
@@ -264,8 +507,10 @@ function sourceLocator(log, run, physical) {
   passed(step(physical, SOURCE_STEP)); const time = Date.parse(lines[0].split(" ")[0]), selectedStep = step(physical, SOURCE_STEP);
   const second = value => Math.floor(Date.parse(value) / 1000);
   assert.ok(Number.isFinite(time) && second(selectedStep.started_at) <= Math.floor(time / 1000) && Math.floor(time / 1000) <= second(selectedStep.completed_at));
-  const encoded = lines[0].slice(lines[0].indexOf(SOURCE_PREFIX) + SOURCE_PREFIX.length); assert.ok(encoded.length <= 4096 && /^[A-Za-z0-9+/]+={0,2}$/.test(encoded));
-  const bytes = Buffer.from(encoded, "base64"), value = JSON.parse(bytes.toString("utf8")); assert.equal(bytes.toString("base64"), encoded); assert.equal(core.canonicalJson(value), bytes.toString("utf8"));
+  const encoded = lines[0].slice(lines[0].indexOf(SOURCE_PREFIX) + SOURCE_PREFIX.length); assert.ok(encoded.length <= 87384 && /^[A-Za-z0-9+/]+={0,2}$/.test(encoded));
+  const bytes = Buffer.from(encoded, "base64"); let value = JSON.parse(bytes.toString("utf8")); assert.equal(bytes.toString("base64"), encoded); assert.equal(core.canonicalJson(value), bytes.toString("utf8"));
+  if (value.kind === SOURCE_KIND) value = parseSourceFrame(log).selection;
+  else assert.ok(encoded.length <= 4096, "Oversized legacy locator is not a handoff");
   assert.deepEqual(Object.keys(value).sort(), ["source", "version", "releaseRun", "publisher", "releaseId", "consumerRun", "controller"].sort());
   assert.equal(value.consumerRun, run.id); positive(value.releaseRun); positive(value.releaseId); core.assertVersion(value.version);
   for (const key of ["source", "publisher", "controller"]) assert.match(value[key], SHA); return value;
@@ -427,5 +672,5 @@ async function main() {
 module.exports = { RUNTIME, IMAGE, PLATFORMS, SELECT, BUILD, SMOKE, PUSH, UPLOAD, REUSE, SOURCE_JOB, SOURCE_STEP, SOURCE_PREFIX, ARM_JOB, ARM_UPLOAD,
   safeEnv, eventRun, locate, target, verifyBytes, original, hostFiles, elfReport, imageReference, candidateImage, digestFile, smokeCommands, digestRecord,
   manifestReport, latestIdentity, publicationTags, verifyLatest, consumerSuite, consumerExecution, freshConsumer, sourceLine, sourceLocator, crossRunGuard, imageHistory, decodeCarrier, readCarrier, noPriorCarrier, authenticated,
-  physicalUpload, refreshPublication, selected, step, passed, skipped, jobHeader };
+  physicalUpload, refreshPublication, selected, step, passed, skipped, jobHeader, parseSourceFrame, readSourceHandoff, freshSourceFacts };
 if (require.main === module) main().catch(error => { console.error("Published Docker consumer: " + error.message); process.exitCode = 1; });

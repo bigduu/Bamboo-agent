@@ -29,6 +29,17 @@ sys.stdout.buffer.write(out.getvalue())`;
   assert.equal(result.status, 0); return result.stdout;
 }
 
+test("Docker Source2361 canonical handoff rejects locator-only, duplicate and oversized evidence", () => {
+  const value = { schemaVersion: 1, kind: "bamboo-docker-source-proof/v1", publicationAuthorized: false,
+    mode: "full", selection: { ...record(), consumerRun: 50, controller: "d".repeat(40) },
+    job: { id: 501, attempt: 1 }, origin: { id: 501, attempt: 1 }, data: {} };
+  delete value.selection.platform; delete value.selection.digest;
+  const line = item => at(1) + " " + consumer.SOURCE_PREFIX + Buffer.from(core.canonicalJson(item)).toString("base64");
+  assert.deepEqual(consumer.parseSourceFrame(line(value)), value);
+  for (const log of [line(value) + "\n" + line(value), line(value.selection), line({ ...value, publicationAuthorized: true }),
+    line({ ...value, data: { oversized: "x".repeat(65536) } })]) assert.throws(() => consumer.parseSourceFrame(log));
+});
+
 test("Docker source selection binds the actual event and explicit release run", () => {
   assert.equal(consumer.eventRun("workflow_run", { workflow_run: { id: 10, conclusion: "success" } }, "10"), 10);
   assert.equal(consumer.eventRun("workflow_dispatch", { inputs: { release_run: "10" } }, "10"), 10);
@@ -324,62 +335,22 @@ test("Docker recovery consumer API identity keeps metadata X distinct from execu
   f.state.reads.json = async route => route.includes("/jobs?") ? { jobs: [f.physical,current] } : previousRead(route); await assert.rejects(consumer.consumerExecution(f.state,"image"), /total_count/);
 });
 test("Docker fresh publication proof after carrier reads stops registry writes on changed Source identity", async () => {
-  for (const variant of ["source", "release", "controller", "completion", "proof-rejected", "latest-advanced", "stable"]) {
-    const f = carrierFixture(), D = f.state.controller; f.run.event = "workflow_dispatch";
-    const arm = { ...imageJob(102,1), name: "Repackage originals (linux/arm64)" };
-    const rawArm = zipDigest(consumer.digestFile(50,1,"linux/arm64"),record("linux/arm64"));
-    const artifactArm = { ...f.artifact, id: 901, name: "docker-digest-50-1-1", size_in_bytes: rawArm.length, digest: "sha256:" + core.sha256(rawArm) };
-    const phase = "Recheck source and publish both architectures together", current = { ...imageJob(202,2), name: "Publish complete multi-arch manifest", status: "in_progress", steps: [{ name: phase, number: 1, status: "in_progress" }] };
-    const finalizer = locatorJob(601,1), publicProof = require("./published-source-admission.cjs");
-    const completion = { schemaVersion: 1, kind: publicProof.KIND, publicationAuthorized: false, repository: { id: 1164779771, fullName: "bigduu/Bamboo-agent" }, source: { revision: facts.source.revision, featurePr: 42, featureRunId: 43 }, controller: { runId: 10 }, release: {}, frontend: {}, crates: {}, native: {}, jobs: [] };
-    const originalFacts = { ...facts, publicationAuthorized: false, completionSha256: "c".repeat(64) }; let changed = false, proofCalls = 0, writes = 0, factories = 0, writtenTags = [];
-    const latest = { id: 30, tag_name: "v2026.10.27", target_commitish: facts.source.revision, draft: false, prerelease: false };
-    const jobs = [f.physical,arm,current], artifacts = [f.artifact,artifactArm];
-    const reads = { json: async route => {
-      if (route.startsWith("actions/runs/10/jobs?")) return { total_count: 1, jobs: [finalizer] };
-      if (route === "actions/runs/10") return { id: 10, created_at: at(0) };
-      if (route === "actions/runs/50") return f.run;
-      if (route === "actions/workflows/70") return { id: 70, path: f.run.path };
-      if (route.startsWith("actions/runs/50/jobs?")) return { total_count: jobs.length, jobs };
-      if (route.startsWith("actions/workflows/70/runs?")) return { total_count: 0, workflow_runs: [] };
-      if (route.startsWith("actions/runs/50/artifacts?")) return { total_count: 2, artifacts };
-      if (route.startsWith("actions/jobs/")) return jobs.find(job => job.id === Number(route.split("/").at(-1)));
-      if (route.startsWith("actions/artifacts/")) return artifacts.find(item => item.id === Number(route.split("/").at(-1)));
-      if (route === "releases/latest") return structuredClone(latest); throw Error("Unexpected fixture read " + route);
-    }, checkSuite: async () => suite(f.run), jobLog: async id => id === 601 ? at(1) + " " + publicProof.PREFIX + Buffer.from(core.canonicalJson(completion)).toString("base64") : uploadLog(artifacts.find(item => item.id === (id === 101 ? 900 : 901))),
-    artifactBytes: async id => { if (id === 901) changed = true; return id === 900 ? f.raw : rawArm; } };
-    const mockProof = { ...publicProof, verifyPublishedSource: async (...args) => {
-      assert.equal(args.length, 2); assert.equal(args[1], reads); proofCalls++;
-      if (changed && variant === "proof-rejected") throw Error("Fresh completed Source proof rejected");
-      const next = structuredClone(originalFacts);
-      if (changed && variant === "source") next.source.revision = "f".repeat(40);
-      if (changed && variant === "release") next.release.id++;
-      if (changed && variant === "controller") next.controller.revision = "f".repeat(40);
-      if (changed && variant === "completion") next.completionSha256 = "f".repeat(64);
-      if (proofCalls === 2 && variant === "latest-advanced") Object.assign(latest, { id: 31, tag_name: "v2026.10.28", target_commitish: "e".repeat(40) });
-      return next;
-    } };
-    const env = { ...consumer.safeEnv(), GITHUB_REPOSITORY: "bigduu/Bamboo-agent", GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_REF: "refs/heads/main", GITHUB_WORKFLOW_REF: "bigduu/Bamboo-agent/.github/workflows/docker-publish.yml@refs/heads/main", GITHUB_WORKFLOW_SHA: D, GITHUB_SHA: D, GITHUB_EVENT_PATH: "fixture-event.json", GITHUB_JOB: "merge", GITHUB_RUN_ID: "50", GITHUB_RUN_ATTEMPT: "2", DOCKER_RELEASE_RUN: "10", GITHUB_OUTPUT: "fixture-output" };
-    const context = { module: { exports: {} }, __dirname, Buffer, console, process: { argv: ["node","fixture.cjs","publish"], env }, require: name => {
-      if (name === "./published-source-admission.cjs") return mockProof;
-      if (name === "./main-admission.cjs") return { createPublicReads: (...args) => { assert.equal(args.length, 0); factories++; return reads; } };
-      if (name === "node:fs") return { ...fs, readFileSync: (file,...args) => file === "fixture-event.json" ? JSON.stringify({ inputs: { release_run: "10" } }) : fs.readFileSync(file,...args), appendFileSync: () => {} };
-      if (name === "node:child_process") return { spawnSync: (program,args,options) => {
-        if (program === "python3") return spawnSync(program,args,options); // only tiny ZIP decoding
-        if (program === "git") return { status: 0, stdout: args.at(-1) === "HEAD" ? D + "\n" : "" };
-        assert.equal(program,"docker"); if (args.includes("create")) { writes++; writtenTags = args.flatMap((arg,i) => arg === "--tag" ? [args[i + 1]] : []); return { status: 0, stdout: "" }; }
-        const manifest = args.at(-1).includes("@") ? { digest: args.at(-1).split("@")[1] } : { digest: digest("3"), manifests: [record(),record("linux/arm64")].map(value => ({ digest: value.digest, platform: { os: "linux", architecture: value.platform.slice(6) } })) };
-        return { status: 0, stdout: JSON.stringify(manifest) };
-      } };
-      return require(name);
-    } };
-    vm.runInNewContext(text("scripts/docker-from-release.cjs"),context,{ filename: path.join(__dirname,"docker-from-release.cjs") });
-    if (["stable", "latest-advanced"].includes(variant)) {
-      let failure; try { await context.main(); } catch (error) { failure = error; }
-      assert.equal(writes,1); assert.deepEqual([...writtenTags],[consumer.IMAGE + ":v2026.10.27", ...(variant === "stable" ? [consumer.IMAGE + ":latest"] : [])], "A latest advance during Source proof must never overwrite latest"); assert.ifError(failure);
-    }
-    else { await assert.rejects(context.main(), /publication changed|Source proof rejected/); assert.equal(writes,0,variant); }
-    assert.equal(changed,true); assert.equal(proofCalls,2); assert.equal(factories,2);
+  for(const variant of ["source","release","controller","completion","proof-rejected","latest-advanced","stable"]){
+    const f=await source2361Fixture();await f.seal();f.prepareDigests();let changed=false;
+    f.hook=(key,args,value)=>{if(!changed&&key==="artifactBytes"&&args[0]===9001){changed=true;
+      if(variant==="source")f.f.f.release.commit.sha="f".repeat(40);
+      if(variant==="release")f.f.state.release.id++;
+      if(variant==="controller")f.f.state.run.head_sha="f".repeat(40);
+      if(variant==="completion")f.f.state.record.source.tree="f".repeat(40);
+      if(variant==="proof-rejected")f.f.f.newerRun=true;
+      if(variant==="latest-advanced")Object.assign(f.latest,{id:4001,tag_name:"v2026.10.28",target_commitish:"e".repeat(40)});
+    }return value;};
+    const c=f.load("merge",undefined,"publish");
+    if(["stable","latest-advanced"].includes(variant)){
+      await c.__main();assert.equal(f.writes,1);
+      assert.deepEqual(f.writtenTags,[consumer.IMAGE+":v2026.10.27",...(variant==="stable"?[consumer.IMAGE+":latest"]:[])]);
+    }else{await assert.rejects(c.__main());assert.equal(f.writes,0,variant);}
+    assert.equal(changed,true);assert.equal(f.full,1,"Reuse one independently authenticated full Source proof");
   }
 });
 test("Docker multi-arch readback binds platform descriptors and exact input digests", () => {
@@ -434,4 +405,335 @@ test("Docker workflow keeps runtime assembly separate from the sole ARM producer
   assert.match(docker, /CMD \["serve", "--port", "9562", "--bind", "0.0.0.0", "--data-dir", "\/data"\]/);
   assert.doesNotMatch(compose, /^    build:/m); assert.match(compose, /BAMBOO_IMAGE:\?/); assert.match(compose, /127\.0\.0\.1:9562:9562/); assert.match(compose, /pids_limit: 512/);
   const owner = text("scripts/ci-policy.test.cjs"); assert.equal((owner.match(/^require\("\.\/docker-from-release.test.cjs"\)/gm) || []).length, 1);
+});
+
+// Load only the existing thirty-crate setup; do not register or run its old suites.
+async function source2361Fixture() {
+  const Module = require("node:module"), filename = path.join(__dirname, "published-source-admission.test.cjs");
+  const setup = fs.readFileSync(filename, "utf8"), terminal = "assert.equal((await f.verify()).crates.length,30);";
+  assert.equal(setup.split(terminal).length, 2); let prepare;
+  const m = new Module(filename, module); m.filename = filename; m.paths = Module._nodeModulePaths(__dirname);
+  const realRequire = m.require.bind(m);
+  m.require = name => name === "node:test" ? { test: (name, fn) => { if (name.startsWith("Main2351 public receipt accepts real thirty-crate")) prepare = fn; } } : realRequire(name);
+  m._compile(setup.replace(terminal, "return f;"), filename); const f = await prepare();
+  const realProof = require("./published-source-admission.cjs"), realSource = require("./frozen-source-admission.cjs");
+  const D = "d".repeat(40), X = "e".repeat(40), T = second => at(10800 + second), events = [], sourceLogs = new Map();
+  const run = { id: 8000, run_attempt: 1, workflow_id: 8001, check_suite_id: 8002, check_suite_node_id: "CS_docker2361",
+    repository: f.state.run.repository, head_repository: f.state.run.head_repository, event: "workflow_dispatch", path: ".github/workflows/docker-publish.yml",
+    name: "Docker", head_sha: X, head_branch: "main", status: "in_progress", created_at: T(0), updated_at: T(0) };
+  const names = { source: consumer.SOURCE_JOB, "arm-originals": consumer.ARM_JOB, amd64: "Repackage originals (linux/amd64)", arm64: "Repackage originals (linux/arm64)", merge: "Publish complete multi-arch manifest" };
+  const jobs = Object.entries(names).map(([key,name], i) => ({ id: 8100 + i, run_id: run.id, run_attempt: 1, name, head_sha: X, head_branch: "main",
+    status: "in_progress", conclusion: null, started_at: T(i ? 30 : 1), completed_at: null, check_run_url: "https://api.github.com/check-runs/" + (8100 + i),
+    steps: [{ number: 1, name: key === "source" ? consumer.SOURCE_STEP : "phase", status: "in_progress", conclusion: null, started_at: T(i ? 31 : 2), completed_at: null }] }));
+  f.f.main.commit.sha = D; f.f.main.protection = { required_status_checks: { enforcement_level: "everyone", contexts: [realProof.MAIN_JOB], checks: [{ context: realProof.MAIN_JOB, app_id: 15368 }] } };
+  const raw = f.reads, fixture = { f, D, X, run, jobs, events, sourceLogs, full: 0, hook: null, T, commands: [], artifacts: [], carriers: new Map(), outputs: [], writes: 0 };
+  const reads = {};
+  for (const key of ["json", "checkSuite", "jobLog", "assetBytes", "artifactBytes", "registryChecksum"]) reads[key] = async (...args) => {
+    events.push({ key, args }); let value;
+    if (key === "json") {
+      const route = args[0];
+      if (route === "") value = { id: 1164779771, full_name: "bigduu/Bamboo-agent", default_branch: "main" };
+      else if (route === "actions/runs/8000") value = run;
+      else if (route === "actions/workflows/8001") value = { id: 8001, path: run.path, state: "active" };
+      else if (route.startsWith("actions/workflows/8001/runs?")) value = { total_count: 0, workflow_runs: [] };
+      else if (route.startsWith("actions/runs/8000/artifacts?")) value = { total_count: fixture.artifacts.length, artifacts: fixture.artifacts };
+      else if (route.startsWith("actions/artifacts/")) value=fixture.artifacts.find(row=>row.id===Number(route.slice(18)));
+      else if (route==="releases/latest") value=fixture.latest;
+      else if (route.startsWith("actions/runs/8000/jobs?")) value = { total_count: jobs.length, jobs };
+      else if (route.startsWith("actions/runs/8000/attempts/")) { const rows = jobs.filter(job => job.run_attempt === Number(route.split("/")[4])); value = { total_count: rows.length, jobs: rows }; }
+      else if (route.startsWith("actions/jobs/") && jobs.some(job => job.id === Number(route.slice(13)))) value = jobs.find(job => job.id === Number(route.slice(13)));
+      else if (route.startsWith("releases/assets/")) value = f.state.assets.find(asset => asset.id === Number(route.slice(16)));
+      else value = await raw.json(...args);
+    } else if (key === "checkSuite" && args[0] === run.check_suite_node_id) value = suite(run);
+    else if (key === "jobLog" && sourceLogs.has(args[0])) value = sourceLogs.get(args[0]);
+    else if (key === "artifactBytes" && fixture.carriers.has(args[0])) value=fixture.carriers.get(args[0]);
+    else value = await raw[key](...args);
+    value = Buffer.isBuffer(value) ? Buffer.from(value) : structuredClone(value);
+    return fixture.hook ? await fixture.hook(key, args, value) : value;
+  };
+  fixture.reads = reads;
+  fixture.load = (role, platform = "linux/amd64", phase = role === "source" ? "source" : "select") => {
+    const env = { GITHUB_REPOSITORY: "bigduu/Bamboo-agent", GITHUB_EVENT_NAME: run.event, GITHUB_REF: "refs/heads/main",
+      GITHUB_WORKFLOW_REF: "bigduu/Bamboo-agent/.github/workflows/docker-publish.yml@refs/heads/main", GITHUB_WORKFLOW_SHA: D, GITHUB_SHA: D,
+      GITHUB_EVENT_PATH: "source2361-event", GITHUB_JOB: role, GITHUB_RUN_ID: "8000", GITHUB_RUN_ATTEMPT: String(run.run_attempt), DOCKER_RELEASE_RUN: "900", DOCKER_PLATFORM: platform };
+    if (fixture.stageRoot) Object.assign(env,{RUNNER_TEMP:fixture.stageRoot,GITHUB_OUTPUT:path.join(fixture.stageRoot,"outputs.txt")});
+    const mod = { exports: {} }, fakeProcess = { env, argv: ["node", "fixture.cjs", phase] };
+    const loader = name => {
+      if (name === "./published-source-admission.cjs") return { ...realProof, ACCEPTED_RELEASE_PRODUCERS: f.policy.releaseProducers,
+        verifyPublishedSource: async (input, ports) => { fixture.full++; return realProof.verifyPublishedSource(input, ports, f.policy); } };
+      if (name === "./frozen-source-admission.cjs") return { ...realSource, ACCEPTED_PRODUCERS: f.policy.producers };
+      if (name === "./main-admission.cjs") return { createPublicReads: () => reads };
+      if (name === "node:fs") return { ...fs, readFileSync: (file,...args) => file === env.GITHUB_EVENT_PATH ? JSON.stringify({ inputs: { release_run: "900" } }) :
+        fixture.workflowText && file===path.join(ROOT,".github/workflows/docker-publish.yml")?fixture.workflowText:fs.readFileSync(file,...args),
+        appendFileSync:(file,data,...args)=>fixture.stageRoot?fs.appendFileSync(file,data,...args):fixture.outputs.push(String(data)) };
+      if (name === "node:child_process") return { spawnSync: (program,args,options) => {
+        fixture.commands.push(program);
+        if (program==="git") return { status:0,stdout:args.at(-1)==="HEAD"?D+"\n":"" };
+        if (fixture.stageRoot && program==="readelf") return {status:0,stdout:"Class: ELF64\nMachine: Advanced Micro Devices X86-64\n(NEEDED) [libc.so.6]\nGLIBC_2.36\n"};
+        if (fixture.stageRoot && program==="python3") return spawnSync(program,args,options); // bounded Host archive parsing only
+        if (fixture.digests && program==="python3") return spawnSync(program,args,options); // tiny retained digest ZIP only
+        if (fixture.digests && program==="docker") {
+          if(args.includes("create")){fixture.writes++;fixture.writtenTags=args.flatMap((arg,i)=>arg==="--tag"?[args[i+1]]:[]);return {status:0,stdout:""};}
+          const value=args.at(-1).includes("@")?{digest:args.at(-1).split("@")[1]}:{digest:digest("3"),manifests:fixture.digests.map(row=>({digest:row.digest,platform:{os:"linux",architecture:row.platform.slice(6)}}))};
+          return {status:0,stdout:JSON.stringify(value)}; // inert registry CLI port, never executes Docker
+        }
+        assert.fail("No product/compiler/registry command in Source fixtures: "+program);
+      } };
+      return require(name);
+    };
+    const fn = vm.runInThisContext("(function(require,module,exports,process,__dirname){" + text("scripts/docker-from-release.cjs").replace(/^#![^\n]*\n/, "") +
+      "\nmodule.exports.__sourceState=authenticatedSource;module.exports.__stage=stage;module.exports.__main=main;})");
+    fn(loader, mod, mod.exports, fakeProcess, __dirname); return mod.exports;
+  };
+  fixture.seal = async () => {
+    const c = fixture.load("source"), state = await c.authenticated(), context = await c.consumerExecution(state, "source");
+    fixture.sourceState = state; fixture.sourceContext = context; fixture.sourceModule = c;
+    const line = c.sourceLine(state, run.id); sourceLogs.set(8100, T(10) + " " + line);
+    jobs[0].status = "completed"; jobs[0].conclusion = "success"; jobs[0].completed_at = T(20);
+    Object.assign(jobs[0].steps[0], { status: "completed", conclusion: "success", completed_at: T(19) });
+    return c.parseSourceFrame(sourceLogs.get(8100));
+  };
+  fixture.prepareStage = () => {
+    const sidecar=require("./sidecar-release.cjs"), files=host(), record=f.state.record;
+    const replace=(ref,bytes)=>{Object.assign(ref,{sha256:core.sha256(bytes),sizeBytes:bytes.length});f.state.data.set(ref.assetId,bytes);
+      Object.assign(f.state.assets.find(asset=>asset.id===ref.assetId),{size:bytes.length,digest:"sha256:"+ref.sha256});};
+    const hostRef=record.native.assets.find(ref=>ref.name===sidecar.HOST_ASSET), manifestRef=record.native.assets.find(ref=>ref.name===sidecar.MANIFEST);
+    replace(hostRef,tar(entries(files)));
+    const value=JSON.parse(f.state.data.get(manifestRef.assetId));Object.assign(value.browserHost,{sha256:hostRef.sha256,sizeBytes:hostRef.sizeBytes,files:manifest(files).sort((a,b)=>a.path<b.path?-1:1)});
+    replace(manifestRef,Buffer.from(JSON.stringify(value)));record.native.manifestSha256=manifestRef.sha256;
+    fixture.stageRoot=fs.mkdtempSync(path.join(require("node:os").tmpdir(),"bamboo2361-stage-"));
+    jobs[2].steps=[{number:1,name:consumer.SELECT,status:"completed",conclusion:"success",started_at:T(31),completed_at:T(32)},
+      {number:2,name:"Copy authenticated binary and Host originals",status:"in_progress",conclusion:null,started_at:T(33),completed_at:null}];
+    return hostRef.assetId;
+  };
+  fixture.prepareDigests = () => {
+    fixture.digests=consumer.PLATFORMS.map((platform,i)=>({...consumer.selected(fixture.sourceState.facts),platform,digest:digest(String(i+1))}));
+    fixture.latest={id:f.state.release.id,tag_name:f.state.release.tag_name,target_commitish:f.state.release.target_commitish,draft:false,prerelease:false};
+    fixture.digests.forEach((record,i)=>{
+      const current=imageJob(8102+i,1);Object.assign(current,{run_id:run.id,head_sha:X,name:"Repackage originals ("+record.platform+")",started_at:T(30),completed_at:T(50)});
+      current.steps.forEach((step,n)=>Object.assign(step,{started_at:T(31+n),completed_at:T(32+n)}));Object.assign(jobs[2+i],current);
+      const raw=zipDigest(consumer.digestFile(run.id,1,record.platform),record),artifact={id:9000+i,name:"docker-digest-8000-1-"+i,expired:false,size_in_bytes:raw.length,digest:"sha256:"+core.sha256(raw),created_at:T(37),workflow_run:{id:run.id,head_sha:X,head_branch:"main"}};
+      fixture.artifacts.push(artifact);fixture.carriers.set(artifact.id,raw);
+      sourceLogs.set(current.id,T(37)+` Artifact ${artifact.name} has been successfully uploaded! Final size is ${raw.length} bytes. Artifact ID is ${artifact.id}\n`+
+        T(37)+` Artifact download URL: https://github.com/bigduu/Bamboo-agent/actions/runs/${run.id}/artifacts/${artifact.id}\n`);
+    });
+    jobs[4].steps[0].name="Recheck source and publish both architectures together";
+  };
+  return fixture;
+}
+test("Docker Source2361 real thirty-crate proof fits a bounded frame and runs full verification once", async () => {
+  const f = await source2361Fixture(), sealed = await f.seal();
+  assert.equal(sealed.data.facts.crates.length, 30); assert.equal(sealed.data.featurePhysical.length, 12); assert.equal(sealed.data.releasePhysical.length, 7);
+  const size = Buffer.byteLength(core.canonicalJson(sealed)); assert.ok(size < 65536); assert.ok(size > 16000);
+  const before = f.events.length, c = f.load("image"), state = await c.authenticated(); await c.consumerExecution(state, "image");
+  assert.equal(f.full, 1); assert.equal(state.controller, f.D); assert.notEqual(f.X, f.D);
+  assert.ok(!f.events.slice(before).some(event => event.key === "assetBytes" || event.key === "json" && /^actions\/jobs\/(?:10[0-9]|11[01]|200[0-6])$/.test(event.args[0])));
+  console.log("Source2361 frame bytes:", size);
+});
+test("Docker Source2361 rejects changed whole completion after the first Source", async () => {
+  const f = await source2361Fixture(); await f.seal();
+  f.f.state.record.source.tree = "1".repeat(40);
+  await assert.rejects(f.load("image").authenticated(), /completion/i);
+});
+test("Docker Source2361 all fixed-role authentication and guard budget", async () => {
+  const f = await source2361Fixture(), groups = {};
+  const count = rows => ({ rest: rows.filter(row => ["json", "jobLog", "assetBytes"].includes(row.key)).length,
+    graphql: rows.filter(row => row.key === "checkSuite").length,
+    crates: rows.filter(row => row.key === "registryChecksum").length });
+  let start = 0; await f.seal(); await f.sourceModule.crossRunGuard(f.sourceState, f.sourceContext);
+  groups.source = count(f.events); start = f.events.length;
+  for (const [label,role,n,refresh,platform] of [["arm","arm-originals",5,[2,4]], ["amd64","image",4,[3],"linux/amd64"],
+    ["arm64","image",4,[3],"linux/arm64"], ["merge","merge",1,[0]]]) {
+    for (let i=0;i<n;i++) {
+      const c=f.load(role,platform), staging=role==="image" && i===1;
+      const state=await (staging ? c.__sourceState() : c.authenticated()), context=await c.consumerExecution(state,role);
+      if (role!=="image" || i===0 || i===3) await c.crossRunGuard(state,context);
+      if (role==="arm-originals" && i===4) await c.crossRunGuard(state,context); // seal's original-output reader
+      if (staging) { await c.refreshPublication(state); await c.freshConsumer(context,"phase"); }
+      if (refresh.includes(i)) { await c.refreshPublication(state); await c.freshConsumer(context,"phase"); }
+    }
+    groups[label]=count(f.events.slice(start)); start=f.events.length;
+  }
+  const measured=count(f.events), unchangedConsumerReads=56; // retained asset/carrier/latest paths from the frozen route audit
+  assert.equal(f.full,1); assert.equal(measured.crates,600);
+  console.log("Source2361 actual role budget:",JSON.stringify({groups,measured,unchangedConsumerReads,bound:measured.rest+unchangedConsumerReads}));
+  assert.ok(measured.rest+unchangedConsumerReads<=850,"All fixed-role reads plus unchanged consumer paths exceed850");
+});
+for (const [name,mutate] of [
+  ["default branch",f=>{f.hook=(key,args,value)=>key==="json"&&args[0]===""?{...value,default_branch:"dev"}:value;}],
+  ["Main protection",f=>{f.f.f.main.protection.required_status_checks.checks[0].app_id=1;}],
+  ["Dev protection",f=>{f.f.f.dev.protection.required_status_checks.enforcement_level="non_admins";}],
+  ["frozen ref",f=>{f.f.f.release.commit.sha="9".repeat(40);}],
+  ["feature PR",f=>{f.f.f.pr.merged=false;}],
+  ["newer feature run",f=>{f.f.f.newerRun=true;}],
+  ["sealed feature attempt",f=>{f.f.f.run.run_attempt++;}],
+  ["latest feature failure",f=>{f.f.f.latest[1].conclusion="failure";}],
+  ["original feature projection",f=>{f.f.f.attempts[1][0].steps[0].conclusion="skipped";}],
+  ["publisher failure",f=>{f.f.state.run.conclusion="failure";}],
+  ["original publisher projection",f=>{f.f.state.physical[0].steps[0].name="changed";}],
+  ["Release state",f=>{f.f.state.release.draft=true;}],
+  ["tag source",f=>{f.f.state.tag.object.sha="9".repeat(40);}],
+  ["asset identity",f=>{f.f.state.assets[0].id=99999;}],
+  ["registry checksum",f=>{f.f.state.registry.set(f.f.state.record.crates[0].name,"0".repeat(64));}],
+]) test("Docker Source2361 fresh guard rejects "+name,async()=>{
+  const f=await source2361Fixture();await f.seal();mutate(f);
+  await assert.rejects(f.load("image").authenticated());assert.equal(f.full,1);
+});
+test("Docker Source2361 anchor equality is reflexive and normal advancement still needs official ancestry",async()=>{
+  const f=await source2361Fixture();await f.seal();let comparisons=0;
+  f.hook=(key,args,value)=>{if(key==="json"&&args[0].startsWith("compare/")){comparisons++;throw Error("No reflexive compare transport required");}return value;};
+  await f.load("image").authenticated();assert.equal(comparisons,0);
+  f.hook=null;f.f.f.main.commit.sha="8".repeat(40);f.f.f.dev.commit.sha="7".repeat(40);
+  // Closed-PR cached base.sha and counters are not accepted source identities.
+  f.f.f.pr.base.sha="6".repeat(40);f.f.state.release.download_count=999;
+  await f.load("image").authenticated();
+  assert.ok(f.events.some(row=>row.key==="json"&&row.args[0]===`compare/${f.D}...${"8".repeat(40)}`));
+  assert.ok(f.events.some(row=>row.key==="json"&&row.args[0]===`compare/${f.f.input.sourceRevision}...${"7".repeat(40)}`));
+});
+for(const branch of ["main","dev"])test("Docker Source2361 anchor rejects "+branch+" rewind or foreign history",async()=>{
+  const f=await source2361Fixture();await f.seal();f.f.f[branch].commit.sha="8".repeat(40);
+  f.hook=(key,args,value)=>key==="json"&&args[0].startsWith("compare/")?{...value,status:"diverged"}:value;
+  await assert.rejects(f.load("image").authenticated(),/ancestry/);
+});
+test("Docker Source2361 direct-only immutable checks stay mandatory for first Source and are not repeated downstream",async()=>{
+  for(const variant of ["apiFailure","differentPhysicalId"]){
+    const first=await source2361Fixture();if(variant==="apiFailure")first.f.f.apiFailure=true;else first.f.f.physical[0].id=999;
+    await assert.rejects(first.seal());assert.equal(first.full,1);
+  }
+  const f=await source2361Fixture();await f.seal();const start=f.events.length;
+  f.f.f.apiFailure=true;f.f.f.physical[0].id=999;
+  await f.load("image").authenticated();assert.equal(f.full,1);
+  assert.ok(!f.events.slice(start).some(row=>row.key==="json"&&row.args[0]==="actions/jobs/100"));
+});
+function source2361NextAttempt(f,copied=false){
+  const attempt=++f.run.run_attempt;
+  const copies=f.jobs.filter(job=>job.run_attempt===1).map(job=>({...structuredClone(job),id:job.id+100*(attempt-1),run_attempt:attempt}));
+  if(!copied)Object.assign(copies[0],{status:"in_progress",conclusion:null,started_at:f.T(40+attempt),completed_at:null,
+    steps:[{name:consumer.SOURCE_STEP,number:1,status:"in_progress",conclusion:null,started_at:f.T(41+attempt),completed_at:null}]});
+  f.jobs.push(...copies);return copies[0];
+}
+test("Docker Source2361 copied Source and publisher successes preserve physical originals",async()=>{
+  const f=await source2361Fixture();await f.seal();source2361NextAttempt(f,true);
+  const state=f.f.state;state.run.run_attempt=2;state.suite.workflowRun.runAttempt=2;
+  const copies=state.physical.map(job=>({...structuredClone(job),id:job.id+100,run_attempt:2}));state.physical.push(...copies);state.latest=structuredClone(copies);
+  const c=f.load("image"),held=await c.authenticated();await c.consumerExecution(held,"image");
+  assert.equal(f.full,1);assert.equal(held.facts.controller.finalizerJobId,2006);
+  assert.ok(f.events.some(row=>row.key==="json"&&row.args[0]==="actions/jobs/8100"));
+  assert.ok(!f.events.some(row=>row.key==="json"&&row.args[0]==="actions/jobs/8200"));
+});
+test("Docker Source2361 full rerun emits guarded reuse linked to the first real full proof",async()=>{
+  const f=await source2361Fixture();await f.seal();const second=source2361NextAttempt(f);
+  const c=f.load("source"),state=await c.authenticated();await c.consumerExecution(state,"source");
+  const line=f.T(45)+" "+c.sourceLine(state,f.run.id),record=c.parseSourceFrame(line);
+  assert.equal(record.mode,"reuse");assert.equal(record.data,null);assert.deepEqual(record.origin,{id:8100,attempt:1});
+  f.sourceLogs.set(second.id,line);Object.assign(second,{status:"completed",conclusion:"success",completed_at:f.T(50)});
+  Object.assign(second.steps[0],{status:"completed",conclusion:"success",completed_at:f.T(49)});
+  await f.load("image").authenticated();assert.equal(f.full,1);
+  f.sourceLogs.delete(8100);await assert.rejects(f.load("image").authenticated());assert.equal(f.full,1);
+});
+for(const status of ["failure","cancelled","skipped","in_progress"])test("Docker Source2361 latest Source "+status+" blocks older green",async()=>{
+  const f=await source2361Fixture();await f.seal();const latest=source2361NextAttempt(f);
+  Object.assign(latest,{status:status==="in_progress"?status:"completed",conclusion:status==="in_progress"?null:status});
+  await assert.rejects(f.load("image").authenticated());assert.equal(f.full,1);
+});
+test("Docker Source2361 workers have no full-proof fallback before Source success",async()=>{
+  const f=await source2361Fixture();await assert.rejects(f.load("image").authenticated());assert.equal(f.full,0);
+});
+test("Docker Source2361 official consumer file metadata binds X instead of claiming executed D",async()=>{
+  const f=await source2361Fixture();await f.seal();
+  f.hook=(key,args,value)=>{if(key==="checkSuite"&&args[0]===f.run.check_suite_node_id)value.workflowRun.file.repositoryFileUrl=value.workflowRun.file.repositoryFileUrl.replace(f.X,f.D);return value;};
+  await assert.rejects(f.load("image").authenticated());assert.equal(f.full,1);
+});
+function source2361NoOutputs(f){
+  f.jobs.push({...structuredClone(f.jobs[4]),id:8105,name:"Scan exact published image (Trivy)"});
+  Object.assign(f.jobs[0],{status:"completed",conclusion:"failure",completed_at:f.T(20)});
+  Object.assign(f.jobs[0].steps[0],{status:"completed",conclusion:"failure",completed_at:f.T(19)});
+  for(const job of f.jobs.slice(1))Object.assign(job,{status:"completed",conclusion:"skipped",steps:[]});
+}
+test("Docker Source2361 unread Source retry recovers a failed first API read before any outputs",async()=>{
+  const f=await source2361Fixture();f.f.f.apiFailure=true;await assert.rejects(f.seal(),/Original API evidence unavailable/);
+  assert.equal(f.full,1);f.f.f.apiFailure=false;source2361NoOutputs(f);const second=source2361NextAttempt(f);
+  const c=f.load("source"),state=await c.authenticated();await c.consumerExecution(state,"source");
+  const line=f.T(45)+" "+c.sourceLine(state,f.run.id),record=c.parseSourceFrame(line);
+  assert.equal(f.full,2,"First read failed; only the second full proof completed");assert.equal(record.mode,"full");assert.deepEqual(record.origin,{id:8200,attempt:2});
+  f.sourceLogs.set(second.id,line);Object.assign(second,{status:"completed",conclusion:"success",completed_at:f.T(50)});
+  Object.assign(second.steps[0],{status:"completed",conclusion:"success",completed_at:f.T(49)});
+  const image=f.jobs.find(job=>job.id===8202);Object.assign(image,{status:"in_progress",conclusion:null,steps:[{name:"phase",number:1,status:"in_progress"}]});
+  await f.load("image").authenticated();assert.equal(f.full,2);
+});
+for(const variant of ["worker-success","worker-failure","worker-running","missing-worker","unknown-worker","nonempty-steps","matrix-placeholder","missing-attempt","pending-Source"])
+test("Docker Source2361 unread Source retry stops on "+variant,async()=>{
+  const f=await source2361Fixture();source2361NoOutputs(f);source2361NextAttempt(f);
+  if(variant==="worker-success")f.jobs[1].conclusion="success";
+  if(variant==="worker-failure")f.jobs[1].conclusion="failure";
+  if(variant==="worker-running")f.jobs[1].status="in_progress";
+  if(variant==="missing-worker")f.jobs.splice(1,1);
+  if(variant==="unknown-worker")f.jobs[1].name="unknown";
+  if(variant==="nonempty-steps")f.jobs[1].steps=[{status:"completed",conclusion:"skipped"}];
+  if(variant==="matrix-placeholder")f.jobs[2].name="Repackage originals";
+  if(variant==="pending-Source")f.jobs[0].status="in_progress";
+  if(variant==="missing-attempt")f.hook=(key,args,value)=>key==="json"&&args[0].startsWith("actions/runs/8000/attempts/1/jobs")?{...value,total_count:0,jobs:[]}:value;
+  await assert.rejects(f.load("source").authenticated());assert.equal(f.full,0);
+});
+test("Docker Source2361 unread Source retry never replaces a recorded successful proof",async()=>{
+  const f=await source2361Fixture();await f.seal();source2361NextAttempt(f);f.sourceLogs.delete(8100);
+  await assert.rejects(f.load("source").authenticated());assert.equal(f.full,1);
+});
+function source2361MatrixPlaceholder(f){
+  f.jobs[2].name="Repackage originals (${{ matrix.platform }})";f.jobs.splice(3,1);
+}
+test("Docker Source2361 exact bound-D matrix placeholder retries only the failed first read",async()=>{
+  const f=await source2361Fixture();f.f.f.apiFailure=true;await assert.rejects(f.seal());
+  f.f.f.apiFailure=false;source2361NoOutputs(f);source2361MatrixPlaceholder(f);source2361NextAttempt(f);
+  const c=f.load("source"),state=await c.authenticated(),record=c.parseSourceFrame(f.T(45)+" "+c.sourceLine(state,f.run.id));
+  assert.equal(record.mode,"full");assert.deepEqual(record.origin,{id:8200,attempt:2});assert.equal(f.full,2);
+});
+for(const variant of ["unknown-template","mixed","duplicate","non-skip","executed-step","changed-D-matrix","incomplete-attempt"])
+test("Docker Source2361 bound matrix placeholder rejects "+variant,async()=>{
+  const f=await source2361Fixture();source2361NoOutputs(f);source2361MatrixPlaceholder(f);
+  if(variant==="unknown-template")f.jobs[2].name="Repackage originals (${{ matrix.arch }})";
+  if(variant==="mixed")f.jobs.push({...structuredClone(f.jobs[2]),id:8190,name:"Repackage originals (linux/amd64)"});
+  if(variant==="duplicate")f.jobs.push({...structuredClone(f.jobs[2]),id:8191});
+  if(variant==="non-skip")f.jobs[2].conclusion="failure";
+  if(variant==="executed-step")f.jobs[2].steps=[{status:"completed",conclusion:"success"}];
+  if(variant==="changed-D-matrix")f.workflowText=text(".github/workflows/docker-publish.yml").replace("- platform: linux/arm64","- platform: linux/arm/v7");
+  source2361NextAttempt(f);
+  if(variant==="incomplete-attempt")f.hook=(key,args,value)=>key==="json"&&args[0].startsWith("actions/runs/8000/attempts/1/jobs")?{...value,total_count:0,jobs:[]}:value;
+  await assert.rejects(f.load("source").authenticated());assert.equal(f.full,0);
+});
+for(const variant of ["direct","lost-log","duplicate-log","outside-window","foreign-D","foreign-R","JSON-stub"])
+test("Docker Source2361 Source origin rejects "+variant,async()=>{
+  const f=await source2361Fixture();await f.seal();let line=f.sourceLogs.get(8100);
+  if(variant==="direct")f.hook=(key,args,value)=>{if(key==="json"&&args[0]==="actions/jobs/8100")throw Error("Source direct unavailable");return value;};
+  if(variant==="lost-log")f.sourceLogs.delete(8100);
+  if(variant==="duplicate-log")f.sourceLogs.set(8100,line+"\n"+line);
+  if(variant==="outside-window")f.sourceLogs.set(8100,line.replace(f.T(10),f.T(25)));
+  if(["foreign-D","foreign-R","JSON-stub"].includes(variant)){
+    const value=f.sourceModule.parseSourceFrame(line);
+    if(variant==="foreign-D")value.selection.controller="f".repeat(40);
+    if(variant==="foreign-R")value.selection.consumerRun++;
+    if(variant==="JSON-stub")value.data={publicationAuthorized:false,success:true};
+    f.sourceLogs.set(8100,f.T(10)+" "+consumer.SOURCE_PREFIX+Buffer.from(core.canonicalJson(value)).toString("base64"));
+  }
+  await assert.rejects(f.load("image").authenticated());assert.equal(f.full,1);
+});
+test("Docker Source2361 stage validates final mutable authority before exposing a build context",async()=>{
+  const f=await source2361Fixture();f.prepareStage();await f.seal();await f.load("image").__stage();
+  const output=fs.readFileSync(path.join(f.stageRoot,"outputs.txt"),"utf8");assert.match(output,/^context=/m);assert.match(output,/^image=/m);
+  assert.equal(f.full,1);assert.ok(f.commands.every(program=>["git","readelf","python3"].includes(program)));
+});
+for(const variant of ["ref","feature","Release","Source-log","consumer-attempt"])
+test("Docker Source2361 stage drift during byte read blocks context and build: "+variant,async()=>{
+  const f=await source2361Fixture(),hostId=f.prepareStage();await f.seal();let changed=false;
+  f.hook=(key,args,value)=>{if(!changed&&key==="assetBytes"&&args[0]===hostId){changed=true;
+    if(variant==="ref")f.f.f.release.commit.sha="9".repeat(40);
+    if(variant==="feature")f.f.f.latest[1].conclusion="failure";
+    if(variant==="Release")f.f.state.release.draft=true;
+    if(variant==="Source-log")f.sourceLogs.delete(8100);
+    if(variant==="consumer-attempt")f.run.run_attempt++;
+  }return value;};
+  await assert.rejects(f.load("image").__stage());assert.equal(changed,true);assert.equal(f.full,1);
+  assert.equal(fs.existsSync(path.join(f.stageRoot,"outputs.txt")),false,"No context output can enable an image build");
+  assert.ok(fs.existsSync(path.join(f.stageRoot,"bamboo-docker-context","originals.json")),"Retain owned scratch for diagnosis");
+  assert.ok(!f.commands.some(program=>["docker","cargo","npm"].includes(program)));
 });
