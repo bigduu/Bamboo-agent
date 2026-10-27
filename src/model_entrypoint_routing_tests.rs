@@ -79,9 +79,18 @@ pub(crate) fn config(flag: bool, fast_provider: &str) -> Config {
     *c.memory_mut() = Some(
         serde_json::from_value(serde_json::json!({
             "auto_dream_enabled":false,"project_prompt_injection":false,"relevant_recall":false,
-            "relevant_recall_rerank":false,"project_first_dream":false,"ledger_agenda":false,
+            "relevant_recall_rerank":false,"project_first_dream":false,"ledger_agenda_injection":false,
         }))
         .unwrap(),
+    );
+    let memory = c.memory().as_ref().unwrap();
+    assert!(
+        !memory.project_prompt_injection
+            && !memory.relevant_recall
+            && !memory.relevant_recall_rerank
+            && !memory.project_first_dream
+            && !memory.ledger_agenda_injection,
+        "routing fixtures must disable canonical memory reads"
     );
     c.defaults = Some(
         serde_json::from_value(serde_json::json!({
