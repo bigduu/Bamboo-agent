@@ -19,7 +19,7 @@ const CONTROLLER_HELPERS = Object.freeze([
   "sidecar-build.cjs", "sidecar-browser-host.py", "native-originals.cjs", "native-originals-zip.py",
 ].map(name => "scripts/" + name));
 const MAIN_WORKFLOW = ".github/workflows/main-admission.yml";
-const MAIN_WORKFLOW_SHA256 = "0086cc3d8a6e4fbf8f4b1fc5345799b0d903dcef4b3ca1b4347c21a22616bf17";
+const MAIN_WORKFLOW_SHA256 = "9794f9b3ca4398adc4e1da1eb4aca3ef3df05713d2fcc67a8085bbbd13240b5a";
 const MAIN_JOB = "Main Admission", MAIN_STEP = "Verify completed publication and exact Main postimage";
 const MAIN_PREFIX = "Bamboo Main admission: ", MAIN_KIND = "bamboo-main-admission/v1";
 // These are whole ordinary B controls, never a candidate-supplied path policy.

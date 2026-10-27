@@ -588,7 +588,7 @@ first complete release/promotion remain separate acceptance work.
 ## Main loader and merged promotion prepared by #2351
 
 The separate `main-admission.yml` prepares a single real `Main Admission` check
-for Main PR Target events. It has read-only contents/actions/pull-request
+for Main PR Target events. It has read-only contents/actions/checks/pull-request
 permissions, no Environment or publication credentials, and runs no candidate
 code, Cargo, npm, browser, Unit/E2E, package or publication command. An initial
 guard stops before checkout while default remains dev. The helper independently
