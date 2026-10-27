@@ -699,7 +699,7 @@ impl TicketApplication {
                 let mut probe = self.cancellation_probe.lock();
                 (probe.tail.take(), probe.registered.take())
             };
-            let _task = tokio::spawn(async move {
+            let _task = tasks.spawn(async move {
                 let child_id = ticket_runtime::ticket_child_id(&assignment.dispatch_key);
                 // Hold the same launch fence as ensure/admission while proving
                 // canonical absence. The committed cancellation already denies
