@@ -1,0 +1,143 @@
+name: Original Supervisor Epic Diagnostic
+
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot_sha:
+        description: 'Full lowercase 40-character source SHA for this API-only diagnostic'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: original-supervisor-epic-diagnostic-${{ inputs.snapshot_sha }}
+  cancel-in-progress: false
+
+jobs:
+  composition:
+    name: Original two-Project Tracker Planner followup and restart (Linux)
+    if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '8388608'
+      BAMBOO_FRONTEND_BUILD_MODE: api-only
+      EXPECTED_SOURCE_SHA: ${{ inputs.snapshot_sha }}
+      DISPATCH_SOURCE_SHA: ${{ github.sha }}
+    steps:
+      - name: Require a fixed diagnostic source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Diagnostic source must be a full lowercase commit SHA' >&2
+            exit 1
+          fi
+          test "$EXPECTED_SOURCE_SHA" = "$DISPATCH_SOURCE_SHA"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.snapshot_sha }}
+          persist-credentials: false
+
+      - name: Bind composition to the exact clean source and lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SOURCE_SHA"
+          test -z "$status"
+          git show -s --format='Original Epic source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Record actual compiler and build mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc -vV
+          cargo -V
+          printf 'frontend=%s jobs=%s incremental=%s target=%s\n' "$BAMBOO_FRONTEND_BUILD_MODE" "$CARGO_BUILD_JOBS" "$CARGO_INCREMENTAL" "$CARGO_TARGET_DIR"
+          df -h .
+
+      - name: Restore existing dependencies without saving cache storage
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-test-${{ runner.os }}
+          workspaces: . -> target/grouped-default
+          save-if: false
+
+      - name: Verify inherited Supervisor journal and new-orphan deferral
+        shell: bash
+        run: |
+          set -euo pipefail
+          for case in \
+            partial_child_outcome_can_drive_tool_work_before_resuspending_exact_inherited_wait \
+            supervisor_new_orphan_wait_keeps_terminal_reply_deferred; do
+            target="runtime::runner::loop_execution::pipeline::tests::$case"
+            cargo test --locked -p bamboo-engine --lib -- "$target" --exact --test-threads=1 --color=never \
+              2>&1 | tee "$RUNNER_TEMP/epic-$case.log"
+            TEST_NAME="$target" TEST_LOG="$RUNNER_TEMP/epic-$case.log" python3 - <<'PY'
+          import os, pathlib, re
+          log = pathlib.Path(os.environ['TEST_LOG']).read_text()
+          binaries = re.findall(r'^\s*Running unittests [^\n]*\(([^()\n]+)\)\s*$', log, re.M)
+          assert len(binaries) == 1 and re.fullmatch(r'bamboo_engine-[0-9a-f]+', pathlib.Path(binaries[0]).name), binaries
+          names = re.findall(r'^test ([\w:]+) \.\.\. ok$', log, re.M)
+          assert names == [os.environ['TEST_NAME']], names
+          summaries = re.findall(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', log, re.M)
+          assert summaries == [('1', '0', '0')], summaries
+          PY
+          done
+
+      - name: Run the complete original seven-row native composition
+        shell: bash
+        run: |
+          set -euo pipefail
+          target=app_state::supervisor_epic_acceptance_tests::two_project_tracker_planner_followup_and_restart_preserve_original_authority
+          cargo test --locked -p bamboo-server --lib -- "$target" --exact --test-threads=1 --color=never \
+            2>&1 | tee "$RUNNER_TEMP/original-supervisor-epic-tests.log"
+          python3 - <<'PY'
+          import os, pathlib, re
+          log = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'original-supervisor-epic-tests.log').read_text()
+          target = 'app_state::supervisor_epic_acceptance_tests::two_project_tracker_planner_followup_and_restart_preserve_original_authority'
+          binaries = re.findall(r'^\s*Running unittests [^\n]*\(([^()\n]+)\)\s*$', log, re.M)
+          assert len(binaries) == 1 and re.fullmatch(r'bamboo_server-[0-9a-f]+', pathlib.Path(binaries[0]).name), binaries
+          names = re.findall(r'^test ([\w:]+) \.\.\. ok$', log, re.M)
+          assert names == [target], names
+          summaries = re.findall(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', log, re.M)
+          assert summaries == [('1', '0', '0')], summaries
+          print('All original seven composition rows ran in the exact nonempty native fixture')
+          PY
+
+      - name: Check affected engine and Host libraries under the original lint policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --all-features --lib -p bamboo-engine -p bamboo-server -- \
+            -D warnings -A deprecated -A clippy::module_inception \
+            -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args \
+            -A clippy::too-many-arguments -A clippy::while-let-loop \
+            -A clippy::type_complexity -A dead-code
+
+      - name: Verify exact source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SOURCE_SHA"
+          test -z "$status"
+          git show -s --format='Final original Epic source: %H tree: %T' HEAD
+          sha256sum Cargo.lock

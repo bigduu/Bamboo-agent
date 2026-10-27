@@ -255,12 +255,26 @@ async fn ticket_unsuccessful_terminal_without_exact_stop_proof_keeps_quarantine(
 async fn only_canonical_ticket_child_of_the_current_supervisor_avoids_orphan_wait() {
     let f = Fixture::new().await;
     assert!(is_independent_ticket_child(f.storage.as_ref(), &f.supervisor, &f.child.id).await);
+    let mut current = f.supervisor.clone();
+    for ultra in [false, true, false, true] {
+        current.set_root_orchestration_only(ultra).unwrap();
+        f.storage.save_session(&current).await.unwrap();
+        assert!(
+            is_independent_ticket_child(f.storage.as_ref(), &f.supervisor, &f.child.id).await,
+            "independent Work ownership survives a parent thinking-mode change"
+        );
+    }
     let ordinary = Session::new_child_of("ordinary", &f.supervisor, "model", "ordinary");
     f.storage.save_session(&ordinary).await.unwrap();
     assert!(!is_independent_ticket_child(f.storage.as_ref(), &f.supervisor, &ordinary.id).await);
     let mut old_parent = f.supervisor.clone();
     old_parent.created_at -= chrono::Duration::seconds(1);
     assert!(!is_independent_ticket_child(f.storage.as_ref(), &old_parent, &f.child.id).await);
+    let mut forged = f.supervisor.clone();
+    forged.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    assert!(!is_independent_ticket_child(f.storage.as_ref(), &forged, &f.child.id).await);
     let mut changed = f.child.clone();
     changed.metadata.insert(
         crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),

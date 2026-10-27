@@ -495,7 +495,65 @@ pub trait Storage: Send + Sync {
         ))
     }
 
-    /// Bounded trusted host scope observation, never a Session directory.
+    /// Trusted Supervisor's effective current-application-user domain. A
+    /// custom backend must implement the canonical identity boundary; an old
+    /// Project list, ordinary load or missing capability is not a fallback.
+    async fn inspect_supervisor_current_user_scope(
+        &self,
+        supervisor: &SupervisorReference,
+    ) -> std::io::Result<crate::SupervisorCurrentUserScope> {
+        let _ = supervisor;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "supervisor_current_user_scope_unsupported",
+        ))
+    }
+
+    /// Canonical metadata-only page in this store's current user domain.
+    /// Target observations include birth/generation, never an acting grant.
+    async fn list_supervisor_current_user_targets(
+        &self,
+        supervisor: &SupervisorReference,
+        query: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> std::io::Result<crate::SupervisorCurrentUserPage> {
+        let _ = (supervisor, query, after, limit);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "supervisor_current_user_directory_unsupported",
+        ))
+    }
+
+    /// Canonical exact target selection for a new immutable management intent.
+    /// The final reader/writer must revalidate this lifetime under its guards.
+    async fn inspect_supervisor_current_user_target(
+        &self,
+        supervisor: &SupervisorReference,
+        target: &str,
+    ) -> std::io::Result<crate::SupervisorCurrentUserTarget> {
+        let _ = (supervisor, target);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "supervisor_current_user_target_unsupported",
+        ))
+    }
+
+    /// Return history and its target selector from one retained canonical read.
+    /// A second unguarded load must not pair old progress with a replacement
+    /// Session's new selector. Custom stores fail closed until implemented.
+    async fn load_supervisor_current_user_observed_session(
+        &self,
+        _supervisor: &crate::SupervisorReference,
+        _target: &str,
+    ) -> std::io::Result<(Session, crate::SupervisorCurrentUserTarget)> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic current-user Session observation is unsupported",
+        ))
+    }
+
+    /// Legacy host scope metadata, retained for compatibility and Observer CAS.
     async fn inspect_supervisor_scope(
         &self,
         supervisor: &SupervisorReference,

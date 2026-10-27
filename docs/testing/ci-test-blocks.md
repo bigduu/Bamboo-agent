@@ -39,6 +39,13 @@ outside the mapped targets also fails admission until its ownership is reviewed.
 Update that inventory only after reviewing the default/additive case map.
 Ordinary cases in existing ungated targets join default execution automatically.
 
+Supervisor role/current-user cases remain ordinary tests in their existing
+Domain, Engine, Server, Storage, Tickets and server-tools Cargo targets. They
+join that default catalog without another automatic Linux producer. The retained
+`supervisor-role-acceptance.yml` is a manual API-only diagnostic bound to the
+exact dispatch SHA; it does not supply feature admission. Original feature-head
+receipts, including `447a1e13`, retain their original source and configuration.
+
 The original serial storage selectors retain --test-threads=1, including their
 matching session-merge regression. The Cargo invocation excludes those qualified
 selectors, then the same standalone default storage executable runs them.

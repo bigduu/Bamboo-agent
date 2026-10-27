@@ -139,14 +139,26 @@ impl FileStore {
     }
 
     pub fn open(root: &Path, binding: ScopeBinding) -> Result<Self> {
-        Self::open_with_policy(root, binding, false)
+        Self::open_with_policy(root, binding, false, false)
+    }
+
+    pub(crate) fn open_supervisor_mode_compatible(
+        root: &Path,
+        binding: ScopeBinding,
+    ) -> Result<Self> {
+        Self::open_with_policy(root, binding, false, true)
     }
 
     pub(crate) fn initialize_empty(root: &Path, binding: ScopeBinding) -> Result<Self> {
-        Self::open_with_policy(root, binding, true)
+        Self::open_with_policy(root, binding, true, false)
     }
 
-    fn open_with_policy(root: &Path, binding: ScopeBinding, empty_only: bool) -> Result<Self> {
+    fn open_with_policy(
+        root: &Path,
+        binding: ScopeBinding,
+        empty_only: bool,
+        preserve_supervisor_revision: bool,
+    ) -> Result<Self> {
         if !Self::is_platform_supported() {
             return Err(Error::AuthorityUnavailable(
                 "filesystem platform not validated".into(),
@@ -223,7 +235,15 @@ impl FileStore {
         let head = store.root.join("HEAD");
         if head.exists() {
             match store.load_head() {
-                Ok((hash, snapshot)) if snapshot.binding == binding => {
+                Ok((hash, snapshot))
+                    if snapshot.binding == binding
+                        || (preserve_supervisor_revision
+                            && binding.binding_revision > 0
+                            && snapshot.binding.binding_revision > 0
+                            && snapshot.binding.scope_id == binding.scope_id
+                            && snapshot.binding.supervisor_session_id
+                                == binding.supervisor_session_id) =>
+                {
                     store.published = Some((hash, snapshot));
                 }
                 Ok(_) => {

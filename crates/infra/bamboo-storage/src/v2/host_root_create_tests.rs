@@ -390,8 +390,8 @@ async fn a_different_valid_generation_cannot_use_the_same_stable_creation_scope(
 }
 
 #[tokio::test]
-async fn observed_supervisor_creation_never_falls_back_after_host_installation() {
-    let (home, store, _ordinary) = fixture().await;
+async fn observed_supervisor_creation_uses_its_role_not_a_legacy_host_acl() {
+    let (home, store, ordinary) = fixture().await;
     let supervisor = store
         .get_or_create_default_supervisor("model")
         .await
@@ -425,26 +425,40 @@ async fn observed_supervisor_creation_never_falls_back_after_host_installation()
         BTreeSet::new(),
     )
     .await;
-    assert!(store
+    let created = store
         .create_and_attach_supervised_root_observed(&original, &reference, 1, &candidate)
         .await
-        .is_err());
-    assert!(store.load_session(&candidate.id).await.unwrap().is_none());
+        .unwrap();
+    assert!(created.changed);
+    assert_eq!(
+        store
+            .load_session(&candidate.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .created_at,
+        candidate.created_at
+    );
     store
         .revoke_host_session_scope(&supervisor.id, token.binding().revision)
         .await
         .unwrap();
-    assert!(store
+    let replay = store
         .create_and_attach_supervised_root_observed(&original, &reference, 1, &candidate)
         .await
-        .is_err());
-    assert!(store.load_session(&candidate.id).await.unwrap().is_none());
-    // The explicit legacy Supervisor API has its independent contract. A
-    // generic caller cannot reach it by dropping a failed Host lookup.
-    store
-        .create_and_attach_supervised_root(&reference, 1, &candidate)
-        .await
         .unwrap();
+    assert!(!replay.changed);
+    // The canonical role is checked with the complete original caller. An
+    // ordinary Root cannot borrow it by supplying the Supervisor reference.
+    assert!(store
+        .create_and_attach_supervised_root_observed(
+            &SessionCallerReference::from(&ordinary),
+            &reference,
+            1,
+            &candidate
+        )
+        .await
+        .is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

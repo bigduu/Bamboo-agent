@@ -112,6 +112,26 @@ impl Fixture {
         ctx
     }
 
+    async fn supervisor_send_args(
+        &self,
+        supervisor: &Session,
+        target: &str,
+        operation: &str,
+    ) -> Value {
+        let reference = SupervisorReference {
+            session_id: supervisor.id.clone(),
+            incarnation_id: supervisor.supervisor_incarnation_id().unwrap(),
+        };
+        let observed = self
+            .store
+            .inspect_supervisor_current_user_target(&reference, target)
+            .await
+            .unwrap();
+        let mut arguments = send(target, operation, Some("trigger_turn"));
+        arguments["target_ref"] = serde_json::to_value(observed).unwrap();
+        arguments
+    }
+
     fn tool(&self) -> SessionMessageTool {
         SessionMessageTool::new(self.messenger.clone()).with_scoped_sender(Arc::new(
             CanonicalSessionSendAdapter::new(self.store.clone(), self.messenger.clone()),
@@ -283,12 +303,32 @@ async fn original_supervisor_send_uses_its_existing_scoped_followup_writer() {
     let target = fixture.new_root("independent-worker").await;
     let supervisor = fixture.supervisor(&[&target.id]).await;
     let tool = fixture.tool();
+    let missing_selector = tool
+        .invoke(
+            send(&target.id, "followup-operation", Some("trigger_turn")),
+            Fixture::ctx(&supervisor),
+        )
+        .await
+        .unwrap_err();
+    assert!(missing_selector
+        .to_string()
+        .contains("scoped_session_send_target_reference_required"));
+    assert_eq!(
+        fixture.inbox.inspect(&target.id).await.unwrap().generation,
+        0
+    );
+    assert!(fixture.activation.requests.lock().await.is_empty());
     for intent in [None, Some("queue_only")] {
+        let mut args = fixture
+            .supervisor_send_args(&supervisor, &target.id, "followup-operation")
+            .await;
+        if let Some(intent) = intent {
+            args["delivery_intent"] = json!(intent);
+        } else {
+            args.as_object_mut().unwrap().remove("delivery_intent");
+        }
         let error = tool
-            .invoke(
-                send(&target.id, "followup-operation", intent),
-                Fixture::ctx(&supervisor),
-            )
+            .invoke(args, Fixture::ctx(&supervisor))
             .await
             .unwrap_err();
         assert!(error
@@ -301,7 +341,9 @@ async fn original_supervisor_send_uses_its_existing_scoped_followup_writer() {
     }
     let before =
         serde_json::to_value(fixture.store.load_session(&target.id).await.unwrap()).unwrap();
-    let args = send(&target.id, "followup-operation", Some("trigger_turn"));
+    let args = fixture
+        .supervisor_send_args(&supervisor, &target.id, "followup-operation")
+        .await;
     let first = result(
         tool.invoke(args.clone(), Fixture::ctx(&supervisor))
             .await
