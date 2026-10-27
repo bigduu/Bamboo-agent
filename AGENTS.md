@@ -46,6 +46,12 @@ aggregates require it to pass. Do not add a second automatic owner for those
 tests.
 Keep the standalone default storage authority families' serial selection in that same
 executor, reusing its compiled library-test executable without repeating cases.
+Planner's 12 Plan and 10 artifact library cases are excluded from the ordinary
+parallel harness and run once serially using each package's same compiled
+canonical test executable. Preserve each default dependency graph and fail the
+existing feature gate on a missing, repeated or failed case. The independent
+Delegated Planner workflow retains its distinct API-only real CLI and original
+Clippy configurations; it does not repeat these library cases.
 `Quick Checks` remains auxiliary and never substitutes for runtime tests.
 
 `trusted-observer.yml` is the single automatic owner for the two original

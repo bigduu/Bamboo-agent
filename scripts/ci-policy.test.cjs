@@ -508,7 +508,7 @@ function assertLinuxTestOwnership(definitions) {
     },
     "release-cargo-isolation.yml": { isolation: "Synthetic credential/ENOSPC containment boundary" },
     "trusted-observer.yml": { observer: "Accepted API-only/F multi-package Observer configuration; not M evidence" },
-    "delegated-planner-acceptance.yml": { planner: "New a64 API-only/F Planner targets; independent accepted configuration, not M evidence" },
+    "delegated-planner-acceptance.yml": { planner: "Distinct API-only/F Planner CLI and original Clippy; library cases run once on canonical M" },
     "observer-subscriptions.yml": { observer: "Inherited 6cfe API-only/F subscription joint graph; temporary exact configuration, not M evidence" },
     "ticket-platform-adapter.yml": { "native-budget": "Explicit manual snapshot diagnosis; normal PR job is Windows" },
   }
@@ -527,15 +527,15 @@ function assertLinuxTestOwnership(definitions) {
           !(/["']cargo["']/u.test(code) && /["']test["']/u.test(code))) continue
       assert.ok(registered[file]?.[id], `Ordinary Linux Rust tests must join the canonical feature executor: ${file}:${id}; consolidate targets or review an explicit scoped exception`)
       if (file === "delegated-planner-acceptance.yml") {
-        // Newly inherited #2304 owner, not part of the original A95 baseline.
-        assert.equal(createHash("sha256").update(source).digest("hex"), "318e924773ffdeb0407c5b73b15a70c330f7f64eb7ef3260c1a955782d12d912")
+        // Retain #2304 API-only CLI/lint; default library runtime has moved to M.
+        assert.equal(createHash("sha256").update(source).digest("hex"), "e40d291b67054a05629a85a8b802fe198a0ee6e3b0d9beb8102e09bd744509ff")
         assert.match(block, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
         assert.match(block, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
         assert.match(block, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
         assert.match(block, /test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SOURCE_SHA"/u)
-        for (const command of ["cargo test --locked -p bamboo-server-tools --lib plan::tests::",
-          "cargo test --locked -p bamboo-engine --lib planner_artifact",
-          "cargo test --locked -p bamboo-agent --test required_child_context_packet",
+        assert.doesNotMatch(block, /cargo test --locked -p bamboo-(?:server-tools|engine) --lib/u)
+        assert.ok(block.includes("-p bamboo-engine -p bamboo-server-tools -p bamboo-server --lib --"))
+        for (const command of ["cargo test --locked -p bamboo-agent --test required_child_context_packet",
           "cargo clippy --locked --all-features -p bamboo-agent"]) assert.ok(block.includes(command))
       }
       if (file === "trusted-observer.yml") {
@@ -2009,4 +2009,20 @@ test("actual source identity keeps unchanged Cargo fingerprints fresh", { timeou
     rmSync(directory, { recursive: true, force: true })
     t.diagnostic("Source-watch module/counter/fingerprint evidence: " + evidence)
   }
+})
+
+test("Planner12/10 libraries have one canonical serial owner while API-only CLI and Clippy remain", () => {
+  const { PLANNER_SERIAL, cargoArguments } = require("./run-feature-tests.cjs")
+  assert.deepEqual(Object.keys(PLANNER_SERIAL), ["bamboo-server-tools", "bamboo-engine"])
+  assert.deepEqual(Object.values(PLANNER_SERIAL).map(recipe => recipe.names.length), [12, 10])
+  for (const [name, recipe] of Object.entries(PLANNER_SERIAL)) {
+    assert.equal(new Set(recipe.names).size, recipe.names.length)
+    assert.deepEqual(cargoArguments({ name }).slice(7), recipe.names.flatMap(name => ["--skip", name]))
+  }
+  const planner = readFileSync(".github/workflows/delegated-planner-acceptance.yml", "utf8")
+  assert.equal([...planner.matchAll(/cargo test/g)].length, 1)
+  assert.match(planner, /delegated_planner::real_cli_planner_/u)
+  assert.match(planner, /test result: ok\. 2 passed; 0 failed; 0 ignored/u)
+  assert.equal([...planner.matchAll(/cargo clippy/g)].length, 2)
+  assert.match(planner, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
 })
