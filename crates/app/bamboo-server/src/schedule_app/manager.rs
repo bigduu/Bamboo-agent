@@ -44,6 +44,8 @@ pub struct ResolvedRunConfig {
     /// Primary + auxiliary model/provider selection for the scheduled run.
     /// The primary `model` is required; resolve it via `roster.model`.
     pub model_roster: ModelRoster,
+    pub model_provider: Option<Arc<dyn bamboo_llm::LLMProvider>>,
+    pub model_error: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub gold_config: Option<GoldConfig>,
     pub system_prompt: String,
@@ -480,6 +482,9 @@ async fn run_schedule_job(
         validate_workflow_schedule_target(&schedule.trigger, &job.run_config)?;
     }
     let mut resolved = (ctx.resolve_run_config)(&job);
+    if let Some(error) = resolved.model_error.as_ref() {
+        return Err(format!("Configured schedule model is unavailable: {error}"));
+    }
     let explicit_workspace = job
         .run_config
         .workspace_path
@@ -856,7 +861,7 @@ async fn run_schedule_job(
         session,
         execution_reservation,
         tools_override: Some(ctx.tools.clone()),
-        provider_override: None,
+        provider_override: resolved.model_provider.clone(),
         model_roster: resolved.model_roster.clone(),
         reasoning_effort: resolved.reasoning_effort,
         reasoning_effort_source: "schedule".to_string(),
@@ -1164,7 +1169,13 @@ fn resolve_run_config_from_config(
     config: &std::sync::Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
     provider_registry: &Arc<bamboo_llm::ProviderRegistry>,
 ) -> ResolvedRunConfig {
-    let config_snapshot = config.try_read().map(|g| g.clone()).unwrap_or_default();
+    let (config_snapshot, snapshot_error) = match config.try_read() {
+        Ok(snapshot) => (snapshot.clone(), None),
+        Err(_) => (
+            bamboo_llm::Config::default(),
+            Some("Live schedule model configuration is temporarily unavailable".to_string()),
+        ),
+    };
 
     let requested_model = job
         .run_config
@@ -1174,14 +1185,49 @@ fn resolve_run_config_from_config(
         .filter(|v| !v.is_empty())
         .map(|v| v.to_string());
 
-    let model = if let Some(m) = requested_model {
-        m
-    } else {
-        bamboo_engine::model_config_helper::get_schedule_model_from_config(&config_snapshot)
-            .unwrap_or_default()
+    let target = requested_model
+        .map(|model| {
+            bamboo_domain::ProviderModelRef::new(
+                config_snapshot.effective_default_provider(),
+                model,
+            )
+        })
+        .or_else(|| {
+            if let Some(defaults) = config_snapshot.defaults.as_ref() {
+                Some(defaults.fast.as_ref().unwrap_or(&defaults.chat).clone())
+            } else {
+                bamboo_engine::model_config_helper::get_schedule_model_from_config(&config_snapshot)
+                    .ok()
+                    .map(|model| {
+                        bamboo_domain::ProviderModelRef::new(
+                            config_snapshot.effective_default_provider(),
+                            model,
+                        )
+                    })
+            }
+        })
+        .filter(|_| snapshot_error.is_none());
+    let model = target.as_ref().map(|target| target.model.clone());
+    let provider_name = Some(
+        target
+            .as_ref()
+            .map(|target| target.provider.clone())
+            .unwrap_or_else(|| config_snapshot.effective_default_provider().to_string()),
+    );
+    let (model_provider, model_error) = match target
+        .as_ref()
+        .map(|target| {
+            bamboo_engine::model_config_helper::try_resolve_exact_model(
+                &config_snapshot,
+                provider_registry,
+                target,
+            )
+        })
+        .transpose()
+    {
+        Ok(target) => (target.map(|target| target.provider), snapshot_error),
+        Err(error) => (None, Some(error.to_string())),
     };
-
-    let provider_name = Some(config_snapshot.effective_default_provider().to_string());
     let provider_type = provider_name.as_deref().and_then(|name| {
         bamboo_engine::model_config_helper::resolve_provider_type(
             &config_snapshot,
@@ -1240,7 +1286,7 @@ fn resolve_run_config_from_config(
     );
 
     let model_roster =
-        bamboo_engine::ModelRoster::from_areas(Some(model), provider_name, provider_type, areas);
+        bamboo_engine::ModelRoster::from_areas(model, provider_name, provider_type, areas);
 
     ResolvedRunConfig {
         auxiliary_model_resolver: bamboo_engine::model_areas::live_auxiliary_model_resolver(
@@ -1249,6 +1295,8 @@ fn resolve_run_config_from_config(
             config_snapshot.effective_default_provider().to_string(),
         ),
         model_roster,
+        model_provider,
+        model_error,
         reasoning_effort,
         gold_config: bamboo_engine::model_config_helper::resolve_gold_config(
             &config_snapshot,

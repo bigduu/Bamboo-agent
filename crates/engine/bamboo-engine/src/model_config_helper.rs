@@ -442,7 +442,7 @@ fn try_resolve_role_ref_chain<'a>(
         || model_ref.model.trim() != model_ref.model
     {
         return Err(LLMError::Api(
-            "Configured auxiliary provider/model reference is invalid".into(),
+            "Configured provider/model reference is invalid".into(),
         ));
     }
     if let Some(instance) = config.provider_instances.get(&model_ref.provider) {
@@ -466,7 +466,7 @@ fn try_resolve_role_ref_chain<'a>(
     Ok(Some(ResolvedModel::from_ref(provider, model_ref)))
 }
 
-pub(crate) fn try_resolve_exact_model(
+pub fn try_resolve_exact_model(
     config: &Config,
     registry: &Arc<ProviderRegistry>,
     target: &bamboo_domain::ProviderModelRef,

@@ -869,6 +869,16 @@ impl ConnectBridge {
         let config_snapshot = self.ctx.config.read().await.clone();
         let resolved = resolve_connect_run_config(&config_snapshot, &self.ctx.provider_registry);
 
+        if let Some(error) = resolved.model_error.as_ref() {
+            reply_text(
+                &platform,
+                reply_ctx,
+                format!("Configured model is unavailable: {error}"),
+            )
+            .await;
+            return;
+        }
+
         if resolved
             .model_roster
             .model
@@ -1002,7 +1012,7 @@ impl ConnectBridge {
             session,
             execution_reservation,
             tools_override: Some(self.ctx.tools.clone()),
-            provider_override: None,
+            provider_override: resolved.model_provider.clone(),
             model_roster: resolved.model_roster.clone(),
             reasoning_effort: resolved.reasoning_effort,
             reasoning_effort_source: "connect".to_string(),
@@ -1589,6 +1599,15 @@ mod tests {
                 extra: Default::default(),
             });
         }
+        // Keep the original terminal-auth fixture while exercising the new
+        // explicit admission path; no real keyed provider is constructed.
+        state
+            .provider_registry
+            .insert("openai".into(), state.provider.read().await.clone());
+        state.provider_registry.set_runtime_models(HashMap::from([(
+            "openai".into(),
+            vec!["gpt-4o-mini".into()],
+        )]));
         let ctx = ConnectContext {
             agent: state.agent.clone(),
             tools: state.tools_for(ToolSurface::Root),

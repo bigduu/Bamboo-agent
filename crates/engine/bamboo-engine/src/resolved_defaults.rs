@@ -20,7 +20,8 @@
 use std::sync::Arc;
 
 use bamboo_domain::reasoning::ReasoningEffort;
-use bamboo_llm::{Config, ProviderRegistry};
+use bamboo_domain::ProviderModelRef;
+use bamboo_llm::{Config, LLMProvider, ProviderRegistry};
 
 use crate::config::GoldConfig;
 use crate::ModelRoster;
@@ -33,6 +34,10 @@ pub struct ResolvedDefaultRunConfig {
     /// resolved via `model_roster.model` (may be `None`/empty if the server
     /// has no model configured at all).
     pub model_roster: ModelRoster,
+    /// The admitted client for the selected primary model. Host consumers must
+    /// dispatch this pair together rather than use a mutable default client.
+    pub model_provider: Option<Arc<dyn LLMProvider>>,
+    pub model_error: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub gold_config: Option<GoldConfig>,
     /// Assembled system prompt (base template + workspace note).
@@ -48,8 +53,28 @@ pub fn resolve_default_run_config(
     config_snapshot: &Config,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> ResolvedDefaultRunConfig {
-    let model = config_snapshot.get_model().unwrap_or_default();
-    let provider_name = Some(config_snapshot.effective_default_provider().to_string());
+    let target = default_chat_model_ref(config_snapshot);
+    let model = target.as_ref().map(|target| target.model.clone());
+    let provider_name = Some(
+        target
+            .as_ref()
+            .map(|target| target.provider.clone())
+            .unwrap_or_else(|| config_snapshot.effective_default_provider().to_string()),
+    );
+    let (model_provider, model_error) = match target
+        .as_ref()
+        .map(|target| {
+            crate::model_config_helper::try_resolve_exact_model(
+                config_snapshot,
+                provider_registry,
+                target,
+            )
+        })
+        .transpose()
+    {
+        Ok(target) => (target.map(|target| target.provider), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     let provider_type = provider_name.as_deref().and_then(|name| {
         crate::model_config_helper::resolve_provider_type(config_snapshot, name, provider_registry)
     });
@@ -73,16 +98,39 @@ pub fn resolve_default_run_config(
         None,
         workspace_path.as_deref(),
     );
-    let model_roster = ModelRoster::from_areas(Some(model), provider_name, provider_type, areas);
+    let model_roster = ModelRoster::from_areas(model, provider_name, provider_type, areas);
 
     ResolvedDefaultRunConfig {
         model_roster,
+        model_provider,
+        model_error,
         reasoning_effort,
         gold_config: crate::model_config_helper::resolve_gold_config(config_snapshot, None),
         system_prompt,
         base_system_prompt,
         workspace_path,
     }
+}
+
+/// Keep configured intent separate from admission so a bad explicit target is
+/// reported, never replaced by an unrelated default account.
+pub fn default_chat_model_ref(config: &Config) -> Option<ProviderModelRef> {
+    if config.features.provider_model_ref {
+        if let Some(defaults) = config.defaults.as_ref() {
+            return Some(defaults.chat.clone());
+        }
+    }
+    let provider = config.effective_default_provider();
+    let model = if let Some(instance) = config.provider_instances.get(provider) {
+        // A disabled configured target is still intent; admission reports it.
+        instance
+            .model
+            .clone()
+            .or_else(|| (instance.provider_type == "copilot").then(|| "gpt-4o".to_string()))
+    } else {
+        config.get_model()
+    }?;
+    (!model.trim().is_empty()).then(|| ProviderModelRef::new(provider, model.trim()))
 }
 
 #[cfg(test)]
