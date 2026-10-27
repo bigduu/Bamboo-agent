@@ -131,9 +131,19 @@ async fn fault_preserves_live_work_wait_and_original_user_input() {
         .agent_runtime_state
         .unwrap()
         .waiting_for_children;
+    let user_admission = f
+        .state
+        .session_messenger
+        .admit_with_activation_intent(
+            SessionMessageEnvelope::user_input(&parent.id, USER_TEXT),
+            bamboo_domain::SessionActivationPolicy::RespectSpecificWait,
+            None,
+        )
+        .await
+        .unwrap();
     f.state
         .session_messenger
-        .admit(SessionMessageEnvelope::user_input(&parent.id, USER_TEXT))
+        .activate_prepared(&user_admission)
         .await
         .unwrap();
     let now = Utc::now();
