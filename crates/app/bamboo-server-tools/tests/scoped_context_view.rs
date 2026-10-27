@@ -649,6 +649,7 @@ async fn ordinary_metadata_rights_stay_narrow_while_supervisor_role_can_read_bou
     let default_view = f.export(&f.supervisor, 0).await;
     let mut default_brief = request(&f.targets[0], &default_view);
     default_brief["file"] = json!("brief");
+    default_brief["limit"] = json!(40);
     let current = result(
         f.tool()
             .invoke(default_brief, ctx(&f.supervisor))
