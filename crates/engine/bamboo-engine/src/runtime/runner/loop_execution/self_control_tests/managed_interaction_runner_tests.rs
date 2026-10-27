@@ -238,7 +238,7 @@ async fn run_interaction_fixture(
     provider: Arc<dyn LLMProvider>,
     tools: Arc<dyn ToolExecutor>,
 ) -> (Result<(), AgentError>, Vec<AgentEvent>) {
-    let (tx, mut rx) = mpsc::channel(512);
+    let (tx, rx) = mpsc::channel(512);
     let storage = fixture.storage.clone();
     let config = fixture.config.take().expect("one activation per fixture");
     let run = run_agent_loop_with_config(
@@ -250,6 +250,14 @@ async fn run_interaction_fixture(
         CancellationToken::new(),
         config,
     );
+    drive_interaction_and_observe(run, storage, rx).await
+}
+
+async fn drive_interaction_and_observe(
+    run: impl std::future::Future<Output = Result<(), AgentError>>,
+    storage: Arc<dyn Storage>,
+    mut rx: mpsc::Receiver<AgentEvent>,
+) -> (Result<(), AgentError>, Vec<AgentEvent>) {
     tokio::pin!(run);
     let mut events = Vec::new();
     let result = loop {
@@ -278,6 +286,78 @@ async fn observe_start_receipt(storage: &dyn Storage, event: &AgentEvent) {
         // contract. Ordinary foreign tool events do not share that promise.
         Fixture::observe_event(storage, event).await;
     }
+}
+
+#[tokio::test]
+async fn interaction_start_observer_pending_read_keeps_runner_polled_and_filters_foreign_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner: Arc<dyn Storage> = Arc::new(
+        bamboo_storage::SessionStoreV2::new(dir.path().join("sessions"))
+            .await
+            .unwrap(),
+    );
+    // Only seed the observer's immutable durable pair. This scheduling test
+    // grants no managed execution or control authority.
+    let result = ToolResult::text(true, json!({"loop": {"generation": null}}).to_string());
+    let mut session = Session::new(SESSION_ID, "synthetic-only");
+    let LLMChunk::ToolCalls(calls) = start_call(2, 8) else {
+        unreachable!("the existing helper emits the Start call");
+    };
+    session.add_message(Message::assistant("", Some(calls)));
+    session.add_message(Message::tool_result_with_status(
+        "start",
+        result.result.clone(),
+        result.success,
+    ));
+    inner.save_session(&session).await.unwrap();
+    let storage = Arc::new(ObserverReadBarrierStorage {
+        inner,
+        writer: tokio::sync::Mutex::new(()),
+        read_entered: Notify::new(),
+    });
+    let (tx, rx) = mpsc::channel(2);
+    let retained_sender = tx.clone();
+    let runner_storage = storage.clone();
+    let run = async move {
+        let writer = runner_storage.writer.lock().await;
+        tx.send(AgentEvent::ToolComplete {
+            tool_call_id: "start".into(),
+            result,
+        })
+        .await
+        .unwrap();
+        // A legal pending Storage read cannot finish until the runner is
+        // polled again. No sleep or scheduler timing selects this ordering.
+        runner_storage.read_entered.notified().await;
+        drop(writer);
+        tx.send(AgentEvent::ToolComplete {
+            tool_call_id: INTERACTION_CALL.into(),
+            // Foreign completions have no durable-before-publication promise:
+            // this deliberately unpaired, non-JSON result must not be loaded.
+            result: ToolResult::text(true, "ordinary foreign completion"),
+        })
+        .await
+        .unwrap();
+        Err(AgentError::Cancelled)
+    };
+    let (outcome, events) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        drive_interaction_and_observe(run, storage, rx),
+    )
+    .await
+    .expect("a pending Start observation must not strand the runner");
+    assert!(matches!(outcome, Err(AgentError::Cancelled)));
+    assert_eq!(events.len(), 2, "retain the Start and queued foreign event");
+    assert!(
+        matches!(&events[0], AgentEvent::ToolComplete { tool_call_id, .. }
+        if tool_call_id == "start")
+    );
+    assert!(
+        matches!(&events[1], AgentEvent::ToolComplete { tool_call_id, .. }
+        if tool_call_id == INTERACTION_CALL)
+    );
+    // A retained sender must not turn completion into a wait for channel close.
+    drop(retained_sender);
 }
 
 fn assert_no_interaction_wait(session: &Session) {
