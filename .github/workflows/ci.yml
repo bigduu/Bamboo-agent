@@ -13,8 +13,8 @@ on:
 permissions:
   contents: read
 
-# Queue every main push for its own release gate; supersede iterative PR/manual
-# validation independently. Full promotion validation still covers three platforms.
+# Feature PRs and exact dev diagnostics share the existing validation owners.
+# Main PRs perform only read-only promotion checks; newer inputs supersede older runs.
 concurrency:
   group: ci-${{ github.event_name }}-${{ (github.event_name == 'workflow_dispatch' && inputs.snapshot_sha) || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
