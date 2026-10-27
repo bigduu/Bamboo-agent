@@ -60,70 +60,98 @@ async fn authorize(
         .session_id()
         .and_then(|id| ctx.executing_caller_for(id))
         .ok_or_else(|| error("original executing caller is required"))?;
-    let caller = context_view::control_plane(tool, &original.session_id).await?;
+    let caller = if ctx.executing_supervisor_for(&original.session_id).is_some() {
+        tool.storage
+            .load_execution_admission_snapshot(&original.session_id)
+            .await
+            .map_err(error)?
+            .ok_or_else(|| error("canonical caller is unavailable"))?
+    } else {
+        context_view::control_plane(tool, &original.session_id).await?
+    };
     if !original.matches_session(&caller) {
         return Err(error("original caller changed"));
     }
     let fingerprint = caller_fingerprint(original)?;
     // An installed, revoked, stale or unsupported Host scope never becomes a
     // Supervisor compatibility grant. Lookup errors propagate without fallback.
-    let (target, route) = match tool
-        .storage
-        .find_host_session_scope(original)
-        .await
-        .map_err(error)?
+    let (target, route) = if let Some(supervisor) =
+        ctx.executing_supervisor_for(&original.session_id)
     {
-        Some(token) => {
-            let target = tool
-                .storage
-                .load_host_scoped_context_target(&token, original, target_id)
-                .await
-                .map_err(error)?;
-            let binding = token.binding();
-            (
-                target,
-                json!({"route":"host", "grant_id":binding.grant_id,
+        let reference = supervisor.supervisor_reference();
+        let (target, observed) = tool
+            .storage
+            .load_supervisor_context_target(&reference, target_id)
+            .await
+            .map_err(error)?;
+        if !observed.authorized {
+            return Err(error("canonical current-user target is unavailable"));
+        }
+        host_discovery::require_absent_host_for_legacy_history(tool.storage.as_ref(), ctx).await?;
+        (
+            target,
+            json!({"route":"current_user", "supervisor":reference}),
+        )
+    } else {
+        match tool
+            .storage
+            .find_host_session_scope(original)
+            .await
+            .map_err(error)?
+        {
+            Some(token) => {
+                let target = tool
+                    .storage
+                    .load_host_scoped_context_target(&token, original, target_id)
+                    .await
+                    .map_err(error)?;
+                let binding = token.binding();
+                (
+                    target,
+                    json!({"route":"host", "grant_id":binding.grant_id,
                 "revision":binding.revision}),
-            )
-        }
-        None if original.kind == SessionKind::Child => {
-            let (target, observer) = tool
-                .storage
-                .load_supervisor_observer_context_target(original, target_id)
-                .await
-                .map_err(error)?;
-            (target, json!({"route":"observer","registration":observer}))
-        }
-        None => {
-            let reference = ctx
-                .executing_supervisor_for(&original.session_id)
-                .ok_or_else(|| error("an explicit Host read scope is required"))?
-                .supervisor_reference();
-            let (target, observed) = tool
-                .storage
-                .load_supervisor_context_target(&reference, target_id)
-                .await
-                .map_err(error)?;
-            if !observed.authorized {
-                return Err(error("Supervisor link is not authorized"));
+                )
             }
-            host_discovery::require_absent_host_for_legacy_history(tool.storage.as_ref(), ctx)
-                .await?;
-            // The exact link epoch survives unrelated relationship/watermark
-            // writes. Scope revoke/regrant disables/increments this link.
-            (
-                target,
-                json!({"route":"supervisor", "supervisor":reference, "link":observed.link}),
-            )
+            None if original.kind == SessionKind::Child => {
+                let (target, observer) = tool
+                    .storage
+                    .load_supervisor_observer_context_target(original, target_id)
+                    .await
+                    .map_err(error)?;
+                (target, json!({"route":"observer","registration":observer}))
+            }
+            None => {
+                let reference = ctx
+                    .executing_supervisor_for(&original.session_id)
+                    .ok_or_else(|| error("an explicit Host read scope is required"))?
+                    .supervisor_reference();
+                let (target, observed) = tool
+                    .storage
+                    .load_supervisor_context_target(&reference, target_id)
+                    .await
+                    .map_err(error)?;
+                if !observed.authorized {
+                    return Err(error("Supervisor link is not authorized"));
+                }
+                host_discovery::require_absent_host_for_legacy_history(tool.storage.as_ref(), ctx)
+                    .await?;
+                // The exact link epoch survives unrelated relationship/watermark
+                // writes. Scope revoke/regrant disables/increments this link.
+                (
+                    target,
+                    json!({"route":"supervisor", "supervisor":reference, "link":observed.link}),
+                )
+            }
         }
     };
     if target.id != target_id
-        || target.kind != SessionKind::Root
-        || target.parent_session_id.is_some()
+        || !target.authority_identity.is_ordinary()
+        || (target.kind == SessionKind::Root && target.parent_session_id.is_some())
+        || (target.kind == SessionKind::Child && target.parent_session_id.is_none())
         || !target.messages.is_empty()
     {
         return Err(error(
-            "strict independent Root control-plane source required",
+            "strict canonical Session control-plane source required",
         ));
     }
     let authority = json!({"caller_sha256":fingerprint, "route":route,

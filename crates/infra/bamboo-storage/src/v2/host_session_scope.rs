@@ -56,8 +56,12 @@ pub(crate) struct HostScopedDeliveryGuards {
 }
 
 enum LegacySessionDeliveryAuthority {
-    Peer { _guard: PeerDeliveryGuard },
-    Supervisor { _guard: SupervisorFollowupGuard },
+    Peer {
+        _guard: PeerDeliveryGuard,
+    },
+    Supervisor {
+        _guard: Box<super::supervisor_management::CurrentUserTargetGuard>,
+    },
 }
 
 /// Compatibility authority, with a retained never-installed publication fence.
@@ -65,7 +69,7 @@ enum LegacySessionDeliveryAuthority {
 pub(crate) struct LegacySessionDeliveryGuards {
     pub(crate) inbox_dir: PathBuf,
     _authority: LegacySessionDeliveryAuthority,
-    _absence: HostSessionScopeAbsence,
+    _absence: Option<HostSessionScopeAbsence>,
 }
 
 impl SessionStoreV2 {
@@ -95,7 +99,7 @@ impl SessionStoreV2 {
         Ok(LegacySessionDeliveryGuards {
             inbox_dir: authority.inbox_dir.clone(),
             _authority: LegacySessionDeliveryAuthority::Peer { _guard: authority },
-            _absence: absence,
+            _absence: Some(absence),
         })
     }
 
@@ -114,23 +118,21 @@ impl SessionStoreV2 {
         {
             return Err(denied("host_session_legacy_caller_mismatch"));
         }
-        let absence = self
-            .host_scope_registry
-            .retain_never_installed(&caller.session_id)
-            .await?;
-        let authority = self.lock_supervisor_followup(supervisor, target_id).await?;
-        let current = self
-            .peer_delivery_session(&caller.session_id, &caller.root_session_id)
-            .await?;
-        if !caller.matches_session(&current) {
+        let authority = self.lock_current_user_target(supervisor, target_id).await?;
+        if !caller.matches_session(&authority.source) {
             return Err(denied("host_session_operation_caller_changed"));
         }
+        let relative = if authority.target.kind == SessionKind::Root {
+            Self::root_rel_path(target_id)
+        } else {
+            Self::child_rel_path(&authority.target.root_session_id, target_id)
+        };
         Ok(LegacySessionDeliveryGuards {
-            inbox_dir: self
-                .abs_path_from_rel(&Self::root_rel_path(target_id))
-                .join("inbox"),
-            _authority: LegacySessionDeliveryAuthority::Supervisor { _guard: authority },
-            _absence: absence,
+            inbox_dir: self.abs_path_from_rel(&relative).join("inbox"),
+            _authority: LegacySessionDeliveryAuthority::Supervisor {
+                _guard: Box::new(authority),
+            },
+            _absence: None,
         })
     }
 

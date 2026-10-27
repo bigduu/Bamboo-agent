@@ -96,13 +96,10 @@ impl TicketApplication {
                             .into(),
                     ));
                 }
-                let mut supervisor = storage
+                let supervisor = storage
                     .load_root_authority(&receipt.session_id)
                     .await?
                     .ok_or_else(|| Error::AuthorityUnavailable("new Supervisor missing".into()))?;
-                supervisor
-                    .set_root_orchestration_only(true)
-                    .map_err(|e| Error::InvalidTransition(e.to_string()))?;
                 (supervisor, true)
             }
             None => {
@@ -133,14 +130,16 @@ impl TicketApplication {
             ScopeBinding {
                 scope_id: format!("supervisor/{incarnation_id}"),
                 supervisor_session_id: supervisor.id.clone(),
-                binding_revision: supervisor.root_tool_authority_revision,
+                binding_revision: supervisor
+                    .supervisor_orchestration_revision()
+                    .expect("canonical Supervisor was checked"),
             }
         } else {
             ticket_runtime::verified_scope_binding(storage, &supervisor.id)
                 .await?
                 .0
         };
-        let service = TicketService::open(scope_root, binding)?;
+        let service = TicketService::open_supervisor_mode_compatible(scope_root, binding)?;
         #[cfg(feature = "ticket-runtime-fixtures")]
         Self::install_fixture_fault(&service)?;
         if freshly_created {
@@ -347,16 +346,12 @@ impl TicketApplication {
 
     pub async fn authority(&self, principal: Principal) -> Result<(Arc<TicketService>, Authority)> {
         let service = self.service()?;
-        let (binding, _) = ticket_runtime::verified_scope_binding(
+        let (binding, _) = ticket_runtime::verified_scope_binding_for_service(
             self.storage.as_ref(),
+            &service,
             DEFAULT_SUPERVISOR_SESSION_ID,
         )
         .await?;
-        if service.published()?.1.binding != binding {
-            return Err(Error::ScopeDenied(
-                "Supervisor scope binding changed".into(),
-            ));
-        }
         Ok((service, Authority::from_verified_host(binding, principal)))
     }
 

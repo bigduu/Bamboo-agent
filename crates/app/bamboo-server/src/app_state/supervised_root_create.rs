@@ -79,29 +79,62 @@ fn io_code(error: &std::io::Error) -> &'static str {
 
 #[async_trait]
 impl SupervisedRootCreatePort for SupervisedRootCreator {
+    async fn scope_observed(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+    ) -> Result<ToolResult, ToolError> {
+        self.caller_port().scope(caller).await
+    }
+
+    async fn create_observed(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        request: SupervisedRootCreateRequest,
+    ) -> Result<ToolResult, ToolError> {
+        self.caller_port().create(caller, request).await
+    }
+
     async fn scope(&self, supervisor: &SupervisorReference) -> Result<ToolResult, ToolError> {
         let scope = self
             .store
-            .inspect_supervisor_scope(supervisor)
+            .inspect_supervisor_current_user_scope(supervisor)
             .await
             .map_err(|error| ToolError::Execution(format!("{}: {error}", io_code(&error))))?;
+        let legacy = self
+            .store
+            .inspect_supervisor_scope(supervisor)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let projects: Vec<_> = self.projects.list()
+            .map_err(|error| ToolError::Execution(format!("Project catalog unavailable: {error}")))?
+            .into_iter().map(|project| json!({
+                "id":project.id,"name":project.name,"status":project.status,
+                "project_path":project.project_path,"workspace_bindings":project.workspace_bindings,
+            })).collect();
+        if self
+            .store
+            .inspect_supervisor_current_user_scope(supervisor)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?
+            != scope
+        {
+            return Err(ToolError::Execution(
+                "Supervisor scope changed during observation".into(),
+            ));
+        }
         Ok(ToolResult::text(true, json!({
             "action":"scope", "supervisor":scope.supervisor,
-            "state_revision":scope.state_revision, "allowed_projects":scope.allowed_projects,
-            "create_route_exposed":true, "project_scope_configured":!scope.allowed_projects.is_empty(),
-            "code":if scope.allowed_projects.is_empty() {"project_scope_uninitialized"} else {"project_scope_configured"},
-            "owner_action":{
-                "method":"PUT", "path":"/api/v1/supervisor/default/scope",
-                "requires":"existing_access", "model_callable":false,
-                "required_fields":["incarnation_id","expected_state_revision","allowed_projects"],
-                "next_step":"Using the existing application access mode, the owner checks GET /api/v1/supervisor/default/scope and explicitly submits the complete selected Project set through PUT. Then read scope again and use the selected Project and existing bound workspace with create under its separate tool approval.",
-                "note":"The owner must explicitly select the complete existing active Project set using the current incarnation and management revision. Project scope is independent of workspace binding, native tool approval and Work initialization. Never issue this owner action through another tool or auto-grant Projects."
-            },
+            "authority":"current_user", "state_revision":scope.legacy_state_revision,
+            "orchestration_revision":scope.orchestration_revision,
+            "allowed_projects":legacy.allowed_projects, "legacy_scope_is_authorization":false,
+            "projects":projects, "requires_project_authorization":false,
+            "create_route_exposed":true, "project_scope_configured":true,
+            "code":"current_user_scope_ready", "owner_action":null,
             "work_scope":{
                 "availability":"not_observed", "status_path":"/api/v1/tickets/scope",
-                "note":"Formal Work has its own identity/mode, feature, binding and health checks. Its owner initialization is permitted only when that endpoint returns can_initialize=true with the current initialization payload. It grants no Project scope or shell/build permission. If an independent implementation route is blocked, report its specific blocker; a read-only Child is not that implementation."
+                "note":"Formal Work retains its own feature, binding and health checks. Initialize only with the current canonical can_initialize payload; this observation never initializes Work or changes worker permissions."
             },
-            "note":"Only these existing Host-authorized Projects may receive a new Ordinary Root. The workspace must already be bound to the explicit Project. This observation is not a grant and never initializes Work, changes permissions or attaches historical Sessions."
+            "note":"The canonical Supervisor manages Projects/Sessions in this application's current user domain by default, independently of Standard/Ultra. No Project selection or Session attachment is required. Creation still validates the selected Project and bound workspace, and workers keep their own tool/approval permissions. Legacy lists are compatibility metadata, never an OS/file grant."
         }).to_string()))
     }
 

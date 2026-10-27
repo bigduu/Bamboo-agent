@@ -49,6 +49,27 @@ pub trait SupervisedRootCreatePort: Send + Sync {
         supervisor: &SupervisorReference,
         request: SupervisedRootCreateRequest,
     ) -> Result<ToolResult, ToolError>;
+
+    /// Model-facing calls retain the complete original execution observation.
+    /// Unsupported/custom legacy ports cannot reconstruct it from a new read.
+    async fn scope_observed(
+        &self,
+        _caller: &SessionCallerReference,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::Execution(
+            "original-caller Root scope is unsupported".into(),
+        ))
+    }
+
+    async fn create_observed(
+        &self,
+        _caller: &SessionCallerReference,
+        _request: SupervisedRootCreateRequest,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::Execution(
+            "original-caller Root creation is unsupported".into(),
+        ))
+    }
 }
 
 /// Role-neutral Host seam. A caller reference identifies the original lifetime;

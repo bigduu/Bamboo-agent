@@ -11,6 +11,7 @@ use crate::{ProjectId, SupervisorBootstrapReceipt, DEFAULT_SUPERVISOR_SESSION_ID
 pub const SUPERVISOR_MANAGEMENT_SCHEMA_VERSION: u32 = 1;
 pub const SUPERVISOR_OBSERVER_SCHEMA_VERSION: u32 = 2;
 pub const SUPERVISOR_SUBSCRIPTION_SCHEMA_VERSION: u32 = 3;
+pub const SUPERVISOR_CURRENT_USER_MANAGEMENT_SCHEMA_VERSION: u32 = 4;
 pub const MAX_SUPERVISOR_OBSERVERS: usize = 8;
 pub const MAX_SUPERVISOR_OBSERVER_TARGETS: usize = 8;
 pub const MAX_SUPERVISOR_PROJECTS: usize = 64;
@@ -55,6 +56,14 @@ pub struct SupervisorObserverRegistration {
     pub parent_created_at: DateTime<Utc>,
     pub child_created_at: DateTime<Utc>,
     pub target_links: BTreeMap<String, SupervisorManagedLink>,
+    /// New explicit target snapshots do not depend on the parent's deprecated
+    /// global attachment table. Old records remain false and byte-compatible.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub current_user_targets: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +115,7 @@ impl SupervisorManagementState {
             SUPERVISOR_MANAGEMENT_SCHEMA_VERSION
                 | SUPERVISOR_OBSERVER_SCHEMA_VERSION
                 | SUPERVISOR_SUBSCRIPTION_SCHEMA_VERSION
+                | SUPERVISOR_CURRENT_USER_MANAGEMENT_SCHEMA_VERSION
         ) || (self.schema_version == SUPERVISOR_MANAGEMENT_SCHEMA_VERSION
             && !self.observers.is_empty())
             || (self.schema_version < SUPERVISOR_SUBSCRIPTION_SCHEMA_VERSION
@@ -144,15 +154,24 @@ impl SupervisorManagementState {
                 || observer.revision > self.revision
                 || observer.target_links.is_empty()
                 || observer.target_links.len() > MAX_SUPERVISOR_OBSERVER_TARGETS
+                || (observer.current_user_targets
+                    && self.schema_version < SUPERVISOR_CURRENT_USER_MANAGEMENT_SCHEMA_VERSION)
             {
                 return Err("invalid Supervisor Observer registration");
             }
             for (target, link) in &observer.target_links {
                 validate_supervisor_target_id(target)?;
-                if target == id || !link.enabled || link.revision == 0 {
+                if target == id
+                    || !link.enabled
+                    || link.revision == 0
+                    || link.revision > observer.revision
+                {
                     return Err("invalid Supervisor Observer target");
                 }
-                if observer.enabled && self.links.get(target) != Some(link) {
+                if observer.enabled
+                    && !observer.current_user_targets
+                    && self.links.get(target) != Some(link)
+                {
                     return Err("enabled Supervisor Observer has a stale target link");
                 }
             }

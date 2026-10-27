@@ -84,6 +84,58 @@ fn create(service: &TicketService, title: &str, dependencies: BTreeSet<String>) 
 }
 
 #[test]
+fn supervisor_mode_compatibility_preserves_sealed_binding_work_and_receipts() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("scope");
+    let original = TicketService::open(&root, binding()).unwrap();
+    let work_id = create(&original, "mode-independent", BTreeSet::new());
+    let before = original.published().unwrap().1;
+    drop(original);
+    let before_head = std::fs::read(root.join("HEAD")).unwrap();
+    let mut stable = binding();
+    stable.binding_revision = 1;
+
+    // Ordinary exact opening still refuses a different revision and changes no HEAD.
+    let strict = TicketService::open(&root, stable.clone()).unwrap();
+    assert!(matches!(strict.health(), Health::ReadOnly { .. }));
+    assert!(strict.binding_mismatch());
+    assert!(strict.published().is_err());
+    drop(strict);
+    assert_eq!(std::fs::read(root.join("HEAD")).unwrap(), before_head);
+
+    let reopened = TicketService::open_supervisor_mode_compatible(&root, stable).unwrap();
+    let after = reopened.published().unwrap().1;
+    assert_eq!(reopened.health(), Health::Writable);
+    assert_eq!(after.binding, before.binding);
+    assert_eq!(after.tickets[&work_id], before.tickets[&work_id]);
+    assert_eq!(after.receipts, before.receipts);
+    // Compatibility retains normal writer-restart fencing, not an old Worker lease.
+    assert!(after.authority_epoch > before.authority_epoch);
+}
+
+#[test]
+fn supervisor_mode_compatibility_denies_other_namespaces_and_zero_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("scope");
+    drop(TicketService::open(&root, binding()).unwrap());
+    let head = std::fs::read(root.join("HEAD")).unwrap();
+    for field in ["scope", "supervisor", "revision"] {
+        let mut wrong = binding();
+        match field {
+            "scope" => wrong.scope_id = "other-incarnation".into(),
+            "supervisor" => wrong.supervisor_session_id = "ordinary-root".into(),
+            _ => wrong.binding_revision = 0,
+        }
+        let denied = TicketService::open_supervisor_mode_compatible(&root, wrong).unwrap();
+        assert!(matches!(denied.health(), Health::ReadOnly { .. }));
+        assert!(denied.binding_mismatch());
+        assert!(denied.published().is_err());
+        drop(denied);
+        assert_eq!(std::fs::read(root.join("HEAD")).unwrap(), head);
+    }
+}
+
+#[test]
 fn empty_update_and_dispatch_do_not_publish_or_invalidate_a_valid_command() {
     for dispatch in [false, true] {
         let dir = tempfile::tempdir().unwrap();

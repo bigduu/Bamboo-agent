@@ -18,6 +18,9 @@ on:
       - 'crates/infra/bamboo-storage/src/v2/supervisor_current_user.rs'
       - 'crates/app/bamboo-server-tools/src/session_inspector/**'
       - 'crates/engine/bamboo-engine/src/ticket_runtime.rs'
+      - 'crates/infra/bamboo-tickets/src/service.rs'
+      - 'crates/infra/bamboo-tickets/src/store.rs'
+      - 'crates/infra/bamboo-tickets/tests/service_contract.rs'
       - '.github/workflows/supervisor-role-acceptance.yml'
 
 permissions:
@@ -64,7 +67,13 @@ jobs:
           set -euo pipefail
           cargo test --locked -p bamboo-storage --test supervisor_current_user_scope \
             -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/supervisor-current-user.log"
-          grep -Fq 'test result: ok. 5 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-current-user.log"
+          grep -Fq 'test result: ok. 7 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-current-user.log"
+      - name: Verify existing Work binding survives Supervisor mode changes
+        run: |
+          set -euo pipefail
+          cargo test --locked -p bamboo-tickets --test service_contract supervisor_mode_compatibility_ \
+            -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/supervisor-work-mode.log"
+          grep -Fq 'test result: ok. 2 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-work-mode.log"
       - name: Verify direct file and process denial in both modes
         run: |
           set -euo pipefail
@@ -107,7 +116,7 @@ jobs:
       - name: Check affected production libraries under the original lint policy
         run: >-
           cargo clippy --locked --all-features --lib
-          -p bamboo-domain -p bamboo-agent-core -p bamboo-engine -p bamboo-server-tools -p bamboo-storage --
+          -p bamboo-domain -p bamboo-agent-core -p bamboo-engine -p bamboo-server-tools -p bamboo-storage -p bamboo-tickets --
           -D warnings -A deprecated -A clippy::module_inception
           -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
           -A clippy::too-many-arguments -A clippy::while-let-loop

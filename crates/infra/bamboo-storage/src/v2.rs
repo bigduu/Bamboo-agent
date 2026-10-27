@@ -157,7 +157,7 @@ mod root_mode_actor_context_tests;
 mod supervisor;
 mod supervisor_management;
 pub(crate) use supervisor_management::{
-    subscriptions::ObserverNoticeAuthority, SupervisorFollowupGuard,
+    subscriptions::ObserverNoticeAuthority, CurrentUserTargetGuard, SupervisorFollowupGuard,
 };
 #[cfg(test)]
 mod supervisor_management_lifetime_tests;

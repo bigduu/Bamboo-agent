@@ -9,6 +9,8 @@ use bamboo_domain::{
 pub(crate) struct CurrentUserTargetGuard {
     pub(crate) source: Session,
     pub(crate) target: Session,
+    pub(crate) inbox_dir: PathBuf,
+    pub(crate) reference: SupervisorCurrentUserTarget,
     pub(crate) _authority: super::super::host_session_scope::HostScopedSessionGuards,
 }
 
@@ -41,6 +43,9 @@ impl SessionStoreV2 {
             .await
             .map_err(|error| other_io_error(error.to_string()))?;
         let (_, root_id) = Self::copy_source_identity_from_rel(target_id, &relative)?;
+        self.load_root_authority_unchecked(&root_id)
+            .await?
+            .ok_or_else(|| denied("canonical target Root authority is unavailable"))?;
         let target = self.peer_delivery_session(target_id, &root_id).await?;
         let actor = bamboo_domain::ActorSession::from_session(&target)
             .map_err(|error| denied(&error.to_string()))?;
@@ -63,12 +68,24 @@ impl SessionStoreV2 {
     ) -> io::Result<CurrentUserTargetGuard> {
         reference_is_valid(reference)?;
         target_id_is_valid(target_id)?;
-        let source = self
+        let proof = self
             .load_root_authority(&reference.session_id)
             .await?
             .ok_or_else(|| denied("canonical Supervisor is unavailable"))?;
-        if source.supervisor_incarnation_id() != Some(reference.incarnation_id) {
+        if proof.supervisor_incarnation_id() != Some(reference.incarnation_id) {
             return Err(denied("Supervisor current-user incarnation changed"));
+        }
+        // Compatible legacy pairs can have different optional session_version
+        // values in Main and the control sidecar. Capture the same full merged
+        // representation that the final guard compares, after checking proof;
+        // never rewrite either file merely to normalize an observation.
+        let source = self
+            .peer_delivery_session(&reference.session_id, &reference.session_id)
+            .await?;
+        if source.created_at != proof.created_at
+            || source.authority_identity != proof.authority_identity
+        {
+            return Err(denied("Supervisor proof and full source lifetime changed"));
         }
         let caller = HostScopeSessionObservation::capture(&source, vec![])
             .map_err(|error| denied(&error.to_string()))?;
@@ -78,16 +95,37 @@ impl SessionStoreV2 {
             .await?;
         // Re-read protected proof while the same source/target/ancestry guards
         // are held. Copying serialized observations never creates authority.
-        let source = self.management_supervisor_locked(reference).await?;
+        let proof = self.management_supervisor_locked(reference).await?;
+        let source = self
+            .peer_delivery_session(&reference.session_id, &reference.session_id)
+            .await?;
+        if source.created_at != proof.created_at
+            || source.authority_identity != proof.authority_identity
+        {
+            return Err(denied("Supervisor proof and full source lifetime changed"));
+        }
+        self.load_root_authority_unchecked(&target.identity.root_session_id)
+            .await?
+            .ok_or_else(|| denied("canonical target Root authority changed"))?;
         let current = self
             .peer_delivery_session(target_id, &target.identity.root_session_id)
             .await?;
         target
             .check_session(&current)
             .map_err(|error| denied(&error.to_string()))?;
+        let reference =
+            SupervisorCurrentUserTarget::capture_with_ancestors(&current, &target.ancestors)
+                .map_err(denied)?;
+        let relative = if current.kind == SessionKind::Root {
+            Self::root_rel_path(target_id)
+        } else {
+            Self::child_rel_path(&current.root_session_id, target_id)
+        };
         Ok(CurrentUserTargetGuard {
             source,
             target: current,
+            inbox_dir: self.abs_path_from_rel(&relative).join("inbox"),
+            reference,
             _authority: authority,
         })
     }
@@ -98,7 +136,7 @@ impl SessionStoreV2 {
         target_id: &str,
     ) -> io::Result<SupervisorCurrentUserTarget> {
         let guard = self.lock_current_user_target(reference, target_id).await?;
-        SupervisorCurrentUserTarget::capture(&guard.target).map_err(denied)
+        Ok(guard.reference.clone())
     }
 
     pub(crate) async fn current_user_supervisor_link(
@@ -223,8 +261,7 @@ impl SessionStoreV2 {
                 "Supervisor directory caller changed",
             ));
         }
-        let next_after =
-            (targets.len() > limit).then(|| targets[limit - 1].original.session_id.clone());
+        let next_after = (targets.len() > limit).then(|| targets[limit - 1].session_id.clone());
         targets.truncate(limit);
         Ok(SupervisorCurrentUserPage {
             scope,

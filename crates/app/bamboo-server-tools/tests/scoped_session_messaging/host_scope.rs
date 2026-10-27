@@ -164,6 +164,7 @@ async fn unsupported_host_inbox_never_retries_through_legacy_delivery() {
                 operation_id: "unsupported-operation".into(),
                 message: "bounded input".into(),
                 delivery_intent: Some(SessionMessageDeliveryIntent::QueueOnly),
+                target_ref: None,
             },
         )
         .await
@@ -490,6 +491,7 @@ async fn host_trigger_failure_preserves_receipt_and_acked_retry_does_not_reactiv
         operation_id: "trigger-operation".into(),
         message: "instruction".into(),
         delivery_intent: Some(SessionMessageDeliveryIntent::TriggerTurn),
+        target_ref: None,
     };
     f.activation.fail.store(true, Ordering::SeqCst);
     let error = sender

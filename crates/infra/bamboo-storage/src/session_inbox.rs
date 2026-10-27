@@ -2541,7 +2541,7 @@ impl SessionInboxPort for FileSessionInbox {
         }
         let authority = self
             .sessions
-            .lock_supervisor_followup(supervisor, &envelope.target_session_id)
+            .lock_current_user_target(supervisor, &envelope.target_session_id)
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
         #[cfg(test)]
@@ -2554,7 +2554,83 @@ impl SessionInboxPort for FileSessionInbox {
         // operation lock, semantic receipt and Maildir transaction as deliver.
         self.deliver_with_lifecycle_held(
             envelope,
-            InboxAuthority::Supervisor { _guard: authority },
+            InboxAuthority::CurrentSupervisor {
+                _guard: Box::new(authority),
+            },
+            None,
+            Some(SessionInboxActivationIntent::new(
+                SessionActivationPolicy::RespectSpecificWait,
+            )),
+        )
+        .await
+    }
+
+    async fn deliver_supervisor_current_user_followup(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        envelope: &SessionMessageEnvelope,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        let invalid = |message: &str| SessionInboxError::InvalidClaim(message.into());
+        let operation = envelope
+            .correlation_id
+            .as_deref()
+            .ok_or_else(|| invalid("current-user followup operation is missing"))?;
+        bamboo_domain::SessionMessageId::parse(operation)
+            .map_err(|error| invalid(&error.to_string()))?;
+        let text = match &envelope.body {
+            bamboo_domain::SessionMessageBody::Content(content)
+                if content.parts.is_empty() && content.skill_request.is_none() =>
+            {
+                &content.text
+            }
+            _ => return Err(invalid("current-user followup requires bounded text")),
+        };
+        if caller.session_id != supervisor.session_id
+            || caller.authority_identity
+                != (bamboo_domain::SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: supervisor.incarnation_id,
+                })
+            || envelope.source
+                != (SessionMessageSource::Session {
+                    session_id: caller.session_id.clone(),
+                })
+            || envelope.target_session_id != target.session_id
+            || envelope.id
+                != bamboo_domain::supervisor_current_user_message_id(supervisor, target, operation)
+            || envelope.kind != bamboo_domain::SessionMessageKind::PeerMessage
+            || envelope.thread_id.is_some()
+            || envelope.in_reply_to.is_some()
+            || envelope.attempt.is_some()
+            || text.trim().is_empty()
+            || text.contains('\0')
+            || text.len() > bamboo_domain::MAX_SESSION_PEER_MESSAGE_BYTES
+        {
+            return Err(invalid(
+                "current-user followup identity or envelope mismatch",
+            ));
+        }
+        let authority = self
+            .sessions
+            .lock_current_user_target(supervisor, &target.session_id)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        if !caller.matches_session(&authority.source) || *target != authority.reference {
+            return Err(invalid(
+                "current-user original caller or target lifetime changed",
+            ));
+        }
+        #[cfg(test)]
+        if let Some((entered, release)) = &self.followup_authority_pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+        self.deliver_with_lifecycle_held(
+            envelope,
+            InboxAuthority::CurrentSupervisor {
+                _guard: Box::new(authority),
+            },
             None,
             Some(SessionInboxActivationIntent::new(
                 SessionActivationPolicy::RespectSpecificWait,

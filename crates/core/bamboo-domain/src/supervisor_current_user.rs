@@ -4,8 +4,9 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::{ProjectId, Session, SessionCallerReference, SupervisorReference};
+use crate::{ProjectId, Session, SessionCallerReference, SessionKind, SupervisorReference};
 
 pub const MAX_SUPERVISOR_DIRECTORY_PAGE: usize = 20;
 
@@ -23,15 +24,31 @@ pub struct SupervisorCurrentUserScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupervisorCurrentUserTarget {
-    /// Full original identity/generation observation. The final writer matches
-    /// this against canonical state while retaining physical ancestry locks.
-    pub original: SessionCallerReference,
+    pub session_id: String,
+    pub created_at: DateTime<Utc>,
+    pub kind: SessionKind,
+    pub root_session_id: String,
+    pub parent_session_id: Option<String>,
+    /// Commitment to the full original identity/generation/workspace, without
+    /// exporting its reset receipt ledger or workspace bytes into every page.
+    /// A hash is an observation, not a grant; the final writer recomputes it.
+    pub authority_sha256: String,
+    /// Commitment to the canonical ancestor births and observations selected
+    /// with this target. A Child cannot outlive an observed parent generation.
+    pub ancestry_sha256: String,
     pub metadata_version: u64,
     pub project_id: Option<ProjectId>,
 }
 
 impl SupervisorCurrentUserTarget {
     pub fn capture(session: &Session) -> Result<Self, &'static str> {
+        Self::capture_with_ancestors(session, &[])
+    }
+
+    pub fn capture_with_ancestors(
+        session: &Session,
+        ancestors: &[crate::ActorAncestorObservation],
+    ) -> Result<Self, &'static str> {
         session
             .validate_conversation_state()
             .map_err(|_| "invalid target conversation authority")?;
@@ -40,8 +57,21 @@ impl SupervisorCurrentUserTarget {
         if !session.authority_identity.is_ordinary() {
             return Err("current-user target must have ordinary Session authority");
         }
+        crate::HostScopeSessionObservation::capture(session, ancestors.to_vec())
+            .map_err(|_| "invalid canonical target ancestry")?;
         Ok(Self {
-            original: SessionCallerReference::from(session),
+            session_id: session.id.clone(),
+            created_at: session.created_at,
+            kind: session.kind,
+            root_session_id: session.root_session_id.clone(),
+            parent_session_id: session.parent_session_id.clone(),
+            authority_sha256: hex::encode(Sha256::digest(
+                serde_json::to_vec(&SessionCallerReference::from(session))
+                    .map_err(|_| "invalid target authority encoding")?,
+            )),
+            ancestry_sha256: hex::encode(Sha256::digest(
+                serde_json::to_vec(ancestors).map_err(|_| "invalid target ancestry encoding")?,
+            )),
             metadata_version: session.metadata_version,
             project_id: session
                 .project_id_meta()
@@ -75,8 +105,8 @@ pub fn supervisor_current_user_message_id(
         "supervisor_current_user_followup_v1",
         &serde_json::json!({
             "supervisor":supervisor,
-            "target_id":target.original.session_id,
-            "target_created_at":target.original.created_at,
+            "target_id":target.session_id,
+            "target_created_at":target.created_at,
             "operation_id":operation_id,
         }),
     )

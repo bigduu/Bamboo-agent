@@ -118,6 +118,22 @@ impl TicketService {
         Self::from_store(FileStore::open(root.as_ref(), binding)?)
     }
 
+    /// Host-only compatibility for the now mode-independent Supervisor role.
+    /// The Host must first verify canonical Supervisor identity. Existing
+    /// positive binding revisions are preserved only within that exact scope
+    /// and Supervisor namespace. Normal writer-restart reconciliation still runs;
+    /// this preserves the binding and never rebinds old Work or receipts.
+    /// Ordinary/Worker/offline callers retain the exact `open` contract.
+    pub fn open_supervisor_mode_compatible(
+        root: impl AsRef<Path>,
+        binding: ScopeBinding,
+    ) -> Result<Self> {
+        Self::from_store(FileStore::open_supervisor_mode_compatible(
+            root.as_ref(),
+            binding,
+        )?)
+    }
+
     /// Create only an empty scope; never attach, import or recover existing bytes.
     pub fn initialize_empty(root: impl AsRef<Path>, binding: ScopeBinding) -> Result<Self> {
         Self::from_store(FileStore::initialize_empty(root.as_ref(), binding)?)
