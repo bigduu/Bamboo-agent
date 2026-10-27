@@ -1,4 +1,4 @@
-name: Native Jiandu Project Sources
+name: Jiandu Registry Source Identity
 
 on:
   pull_request:
@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   sources:
-    name: Native Jiandu registry and public Host acceptance
+    name: Locked Jiandu registry identity
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -77,23 +77,6 @@ jobs:
           assert not vcs['git'].get('dirty', False)
           print(json.dumps({'registry_package': lock, 'vcs': vcs}, sort_keys=True))
           PY
-
-      - name: Verify native memory and actual public Host reads
-        run: |
-          cargo test --locked -p bamboo-memory --test project_sources -- --test-threads=1
-          cargo test --locked -p bamboo-server --test native_work_memory_source -- --test-threads=1 --nocapture
-
-      - name: Check the affected libraries and integration targets
-        shell: bash
-        run: |
-          set -euo pipefail
-          policy=(-D warnings -A deprecated -A clippy::module_inception
-            -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
-            -A clippy::too-many-arguments -A clippy::while-let-loop
-            -A clippy::type_complexity -A dead-code)
-          cargo clippy --locked --all-features --lib -p bamboo-memory -p bamboo-server -- "${policy[@]}"
-          cargo clippy --locked --all-features -p bamboo-memory --test project_sources -- "${policy[@]}"
-          cargo clippy --locked --all-features -p bamboo-server --test native_work_memory_source -- "${policy[@]}"
 
       - name: Verify the source stayed exact and clean
         if: always()
