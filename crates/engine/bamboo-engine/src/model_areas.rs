@@ -29,6 +29,10 @@ use crate::model_config_helper::{
     try_resolve_fast_model, try_resolve_task_summary_model,
 };
 
+#[cfg(test)]
+#[path = "model_areas_live_tests.rs"]
+mod live_tests;
+
 /// The auxiliary (non-chat) models, all resolved from **global** config for a
 /// given provider routing key. None of these are session-bound.
 ///

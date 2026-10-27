@@ -40,7 +40,16 @@ impl CaptureProvider {
                 }
             });
         }
-        let chunk = if purpose == "gold_evaluation" {
+        let chunk = if purpose == "final_evidence_check" {
+            LLMChunk::ToolCalls(vec![ToolCall {
+                id: "synthetic-evidence".into(),
+                tool_type: "function".into(),
+                function: bamboo_agent_core::tools::FunctionCall {
+                    name: tools[0].function.name.clone(),
+                    arguments: serde_json::json!({"verdict":"supported", "corrected_answer":"", "reason":"synthetic routing witness", "evidence_ids":["check-1"]}).to_string(),
+                },
+            }])
+        } else if purpose == "gold_evaluation" {
             LLMChunk::ToolCalls(vec![ToolCall {
                 id: "synthetic-gold".into(),
                 tool_type: "function".into(),

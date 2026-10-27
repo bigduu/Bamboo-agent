@@ -2199,6 +2199,27 @@ async fn abort_in_flight_evaluations(
     }
 }
 
+fn start_queued_task_evaluation_if_idle(
+    state: &mut LoopRunState,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    cancel_token: CancellationToken,
+    configured_limit: usize,
+) {
+    if state.task_evaluation.in_flight.is_some() {
+        return;
+    }
+    if let Some(request) = state.task_evaluation.queued_request.take() {
+        spawn_task_evaluation_request(
+            state,
+            event_tx,
+            request.request,
+            request.provider,
+            cancel_token,
+            configured_limit,
+        );
+    }
+}
+
 fn spawn_task_evaluation_if_needed(
     turn: usize,
     session: &Session,
@@ -2648,11 +2669,17 @@ async fn handle_no_tool_calls_with_native(
                 evidence_llm
             };
             let fallback_model = if config.auxiliary_model_resolver.is_some() {
-                config.model_name.as_deref().unwrap_or(eval_model)
+                config.model_name.as_deref().unwrap_or(&session.model)
             } else {
                 eval_model
             };
-            let target = auxiliary.fast_target(fallback_provider, fallback_model)?;
+            let target = if crate::runtime::final_evidence::has_tool_evidence(session) {
+                auxiliary.fast_target(fallback_provider, fallback_model)?
+            } else {
+                // No request will be sent. Preserve the existing skipped-check
+                // accounting even when an unused auxiliary role is invalid.
+                bamboo_llm::ResolvedModel::new(fallback_provider, fallback_model)
+            };
             super::final_answer::check(
                 session,
                 runtime_state,
@@ -3205,18 +3232,12 @@ async fn run_pipeline_inner(
         refresh_auxiliary_models_for_round(state, config);
         poll_completed_task_evaluation(state).await;
         apply_completed_task_evaluation(session, event_tx, config, state).await;
-        if state.task_evaluation.in_flight.is_none() {
-            if let Some(request) = state.task_evaluation.queued_request.take() {
-                spawn_task_evaluation_request(
-                    state,
-                    event_tx,
-                    request.request,
-                    request.provider,
-                    cancel_token.clone(),
-                    config.auxiliary_evaluation_max_concurrency,
-                );
-            }
-        }
+        start_queued_task_evaluation_if_idle(
+            state,
+            event_tx,
+            cancel_token.clone(),
+            config.auxiliary_evaluation_max_concurrency,
+        );
         poll_completed_gold_evaluation(state).await;
         apply_completed_gold_evaluation(session, config, state).await;
         start_queued_gold_evaluation_if_idle(
@@ -14473,6 +14494,10 @@ mod tests {
 #[cfg(test)]
 #[path = "pipeline_final_evidence_tests.rs"]
 mod final_evidence_tests;
+
+#[cfg(test)]
+#[path = "pipeline_model_routing_tests.rs"]
+mod model_routing_tests;
 
 #[cfg(all(test, unix))]
 #[path = "pipeline_exec_sessions_tests.rs"]

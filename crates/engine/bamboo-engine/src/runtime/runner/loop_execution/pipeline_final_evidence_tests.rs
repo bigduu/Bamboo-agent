@@ -259,6 +259,72 @@ async fn disabled_check_keeps_the_original_final_answer_without_an_auxiliary_cal
 }
 
 #[tokio::test]
+async fn routing_contract_final_evidence_uses_live_pair_and_rejects_invalid_fast_before_dispatch() {
+    use crate::app_context::model_routing_test_support::RoutingContext;
+    use bamboo_domain::ProviderModelRef;
+    for target in ["fast-b", "memory-c", "unknown-account"] {
+        let context = RoutingContext::new(Some(false));
+        let model = match target {
+            "fast-b" => "cheap-b",
+            "memory-c" => "background-c",
+            _ => "missing-model",
+        };
+        context.config.write().await.defaults.as_mut().unwrap().fast =
+            Some(ProviderModelRef::new(target, model));
+        let (mut session, mut config, mut state) = fixture(true);
+        config.provider_name = Some("chat-a".into());
+        config.auxiliary_model_resolver = Some(crate::model_areas::live_auxiliary_model_resolver(
+            context.config.clone(),
+            context.registry.clone(),
+            "chat-a".into(),
+        ));
+        let provider = FinalProvider::new(Verdict::Revise);
+        let (tx, mut rx) = mpsc::channel(128);
+        let result = run(&mut session, &config, &mut state, provider.clone(), &tx).await;
+        assert_eq!(provider.main_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.auxiliary_calls.load(Ordering::SeqCst), 0);
+        if target == "unknown-account" {
+            assert!(matches!(result, Err(AgentError::LLM(_))));
+            context.assert_no_requests();
+            assert_eq!(drain(&mut rx), (String::new(), 0));
+            assert_eq!(session.messages.last().unwrap().role, Role::Tool);
+        } else {
+            assert!(result.unwrap());
+            assert_eq!(
+                context.requests(target),
+                vec![(model.into(), "final_evidence_check".into())]
+            );
+            assert_eq!(drain(&mut rx), (CANDIDATE.into(), 1));
+            assert!(context.requests("chat-a").is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn routing_contract_final_evidence_skips_invalid_unused_role_without_tool_evidence() {
+    let (mut session, mut config, mut state) = fixture(true);
+    session
+        .messages
+        .retain(|message| matches!(message.role, Role::User | Role::System));
+    config.auxiliary_model_resolver = Some(Arc::new(|| crate::AuxiliaryModelConfig {
+        fast_model_error: Some("synthetic invalid unused role".into()),
+        ..Default::default()
+    }));
+    let provider = FinalProvider::new(Verdict::Revise);
+    let (tx, mut rx) = mpsc::channel(128);
+    assert!(
+        run(&mut session, &config, &mut state, provider.clone(), &tx)
+            .await
+            .unwrap()
+    );
+    assert_eq!(provider.auxiliary_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(drain(&mut rx), (CANDIDATE.into(), 1));
+    let status: serde_json::Value =
+        serde_json::from_str(&session.metadata["runtime.final_evidence_check"]).unwrap();
+    assert_eq!(status["status"], "skipped_no_evidence");
+}
+
+#[tokio::test]
 async fn enabled_check_emits_and_saves_only_the_correction_and_accounts_once() {
     let (mut session, config, mut state) = fixture(true);
     let provider = FinalProvider::new(Verdict::Revise);

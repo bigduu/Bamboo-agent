@@ -24,7 +24,7 @@ use bamboo_metrics::RoundStatus as MetricsRoundStatus;
 fn resolve_gold_target(
     config: &AgentLoopConfig,
     auxiliary: &crate::AuxiliaryModelConfig,
-    gold: &crate::GoldConfig,
+    gold: &crate::runtime::config::GoldConfig,
     fallback_provider: Arc<dyn LLMProvider>,
     fallback_model: &str,
 ) -> Result<bamboo_llm::ResolvedModel, AgentError> {
@@ -537,7 +537,7 @@ pub(super) fn spawn_gold_evaluation_if_needed(
         &state.model_name,
     )?;
     let eval_model = Some(target.model_name.as_str());
-    let effective_gold = crate::GoldConfig {
+    let effective_gold = crate::runtime::config::GoldConfig {
         model_name: Some(target.model_name.clone()),
         ..gold_config.clone()
     };

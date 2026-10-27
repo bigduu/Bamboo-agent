@@ -314,6 +314,10 @@ fn parse_report(calls: &[ToolCall], packet: &EvidencePacket) -> Result<Report, F
     Ok(report)
 }
 
+pub(crate) fn has_tool_evidence(session: &Session) -> bool {
+    !collect_evidence(session).tools.is_empty()
+}
+
 /// Invoke at most one auxiliary request. The caller owns the master switch and
 /// records `usage` even when a completed response contains an invalid verdict.
 pub(crate) async fn evaluate_final_evidence(

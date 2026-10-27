@@ -1246,7 +1246,7 @@ fn resolve_run_config_from_config(
         auxiliary_model_resolver: bamboo_engine::model_areas::live_auxiliary_model_resolver(
             config.clone(),
             provider_registry.clone(),
-            capability_provider_name.to_string(),
+            config_snapshot.effective_default_provider().to_string(),
         ),
         model_roster,
         reasoning_effort,
