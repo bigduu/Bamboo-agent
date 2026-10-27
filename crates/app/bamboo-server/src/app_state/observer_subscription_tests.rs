@@ -173,10 +173,12 @@ impl Fixture {
         parent.set_provider_name(PROVIDER);
         parent.workspace = Some(workspace.to_string_lossy().into());
         parent.set_workspace_path_meta(workspace.to_string_lossy());
+        // A fresh canonical Supervisor has no runtime sidecar until its first
+        // run. Initialize the fixture's requested runtime policy just as the
+        // actual Observer fixture does, before admitting any execution.
         parent
             .agent_runtime_state
-            .as_mut()
-            .unwrap()
+            .get_or_insert_with(Default::default)
             .set_permission_mode(SessionPermissionMode::Bypass);
         state.storage.save_session(&parent).await.unwrap();
         let mut projects = BTreeSet::new();
