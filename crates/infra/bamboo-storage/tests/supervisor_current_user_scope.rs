@@ -135,6 +135,99 @@ async fn current_user_two_projects_and_later_roots_need_no_manual_grants() {
 }
 
 #[tokio::test]
+async fn current_user_main_only_child_queries_keep_control_view_and_root_proof() {
+    let (_home, store, reference) = fixture().await;
+    let parent = root(&store, "query-parent", Some("legacy-child-project")).await;
+    let mut child = Session::new_child_of("query-child", &parent, "model", "bounded work");
+    child.set_project_id_meta("legacy-child-project");
+    child.agent_runtime_state = Some(AgentRuntimeState::new("query-child"));
+    child.add_message(Message::assistant("synthetic child history", None));
+    store.save_session(&child).await.unwrap();
+    let directory = store
+        .sessions_root_dir()
+        .join(&parent.id)
+        .join("children")
+        .join(&child.id);
+    let runtime = directory.join("runtime.json");
+    tokio::fs::remove_file(&runtime).await.unwrap();
+    assert_default_read(&store, &reference, &child).await;
+    let unfiltered = store
+        .list_supervisor_current_user_targets(&reference, None, None, 20)
+        .await
+        .unwrap();
+    let expected = unfiltered
+        .targets
+        .into_iter()
+        .find(|target| target.session_id == child.id)
+        .unwrap();
+    for query in ["legacy-child-project", "query-child"] {
+        let page = store
+            .list_supervisor_current_user_targets(&reference, Some(query), None, 20)
+            .await
+            .unwrap();
+        assert!(page.targets.contains(&expected), "query {query}");
+    }
+    // The main-only fallback is still a control view, not full history. Keep
+    // the compact Main framing and make only its message shape invalid.
+    let main = directory.join("session.json");
+    let mut raw = tokio::fs::read_to_string(&main).await.unwrap();
+    let fields: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+        serde_json::from_str(&raw).unwrap();
+    let history = fields["messages"].get();
+    let start = history.as_ptr() as usize - raw.as_ptr() as usize;
+    let end = start + history.len();
+    raw.replace_range(
+        start..end,
+        r#"[{"invalid_private_transcript_fixture":true}]"#,
+    );
+    tokio::fs::write(&main, &raw).await.unwrap();
+    for query in [None, Some("legacy-child-project")] {
+        let page = store
+            .list_supervisor_current_user_targets(&reference, query, None, 20)
+            .await
+            .unwrap();
+        assert!(page.targets.contains(&expected));
+    }
+    assert!(store
+        .load_supervisor_current_user_observed_session(&reference, &child.id)
+        .await
+        .is_err());
+    assert_eq!(tokio::fs::read_to_string(&main).await.unwrap(), raw);
+    assert!(
+        !runtime.exists(),
+        "directory reads must not create a sidecar"
+    );
+    // Only an absent Child sidecar is compatible. Corrupt sidecars and a
+    // missing Root runtime/proof must still fail closed on either query path.
+    tokio::fs::write(&runtime, b"{invalid-runtime-json")
+        .await
+        .unwrap();
+    for query in [None, Some("legacy-child-project")] {
+        assert!(store
+            .list_supervisor_current_user_targets(&reference, query, None, 20)
+            .await
+            .is_err());
+    }
+    tokio::fs::remove_file(&runtime).await.unwrap();
+    tokio::fs::remove_file(
+        store
+            .sessions_root_dir()
+            .join(&parent.id)
+            .join("runtime.json"),
+    )
+    .await
+    .unwrap();
+    for query in [None, Some("legacy-child-project")] {
+        assert!(store
+            .list_supervisor_current_user_targets(&reference, query, None, 20)
+            .await
+            .is_err());
+    }
+    assert_eq!(tokio::fs::read_to_string(&main).await.unwrap(), raw);
+    assert!(!runtime.exists());
+}
+
+#[tokio::test]
 async fn legacy_scope_and_detached_link_are_preserved_without_restricting_default_access() {
     let (_home, store, reference) = fixture().await;
     let a = root(&store, "legacy-a", Some("project-a")).await;

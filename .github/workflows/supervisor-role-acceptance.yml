@@ -61,7 +61,7 @@ jobs:
           set -euo pipefail
           cargo test --locked -p bamboo-storage --test supervisor_current_user_scope \
             -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/supervisor-current-user.log"
-          grep -Fq 'test result: ok. 7 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-current-user.log"
+          grep -Fq 'test result: ok. 8 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-current-user.log"
           cargo test --locked -p bamboo-storage --test patrol_notice \
             -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/supervisor-role-notice.log"
           grep -Fq 'test result: ok. 2 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-role-notice.log"
