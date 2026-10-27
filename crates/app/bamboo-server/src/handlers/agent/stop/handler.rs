@@ -31,12 +31,16 @@ pub async fn handler_with_run(
     http: HttpRequest,
     path: web::Path<String>,
 ) -> HttpResponse {
-    // Both request forms operate on the same protected Supervisor. Apply
-    // its existing owner requirement before entering legacy cancellation.
-    if let Err(error) =
-        crate::handlers::agent::tickets::require_supervisor_owner(&state, &http, path.as_str())
+    // Canonical Supervisor identity is bound to this reserved ID. Gate its
+    // cancellation before selecting either request form.
+    let owner_check = if path.as_str() == bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID {
+        crate::handlers::agent::tickets::user(&state, &http)
             .await
-    {
+            .map(|_| ())
+    } else {
+        Ok(())
+    };
+    if let Err(error) = owner_check {
         return crate::handlers::agent::tickets::TicketHttpError::from(error).error_response();
     }
     let Some(header) = http.headers().get("Bamboo-Run-Id") else {

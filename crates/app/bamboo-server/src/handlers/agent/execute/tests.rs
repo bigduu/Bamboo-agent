@@ -375,13 +375,21 @@ mod execution_input_http {
                 .configure(crate::routes::configure_routes),
         )
         .await;
-        for canonical in [false, true] {
+        for (canonical, child) in [(false, false), (true, false), (false, true), (true, true)] {
             let id = format!("exact-stop-http-{}", uuid::Uuid::new_v4());
-            state
-                .storage
-                .save_session(&owned_http_session(&state, &id))
-                .await
-                .unwrap();
+            let session = if child {
+                let parent = owned_http_session(&state, &format!("parent-{id}"));
+                state.storage.save_session(&parent).await.unwrap();
+                bamboo_agent_core::Session::new_child_of(
+                    &id,
+                    &parent,
+                    "test-model",
+                    "controlled-stop-child",
+                )
+            } else {
+                owned_http_session(&state, &id)
+            };
+            state.storage.save_session(&session).await.unwrap();
             let uri = if canonical {
                 format!("/api/v1/sessions/{id}/stop")
             } else {
