@@ -22,6 +22,33 @@ struct Snapshot {
     authority: Value,
 }
 
+pub(super) async fn observe(
+    tool: &SessionInspectorTool,
+    ctx: &ToolCtx,
+    target_id: &str,
+    filter: &std::collections::BTreeSet<bamboo_domain::ObserverChangeKind>,
+    previous: Option<&str>,
+) -> Result<Option<ToolResult>, ToolError> {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        return Err(error("retained context reading is unsupported"));
+    }
+    let source = authorize(tool, ctx, target_id).await?;
+    let result = context_view::publish_filtered_scoped_context(
+        tool,
+        &source.caller,
+        &source.target,
+        source.authority.clone(),
+        filter,
+        previous,
+    )
+    .await?;
+    let after = authorize(tool, ctx, target_id).await?;
+    if after.authority != source.authority {
+        return Err(error("scope changed during observation"));
+    }
+    Ok(result)
+}
+
 async fn authorize(
     tool: &SessionInspectorTool,
     ctx: &ToolCtx,
