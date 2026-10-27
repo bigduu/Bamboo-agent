@@ -83,12 +83,12 @@ flow. GitHub selects a `workflow_run` listener from the default branch. At the
 time of this guide, the default is protected `dev`, so merging the listener into
 `dev` enables automatic Docker consumption even before Main is promoted. After
 the first publisher succeeds, check its corresponding Docker run before doing
-anything else. Do not manually dispatch a duplicate consumer. If that run
+anything else. Do not manually dispatch a duplicate consumer. If a consumer run
 failed, recover its failed jobs in the same run and reuse its verified outputs.
 
 If the expected automatic run is confirmed missing, recheck the live default
-branch and installed listener. Only when no consumer for this release is queued
-or running, use the existing recovery flow for its exact version and source:
+branch and installed listener. Only when no consumer run for this release exists,
+use the existing recovery flow for its exact version and source:
 
 ```bash
 gh workflow run docker-publish.yml -R bigduu/Bamboo-agent --ref dev \
