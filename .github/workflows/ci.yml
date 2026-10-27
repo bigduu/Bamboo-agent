@@ -116,6 +116,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_REF: ${{ github.head_ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           python3 - <<'PYTHON'
@@ -139,6 +140,9 @@ jobs:
           head = os.environ["HEAD_SHA"]
           require(re.fullmatch(r"[0-9a-f]{40}", head) is not None, "Missing exact pull-request head")
           require(head == cut, "Release head must equal its accepted dev cut; repairs return through feature/dev")
+          base, snapshot = os.environ["BASE_SHA"], os.environ["GITHUB_SHA"]
+          require(all(re.fullmatch(r"[0-9a-f]{40}", value) for value in [base, snapshot]),
+                  "Missing exact pull-request base or merge snapshot")
           token = os.environ["GH_TOKEN"]
           require(bool(token), "Missing read-only source proof authority")
 
@@ -177,6 +181,14 @@ jobs:
                       "Release ancestry proof is missing or does not match")
 
           require(branch(release) == head, "Release branch no longer matches the exact PR head")
+          require(branch("main") == base, "main no longer matches the exact PR base")
+          merged, product = api(f"git/commits/{snapshot}"), api(f"git/commits/{cut}")
+          require(merged["sha"] == snapshot and product["sha"] == cut, "Promotion commit identity changed")
+          require([parent["sha"] for parent in merged["parents"]] == [base, head],
+                  "Actual PR merge parents differ from its base and release head")
+          require(re.fullmatch(r"[0-9a-f]{40}", product["tree"]["sha"]) is not None
+                  and merged["tree"]["sha"] == product["tree"]["sha"],
+                  "Actual PR merge tree differs from the published release cut")
           dev = branch("dev", protected=True)
           ancestor(cut, head)
           ancestor(head, dev)
@@ -203,6 +215,7 @@ jobs:
           if current_dev != dev:
               ancestor(dev, current_dev)
           require(branch(release) == head, "Release branch changed during source proof")
+          require(branch("main") == base, "main changed during source proof")
           print(f"Accepted frozen release cut={cut} head={head} protected_dev={current_dev}")
           PYTHON
 

@@ -231,19 +231,39 @@ test("main deploys only the retained accepted feature site and never recompiles 
 
 test("main promotion requires an unchanged cut and completed three-platform release", () => {
   const body = pythonBody(script(job(ci, "promotion-source")), "PYTHON"), sha = "a".repeat(40), dev = "b".repeat(40);
+  const base = "c".repeat(40), merge = "d".repeat(40), tree = "e".repeat(40);
   const release = { id: 4, tag_name: "v2026.10.28", target_commitish: sha, draft: false, prerelease: false, published_at: "2026-10-28T00:00:00Z",
     assets: ["bamboo-aarch64-apple-darwin", "bamboo-x86_64-unknown-linux-gnu", "bamboo-x86_64-pc-windows-msvc.exe", "bamboo-sidecars-v2.json", "bamboo-executables-provenance-v2.json", "release-provenance.json"].map(name => ({ name, state: "uploaded", size: 1 })) };
   const routes = { [`branches/release%2F${sha}`]: { name: "release/" + sha, commit: { sha } }, "branches/dev": { name: "dev", protected: true, commit: { sha: dev } },
+    "branches/main": { name: "main", commit: { sha: base } },
+    [`git/commits/${merge}`]: { sha: merge, parents: [{ sha: base }, { sha }], tree: { sha: tree } },
+    [`git/commits/${sha}`]: { sha, tree: { sha: tree } },
     [`compare/${sha}...${sha}`]: { status: "identical", base_commit: { sha }, merge_base_commit: { sha } },
     [`compare/${sha}...${dev}`]: { status: "ahead", base_commit: { sha }, merge_base_commit: { sha } },
     "releases?per_page=100": [release], "releases/4": release, "git/ref/tags/v2026.10.28": { object: { type: "commit", sha } } };
-  const run = (model = routes, override = {}) => spawnSync("python3", ["-c", "import io,json,sys,urllib.request\npayload=json.load(sys.stdin)\nclass Opener:\n def open(self,request,timeout): return io.StringIO(json.dumps(payload['routes'][request.full_url.split('/',6)[6]]))\nurllib.request.build_opener=lambda *args: Opener()\nexec(compile(payload['body'],'<actual-promotion-workflow>','exec'))"], { encoding: "utf8", input: JSON.stringify({ body, routes: model }), env: { ...process.env, GITHUB_REPOSITORY: "bigduu/Bamboo-agent", HEAD_REPOSITORY: "bigduu/Bamboo-agent", GH_TOKEN: "inert-fixture", HEAD_REF: "release/" + sha, HEAD_SHA: sha, ...override } });
+  const run = (model = routes, override = {}) => spawnSync("python3", ["-c", "import io,json,sys,urllib.request\npayload=json.load(sys.stdin)\nclass Opener:\n def open(self,request,timeout):\n  route=request.full_url.split('/',6)[6]\n  value=payload['routes'][route]\n  if route.startswith('branches/') and isinstance(value,list): value=value.pop(0)\n  return io.StringIO(json.dumps(value))\nurllib.request.build_opener=lambda *args: Opener()\nexec(compile(payload['body'],'<actual-promotion-workflow>','exec'))"], { encoding: "utf8", input: JSON.stringify({ body, routes: model }), env: { ...process.env, GITHUB_REPOSITORY: "bigduu/Bamboo-agent", GITHUB_SHA: merge, BASE_SHA: base, HEAD_REPOSITORY: "bigduu/Bamboo-agent", GH_TOKEN: "inert-fixture", HEAD_REF: "release/" + sha, HEAD_SHA: sha, ...override } });
   assert.equal(run().status, 0);
   assert.notEqual(run(routes, { HEAD_SHA: dev }).status, 0);
   for (const mutate of [model => { model["releases/4"].draft = true; }, model => { model["releases/4"].assets.pop(); },
     model => { model["git/ref/tags/v2026.10.28"].object.sha = dev; }, model => { model["branches/dev"].protected = false; }]) {
     const model = structuredClone(routes); mutate(model); assert.notEqual(run(model).status, 0);
   }
+  for (const [name, mutate, reason] of [
+    ["main content survives the merge", m => { m[`git/commits/${merge}`].tree.sha = dev; }, /merge tree differs/],
+    ["wrong base parent", m => { m[`git/commits/${merge}`].parents[0].sha = dev; }, /merge parents/],
+    ["wrong release parent", m => { m[`git/commits/${merge}`].parents[1].sha = dev; }, /merge parents/],
+    ["reversed parents", m => { m[`git/commits/${merge}`].parents.reverse(); }, /merge parents/],
+    ["missing parent", m => { m[`git/commits/${merge}`].parents.pop(); }, /merge parents/],
+    ["foreign merge response", m => { m[`git/commits/${merge}`].sha = dev; }, /commit identity/],
+    ["foreign cut response", m => { m[`git/commits/${sha}`].sha = dev; }, /commit identity/],
+    ["main already moved", m => { m["branches/main"].commit.sha = dev; }, /main no longer matches/],
+    ["main moves during proof", m => { m["branches/main"] = [m["branches/main"], { name: "main", commit: { sha: dev } }]; }, /main changed during/],
+    ["release moves during proof", m => { m[`branches/release%2F${sha}`] = [m[`branches/release%2F${sha}`], { name: "release/" + sha, commit: { sha: dev } }]; }, /Release branch changed/],
+  ]) {
+    const model = structuredClone(routes); mutate(model); const result = run(model);
+    assert.notEqual(result.status, 0, name); assert.match(result.stderr, reason, name);
+  }
+  for (const override of [{ BASE_SHA: "" }, { GITHUB_SHA: "" }]) assert.notEqual(run(routes, override).status, 0);
 });
 
 test("Docker receives the completed publisher's matching run and attempt", () => {
