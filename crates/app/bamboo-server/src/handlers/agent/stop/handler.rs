@@ -31,6 +31,14 @@ pub async fn handler_with_run(
     http: HttpRequest,
     path: web::Path<String>,
 ) -> HttpResponse {
+    // Both request forms operate on the same protected Supervisor. Apply
+    // its existing owner requirement before entering legacy cancellation.
+    if let Err(error) =
+        crate::handlers::agent::tickets::require_supervisor_owner(&state, &http, path.as_str())
+            .await
+    {
+        return crate::handlers::agent::tickets::TicketHttpError::from(error).error_response();
+    }
     let Some(header) = http.headers().get("Bamboo-Run-Id") else {
         return handler(state, path)
             .await
@@ -51,11 +59,6 @@ pub async fn handler_with_run(
         }
     };
     let id = path.into_inner();
-    if let Err(error) =
-        crate::handlers::agent::tickets::require_supervisor_owner(&state, &http, &id).await
-    {
-        return crate::handlers::agent::tickets::TicketHttpError::from(error).error_response();
-    }
     if cancel_exact_run(&state, &id, run_id).await {
         HttpResponse::Ok().json(serde_json::json!({"success":true,"session_id":id,"run_id":run_id}))
     } else {
