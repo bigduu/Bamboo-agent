@@ -48,6 +48,16 @@ Keep the standalone default storage authority families' serial selection in that
 executor, reusing its compiled library-test executable without repeating cases.
 `Quick Checks` remains auxiliary and never substitutes for runtime tests.
 
+`trusted-observer.yml` is the single automatic owner for the two original
+API-only Observer joint recipes, run sequentially in one target directory on the
+actual PR head. Keep both package selections and their full behavior assertions.
+The first recipe owns the shared supervisor-management serde case; the second
+skips only that full case name and still selects `bamboo-domain` for its six
+subscription windows. `observer-subscriptions.yml` retains the complete original
+recipe as an explicit manual diagnostic on the selected workflow SHA. The shared
+five-library Clippy check remains solely in `observer-api-lint.yml`; these API-only
+contexts remain distinct from canonical embedded feature tests.
+
 ## Native feature ownership
 
 #2319 gives Windows and macOS one feature job, workspace and owned target each.

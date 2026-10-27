@@ -1,23 +1,7 @@
 name: Observer Subscription Acceptance
 
 on:
-  pull_request:
-    branches: [dev]
-    paths:
-      - 'crates/core/bamboo-domain/src/observer_subscription.rs'
-      - 'crates/core/bamboo-domain/src/session/supervisor_management.rs'
-      - 'crates/infra/bamboo-storage/src/context_view.rs'
-      - 'crates/infra/bamboo-storage/src/session_inbox*.rs'
-      - 'crates/infra/bamboo-storage/src/v2/observer_subscriptions.rs'
-      - 'crates/infra/bamboo-storage/src/v2/supervisor_management.rs'
-      - 'crates/app/bamboo-server-tools/src/session_inspector/**'
-      - 'crates/app/bamboo-server/src/app_state/observer_subscription*.rs'
-      - 'crates/app/bamboo-server/src/app_state/observer_fault_tests.rs'
-      - 'crates/app/bamboo-server/src/app_state/builder.rs'
-      - 'crates/app/bamboo-server/src/app_state/mod.rs'
-      - 'crates/app/bamboo-server/src/app_state/wake_reconciler.rs'
-      - 'crates/engine/bamboo-engine/src/runtime/runner/state_bridge.rs'
-      - '.github/workflows/observer-subscriptions.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -40,11 +24,11 @@ jobs:
       # These native Host tests exercise API/runtime contracts, not frontend
       # packaging or publication. No frontend bytes are staged or substituted.
       BAMBOO_FRONTEND_BUILD_MODE: api-only
-      EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      EXPECTED_SOURCE_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Bind acceptance to the exact clean source and lock

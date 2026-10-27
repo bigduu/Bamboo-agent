@@ -354,8 +354,8 @@ const OBSERVER_FAULT_HOST_CASES = [
 ]
 
 function assertSubscriptionException(source) {
-  // Keep the S19 runtime recipe and exact fault extension after moving only
-  // the duplicate API-only Clippy step into its single shared owner.
+  // Keep the complete original joint recipe as an explicit manual diagnostic.
+  // Only its entrypoint/source binding and the separate Clippy owner changed.
   // This remains API-only feature-head evidence, never canonical-M admission.
   const extension = "          faults = {\n" + OBSERVER_FAULT_HOST_CASES
     .map(name => `              '${name}',\n`).join("") +
@@ -366,18 +366,68 @@ function assertSubscriptionException(source) {
     .replace(extension, "")
     .replace("print('Six canonical windows, exact legacy serde, five fail-closed Inbox regressions, seven subscription and five fault Host fixtures passed')",
       "print('Six canonical windows, exact legacy serde, five fail-closed Inbox regressions and all seven actual subscription Host fixtures passed')")
-  assert.equal(createHash("sha256").update(original).digest("hex"), "f51f3bced49a34a51ff360d083ba5a94154ca13dd415f06159dbc61e3dd55a96")
-  assert.equal(createHash("sha256").update(source).digest("hex"), "11d4b1dc76c3db28992cc97f357208d67b971b3ec258b3d5fdb4b13408040806")
-  assert.match(source, /pull_request:\n    branches: \[dev\]/u)
+  assert.equal(createHash("sha256").update(original).digest("hex"), "ada1eed323eeb271ca3411d54ec5da774046b2b0bc3fba15358c30aa9b195110")
+  assert.equal(createHash("sha256").update(source).digest("hex"), "45e0b535db3cefb7a7094a58432b18c8269781101af0450ef7910d4747ccf64f")
+  assert.match(source, /on:\n  workflow_dispatch:\n/u)
+  assert.doesNotMatch(source.split("\npermissions:")[0], /pull_request:|push:/u)
   assert.match(source, /runs-on: ubuntu-latest/u)
   assert.match(source, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
-  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
-  assert.match(source, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ github\.sha \}\}/u)
+  assert.match(source, /ref: \$\{\{ github\.sha \}\}/u)
   assert.match(source, /test "\$actual" = "\$EXPECTED_SOURCE_SHA"/u)
   assert.match(source, /cargo test --locked -p bamboo-domain -p bamboo-engine -p bamboo-server --lib --/u)
   assert.match(source, /--test-threads=1 --color=never/u)
   assert.doesNotMatch(source, /cargo clippy/u)
 }
+
+const OBSERVER_SHARED_SERDE_CASE = "session::supervisor_management::tests::supervisor_management_public_serde_is_legacy_compatible_and_children_drop_state"
+function observerRecipe(source, name) {
+  const marker = `      - name: ${name}\n`, start = source.indexOf(marker)
+  assert.notEqual(start, -1, `Missing Observer recipe ${name}`)
+  const end = source.indexOf("\n      - ", start + marker.length)
+  return source.slice(start, end === -1 ? undefined : end).trimEnd()
+}
+function assertObserverRuntimeOwner(definitions) {
+  const combined = definitions["trusted-observer.yml"], manual = definitions["observer-subscriptions.yml"]
+  assertLinuxTestOwnership({ "trusted-observer.yml": combined, "observer-subscriptions.yml": manual })
+  const paths = source => [...source.split("\npermissions:")[0].matchAll(/^      - '([^']+)'$/gmu)].map(row => row[1]).sort()
+  assert.deepEqual(paths(combined), paths(definitions["observer-api-lint.yml"]).filter(file => file !== ".github/workflows/observer-api-lint.yml"))
+  assert.match(combined, /pull_request:\n    branches: \[dev\]/u)
+  assert.doesNotMatch(manual.split("\npermissions:")[0], /pull_request:|push:/u)
+  assert.match(combined, /timeout-minutes: 180/u)
+  const firstName = "Run real management, proof, lock-order and native Host cases"
+  const secondName = "Run exact canonical state and seven real subscription Host cases"
+  assert.ok(combined.indexOf(firstName) < combined.indexOf(secondName))
+  const first = observerRecipe(combined, firstName), second = observerRecipe(combined, secondName)
+  assert.match(first, /timeout-minutes: 90/u)
+  assert.ok(first.includes(`assert '${OBSERVER_SHARED_SERDE_CASE}' in results['domain']`), "The first joint recipe must prove the shared case passed")
+  const expected = observerRecipe(manual, secondName)
+    .replace(`name: ${secondName}\n`, `name: ${secondName}\n        if: success()\n        timeout-minutes: 90\n`)
+    .replace('            --test-threads=1 --color=never \\\n', `            --skip ${OBSERVER_SHARED_SERDE_CASE} \\\n            --test-threads=1 --color=never \\\n`)
+    .replace(`assert results['domain'] - window == {'${OBSERVER_SHARED_SERDE_CASE}'}`, "assert results['domain'] == window, 'Shared serde case already passed in the first joint recipe'")
+    .replace("Six canonical windows, exact legacy serde,", "Six canonical windows, shared serde already covered,")
+  assert.equal(second, expected, "Preserve the complete original joint recipe, skipping only the already-passed serde case")
+  assert.equal((combined.match(/--skip /gu) ?? []).length, 1)
+  assert.match(second, /cargo test --locked -p bamboo-domain -p bamboo-engine -p bamboo-server --lib --/u)
+  assert.equal((combined.match(/CARGO_TARGET_DIR:/gu) ?? []).length, 1)
+}
+
+test("one automatic Observer job preserves both joint graphs and executes shared serde once", () => {
+  const definitions = Object.fromEntries(readdirSync(".github/workflows").filter(file => /\.ya?ml$/u.test(file))
+    .map(file => [file, readFileSync(path.join(".github/workflows", file), "utf8")]))
+  assertObserverRuntimeOwner(definitions)
+  const name = "trusted-observer.yml", source = definitions[name]
+  for (const [before, after] of [[`--skip ${OBSERVER_SHARED_SERDE_CASE}`, "--skip supervisor_management"],
+    [`--skip ${OBSERVER_SHARED_SERDE_CASE}`, ""], ["        if: success()", "        if: always()"],
+    ["-p bamboo-domain -p bamboo-engine -p bamboo-server --lib", "-p bamboo-engine -p bamboo-server --lib"],
+    ["Shared serde case already passed in the first joint recipe", "ignored duplicate"],
+    ["assert len(window) == 6", "assert len(window) >= 0"]]) {
+    assert.ok(source.includes(before), before)
+    assert.throws(() => assertObserverRuntimeOwner({ ...definitions, [name]: source.replace(before, after) }))
+  }
+  assert.throws(() => assertObserverRuntimeOwner({ ...definitions, "observer-subscriptions.yml": definitions["observer-subscriptions.yml"]
+    .replace("  workflow_dispatch:", "  pull_request:\n    branches: [dev]") }))
+})
 
 function assertObserverLintOwner(definitions) {
   const filename = "observer-api-lint.yml", owner = definitions[filename]
@@ -490,7 +540,7 @@ function assertLinuxTestOwnership(definitions) {
       }
       if (file === "trusted-observer.yml") {
         // Preserve this separately accepted F/config exactly; never relabel it as M.
-        assert.equal(createHash("sha256").update(source).digest("hex"), "433631549dc24ea3d6dfdad6a427251d9832acb11aea32ce05747206a69a6268")
+        assert.equal(createHash("sha256").update(source).digest("hex"), "ce58547220ee0620820911b4354af9d446acd65bb036cbfb1ce5411360acebaa")
         assert.match(block, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
         assert.match(block, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
         assert.match(block, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
@@ -528,6 +578,7 @@ test("all agents share canonical feature tests instead of adding ordinary Linux 
     .map(file => [file, readFileSync(path.join(directory, file), "utf8")]))
   assertLinuxTestOwnership(definitions)
   assertObserverLintOwner(definitions)
+  assertObserverRuntimeOwner(definitions)
   for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
     ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
     ["-p bamboo-domain -p bamboo-storage -p bamboo-server --lib", "-p bamboo-server --lib"]]) {
@@ -549,13 +600,13 @@ test("all agents share canonical feature tests instead of adding ordinary Linux 
     .replace("if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''", "if: github.event_name == 'pull_request'") }), /workflow_dispatch/u)
 })
 
-test("subscription exception retains exact F API-only graph without becoming merge-source evidence", () => {
+test("manual subscription diagnostic retains the original API-only joint recipe", () => {
   const source = readFileSync(".github/workflows/observer-subscriptions.yml", "utf8")
   assertLinuxTestOwnership({ "observer-subscriptions.yml": source })
   for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
-    ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
-    ["EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}", "EXPECTED_SOURCE_SHA: ${{ github.sha }}"],
-    ["ubuntu-latest", "windows-latest"], ["branches: [dev]", "branches: [main]"],
+    ["ref: ${{ github.sha }}", "ref: dev"],
+    ["EXPECTED_SOURCE_SHA: ${{ github.sha }}", "EXPECTED_SOURCE_SHA: dev"],
+    ["ubuntu-latest", "windows-latest"], ["  workflow_dispatch:", "  pull_request:\n    branches: [dev]"],
     ["-p bamboo-domain -p bamboo-engine -p bamboo-server --lib", "-p bamboo-server --lib"],
     ["observer_subscription session::supervisor_management::tests::", "observer_subscription"],
     ["--test-threads=1", "--test-threads=2"],
@@ -567,7 +618,7 @@ test("subscription exception retains exact F API-only graph without becoming mer
     assert.ok(source.includes(name), name)
     assert.throws(() => assertLinuxTestOwnership({ "observer-subscriptions.yml": source.replace(name, name + "_unowned") }))
   }
-  assert.throws(() => assertLinuxTestOwnership({ "unregistered-subscriptions.yml": source }), /must join the canonical feature executor/u)
+  assert.throws(() => assertLinuxTestOwnership({ "unregistered-subscriptions.yml": source.replace("  workflow_dispatch:", "  pull_request:\n    branches: [dev]") }), /must join the canonical feature executor/u)
 })
 
 function serverCommand(id) {
