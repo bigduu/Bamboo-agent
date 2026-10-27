@@ -1,0 +1,129 @@
+name: Supervisor Delegation Boundary
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - 'crates/core/bamboo-domain/src/session/tool_authority.rs'
+      - 'crates/core/bamboo-agent-core/src/tools/result_handler.rs'
+      - 'crates/engine/bamboo-engine/src/runtime/runner/session_setup/**'
+      - 'crates/engine/bamboo-engine/src/runtime/runner/loop_execution/pipeline.rs'
+      - 'crates/engine/bamboo-engine/src/runtime/runner/round_lifecycle.rs'
+      - 'crates/engine/bamboo-engine/src/runtime/runner/tool_execution/per_call.rs'
+      - 'crates/engine/bamboo-engine/src/runtime/runner/tool_execution/supervisor_dispatch_tests.rs'
+      - 'crates/engine/bamboo-engine/src/session_app/approval_replay.rs'
+      - 'crates/app/bamboo-server-tools/src/skill_runtime/catalog_tests.rs'
+      - 'crates/infra/bamboo-storage/tests/supervisor_current_user_scope.rs'
+      - 'crates/infra/bamboo-storage/src/v2/supervisor_management.rs'
+      - 'crates/infra/bamboo-storage/src/v2/supervisor_current_user.rs'
+      - 'crates/app/bamboo-server-tools/src/session_inspector/**'
+      - 'crates/engine/bamboo-engine/src/ticket_runtime.rs'
+      - 'crates/infra/bamboo-tickets/src/service.rs'
+      - 'crates/infra/bamboo-tickets/src/store.rs'
+      - 'crates/infra/bamboo-tickets/tests/service_contract.rs'
+      - '.github/workflows/supervisor-role-acceptance.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supervisor-role-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  boundary:
+    name: Supervisor role catalog and native dispatch (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
+      RUST_MIN_STACK: '8388608'
+      BAMBOO_FRONTEND_BUILD_MODE: api-only
+      EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Bind the exact clean source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git show -s --format='Supervisor role source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-test-${{ runner.os }}
+          workspaces: . -> target/grouped-default
+          save-if: false
+      - name: Verify canonical current-user management without manual grants
+        run: |
+          set -euo pipefail
+          cargo test --locked -p bamboo-storage --test supervisor_current_user_scope \
+            -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/supervisor-current-user.log"
+          grep -Fq 'test result: ok. 7 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-current-user.log"
+      - name: Verify existing Work binding survives Supervisor mode changes
+        run: |
+          set -euo pipefail
+          cargo test --locked -p bamboo-tickets --test service_contract supervisor_mode_compatibility_ \
+            -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/supervisor-work-mode.log"
+          grep -Fq 'test result: ok. 2 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-work-mode.log"
+      - name: Verify direct file and process denial in both modes
+        run: |
+          set -euo pipefail
+          cargo test --locked -p bamboo-domain --lib \
+            session::tool_authority::tests::supervisor_direct_files_and_processes_require_delegation_in_both_modes \
+            -- --exact --test-threads=1 2>&1 | tee "$RUNNER_TEMP/supervisor-role-direct.log"
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-role-direct.log"
+      - name: Verify authority, native dispatch, discovery and replay contracts
+        run: |
+          set -euo pipefail
+          run_nonempty() {
+            local result="$RUNNER_TEMP/supervisor-role-$1.log"
+            shift
+            "$@" 2>&1 | tee "$result"
+            grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored' "$result"
+            ! grep -Eq 'test result: ok\. 0 passed;' "$result"
+          }
+          run_nonempty domain cargo test --locked -p bamboo-domain --lib \
+            session::tool_authority::tests:: -- --test-threads=1 \
+            --skip supervisor_direct_files_and_processes_require_delegation_in_both_modes
+          run_nonempty core cargo test --locked -p bamboo-agent-core --lib \
+            supervisor_delegation_first -- --test-threads=1
+          run_nonempty native cargo test --locked -p bamboo-engine --lib \
+            runtime::runner::tool_execution::supervisor_dispatch_tests::supervisor_native_direct_files_and_processes_never_enter_executor_in_both_modes \
+            -- --exact --test-threads=1 --nocapture
+          grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-role-native.log"
+          run_nonempty engine cargo test --locked -p bamboo-engine --lib supervisor_ \
+            -- --test-threads=1 \
+            --skip supervisor_native_direct_files_and_processes_never_enter_executor_in_both_modes
+          for case in \
+            supervisor_retained_once_cannot_override_role_or_consume_replay_markers \
+            supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standard_and_ultra \
+            supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials \
+            session_port_catalog_uses_concrete_host_schema_for_ordinary_ultra_supervisor_and_child; do
+            grep -Fq "$case ... ok" "$RUNNER_TEMP/supervisor-role-engine.log"
+          done
+          run_nonempty factory cargo test --locked -p bamboo-server-tools --lib \
+            supervisor_delegation_first_catalog_and_factory_keep_skill_authority_denied_in_both_modes \
+            -- --test-threads=1
+      - name: Check affected production libraries under the original lint policy
+        run: >-
+          cargo clippy --locked --all-features --lib
+          -p bamboo-domain -p bamboo-agent-core -p bamboo-engine -p bamboo-server-tools -p bamboo-storage -p bamboo-tickets --
+          -D warnings -A deprecated -A clippy::module_inception
+          -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
+          -A clippy::too-many-arguments -A clippy::while-let-loop
+          -A clippy::type_complexity -A dead-code
+      - name: Verify source stayed exact and clean
+        if: always()
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"

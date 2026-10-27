@@ -141,6 +141,21 @@ impl CallerRootCreator {
         caller: &SessionCallerReference,
     ) -> Result<CreationAuthority, ToolError> {
         let current = self.creator.check_original_caller(caller).await?;
+        if let Some(incarnation_id) = current.supervisor_incarnation_id() {
+            let reference = SupervisorReference {
+                session_id: current.id,
+                incarnation_id,
+            };
+            self.creator
+                .store
+                .inspect_supervisor_current_user_scope(&reference)
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            return Ok(CreationAuthority::Supervisor {
+                reference,
+                original_caller: Some(caller.clone()),
+            });
+        }
         // Lookup errors, revocation, stale identity and any installed finite
         // grant are terminal here. None means this caller was never installed.
         match self
@@ -328,19 +343,6 @@ impl CreationAuthority {
                 let result = SupervisedRootCreatePort::scope(creator, reference).await?;
                 if let Some(caller) = original_caller {
                     creator.check_original_caller(caller).await?;
-                    // Last await for this read: an installation or tombstone
-                    // cannot be reinterpreted as legacy Supervisor scope.
-                    if creator
-                        .store
-                        .find_host_session_scope(caller)
-                        .await
-                        .map_err(|error| {
-                            ToolError::Execution(format!("Host Root scope unavailable: {error}"))
-                        })?
-                        .is_some()
-                    {
-                        return Err(ToolError::Execution("Host Root scope was installed before the legacy observation completed; read current scope again".into()));
-                    }
                 }
                 Ok(result)
             }
@@ -385,16 +387,10 @@ impl CreationAuthority {
                 }
                 let scope = creator
                     .store
-                    .inspect_supervisor_scope(reference)
+                    .inspect_supervisor_current_user_scope(reference)
                     .await
                     .map_err(CreationAuthorizationError::io)?;
-                if !scope.allowed_projects.contains(&request.project_id) {
-                    return Err(CreationAuthorizationError::blocked(
-                        "scope_denied",
-                        "Project is outside the current explicit Supervisor scope",
-                    ));
-                }
-                Ok(scope.state_revision)
+                Ok(scope.legacy_state_revision)
             }
             Self::Host { token, .. } => {
                 let revision = self
@@ -484,7 +480,7 @@ impl CreationAuthority {
                 Ok(CreationPublication {
                     state_revision: relation.state_revision,
                     link_revision: relation.link_revision,
-                    linked: Some(true),
+                    linked: relation.link_revision.map(|_| true),
                 })
             }
             Self::Host { caller, token, .. } => {

@@ -1,5 +1,8 @@
 //! One canonical Supervisor relationship writer. No target mutation or registry.
 
+#[path = "supervisor_current_user.rs"]
+mod current_user;
+pub(crate) use current_user::CurrentUserTargetGuard;
 #[path = "observer_subscriptions.rs"]
 pub(super) mod subscriptions;
 
@@ -176,6 +179,24 @@ fn link_authorizes_target(
         && target.metadata_version == link.target_metadata_version
 }
 
+fn observer_link_authorizes_target(
+    state: &SupervisorManagementState,
+    observer: &bamboo_domain::SupervisorObserverRegistration,
+    target_id: &str,
+    link: &SupervisorManagedLink,
+    target: &Session,
+) -> bool {
+    if observer.current_user_targets {
+        link.enabled
+            && target.id == target_id
+            && target_project(target).is_ok_and(|project| project == link.target_project_id)
+            && target.created_at == link.target_created_at
+            && target.metadata_version == link.target_metadata_version
+    } else {
+        state.links.get(target_id) == Some(link) && link_authorizes_target(state, link, target)
+    }
+}
+
 impl SessionStoreV2 {
     async fn strict_observer_child(
         &self,
@@ -267,7 +288,7 @@ impl SessionStoreV2 {
     ) -> io::Result<bamboo_domain::SupervisorObserverReceipt> {
         use bamboo_domain::{
             SupervisorObserverRegistration, MAX_SUPERVISOR_OBSERVERS,
-            MAX_SUPERVISOR_OBSERVER_TARGETS, SUPERVISOR_OBSERVER_SCHEMA_VERSION,
+            MAX_SUPERVISOR_OBSERVER_TARGETS, SUPERVISOR_CURRENT_USER_MANAGEMENT_SCHEMA_VERSION,
         };
         reference_is_valid(reference)?;
         target_id_is_valid(child_id)?;
@@ -359,22 +380,27 @@ impl SessionStoreV2 {
             ));
         }
         let mut links = BTreeMap::new();
+        let registration_revision = next_revision(state.revision)?;
         for id in &targets {
-            let link = state
-                .links
-                .get(id)
-                .ok_or_else(|| denied("Observer target is not managed"))?;
             let target = self
                 .load_root_authority_unchecked(id)
                 .await?
                 .ok_or_else(|| denied("Observer target is missing"))?;
-            if !link_authorizes_target(&state, link, &target) {
-                return Err(denied("Observer target scope changed"));
-            }
-            links.insert(id.clone(), link.clone());
+            links.insert(
+                id.clone(),
+                SupervisorManagedLink {
+                    revision: registration_revision,
+                    enabled: true,
+                    target_created_at: target.created_at,
+                    target_project_id: target_project(&target)?,
+                    target_metadata_version: target.metadata_version,
+                },
+            );
         }
-        state.revision = next_revision(state.revision)?;
-        state.schema_version = state.schema_version.max(SUPERVISOR_OBSERVER_SCHEMA_VERSION);
+        state.revision = registration_revision;
+        state.schema_version = state
+            .schema_version
+            .max(SUPERVISOR_CURRENT_USER_MANAGEMENT_SCHEMA_VERSION);
         let registration = SupervisorObserverRegistration {
             operation_id,
             revision: state.revision,
@@ -382,6 +408,7 @@ impl SessionStoreV2 {
             parent_created_at: parent.created_at,
             child_created_at: child.created_at,
             target_links: links,
+            current_user_targets: true,
         };
         state
             .observers
@@ -557,7 +584,7 @@ impl SessionStoreV2 {
                 .load_root_authority_unchecked(id)
                 .await?
                 .ok_or_else(|| denied("Observer target is missing"))?;
-            if state.links.get(id) != Some(link) || !link_authorizes_target(state, link, &target) {
+            if !observer_link_authorizes_target(state, registration, id, link, &target) {
                 return Err(denied("Observer activation target scope changed"));
             }
         }
@@ -615,8 +642,7 @@ impl SessionStoreV2 {
             .load_root_authority_unchecked(target_id)
             .await?
             .ok_or_else(|| denied("Observer target is missing"))?;
-        if state.links.get(target_id) != Some(link) || !link_authorizes_target(state, link, &target)
-        {
+        if !observer_link_authorizes_target(state, registration, target_id, link, &target) {
             return Err(denied("Observer view grant changed"));
         }
         Ok((
@@ -819,10 +845,9 @@ impl SessionStoreV2 {
             self.management_supervisor_locked(reference).await?;
             return self.load_session_unlocked(target_id).await;
         }
-        // This guard retains caller, link, Project and exact target lifetime
-        // validation through the complete physical read and overlay checks.
-        let _guard = self.lock_supervisor_followup(reference, target_id).await?;
-        self.load_session_unlocked(target_id).await
+        self.current_user_supervisor_history(reference, target_id)
+            .await
+            .map(Some)
     }
 
     pub(super) async fn management_context(
@@ -830,30 +855,8 @@ impl SessionStoreV2 {
         reference: &SupervisorReference,
         target_id: &str,
     ) -> io::Result<(Session, SupervisorLinkObservation)> {
-        let _guard = self.lock_supervisor_followup(reference, target_id).await?;
-        let current = self.management_supervisor_locked(reference).await?;
-        let state = current
-            .supervisor_management
-            .ok_or_else(|| denied("Supervisor scope missing"))?;
-        let link = state
-            .links
-            .get(target_id)
-            .cloned()
-            .ok_or_else(|| denied("Supervisor link missing"))?;
-        let target = self
-            .load_root_authority_unchecked(target_id)
-            .await?
-            .ok_or_else(|| denied("context view target disappeared"))?;
-        Ok((
-            target,
-            SupervisorLinkObservation {
-                supervisor: reference.clone(),
-                state_revision: state.revision,
-                target_session_id: target_id.to_owned(),
-                link: Some(link),
-                authorized: true,
-            },
-        ))
+        self.current_user_supervisor_context(reference, target_id)
+            .await
     }
 
     pub(super) async fn supervisor_orchestration_job(
@@ -867,10 +870,7 @@ impl SessionStoreV2 {
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let sessions = self.management_session_locks(None).await?;
         let current = self.management_supervisor_locked(reference).await?;
-        if !current.root_orchestration_only_enabled()
-            || expected_revision == 0
-            || current.root_tool_authority_revision != expected_revision
-        {
+        if current.supervisor_orchestration_revision() != Some(expected_revision) {
             return Err(denied("Supervisor orchestration authority changed"));
         }
         let guards = Arc::new(SupervisorManagementGuards {
@@ -1074,16 +1074,10 @@ impl SessionStoreV2 {
     ) -> io::Result<SupervisorManagementReceipt> {
         reference_is_valid(supervisor)?;
         target_id_is_valid(&candidate.id)?;
-        let project = new_root_candidate_project(candidate)?;
-        let host_namespace = match original_caller {
-            Some(caller) if caller.session_id == supervisor.session_id => Some(
-                self.host_scope_registry
-                    .retain_never_installed(&caller.session_id)
-                    .await?,
-            ),
-            Some(_) => return Err(denied("host_session_legacy_caller_mismatch")),
-            None => None,
-        };
+        new_root_candidate_project(candidate)?;
+        if original_caller.is_some_and(|caller| caller.session_id != supervisor.session_id) {
+            return Err(denied("current-user original caller mismatch"));
+        }
         let lifecycle = self.lock_session_lifecycle_exclusive().await?;
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let sessions = self
@@ -1093,91 +1087,51 @@ impl SessionStoreV2 {
             sessions,
             _task: task,
             _lifecycle: LifecycleGuard::Exclusive { _guard: lifecycle },
-            _host_namespace: host_namespace,
+            _host_namespace: None,
         });
-        let mut current = self.management_supervisor_locked(supervisor).await?;
+        let current = self.management_supervisor_locked(supervisor).await?;
         if original_caller.is_some_and(|caller| !caller.matches_session(&current)) {
             return Err(denied("host_session_operation_caller_changed"));
         }
         self.check_management_session_compatibility(&current)
             .await?;
-        let mut state = current
+        let state = current
             .supervisor_management
             .clone()
             .unwrap_or_else(|| empty_state(supervisor.incarnation_id));
-        if !state.allowed_projects.contains(&project) {
-            return Err(denied(
-                "creation Project is outside configured Supervisor scope",
-            ));
-        }
         let existing = self.load_root_authority_unchecked(&candidate.id).await?;
-        if let Some(link) = state.links.get(&candidate.id) {
-            // Explicit detach/re-attach is a new relationship generation. An
-            // old creation operation can observe, never revive or use it.
-            if link.revision != 1
-                || !existing.as_ref().is_some_and(|target| {
-                    target.created_at == candidate.created_at
-                        && link_authorizes_target(&state, link, target)
-                })
-            {
+        if let Some(target) = existing {
+            if !reserved_root_matches(&target, candidate) {
                 return Err(denied(
-                    "creation relationship was revoked or its target lifetime changed",
+                    "reserved creation target has a different lifetime or context",
                 ));
             }
+            // Preserve any historical annotation/receipt, but it is not an ACL
+            // and an old detach never authorizes replacing this lifetime.
             return Ok(SupervisorManagementReceipt {
                 supervisor: supervisor.clone(),
                 state_revision: state.revision,
                 changed: false,
-                link_revision: Some(link.revision),
+                link_revision: state.links.get(&candidate.id).map(|link| link.revision),
             });
         }
         if state.revision != expected_state_revision {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                SessionAuthorityConflict(
-                    "Supervisor scope changed before creation; reload scope for a new operation"
-                        .into(),
-                ),
+                SessionAuthorityConflict("Supervisor state changed before Root creation".into()),
             ));
         }
-        if state.links.len() >= MAX_SUPERVISOR_LINKS {
-            return Err(invalid("Supervisor link/tombstone capacity exceeded"));
-        }
-        let committed_revision = next_revision(state.revision)?;
-        match existing {
-            Some(target) if reserved_root_matches(&target, candidate) => {}
-            Some(_) => {
-                return Err(denied(
-                    "reserved creation target has a different lifetime or context",
-                ))
-            }
-            None => {
-                // The same canonical writer and retained physical guards as a
-                // normal Root save. Revocation cannot slip between the scope
-                // decision and filesystem publication, including cancellation.
-                let writer = DefaultWriterGuards::supervised_creation(guards.clone());
-                self.save_session_after_lock(candidate, Instant::now(), &writer, None)
-                    .await?;
-            }
-        }
-        state.links.insert(
-            candidate.id.clone(),
-            SupervisorManagedLink {
-                revision: 1,
-                enabled: true,
-                target_created_at: candidate.created_at,
-                target_project_id: project,
-                target_metadata_version: candidate.metadata_version,
-            },
-        );
-        state.revision = committed_revision;
-        self.publish_management_state(&mut current, &state, &guards)
+        // The existing reservation and normal Root writer retain the original
+        // caller, candidate, lifecycle/Task/Session locks through publication.
+        // No global Project grant or management-link entry is manufactured.
+        let writer = DefaultWriterGuards::supervised_creation(guards);
+        self.save_session_after_lock(candidate, Instant::now(), &writer, None)
             .await?;
         Ok(SupervisorManagementReceipt {
             supervisor: supervisor.clone(),
             state_revision: state.revision,
             changed: true,
-            link_revision: Some(1),
+            link_revision: None,
         })
     }
 
@@ -1302,6 +1256,7 @@ impl SessionStoreV2 {
             state.revision = next_revision(state.revision)?;
             for observer in state.observers.values_mut() {
                 if observer.enabled
+                    && !observer.current_user_targets
                     && observer
                         .target_links
                         .iter()
@@ -1329,47 +1284,8 @@ impl SessionStoreV2 {
         reference: &SupervisorReference,
         target_id: &str,
     ) -> io::Result<SupervisorLinkObservation> {
-        reference_is_valid(reference)?;
-        target_id_is_valid(target_id)?;
-        let _lifecycle = self.lock_session_lifecycle_shared().await?;
-        let _task = self.lock_runtime_task_sidecar_shared().await?;
-        // Revoked links remain observable even when their target is corrupt or
-        // deleted. Only an enabled link needs a canonical Root lock location;
-        // an absent preflight can report unauthorized, never grant a later
-        // replacement that appeared without belonging to the final lock set.
-        let enabled = {
-            let _supervisor = self
-                .acquire_session_maintenance_lock(&reference.session_id)
-                .await?;
-            self.management_supervisor_locked(reference)
-                .await?
-                .supervisor_management
-                .as_ref()
-                .and_then(|state| state.links.get(target_id))
-                .is_some_and(|link| link.enabled)
-        };
-        let target_present = enabled && self.preview_management_root(target_id).await?;
-        let _sessions = self
-            .management_root_session_locks(target_present.then_some(target_id))
-            .await?;
-        let current = self.management_supervisor_locked(reference).await?;
-        let state = current
-            .supervisor_management
-            .unwrap_or_else(|| empty_state(reference.incarnation_id));
-        let link = state.links.get(target_id).cloned();
-        let mut authorized = false;
-        if let Some(link) = link.as_ref().filter(|link| link.enabled && target_present) {
-            if let Some(target) = self.load_root_authority_unchecked(target_id).await? {
-                authorized = link_authorizes_target(&state, link, &target);
-            }
-        }
-        Ok(SupervisorLinkObservation {
-            supervisor: reference.clone(),
-            state_revision: state.revision,
-            target_session_id: target_id.to_string(),
-            link,
-            authorized,
-        })
+        self.current_user_supervisor_link(reference, target_id)
+            .await
     }
 }
 

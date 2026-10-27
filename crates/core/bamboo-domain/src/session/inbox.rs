@@ -1932,6 +1932,21 @@ pub trait SessionInboxPort: Send + Sync {
         Err(SessionRunConflict::unsupported(expected_run_id).into())
     }
 
+    /// Current-user followup with an immutable observed target lifetime. The
+    /// existing Inbox retains canonical caller, target/ancestry and physical
+    /// publication guards; no installed per-Project capability is required.
+    async fn deliver_supervisor_current_user_followup(
+        &self,
+        _caller: &crate::SessionCallerReference,
+        _supervisor: &super::SupervisorReference,
+        _target: &crate::SupervisorCurrentUserTarget,
+        _envelope: &SessionMessageEnvelope,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "current-user Supervisor followup admission is unsupported".into(),
+        ))
+    }
+
     /// Admit one typed Supervisor peer message while retaining canonical
     /// incarnation, relationship, Project and target lifetime authority locks
     /// through the inbox receipt. An earlier link observation is not a grant.

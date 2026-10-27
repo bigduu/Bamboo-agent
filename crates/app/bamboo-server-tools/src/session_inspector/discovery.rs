@@ -9,8 +9,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ExecutingSupervisorObservation, ToolCtx, ToolError};
 use bamboo_domain::{
-    ProjectId, Role, Session, SessionCallerReference, Storage, SupervisorManagementState,
-    SupervisorReference, TaskItemStatus, MAX_SUPERVISOR_LINKS,
+    ProjectId, Role, Session, SessionCallerReference, Storage, SupervisorCurrentUserTarget,
+    SupervisorReference, TaskItemStatus,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -74,7 +74,7 @@ impl AuthorizedSessionInspectRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthorizedSessionTarget {
     pub session_id: String,
-    pub project_id: ProjectId,
+    pub project_id: Option<ProjectId>,
     pub created_at: DateTime<Utc>,
     pub metadata_version: u64,
     pub link_revision: u64,
@@ -82,6 +82,9 @@ pub struct AuthorizedSessionTarget {
     /// this field records the explicitly installed Host authorization revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorization_revision: Option<u64>,
+    /// Canonical target selection for a later management intent, not a grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_user_target: Option<SupervisorCurrentUserTarget>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -126,6 +129,8 @@ pub struct SessionProgressObservation {
     pub status_is_live: bool,
     pub input_specific: bool,
     pub completion_verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_user_target: Option<SupervisorCurrentUserTarget>,
 }
 
 /// One role-neutral capability surface. Hosts install an adapter; neither the
@@ -162,12 +167,22 @@ impl SupervisorSessionDiscovery {
         let reference = observation.supervisor_reference();
         let session = self
             .storage
-            .load_root_authority(id)
+            .load_execution_admission_snapshot(id)
             .await
             .map_err(authority_unavailable)?
             .ok_or_else(authority_required)?;
         if ExecutingSupervisorObservation::capture_from_executing_session(&session)
             != Some(observation)
+        {
+            return Err(authority_required());
+        }
+        let scope = self
+            .storage
+            .inspect_supervisor_current_user_scope(&reference)
+            .await
+            .map_err(authority_unavailable)?;
+        if scope.created_at != session.created_at
+            || Some(scope.orchestration_revision) != session.supervisor_orchestration_revision()
         {
             return Err(authority_required());
         }
@@ -195,7 +210,6 @@ impl SupervisorSessionDiscovery {
                 scope_revision: state.as_ref().map_or(0, |state| state.revision),
                 original_caller_sha256,
             },
-            state,
         })
     }
 
@@ -223,7 +237,6 @@ struct CallerBinding {
 
 struct CallerSnapshot {
     binding: CallerBinding,
-    state: Option<SupervisorManagementState>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -258,7 +271,7 @@ impl SessionDiscoveryPort for SupervisorSessionDiscovery {
             .map(|value| {
                 let cursor: DirectoryCursor = serde_json::from_str(value)
                     .map_err(|_| arguments("malformed authorized Session cursor"))?;
-                if cursor.version != 1
+                if cursor.version != 2
                     || cursor.caller != caller.binding
                     || cursor.query != query
                     || cursor.limit != limit
@@ -268,88 +281,49 @@ impl SessionDiscoveryPort for SupervisorSessionDiscovery {
                     ));
                 }
                 bamboo_domain::validate_supervisor_target_id(&cursor.after).map_err(arguments)?;
-                if !caller
-                    .state
-                    .as_ref()
-                    .is_some_and(|state| state.links.contains_key(&cursor.after))
-                {
-                    return Err(stale("cursor target is no longer in the current scope"));
-                }
                 Ok(cursor.after)
             })
             .transpose()?;
 
-        let mut authorized = Vec::new();
-        if let Some(state) = caller.state.as_ref() {
-            // Canonical state has a hard 256-link capacity, including tombstones.
-            // We never scan the global Session index or read peer transcripts.
-            if state.links.len() > MAX_SUPERVISOR_LINKS {
-                return Err(authority_unavailable("management link capacity exceeded"));
-            }
-            for (id, link) in &state.links {
-                if !link.enabled || !state.allowed_projects.contains(&link.target_project_id) {
-                    continue;
-                }
-                let current = self
-                    .storage
-                    .inspect_supervisor_link(&caller.binding.reference, id)
-                    .await
-                    .map_err(authority_unavailable)?;
-                if current.state_revision != caller.binding.scope_revision
-                    || current.supervisor != caller.binding.reference
-                    || current.target_session_id != *id
-                    || current.link.as_ref() != Some(link)
-                {
-                    return Err(stale("management relationship changed; start a new page"));
-                }
-                if current.authorized
-                    && query.as_ref().is_none_or(|query| {
-                        id.to_lowercase().contains(query)
-                            || link
-                                .target_project_id
-                                .to_string()
-                                .to_lowercase()
-                                .contains(query)
-                    })
-                {
-                    authorized.push(AuthorizedSessionTarget {
-                        session_id: id.clone(),
-                        project_id: link.target_project_id.clone(),
-                        created_at: link.target_created_at,
-                        metadata_version: link.target_metadata_version,
-                        link_revision: link.revision,
-                        authorization_revision: None,
-                    });
-                }
-            }
+        let page = self
+            .storage
+            .list_supervisor_current_user_targets(
+                &caller.binding.reference,
+                query.as_deref(),
+                after.as_deref(),
+                limit,
+            )
+            .await
+            .map_err(authority_unavailable)?;
+        if page.scope.supervisor != caller.binding.reference
+            || page.scope.created_at != caller.binding.created_at
+            || page.scope.orchestration_revision != caller.binding.tool_revision.max(1)
+            || page.scope.legacy_state_revision != caller.binding.scope_revision
+        {
+            return Err(stale("canonical Supervisor directory caller changed"));
         }
-        self.unchanged(ctx, &caller.binding).await?;
-        // Authorization precedes both ordering and pagination. Each target was
-        // independently observed under the existing strict authority locks.
-        authorized.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-        let mut sessions: Vec<_> = authorized
+        let sessions = page
+            .targets
             .into_iter()
-            .filter(|target| {
-                after
-                    .as_ref()
-                    .is_none_or(|after| target.session_id > *after)
+            .map(|target| AuthorizedSessionTarget {
+                session_id: target.session_id.clone(),
+                project_id: target.project_id.clone(),
+                created_at: target.created_at,
+                metadata_version: target.metadata_version,
+                link_revision: 0,
+                authorization_revision: Some(page.scope.orchestration_revision),
+                current_user_target: Some(target),
             })
-            .take(limit + 1)
             .collect();
-        let has_more = sessions.len() > limit;
-        sessions.truncate(limit);
-        let next_cursor = if has_more {
+        self.unchanged(ctx, &caller.binding).await?;
+        let next_cursor = if let Some(after) = page.next_after {
             Some(
                 serde_json::to_string(&DirectoryCursor {
-                    version: 1,
+                    version: 2,
                     caller: caller.binding.clone(),
                     query,
                     limit,
-                    after: sessions
-                        .last()
-                        .expect("nonempty bounded page")
-                        .session_id
-                        .clone(),
+                    after,
                 })
                 .map_err(authority_unavailable)?,
             )
@@ -381,11 +355,19 @@ impl SessionDiscoveryPort for SupervisorSessionDiscovery {
             .map_err(authority_unavailable)?
             .ok_or_else(|| authority_unavailable("authorized target is unavailable"))?;
         self.unchanged(ctx, &caller.binding).await?;
-        Ok(progress_observation(
+        let mut result = progress_observation(
             &session,
             caller.binding.scope_revision,
             request.max_chars.unwrap_or(2_000),
-        ))
+        );
+        result.current_user_target = Some(
+            self.storage
+                .inspect_supervisor_current_user_target(&caller.binding.reference, &session.id)
+                .await
+                .map_err(authority_unavailable)?,
+        );
+        self.unchanged(ctx, &caller.binding).await?;
+        Ok(result)
     }
 }
 
@@ -451,6 +433,7 @@ pub(super) fn progress_observation(
         status_is_live: false,
         input_specific: false,
         completion_verified: false,
+        current_user_target: None,
     }
 }
 

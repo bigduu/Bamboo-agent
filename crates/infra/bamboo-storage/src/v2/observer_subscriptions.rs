@@ -118,9 +118,7 @@ impl SessionStoreV2 {
                     .load_root_authority_unchecked(id)
                     .await?
                     .ok_or_else(|| denied("Observer target is missing"))?;
-                if state.links.get(id) != Some(link)
-                    || !link_authorizes_target(&state, link, &target)
-                {
+                if !observer_link_authorizes_target(&state, &registration, id, link, &target) {
                     return Err(denied("Observer target scope changed"));
                 }
             }

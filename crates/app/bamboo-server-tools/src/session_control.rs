@@ -525,6 +525,8 @@ enum SessionControlArgs {
     },
     Followup {
         target_session_id: String,
+        #[serde(default)]
+        target_ref: Option<bamboo_domain::SupervisorCurrentUserTarget>,
         operation_id: String,
         message: String,
     },
@@ -565,9 +567,9 @@ impl Tool for SessionControlTool {
 
     fn description(&self) -> &str {
         if self.root_creator.is_some() {
-            return "Supervisor-only control of independent Ordinary Roots in explicitly Host-authorized Projects. scope reads current allowed_projects/state_revision. create requires that revision, an explicit Project and existing Host-bound workspace, a stable operation UUID and first instruction; creates a new Standard Ordinary Root, attaches only that new lifetime and durably submits the instruction. Reuse the complete request on uncertain results; receipts report creation/link/admission/activation, never completion. No Supervisor history, prompt, model, permissions or Project grants are inherited. It does not create a Ticket/Work or isolated worktree. SubAgent creates a bounded Child instead. Existing followup continues an explicitly attached Root using stable operation_id/message. loop retains its separate live-owner Host grant and finite loop opt-in; mutations need exact link/generation/control CAS. No arbitrary attach, permission change, approval answer, successor or cadence. Report actual blocked stage/reason; never substitute shell execution or create another overlapping worker.";
+            return "Supervisor management covers all Projects and Sessions in this application's current-user domain by default. scope returns Projects, canonical Supervisor identity and state_revision; legacy allowed_projects/links are compatibility metadata, not a permission gate. create requires that revision, an existing Project/workspace, stable operation UUID and first instruction; it creates one independent Standard Ordinary Root with its own unchanged work permissions. It does not attach an ACL, create Ticket/Work or make a worktree. Prefer continuing an existing Session: obtain current_user_target from session_history list/inspect, then followup with that unchanged target_ref, stable operation_id and identical message on retry. Receipts describe creation/admission/activation, never completion. No Supervisor history, prompt, model or permissions are inherited. SubAgent creates a bounded Child. loop retains its separate active-owner grant, finite opt-in and exact CAS; default management never grants that capability. Do not answer approvals, change permissions, substitute shell execution or create overlapping workers when blocked.";
         }
-        "Supervisor-only control of an already attached independent Root, preserving its original context and authority. followup: use a stable operation_id per target and exactly the same message on retry; returns durable admission/activation status, not task completion. loop: requires a separate explicit host grant for the target's current active execution and its existing finite loop opt-in. command is status/start/update/stop; only status may omit expected_link_revision or query receipt_operation_id. Mutations require the exact nonzero link revision and command generation/control CAS. A target-owner receipt distinguishes queued delivery, committed control and any objective still pending its next iteration. No new session, attachment, successor, cadence, approval answer or permission is created. Plan and approval replay cannot issue loop commands. Pending human questions remain unanswered; use session_history.read_messages for bounded history."
+        "Supervisor followup preserves a current-user Session's original context and work permissions. Copy current_user_target from session_history list/inspect into target_ref; preserve it, operation_id and message on retry. A stale birth/generation/ancestry is denied, not redirected to a replacement Session. Admission/activation receipts do not prove consumption or completion. No per-Project authorization or attachment is needed. loop is a separate capability: it requires an explicit active-owner Host grant and existing finite opt-in; status/start/update/stop keep exact link/generation/control CAS and objective receipts. Default management does not enable loops, answer pending human approvals, grant permissions, create successors or run a shell. Plan and approval replay cannot issue loop commands."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -577,6 +579,7 @@ impl Tool for SessionControlTool {
                 "action": {"type": "string", "enum": ["followup", "loop"],
                     "description": "followup requires target_session_id, operation_id and message. loop requires target_session_id and command; mutations also require expected_link_revision. Only loop status may query receipt_operation_id or omit the link revision."},
                 "target_session_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "target_ref": {"type":"object", "description":"followup only: copy the unchanged current_user_target returned by session_history list/inspect. This selects the exact birth/generation, never grants access. Refresh on a stale-target error; an uncertain delivery retains every original argument."},
                 "operation_id": {"type": "string", "minLength": 1, "maxLength": 256,
                     "description": "followup only: stable operation id for this target; no whitespace padding, slashes or '..'. Reuse it only with the same message."},
                 "message": {"type": "string", "minLength": 1, "maxLength": 16384,
@@ -596,12 +599,13 @@ impl Tool for SessionControlTool {
                         "expected_link_revision": false,
                         "receipt_operation_id": false
                     },
-                    "required": ["operation_id", "message"]
+                    "required": ["operation_id", "message", "target_ref"]
                 },
                 {
                     "properties": {
                         "action": {"const": "loop"},
                         "operation_id": false,
+                        "target_ref": false,
                         "message": false
                     },
                     "required": ["command"],
@@ -638,6 +642,7 @@ impl Tool for SessionControlTool {
             }
             let forbidden = [
                 "target_session_id",
+                "target_ref",
                 "operation_id",
                 "message",
                 "expected_link_revision",
@@ -682,15 +687,23 @@ impl Tool for SessionControlTool {
                 )
             })?
             .supervisor_reference();
-        let (target_session_id, operation_id, message) = match serde_json::from_value(args)
-            .map_err(|error| {
-                ToolError::InvalidArguments(format!("invalid session_control arguments: {error}"))
-            })? {
+        let original = ctx.executing_caller_for(caller).ok_or_else(|| {
+            ToolError::Execution("session_control requires its original complete caller".into())
+        })?;
+        let (target_session_id, target_ref, operation_id, message) = match serde_json::from_value(
+            args,
+        )
+        .map_err(|error| {
+            ToolError::InvalidArguments(format!("invalid session_control arguments: {error}"))
+        })? {
             SessionControlArgs::Scope => {
                 let creator = self.root_creator.as_ref().ok_or_else(|| ToolError::Execution(
                     "supervised_root_create_unavailable: this Host has no scoped Root creation port".into(),
                 ))?;
-                return creator.scope(&supervisor).await.map(ToolOutcome::Completed);
+                return creator
+                    .scope_observed(original)
+                    .await
+                    .map(ToolOutcome::Completed);
             }
             SessionControlArgs::Create { request } => {
                 request.validate()?;
@@ -698,15 +711,16 @@ impl Tool for SessionControlTool {
                     "supervised_root_create_unavailable: this Host has no scoped Root creation port".into(),
                 ))?;
                 return creator
-                    .create(&supervisor, request)
+                    .create_observed(original, request)
                     .await
                     .map(ToolOutcome::Completed);
             }
             SessionControlArgs::Followup {
                 target_session_id,
+                target_ref,
                 operation_id,
                 message,
-            } => (target_session_id, operation_id, message),
+            } => (target_session_id, target_ref, operation_id, message),
             SessionControlArgs::Loop {
                 target_session_id,
                 expected_link_revision,
@@ -744,9 +758,19 @@ impl Tool for SessionControlTool {
                 )));
             }
         };
+        let target_ref = target_ref.filter(|target| target.session_id == target_session_id)
+            .ok_or_else(|| ToolError::InvalidArguments(
+                "followup requires the exact current_user_target from session_history list/inspect; no Project grant or attachment is needed".into()
+            ))?;
         let result = self
             .messenger
-            .supervisor_followup(&supervisor, &target_session_id, &operation_id, &message)
+            .supervisor_current_user_followup(
+                original,
+                &supervisor,
+                &target_ref,
+                &operation_id,
+                &message,
+            )
             .await;
         let (delivery, activation, detail) = match result {
             Ok(receipt) => {

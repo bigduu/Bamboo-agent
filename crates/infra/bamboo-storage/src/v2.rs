@@ -157,7 +157,7 @@ mod root_mode_actor_context_tests;
 mod supervisor;
 mod supervisor_management;
 pub(crate) use supervisor_management::{
-    subscriptions::ObserverNoticeAuthority, SupervisorFollowupGuard,
+    subscriptions::ObserverNoticeAuthority, CurrentUserTargetGuard, SupervisorFollowupGuard,
 };
 #[cfg(test)]
 mod supervisor_management_lifetime_tests;
@@ -7514,6 +7514,33 @@ impl Storage for SessionStoreV2 {
         supervisor: &bamboo_domain::SupervisorReference,
     ) -> io::Result<bamboo_domain::SupervisorScopeObservation> {
         self.management_scope(supervisor).await
+    }
+
+    async fn inspect_supervisor_current_user_scope(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+    ) -> io::Result<bamboo_domain::SupervisorCurrentUserScope> {
+        self.current_user_supervisor_scope(supervisor).await
+    }
+
+    async fn list_supervisor_current_user_targets(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        query: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> io::Result<bamboo_domain::SupervisorCurrentUserPage> {
+        self.current_user_supervisor_page(supervisor, query, after, limit)
+            .await
+    }
+
+    async fn inspect_supervisor_current_user_target(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target: &str,
+    ) -> io::Result<bamboo_domain::SupervisorCurrentUserTarget> {
+        self.current_user_supervisor_target(supervisor, target)
+            .await
     }
 
     async fn mutate_supervisor_management(
