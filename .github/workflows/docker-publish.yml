@@ -136,7 +136,7 @@ jobs:
             dockerfile: .docker-release/Dockerfile
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
-            dockerfile: docker/Dockerfile
+            dockerfile: .docker-release/Dockerfile.arm64
     steps:
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
@@ -231,6 +231,8 @@ jobs:
           python3 scripts/crate-release-lock.py stamp "${TARGET_VERSION}"
           cargo metadata --format-version 1 >/dev/null
           python3 scripts/crate-release-lock.py
+          mkdir -p .docker-release
+          git show "${GITHUB_WORKFLOW_SHA}:docker/Dockerfile" > .docker-release/Dockerfile.arm64
 
       - name: Build the candidate once
         if: steps.candidate.outputs.mode == 'build'
