@@ -538,7 +538,7 @@ mod execution_input_http {
             .get_or_create_default_supervisor("test-model")
             .await
             .unwrap();
-        let id = supervisor.id;
+        let id = supervisor.session_id;
         let app = test::init_service(
             actix_web::App::new()
                 .app_data(state.clone())
