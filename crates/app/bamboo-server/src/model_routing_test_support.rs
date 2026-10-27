@@ -10,6 +10,7 @@ use bamboo_llm::{
 #[derive(Default)]
 pub(crate) struct CaptureProvider {
     pub(crate) models: Mutex<Vec<String>>,
+    pub(crate) efforts: Mutex<Vec<Option<bamboo_domain::ReasoningEffort>>>,
 }
 
 #[async_trait::async_trait]
@@ -33,8 +34,12 @@ impl LLMProvider for CaptureProvider {
         tools: &[ToolSchema],
         max: Option<u32>,
         model: &str,
-        _options: Option<&LLMRequestOptions>,
+        options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream, LLMError> {
+        self.efforts
+            .lock()
+            .unwrap()
+            .push(options.and_then(|options| options.reasoning_effort));
         self.chat_stream(messages, tools, max, model).await
     }
 }

@@ -161,3 +161,47 @@ async fn routing_contract_schedule_unset_fast_uses_chat_pair_and_explicit_overri
     );
     assert!(providers["fast-c"].models.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn routing_contract_schedule_explicit_reasoning_wins_role_policy_at_dispatch() {
+    let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+    state
+        .config
+        .write()
+        .await
+        .defaults
+        .as_mut()
+        .unwrap()
+        .fast
+        .as_mut()
+        .unwrap()
+        .reasoning_effort = Some(bamboo_domain::ReasoningEffort::Low);
+    let context = context(&state).await;
+    for (step, requested, expected) in [
+        (
+            1,
+            Some(bamboo_domain::ReasoningEffort::High),
+            bamboo_domain::ReasoningEffort::High,
+        ),
+        (2, None, bamboo_domain::ReasoningEffort::Low),
+    ] {
+        let mut request = job();
+        request.run_config.reasoning_effort = requested;
+        run_schedule_job(context.clone(), request, None)
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while providers["fast-c"].efforts.lock().unwrap().len() < step {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the schedule must dispatch its reasoning policy"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            providers["fast-c"].efforts.lock().unwrap()[step - 1],
+            Some(expected)
+        );
+    }
+    assert!(providers["startup-a"].models.lock().unwrap().is_empty());
+}
