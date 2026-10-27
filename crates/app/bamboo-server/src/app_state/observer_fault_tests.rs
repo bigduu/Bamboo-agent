@@ -205,7 +205,7 @@ async fn fault_parent_inbox_before_checkpoint_reopens_and_never_replays_provider
         .deliver_supervisor_observer_fault(&f.reference, OBSERVER, due)
         .await
         .is_err());
-    let physical = inbox.backlog(&f.reference.session_id).await.unwrap();
+    let physical = inbox.inspect(&f.reference.session_id).await.unwrap();
     assert_eq!(physical.generation, 1);
     assert!(!fault(&f).await.reported);
     // This is an actual persisted Maildir transport produced by the adapter.
@@ -238,7 +238,7 @@ async fn fault_parent_inbox_before_checkpoint_reopens_and_never_replays_provider
         "a typed diagnostic cannot use generic admission even under another runtime label"
     );
     assert_eq!(
-        inbox.backlog(&f.reference.session_id).await.unwrap(),
+        inbox.inspect(&f.reference.session_id).await.unwrap(),
         physical
     );
     let bamboo_domain::SessionMessageBody::RuntimeInstruction(body) = envelope.body else {
@@ -269,7 +269,7 @@ async fn fault_parent_inbox_before_checkpoint_reopens_and_never_replays_provider
         .unwrap();
     assert_eq!(receipt.delivery.id, original.event_id);
     assert_eq!(
-        inbox.backlog(&f.reference.session_id).await.unwrap(),
+        inbox.inspect(&f.reference.session_id).await.unwrap(),
         physical
     );
     let recovered = host(f.home.path(), f.probe.clone()).await;
@@ -339,7 +339,7 @@ async fn fault_missing_source_can_report_but_revoked_registration_cannot() {
     let before = f
         .state
         .session_inbox
-        .backlog(&f.reference.session_id)
+        .inspect(&f.reference.session_id)
         .await
         .unwrap();
     assert!(f
@@ -356,7 +356,7 @@ async fn fault_missing_source_can_report_but_revoked_registration_cannot() {
     assert_eq!(
         f.state
             .session_inbox
-            .backlog(&f.reference.session_id)
+            .inspect(&f.reference.session_id)
             .await
             .unwrap(),
         before
@@ -389,7 +389,7 @@ async fn fault_missing_source_can_report_but_revoked_registration_cannot() {
     assert_eq!(
         f.state
             .session_inbox
-            .backlog(&f.reference.session_id)
+            .inspect(&f.reference.session_id)
             .await
             .unwrap()
             .generation,
@@ -436,7 +436,7 @@ async fn fault_delivery_failure_is_bounded_durable_and_preserves_original_payloa
     let before = f
         .state
         .session_inbox
-        .backlog(&f.reference.session_id)
+        .inspect(&f.reference.session_id)
         .await
         .unwrap();
     assert_eq!(before.generation, 0);
@@ -463,7 +463,7 @@ async fn fault_delivery_failure_is_bounded_durable_and_preserves_original_payloa
         Some(&blocked)
     );
     assert_eq!(
-        inbox.backlog(&f.reference.session_id).await.unwrap(),
+        inbox.inspect(&f.reference.session_id).await.unwrap(),
         before
     );
 }
