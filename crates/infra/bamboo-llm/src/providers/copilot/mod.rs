@@ -522,6 +522,20 @@ impl CopilotProvider {
             || Self::is_retryable_transport_message(&error.to_string())
     }
 
+    // Model POSTs use the advertised finite or explicitly continuous policy.
+    // Model discovery keeps its existing bounded transport/auth contract.
+    async fn send_model_request<F>(
+        &self,
+        build_request: F,
+        _operation: &str,
+        _session_id: Option<&str>,
+    ) -> std::result::Result<reqwest::Response, LLMError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        crate::retry::send_provider_request(crate::retry::global(), "Copilot", build_request).await
+    }
+
     async fn send_with_transport_retry<F>(
         &self,
         mut build_request: F,
@@ -662,7 +676,7 @@ impl CopilotProvider {
             Some(model),
         )?;
         let mut response = self
-            .send_with_transport_retry(
+            .send_model_request(
                 || {
                     self.client
                         .post(url)
@@ -688,7 +702,7 @@ impl CopilotProvider {
                             Some(model),
                         )?;
                         response = self
-                            .send_with_transport_retry(
+                            .send_model_request(
                                 || {
                                     self.client
                                         .post(url)
@@ -1164,7 +1178,7 @@ impl LLMProvider for CopilotProvider {
             Some(upstream_model),
         )?;
         let mut response = self
-            .send_with_transport_retry(
+            .send_model_request(
                 || {
                     self.client
                         .post(url)
@@ -1191,7 +1205,7 @@ impl LLMProvider for CopilotProvider {
                             Some(upstream_model),
                         )?;
                         response = self
-                            .send_with_transport_retry(
+                            .send_model_request(
                                 || {
                                     self.client
                                         .post(url)
@@ -2100,5 +2114,159 @@ mod operational_log_privacy_tests {
                 "private-session-999-sentinel",
             ],
         );
+    }
+}
+
+#[cfg(test)]
+mod continuous_model_request_tests {
+    use super::*;
+    use crate::retry::{
+        observe_initial_http_retries, with_upstream_retry, InitialHttpRetryObserver, UpstreamRetry,
+        WorkPhysicalRequest,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn continuous_model_posts_retry_transient_statuses_and_keep_terminal_responses_unread() {
+        for operation in [
+            "copilot responses initial request",
+            "copilot chat/completions initial request",
+        ] {
+            for status in [429, 503, 400, 401, 403, 422] {
+                let server = MockServer::start().await;
+                let count = Arc::new(AtomicUsize::new(0));
+                let hits = count.clone();
+                Mock::given(method("POST"))
+                    .respond_with(move |_: &wiremock::Request| {
+                        let n = hits.fetch_add(1, Ordering::SeqCst);
+                        ResponseTemplate::new(if n == 0 { status } else { 200 })
+                            .set_body_string("synthetic unread response")
+                    })
+                    .mount(&server)
+                    .await;
+                let provider = CopilotProvider::with_token("synthetic-token");
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let observer = Arc::new(InitialHttpRetryObserver::default());
+                let response = with_upstream_retry(
+                    UpstreamRetry::UntilCancelled,
+                    observe_initial_http_retries(
+                        observer.clone(),
+                        provider.send_model_request(
+                            || client.post(server.uri()),
+                            operation,
+                            Some("synthetic-session"),
+                        ),
+                    ),
+                )
+                .await
+                .unwrap();
+                let transient = matches!(status, 429 | 503);
+                assert_eq!(
+                    response.status().as_u16(),
+                    if transient { 200 } else { status }
+                );
+                assert_eq!(response.text().await.unwrap(), "synthetic unread response");
+                assert_eq!(count.load(Ordering::SeqCst), if transient { 2 } else { 1 });
+                assert!(observer.request_budget_managed());
+                assert!(!observer.request_policy_active());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn copilot_continuous_long_hint_is_cancellable_and_discovery_remains_bounded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "120"))
+            .mount(&server)
+            .await;
+        let observer = Arc::new(InitialHttpRetryObserver::default());
+        let observed = observer.clone();
+        let url = server.uri();
+        let task = tokio::spawn(async move {
+            let provider = CopilotProvider::with_token("synthetic-token");
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            with_upstream_retry(
+                UpstreamRetry::UntilCancelled,
+                observe_initial_http_retries(
+                    observed,
+                    provider.send_model_request(
+                        || client.post(&url),
+                        "copilot responses initial request",
+                        None,
+                    ),
+                ),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while observer.last().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(observer.last().unwrap().delay >= Duration::from_secs(120));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert!(!observer.request_policy_active());
+        let provider = CopilotProvider::with_token("synthetic-token");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let discovery = with_upstream_retry(
+            UpstreamRetry::UntilCancelled,
+            provider.send_with_transport_retry(
+                || client.post(server.uri()),
+                "copilot models list",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(discovery.status(), 429);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn copilot_continuous_mode_keeps_the_work_single_physical_send_guard() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = CopilotProvider::with_token("synthetic-token");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let scope = WorkPhysicalRequest::default();
+        with_upstream_retry(
+            UpstreamRetry::UntilCancelled,
+            scope.scope(async {
+                let first = provider
+                    .send_model_request(
+                        || client.post(server.uri()),
+                        "copilot responses initial request",
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(first.status(), 503);
+                let second = provider
+                    .send_model_request(
+                        || client.post(server.uri()),
+                        "copilot responses auth-refresh retry",
+                        None,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(second, LLMError::RequestFailed(_)));
+            }),
+        )
+        .await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

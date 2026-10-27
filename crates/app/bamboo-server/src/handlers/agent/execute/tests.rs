@@ -219,10 +219,11 @@ mod execution_input_http {
                 max_delay: std::time::Duration::from_millis(5),
             };
             let client = reqwest::Client::builder().no_proxy().build().unwrap();
-            let response = bamboo_llm::retry::send_with_retry(&config, "controlled-http", || {
-                client.post(&self.url).json(messages)
-            })
-            .await?;
+            let response =
+                bamboo_llm::retry::send_provider_request(&config, "controlled-http", || {
+                    client.post(&self.url).json(messages)
+                })
+                .await?;
             if !response.status().is_success() {
                 return Err(LLMError::RequestFailed("controlled request failed".into()));
             }

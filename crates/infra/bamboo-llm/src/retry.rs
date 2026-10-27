@@ -157,7 +157,11 @@ pub(crate) fn claim_work_physical_request() -> Result<(), LLMError> {
     }).unwrap_or(Ok(()))
 }
 
-pub(crate) async fn send_provider_request<F>(
+/// Establish one managed provider HTTP response, leaving its successful body
+/// unread. The owner must retain cancellation around this future. Only this
+/// managed entry opts into the execution's continuous policy; the legacy
+/// public `send_with_retry` helper keeps its caller-owned bootstrap contract.
+pub async fn send_provider_request<F>(
     config: &RetryConfig,
     provider: &str,
     build: F,
@@ -166,38 +170,43 @@ where
     F: Fn() -> RequestBuilder,
 {
     claim_work_physical_request()?;
-    if continuous_request_retries() {
-        return send_continuously(config, provider, build).await;
-    }
-    send_with_retry(config, provider, build)
-        .await
-        .map_err(LLMError::Http)
+    send_managed_request(config, provider, *initial_request_limits(), build).await
 }
 
-// Built-in non-Anthropic providers keep their legacy response/error parsing.
-// Only opt-in initial sends gain a headers-only timeout; successful SSE bodies
-// retain their existing streaming watchdog and are never reissued here.
-async fn send_continuously<F>(
+// The timeout owns only the headers future, never the successful SSE body.
+// Anthropic separately shares one budget across its compatibility fallbacks.
+async fn send_managed_request<F>(
     config: &RetryConfig,
     provider: &str,
+    limits: InitialRequestLimits,
     build: F,
 ) -> Result<Response, LLMError>
 where
     F: Fn() -> RequestBuilder,
 {
+    let continuous = continuous_request_retries();
+    let deadline = (!continuous).then(|| Instant::now() + limits.total_budget);
     let _managed_request = ManagedRequestScope::enter();
     retry_initial_request(
         config,
         provider,
+        continuous,
         || async {
-            match tokio::time::timeout(initial_request_limits().attempt_timeout, build().send())
-                .await
-            {
+            let started = Instant::now();
+            if deadline.is_some_and(|deadline| started >= deadline) {
+                return RetryAttempt::final_result(Err(LLMError::RequestFailed(
+                    "initial upstream request time budget exhausted".into(),
+                )));
+            }
+            let attempt_deadline = deadline
+                .map(|deadline| deadline.min(started + limits.attempt_timeout))
+                .unwrap_or(started + limits.attempt_timeout);
+            match tokio::time::timeout_at(attempt_deadline, build().send()).await {
                 Ok(Ok(response)) => RetryAttempt {
                     retry: is_retryable_status(response.status()),
                     status: Some(response.status()),
                     retry_after: parse_retry_after_with_date(&response),
-                    deadline: None,
+                    deadline,
                     observation: None,
                     result: Ok(response),
                 },
@@ -205,7 +214,7 @@ where
                     retry: is_retryable_reqwest_error(&error),
                     status: None,
                     retry_after: None,
-                    deadline: None,
+                    deadline,
                     observation: None,
                     result: Err(LLMError::Http(error)),
                 },
@@ -213,7 +222,7 @@ where
                     retry: true,
                     status: None,
                     retry_after: None,
-                    deadline: None,
+                    deadline,
                     observation: None,
                     result: Err(LLMError::RequestFailed(
                         "initial response headers timed out".into(),
@@ -398,9 +407,13 @@ pub async fn send_with_retry<F>(
 where
     F: Fn() -> RequestBuilder,
 {
+    // Legacy/custom callers keep their finite policy even when invoked from
+    // a main execution that opted into managed continuous requests.
+    let deadline = Instant::now() + initial_request_limits().total_budget;
     retry_initial_request(
         config,
         provider,
+        false,
         || async {
             match build().send().await {
                 Ok(response) => {
@@ -410,7 +423,7 @@ where
                         retry: is_retryable_status(status),
                         status: Some(status),
                         retry_after,
-                        deadline: None,
+                        deadline: Some(deadline),
                         observation: None,
                         result: Ok(response),
                     }
@@ -419,7 +432,7 @@ where
                     retry: is_retryable_reqwest_error(&error),
                     status: None,
                     retry_after: None,
-                    deadline: None,
+                    deadline: Some(deadline),
                     observation: None,
                     result: Err(error),
                 },
@@ -467,6 +480,7 @@ enum RetryDecision {
 async fn retry_initial_request<T, F, Fut, D>(
     config: &RetryConfig,
     provider: &str,
+    allow_continuous: bool,
     attempt: F,
     decide: D,
 ) -> T
@@ -480,7 +494,7 @@ where
     } else {
         config.max_attempts.max(1)
     };
-    let continuous = continuous_request_retries();
+    let continuous = allow_continuous && !work_request_budget_active();
     let mut index: u32 = 0;
     loop {
         let mut outcome = attempt().await;
@@ -694,10 +708,9 @@ fn parse_retry_after_with_date(response: &Response) -> Option<Duration> {
             .get(reqwest::header::RETRY_AFTER)?
             .to_str()
             .ok()?;
-        let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+        let date = httpdate::parse_http_date(value).ok()?;
         Some(
-            (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
-                .to_std()
+            date.duration_since(std::time::SystemTime::now())
                 .unwrap_or_default(),
         )
     })
@@ -720,6 +733,7 @@ where
     let result = retry_initial_request(
         config,
         "Anthropic",
+        budget.continuous,
         || async {
             let attempt_started = Instant::now();
             if !budget.continuous && attempt_started >= budget.deadline {

@@ -150,6 +150,12 @@ async fn continuous_retry_after_seconds_and_http_date_are_not_shortened_and_back
         (chrono::Utc::now() + chrono::Duration::seconds(120))
             .format("%a, %d %b %Y %H:%M:%S GMT")
             .to_string(),
+        (chrono::Utc::now() + chrono::Duration::seconds(120))
+            .format("%A, %d-%b-%y %H:%M:%S GMT")
+            .to_string(),
+        (chrono::Utc::now() + chrono::Duration::seconds(120))
+            .format("%a %b %e %H:%M:%S %Y")
+            .to_string(),
     ] {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -294,4 +300,133 @@ async fn no_http_connect_failures_continue_until_cancelled_but_invalid_request_s
     })
     .await;
     assert_eq!(count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn bounded_managed_and_legacy_calls_stop_for_a_long_server_hint_without_sending_early() {
+    for managed in [false, true] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "3600"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let observer = Arc::new(InitialHttpRetryObserver::default());
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            observe_initial_http_retries(observer.clone(), async {
+                if managed {
+                    send_provider_request(&fast(9), "controlled-long-hint", || {
+                        client.post(server.uri())
+                    })
+                    .await
+                } else {
+                    send_with_retry(&fast(9), "controlled-legacy-hint", || {
+                        client.post(server.uri())
+                    })
+                    .await
+                    .map_err(LLMError::Http)
+                }
+            }),
+        )
+        .await
+        .expect("bounded policy must stop when a server hint does not fit")
+        .unwrap();
+        assert_eq!(response.status(), 429);
+        assert_eq!(observer.request_budget_managed(), managed);
+        assert!(!observer.request_policy_active());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn legacy_public_helper_keeps_its_finite_contract_inside_an_opted_in_execution() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let response = with_upstream_retry(
+        UpstreamRetry::UntilCancelled,
+        send_with_retry(&fast(1), "legacy-finite", || client.post(server.uri())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn bounded_managed_headers_timeout_finishes_without_needing_cancellation() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+        .mount(&server)
+        .await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let observer = Arc::new(InitialHttpRetryObserver::default());
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        observe_initial_http_retries(
+            observer.clone(),
+            send_managed_request(
+                &fast(2),
+                "bounded-headers",
+                InitialRequestLimits {
+                    total_budget: Duration::from_millis(250),
+                    attempt_timeout: Duration::from_millis(50),
+                },
+                || client.post(server.uri()),
+            ),
+        ),
+    )
+    .await
+    .expect("bounded headers must finish before an owner has to Stop");
+    assert!(matches!(result, Err(LLMError::RequestFailed(_))));
+    let count = server.received_requests().await.unwrap().len();
+    assert!((1..=2).contains(&count));
+    assert!(observer.request_budget_managed());
+    assert!(!observer.request_policy_active());
+}
+
+#[tokio::test]
+async fn managed_headers_timeout_never_becomes_a_successful_body_deadline() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buffer = [0u8; 2048];
+        socket.read(&mut buffer).await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        socket.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        socket.write_all(b"ok").await.unwrap();
+    });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let response = send_managed_request(
+        &fast(1),
+        "successful-body",
+        InitialRequestLimits {
+            total_budget: Duration::from_secs(1),
+            attempt_timeout: Duration::from_millis(50),
+        },
+        || client.post(format!("http://{address}")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), response.text())
+            .await
+            .unwrap()
+            .unwrap(),
+        "ok"
+    );
+    server.await.unwrap();
 }

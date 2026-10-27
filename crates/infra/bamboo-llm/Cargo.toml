@@ -12,6 +12,7 @@ bamboo-domain = { path = "../../core/bamboo-domain" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+httpdate = "1"
 thiserror = { workspace = true }
 anyhow = "1"
 tracing = "0.1"

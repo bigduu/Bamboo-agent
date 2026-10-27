@@ -13,7 +13,7 @@ Anthropic shares a 120-second total budget across its compatibility fallbacks;
 each headers attempt has a 20-second deadline. This doubles the previous
 60-second allowance while keeping ordinary interactive execution finite. The
 count remains a ceiling: elapsed time or a long server hint may stop it sooner.
-Other built-in providers retain their existing finite bootstrap/stream policy.
+Other built-in providers using the shared HTTP driver apply finite headers and per-send time limits. Copilot model POSTs use the same policy while model discovery retains its existing transport contract. Successful streams retain their independent stream watchdog.
 
 Operator environment settings are read once at first use, so changing them
 requires a later normal process start. This feature does not edit live settings.
@@ -21,7 +21,7 @@ requires a later normal process start. This feature does not edit live settings.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `BAMBOO_LLM_MAX_RETRIES` | `5` | Retries after the initial attempt; `0` means one attempt. Anthropic no longer silently clamps this setting to four total attempts. |
-| `BAMBOO_LLM_RETRY_TOTAL_BUDGET_MS` | `120000` | Anthropic total initial-request budget; positive values up to 3600000 ms. |
+| `BAMBOO_LLM_RETRY_TOTAL_BUDGET_MS` | `120000` | Managed initial-request budget, shared across Anthropic fallbacks and per send for other providers; positive values up to 3600000 ms. |
 | `BAMBOO_LLM_RETRY_ATTEMPT_TIMEOUT_MS` | `20000` | Initial headers deadline; positive values up to 60000 ms. |
 | `BAMBOO_LLM_RETRY_BASE_DELAY_MS` | `500` | Exponential backoff base. |
 | `BAMBOO_LLM_RETRY_MAX_DELAY_MS` | `30000` | Cap on computed backoff, with jitter. |
@@ -68,8 +68,9 @@ exception remains narrow; it is not a general authentication retry rule.
 A managed headers policy owns its initial deadline. On successful establishment,
 the independent first-semantic/transport/semantic stream watchdog starts, and a
 stream failure remains terminal rather than replaying successful output or tools.
-Custom providers that do not use Bamboo's managed send retain their own bootstrap
-contract.
+Custom providers using public `send_provider_request` opt into the managed headers contract. The legacy public `send_with_retry` helper remains finite and does not inherit continuous mode; those custom providers retain their own bootstrap contract.
+
+SDK callers can use `agent.execute_with_upstream_retry(session, request, UpstreamRetry::UntilCancelled)`, importing the enum from `bamboo_sdk`. Existing requests, builders and execute entrypoints retain their bounded contract.
 
 Continuous mode does not override Work's one-physical-send-per-Host-reservation
 rule, run/token/tool budgets, approvals or permissions. A Work retry must still

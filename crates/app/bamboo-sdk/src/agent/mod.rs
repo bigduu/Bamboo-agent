@@ -56,7 +56,7 @@ use async_trait::async_trait;
 pub use builder::AgentBuilder;
 pub use execute_request::{
     inspect_loop, CountedLoopConfig, ExecuteRequestBuilder, LoopControlConfig, LoopControlReceipt,
-    LoopStatusSnapshot,
+    LoopStatusSnapshot, UpstreamRetry,
 };
 use tokio::sync::mpsc;
 
@@ -606,6 +606,21 @@ impl Agent {
         #[cfg(test)]
         constructor_parity_tests::observe_inputs(&session.id, None);
         self.inner.execute_direct(session, request).await
+    }
+
+    /// Execute with an explicit per-run upstream retry policy through the same
+    /// direct owner, compatibility and session preparation checks as execute.
+    pub async fn execute_with_upstream_retry(
+        &self,
+        session: &mut Session,
+        request: ExecuteRequest,
+        upstream_retry: UpstreamRetry,
+    ) -> Result<(), AgentError> {
+        #[cfg(test)]
+        constructor_parity_tests::observe_inputs(&session.id, None);
+        self.inner
+            .execute_direct_with_upstream_retry(session, request, upstream_retry)
+            .await
     }
 
     /// Shared execution path: prepare the session (system prompt + model), build
@@ -3074,6 +3089,33 @@ mod constructor_parity_tests {
             .unwrap()
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn explicit_upstream_retry_preserves_direct_execution_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let agent = agent(root.path(), provider.clone()).await;
+        let mut session = Session::new("retry-sdk-owned", "claude-test");
+        session.add_message(Message::user("retained"));
+        let before = serde_json::to_value(&session).unwrap();
+        let lease = agent
+            .inner
+            .begin_direct_execution(&session.id)
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let request = ExecuteRequestBuilder::new("", tx, CancellationToken::new()).build();
+        let result = agent
+            .execute_with_upstream_retry(&mut session, request, UpstreamRetry::UntilCancelled)
+            .await;
+        assert!(
+            result.is_err(),
+            "an occupied direct owner must refuse execution"
+        );
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert!(provider.0.lock().unwrap().is_empty());
+        lease.abandon().await;
     }
 
     struct ObservedInput(Arc<AtomicUsize>);

@@ -1304,7 +1304,7 @@ pub fn spawn_session_execution_with_upstream_retry(
             // newly armed safety-net wait, it must not resurrect a completed
             // child wait. Tagged tool waits are reconciled by the final writer.
             let inherited_child_wait = agent.persistence().inherited_child_wait();
-            let mut execute_request = build_execute_request(
+            let execute_request = build_execute_request(
                 initial_message,
                 mpsc_tx.clone(),
                 cancel_token,
@@ -1330,8 +1330,6 @@ pub fn spawn_session_execution_with_upstream_retry(
                 },
             );
 
-            execute_request.upstream_retry = upstream_retry;
-
             // Panic containment (issue #546): everything below — the terminal
             // status persist, finalize_runner, and the child-completion
             // publish — only runs if this task survives execution. An
@@ -1340,10 +1338,11 @@ pub fn spawn_session_execution_with_upstream_retry(
             // waiting parent. Map a panic to a terminal error instead.
             let result = {
                 use futures::FutureExt;
-                match std::panic::AssertUnwindSafe(agent.execute_with_inputs(
+                match std::panic::AssertUnwindSafe(agent.execute_with_inputs_and_upstream_retry(
                     &mut session,
                     execute_request,
                     inputs,
+                    upstream_retry,
                 ))
                 .catch_unwind()
                 .await

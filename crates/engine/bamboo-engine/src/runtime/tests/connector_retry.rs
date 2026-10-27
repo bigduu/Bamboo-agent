@@ -609,10 +609,11 @@ impl LLMProvider for InitialRetryProbe {
             max_delay: std::time::Duration::from_millis(5),
         };
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let response = bamboo_llm::retry::send_with_retry(&config, "controlled-consumer", || {
-            client.post(&self.url).json(messages)
-        })
-        .await?;
+        let response =
+            bamboo_llm::retry::send_provider_request(&config, "controlled-consumer", || {
+                client.post(&self.url).json(messages)
+            })
+            .await?;
         if !response.status().is_success() {
             return Err(LLMError::RequestFailed(
                 "controlled initial request failed".into(),
@@ -653,11 +654,18 @@ async fn execute_opt_in_retries_initial_http_without_replaying_tools_or_user_mes
         session.add_message(Message::user("one retained user message"));
         storage.save_session(&session).await.unwrap();
         let (tx, _rx) = mpsc::channel(128);
-        let mut request = direct_request(tx, CancellationToken::new());
-        if continuous {
-            request.upstream_retry = bamboo_llm::retry::UpstreamRetry::UntilCancelled;
-        }
-        let result = agent.execute(&mut session, request).await;
+        let request = direct_request(tx, CancellationToken::new());
+        let result = agent
+            .execute_with_upstream_retry(
+                &mut session,
+                request,
+                if continuous {
+                    bamboo_llm::retry::UpstreamRetry::UntilCancelled
+                } else {
+                    bamboo_llm::retry::UpstreamRetry::Bounded
+                },
+            )
+            .await;
         assert_eq!(result.is_ok(), continuous);
         assert_eq!(hits.load(Ordering::SeqCst), if continuous { 4 } else { 1 });
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
@@ -697,9 +705,15 @@ async fn continuous_initial_retry_never_replays_partial_text_reasoning_or_tool_f
         let (tx, _rx) = mpsc::channel(128);
         let request = crate::runtime::ExecuteRequestBuilder::new("", tx, CancellationToken::new())
             .model("test-model")
-            .upstream_retry(bamboo_llm::retry::UpstreamRetry::UntilCancelled)
             .build();
-        let error = agent.execute(&mut session, request).await.unwrap_err();
+        let error = agent
+            .execute_with_upstream_retry(
+                &mut session,
+                request,
+                bamboo_llm::retry::UpstreamRetry::UntilCancelled,
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(error, AgentError::LLMNonRetryable(_)));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         let cold = storage.load_session(&session.id).await.unwrap().unwrap();
@@ -707,6 +721,52 @@ async fn continuous_initial_retry_never_replays_partial_text_reasoning_or_tool_f
             cold.messages
                 .iter()
                 .filter(|m| m.content == "retained once")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn actual_openai_bounded_consumer_stops_when_retry_after_cannot_fit_without_turn_replay() {
+    use bamboo_llm::providers::openai::OpenAIProvider;
+    for status in [429, 503] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("Retry-After", "3600")
+                    .set_body_json(
+                        serde_json::json!({"error":{"message":"synthetic temporary failure"}}),
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = Arc::new(
+            OpenAIProvider::new("synthetic-key")
+                .with_base_url(server.uri())
+                .with_client(reqwest::Client::builder().no_proxy().build().unwrap()),
+        );
+        let (_home, agent, storage) = build_direct_execute_agent(provider, None, None).await;
+        let mut session = Session::new(&format!("bounded-openai-hint-{status}"), "test-model");
+        session.add_message(Message::user("one synthetic user identity"));
+        storage.save_session(&session).await.unwrap();
+        let (tx, _rx) = mpsc::channel(128);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.execute(&mut session, direct_request(tx, CancellationToken::new())),
+        )
+        .await
+        .expect("long hint must terminate without resetting a turn")
+        .unwrap_err();
+        assert!(matches!(error, AgentError::LLMNonRetryable(_)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let cold = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            cold.messages
+                .iter()
+                .filter(|m| m.content == "one synthetic user identity")
                 .count(),
             1
         );
