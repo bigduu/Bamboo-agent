@@ -216,3 +216,47 @@ async fn routing_contract_explicit_child_override_wins_invalid_default_role() {
         Some(ProviderModelRef::new("chat-a", "explicit-child"))
     );
 }
+
+#[tokio::test]
+async fn routing_contract_plan_rejects_unknown_explicit_type_role_before_parent_inheritance() {
+    let harness = routing_harness(None).await;
+    harness
+        .adapter
+        .config
+        .write()
+        .await
+        .defaults
+        .as_mut()
+        .unwrap()
+        .subagent_models
+        .insert(
+            "planner".into(),
+            ProviderModelRef::new("missing-planner-account", "unadmitted-planner"),
+        );
+    let before = harness
+        .adapter
+        .session_store
+        .list_index_entries()
+        .await
+        .len();
+    let plan = PlanTool::new(harness.adapter.clone(), harness.adapter.clone());
+    let result = invoke_plan_completed(
+        &plan,
+        json!({"task":"Inspect synthetic routing only", "workspace":harness.workspace_path}),
+        subagent_test_ctx(&harness.parent_session_id, "synthetic-unknown-planner-role"),
+    )
+    .await;
+    let error = result
+        .expect_err("the explicitly rejected planner route must not inherit the parent's model");
+    assert!(error.to_string().contains("not admitted"), "{error}");
+    assert_eq!(
+        harness
+            .adapter
+            .session_store
+            .list_index_entries()
+            .await
+            .len(),
+        before
+    );
+    assert!(harness.agent_runners.read().await.is_empty());
+}
