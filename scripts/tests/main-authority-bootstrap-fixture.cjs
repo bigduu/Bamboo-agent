@@ -127,8 +127,8 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
     ? ['Validation Source', 'Test', 'Main Release Admission', 'Quick Checks', 'Promotion Source',
       'E2E Tests', 'Lint', 'MSRV (Rust 1.95)', 'Security Audit', 'cargo-deny (licenses/bans/advisories/sources)',
       'Documentation', 'TLS Fixture (${{ matrix.os }})', 'ToolEvent Recorder E2E (${{ matrix.os }})', platformLabel + ' (${{ matrix.os }})', ...mainSkipped,
-      ...(current ? ['Feature Unit and E2E', 'Native Feature (${{ matrix.os }})'] : [])]
-    : [...FULL, ...(grouped ? groupedNames : crates ? crateNames : []), ...(current ? ['Feature Unit and E2E', 'Native Feature (${{ matrix.os }})'] : []),
+      ...(current ? ['Feature Unit and E2E', 'Native Feature (${{ matrix.os }})', 'Browser Runtime Unit and E2E'] : [])]
+    : [...FULL, ...(grouped ? groupedNames : crates ? crateNames : []), ...(current ? ['Feature Unit and E2E', 'Native Feature (${{ matrix.os }})', 'Browser Runtime Unit and E2E'] : []),
       ...(promotion ? [...platforms, 'Promotion Source'] : [])]).map((name, i) => ({
     id: id * 100 + i, name, run_id: id, run_attempt: 1,
     head_sha: promotion ? head : source, head_branch: promotion ? release : 'main',
@@ -136,7 +136,7 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
       : name.startsWith('Test (') ? (name.includes('bamboo-server/') ? 'Test server block' : 'Test crate')
       : (name.includes('bamboo-server/') ? 'Run E2E server block' : 'Run E2E crate tests'), 'Complete job']
       .map((name, i) => ({ name, number: i + 1, status: 'completed', conclusion: 'success' })) : steps,
-    status: 'completed', conclusion: name === 'Feature Unit and E2E' || name === 'Native Feature (${{ matrix.os }})' || (promotion && grouped && emptyNames.includes(name)) ||
+    status: 'completed', conclusion: name === 'Feature Unit and E2E' || name === 'Native Feature (${{ matrix.os }})' || name === 'Browser Runtime Unit and E2E' || (promotion && grouped && emptyNames.includes(name)) ||
       (!promotion && light && !['Validation Source', 'Test', 'Main Release Admission'].includes(name)) ? 'skipped' : 'success',
     completed_at: '2026-10-20T02:59:00Z' })) })
   const commitObject = (sha) => ({ sha, tree: { sha: git('rev-parse', `${sha}^{tree}`) },
@@ -434,6 +434,12 @@ with patch('subprocess.check_output', output):
   ]
   if (current) for (const [runId, label] of [[222, 'legacy premerge'], ...(mode === 'publication' ? [[111, 'main admission']] : [])]) {
     const route = `actions/runs/${runId}/jobs?filter=latest&per_page=10&page=1`
+    for (const state of ['missing', 'success', 'failure', 'in_progress']) negatives.push([`${label} browser runtime must stay skipped: ${state}`, x => {
+      const jobs = x.routes[route].jobs, index = jobs.findIndex(job => job.name === 'Browser Runtime Unit and E2E')
+      if (state === 'missing') jobs.splice(index, 1)
+      else if (state === 'in_progress') jobs[index].status = state
+      else jobs[index].conclusion = state
+    }])
     for (const state of ['missing', 'success', 'failure', 'in_progress']) negatives.push([`${label} native skip must be complete: ${state}`, x => {
       const jobs = x.routes[route].jobs
       const index = jobs.findIndex(job => job.name === 'Native Feature (${{ matrix.os }})')

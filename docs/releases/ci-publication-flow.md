@@ -31,7 +31,27 @@ The three portable Node suites register 46 Supervisor, 6 Lotus artifact and
 each Windows/macOS native feature job runs them once before Cargo. Windows
 retains the explicit unsupported-platform refusal assertions. These counts
 describe registration, not hosted execution or the separate `browser-runtime`
-Node suites; that class still needs an automatic feature owner.
+Node suites.
+
+#2330 prepares one Ubuntu Node 24 `Browser Runtime Unit and E2E` feature job.
+Both required summaries consume that same job result. It installs the locked
+`playwright-core` 1.62.1 with package scripts disabled, installs only its matching
+headless shell once, then runs `npm --prefix browser-runtime run test:runtime`.
+That serial command lists all thirteen files: original host/profile/checkpoint/
+writer-close/shared-host/shared-failclosed/storage-runtime/native-root-tracker,
+plus busy-response, ephemeral-clean, launch-admission, storage-preparation and
+working-directory. The final TAP summary must contain real passing cases and
+zero failures, cancellation, skips or TODOs. There is no Cargo/Vite or portable
+61-case repetition, and release/main/legacy full paths skip the new suite.
+
+The Node child receives only runtime paths and actual M identity, without
+workflow credentials/write channels; Git source/clean checks bracket execution.
+Per-attempt TAP evidence preserves failures. #2329's unknown writer scratch is
+retained for isolated-runner teardown. Its diagnostic `40422761407` passed one
+bounded download case plus eight close fixtures; it is not thirteen-file or
+combined feature acceptance. C7c552 + F772468 are explicit WIP prerequisites;
+refresh only through normal accepted A/C integration and require final-source
+CI before claiming this owner accepted. This does not activate publication.
 
 | Native configuration | Cases currently selected from source | Runtime owner |
 | --- | --- | --- |

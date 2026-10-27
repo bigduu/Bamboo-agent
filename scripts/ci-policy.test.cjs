@@ -308,6 +308,79 @@ test("the feature executor bounds debug artifacts and records capacity without c
   assert.doesNotMatch(readFileSync(".github/workflows/publish-crate.yml", "utf8"), /CARGO_PROFILE_(?:DEV|TEST)_DEBUG/u)
 })
 
+const browserRuntimeFiles = ["host", "profile", "profile-checkpoint", "writer-close", "shared-host", "shared-failclosed",
+  "storage-runtime", "native-root-tracker", "busy-response", "ephemeral-clean", "launch-admission", "storage-preparation", "working-directory"]
+  .map(name => `${name}.test.cjs`)
+test("one feature Node24 owner runs all thirteen browser runtime files without another producer", () => {
+  const metadata = JSON.parse(readFileSync("browser-runtime/package.json", "utf8"))
+  const lock = JSON.parse(readFileSync("browser-runtime/package-lock.json", "utf8"))
+  assert.equal(metadata.dependencies["playwright-core"], "1.62.1"); assert.equal(lock.packages["node_modules/playwright-core"].version, "1.62.1")
+  const command = metadata.scripts["test:runtime"]
+  const verify = (source, runtimeCommand) => {
+    const owner = source.match(/\n  browser-runtime-tests:\n([\s\S]*?)(?=\n  [a-z][a-z0-9-]*:\n)/u)?.[1]
+    assert.ok(owner)
+    assert.match(owner, /if: needs\.validation-source\.outputs\.feature == 'true'/u)
+    assert.match(owner, /runs-on: ubuntu-latest/u); assert.match(owner, /node-version: '24'/u)
+    assert.match(owner, /persist-credentials: false/u)
+    assert.match(owner, /npm ci --prefix browser-runtime --ignore-scripts/u)
+    assert.match(owner, /playwright-core\/package\.json'\)\.version, '1\.62\.1'/u)
+    assert.equal(owner.split("cli.js install --with-deps chromium-headless-shell").length - 1, 1)
+    assert.equal(owner.split("PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/bamboo-browser-runtime-browsers").length - 1, 2, "install and execution share one shell directory")
+    assert.doesNotMatch(owner, /\bcargo\b|\brust\b|\bvite\b|supervisor-native|lotus-next-artifact\.test|release-frontend-policy\.test|\bnpx\b|rm -|continue-on-error:|\|\| true/u)
+    assert.equal((owner.match(/test "\$\(git rev-parse HEAD\)" = "\$GITHUB_SHA"/gu) || []).length, 2)
+    assert.equal((owner.match(/test -z "\$\(git status --porcelain --untracked-files=all\)"/gu) || []).length, 2)
+    assert.match(owner, /set -euo pipefail\n          node <<'NODE' \| tee/u)
+    assert.match(owner, /if: always\(\)[\s\S]*name: browser-runtime-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}/u)
+    assert.deepEqual(runtimeCommand.split(" "), ["node", "--test", "--test-concurrency=1", "--test-reporter=tap", ...browserRuntimeFiles])
+    for (const id of ["test", "e2e-test"]) {
+      const body = source.split(`\n  ${id}:\n`)[1].split(/\n  [a-z][a-z0-9-]*:\n/u)[0]
+      assert.match(body, /needs: \[[^\n]*browser-runtime-tests/u)
+      assert.match(body, /BROWSER_RUNTIME_RESULT: \$\{\{ needs.browser-runtime-tests.result \}\}/u)
+      assert.match(body, /test "\$BROWSER_RUNTIME_RESULT" = success/u)
+    }
+    assert.equal(source.split("'test:runtime'").length - 1, 1, "one physical runtime command")
+  }
+  verify(workflow, command)
+  assert.deepEqual(readdirSync("browser-runtime").filter(file => file.endsWith(".test.cjs")).sort(), [...browserRuntimeFiles].sort())
+  for (const file of browserRuntimeFiles) assert.match(readFileSync(`browser-runtime/${file}`, "utf8"), /\btest\(/u, file + " must register cases")
+  for (const [from, to] of [["feature == 'true'", "full == 'true'"], ["node-version: '24'", "node-version: '22'"],
+    ["--ignore-scripts", ""], ["chromium-headless-shell", "chromium"], ['test "$BROWSER_RUNTIME_RESULT" = success', "true"]]) {
+    const owner = job("browser-runtime-tests")
+    const changed = from === 'test "$BROWSER_RUNTIME_RESULT" = success' ? workflow.replaceAll(from, to)
+      : workflow.replace(owner, owner.replace(from, to))
+    assert.throws(() => verify(changed, command))
+  }
+  assert.throws(() => verify(workflow, command.replace(" working-directory.test.cjs", "")))
+  assert.throws(() => verify(workflow, command + " host.test.cjs"))
+})
+
+test("browser runtime child keeps paths and actual M but never inherits workflow credentials", () => {
+  const block = job("browser-runtime-tests").match(/node <<'NODE' \| tee[^\n]*\n([\s\S]*?)\n          NODE/u)[1]
+  const script = block.split("\n").map(line => line.replace(/^          /u, "")).join("\n")
+  for (const [result, expected] of [[{ status: 0 }, 0], [{ status: 7 }, 7], [{ status: null }, 1]]) {
+    let received, exitCode
+    runInNewContext(script, { require: () => ({ spawnSync: (command, args, options) => { received = { command, args, options }; return result } }),
+      process: { env: { PATH: "/real-node-git", HOME: "/isolated-home", GITHUB_SHA: "a".repeat(40), GITHUB_RUN_ID: "12",
+        PLAYWRIGHT_BROWSERS_PATH: "/pinned-shell", GH_TOKEN: "private", ACTIONS_RUNTIME_TOKEN: "private", GITHUB_ENV: "/write-channel", NODE_OPTIONS: "--unsafe" },
+      exit: value => { exitCode = value } } })
+    assert.equal(received.command, "npm"); assert.deepEqual(Array.from(received.args), ["--prefix", "browser-runtime", "run", "test:runtime"])
+    assert.equal(received.options.env.GITHUB_SHA, "a".repeat(40)); assert.equal(received.options.env.PATH, "/real-node-git")
+    for (const key of ["GH_TOKEN", "ACTIONS_RUNTIME_TOKEN", "GITHUB_ENV", "NODE_OPTIONS"]) assert.equal(received.options.env[key], undefined)
+    assert.equal(exitCode, expected)
+  }
+})
+
+test("browser runtime TAP cannot report empty, partial, skipped or failed execution as success", () => {
+  const script = job("browser-runtime-tests").match(/          node <<'NODE'\n([\s\S]*?)\n          NODE/u)[1]
+    .split("\n").map(line => line.replace(/^          /u, "")).join("\n")
+  const good = "# tests 128\n# pass 128\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n"
+  const check = log => runInNewContext(script, { require: name => name === "node:assert/strict" ? assert : { readFileSync: () => log }, process: { env: { RUNNER_TEMP: "/isolated" } } })
+  check(good)
+  for (const log of ["", good.replace("tests 128", "tests 0"), good.replace("pass 128", "pass 0"),
+    good.replace("tests 128", "tests 127"), good + "# pass 128\n",
+    ...["fail", "cancelled", "skipped", "todo"].map(name => good.replace(`# ${name} 0`, `# ${name} 1`))]) assert.throws(() => check(log))
+})
+
 test("required Test performs only result admission for feature PRs without an unused checkout, toolchain or cache", () => {
   const assertOwnership = (source) => {
     const steps = source.split(/\n      - /u).slice(1)
@@ -580,7 +653,7 @@ test("promotion retains required checks without repeating platform coverage", ()
 test("all-feature E2E crates retain the workspace stack and required summary", () => {
   assert.match(workflow, /^  RUST_MIN_STACK: "8388608"$/mu)
   assert.match(job("e2e-crates"), /--all-features --lib --tests/u)
-  assert.match(job("e2e-test"), /needs: \[validation-source, feature-tests, native-feature-tests, e2e-crates, test-ssh\]/u)
+  assert.match(job("e2e-test"), /needs: \[validation-source, feature-tests, native-feature-tests, browser-runtime-tests, e2e-crates, test-ssh\]/u)
   assert.match(job("e2e-test"), /always\(\) && !cancelled\(\)/u)
 })
 

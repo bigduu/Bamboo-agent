@@ -98,7 +98,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "a68d346e1851e26b4b27e8d67ddbd27084be0e1e25415280b8183542a1d590e8"
+          ADMISSION_HELPER_SHA256: "7793e40eb2c101f0afe37622449c314be938b9c674fc59ca086de19a4311cf43"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -249,7 +249,7 @@ jobs:
       actions: read
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
-    needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]
+    needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]
     # A source-gate failure must fail required Test, never turn it into a skip.
     if: always() && !cancelled()
     runs-on: ubuntu-latest
@@ -264,6 +264,7 @@ jobs:
           FEATURE_RESULT: ${{ needs.feature-tests.result }}
           QUICK_RESULT: ${{ needs.quick-checks.result }}
           NATIVE_RESULT: ${{ needs.native-feature-tests.result }}
+          BROWSER_RUNTIME_RESULT: ${{ needs.browser-runtime-tests.result }}
         shell: bash
         run: |
           set -euo pipefail
@@ -274,6 +275,7 @@ jobs:
               test "$FEATURE_RESULT" = success
               test "$QUICK_RESULT" = success
               test "$NATIVE_RESULT" = success
+              test "$BROWSER_RUNTIME_RESULT" = success
               ;;
             pull_request:main:true|workflow_dispatch::true) test "$FEATURE_VALIDATION" = false ;;
             push::false)
@@ -468,6 +470,80 @@ jobs:
             ${{ runner.temp }}/bamboo-feature-tests-*/*
             ${{ runner.temp }}/bamboo-feature-profile.log
           if-no-files-found: ignore
+          retention-days: 7
+
+  browser-runtime-tests:
+    name: Browser Runtime Unit and E2E
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Bind the exact clean browser runtime source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git show -s --format='Browser runtime source: %H tree: %T' HEAD
+          sha256sum browser-runtime/package-lock.json
+      - name: Install the locked runtime without package scripts
+        run: npm ci --prefix browser-runtime --ignore-scripts
+      - name: Install only the matching headless shell
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/bamboo-browser-runtime-browsers
+        run: |
+          node -e "require('node:assert/strict').equal(require('./browser-runtime/node_modules/playwright-core/package.json').version, '1.62.1')"
+          node browser-runtime/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
+      - name: Run all thirteen runtime files once without workflow credentials
+        shell: bash
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/bamboo-browser-runtime-browsers
+        run: |
+          set -euo pipefail
+          node <<'NODE' | tee "$RUNNER_TEMP/browser-runtime.tap"
+          const { spawnSync } = require('node:child_process');
+          const environment = Object.fromEntries(['PATH', 'HOME', 'USERPROFILE', 'SystemRoot', 'TEMP', 'TMP', 'TMPDIR',
+            'LANG', 'LC_ALL', 'NODE_PATH', 'PLAYWRIGHT_BROWSERS_PATH', 'GITHUB_REPOSITORY', 'GITHUB_SHA',
+            'GITHUB_REF', 'GITHUB_EVENT_NAME', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_WORKFLOW_SHA']
+            .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
+          const result = spawnSync('npm', ['--prefix', 'browser-runtime', 'run', 'test:runtime'], { env: environment, stdio: 'inherit' });
+          if (result.error) throw result.error;
+          process.exit(result.status ?? 1);
+          NODE
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const log = require('node:fs').readFileSync(process.env.RUNNER_TEMP + '/browser-runtime.tap', 'utf8');
+          const count = name => {
+            const values = [...log.matchAll(new RegExp('^# ' + name + ' ([0-9]+)$', 'gm'))];
+            assert.equal(values.length, 1, 'Missing or duplicate runtime summary: ' + name);
+            return Number(values[0][1]);
+          };
+          assert.ok(count('tests') > 0 && count('pass') > 0, 'Runtime cases must actually execute');
+          for (const name of ['fail', 'cancelled', 'skipped', 'todo']) assert.equal(count(name), 0, 'Runtime suite did not fully pass: ' + name);
+          assert.equal(count('tests'), count('pass'), 'Every declared runtime case must pass');
+          NODE
+      - name: Require unchanged browser runtime source after execution
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Preserve browser runtime outcome including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/browser-runtime.tap
+          if-no-files-found: error
           retention-days: 7
 
   native-feature-tests:
@@ -882,7 +958,7 @@ jobs:
 
   e2e-test:
     name: E2E Tests
-    needs: [validation-source, feature-tests, native-feature-tests, e2e-crates, test-ssh]
+    needs: [validation-source, feature-tests, native-feature-tests, browser-runtime-tests, e2e-crates, test-ssh]
     if: always() && !cancelled() && (needs.validation-source.outputs.full == 'true' || needs.validation-source.outputs.feature == 'true')
     runs-on: ubuntu-latest
     steps:
@@ -893,11 +969,13 @@ jobs:
           FEATURE_VALIDATION: ${{ needs.validation-source.outputs.feature }}
           FEATURE_RESULT: ${{ needs.feature-tests.result }}
           NATIVE_RESULT: ${{ needs.native-feature-tests.result }}
+          BROWSER_RUNTIME_RESULT: ${{ needs.browser-runtime-tests.result }}
         run: |
           set -euo pipefail
           if test "$FEATURE_VALIDATION" = true; then
             test "$FEATURE_RESULT" = success
             test "$NATIVE_RESULT" = success
+            test "$BROWSER_RUNTIME_RESULT" = success
           else
             test "$CRATE_RESULT" = success
             test "$SSH_RESULT" = success

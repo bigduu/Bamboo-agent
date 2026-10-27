@@ -241,6 +241,8 @@ def full_jobs(ci, promotion=False, before=None):
         native = [job for job in jobs if job["name"] in native_names]
         assert [job["name"] for job in native] == [native_names[0]] or {job["name"] for job in native} == set(native_names[1:]) and len(native) == 2, "Missing or ambiguous feature-native skip representation"
         assert all(job["status"] == "completed" and job["conclusion"] == "skipped" for job in native), "Native feature tests cannot repeat on a legacy release"
+        browser = [job for job in jobs if job["name"] == "Browser Runtime Unit and E2E"]
+        assert len(browser) == 1 and browser[0]["status"] == "completed" and browser[0]["conclusion"] == "skipped", "Browser runtime tests cannot repeat on a legacy release"
     tests = grouped_jobs(ci, jobs, before) if contract == "grouped" else crate_jobs(ci, jobs) if contract == "crates" else ()
     for name in FULL + (platform_jobs(ci["head_sha"]) + ("Promotion Source",) if promotion else ()) + tests:
         found = [job for job in jobs if job["name"] == name]
@@ -317,7 +319,7 @@ REVIEWED_PRODUCERS = frozenset((PRODUCER_V1, PRODUCER_V2))
 # by a sentinel. Then independently authenticate the actual helper bytes below.
 # This breaks the workflow -> helper -> workflow hash cycle, without excluding
 # a job, global environment, trigger, command or permission from review.
-CURRENT_PRODUCER = "ca5fe64e2dfe604e8ca9826941112e08bf00bcde3e1d15cbdcf4b8fa261aa8a9"
+CURRENT_PRODUCER = "065186ed363a6b8387bea0884f74750dc099ea76b81a32f20970c59ad1f86066"
 # Preserve the previously reviewed default/all-feature server partitions.
 LEGACY_SERVER_BLOCK_PRODUCER = "20ca6ba17401c2d9cae9019cbb693eea29386ab77814bfda5d793ee4efb45649"
 LEGACY_SERVER_BLOCK_HELPER = "4ccc047bbaeedab71e93db9b6470f5a3131c1b395260f852baebef19ff9109b7"
@@ -496,7 +498,7 @@ if ci is not None:
         skipped = ["Quick Checks", "Promotion Source", "E2E Tests", "Lint", "MSRV (Rust 1.95)",
                    "Security Audit", "cargo-deny (licenses/bans/advisories/sources)", "Documentation"]
         if source in FEATURE_REVISIONS:
-            skipped.append("Feature Unit and E2E")
+            skipped.extend(["Feature Unit and E2E", "Browser Runtime Unit and E2E"])
         if contract == "grouped":
             skipped.extend(["Test Build", "E2E Build", "Test SSH Build", "Test SSH",
                             "Test Block (${{ matrix.id }})", "E2E Block (${{ matrix.id }})", "Test Doctest (${{ matrix.id }})",

@@ -33,7 +33,13 @@ Ubuntu `Quick Checks` owns the 46 Supervisor component/protocol registrations
 and 15 frontend artifact/policy registrations once. Each native feature job
 runs the same 61 portable Node registrations once on its own OS; retain the
 Windows unsupported-platform assertions. These do not execute the separate
-`browser-runtime` Node suites, whose missing automatic owner is pending.
+`browser-runtime` Node suites. #2330 prepares their sole Ubuntu Node 24 feature
+owner: `Browser Runtime Unit and E2E`, required by both Test/E2E summaries. Its
+locked Playwright 1.62.1 headless shell runs all thirteen files serially once;
+never copy that suite into portable Node, native Cargo or release/main jobs.
+Keep real M/clean input binding and failure propagation. Native writer scratch
+remains with the isolated runner; a Node exit never grants deletion. The WIP
+ownership/retirement changes require combined-source CI before dev admission.
 Keep the standalone default storage authority families' serial selection in that same
 executor, reusing its compiled library-test executable without repeating cases.
 `Quick Checks` remains auxiliary and never substitutes for runtime tests.
