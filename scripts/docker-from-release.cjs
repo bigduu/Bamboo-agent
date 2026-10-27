@@ -96,7 +96,11 @@ assert len(files)==3
 print(json.dumps(files))`;
 function hostFiles(bytes, expected) {
   assert.deepEqual(expected.map(value => value.path).sort(), [...sidecar.HOST_FILES].sort(), "Incomplete Host manifest");
-  const files = JSON.parse(command("python3", ["-I", "-c", HOST_READER], { input: bytes }));
+  // Each member may need two padding bytes before base64. Add the exact empty
+  // JSON/key overhead, Python's colon/comma spaces and at most a CRLF newline.
+  const count = sidecar.HOST_FILES.length, base64Bound = 4 * Math.floor((sidecar.MAX_HOST + 2 * count) / 3);
+  const jsonOverhead = Buffer.byteLength(JSON.stringify(Object.fromEntries(sidecar.HOST_FILES.map(name => [name, ""])))) + count + count - 1 + 2;
+  const files = JSON.parse(command("python3", ["-I", "-c", HOST_READER], { input: bytes, maxBuffer: base64Bound + jsonOverhead }));
   assert.deepEqual(Object.keys(files).sort(), [...sidecar.HOST_FILES].sort());
   for (const name of Object.keys(files)) {
     files[name] = Buffer.from(files[name], "base64"); const found = expected.find(value => value.path === name); assert.ok(found);
@@ -192,6 +196,20 @@ function manifestReport(value, records) {
   assert.deepEqual(actual.sort((a,b) => a.platform.localeCompare(b.platform)), records.map(({ platform, digest }) => ({ platform, digest })).sort((a,b) => a.platform.localeCompare(b.platform)));
   return value.digest;
 }
+function latestIdentity(value) {
+  assert.equal(typeof value.id, "number"); positive(value.id);
+  for (const key of ["tag_name", "target_commitish"]) assert.ok(typeof value[key] === "string" && value[key].length > 0 && value[key].length <= 255);
+  assert.equal(value.draft, false); assert.equal(value.prerelease, false);
+  return { id: value.id, tag: value.tag_name, source: value.target_commitish, draft: value.draft, prerelease: value.prerelease };
+}
+function publicationTags(facts, value) {
+  const latest = latestIdentity(value), tag = "v" + core.assertVersion(facts.release.version), tags = [IMAGE + ":" + tag];
+  if (latest.id === facts.release.id) {
+    assert.equal(latest.tag, tag); assert.equal(latest.source, facts.source.revision); tags.push(IMAGE + ":latest");
+  } else assert.notEqual(latest.tag, tag, "Latest tag has a foreign Release identity");
+  return tags;
+}
+function verifyLatest(before, after) { assert.deepEqual(latestIdentity(after), latestIdentity(before), "Official latest Release changed during Docker publication"); }
 async function main() {
   const [phase] = process.argv.slice(2); assert.equal(process.argv.length, 3);
   if (phase === "stage") return stage(); if (phase === "smoke") return smoke();
@@ -208,11 +226,14 @@ async function main() {
     fs.writeFileSync(path.join(process.env.RUNNER_TEMP, digestFile(process.env.GITHUB_RUN_ID, process.env.GITHUB_RUN_ATTEMPT, platform)), JSON.stringify(record) + "\n", { flag: "wx" }); return;
   }
   assert.equal(phase, "publish"); const records = readDigests(facts), versionTag = IMAGE + ":v" + facts.release.version;
-  command("docker", ["buildx", "imagetools", "create", "--tag", versionTag, "--tag", IMAGE + ":latest", ...records.map(value => IMAGE + "@" + value.digest)], { timeout: 5 * 60000 });
+  const latest = await state.reads.json("releases/latest"), tags = publicationTags(facts, latest);
+  command("docker", ["buildx", "imagetools", "create", ...tags.flatMap(tag => ["--tag", tag]), ...records.map(value => IMAGE + "@" + value.digest)], { timeout: 5 * 60000 });
+  verifyLatest(latest, await state.reads.json("releases/latest"));
   // Use Buildx's descriptor digest, not a hash of CLI-formatted JSON/newlines.
   const inspect = name => JSON.parse(command("docker", ["buildx", "imagetools", "inspect", "--format", "{{json .Manifest}}", name]));
-  const digest = manifestReport(inspect(versionTag), records); assert.equal(manifestReport(inspect(IMAGE + ":latest"), records), digest);
+  const digest = manifestReport(inspect(versionTag), records);
+  if (tags.includes(IMAGE + ":latest")) assert.equal(manifestReport(inspect(IMAGE + ":latest"), records), digest);
   output("image", IMAGE + "@" + digest);
 }
-module.exports = { RUNTIME, IMAGE, PLATFORMS, safeEnv, eventRun, locate, target, verifyBytes, original, hostFiles, elfReport, imageReference, candidateImage, digestFile, smokeCommands, digestRecord, readDigests, manifestReport, authenticated };
+module.exports = { RUNTIME, IMAGE, PLATFORMS, safeEnv, eventRun, locate, target, verifyBytes, original, hostFiles, elfReport, imageReference, candidateImage, digestFile, smokeCommands, digestRecord, readDigests, manifestReport, latestIdentity, publicationTags, verifyLatest, authenticated };
 if (require.main === module) main().catch(error => { console.error("Published Docker consumer: " + error.message); process.exitCode = 1; });

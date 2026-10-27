@@ -97,6 +97,14 @@ test("Docker original asset readback rejects changed identity and bytes", async 
 test("Docker tiny real Host tar roundtrip preserves every original byte", () => {
   const files = host(); assert.deepEqual(consumer.hostFiles(tar(entries(files)), manifest(files)), files);
 });
+test("Docker Host accepts the complete bounded archive after base64 expansion", () => {
+  const files = host(), maximum = require("./sidecar-release.cjs").MAX_HOST;
+  const others = Object.entries(files).filter(([name]) => name !== "browser-runtime/host.cjs").reduce((size, [,bytes]) => size + bytes.length, 0);
+  files["browser-runtime/host.cjs"] = Buffer.alloc(maximum - others, 32); // compressible data; never executed
+  assert.deepEqual(consumer.hostFiles(tar(entries(files)), manifest(files)), files);
+  files["browser-runtime/host.cjs"] = Buffer.alloc(maximum - others + 1, 32);
+  assert.throws(() => consumer.hostFiles(tar(entries(files)), manifest(files)));
+});
 for (const variant of ["extra", "traversal", "absolute", "symlink", "duplicate", "missing", "hash", "manifest", "dependency"]) {
   test("Docker Host archive rejects " + variant, () => {
     const files = host(), rows = entries(files); let expected = manifest(files);
@@ -177,6 +185,19 @@ test("Docker multi-arch readback binds platform descriptors and exact input dige
   assert.throws(() => consumer.manifestReport({ ...manifest, manifests: manifest.manifests.slice(1) }, records));
   const wrong = structuredClone(manifest); wrong.manifests[0].digest = digest("4"); assert.throws(() => consumer.manifestReport(wrong, records));
 });
+test("Docker historical recovery writes only its version unless the official latest identity matches", () => {
+  const latest = { id: 30, tag_name: "v2026.10.27", target_commitish: facts.source.revision, draft: false, prerelease: false };
+  assert.deepEqual(consumer.publicationTags(facts, latest), [consumer.IMAGE + ":v2026.10.27", consumer.IMAGE + ":latest"]);
+  assert.deepEqual(consumer.publicationTags(facts, { ...latest, id: 31, tag_name: "v2026.10.28", target_commitish: "c".repeat(40) }), [consumer.IMAGE + ":v2026.10.27"]);
+  for (const change of [{ tag_name: "v2026.10.28" }, { target_commitish: "c".repeat(40) }, { draft: true }, { prerelease: true }, { id: 31 }]) {
+    assert.throws(() => consumer.publicationTags(facts, { ...latest, ...change }));
+  }
+});
+test("Docker latest readback ignores counters but rejects changed Release identity", () => {
+  const latest = { id: 30, tag_name: "v2026.10.27", target_commitish: facts.source.revision, draft: false, prerelease: false, download_count: 1 };
+  consumer.verifyLatest(latest, { ...latest, download_count: 2, body: "comment changed" });
+  for (const change of [{ id: 31 }, { tag_name: "v2026.10.28" }, { target_commitish: "c".repeat(40) }]) assert.throws(() => consumer.verifyLatest(latest, { ...latest, ...change }));
+});
 test("Docker workflow has one runtime consumer, no source or frontend rebuild", () => {
   const workflow = text(".github/workflows/docker-publish.yml"), docker = text("docker/Dockerfile"), compose = text("docker/docker-compose.yml");
   assert.match(workflow, /workflow_run:\n    workflows: \[Publish Crate\]\n    types: \[completed\]/);
@@ -189,6 +210,10 @@ test("Docker workflow has one runtime consumer, no source or frontend rebuild", 
   assert.match(workflow, /pattern: docker-digest-\$\{\{ github.run_id \}\}-\*/);
   assert.match(workflow, /image-ref: \$\{\{ needs.merge.outputs.image \}\}/);
   assert.match(workflow, /trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25/); assert.match(workflow, /exit-code: "0"/);
+  for (const [action, sha] of [["docker/setup-buildx-action", "f87e5991a6d7451dcb8d9637bfbc97413f497069"],
+    ["docker/login-action", "81c6f93d4bc991e510b342a00b419b3bb4efc5c6"], ["docker/build-push-action", "c3c9e263c25d99ce0380d002d59b67737d91b0dc"],
+    ["actions/upload-artifact", "cf430e030ddbb5b0abf93d22962f4752f3646cd9"], ["actions/download-artifact", "9000827ccba6bdab643e8b6fd33ac0654aef8333"]]) assert.ok(workflow.includes("uses: " + action + "@" + sha));
+  assert.doesNotMatch(workflow, /uses: [^\n]+@v[0-9]/);
   assert.match(docker, new RegExp("FROM " + consumer.RUNTIME.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   const instructions = docker.split("\n").filter(line => !line.trimStart().startsWith("#")).join("\n");
   assert.equal((docker.match(/^FROM /gm) || []).length, 1); assert.doesNotMatch(instructions, /cargo|rust:|COPY \.|--from=|npm (?:install|run)|\bvite\b/i);

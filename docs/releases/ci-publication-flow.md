@@ -693,6 +693,8 @@ from that completed release. The Host manifest must enumerate exactly its three
 regular files with original byte hashes, and the lock must select Playwright
 1.62.1. Links, traversal, extra/duplicate members and hash mismatches fail. Never
 download a moving frontend, execute candidate scripts or copy the source tree.
+The compressed input and decoded Host total remain bounded at eight MiB; the
+Python-to-Node base64 JSON pipe alone includes its exact expansion/key overhead.
 The isolated context contains only those verified files, D's fixed Dockerfile
 and a data-only source/version/asset/ABI descriptor.
 
@@ -739,6 +741,11 @@ multi-arch/version/latest push. The finalizer authenticates fresh source and two
 exact same-release digests, creates their manifest with standard Buildx, and
 checks both descriptors and the returned registry digest before scanning that
 exact image. The existing pinned Trivy warning-only policy is unchanged.
+Fresh official `releases/latest` ID/tag/source decides whether that write also
+gets the `latest` Docker tag. Other legitimate recoveries publish only their
+version. A changed latest identity during the write stops completion. Docker
+setup-buildx/login/build-push are pinned to their verified official v4/v4/v7
+commits, together with the existing accepted artifact-action pins.
 
 Focused local commands are `node --test scripts/docker-from-release.test.cjs`,
 the single affected `crate resolver and Docker original consumer keep separate

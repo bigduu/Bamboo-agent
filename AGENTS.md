@@ -321,3 +321,7 @@ the native three-target release manifest. Missing/ambiguous digest evidence stop
 finalization; the original release assets must remain available and verified.
 This nine-file slice is staged: Node/tiny archive fixtures are not image evidence.
 Real compatibility smoke and Docker control-closure/Ops activation remain pending.
+The Host parser's decoded eight-MiB role limit is unchanged; only its bounded
+base64 JSON pipe includes expansion overhead. Historical recovery writes its
+version tag; `latest` additionally requires the exact official latest Release
+ID/tag/source before and after the write. Keep all Docker actions immutable.
