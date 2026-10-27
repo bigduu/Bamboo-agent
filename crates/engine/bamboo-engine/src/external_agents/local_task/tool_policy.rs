@@ -139,6 +139,18 @@ impl LocalChildTools {
         self
     }
 
+    /// Negative capability derived from the canonical Observer registration.
+    /// All callable/retained aliases share these same sets; no ordinary file,
+    /// shell, delegation, send or control tool survives this native ceiling.
+    pub fn restrict_to_observer(mut self) -> Self {
+        self.allowed.clear();
+        self.legacy_allowed.clear();
+        self.framework.retain(|_, tool| tool.kind().is_reader());
+        self.nested_allowed = false;
+        self.subagent = None;
+        self
+    }
+
     fn registered(&self, name: &str) -> bool {
         if SessionToolKind::from_execution_name(name).is_some() {
             return self

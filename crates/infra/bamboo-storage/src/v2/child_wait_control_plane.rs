@@ -354,6 +354,19 @@ impl SessionStoreV2 {
         let mut pending = Vec::new();
         let mut satisfied = false;
         for entry in batch {
+            if let Some(state) = latest.supervisor_management.as_ref() {
+                if let Some(child) = self
+                    .load_child_wait_session(&latest, &entry.0, false)
+                    .await?
+                {
+                    if state.classifies_observer(&latest, &child) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "an Observer cannot become a foreground child wait",
+                        ));
+                    }
+                }
+            }
             if !check_terminal {
                 // A synchronous launch owns a new run that has not reached
                 // enqueue yet. Its predecessor's terminal status is irrelevant.

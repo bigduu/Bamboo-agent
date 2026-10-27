@@ -59,6 +59,14 @@ async fn authorize(
                 "revision":binding.revision}),
             )
         }
+        None if original.kind == SessionKind::Child => {
+            let (target, observer) = tool
+                .storage
+                .load_supervisor_observer_context_target(original, target_id)
+                .await
+                .map_err(error)?;
+            (target, json!({"route":"observer","registration":observer}))
+        }
         None => {
             let reference = ctx
                 .executing_supervisor_for(&original.session_id)
