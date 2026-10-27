@@ -260,3 +260,114 @@ async fn routing_contract_plan_rejects_unknown_explicit_type_role_before_parent_
     );
     assert!(harness.agent_runners.read().await.is_empty());
 }
+
+#[tokio::test]
+async fn routing_contract_legacy_child_model_rejection_is_not_parent_inheritance() {
+    let harness = routing_harness(Some(false)).await;
+    {
+        let mut config = harness.adapter.config.write().await;
+        config.defaults = None;
+        config
+            .provider_instances
+            .get_mut("chat-a")
+            .unwrap()
+            .fast_model = Some("unadmitted-legacy-fast".into());
+    }
+    let before = harness
+        .adapter
+        .session_store
+        .list_index_entries()
+        .await
+        .len();
+    let error = invoke_completed(
+        &harness.tool,
+        create_args(&harness),
+        subagent_test_ctx(
+            &harness.parent_session_id,
+            "synthetic-legacy-bad-child-model",
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("unadmitted-legacy-fast"),
+        "{error}"
+    );
+    assert_eq!(
+        harness
+            .adapter
+            .session_store
+            .list_index_entries()
+            .await
+            .len(),
+        before
+    );
+    assert!(harness.agent_runners.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn routing_contract_guardian_override_keeps_parent_account_and_child_admission() {
+    use bamboo_engine::GuardianSpawner;
+    let harness = routing_harness(Some(true)).await;
+    let mut parent = harness
+        .storage
+        .load_session(&harness.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    parent.model_ref = Some(ProviderModelRef::new("chat-a", "gpt-5"));
+    parent.set_workspace_path_meta(harness.workspace_path.to_string_lossy());
+    harness.storage.save_session(&parent).await.unwrap();
+    harness
+        .adapter
+        .session_store
+        .save_session(&parent)
+        .await
+        .unwrap();
+    let before = harness
+        .adapter
+        .session_store
+        .list_index_entries()
+        .await
+        .len();
+    let error = harness
+        .adapter
+        .spawn_guardian_review(
+            &parent,
+            "Synthetic routing review".into(),
+            "unadmitted-guardian-model".into(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.contains("not admitted"), "{error}");
+    assert_eq!(
+        harness
+            .adapter
+            .session_store
+            .list_index_entries()
+            .await
+            .len(),
+        before
+    );
+    let child_id = harness
+        .adapter
+        .spawn_guardian_review(
+            &parent,
+            "Synthetic routing review".into(),
+            "explicit-child".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let child = harness
+        .storage
+        .load_session(&child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        child.model_ref,
+        Some(ProviderModelRef::new("chat-a", "explicit-child"))
+    );
+}

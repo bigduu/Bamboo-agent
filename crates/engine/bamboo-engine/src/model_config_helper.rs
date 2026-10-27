@@ -719,10 +719,9 @@ pub fn resolve_code_review_model(
 pub fn resolve_subagent_model_ref(
     config: &Config,
     provider_name: &str,
-    provider_registry: &Arc<ProviderRegistry>,
+    _provider_registry: &Arc<ProviderRegistry>,
     subagent_type: &str,
 ) -> Option<bamboo_domain::ProviderModelRef> {
-    let router = ProviderModelRouter::new(provider_registry.clone());
     if let Some(defaults) = config.defaults.as_ref() {
         let candidate_refs = [
             defaults.subagent_models.get(subagent_type),
@@ -732,11 +731,24 @@ pub fn resolve_subagent_model_ref(
         ];
 
         let model_ref = candidate_refs.into_iter().flatten().next()?;
-        return router.route(model_ref).ok().map(|_| model_ref.clone());
+        // This is selection, not admission. Preserve an explicit invalid ref
+        // so the real child admission rejects it rather than inheriting the
+        // parent's unrelated model after `None`.
+        return Some(model_ref.clone());
     }
 
-    resolve_fast_model(config, provider_name, provider_registry)
-        .map(|resolved| bamboo_domain::ProviderModelRef::new(provider_name, resolved.model_name))
+    let legacy_model = if let Some(instance) = config.provider_instances.get(provider_name) {
+        // Retain a disabled instance's configured intent for final admission.
+        instance
+            .fast_model
+            .as_ref()
+            .or(instance.model.as_ref())
+            .cloned()
+            .or_else(|| (instance.provider_type == "copilot").then(|| "gpt-4o".to_string()))
+    } else {
+        get_fast_model_for_provider(config, provider_name)
+    };
+    legacy_model.map(|model| bamboo_domain::ProviderModelRef::new(provider_name, model))
 }
 
 /// Resolve the model for a specific subagent type.
@@ -751,10 +763,7 @@ pub fn resolve_subagent_model(
 ) -> Option<ResolvedModel> {
     let model_ref =
         resolve_subagent_model_ref(config, provider_name, provider_registry, subagent_type)?;
-    let provider = ProviderModelRouter::new(provider_registry.clone())
-        .route(&model_ref)
-        .ok()?;
-    Some(ResolvedModel::from_ref(provider, &model_ref))
+    try_resolve_exact_model(config, provider_registry, &model_ref).ok()
 }
 
 /// Resolve the image-fallback configuration from a config snapshot.
