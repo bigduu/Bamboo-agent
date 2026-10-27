@@ -40,12 +40,93 @@ struct Probe {
     parent_calls: AtomicUsize,
     parent_inputs: StdMutex<Vec<Vec<Message>>>,
     parent_request_diagnostics: StdMutex<Vec<Value>>,
+    diagnostic_home: StdMutex<Option<std::path::PathBuf>>,
+    diagnostic_phase: StdMutex<&'static str>,
     observed: StdMutex<Vec<ObserverViewChange>>,
     hold_reader: AtomicBool,
     reader_entered: Notify,
     reader_release: Notify,
     work_entered: Notify,
     work_release: Notify,
+}
+
+// Read only this test's bounded physical transport. These are diagnostics,
+// never admission authority; atomic writes may advance between observations.
+fn provider_boundary_snapshot(home: &std::path::Path) -> Value {
+    fn read(path: &std::path::Path) -> Option<Value> {
+        let file = std::fs::File::open(path).ok()?;
+        let mut reader = std::io::Read::take(file, 128 * 1024);
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+    fn collect(
+        value: &Value,
+        reports: &mut BTreeSet<String>,
+        cursors: &mut BTreeSet<u64>,
+        runs: &mut BTreeSet<String>,
+    ) {
+        match value {
+            Value::Object(object) => {
+                if object
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("OBSERVATION "))
+                {
+                    if let Some(id) = object.get("id").and_then(Value::as_str) {
+                        reports.insert(id.into());
+                    }
+                }
+                if let Some(cursor) = object.get("last_admitted_sequence").and_then(Value::as_u64) {
+                    cursors.insert(cursor);
+                }
+                if let Some(run) = object.get("run_id").and_then(Value::as_str) {
+                    if !run.is_empty() {
+                        runs.insert(run.into());
+                    }
+                }
+                for value in object.values() {
+                    collect(value, reports, cursors, runs);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    collect(value, reports, cursors, runs);
+                }
+            }
+            _ => {}
+        }
+    }
+    let root = home
+        .join("sessions")
+        .join(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID);
+    let mut persisted = Vec::new();
+    for name in ["session.json", "runtime.json"] {
+        let mut reports = BTreeSet::new();
+        let mut cursors = BTreeSet::new();
+        let mut runs = BTreeSet::new();
+        if let Some(value) = read(&root.join(name)) {
+            collect(&value, &mut reports, &mut cursors, &mut runs);
+        }
+        persisted.push(json!({"file":name,"report_ids":reports,"cursors":cursors,"run_ids":runs.into_iter().take(4).collect::<Vec<_>>()}));
+    }
+    let mut transport = Vec::new();
+    for queue in ["new", "cur"] {
+        if let Ok(entries) = std::fs::read_dir(root.join("inbox").join(queue)) {
+            for entry in entries.flatten().take(8) {
+                if let Some(wrapper) = read(&entry.path()) {
+                    let envelope = wrapper
+                        .get("body")
+                        .filter(|value| value.get("id").is_some())
+                        .unwrap_or(&wrapper);
+                    transport.push(json!({"queue":queue,"id":envelope.get("id"),"kind":envelope.get("kind"),
+                        "correlation_id":envelope.get("correlation_id"),"generation":wrapper.get("generation"),
+                        "report1":envelope.to_string().contains("OBSERVATION 1"),"report2":envelope.to_string().contains("OBSERVATION 2")}));
+                }
+            }
+        }
+    }
+    json!({"persisted":persisted,"transport":transport})
 }
 
 #[async_trait]
@@ -59,6 +140,9 @@ impl LLMProvider for Probe {
         options: Option<&bamboo_llm::provider::LLMRequestOptions>,
     ) -> Result<LLMStream, LLMError> {
         if model == PARENT {
+            let home = self.diagnostic_home.lock().unwrap().clone();
+            let boundary = home.as_deref().map(provider_boundary_snapshot);
+            let phase = *self.diagnostic_phase.lock().unwrap();
             let bounded: Vec<_> = messages.iter().enumerate()
                 .filter(|(index, _)| *index < 2 || *index + 4 >= messages.len())
                 .map(|(_, message)| json!({
@@ -74,7 +158,8 @@ impl LLMProvider for Probe {
                 diagnostics.push(
                     json!({"purpose":options.and_then(|value|value.request_purpose.as_deref()),
                     "session_id":options.and_then(|value|value.session_id.as_deref()),
-                    "tools":tools.len(),"messages":messages.len(),"bounded":bounded}),
+                    "tools":tools.len(),"messages":messages.len(),"bounded":bounded,
+                    "phase":phase,"observed_at":Utc::now(),"boundary":boundary}),
                 );
             }
         }
@@ -167,6 +252,7 @@ impl LLMProvider for Probe {
 }
 
 async fn host(home: &std::path::Path, probe: Arc<Probe>) -> AppState {
+    *probe.diagnostic_home.lock().unwrap() = Some(home.into());
     let mut config = Config::from_data_dir(Some(home.into()));
     config.provider = PROVIDER.into();
     config.subagents_mut().max_concurrent = Some(2);
@@ -695,6 +781,7 @@ async fn subscription_rotates_derived_shards_has_gap_and_revocation_is_final() {
 #[tokio::test]
 async fn subscription_native_two_projects_changes_and_restart_do_not_clear_original_work_wait() {
     let f = Fixture::new().await;
+    *f.probe.diagnostic_phase.lock().unwrap() = "create-existing-work";
     let work = f.child("subscription-held-work", false, WORK).await;
     let parent = load(&f.state, &f.reference.session_id).await;
     let creator = f.state.supervisor_observer_creator();
@@ -711,7 +798,9 @@ async fn subscription_native_two_projects_changes_and_restart_do_not_clear_origi
         .agent_runtime_state
         .unwrap()
         .waiting_for_children;
+    *f.probe.diagnostic_phase.lock().unwrap() = "create-observer";
     f.child(OBSERVER, true, READER).await;
+    *f.probe.diagnostic_phase.lock().unwrap() = "subscribe-initial-notice";
     f.state
         .subscribe_supervisor_observer(ObserverSubscriptionStart {
             supervisor: f.reference.clone(),
@@ -725,6 +814,7 @@ async fn subscription_native_two_projects_changes_and_restart_do_not_clear_origi
         .await
         .unwrap();
     settled(&f.state, OBSERVER).await;
+    *f.probe.diagnostic_phase.lock().unwrap() = "second-project-notice";
     assert_eq!(f.probe.calls.load(Ordering::SeqCst), 2);
     let now = Utc::now() + chrono::Duration::seconds(2);
     f.state.observer_subscriptions.tick(now).await;
