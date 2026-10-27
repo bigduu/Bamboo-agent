@@ -76,7 +76,7 @@ jobs:
           workspaces: . -> target/grouped-default
           save-if: false
 
-      - name: Run exact canonical state and six real subscription Host cases
+      - name: Run exact canonical state and seven real subscription Host cases
         shell: bash
         run: |
           set -euo pipefail
@@ -114,10 +114,11 @@ jobs:
               'subscription_native_two_projects_changes_and_restart_do_not_clear_original_work_wait',
               'subscription_owned_and_active_backpressure_coalesces_until_real_consumption',
               'subscription_status_filter_ignores_question_and_task_noise_but_tracks_run_identity',
+              'subscription_unavailable_observer_retries_are_bounded_without_borrowing_authority',
           }
           expected = {f'app_state::observer_subscriptions::tests::{name}' for name in fixtures}
           assert results['server'] == expected, results['server'] ^ expected
-          print('Six canonical windows, exact legacy serde and all six actual subscription Host fixtures passed')
+          print('Six canonical windows, exact legacy serde and all seven actual subscription Host fixtures passed')
           PY
 
       - name: Check affected production libraries under the original lint policy
