@@ -1588,3 +1588,18 @@ test('minimal frozen publisher seals the original run and requires failed-job re
   assert.doesNotThrow(() => assertFrozenPublisherRun(result.receipt, '88', true))
   assert.throws(() => assertFrozenPublisherRun({ publisherRunId: '' }, '77', true))
 })
+
+test('frozen Dev reservation renders its real feature acceptance without historical premerge fields', async t => {
+  const x = minimalFrozenFixture(t)
+  const validation = require('./release-source.cjs').authorizeFrozenRelease(x.env, x.read, x.log)
+  assert.equal(validation.kind, 'bamboo-frozen-dev-release/v1')
+  assert.equal(validation.premerge, undefined)
+  const { context, bodies } = fixture({ validation, ciRun: validation.ciRun.html_url, publisherRunId: '77' })
+  const result = await plan(context)
+  const body = bodies[0]
+  assert.ok(body.includes('Feature CI: ' + validation.ciRun.html_url))
+  assert.ok(body.includes('tested snapshot ' + validation.validatedRevision))
+  assert.ok(body.includes('attempt ' + validation.ciRun.run_attempt))
+  assert.doesNotMatch(body, /Main publication CI:|Full pre-merge acceptance:/)
+  assert.deepEqual(readBodyReceipt({ body }), result.receipt, 'Display rendering must preserve the signed receipt')
+})

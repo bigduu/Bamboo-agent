@@ -511,11 +511,13 @@ function github(repository, route, payload, method, allowMissing = false) {
 
 function receiptBody(receipt) {
   const { repository, sourceRevision, frontend } = receipt.identity
+  const frozen = receipt.validation?.kind === 'bamboo-frozen-dev-release/v1'
   return `${receipt.completed ? 'Published' : 'Reserved'} Bamboo ${receipt.version}.\n\n` +
     `Source: [${sourceRevision}](https://github.com/${repository}/commit/${sourceRevision})\n\n` +
     `Frontend: ${frontend.packageName}@${frontend.packageVersion}\n\n` +
-    (receipt.ciRun ? `Main publication CI: ${receipt.ciRun}\n\n` : '') +
-    (receipt.validation ? `Full pre-merge acceptance: ${receipt.validation.premerge.url} ` +
+    (receipt.ciRun ? `${frozen ? 'Feature CI' : 'Main publication CI'}: ${receipt.ciRun}\n\n` : '') +
+    (frozen ? `Feature acceptance: PR #${receipt.validation.featurePr}, attempt ${receipt.validation.ciRun.run_attempt}, ` +
+      `tested snapshot ${receipt.validation.validatedRevision}.\n\n` : receipt.validation ? `Full pre-merge acceptance: ${receipt.validation.premerge.url} ` +
       `(attempt ${receipt.validation.premerge.runAttempt}, tested snapshot ${receipt.validation.premerge.snapshotRevision}).\n\n` : '') +
     'Provenance binds the source, preserved frontend bytes and each crate checksum.\n\n' +
     `<!-- bamboo-release-provenance\n${JSON.stringify(receipt)}\n-->`
