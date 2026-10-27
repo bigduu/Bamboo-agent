@@ -632,9 +632,12 @@ async fn entrypoint_routing_sdk_native_client_rejects_replacement_invalid_chat_b
         c.provider_instances
             .insert("chat-a".into(), serde_json::from_value(value).unwrap());
         let dir = tempfile::tempdir().unwrap();
+        // Public serialization omits credentials; restore only this mock key.
+        let mut persisted = serde_json::to_value(&c).unwrap();
+        persisted["provider_instances"]["chat-a"]["api_key"] = "synthetic-no-real-key".into();
         std::fs::write(
             dir.path().join("config.json"),
-            serde_json::to_vec(&c).unwrap(),
+            serde_json::to_vec(&persisted).unwrap(),
         )
         .unwrap();
         let builder = bamboo_sdk::Agent::builder()

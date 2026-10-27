@@ -585,6 +585,9 @@ impl AgentBuilder {
     /// defaults regardless of whether they are called before or after this
     /// method. An explicit [`tools`](Self::tools)/[`no_tools`](Self::no_tools)
     /// policy has final precedence over both assembled and injected executors.
+    /// Replacing config after creating a native client cannot change that
+    /// client's account. Supply a matching client or assemble defaults again;
+    /// otherwise `build` rejects an incompatible or invalid Chat selection.
     ///
     /// # Precondition
     ///
@@ -773,14 +776,47 @@ impl AgentBuilder {
     /// `instruction` and `model` are carried onto the `Agent` for
     /// [`Agent::run`](super::Agent::run).
     pub fn build(mut self) -> Result<Agent, SdkError> {
-        let provider_scope = self.assembled_provider_scope.clone().or_else(|| {
-            self.config_override.as_ref().and_then(|shared| {
-                shared
-                    .try_read()
-                    .ok()
-                    .map(|config| config.effective_default_provider().to_string())
-            })
+        let effective_config = self
+            .config_override
+            .clone()
+            .or_else(|| self.assembled_config.clone());
+        let declared_scope = effective_config.as_ref().and_then(|shared| {
+            shared
+                .try_read()
+                .ok()
+                .map(|config| config.effective_default_provider().to_string())
         });
+        let provider_scope = if self.provider_override.is_some() && self.provider_name.is_none() {
+            declared_scope
+        } else {
+            self.assembled_provider_scope.clone().or(declared_scope)
+        };
+        if self.provider_override.is_some() && self.model.is_none() {
+            // An injected client is authoritative for its declared account.
+            // A different global Chat role cannot lend its model name to it.
+            if let (Some(scope), Some(shared)) =
+                (provider_scope.as_ref(), effective_config.as_ref())
+            {
+                self.session_model = shared.try_read().ok().and_then(|config| {
+                    bamboo_engine::model_config_helper::get_default_model_for_provider(
+                        &config, scope,
+                    )
+                    .ok()
+                });
+                self.assembled_chat_reasoning = shared.try_read().ok().and_then(|config| {
+                    config
+                        .defaults
+                        .as_ref()
+                        .filter(|_| config.features.provider_model_ref)
+                        .map(|defaults| &defaults.chat)
+                        .filter(|target| {
+                            &target.provider == scope
+                                && Some(&target.model) == self.session_model.as_ref()
+                        })
+                        .and_then(|target| target.reasoning_effort)
+                });
+            }
+        }
         if self.provider_override.is_none() && self.model.is_none() && self.provider_name.is_none()
         {
             if let (Some(scope), Some(shared)) =
@@ -794,6 +830,11 @@ impl AgentBuilder {
                             return Err(SdkError::Config(format!(
                                 "SDK client is bound to provider '{scope}', but replacement Chat configuration targets '{}'; rebuild defaults or supply a matching client", target.provider
                             )));
+                        }
+                        if config.features.provider_model_ref && config.defaults.is_some() {
+                            // The native client was created earlier. Replacing
+                            // its metadata must still pass exact admission.
+                            select_configured_chat_target(&mut config.clone(), &target)?;
                         }
                     }
                 }
@@ -2943,7 +2984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_config_model_is_captured_before_or_after_defaults() {
+    async fn explicit_config_model_is_captured_before_or_after_defaults_with_matching_client() {
         let copilot_config = || {
             let mut config = Config::default();
             config.provider = "copilot".to_string();
@@ -2972,6 +3013,7 @@ mod tests {
             .with_defaults_for_data_dir(after_dir.path().to_path_buf())
             .await
             .unwrap()
+            .provider(Arc::new(NeverCalledProvider))
             .config(copilot_config())
             .build()
             .unwrap();
