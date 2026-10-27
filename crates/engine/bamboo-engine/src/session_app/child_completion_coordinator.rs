@@ -42,7 +42,6 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, RwLock};
 
-use crate::model_areas::resolve_global_area_models;
 use crate::model_config_helper::{
     resolve_fast_model, resolve_gold_config, resolve_provider_routing_key, GOLD_CONFIG_METADATA_KEY,
 };
@@ -2134,33 +2133,11 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                 root_publication,
             );
 
-        let config_handle = self.config.clone();
-        let cached_config = Arc::new(StdRwLock::new(config_snapshot.clone()));
-        let provider_registry = self.provider_registry.clone();
-        let provider_name_for_aux = resolved_provider_name.clone();
-        let auxiliary_model_resolver = std::sync::Arc::new(move || {
-            let config_snapshot = read_config_snapshot(&config_handle, cached_config.as_ref());
-            // Auxiliary models are global (config-derived), never session-bound.
-            let areas = resolve_global_area_models(
-                &config_snapshot,
-                &provider_name_for_aux,
-                &provider_registry,
-            );
-            crate::AuxiliaryModelConfig {
-                fast_model_name: areas.fast.as_ref().map(|m| m.model_name.clone()),
-                fast_model_provider: areas.fast.map(|m| m.provider),
-                background_model_name: areas.background.as_ref().map(|m| m.model_name.clone()),
-                planning_model_name: None,
-                search_model_name: None,
-                summarization_model_name: areas
-                    .summarization
-                    .as_ref()
-                    .map(|m| m.model_name.clone()),
-                background_model_provider: areas.background.map(|m| m.provider),
-                summarization_model_provider: areas.summarization.map(|m| m.provider),
-                summarization_model_error: areas.summarization_error,
-            }
-        });
+        let auxiliary_model_resolver = crate::model_areas::live_auxiliary_model_resolver(
+            self.config.clone(),
+            self.provider_registry.clone(),
+            resolved_provider_name.clone(),
+        );
         let model_roster = crate::ModelRoster {
             model: Some(model),
             provider_name: Some(resolved_provider_name),

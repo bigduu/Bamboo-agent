@@ -44,7 +44,9 @@ pub type DisabledFilterResolver = Arc<dyn Fn() -> DisabledFilterSets + Send + Sy
 pub struct AuxiliaryModelConfig {
     pub fast_model_name: Option<String>,
     pub fast_model_provider: Option<Arc<dyn LLMProvider>>,
+    pub fast_model_error: Option<String>,
     pub background_model_name: Option<String>,
+    pub background_model_error: Option<String>,
     pub planning_model_name: Option<String>,
     pub search_model_name: Option<String>,
     pub summarization_model_name: Option<String>,
@@ -52,6 +54,43 @@ pub struct AuxiliaryModelConfig {
     pub summarization_model_provider: Option<Arc<dyn LLMProvider>>,
     /// A rejected explicit summary role is different from an unset model.
     pub summarization_model_error: Option<String>,
+    /// Host admission for a dedicated bare auxiliary model on the executing
+    /// account. Standalone SDK snapshots retain their supplied provider seam.
+    pub exact_model_resolver: Option<
+        Arc<
+            dyn Fn(
+                    &bamboo_domain::ProviderModelRef,
+                ) -> Result<bamboo_llm::ResolvedModel, bamboo_llm::LLMError>
+                + Send
+                + Sync,
+        >,
+    >,
+}
+
+impl AuxiliaryModelConfig {
+    pub(crate) fn fast_target(
+        &self,
+        fallback_provider: Arc<dyn LLMProvider>,
+        fallback_model: &str,
+    ) -> Result<bamboo_llm::ResolvedModel, bamboo_agent_core::AgentError> {
+        if let Some(error) = self.fast_model_error.as_ref() {
+            return Err(bamboo_agent_core::AgentError::LLM(format!(
+                "Configured Fast route is unavailable: {error}"
+            )));
+        }
+        let model = self.fast_model_name.as_deref().unwrap_or(fallback_model);
+        if model.trim().is_empty() {
+            return Err(bamboo_agent_core::AgentError::LLM(
+                "Fast/default model is required".into(),
+            ));
+        }
+        Ok(bamboo_llm::ResolvedModel::new(
+            self.fast_model_provider
+                .clone()
+                .unwrap_or(fallback_provider),
+            model,
+        ))
+    }
 }
 
 fn default_gold_max_output_tokens() -> u32 {
@@ -1201,13 +1240,16 @@ impl AgentLoopConfig {
             .unwrap_or_else(|| AuxiliaryModelConfig {
                 fast_model_name: self.fast_model_name.clone(),
                 fast_model_provider: self.fast_model_provider.clone(),
+                fast_model_error: None,
                 background_model_name: self.background_model_name.clone(),
+                background_model_error: None,
                 planning_model_name: self.planning_model_name.clone(),
                 search_model_name: self.search_model_name.clone(),
                 summarization_model_name: self.summarization_model_name.clone(),
                 background_model_provider: self.background_model_provider.clone(),
                 summarization_model_provider: self.summarization_model_provider.clone(),
                 summarization_model_error: None,
+                exact_model_resolver: None,
             })
     }
 

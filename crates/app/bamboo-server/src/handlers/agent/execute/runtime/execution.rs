@@ -12,8 +12,6 @@ use tokio::sync::mpsc;
 use crate::app_state::AppState;
 use crate::permission_audit::record_bamboo_runtime_permission_metadata;
 use crate::tools::ToolSurface;
-use bamboo_engine::model_areas::resolve_global_area_models;
-use bamboo_engine::model_config_helper::{resolve_planning_model, resolve_search_model};
 use bamboo_engine::session_app::provider_model::session_effective_model_ref;
 
 use bamboo_engine::config::GoldConfig;
@@ -92,38 +90,11 @@ pub(crate) fn make_auxiliary_model_resolver(
     state: &actix_web::web::Data<AppState>,
     provider_name: &str,
 ) -> Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync> {
-    let config = state.config.clone();
-    let cached_config = Arc::new(StdRwLock::new(
-        config
-            .try_read()
-            .map(|guard| guard.clone())
-            .unwrap_or_default(),
-    ));
-    let provider_registry = state.provider_registry.clone();
-    let provider_name = provider_name.to_string();
-
-    Arc::new(move || {
-        let config_snapshot = read_config_snapshot(&config, cached_config.as_ref());
-        // Auxiliary models are global (config-derived), never session-bound.
-        let areas =
-            resolve_global_area_models(&config_snapshot, &provider_name, &provider_registry);
-        let resolved_planning =
-            resolve_planning_model(&config_snapshot, &provider_name, &provider_registry);
-        let resolved_search =
-            resolve_search_model(&config_snapshot, &provider_name, &provider_registry);
-
-        AuxiliaryModelConfig {
-            fast_model_name: areas.fast.as_ref().map(|m| m.model_name.clone()),
-            fast_model_provider: areas.fast.map(|m| m.provider),
-            background_model_name: areas.background.as_ref().map(|m| m.model_name.clone()),
-            planning_model_name: resolved_planning.as_ref().map(|m| m.model_name.clone()),
-            search_model_name: resolved_search.as_ref().map(|m| m.model_name.clone()),
-            summarization_model_name: areas.summarization.as_ref().map(|m| m.model_name.clone()),
-            background_model_provider: areas.background.map(|m| m.provider),
-            summarization_model_provider: areas.summarization.map(|m| m.provider),
-            summarization_model_error: areas.summarization_error,
-        }
-    })
+    bamboo_engine::model_areas::live_auxiliary_model_resolver(
+        state.config.clone(),
+        state.provider_registry.clone(),
+        provider_name.to_string(),
+    )
 }
 
 /// Build the per-round resolver for the LIVE disabled tool/skill sets (#136).

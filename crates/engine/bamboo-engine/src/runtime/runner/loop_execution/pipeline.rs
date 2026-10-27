@@ -2232,11 +2232,8 @@ fn spawn_task_evaluation_if_needed(
         ctx.task_list_dirty = false;
     }
 
-    let eval_model = state
-        .auxiliary_models
-        .fast_model_name
-        .as_deref()
-        .or(Some(state.model_name.as_str()));
+    let target = state.auxiliary_models.fast_target(llm, &state.model_name)?;
+    let eval_model = Some(target.model_name.as_str());
     let request = crate::runtime::runner::task_lifecycle::build_async_task_evaluation_request(
         &state.task_context,
         session,
@@ -2255,7 +2252,10 @@ fn spawn_task_evaluation_if_needed(
     };
 
     if state.task_evaluation.in_flight.is_some() {
-        state.task_evaluation.queued_request = Some(request);
+        state.task_evaluation.queued_request = Some(super::startup::QueuedEvaluation {
+            request,
+            provider: target.provider,
+        });
         tracing::debug!(
             "[{}] Queued latest async task evaluation snapshot for round {} while another evaluation is still in flight",
             state.session_id,
@@ -2268,7 +2268,7 @@ fn spawn_task_evaluation_if_needed(
         state,
         event_tx,
         request,
-        llm,
+        target.provider,
         cancel_token,
         config.auxiliary_evaluation_max_concurrency,
     );
@@ -2482,7 +2482,7 @@ async fn handle_no_tool_calls_with_native(
         config.reasoning_effort,
         session_id,
         iteration,
-        llm,
+        llm.clone(),
         event_tx,
     )
     .await;
@@ -2640,18 +2640,33 @@ async fn handle_no_tool_calls_with_native(
         total_tokens: prompt_tokens.saturating_add(completion_tokens),
     };
     if let Some(mut answer) = buffered_candidate {
-        let check = super::final_answer::check(
-            session,
-            runtime_state,
-            &mut answer,
-            config,
-            evidence_llm,
-            eval_model,
-            cancel_token,
-            metrics_collector,
-            round_id,
-            round_usage,
-        )
+        let check = async {
+            let auxiliary = config.resolve_auxiliary_models();
+            let fallback_provider = if config.auxiliary_model_resolver.is_some() {
+                llm.clone()
+            } else {
+                evidence_llm
+            };
+            let fallback_model = if config.auxiliary_model_resolver.is_some() {
+                config.model_name.as_deref().unwrap_or(eval_model)
+            } else {
+                eval_model
+            };
+            let target = auxiliary.fast_target(fallback_provider, fallback_model)?;
+            super::final_answer::check(
+                session,
+                runtime_state,
+                &mut answer,
+                config,
+                target.provider,
+                &target.model_name,
+                cancel_token,
+                metrics_collector,
+                round_id,
+                round_usage,
+            )
+            .await
+        }
         .await;
         let check = match check {
             Ok(check) => check,
@@ -3192,16 +3207,11 @@ async fn run_pipeline_inner(
         apply_completed_task_evaluation(session, event_tx, config, state).await;
         if state.task_evaluation.in_flight.is_none() {
             if let Some(request) = state.task_evaluation.queued_request.take() {
-                let eval_provider = state
-                    .auxiliary_models
-                    .fast_model_provider
-                    .clone()
-                    .unwrap_or_else(|| llm.clone());
                 spawn_task_evaluation_request(
                     state,
                     event_tx,
-                    request,
-                    eval_provider,
+                    request.request,
+                    request.provider,
                     cancel_token.clone(),
                     config.auxiliary_evaluation_max_concurrency,
                 );
@@ -3212,11 +3222,6 @@ async fn run_pipeline_inner(
         start_queued_gold_evaluation_if_idle(
             state,
             event_tx,
-            state
-                .auxiliary_models
-                .fast_model_provider
-                .clone()
-                .unwrap_or_else(|| llm.clone()),
             cancel_token.clone(),
             config.auxiliary_evaluation_max_concurrency,
         );
@@ -4289,11 +4294,7 @@ async fn run_pipeline_inner(
             event_tx,
             config,
             state,
-            state
-                .auxiliary_models
-                .fast_model_provider
-                .clone()
-                .unwrap_or_else(|| llm.clone()),
+            llm.clone(),
             cancel_token.clone(),
         ) {
             tracing::warn!(
@@ -4309,11 +4310,7 @@ async fn run_pipeline_inner(
             event_tx,
             config,
             state,
-            state
-                .auxiliary_models
-                .fast_model_provider
-                .clone()
-                .unwrap_or_else(|| llm.clone()),
+            llm.clone(),
             cancel_token.clone(),
         ) {
             tracing::warn!(
@@ -12923,7 +12920,12 @@ mod tests {
         )
         .expect("evaluation request")
         .expect("task context");
-        state.task_evaluation.queued_request = Some(request.clone());
+        state.task_evaluation.queued_request = Some(super::super::startup::QueuedEvaluation {
+            request: request.clone(),
+            provider: Arc::new(
+                crate::app_context::model_routing_test_support::CaptureProvider::default(),
+            ),
+        });
 
         let dropped = Arc::new(AtomicBool::new(false));
         let drop_flag = EvalDropFlag(dropped.clone());
@@ -13637,7 +13639,12 @@ mod tests {
             request: request.clone(),
             join_handle: tokio::spawn(std::future::pending()),
         });
-        state.gold_evaluation.queued_request = Some(request.clone());
+        state.gold_evaluation.queued_request = Some(super::super::startup::QueuedEvaluation {
+            request: request.clone(),
+            provider: Arc::new(
+                crate::app_context::model_routing_test_support::CaptureProvider::default(),
+            ),
+        });
 
         tokio::time::timeout(
             Duration::from_millis(100),

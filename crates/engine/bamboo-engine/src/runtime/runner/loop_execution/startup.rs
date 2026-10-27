@@ -64,14 +64,21 @@ pub(super) struct InFlightGoldEvaluation {
 pub(super) struct TaskEvaluationState {
     pub(super) in_flight: Option<InFlightTaskEvaluation>,
     pub(super) completed: Option<AsyncTaskEvaluationResult>,
-    pub(super) queued_request: Option<AsyncTaskEvaluationRequest>,
+    pub(super) queued_request: Option<QueuedEvaluation<AsyncTaskEvaluationRequest>>,
 }
 
 #[derive(Default)]
 pub(super) struct GoldEvaluationState {
     pub(super) in_flight: Option<InFlightGoldEvaluation>,
     pub(super) completed: Option<AsyncGoldEvaluationResult>,
-    pub(super) queued_request: Option<AsyncGoldEvaluationRequest>,
+    pub(super) queued_request: Option<QueuedEvaluation<AsyncGoldEvaluationRequest>>,
+}
+
+/// The model already belongs to the request snapshot. Preserve its provider
+/// through queueing as well, including the selected role's reasoning policy.
+pub(super) struct QueuedEvaluation<R> {
+    pub(super) request: R,
+    pub(super) provider: Arc<dyn bamboo_llm::LLMProvider>,
 }
 
 pub(super) struct LoopRunState {

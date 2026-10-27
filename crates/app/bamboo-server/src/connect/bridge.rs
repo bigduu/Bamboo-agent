@@ -21,7 +21,7 @@ use bamboo_engine::execution::{
     create_event_forwarder_with_root_actor, get_or_create_event_sender, reserve_session_execution,
     spawn_session_execution, SessionExecutionArgs, SessionExecutionReserveOutcome,
 };
-use bamboo_engine::{AuxiliaryModelConfig, SessionRepository};
+use bamboo_engine::SessionRepository;
 use bamboo_llm::{Config, ProviderRegistry};
 
 use crate::permission_audit::record_bamboo_runtime_permission_metadata;
@@ -986,23 +986,15 @@ impl ConnectBridge {
 
         // Auxiliary (fast/background/summarization) model resolver — mirrors
         // `schedule_app::manager::run_schedule_job` exactly.
-        let aux_fast_model = resolved.model_roster.fast_model();
-        let aux_fast_provider = resolved.model_roster.fast_model_provider();
-        let aux_background_model = resolved.model_roster.background_model();
-        let aux_background_provider = resolved.model_roster.background_model_provider();
-        let aux_summarization_model = resolved.model_roster.summarization_model();
-        let aux_summarization_provider = resolved.model_roster.summarization_model_provider();
-        let auxiliary_model_resolver = Arc::new(move || AuxiliaryModelConfig {
-            fast_model_name: aux_fast_model.clone(),
-            fast_model_provider: aux_fast_provider.clone(),
-            background_model_name: aux_background_model.clone(),
-            planning_model_name: None,
-            search_model_name: None,
-            summarization_model_name: aux_summarization_model.clone(),
-            background_model_provider: aux_background_provider.clone(),
-            summarization_model_provider: aux_summarization_provider.clone(),
-            summarization_model_error: None,
-        });
+        let auxiliary_model_resolver = bamboo_engine::model_areas::live_auxiliary_model_resolver(
+            self.ctx.config.clone(),
+            self.ctx.provider_registry.clone(),
+            resolved
+                .model_roster
+                .provider_name
+                .clone()
+                .unwrap_or_else(|| config_snapshot.effective_default_provider().to_string()),
+        );
 
         spawn_session_execution(SessionExecutionArgs {
             agent: self.ctx.agent.clone(),

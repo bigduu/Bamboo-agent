@@ -154,6 +154,29 @@ pub struct AutoDreamContext {
     pub provider_registry: Arc<ProviderRegistry>,
 }
 
+pub(crate) fn resolve_background_target(
+    ctx: &AutoDreamContext,
+    snapshot: &Config,
+) -> Result<Option<(Arc<dyn LLMProvider>, String)>, String> {
+    // Preserve the standalone direct-client seam, without letting an invalid
+    // configured role/instance escape through a captured default client.
+    if snapshot.defaults.is_none()
+        && snapshot.provider_instances.is_empty()
+        && ctx.provider_registry.is_empty()
+    {
+        return Ok(snapshot
+            .get_memory_background_model()
+            .map(|model| (ctx.provider.clone(), model)));
+    }
+    crate::model_config_helper::try_resolve_background_model(
+        snapshot,
+        snapshot.effective_default_provider(),
+        &ctx.provider_registry,
+    )
+    .map(|target| target.map(|target| (target.provider, target.model_name)))
+    .map_err(|error| format!("Configured background model route is unavailable: {error}"))
+}
+
 fn memory_store_for_context(ctx: &AutoDreamContext) -> MemoryStore {
     ctx.memory.clone()
 }
@@ -3028,19 +3051,7 @@ async fn run_auto_dream_once_for_scope(
     // ProviderModelRef). Doing this after the session check keeps an idle default-on
     // instance without a model quiet; a "no model" warn here means real work exists
     // that we can't do.
-    let resolved_background =
-        if config_snapshot.features.provider_model_ref && config_snapshot.defaults.is_some() {
-            crate::model_config_helper::resolve_background_model(
-                &config_snapshot,
-                config_snapshot.effective_default_provider(),
-                &ctx.provider_registry,
-            )
-            .map(|resolved| (resolved.provider, resolved.model_name))
-        } else {
-            config_snapshot
-                .get_memory_background_model()
-                .map(|model| (ctx.provider.clone(), model))
-        };
+    let resolved_background = resolve_background_target(ctx, &config_snapshot)?;
     let Some((bg_provider, model)) = resolved_background else {
         tracing::warn!(
             target: DREAM_TRACING_TARGET,

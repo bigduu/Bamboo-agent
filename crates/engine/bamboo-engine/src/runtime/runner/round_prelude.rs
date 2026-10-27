@@ -554,9 +554,13 @@ async fn prepare_round_inner(
     let model_name = frame.model_name;
     let debug_enabled = frame.debug_enabled;
 
+    let auxiliary = config.resolve_auxiliary_models();
+    if let Some(error) = auxiliary.background_model_error.as_deref() {
+        tracing::warn!(%error, "Configured prompt-memory background route is unavailable");
+    }
     let runtime_context = PromptMemoryRuntimeContext {
-        llm: config.background_model_provider.clone().unwrap_or(llm),
-        background_model_name: config.background_model_name.clone(),
+        llm: auxiliary.background_model_provider.unwrap_or(llm),
+        background_model_name: auxiliary.background_model_name,
     };
     let (_, observation) = refresh_round_boundary_inner(
         session,

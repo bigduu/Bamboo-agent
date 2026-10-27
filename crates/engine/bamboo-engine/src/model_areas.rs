@@ -18,15 +18,15 @@
 //! underlying per-area logic lives in [`crate::model_config_helper`]; this layer
 //! groups the auxiliary trio that ~8 call sites previously resolved by hand.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_domain::ProviderModelRef;
 use bamboo_llm::{Config, ProviderRegistry, ResolvedModel};
 
 use crate::model_config_helper::{
-    resolve_background_model, resolve_fast_model, resolve_subagent_model, resolve_vision_model,
-    try_resolve_task_summary_model,
+    resolve_subagent_model, resolve_vision_model, try_resolve_background_model,
+    try_resolve_fast_model, try_resolve_task_summary_model,
 };
 
 /// The auxiliary (non-chat) models, all resolved from **global** config for a
@@ -39,9 +39,11 @@ pub struct GlobalAreaModels {
     /// Fast/cheap model — title generation, lightweight tasks.
     pub fast: Option<ResolvedModel>,
     pub fast_ref: Option<ProviderModelRef>,
+    pub fast_error: Option<String>,
     /// Memory/background model — reflection, background memory work.
     pub background: Option<ResolvedModel>,
     pub background_ref: Option<ProviderModelRef>,
+    pub background_error: Option<String>,
     /// Task-summary model — conversation/task summarization and compression.
     pub summarization: Option<ResolvedModel>,
     pub summarization_ref: Option<ProviderModelRef>,
@@ -78,11 +80,23 @@ pub fn resolve_global_area_models(
                 (None, Some(error.to_string()))
             }
         };
+    let (fast, fast_error) = match try_resolve_fast_model(config, provider_name, provider_registry)
+    {
+        Ok(model) => (model, None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    let (background, background_error) =
+        match try_resolve_background_model(config, provider_name, provider_registry) {
+            Ok(model) => (model, None),
+            Err(error) => (None, Some(error.to_string())),
+        };
     GlobalAreaModels {
-        fast: resolve_fast_model(config, provider_name, provider_registry),
+        fast,
         fast_ref: refs.as_ref().map(|(fast, _)| fast.clone()),
-        background: resolve_background_model(config, provider_name, provider_registry),
+        fast_error,
+        background,
         background_ref: refs.map(|(_, background)| background),
+        background_error,
         summarization,
         summarization_ref: config.defaults.as_ref().map(|defaults| {
             defaults
@@ -94,6 +108,79 @@ pub fn resolve_global_area_models(
         }),
         summarization_error,
     }
+}
+
+/// One nonblocking, live global-role resolver shared by every host entrypoint.
+/// A contended first read is an unavailable configuration, never empty defaults.
+pub fn live_auxiliary_model_resolver(
+    config: Arc<tokio::sync::RwLock<Config>>,
+    registry: Arc<ProviderRegistry>,
+    provider_name: String,
+) -> Arc<dyn Fn() -> crate::AuxiliaryModelConfig + Send + Sync> {
+    let initial = config.try_read().ok().map(|snapshot| snapshot.clone());
+    let previous = StdRwLock::new(initial);
+    Arc::new(move || {
+        let snapshot = if let Ok(current) = config.try_read() {
+            let snapshot = current.clone();
+            *previous
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot.clone());
+            Some(snapshot)
+        } else {
+            previous
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        };
+        let Some(snapshot) = snapshot else {
+            let message = "Live model configuration is temporarily unavailable".to_string();
+            let error = Some(message.clone());
+            return crate::AuxiliaryModelConfig {
+                fast_model_error: error.clone(),
+                background_model_error: error.clone(),
+                summarization_model_error: error,
+                exact_model_resolver: Some(Arc::new(move |_| {
+                    Err(bamboo_llm::LLMError::Api(message.clone()))
+                })),
+                ..Default::default()
+            };
+        };
+        let areas = resolve_global_area_models(&snapshot, &provider_name, &registry);
+        let planning = crate::model_config_helper::resolve_planning_model(
+            &snapshot,
+            &provider_name,
+            &registry,
+        );
+        let search =
+            crate::model_config_helper::resolve_search_model(&snapshot, &provider_name, &registry);
+        let exact_registry = registry.clone();
+        crate::AuxiliaryModelConfig {
+            fast_model_name: areas.fast.as_ref().map(|model| model.model_name.clone()),
+            fast_model_provider: areas.fast.map(|model| model.provider),
+            fast_model_error: areas.fast_error,
+            background_model_name: areas
+                .background
+                .as_ref()
+                .map(|model| model.model_name.clone()),
+            background_model_provider: areas.background.map(|model| model.provider),
+            background_model_error: areas.background_error,
+            planning_model_name: planning.map(|model| model.model_name),
+            search_model_name: search.map(|model| model.model_name),
+            summarization_model_name: areas
+                .summarization
+                .as_ref()
+                .map(|model| model.model_name.clone()),
+            summarization_model_provider: areas.summarization.map(|model| model.provider),
+            summarization_model_error: areas.summarization_error,
+            exact_model_resolver: Some(Arc::new(move |target| {
+                crate::model_config_helper::try_resolve_exact_model(
+                    &snapshot,
+                    &exact_registry,
+                    target,
+                )
+            })),
+        }
+    })
 }
 
 /// Vision model — **global**. Resolved on demand (only when a request actually

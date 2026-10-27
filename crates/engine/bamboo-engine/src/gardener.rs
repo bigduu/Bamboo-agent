@@ -116,19 +116,8 @@ pub(crate) async fn collect_model_json(
 pub(crate) fn resolve_background_model(
     ctx: &AutoDreamContext,
     config_snapshot: &Config,
-) -> Option<(Arc<dyn LLMProvider>, String)> {
-    if config_snapshot.features.provider_model_ref && config_snapshot.defaults.is_some() {
-        crate::model_config_helper::resolve_background_model(
-            config_snapshot,
-            config_snapshot.effective_default_provider(),
-            &ctx.provider_registry,
-        )
-        .map(|resolved| (resolved.provider, resolved.model_name))
-    } else {
-        config_snapshot
-            .get_memory_background_model()
-            .map(|model| (ctx.provider.clone(), model))
-    }
+) -> Result<Option<(Arc<dyn LLMProvider>, String)>, String> {
+    crate::auto_dream::resolve_background_target(ctx, config_snapshot)
 }
 
 pub async fn run_gardener_once(
@@ -230,7 +219,7 @@ async fn run_gardener_once_with_store_and_resolver(
         return Ok(Some(result));
     }
 
-    let Some((provider, model)) = resolve_background_model(ctx, &config_snapshot) else {
+    let Some((provider, model)) = resolve_background_model(ctx, &config_snapshot)? else {
         tracing::warn!(
             target: GARDENER_TRACING_TARGET,
             event = "run_skip",
@@ -374,7 +363,7 @@ async fn run_dedup_gardener_once_with_store_and_resolver(
         return Ok(Some(result));
     }
 
-    let Some((provider, model)) = resolve_background_model(ctx, &config_snapshot) else {
+    let Some((provider, model)) = resolve_background_model(ctx, &config_snapshot)? else {
         tracing::warn!(
             target: GARDENER_TRACING_TARGET,
             event = "dedup_run_skip",

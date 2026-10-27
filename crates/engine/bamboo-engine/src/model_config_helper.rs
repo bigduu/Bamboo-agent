@@ -466,6 +466,15 @@ fn try_resolve_role_ref_chain<'a>(
     Ok(Some(ResolvedModel::from_ref(provider, model_ref)))
 }
 
+pub(crate) fn try_resolve_exact_model(
+    config: &Config,
+    registry: &Arc<ProviderRegistry>,
+    target: &bamboo_domain::ProviderModelRef,
+) -> Result<ResolvedModel, LLMError> {
+    try_resolve_role_ref_chain(config, registry, [Some(target)])?
+        .ok_or_else(|| LLMError::Api("Configured model target is required".into()))
+}
+
 fn try_resolve_legacy_role(
     config: &Config,
     provider_name: &str,

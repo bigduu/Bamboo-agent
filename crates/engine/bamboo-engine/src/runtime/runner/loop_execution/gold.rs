@@ -21,6 +21,32 @@ use bamboo_domain::ReasoningEffort;
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::RoundStatus as MetricsRoundStatus;
 
+fn resolve_gold_target(
+    config: &AgentLoopConfig,
+    auxiliary: &crate::AuxiliaryModelConfig,
+    gold: &crate::GoldConfig,
+    fallback_provider: Arc<dyn LLMProvider>,
+    fallback_model: &str,
+) -> Result<bamboo_llm::ResolvedModel, AgentError> {
+    if let Some(model) = gold
+        .model_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        if let Some(resolve) = auxiliary.exact_model_resolver.as_ref() {
+            let provider = config
+                .provider_name
+                .as_deref()
+                .ok_or_else(|| AgentError::LLM("Gold's executing provider is required".into()))?;
+            return resolve(&bamboo_domain::ProviderModelRef::new(provider, model))
+                .map_err(|error| AgentError::LLM(error.to_string()));
+        }
+        return Ok(bamboo_llm::ResolvedModel::new(fallback_provider, model));
+    }
+    auxiliary.fast_target(fallback_provider, fallback_model)
+}
+
 /// Outcome of the terminal goal gate evaluated when the agent produces no tool
 /// calls (i.e. it would otherwise complete the run).
 pub(super) enum GoldTerminalDecision {
@@ -108,38 +134,48 @@ pub(super) async fn evaluate_gold_terminal(
         return GoldTerminalDecision::Stop;
     }
 
-    // Side-channel double-check: re-verify achievement at the stop boundary.
-    let model_name = gold_config.model_name.as_deref().unwrap_or(eval_model);
-    let budget_provider = llm.clone();
-    let budget_model = model_name.to_string();
-    let acquire_dispatch_guard = async move {
-        crate::runtime::runner::auxiliary_budget::acquire(
-            &budget_provider,
-            &budget_model,
-            config.auxiliary_evaluation_max_concurrency,
+    // Resolve one complete target for this check. A rejected role remains an
+    // evaluator failure and follows the existing unverified-stop contract.
+    let verdict = match async {
+        let auxiliary = config.resolve_auxiliary_models();
+        let fallback_model = if config.auxiliary_model_resolver.is_some() {
+            config.model_name.as_deref().unwrap_or(&session.model)
+        } else {
+            eval_model
+        };
+        let target = resolve_gold_target(config, &auxiliary, gold_config, llm, fallback_model)?;
+        let budget_provider = target.provider.clone();
+        let budget_model = target.model_name.clone();
+        let acquire_dispatch_guard = async move {
+            crate::runtime::runner::auxiliary_budget::acquire(
+                &budget_provider,
+                &budget_model,
+                config.auxiliary_evaluation_max_concurrency,
+            )
+            .await
+        };
+        evaluate_gold_with_dispatch(
+            session,
+            task_context.as_ref(),
+            gold_config,
+            target.provider,
+            &crate::runtime::gold_evaluation::GoldEvalFrame {
+                event_tx,
+                session_id,
+                model: &target.model_name,
+                timeout_context: crate::runtime::stream::handler::StreamTimeoutContext::new(
+                    config.stream_timeout,
+                    config.provider_name.as_deref(),
+                    Some(&target.model_name),
+                ),
+                reasoning_effort,
+                checkpoint: GoldCheckpoint::Terminal,
+                iteration,
+            },
+            acquire_dispatch_guard,
         )
         .await
-    };
-    let verdict = match evaluate_gold_with_dispatch(
-        session,
-        task_context.as_ref(),
-        gold_config,
-        llm,
-        &crate::runtime::gold_evaluation::GoldEvalFrame {
-            event_tx,
-            session_id,
-            model: model_name,
-            timeout_context: crate::runtime::stream::handler::StreamTimeoutContext::new(
-                config.stream_timeout,
-                config.provider_name.as_deref(),
-                Some(model_name),
-            ),
-            reasoning_effort,
-            checkpoint: GoldCheckpoint::Terminal,
-            iteration,
-        },
-        acquire_dispatch_guard,
-    )
+    }
     .await
     {
         Ok(result) => result,
@@ -456,7 +492,6 @@ fn spawn_gold_evaluation_request(
 pub(super) fn start_queued_gold_evaluation_if_idle(
     state: &mut LoopRunState,
     event_tx: &mpsc::Sender<AgentEvent>,
-    llm: Arc<dyn LLMProvider>,
     cancel_token: CancellationToken,
     configured_limit: usize,
 ) {
@@ -471,8 +506,8 @@ pub(super) fn start_queued_gold_evaluation_if_idle(
     spawn_gold_evaluation_request(
         state,
         event_tx,
-        request,
-        llm,
+        request.request,
+        request.provider,
         cancel_token,
         configured_limit,
     );
@@ -494,11 +529,18 @@ pub(super) fn spawn_gold_evaluation_if_needed(
         return Ok(());
     }
 
-    let eval_model = state
-        .auxiliary_models
-        .fast_model_name
-        .as_deref()
-        .or(Some(state.model_name.as_str()));
+    let target = resolve_gold_target(
+        config,
+        &state.auxiliary_models,
+        gold_config,
+        llm,
+        &state.model_name,
+    )?;
+    let eval_model = Some(target.model_name.as_str());
+    let effective_gold = crate::GoldConfig {
+        model_name: Some(target.model_name.clone()),
+        ..gold_config.clone()
+    };
     let request = build_async_gold_evaluation_request(
         &state.task_context,
         session,
@@ -507,7 +549,7 @@ pub(super) fn spawn_gold_evaluation_if_needed(
         eval_model,
         config.reasoning_effort,
         GoldCheckpoint::PostRound,
-        gold_config,
+        &effective_gold,
         crate::runtime::stream::handler::StreamTimeoutContext::new(
             config.stream_timeout,
             config.provider_name.as_deref(),
@@ -519,7 +561,10 @@ pub(super) fn spawn_gold_evaluation_if_needed(
     };
 
     if state.gold_evaluation.in_flight.is_some() {
-        state.gold_evaluation.queued_request = Some(request);
+        state.gold_evaluation.queued_request = Some(super::startup::QueuedEvaluation {
+            request,
+            provider: target.provider,
+        });
         tracing::debug!(
             "[{}] Queued latest async Gold evaluation snapshot for round {} while another evaluation is still in flight",
             state.session_id,
@@ -532,7 +577,7 @@ pub(super) fn spawn_gold_evaluation_if_needed(
         state,
         event_tx,
         request,
-        llm,
+        target.provider,
         cancel_token,
         config.auxiliary_evaluation_max_concurrency,
     );
