@@ -41,10 +41,14 @@ impl CaptureProvider {
             });
         }
         let chunk = if purpose == "gold_evaluation" {
-            LLMChunk::ToolCalls(vec![ToolCall::new(
-                "synthetic-gold", &tools[0].function.name,
-                &serde_json::json!({"decision":"continue", "confidence":"high", "reasoning":"synthetic routing witness", "missing_information":[], "next_action":"Continue the synthetic task"}).to_string(),
-            )])
+            LLMChunk::ToolCalls(vec![ToolCall {
+                id: "synthetic-gold".into(),
+                tool_type: "function".into(),
+                function: bamboo_agent_core::tools::FunctionCall {
+                    name: tools[0].function.name.clone(),
+                    arguments: serde_json::json!({"decision":"continue", "confidence":"high", "reasoning":"synthetic routing witness", "missing_information":[], "next_action":"Continue the synthetic task"}).to_string(),
+                },
+            }])
         } else {
             LLMChunk::Token("Synthetic routing title".into())
         };
