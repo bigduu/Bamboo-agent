@@ -51,10 +51,14 @@ function assertRouting(source) {
   assert.match(job(source, "security"), /cargo audit --deny warnings/);
   assert.match(job(source, "deny"), /command: check/);
   const browser = job(source, "browser-runtime-tests");
+  assert.match(browser, /name: Browser Runtime Unit and E2E \(\$\{\{ matrix.shard \}\}\)/);
+  assert.match(browser, /strategy:\n      fail-fast: false\n      matrix:\n        shard: \[host, profile, shared, policy\]/);
   assert.match(browser, /cli.js install --with-deps chromium-headless-shell/);
   assert.match(browser, /readdirSync\('browser-runtime'\)\.filter\(file => file\.endsWith\('\.test\.cjs'\)\)/);
   assert.match(browser, /spawnSync\(process.execPath, \['--test', '--test-reporter=tap', '--test-concurrency=1', \.\.\.files\]/);
   assert.match(browser, /for \(const name of \['fail', 'cancelled', 'skipped', 'todo'\]\)/);
+  assert.match(browser, /BROWSER_RUNTIME_SHARD: \$\{\{ matrix.shard \}\}/);
+  assert.match(browser, /name: browser-runtime-\$\{\{ matrix.shard \}\}-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}/);
   assert.ok(job(source, "test").includes('test "${!key}" = success'));
   assert.match(job(source, "e2e-test"), /test "\$BROWSER_RESULT" = success/);
   assert.doesNotMatch(source, /outputs.full == 'true'|cargo build[^\n]*--release/);
@@ -66,8 +70,51 @@ test("feature CI owns tests and quality once; main has only read-only promotion"
     ["needs.validation-source.outputs.feature == 'true'", "always()"],
     ["run: node scripts/run-feature-tests.cjs", "run: cargo test"],
     ["os: [windows-2025, macos-latest]", "os: [windows-2025]"],
+    ["shard: [host, profile, shared, policy]", "shard: [host, profile, shared]"],
     ["run: cargo fmt --all -- --check", "run: true"],
   ]) assert.throws(() => assertRouting(ci.replace(before, after)));
+});
+
+test("browser matrix executes a complete disjoint file selection and preserves child isolation", () => {
+  const inventory = fs.readdirSync("browser-runtime").filter(file => file.endsWith(".test.cjs")).sort();
+  const run = (shard, { source = ci, files = inventory, status = 0 } = {}) => {
+    const block = job(source, "browser-runtime-tests");
+    const match = block.match(/node <<'NODE' \| tee[^\n]*\n([\s\S]*?)\n          NODE/);
+    assert.ok(match, "missing actual runtime selector");
+    const calls = [];
+    let exit;
+    const fakeRequire = name => {
+      if (name === "node:fs") return { readdirSync(directory) { assert.equal(directory, "browser-runtime"); return [...files]; } };
+      if (name === "node:child_process") return { spawnSync(executable, args, options) {
+        calls.push({ executable, args, options }); return { status };
+      } };
+      return require(name);
+    };
+    const environment = { PATH: "synthetic-path", PLAYWRIGHT_BROWSERS_PATH: "/synthetic/browser", BROWSER_RUNTIME_SHARD: shard,
+      GITHUB_SHA: "a".repeat(40), GITHUB_TOKEN: "denied", ACTIONS_RUNTIME_TOKEN: "denied", GITHUB_OUTPUT: "/denied/output" };
+    new Function("require", "process", "console", match[1])(fakeRequire,
+      { execPath: process.execPath, env: environment, exit(code) { exit = code; } }, { log() {} });
+    return { calls, exit };
+  };
+  const selected = [];
+  for (const shard of ["host", "profile", "shared", "policy"]) {
+    const result = run(shard);
+    assert.equal(result.exit, 0); assert.equal(result.calls.length, 1);
+    const { executable, args, options } = result.calls[0];
+    assert.equal(executable, process.execPath);
+    assert.deepEqual(args.slice(0, 3), ["--test", "--test-reporter=tap", "--test-concurrency=1"]);
+    assert.ok(args.length > 3); selected.push(...args.slice(3));
+    assert.equal(options.cwd, "browser-runtime"); assert.equal(options.stdio, "inherit");
+    assert.deepEqual(Object.keys(options.env).sort(), ["GITHUB_SHA", "PATH", "PLAYWRIGHT_BROWSERS_PATH"]);
+    if (shard !== "policy") assert.deepEqual(args.slice(3), [{ host: "host.test.cjs", profile: "profile.test.cjs", shared: "shared-host.test.cjs" }[shard]]);
+  }
+  assert.deepEqual(selected.sort(), inventory); assert.equal(new Set(selected).size, selected.length);
+  assert.equal(run("host", { status: 17 }).exit, 17, "runtime failure must fail its shard");
+  assert.throws(() => run("unknown"), /Unknown runtime shard/);
+  assert.throws(() => run("host", { files: inventory.filter(file => file !== "profile.test.cjs") }), /cover every file exactly once/);
+  assert.throws(() => run("host", { files: [...inventory, inventory[0]] }), /Duplicate runtime file/);
+  assert.throws(() => run("host", { files: ["host.test.cjs", "profile.test.cjs", "shared-host.test.cjs"] }), /Empty runtime shard/);
+  assert.throws(() => run("host", { source: ci.replace("shared: [browserFiles[2]]", "shared: [browserFiles[0]]") }), /cover every file exactly once/);
 });
 
 test("feature source controller preserves the official log and rejects main or release execution", t => {

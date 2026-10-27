@@ -321,11 +321,15 @@ jobs:
           retention-days: 7
 
   browser-runtime-tests:
-    name: Browser Runtime Unit and E2E
+    name: Browser Runtime Unit and E2E (${{ matrix.shard }})
     needs: validation-source
     if: needs.validation-source.outputs.feature == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [host, profile, shared, policy]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -354,6 +358,7 @@ jobs:
         shell: bash
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/bamboo-browser-runtime-browsers
+          BROWSER_RUNTIME_SHARD: ${{ matrix.shard }}
         run: |
           set -euo pipefail
           node <<'NODE' | tee "$RUNNER_TEMP/browser-runtime.tap"
@@ -362,8 +367,19 @@ jobs:
             'LANG', 'LC_ALL', 'NODE_PATH', 'PLAYWRIGHT_BROWSERS_PATH', 'GITHUB_REPOSITORY', 'GITHUB_SHA',
             'GITHUB_REF', 'GITHUB_EVENT_NAME', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_WORKFLOW_SHA']
             .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
-          const files = require('node:fs').readdirSync('browser-runtime').filter(file => file.endsWith('.test.cjs')).sort();
-          require('node:assert/strict').ok(files.length > 0);
+          const assert = require('node:assert/strict');
+          const inventory = require('node:fs').readdirSync('browser-runtime').filter(file => file.endsWith('.test.cjs')).sort();
+          assert.equal(new Set(inventory).size, inventory.length, 'Duplicate runtime file');
+          const browserFiles = ['host.test.cjs', 'profile.test.cjs', 'shared-host.test.cjs'];
+          const shards = {
+            host: [browserFiles[0]], profile: [browserFiles[1]], shared: [browserFiles[2]],
+            policy: inventory.filter(file => !browserFiles.includes(file)),
+          };
+          assert.deepEqual(Object.values(shards).flat().sort(), inventory, 'Runtime shards must cover every file exactly once');
+          for (const files of Object.values(shards)) assert.ok(files.length > 0, 'Empty runtime shard');
+          const files = shards[process.env.BROWSER_RUNTIME_SHARD];
+          assert.ok(Array.isArray(files) && files.length > 0, 'Unknown runtime shard');
+          console.log('# Runtime shard: ' + process.env.BROWSER_RUNTIME_SHARD + '; files: ' + files.join(', '));
           const result = spawnSync(process.execPath, ['--test', '--test-reporter=tap', '--test-concurrency=1', ...files], { cwd: 'browser-runtime', env: environment, stdio: 'inherit' });
           if (result.error) throw result.error;
           process.exit(result.status ?? 1);
@@ -391,7 +407,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: browser-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+          name: browser-runtime-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/browser-runtime.tap
           if-no-files-found: error
           retention-days: 7
