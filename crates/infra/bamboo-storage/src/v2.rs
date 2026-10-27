@@ -9399,6 +9399,9 @@ mod tests {
         let storage = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await?);
         let paused = session_with_history("convoy-full-a", 2, "run-a");
         let unrelated = session_with_history("convoy-full-b", 2, "run-b");
+        // Existing Root updates share lifecycle authority; first births do not.
+        storage.save_session(&paused).await?;
+        storage.save_session(&unrelated).await?;
         let (reached, release) =
             storage.pause_full_save_before_filesystem_commit_for_test(&paused.id);
 
@@ -9426,6 +9429,7 @@ mod tests {
         let storage = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await?);
         let paused = session_with_history("convoy-runtime-a", 2, "run-a");
         let mut unrelated = session_with_history("convoy-runtime-b", 2, "run-b");
+        storage.save_session(&paused).await?;
         storage.save_session(&unrelated).await?;
         unrelated.agent_runtime_state = Some(AgentRuntimeState::new("run-b-next"));
         let (reached, release) =
@@ -9584,6 +9588,7 @@ mod tests {
         let second = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await?);
 
         let unrelated = session_with_history("cross-store-unrelated", 2, "run-b");
+        second.save_session(&unrelated).await?;
         let mut runtime = shared.clone();
         runtime.agent_runtime_state = Some(AgentRuntimeState::new("run-after-cross-store-full"));
         let (reached, release) =

@@ -1730,6 +1730,25 @@ pub trait SessionInboxPort: Send + Sync {
         envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError>;
 
+    /// Whether Runtime completions can retain the original target lifetime
+    /// through publication. Older/custom adapters remain explicitly pull-only.
+    fn supports_runtime_target_lifetime(&self) -> bool {
+        false
+    }
+
+    /// Admit a RuntimeInstruction only into this immutable Session lifetime.
+    /// The backend must retain its canonical lifecycle guard through receipt
+    /// publication, rather than checking a snapshot before ordinary deliver.
+    async fn deliver_runtime_for_target(
+        &self,
+        _envelope: &SessionMessageEnvelope,
+        _target_created_at: DateTime<Utc>,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::InvalidClaim(
+            "lifetime-bound Runtime admission is unsupported".into(),
+        ))
+    }
+
     /// Inspect an exact staged delivery, including its permanent ACK receipt,
     /// without creating a new delivery or changing activation permission.
     async fn existing_staged_delivery(

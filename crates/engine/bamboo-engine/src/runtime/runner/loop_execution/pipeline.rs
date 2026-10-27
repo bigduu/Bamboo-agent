@@ -1468,6 +1468,81 @@ async fn maybe_suspend_for_outstanding_bash(
     Some(outcome)
 }
 
+/// Transfer the trusted quiet-poll observation to the host without spending
+/// another model recovery round. Stage the notice and wait together: failed
+/// persistence must neither publish a handoff nor start a detached monitor.
+async fn maybe_background_quiet_exec(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    runtime: &mut AgentRuntimeState,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    handle: &str,
+) -> Result<bool, AgentError> {
+    if !crate::runtime::runner::tool_execution::progress_feedback_active(session, runtime, config)
+        || runtime.waiting_for_bash.is_some()
+    {
+        return Ok(false);
+    }
+    let (Some(persistence), Some(hook)) = (
+        config.persistence.as_ref(),
+        config.bash_resume_hook.as_ref(),
+    ) else {
+        return Ok(false);
+    };
+    if !hook.supports_background_exec() {
+        return Ok(false);
+    }
+    let Some(job) = bamboo_tools::tools::exec_command::reserve_background_job(&session.id, handle)
+    else {
+        return Ok(false);
+    };
+    let mut candidate = session.clone();
+    let mut waiting_runtime = runtime.clone();
+    let now = Utc::now();
+    waiting_runtime.status = AgentStatusState::Suspended;
+    waiting_runtime.suspension = Some(SuspensionState {
+        reason: "waiting_for_bash".into(),
+        suspended_at: now,
+        resumable: true,
+        hook_point: Some("AfterToolExecution".into()),
+    });
+    waiting_runtime.waiting_for_bash =
+        Some(WaitingForBashState::for_bash(vec![handle.to_owned()], now));
+    state_bridge::write_runtime_state(&mut candidate, &waiting_runtime);
+    candidate
+        .metadata
+        .insert("runtime.suspend_reason".into(), "waiting_for_bash".into());
+    candidate
+        .metadata
+        .insert("runtime.background_exec_id".into(), handle.to_owned());
+    candidate.updated_at = now;
+    let mut notice = Message::assistant(
+        format!("Moved command `{handle}` to background monitoring. You can continue this conversation; its result will return automatically."),
+        None,
+    );
+    notice.metadata = Some(serde_json::json!({
+        "runtime_kind": "background_exec_wait",
+        "source": "runtime",
+        "exec_session_id": handle,
+    }));
+    candidate.add_message(notice.clone());
+    persistence
+        .save_runtime_session(&mut candidate)
+        .await
+        .map_err(|error| {
+            AgentError::Tool(format!(
+                "Background command wait could not be saved: {error}"
+            ))
+        })?;
+    *session = candidate;
+    *runtime = waiting_runtime;
+    hook.arrange_exec_self_resume(job, session.created_at);
+    let _ = event_tx
+        .send(AgentEvent::message_appended(&session.id, &notice))
+        .await;
+    Ok(true)
+}
+
 /// Build the guardian reviewer's task brief: the static rubric plus the active
 /// task's completion criteria, the session goal, and (issue #400) the agent's
 /// own final assistant message, when present.
@@ -3236,6 +3311,21 @@ async fn run_pipeline_inner(
             &state.runtime_state,
             config,
         );
+        if feedback_active {
+            if let Some(handle) = tool_policy_guard.quiet_command_for_background() {
+                if maybe_background_quiet_exec(
+                    session,
+                    config,
+                    &mut state.runtime_state,
+                    event_tx,
+                    handle,
+                )
+                .await?
+                {
+                    break;
+                }
+            }
+        }
         let observation_progress_hint =
             match tool_policy_guard.feedback_for_next_round(feedback_active) {
                 crate::runtime::runner::tool_execution::FeedbackDecision::Continue(hint) => hint,
