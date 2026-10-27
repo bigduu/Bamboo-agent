@@ -13,6 +13,8 @@ pub(crate) const PIXEL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAA
 #[derive(Default)]
 pub(crate) struct Capture {
     pub(crate) calls: Mutex<Vec<(String, String, bool)>>,
+    vision_support: Option<bool>,
+    saw_omission: Mutex<bool>,
 }
 
 impl Capture {
@@ -32,6 +34,12 @@ impl Capture {
                     .any(|p| matches!(p, bamboo_domain::MessagePart::ImageUrl { .. }))
             })
         });
+        if messages
+            .iter()
+            .any(|m| m.content.contains("omitted (vision failed)"))
+        {
+            *self.saw_omission.lock().unwrap() = true;
+        }
         self.calls
             .lock()
             .unwrap()
@@ -50,6 +58,10 @@ impl Capture {
 
 #[async_trait::async_trait]
 impl LLMProvider for Capture {
+    async fn vision_support_override(&self, _: &str) -> Option<bool> {
+        self.vision_support
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
@@ -299,30 +311,29 @@ async fn entrypoint_routing_sdk_default_constructor_keeps_chat_role_account_and_
     }
 }
 
-#[tokio::test]
-async fn entrypoint_routing_legacy_image_transform_keeps_configured_vision_account() {
-    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
-    let server = MockServer::start().await;
-    let sse = "data: {\"id\":\"synthetic\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"vision-b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Synthetic pixel\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
-        .mount(&server)
-        .await;
-    let mut c = config(true, "chat-a");
+fn legacy_config(flag: bool, endpoint: &str) -> Config {
+    let mut c = config(flag, "chat-a");
     c.hooks.image_fallback.enabled = true;
     c.hooks.image_fallback.mode = "vision".into();
     c.defaults.as_mut().unwrap().vision =
         Some(bamboo_domain::ProviderModelRef::new("vision-b", "vision-b"));
     c.provider_instances.insert("vision-b".into(), serde_json::from_value(serde_json::json!({
-        "provider_type":"openai","enabled":true,"api_key":"synthetic-no-real-key","base_url":server.uri(),
-        "model":"vision-b","runtime_models":["vision-b"],"model_capabilities":{"vision-b":{"supports_vision":true}},
+        "provider_type":"openai","enabled":true,"api_key":"synthetic-no-real-key","base_url":endpoint,
+        "model":"vision-b","runtime_models":["vision-b","cheap"],
+        "model_capabilities":{"vision-b":{"supports_vision":true},"cheap":{"supports_vision":true}},
     })).unwrap());
+    c
+}
+
+async fn execute_legacy(
+    c: Config,
+    main: Arc<Capture>,
+) -> Result<(), bamboo_agent_core::AgentError> {
     let fallback = bamboo_engine::model_config_helper::resolve_image_fallback(&c)
         .unwrap()
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let main = Arc::new(Capture::default());
-    let agent = agent(c, main.clone(), dir.path()).await;
+    let agent = agent(c, main, dir.path()).await;
     let mut session = Session::new("synthetic-legacy-vision", "main-a");
     let user = Message::user_with_parts(
         "Inspect synthetic pixel",
@@ -344,24 +355,13 @@ async fn entrypoint_routing_legacy_image_transform_keeps_configured_vision_accou
             .image_fallback(fallback)
             .build();
     request.app_data_dir = Some(dir.path().to_path_buf());
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
         agent.execute(&mut session, request),
     )
     .await
-    .unwrap()
-    .unwrap();
+    .expect("controlled legacy consumer must finish within its bounded request policy");
     drain.abort();
-    let calls = main.calls.lock().unwrap().clone();
-    assert!(
-        calls.iter().all(|(_, _, images)| !images),
-        "legacy conversion dispatched pixels to the primary account: {calls:?}"
-    );
-    let requests = server.received_requests().await.unwrap();
-    assert!(!requests.is_empty());
-    assert!(requests
-        .iter()
-        .all(|request| request.body_json::<serde_json::Value>().unwrap()["model"] == "vision-b"));
     assert_eq!(
         session
             .messages
@@ -369,6 +369,206 @@ async fn entrypoint_routing_legacy_image_transform_keeps_configured_vision_accou
             .find(|m| m.id == original.id)
             .unwrap()
             .content_parts,
-        original.content_parts
+        original.content_parts,
+        "every success and failure must preserve original session pixels"
+    );
+    outcome
+}
+
+async fn vision_server(status: u16) -> wiremock::MockServer {
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let sse = "data: {\"id\":\"synthetic\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"vision-b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Synthetic pixel\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+    let response = if status == 200 {
+        ResponseTemplate::new(status).set_body_raw(sse, "text/event-stream")
+    } else {
+        ResponseTemplate::new(status)
+            .set_body_json(serde_json::json!({"error":{"message":"synthetic refusal"}}))
+    };
+    Mock::given(method("POST"))
+        .respond_with(response)
+        .mount(&server)
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn entrypoint_routing_legacy_image_transform_keeps_configured_vision_account() {
+    // Include identical model IDs on A/B: a model name cannot identify its account.
+    for flag in [false, true] {
+        for model in ["vision-b", "cheap"] {
+            let server = vision_server(200).await;
+            let mut c = legacy_config(flag, &server.uri());
+            c.defaults.as_mut().unwrap().vision.as_mut().unwrap().model = model.into();
+            let main = Arc::new(Capture::default());
+            execute_legacy(c, main.clone()).await.unwrap();
+            let calls = main.calls.lock().unwrap().clone();
+            assert!(!calls.is_empty());
+            assert!(calls.iter().all(|(_, _, images)| !images), "{calls:?}");
+            let requests = server.received_requests().await.unwrap();
+            assert!(!requests.is_empty(), "flag={flag}, model={model}");
+            assert!(requests
+                .iter()
+                .all(|r| r.body_json::<serde_json::Value>().unwrap()["model"] == model));
+        }
+    }
+}
+
+#[tokio::test]
+async fn entrypoint_routing_legacy_rejects_ungranted_or_invalid_targets_before_any_send() {
+    for flag in [false, true] {
+        for case in [
+            "fast-only-cross",
+            "chat-only-cross",
+            "unknown",
+            "disabled",
+            "unadmitted",
+            "unsupported",
+            "same-account-unsupported",
+        ] {
+            let server = vision_server(200).await;
+            let mut c = legacy_config(flag, &server.uri());
+            let defaults = c.defaults.as_mut().unwrap();
+            match case {
+                "fast-only-cross" => {
+                    defaults.vision = None;
+                    defaults.fast =
+                        Some(bamboo_domain::ProviderModelRef::new("vision-b", "vision-b"));
+                }
+                "chat-only-cross" => {
+                    defaults.vision = None;
+                    defaults.fast = None;
+                    defaults.chat = bamboo_domain::ProviderModelRef::new("vision-b", "vision-b");
+                }
+                "unknown" => defaults.vision.as_mut().unwrap().provider = "absent-account".into(),
+                "disabled" => c.provider_instances.get_mut("vision-b").unwrap().enabled = false,
+                "unadmitted" => defaults.vision.as_mut().unwrap().model = "absent-model".into(),
+                "unsupported" => {
+                    let instance = c.provider_instances.get("vision-b").unwrap();
+                    let mut value = serde_json::to_value(instance).unwrap();
+                    value["model_capabilities"]["vision-b"]["supports_vision"] = false.into();
+                    c.provider_instances
+                        .insert("vision-b".into(), serde_json::from_value(value).unwrap());
+                }
+                "same-account-unsupported" => {
+                    defaults.vision = Some(bamboo_domain::ProviderModelRef::new("chat-a", "cheap"));
+                    let mut value =
+                        serde_json::to_value(c.provider_instances.get("chat-a").unwrap()).unwrap();
+                    value["model_capabilities"] =
+                        serde_json::json!({"cheap":{"supports_vision":false}});
+                    c.provider_instances
+                        .insert("chat-a".into(), serde_json::from_value(value).unwrap());
+                }
+                _ => unreachable!(),
+            }
+            let main = Arc::new(Capture::default());
+            let error = execute_legacy(c, main.clone()).await.unwrap_err();
+            assert!(
+                error.to_string().contains("preserved"),
+                "{case}, flag={flag}: {error}"
+            );
+            assert!(main.calls.lock().unwrap().is_empty(), "{case}, flag={flag}");
+            assert!(
+                server.received_requests().await.unwrap().is_empty(),
+                "{case}, flag={flag}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn entrypoint_routing_legacy_native_main_bypasses_unavailable_auxiliary() {
+    let server = vision_server(200).await;
+    let mut c = legacy_config(false, &server.uri());
+    c.provider_instances.get_mut("vision-b").unwrap().enabled = false;
+    let main = Arc::new(Capture {
+        vision_support: Some(true),
+        ..Default::default()
+    });
+    execute_legacy(c, main.clone()).await.unwrap();
+    let calls = main.calls.lock().unwrap().clone();
+    assert!(!calls.is_empty());
+    assert!(
+        calls
+            .iter()
+            .all(|(model, _, images)| model == "main-a" && *images),
+        "{calls:?}"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn entrypoint_routing_legacy_unset_vision_can_use_same_account_fast() {
+    let server = vision_server(200).await;
+    let mut c = legacy_config(false, &server.uri());
+    c.defaults.as_mut().unwrap().vision = None;
+    let main = Arc::new(Capture::default());
+    execute_legacy(c, main.clone()).await.unwrap();
+    let calls = main.calls.lock().unwrap().clone();
+    assert!(
+        calls
+            .iter()
+            .any(|(model, _, images)| model == "cheap" && *images),
+        "{calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(model, _, images)| model == "main-a" && !images),
+        "{calls:?}"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn entrypoint_routing_legacy_auth_quota_and_server_failure_never_switch_image_accounts() {
+    for status in [401, 429, 503] {
+        let server = vision_server(status).await;
+        let main = Arc::new(Capture::default());
+        execute_legacy(legacy_config(true, &server.uri()), main.clone())
+            .await
+            .unwrap();
+        let calls = main.calls.lock().unwrap().clone();
+        assert!(!calls.is_empty(), "status={status}");
+        assert!(
+            calls
+                .iter()
+                .all(|(model, _, images)| model == "main-a" && !images),
+            "status={status}: {calls:?}"
+        );
+        assert!(
+            *main.saw_omission.lock().unwrap(),
+            "legacy omission marker must remain explicit: status={status}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty(), "status={status}");
+        assert!(requests
+            .iter()
+            .all(|r| r.body_json::<serde_json::Value>().unwrap()["model"] == "vision-b"));
+    }
+}
+
+#[tokio::test]
+async fn entrypoint_routing_sdk_run_keeps_existing_session_model_without_builder_override() {
+    let c = config(false, "chat-a");
+    let main = Arc::new(Capture::default());
+    let dir = tempfile::tempdir().unwrap();
+    let agent = bamboo_sdk::Agent::builder()
+        .provider(main.clone())
+        .config(Arc::new(RwLock::new(c)))
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(dir.path().to_path_buf())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut session = Session::new("synthetic-existing-sdk-session", "cheap");
+    session.add_message(Message::user("Synthetic existing session model witness"));
+    agent.run_session(&mut session).await.unwrap();
+    let calls = main.calls.lock().unwrap().clone();
+    assert!(!calls.is_empty());
+    assert!(
+        calls.iter().all(|(model, _, _)| model == "cheap"),
+        "{calls:?}"
     );
 }

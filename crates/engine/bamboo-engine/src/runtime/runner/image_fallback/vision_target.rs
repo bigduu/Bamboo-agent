@@ -13,6 +13,10 @@ fn configuration_error() -> AgentError {
     AgentError::LLM(VISION_CONFIGURATION_ERROR.into())
 }
 
+fn rejected_target(reason: &str) -> AgentError {
+    AgentError::LLM(format!("{reason} {VISION_CONFIGURATION_ERROR}"))
+}
+
 pub(super) fn configured_instance(
     config: &Config,
     provider: &str,
@@ -74,19 +78,22 @@ pub(super) fn validate_target(
         || target.provider.trim() != target.provider
         || target.model.trim() != target.model
     {
-        return Err(configuration_error());
+        return Err(rejected_target("Configured Vision reference is invalid."));
     }
-    let instance = configured_instance(config, &target.provider).ok_or_else(configuration_error)?;
+    let instance = configured_instance(config, &target.provider)
+        .ok_or_else(|| rejected_target("Configured Vision provider is unavailable."))?;
     if !instance.enabled {
-        return Err(configuration_error());
+        return Err(rejected_target("Configured Vision provider is disabled."));
     }
-    let admitted =
-        bamboo_config::explicit_runtime_models(&instance).map_err(|_| configuration_error())?;
+    let admitted = bamboo_config::explicit_runtime_models(&instance)
+        .map_err(|_| rejected_target("Configured Vision model catalog is invalid."))?;
     if admitted.is_some_and(|models| !models.contains(&target.model)) {
-        return Err(configuration_error());
+        return Err(rejected_target(
+            "Configured Vision model is not admitted by its provider.",
+        ));
     }
-    let overrides =
-        bamboo_config::model_vision_overrides(&instance).map_err(|_| configuration_error())?;
+    let overrides = bamboo_config::model_vision_overrides(&instance)
+        .map_err(|_| rejected_target("Configured Vision capability metadata is invalid."))?;
     if overrides.get(&target.model) == Some(&false) {
         return Err(AgentError::LLM(format!(
             "Configured Vision model does not support Vision. {VISION_CONFIGURATION_ERROR}"
