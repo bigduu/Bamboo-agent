@@ -55,10 +55,19 @@ children, later executions or restart. Do not send another Chat request to
 implement the button.
 
 Use the existing `POST /api/v1/sessions/{session_id}/stop` or legacy
-`POST /api/v1/stop/{session_id}`. Retain the existing current-run correlation
-(`Bamboo-Run-Id` when the client already uses it); cancellation drops both sends
-and backoff immediately. Repeated Execute while an owner is running keeps the
-existing already-running semantics; it does not start another retry loop.
+`POST /api/v1/stop/{session_id}`. For an exact stop, send `Bamboo-Run-Id` with the
+opaque `run_id` returned by Execute; the diagnostic receipt's `run_id` is not a
+replacement. A malformed header returns 400. A stale, replaced or completed run
+returns 409 and never cancels a newer run. Repeating an exact stop succeeds while
+that cancelled runner remains current in the registry; removal or replacement
+returns 409. Headerless Stop retains its legacy current-owner behavior.
+Cancellation drops both sends and backoff immediately. Repeated Execute while an
+owner is running keeps the existing already-running semantics; it neither
+starts another retry loop nor upgrades that owner's mode.
+
+There is no per-retry AgentEvent/SSE progress event or next-attempt timestamp in
+this contract. Clients can show a cancellable waiting state. The content-free
+retry diagnostics are evidence, not a live attempt counter or countdown.
 
 Only transient network/connect failures, headers timeouts, 429 and
 500/502/503/504 are retried. Ordinary 401, 403, parameter errors and other terminal

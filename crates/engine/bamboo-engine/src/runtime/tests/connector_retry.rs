@@ -408,10 +408,12 @@ async fn cancelling_anthropic_backoff_stops_without_another_model_request() {
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
+const RECOVERIES_BEFORE_REJECTION: usize = 3;
+
 struct RecoveryThenRejected(AtomicUsize);
 impl Respond for RecoveryThenRejected {
     fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
-        if self.0.fetch_add(1, Ordering::SeqCst) < 3 {
+        if self.0.fetch_add(1, Ordering::SeqCst) < RECOVERIES_BEFORE_REJECTION {
             recovery()
         } else {
             ResponseTemplate::new(422).set_body_string("unprocessable model request")
@@ -438,38 +440,98 @@ async fn connector_recovery_then_terminal_422_does_not_reset_the_request_budget(
         .unwrap_err();
     assert!(matches!(error, AgentError::LLMNonRetryable(_)));
     assert!(error.to_string().contains("422"));
+    // A larger ceiling does not authorize retrying the first terminal response.
+    assert!(bamboo_llm::retry::global().max_attempts as usize > RECOVERIES_BEFORE_REJECTION + 1);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), RECOVERIES_BEFORE_REJECTION + 1);
+    assert!(requests
+        .iter()
+        .all(|request| request.body == requests[0].body));
+    let cold = storage.load_session(&session.id).await.unwrap().unwrap();
     assert_eq!(
-        server.received_requests().await.unwrap().len(),
-        bamboo_llm::retry::global().max_attempts as usize
+        cold.messages
+            .iter()
+            .filter(|message| message.role == bamboo_agent_core::Role::User
+                && message.content == "once")
+            .count(),
+        1
     );
+}
+
+struct ManagedResponseThenHang {
+    provider: AnthropicProvider,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LLMProvider for ManagedResponseThenHang {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+        // The managed send must finish before this deliberately unresponsive
+        // provider wrapper becomes the outer watchdog's responsibility.
+        let _stream = self
+            .provider
+            .chat_stream(messages, tools, max, model)
+            .await?;
+        std::future::pending().await
+    }
 }
 
 #[tokio::test]
 async fn anthropic_bootstrap_watchdog_does_not_restart_a_managed_budget() {
     let server = MockServer::start().await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let count = hits.clone();
+    let request_times = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_times = request_times.clone();
     Mock::given(method("POST"))
-        .respond_with(recovery().insert_header("Retry-After", "5"))
+        .respond_with(move |_: &wiremock::Request| {
+            observed_times
+                .lock()
+                .unwrap()
+                .push(std::time::Instant::now());
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                recovery().insert_header("Retry-After", "2")
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+            }
+        })
+        .expect(2)
         .mount(&server)
         .await;
-    let provider = Arc::new(AnthropicProvider::new("fixture-key").with_base_url(server.uri()));
+    let provider = Arc::new(ManagedResponseThenHang {
+        provider: AnthropicProvider::new("fixture-key").with_base_url(server.uri()),
+        calls: AtomicUsize::new(0),
+    });
     let mut config = bamboo_llm::Config::default();
     config.stream_timeout.transport_idle_timeout_secs = 1;
     let (_temp, agent, storage) =
-        build_direct_execute_agent_with_config(provider, None, None, config).await;
+        build_direct_execute_agent_with_config(provider.clone(), None, None, config).await;
     let mut session = Session::new("connector-bootstrap-watchdog", "test-model");
     session.add_message(Message::user("once"));
     storage.save_session(&session).await.unwrap();
     let (tx, _rx) = mpsc::channel(128);
-    let error = agent
-        .execute(&mut session, direct_request(tx, CancellationToken::new()))
-        .await
-        .unwrap_err();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        agent.execute(&mut session, direct_request(tx, CancellationToken::new())),
+    )
+    .await
+    .expect("the provider hang after managed headers must remain bounded")
+    .unwrap_err();
     let receipt =
         bamboo_llm::retry::public_request_diagnostic(&session.id, &error.to_string()).unwrap();
     let wire = serde_json::to_value(&receipt).unwrap();
     assert_eq!(wire["phase"], "bootstrap");
     assert_eq!(wire["last_http_status"], 401);
-    assert_eq!(wire["retry_delay_ms"], 5_000);
+    assert_eq!(wire["retry_delay_ms"], 2_000);
     assert_eq!(wire["semantic_output_started"], false);
     assert_eq!(wire["retry_safe"], false);
     match error {
@@ -477,9 +539,27 @@ async fn anthropic_bootstrap_watchdog_does_not_restart_a_managed_budget() {
             assert!(!timeout.retry_safe());
             assert_eq!(timeout.last_http_retry().unwrap().0, 401);
         }
-        other => panic!("expected managed bootstrap timeout, got {other:?}"),
+        other => panic!("expected bounded post-headers provider hang, got {other:?}"),
     }
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(requests[0].body, requests[1].body);
+    {
+        let times = request_times.lock().unwrap();
+        assert_eq!(times.len(), 2);
+        assert!(times[1].duration_since(times[0]) >= std::time::Duration::from_secs(2));
+    }
+    let cold = storage.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(
+        cold.messages
+            .iter()
+            .filter(|message| message.role == bamboo_agent_core::Role::User
+                && message.content == "once")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -572,6 +652,28 @@ async fn credential_and_permission_denials_with_overflow_text_remain_terminal() 
     }
 }
 
+struct InitialRetryTool(AtomicUsize);
+
+#[async_trait]
+impl ToolExecutor for InitialRetryTool {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        assert_eq!(call.id, "retry-probe-tool");
+        assert_eq!(call.function.name, "Read");
+        assert_eq!(call.function.arguments, "{}");
+        assert_eq!(self.0.fetch_add(1, Ordering::SeqCst), 0);
+        Ok(ToolResult {
+            success: true,
+            result: "controlled retry tool result".to_string(),
+            display_preference: None,
+            images: Vec::new(),
+        })
+    }
+
+    fn list_tools(&self) -> Vec<ToolSchema> {
+        SuccessfulReadToolExecutor.list_tools()
+    }
+}
+
 struct InitialRetryProbe {
     url: String,
     tool_once: bool,
@@ -647,7 +749,7 @@ async fn execute_opt_in_retries_initial_http_without_replaying_tools_or_user_mes
             tool_once: true,
             calls: AtomicUsize::new(0),
         });
-        let tools = Arc::new(CountingTool(AtomicUsize::new(0)));
+        let tools = Arc::new(InitialRetryTool(AtomicUsize::new(0)));
         let (_home, agent, storage) =
             build_direct_execute_agent(provider.clone(), None, Some(tools.clone())).await;
         let mut session = Session::new(&format!("retry-consumer-{continuous}"), "test-model");
