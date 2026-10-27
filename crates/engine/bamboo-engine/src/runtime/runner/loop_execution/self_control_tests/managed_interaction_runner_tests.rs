@@ -258,24 +258,34 @@ async fn drive_interaction_and_observe(
     storage: Arc<dyn Storage>,
     mut rx: mpsc::Receiver<AgentEvent>,
 ) -> (Result<(), AgentError>, Vec<AgentEvent>) {
-    tokio::pin!(run);
-    let mut events = Vec::new();
-    let result = loop {
-        tokio::select! {
-            result = &mut run => break result,
-            event = rx.recv() => {
-                if let Some(event) = event {
+    let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+    let run = async move {
+        let result = run.await;
+        let _ = finished_tx.send(());
+        result
+    };
+    // Like Fixture::drive_and_observe, keep polling the runner while a durable
+    // observation waits on a lock retained by its next checkpoint.
+    let observe = async move {
+        let mut events = Vec::new();
+        loop {
+            tokio::select! {
+                _ = &mut finished_rx => break,
+                event = rx.recv() => {
+                    let Some(event) = event else { break };
                     observe_start_receipt(storage.as_ref(), &event).await;
                     events.push(event);
                 }
             }
         }
+        // Completion must not wait for unrelated retained sender clones.
+        while let Ok(event) = rx.try_recv() {
+            observe_start_receipt(storage.as_ref(), &event).await;
+            events.push(event);
+        }
+        events
     };
-    while let Ok(event) = rx.try_recv() {
-        observe_start_receipt(storage.as_ref(), &event).await;
-        events.push(event);
-    }
-    (result, events)
+    tokio::join!(run, observe)
 }
 
 async fn observe_start_receipt(storage: &dyn Storage, event: &AgentEvent) {
