@@ -664,14 +664,71 @@ fn reject_session_version_change(incoming: &Session, durable: &Session) -> io::R
 /// Control-plane decoding retains the exact Session/caller fields and shared
 /// pair validation, but serde skips the two transcript payloads entirely.
 /// Whole-Main framing is still validated; a prefix alone never grants authority.
-#[derive(Deserialize)]
 struct SessionControlPlane {
-    #[serde(default, rename = "messages")]
-    _messages: Option<serde::de::IgnoredAny>,
-    #[serde(default, rename = "provider_transcript")]
-    _provider_transcript: Option<serde::de::IgnoredAny>,
-    #[serde(flatten)]
     session: Session,
+}
+
+impl<'de> Deserialize<'de> for SessionControlPlane {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ControlVisitor;
+        impl<'de> serde::de::Visitor<'de> for ControlVisitor {
+            type Value = SessionControlPlane;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a canonical Session control plane")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                // Keep Session's exact required/default/duplicate-field rules.
+                // Replace only the required messages value with an empty array;
+                // the optional native transcript keeps its existing default.
+                Session::deserialize(serde::de::value::MapAccessDeserializer::new(ControlMap {
+                    inner: map,
+                    messages: false,
+                }))
+                .map(|session| SessionControlPlane { session })
+            }
+        }
+        struct ControlMap<A> {
+            inner: A,
+            messages: bool,
+        }
+        impl<'de, A: serde::de::MapAccess<'de>> serde::de::MapAccess<'de> for ControlMap<A> {
+            type Error = A::Error;
+            fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
+                &mut self,
+                seed: K,
+            ) -> Result<Option<K::Value>, Self::Error> {
+                loop {
+                    let Some(key) = self.inner.next_key::<String>()? else {
+                        return Ok(None);
+                    };
+                    if key == "provider_transcript" {
+                        self.inner.next_value::<serde::de::IgnoredAny>()?;
+                        continue;
+                    }
+                    self.messages = key == "messages";
+                    return seed
+                        .deserialize(serde::de::value::StringDeserializer::<A::Error>::new(key))
+                        .map(Some);
+                }
+            }
+            fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
+                &mut self,
+                seed: V,
+            ) -> Result<V::Value, Self::Error> {
+                if self.messages {
+                    self.inner.next_value::<serde::de::IgnoredAny>()?;
+                    seed.deserialize(&mut serde_json::Deserializer::from_str("[]"))
+                        .map_err(serde::de::Error::custom)
+                } else {
+                    self.inner.next_value_seed(seed)
+                }
+            }
+        }
+        deserializer.deserialize_map(ControlVisitor)
+    }
 }
 
 /// Build the sidecar snapshot: the full session minus its `messages` history.
