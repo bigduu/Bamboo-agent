@@ -174,13 +174,14 @@ test("main-push validation remains reachable by the existing automatic publisher
   assert.match(testJob, /name: Test\n/u)
   assert.match(testJob, /runs-on: ubuntu-latest\n/u)
   assert.ok(testJob.includes("    timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"))
-  assert.match(testJob, /run: cargo build --locked\n/u)
+  assert.doesNotMatch(testJob, /cargo build/u)
+  assert.match(testJob, /test "\$FEATURE_RESULT" = success/u)
   assert.match(testJob, /test "\$CRATE_RESULT" = success/u)
   assert.match(testJob, /test "\$SSH_RESULT" = success/u)
   assert.doesNotMatch(testJob, /run: cargo test/u)
   assert.match(
     testJob,
-    /- name: Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs scripts\/sidecar-release\.test\.cjs scripts\/test-groups\.test\.cjs\n/u,
+    /- name: Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs scripts\/sidecar-release\.test\.cjs scripts\/test-groups\.test\.cjs scripts\/run-feature-tests\.test\.cjs\n/u,
   )
   assert.match(
     testJob,
@@ -206,7 +207,7 @@ test("main-push validation remains reachable by the existing automatic publisher
 
   assert.match(
     contributing,
-    /Pull requests into `dev` run the required\s+`Test` check in compile-only mode \(`cargo build --locked`\) and auxiliary\s+`Quick Checks`/u,
+    /feature PR into `dev` runs required `Test`/u,
   )
   assert.match(contributing, /Before merge, owners must run affected tests locally and add or update coverage/u)
   assert.match(contributing, /for changed behavior, recording exact source, commands and results/u)
@@ -226,7 +227,7 @@ function serverMatrix(source) {
     .map((match) => ({ crate: match[1], block: match[2] }))
 }
 
-test("native matrices cover ordinary crates once and server through eight appended rows", () => {
+test("legacy release matrices retain their original crate and server coverage", () => {
   const manifest = readFileSync("Cargo.toml", "utf8")
   const members = manifest.match(/^default-members = \[([\s\S]*?)^\]/mu)
   assert.ok(members)
@@ -255,6 +256,230 @@ test("native matrices cover ordinary crates once and server through eight append
   assert.doesNotMatch(workflow, /test-build:|e2e-build:|test-blocks:|test-doctests:|grouped-tests|ci-artifacts|plan-id:/u)
   assert.match(workflow, /^permissions:\n  contents: read\n/mu)
   assert.match(job("main-release-admission"), /^    permissions:\n      contents: read\n      actions: read\n/mu)
+})
+
+test("one feature executor preserves default configurations and complete explicit additive case ownership", () => {
+  const { selectedPackages, sourceFeatureHash, FEATURE_SOURCE_SHA256, FEATURE_CONTEXTS, cargoArguments } = require('./run-feature-tests.cjs')
+  const result = spawnSync('cargo', ['metadata', '--locked', '--format-version', '1', '--no-deps'], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
+  assert.equal(result.status, 0, result.stderr)
+  const metadata = JSON.parse(result.stdout), packages = selectedPackages(metadata)
+  const expected = metadata.packages.filter(item => metadata.workspace_default_members.includes(item.id) || item.name === 'bamboo-tool-event-recorder-example')
+  assert.deepEqual(packages.map(item => item.name).sort(), expected.map(item => item.name).sort())
+  assert.ok(!packages.some(item => item.name === 'bamboo-analytics'))
+  const kinds = packages.flatMap(item => item.targets.filter(target => target.test).map(target => ({ id: `${item.id}/${target.name}/${target.kind}`, kind: target.kind })))
+  const unit = kinds.filter(target => target.kind.some(kind => ['lib', 'bin'].includes(kind))).map(target => target.id)
+  const e2e = kinds.filter(target => target.kind.includes('test')).map(target => target.id)
+  assert.ok(unit.length > 0 && e2e.length > 0)
+  assert.deepEqual(unit.filter(id => e2e.includes(id)), [])
+  for (const owner of packages) {
+    const args = cargoArguments(owner)
+    assert.equal(args.filter(arg => arg === '-p').length, 1)
+    assert.equal(args[args.indexOf('-p') + 1], owner.name)
+    assert.ok(!args.some(arg => ['--all-features','--features','--lib','--bins','--test','--tests','--doc','--all-targets'].includes(arg)))
+  }
+  assert.equal(sourceFeatureHash(packages, require('node:fs').realpathSync('.')), FEATURE_SOURCE_SHA256,
+    'New feature-sensitive source requires a reviewed ownership update')
+  assert.equal(FEATURE_CONTEXTS.flatMap(context => context.targets.flatMap(target => target.added)).length, 19)
+  assert.deepEqual(FEATURE_CONTEXTS.map(context => [context.package, context.features]), [
+    ['bamboo-infrastructure', ['otel-otlp', 'test-utils']], ['bamboo-tickets', ['test-utils']],
+    ['bamboo-server', ['test-utils']], ['bamboo-agent', ['ticket-runtime-fixtures']]])
+  for (const context of FEATURE_CONTEXTS) {
+    assert.ok(packages.some(owner => owner.name === context.package))
+    assert.ok(!cargoArguments({ name: context.package }, context, true).includes('--all-features'))
+  }
+  assert.match(job('feature-tests'), /target\/feature-tests/u)
+  assert.match(job('feature-tests'), /run: node scripts\/run-feature-tests.cjs/u)
+})
+
+test("the feature executor bounds debug artifacts and records capacity without changing release profiles", () => {
+  const feature = job("feature-tests")
+  assert.match(feature, /^    timeout-minutes: 90$/mu)
+  for (const profile of ["DEV", "TEST"]) {
+    const setting = `CARGO_PROFILE_${profile}_DEBUG: "0"`
+    assert.ok(feature.includes(setting))
+    assert.equal(workflow.split(setting).length - 1, 1, "debug override belongs only to the feature job")
+  }
+  assert.match(workflow, /^  CARGO_INCREMENTAL: "0"$/mu)
+  assert.match(feature, /rustc -vV\n            cargo -V/u)
+  assert.match(feature, /df -Pk "\$GITHUB_WORKSPACE" "\$RUNNER_TEMP"/u)
+  assert.match(feature, /- name: Record final feature disk usage\n        if: always\(\)/u)
+  assert.match(feature, /du -sk "\$CARGO_TARGET_DIR"/u)
+  assert.match(feature, /\$\{\{ runner.temp \}\}\/bamboo-feature-profile.log/u)
+  assert.doesNotMatch(feature, /cargo (?:build|check|clean|test)|--release|CARGO_PROFILE_RELEASE_|rm -[a-z]*r/u)
+  assert.doesNotMatch(readFileSync(".github/workflows/publish-crate.yml", "utf8"), /CARGO_PROFILE_(?:DEV|TEST)_DEBUG/u)
+})
+
+test("required Test performs only result admission for feature PRs without an unused checkout, toolchain or cache", () => {
+  const assertOwnership = (source) => {
+    const steps = source.split(/\n      - /u).slice(1)
+    assert.ok(steps.length > 1)
+    assert.match(steps[0], /^name: Require validation admission\n/u)
+    for (const step of steps.slice(1)) {
+      assert.match(step, /^        if: (?:(?:always|failure)\(\) && )?needs\.validation-source\.outputs\.full == 'true'$/mu)
+    }
+  }
+  const aggregate = job("test")
+  assertOwnership(aggregate)
+  for (const name of ["Install Rust", "Record the full validation toolchain", "Rust cache"]) {
+    assert.throws(() => assertOwnership(aggregate.replace(`name: ${name}\n        if: needs.validation-source.outputs.full == 'true'`,
+      `name: ${name}\n        if: github.event_name != 'push'`)))
+  }
+})
+
+test("serial Root birth selectors reuse canonical storage compilation and preserve strict lint ownership", () => {
+  const { SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES, cargoArguments } = require("./run-feature-tests.cjs")
+  assert.deepEqual(SERIAL_STORAGE_FAMILIES, ["v2::root_birth_tests::", "v2::host_root_create::tests::",
+    "v2::supervisor_management_tests::", "v2::supervisor_management_lifetime_tests::", "v2::supervisor_proof_tests::",
+    "v2::supervisor_management::observer_lock_order_tests::"])
+  assert.deepEqual(SERIAL_STORAGE_FILTERS, ["root_birth_tests", "host_root_create::tests", "supervisor_management", "supervisor_proof"])
+  const source = readFileSync("crates/infra/bamboo-storage/src/v2/root_birth_tests.rs", "utf8")
+  assert.deepEqual([...source.matchAll(/async fn (root_birth_[a-z_]+)\(/gu)].map(match => match[1]).sort(), [...ROOT_BIRTH_CASES].sort())
+  const args = cargoArguments({ name: "bamboo-storage" })
+  assert.deepEqual(args.slice(args.indexOf("--") + 1), SERIAL_STORAGE_SELECTORS.flatMap(prefix => ["--skip", prefix]))
+  const lint = readFileSync(".github/workflows/root-birth-acceptance.yml", "utf8")
+  assert.doesNotMatch(lint, /cargo test/u)
+  assert.match(lint, /cargo clippy --locked --all-features --lib -p bamboo-storage -- -D warnings/u)
+  assert.match(lint, /test "\$actual" = "\$EXPECTED_SOURCE"/u)
+})
+
+function assertSubscriptionException(source) {
+  // Normal merge6cfe/PR2316 retains original F57c1 configuration. This is not
+  // actual-M acceptance or ownership migration; a future owner needs review.
+  assert.equal(createHash("sha256").update(source).digest("hex"), "e79b9f16140786a49761cd5baab66a5cf83faa5d793ed11464701c2b475175da")
+  assert.match(source, /pull_request:\n    branches: \[dev\]/u)
+  assert.match(source, /runs-on: ubuntu-latest/u)
+  assert.match(source, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
+  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+  assert.match(source, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+  assert.match(source, /test "\$actual" = "\$EXPECTED_SOURCE_SHA"/u)
+  assert.match(source, /cargo test --locked -p bamboo-domain -p bamboo-engine -p bamboo-server --lib --/u)
+  assert.match(source, /--test-threads=1 --color=never/u)
+  assert.match(source, /cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-engine -p bamboo-storage/u)
+}
+
+function assertLinuxTestOwnership(definitions) {
+  const registered = {
+    "ci.yml": {
+      "feature-tests": "The canonical isolated-default and explicit-feature test executor",
+      "quick-checks": "Small synthetic workflow/controller policy fixtures",
+      test: "Pinned legacy release policy fixtures; feature mode is admission only",
+      "test-crates": "Pinned legacy release Unit acceptance until source cutover",
+      "e2e-crates": "Pinned legacy release E2E acceptance until source cutover",
+      "test-ssh": "Pinned legacy release live SSH fixture until source cutover",
+      build: "Pinned legacy release native-platform tests until source cutover",
+      "tool-event-recorder-e2e": "Legacy Linux coverage; feature matrix is Mac/Windows only",
+    },
+    "frontend-acceptance.yml": {
+      build: "Pinned legacy original-release-head build and policy fixtures",
+      test: "Pinned legacy original-release-head consumer contract",
+    },
+    "release-cargo-isolation.yml": { isolation: "Synthetic credential/ENOSPC containment boundary" },
+    "trusted-observer.yml": { observer: "Accepted API-only/F multi-package Observer configuration; not M evidence" },
+    "delegated-planner-acceptance.yml": { planner: "New a64 API-only/F Planner targets; independent accepted configuration, not M evidence" },
+    "observer-subscriptions.yml": { observer: "Inherited 6cfe API-only/F subscription joint graph; temporary exact configuration, not M evidence" },
+    "ticket-platform-adapter.yml": { "native-budget": "Explicit manual snapshot diagnosis; normal PR job is Windows" },
+  }
+  for (const [file, source] of Object.entries(definitions)) {
+    if (file === "observer-subscriptions.yml") assertSubscriptionException(source)
+    if (!/^  pull_request:\s*$/mu.test(source)) continue
+    const jobs = source.slice(source.indexOf("\njobs:\n") + 7)
+      .split(/(?=^  [a-z][a-z0-9-]*:\n)/mu).filter(Boolean)
+    for (const block of jobs) {
+      if (!/ubuntu|linux\//iu.test(block)) continue
+      const id = block.match(/^  ([a-z][a-z0-9-]*):/u)?.[1]
+      const scripts = [...block.matchAll(/(?:node(?: --test)?|bash|python3?) (scripts\/[a-zA-Z0-9_./-]+\.(?:cjs|mjs|js|py|sh))/gu)]
+        .map(match => match[1]).filter(name => existsSync(name)).map(name => readFileSync(name, "utf8"))
+      const code = [block, ...scripts].join("\n")
+      if (!/\bcargo(?: \+[^\s]+)? test\b/u.test(code) &&
+          !(/["']cargo["']/u.test(code) && /["']test["']/u.test(code))) continue
+      assert.ok(registered[file]?.[id], `Ordinary Linux Rust tests must join the canonical feature executor: ${file}:${id}; consolidate targets or review an explicit scoped exception`)
+      if (file === "delegated-planner-acceptance.yml") {
+        // Newly inherited #2304 owner, not part of the original A95 baseline.
+        assert.equal(createHash("sha256").update(source).digest("hex"), "318e924773ffdeb0407c5b73b15a70c330f7f64eb7ef3260c1a955782d12d912")
+        assert.match(block, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
+        assert.match(block, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+        assert.match(block, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+        assert.match(block, /test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SOURCE_SHA"/u)
+        for (const command of ["cargo test --locked -p bamboo-server-tools --lib plan::tests::",
+          "cargo test --locked -p bamboo-engine --lib planner_artifact",
+          "cargo test --locked -p bamboo-agent --test required_child_context_packet",
+          "cargo clippy --locked --all-features -p bamboo-agent"]) assert.ok(block.includes(command))
+      }
+      if (file === "trusted-observer.yml") {
+        // Preserve this separately accepted F/config exactly; never relabel it as M.
+        assert.equal(createHash("sha256").update(source).digest("hex"), "7c26b1511759f5a40bad6a21dc44976a59f60c81f841cdf00396fa38e5d868ab")
+        assert.match(block, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
+        assert.match(block, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+        assert.match(block, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+        assert.match(block, /test "\$actual" = "\$EXPECTED_SOURCE_SHA"/u)
+        assert.match(block, /cargo test --locked -p bamboo-domain -p bamboo-storage -p bamboo-server --lib --/u)
+        assert.match(block, /cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-storage/u)
+      }
+      if (file === "ticket-platform-adapter.yml") {
+        assert.match(block, /^    if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''$/mu)
+      }
+      if (file === "frontend-acceptance.yml") assert.match(source, /pull_request:\n    branches: \[main\]/u)
+      if (file === "ci.yml" && ["test-crates", "e2e-crates", "test-ssh"].includes(id)) {
+        assert.match(block, /^    if: needs.validation-source.outputs.full == 'true'$/mu)
+      }
+      if (file === "ci.yml" && id === "build") {
+        assert.match(block, /^    if: >-\n      needs.validation-source.outputs.full == 'true' &&\n/mu)
+        assert.doesNotMatch(block, /outputs\.feature|base_ref == 'dev'/u)
+      }
+      if (file === "ci.yml" && id === "feature-tests") {
+        assert.equal([...block.matchAll(/run: node scripts\/run-feature-tests\.cjs$/gmu)].length, 1)
+        assert.doesNotMatch(block, /cargo test/u)
+        const paths = [...block.matchAll(/\bscripts\/[a-zA-Z0-9_./-]+\.(?:cjs|mjs|js|py|sh)/gu)].map(match => match[0])
+        assert.ok(paths.every(name => ["scripts/run-feature-tests.cjs", "scripts/frontend-package.cjs"].includes(name)))
+      }
+      if (file === "ci.yml" && id === "tool-event-recorder-e2e") {
+        assert.ok(block.includes(`needs.validation-source.outputs.feature == 'true' && '["macos-latest","windows-latest"]'`))
+      }
+    }
+  }
+}
+
+test("all agents share canonical feature tests instead of adding ordinary Linux PR producers", () => {
+  const directory = ".github/workflows"
+  const definitions = Object.fromEntries(readdirSync(directory).filter(file => /\.ya?ml$/u.test(file))
+    .map(file => [file, readFileSync(path.join(directory, file), "utf8")]))
+  assertLinuxTestOwnership(definitions)
+  for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
+    ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
+    ["-p bamboo-domain -p bamboo-storage -p bamboo-server --lib", "-p bamboo-server --lib"],
+    ["cargo clippy --locked --all-features --lib", "cargo clippy --locked --lib"]]) {
+    assert.throws(() => assertLinuxTestOwnership({ ...definitions,
+      "trusted-observer.yml": definitions["trusted-observer.yml"].replace(before, after) }))
+  }
+  for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
+    ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
+    ["--test required_child_context_packet", "--lib"], ["--all-features", "--no-default-features"]]) {
+    assert.throws(() => assertLinuxTestOwnership({ ...definitions,
+      "delegated-planner-acceptance.yml": definitions["delegated-planner-acceptance.yml"].replace(before, after) }))
+  }
+  const duplicate = "name: New delegated planner acceptance\non:\n  pull_request:\n    branches: [dev]\njobs:\n  planner:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test --locked -p bamboo-agent --test required_child_context_packet\n"
+  assert.throws(() => assertLinuxTestOwnership({ ...definitions, "unregistered-planner-acceptance.yml": duplicate }), /must join the canonical feature executor/u)
+  const unregistered = workflow + "\n  extra-linux-tests:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test --locked -p bamboo-server --lib\n"
+  assert.throws(() => assertLinuxTestOwnership({ ...definitions, "ci.yml": unregistered }), /must join the canonical feature executor/u)
+  assert.throws(() => assertLinuxTestOwnership({ ...definitions, "ticket-platform-adapter.yml": definitions["ticket-platform-adapter.yml"]
+    .replace("if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''", "if: github.event_name == 'pull_request'") }), /workflow_dispatch/u)
+})
+
+test("subscription exception retains exact F API-only graph without becoming merge-source evidence", () => {
+  const source = readFileSync(".github/workflows/observer-subscriptions.yml", "utf8")
+  assertLinuxTestOwnership({ "observer-subscriptions.yml": source })
+  for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
+    ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
+    ["EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}", "EXPECTED_SOURCE_SHA: ${{ github.sha }}"],
+    ["ubuntu-latest", "windows-latest"], ["branches: [dev]", "branches: [main]"],
+    ["-p bamboo-domain -p bamboo-engine -p bamboo-server --lib", "-p bamboo-server --lib"],
+    ["observer_subscription session::supervisor_management::tests::", "observer_subscription"],
+    ["--test-threads=1", "--test-threads=2"], ["--all-features", "--no-default-features"],
+    ["assert len(window) == 6", "assert len(window) >= 0"]]) {
+    assert.ok(source.includes(before), before)
+    assert.throws(() => assertLinuxTestOwnership({ "observer-subscriptions.yml": source.replace(before, after) }))
+  }
+  assert.throws(() => assertLinuxTestOwnership({ "unregistered-subscriptions.yml": source }), /must join the canonical feature executor/u)
 })
 
 function serverCommand(id) {
@@ -361,8 +586,8 @@ test("server Cargo target layout keeps the unfiltered integration tail complete"
 
 test("native summaries reject failed, cancelled, skipped and missing crate results", () => {
   for (const [id, stepName, variables] of [
-    ["test", "Require all crate tests and the SSH fixture", ["CRATE_RESULT", "SSH_RESULT"]],
-    ["e2e-test", "Require all E2E crate tests", ["CRATE_RESULT"]],
+    ["test", "Require all crate tests and the SSH fixture", ["CRATE_RESULT", "E2E_RESULT", "SSH_RESULT"]],
+    ["e2e-test", "Require all E2E crate tests", ["CRATE_RESULT", "SSH_RESULT"]],
   ]) {
     const step = job(id).split(`      - name: ${stepName}\n`)[1]?.split(/\n      - /u)[0]
     assert.ok(step)
@@ -371,7 +596,7 @@ test("native summaries reject failed, cancelled, skipped and missing crate resul
     assert.ok(command)
     const results = Object.fromEntries(variables.map((name) => [name, "success"]))
     const run = (overrides = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", command], {
-      env: { ...process.env, ...results, ...overrides }, encoding: "utf8",
+      env: { ...process.env, FEATURE_VALIDATION: "false", ...results, ...overrides }, encoding: "utf8",
     })
     assert.equal(run().status, 0)
     for (const variable of variables) {
@@ -428,7 +653,7 @@ test("promotion retains required checks without repeating platform coverage", ()
 test("all-feature E2E crates retain the workspace stack and required summary", () => {
   assert.match(workflow, /^  RUST_MIN_STACK: "8388608"$/mu)
   assert.match(job("e2e-crates"), /--all-features --lib --tests/u)
-  assert.match(job("e2e-test"), /needs: \[validation-source, e2e-crates\]/u)
+  assert.match(job("e2e-test"), /needs: \[validation-source, feature-tests, e2e-crates, test-ssh\]/u)
   assert.match(job("e2e-test"), /always\(\) && !cancelled\(\)/u)
 })
 
@@ -468,7 +693,7 @@ test("ordinary PR caches remain reusable and frozen validation restores without 
   assert.doesNotMatch(cacheCleanupWorkflow, /actions\/checkout|pull_request_target/u)
 })
 
-test("expensive validation jobs stay off dev pull requests", () => {
+test("legacy release jobs retain explicit full-validation selection", () => {
   for (const id of [
     "msrv",
     "tls-fixture-test",
@@ -852,7 +1077,7 @@ test("this frozen batch cannot save cache on source, integration, promotion or m
     assert.equal(source.split(header).length, 2, "one shared batch predicate must govern each workflow")
     for (const [name, github, expected] of cases) assert.equal(evaluate(expression, github, true), expected, name)
   }
-  assert.equal(caches, 14, "all planned source/dev/main cache actions remain covered")
+  assert.equal(caches, 15, "all planned source/dev/main cache actions remain covered")
   assert.ok(actor.includes(cacheSaveIf("github.event_name == 'pull_request' && github.base_ref == 'dev'")))
   assert.match(docs, /cache-on-failure: true\n          save-if: \$\{\{ env\.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' \}\}/u)
   const publisher = readFileSync(".github/workflows/publish-crate.yml", "utf8")
