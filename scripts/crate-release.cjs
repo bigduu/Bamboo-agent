@@ -140,6 +140,11 @@ function validateReceipt(receipt, identity, crates, version = receipt?.version) 
   assert.deepEqual(receipt.crates, crates, 'Release publish closure changed')
   assert.equal(typeof receipt.automatic, 'boolean')
   assert.equal(typeof receipt.completed, 'boolean')
+  if (Object.hasOwn(receipt, 'nativeOriginals')) {
+    const marker = receipt.nativeOriginals
+    assert.equal(receipt.automatic, true, 'Original native outputs require the canonical reservation')
+    assert.deepEqual(marker, nativeOriginalContract({ workflowRevision: marker?.controllerRevision, runId: marker?.runId }))
+  }
   assert.match(receipt.frontendBytes?.manifestSha256, DIGEST)
   assert.match(receipt.frontendBytes?.archiveSha256, DIGEST)
   assert.ok(receipt.packageChecksums && typeof receipt.packageChecksums === 'object')
@@ -152,6 +157,15 @@ function validateReceipt(receipt, identity, crates, version = receipt?.version) 
       'Completed release must record every package checksum')
   }
   return receipt
+}
+
+// A trusted controller may opt a NEW reservation into this lifecycle. There is
+// no input/env switch, upgrade of a signed receipt, or new source authority.
+function nativeOriginalContract(identity) {
+  assert.match(identity?.workflowRevision, SHA)
+  assert.match(identity?.runId, /^[1-9][0-9]*$/)
+  return { schemaVersion: 1, kind: 'bamboo-native-originals/v1',
+    controllerRevision: identity.workflowRevision, runId: identity.runId }
 }
 
 // Preserve original signed acceptance when the same main CI is rerun.
@@ -183,6 +197,10 @@ function validatePreparation(preparation, identity, contractVersion) {
   assert.ok(Number.isSafeInteger(preparation.releaseId) && preparation.releaseId > 0)
   const receipt = preparation.receipt
   validateReceipt(receipt, receipt?.identity, receipt?.crates, identity.version)
+  if (receipt.nativeOriginals) {
+    assert.equal(contractVersion, 2, 'Original native lifecycle requires the three-target contract')
+    assert.deepEqual(receipt.nativeOriginals, nativeOriginalContract(identity), 'Original controller/run must remain unchanged')
+  }
   assert.equal(receipt.identity.repository, identity.repository)
   assert.equal(receipt.identity.sourceRevision, identity.sourceRevision)
   assert.equal(receipt.automatic, true)
@@ -221,6 +239,7 @@ async function resumePrepared(context, preparation, identity, contractVersion) {
   assert.equal(receipt.ciRun, preparation.receipt.ciRun)
   assert.deepEqual(receipt.validation, preparation.receipt.validation)
   assert.deepEqual(receipt.frontendBytes, preparation.receipt.frontendBytes, 'Prepared frontend bytes changed')
+  assert.deepEqual(receipt.nativeOriginals, preparation.receipt.nativeOriginals, 'Signed native lifecycle changed')
   assert.ok(release.draft || receipt.completed, 'Public release has incomplete provenance')
   for (const [name, checksum] of Object.entries(preparation.receipt.packageChecksums)) {
     assert.equal(receipt.packageChecksums[name], checksum, 'Previously prepared package checksum changed')
@@ -291,7 +310,9 @@ async function plan(context) {
   const receipt = { schemaVersion: 1, version, identity, crates,
     frontendBytes: context.frontendBytes, automatic: true, completed: false,
     ciRun: context.ciRun || null, packageChecksums: {},
-    ...(context.validation ? { validation: context.validation } : {}) }
+    ...(context.validation ? { validation: context.validation } : {}),
+    ...(context.nativeOriginals ? { nativeOriginals: context.nativeOriginals } : {}) }
+  validateReceipt(receipt, identity, crates, version)
   // Reserve before uploading any crate. An uncertain GitHub write is recovered
   // by reading this exact tag on a rerun, never by allocating another version.
   const reserved = await context.reserve(receipt)
@@ -816,5 +837,5 @@ module.exports = { assertVersion, assertManualVersion, validateSource, validateR
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
   verifyRegistrySource, highestStableVersion, spawnCommand, command, createPreparation, validatePreparation, resumePrepared,
-  assertAdmissionCompatibility }
+  assertAdmissionCompatibility, nativeOriginalContract }
 if (require.main === module) main().catch((error) => { console.error(error); process.exitCode = 1 })

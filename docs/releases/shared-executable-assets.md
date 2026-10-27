@@ -128,3 +128,64 @@ stand in for actual platform builds or native desktop acceptance. Update a
 consumer's official identity lock only after every asset required by the source
 contract and its
 manifest have been published and independently verified.
+
+## Staged original-output lifecycle (#2324)
+
+The helpers also implement the explicit `bamboo-native-originals/v1` reservation
+extension. This is an inactive capability until the publisher graph is wired and
+reviewed. No dispatch/environment flag enables it. A trusted controller can add
+it only when allocating a new reservation; old v1/v2 signed reservations and
+published checkpoints keep their existing paths and bytes. The frozen-source
+foundation's empty producer registry and `publicationAuthorized: false` remain
+closed. These helpers do not grant a new release source publication authority.
+
+The extension binds the original controller and run to the same reservation,
+source/tree, version and sealed frontend. Preparation checks all earlier native
+executions and all retained originals before allowing any target to build. Its
+signed plan belongs to the current physical preparation attempt. A native
+selector checks that attempt and the actual original preparation log before
+cache/toolchain/stamping/build work. Copied outputs from a failed-only rerun
+stop there. Use the existing full workflow rerun to get a fresh preparation;
+successful targets then select their originals and only explicitly permitted
+failed targets build. A source/compiler failure or unknown build outcome does
+not become an infrastructure retry.
+
+The successful original Actions ZIP is copied byte for byte into the existing
+Release as `bamboo-native-original-<target>.zip`. The associated
+`bamboo-native-original-<target>.json` checkpoint uses the existing Environment
+HMAC authority and records the physical job/attempt/execution fingerprint,
+Actions artifact ID and ZIP digest, durable Release asset ID/digest, and original
+build receipt. It does not introduce another store or version allocator. The
+collector preserves valid successful siblings even when another target fails.
+An API-copied success is an earlier physical execution only when all absolute
+job and step execution times and fields match across different attempts.
+Another physical build, a later real build failure or an ambiguous attempt
+stops publication.
+
+Actions expiry is harmless only after the matching durable ZIP/checkpoint is
+sealed. Missing or changed previously successful originals stop recovery;
+neither a rebuild nor an asset replacement is allowed. An uncertain upload
+response is read back by exact identity and bytes. A ZIP left without its sealed
+checkpoint after a process interruption requires explicit diagnosis and stops
+automatic recovery. It is not permission to overwrite or re-sign a replacement.
+
+Preparation produces the browser-host tar once, with a signed start intent and
+`bamboo-native-host-original-v1.json` checkpoint in that same Release. An
+interrupted start or lost checkpoint stops rather than packaging again. The
+new finalizer restores all native ZIPs and that prepared tar, verifies their
+original receipts and latest logical outcomes, and distributes the original raw
+executables. It invokes no compiler, product binary or archive builder. The
+consumer-facing v2 manifest and its three raw executable names remain unchanged.
+
+After verified uploads, `Native original completion:` records the actual
+controller/finalizer run and attempt, source, version, Release and final asset
+IDs/digests. It contains no HMAC key. A later public Main gate must authenticate
+the fixed controller and original physical job/log through GitHub, plus the real
+tag, source and assets; the record is not self-authenticating. Public Main
+authority and production activation remain separate work.
+
+`node --test scripts/sidecar-release.test.cjs` registers the new lifecycle
+regressions through the existing Quick Checks policy owner. There is no second
+automatic invocation of `scripts/native-originals.test.cjs`. Tiny archive/header
+fixtures exercise preservation and isolation without Cargo or product packaging;
+they do not establish native build, hosted reuse or publication success.

@@ -32,6 +32,8 @@ const identity = { repository: release.REPOSITORY, version: '2026.10.123', sourc
 const frontendBytes = { manifestSha256: '4'.repeat(64), archiveSha256: '5'.repeat(64) }
 const signingKey = 'a'.repeat(64) // Synthetic test authority only.
 
+if (!legacySuite) require('./native-originals.test.cjs').register()
+
 function temporary(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-executables-test-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

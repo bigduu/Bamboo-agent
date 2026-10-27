@@ -10,7 +10,7 @@ const { assertVersion, assertManualVersion, validateSource, validateReceipt, nex
   shouldMakeLatest, gitIsAncestor, canonicalJson, signReceipt, authenticateReceipt,
   readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration, verifyRegistrySource, highestStableVersion,
   command, spawnCommand, assertCurrentMain, currentMainWrite, createPreparation, validatePreparation,
-  resumePrepared, assertAdmissionCompatibility } = require('./crate-release.cjs')
+  resumePrepared, assertAdmissionCompatibility, nativeOriginalContract } = require('./crate-release.cjs')
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 const sourceRevision = 'a'.repeat(40)
@@ -72,6 +72,34 @@ const completedReceipt = (version, revision) => makeReceipt({ version,
 
 const preparationIdentity = { repository: identity.repository, sourceRevision, sourceTree: '1'.repeat(40),
   workflowRevision: '2'.repeat(40), runId: '123', runAttempt: 1, version: '2026.10.8', ciRun: null }
+
+test('original native opt-in uses the existing allocator and cannot upgrade a signed historical reservation', async () => {
+  const marker = nativeOriginalContract(preparationIdentity)
+  const fresh = fixture({ nativeOriginals: marker })
+  const allocated = await plan(fresh.context)
+  assert.deepEqual(allocated.receipt.nativeOriginals, marker)
+  const allocatedIdentity = { ...preparationIdentity, version: allocated.receipt.version }
+  const prepared = createPreparation(allocated, allocatedIdentity, 2)
+  authenticateReceipt(prepared.receipt, signingKey)
+  validatePreparation(prepared, { ...allocatedIdentity, runAttempt: 2 }, 2)
+  for (const current of [{ ...allocatedIdentity, workflowRevision: '3'.repeat(40) },
+    { ...allocatedIdentity, runId: '124' }]) assert.throws(() => validatePreparation(prepared, current, 2))
+  assert.throws(() => validatePreparation({ ...prepared, contractVersion: 1 }, allocatedIdentity, 1))
+  const old = makeReceipt(), entry = release(old), bytes = entry.body
+  const existing = fixture({ nativeOriginals: marker, releases: async () => [entry] })
+  const resumed = await plan(existing.context)
+  assert.equal(resumed.receipt.nativeOriginals, undefined)
+  assert.equal(entry.body, bytes)
+  assert.ok(!existing.calls.includes('reserve'))
+  assert.equal(createPreparation(resumed, preparationIdentity, 2).receipt.nativeOriginals, undefined)
+})
+
+test('original native lifecycle does not turn frozen-source read-only context into publication authority', () => {
+  assert.throws(() => validateSource({ eventName: 'workflow_dispatch', event: { inputs: {} },
+    repository: identity.repository, sourceRevision, sourceTree: preparationIdentity.sourceTree,
+    validation: { schemaVersion: 2, kind: 'bamboo-frozen-source-context/v2', publicationAuthorized: false } }),
+  /Unsupported release trigger/)
+})
 
 test('original signed admission tolerates only a later attempt of the identical main CI run', async () => {
   const recorded = { schemaVersion: 1, sourceRevision, ciRun: { id: 100, run_attempt: 1, html_url: 'fixture/main/100' },
