@@ -2504,6 +2504,43 @@ impl SessionInboxPort for FileSessionInbox {
         .await
     }
 
+    fn supports_runtime_target_lifetime(&self) -> bool {
+        true
+    }
+
+    async fn deliver_runtime_for_target(
+        &self,
+        envelope: &SessionMessageEnvelope,
+        target_created_at: chrono::DateTime<Utc>,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        if !matches!(envelope.source, SessionMessageSource::Runtime { .. })
+            || envelope.kind != bamboo_domain::SessionMessageKind::RuntimeInstruction
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "lifetime-bound Runtime admission requires RuntimeInstruction".into(),
+            ));
+        }
+        let lifecycle = self.lock_lifecycle().await?;
+        let target = bamboo_domain::Storage::load_runtime_control_plane(
+            self.sessions.as_ref(),
+            &envelope.target_session_id,
+        )
+        .await
+        .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        if target.is_none_or(|session| session.created_at != target_created_at) {
+            return Err(SessionInboxError::InvalidClaim(
+                "Runtime completion target lifetime changed".into(),
+            ));
+        }
+        self.deliver_with_lifecycle_held(
+            envelope,
+            InboxAuthority::Lifecycle { _guard: lifecycle },
+            None,
+            None,
+        )
+        .await
+    }
+
     async fn existing_staged_delivery(
         &self,
         envelope: &SessionMessageEnvelope,

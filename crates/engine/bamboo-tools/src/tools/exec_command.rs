@@ -23,7 +23,7 @@ const QUIET_POLL_ADVISORY_READOUTS: usize = 3;
 const QUIET_POLL_DIAGNOSIS_READOUTS: usize = 6;
 const QUIET_POLL_ADVISORY: &str = "No new output across repeated polls. Do other useful work or check a command-owned progress signal before polling again. Quiet output or an existing report does not prove completion. Continue waiting when appropriate, or report the concrete blocker; retain this handle for the final status.";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CapturedOutput {
     bytes: Vec<u8>,
     omitted_bytes: usize,
@@ -58,6 +58,7 @@ pub(crate) struct PolledShellState {
     // A reaped parent may still have descendants holding its output pipes.
     // This observation does not publish a terminal capture result.
     process_exited: AtomicBool,
+    background_monitor: AtomicBool,
     #[cfg(test)]
     fail_cleanup_after_reap: AtomicBool,
     capture_stop: watch::Sender<bool>,
@@ -77,6 +78,7 @@ impl PolledShellState {
             output: Mutex::new(CapturedOutput::default()),
             completed: Notify::new(),
             process_exited: AtomicBool::new(false),
+            background_monitor: AtomicBool::new(false),
             #[cfg(test)]
             fail_cleanup_after_reap: AtomicBool::new(false),
             capture_stop: watch::channel(false).0,
@@ -231,6 +233,79 @@ impl PolledShellState {
             polling,
         }
     }
+}
+
+/// A reserved, owner-checked observation of an existing exec command. It does
+/// not own the process or advance its output cursor. At most one live monitor
+/// can hold a command; dropping an unstarted or cancelled monitor releases it.
+pub struct BackgroundExecJob {
+    shell: Arc<bash_runtime::ShellSession>,
+}
+
+impl BackgroundExecJob {
+    pub fn id(&self) -> &str {
+        &self.shell.id
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.shell.session_id.as_deref().expect("validated owner")
+    }
+
+    /// Wait for the same fully drained terminal capture used by write_stdin.
+    /// The bounded snapshot leaves the ordinary pull result and TTL untouched.
+    pub async fn completion(&self) -> bamboo_agent_core::BashCompletionInfo {
+        let state = self.shell.polled.as_ref().expect("validated exec capture");
+        loop {
+            state.wait(30_000).await;
+            let output = state.output.lock().await;
+            if output.completion.is_none() {
+                continue;
+            }
+            let mut snapshot = output.clone();
+            drop(output);
+            let result = PolledShellState::take_locked(
+                &mut snapshot,
+                &self.shell.id,
+                Some(1024),
+                state.process_exited(),
+            );
+            return bamboo_agent_core::BashCompletionInfo {
+                session_id: self.session_id().to_owned(),
+                bash_id: self.id().to_owned(),
+                command: self.shell.command.clone(),
+                exit_code: result.exit_code,
+                status: result.status.to_owned(),
+                output_tail: serde_json::to_string(&result).expect("exec result is serializable"),
+            };
+        }
+    }
+}
+
+impl Drop for BackgroundExecJob {
+    fn drop(&mut self) {
+        self.shell
+            .polled
+            .as_ref()
+            .expect("validated exec capture")
+            .background_monitor
+            .store(false, Ordering::Release);
+    }
+}
+
+/// Reserve only an exact handle from this owner's pull-session registry.
+/// Legacy Bash shells and another owner's handles cannot be handed off.
+pub fn reserve_background_job(owner: &str, handle: &str) -> Option<BackgroundExecJob> {
+    let shell = bash_runtime::get_shell(handle)?;
+    if shell.session_id.as_deref() != Some(owner) {
+        return None;
+    }
+    shell
+        .polled
+        .as_ref()?
+        .background_monitor
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()?;
+    Some(BackgroundExecJob { shell })
 }
 
 /// Bound the serialized `output` string, including its JSON quotes and escapes.
@@ -601,3 +676,7 @@ mod tests;
 #[cfg(all(test, unix))]
 #[path = "initial_exec_cleanup_tests.rs"]
 mod initial_cleanup_tests;
+
+#[cfg(test)]
+#[path = "background_exec_tests.rs"]
+mod background_tests;
