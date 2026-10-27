@@ -1,90 +1,95 @@
-# Legacy main/master producer and Pages deployment stay active until shared v2
-# Main authority authenticates source + featureDocs. CI now owns the only dev-PR
-# documentation producer. This workflow is not yet a read-only consumer; bootstrap
-# cannot authorize deployment and missing/expired originals must not be rebuilt.
-name: Documentation
+name: Documentation Deployment
 
 on:
   push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+    branches: [main]
 
-env:
-  CARGO_TERM_COLOR: always
+permissions:
+  contents: read
 
-  # This frozen batch restores existing caches without adding paid storage.
-  # The main anchor also covers its first normal promotion push.
-  BAMBOO_RELEASE_CACHE_WRITE_ALLOWED: >-
-    ${{ !(
-      startsWith(github.ref, 'refs/heads/bamboo/release/da348-') ||
-      github.ref == 'refs/heads/release/da348a63f1d019a22df547c78575c500b6b1294e' ||
-      startsWith(github.head_ref, 'bamboo/release/da348-') ||
-      github.head_ref == 'release/da348a63f1d019a22df547c78575c500b6b1294e' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-       (github.event.before == 'dbafb74522794012fc8f0a61e761817b3913989a' ||
-        contains(github.event.head_commit.message, 'release/da348a63f1d019a22df547c78575c500b6b1294e')))
-    ) }}
+concurrency:
+  group: bamboo-documentation-pages
+  cancel-in-progress: false
 
 jobs:
-  build-docs:
-    name: Build Documentation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rust-docs
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          shared-key: bamboo-docs-${{ runner.os }}
-          cache-on-failure: true
-          save-if: ${{ env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
-
-      - name: Build documentation
-        run: cargo doc --no-deps --all-features --document-private-items
-
-      - name: Add redirect
-        run: |
-          echo '<meta http-equiv="refresh" content="0;url=bamboo_agent/index.html">' > target/doc/index.html
-
-      - name: Upload documentation artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: documentation
-          path: target/doc
-
-  deploy-docs:
-    name: Deploy to GitHub Pages
-    needs: build-docs
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  inspect-docs:
+    name: Identify Main documentation disposition
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
+      checks: read
+      pull-requests: read
+    outputs:
+      mode: ${{ steps.inspect.outputs.mode }}
+    steps:
+      - &main-ref
+        name: Require the actual protected Main controller
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          test "$DEFAULT_BRANCH" = main
+          test "$GITHUB_EVENT_NAME" = push
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_REF_PROTECTED" = true
+          test "$GITHUB_SHA" = "$GITHUB_WORKFLOW_SHA"
+      - &controller-checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - &node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+      - name: Inspect Main event
+        id: inspect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docs-deploy.cjs inspect
+
+  deploy-docs:
+    name: Deploy to GitHub Pages
+    needs: inspect-docs
+    if: needs.inspect-docs.outputs.mode == 'promotion'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
       pages: write
       id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Download documentation artifact
-        uses: actions/download-artifact@v8
+      - *main-ref
+      - *controller-checkout
+      - *node
+      - name: Verify retained documentation originals
+        id: site
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docs-deploy.cjs prepare
+      - name: Transfer the original TAR to Pages
+        id: pages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: documentation
-          path: doc
-
-      - name: Setup Pages
-        uses: actions/configure-pages@v6
-
-      - name: Upload to GitHub Pages
-        uses: actions/upload-pages-artifact@v5
-        with:
-          path: doc
-
-      - name: Deploy to GitHub Pages
+          name: ${{ steps.site.outputs.transfer_name }}
+          path: ${{ steps.site.outputs.site_tar }}
+          if-no-files-found: error
+          retention-days: 1
+      - name: Recheck Main before Pages deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAGES_ARTIFACT_ID: ${{ steps.pages.outputs.artifact-id }}
+          PAGES_ARTIFACT_SHA256: ${{ steps.pages.outputs.artifact-digest }}
+        run: node scripts/docs-deploy.cjs guard
+      - name: Deploy original documentation to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5
+        with:
+          artifact_name: ${{ steps.site.outputs.transfer_name }}

@@ -312,15 +312,60 @@ publication authority: the future consumer must separately authenticate the
 official workflow/run/jobs, original artifact API ID/digest and promoted source
 through the shared v2 Main admission interface. Equal trees are insufficient.
 
-Only the producer is implemented here, pending its own hosted acceptance. The
-read-only Main consumer is not connected; legacy `docs.yml` still builds
-main/master PRs and pushes and retains its existing main-only Pages permissions
-and environment. Full legacy CI keeps its old `cargo doc --no-deps` route until
-the coordinated authority cutover. These repetitions are pending, not removed.
-The future consumer must copy the original tar rather than rebuild or repackage;
-its Pages transfer has a separate one-day retention boundary. Missing, expired
-or changed originals stop deployment. There is no new store or allocator, and
-bootstrap never authorizes Pages deployment.
+#2355 stages the retained-site Main consumer in `docs.yml`. Only Main pushes
+trigger it; feature coverage stays in the existing Docs producer and Quick
+Checks Node owner. The metadata job identifies the actual merged Main PR and
+uses the shared locator parser. A recognized bootstrap/controller-only event
+has no Pages job or artifact authorization. Unknown modes stop. Only normal
+`mode=promotion` reaches the real `verifyMergedPromotion`, authenticating the
+original successful Main Admission execution, completed release, exact Main
+postimage and feature evidence. PR text is a locator, never authority.
+
+Both consumer jobs check out actual protected-main C; GITHUB_SHA remains C.
+They execute only C helpers and make no separate candidate/frozen-product
+checkout. The privileged job rederives the Main
+PR/admission run through fixed reads, rather than accepting a metadata-job proof.
+`main-admission.cjs.createPublicReads()` has one additional bounded binary port,
+`artifactBytes(id,max)`, for the fixed repository's Actions artifact ZIP GET;
+the zero-argument factory, safe child environment and original five ports remain.
+There are no publisher secrets, signer, new allocator or new durable store.
+
+The physical `Documentation` job and its successful upload-step log identify
+`feature-docs-R-A` and its immutable API ID. A copied logical attempt cannot
+relabel A. Unique upload records, run/repository/head identities, times, size,
+digest, current nonexpired metadata and downloaded ZIP hash must agree. The
+consumer reads only the two original archive members, rejects links/unsafe or
+extra entries, and verifies source M/tree, recorded workflow/ref, supported
+30-member configuration, lock/manifests/workflow hashes, receipt and complete
+TAR file/hash manifest. Workflow API definition and actual captured merge remain
+distinct values. The configuration digest retains the producer's Python sorted
+JSON separators; it is not replaced by a compact JSON hash.
+
+The Main consumer runs no Rustdoc/compiler, package builder, npm or runtime
+suite. It transfers the original `artifact.tar` with `upload-artifact`, not
+`upload-pages-artifact`, which would create another TAR. The per-consumer-attempt
+Pages artifact name avoids replacing an earlier attempt and retains the standard
+one-day transport boundary. Its raw TAR bytes remain identical. Before
+`deploy-pages`, local ZIP/receipt/TAR integrity is checked again, followed by a
+second real Main verifier call. Held configuration data is rebound to ordinary
+blobs in the immutable S tree; the uploaded Pages artifact ID/digest is checked,
+and Main must still equal this push to prevent an old run overwriting a new site.
+
+The consumer accepts at most 1 GiB ZIP/TAR, a stricter Pages transfer boundary
+than the producer's historical 2 GiB TAR cap. Oversized, missing, expired,
+replaced or unconfirmable originals stop. No matching durable original store
+exists to justify a fallback; do not compile, regenerate, retar or reconstruct
+an expired site. Owned runner scratch contains only temporary data and is not
+an authorization or recovery store. Data-verification children receive no
+GitHub, Pages, registry or signing credentials.
+
+Separate Ops must install the literal control closure for `docs.yml`,
+`scripts/docs-deploy.cjs` and `scripts/docs-deploy-verify.py`; the entrypoint
+currently stops until all three appear in the shared Main control list. Actual
+Pages positive acceptance is also pending. Preserve d6a's producer and original
+evidence. Full legacy CI still has `cargo doc --no-deps` until coordinated
+cutover, so this staged code does not establish ecosystem-wide zero Main
+compilation. Bootstrap/controller-only maintenance never earns Docs deployment.
 
 ## Native and browser feature owners
 
