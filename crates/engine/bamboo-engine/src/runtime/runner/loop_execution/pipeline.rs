@@ -11414,6 +11414,25 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Storage for ChildIndexStorage {
+        async fn load_root_authority(&self, id: &str) -> std::io::Result<Option<Session>> {
+            // This unit fixture's locked map is its sole canonical store.
+            // Keep the strict authority observation separate from history.
+            let mut observed = self.inner.load_session(id).await?;
+            if let Some(root) = observed.as_mut() {
+                if root.kind != bamboo_domain::SessionKind::Root
+                    || root.parent_session_id.is_some()
+                    || root.root_session_id != root.id
+                    || root.spawn_depth != 0
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unit authority observation is not a canonical Root",
+                    ));
+                }
+                root.messages.clear();
+            }
+            Ok(observed)
+        }
         async fn save_session(&self, session: &Session) -> std::io::Result<()> {
             self.inner.save_session(session).await
         }
