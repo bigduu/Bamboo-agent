@@ -486,26 +486,42 @@ test("Controller2354 default registry stays inactive and production readers rece
   assert.deepEqual(source.ACCEPTED_PRODUCERS,{});assert.deepEqual(proof.ACCEPTED_RELEASE_PRODUCERS,{});
 });
 test("Controller2354 registration first permits known P0 controls then explicitly known P1 without unknown fallback",async()=>{
-  const before=controllerFixture(),registryFile="scripts/frozen-source-admission.cjs";
-  // Inert future-registration control text, copied as data. P0 definition/helpers stay unchanged.
-  before.f.files[before.D][registryFile]="// P0 + reviewed P1 registration; not executed fixture code";
+  const Module=require("node:module"),before=controllerFixture(),next=controllerFixture(),registryFile="scripts/frozen-source-admission.cjs";
+  const text=fixtures.workflowText+"# explicitly reviewed P1\n",helper=source.REQUIRED_HELPERS[0],helperText=fixtures.helperText+"// reviewed P1 helper\n";
+  const p0=hash(Buffer.from(fixtures.workflowText)),p1=hash(Buffer.from(text)),contract=clone(next.f.contract);contract.helpers[helper]=hash(Buffer.from(helperText));
+  const registryText=producers=>{
+    const original=readFileSync(path.join(__dirname,"frozen-source-admission.cjs"),"utf8"),needle="const ACCEPTED_PRODUCERS = Object.freeze({});";
+    assert.equal(original.split(needle).length,2);return original.replace(needle,"const ACCEPTED_PRODUCERS = Object.freeze("+JSON.stringify(producers)+");");
+  };
+  // Simulate the trusted installed B module, not a caller policy argument. Only
+  // known repository source + inert registration data is compiled in this unit.
+  const installed=sourceText=>{
+    const filename=path.join(__dirname,"frozen-source-admission.cjs"),s=new Module(filename,module);s.filename=filename;
+    s.require=Module.createRequire(filename);s._compile(sourceText,filename);
+    const target=path.join(__dirname,"published-source-admission.cjs"),m=new Module(target,module);m.filename=target;
+    const normal=Module.createRequire(target);m.require=name=>name==="./frozen-source-admission.cjs"?s.exports:normal(name);
+    m._compile(readFileSync(target,"utf8"),target);return m.exports;
+  };
+  const B0=installed(registryText({[p0]:clone(before.f.contract)}));
+  const nextControls=registryText({[p0]:clone(before.f.contract),[p1]:contract});
+  before.f.files[before.D][registryFile]=nextControls;
   const changed={path:registryFile,mode:"100644",type:"blob",sha:oid(before.f.files[before.D][registryFile])};
   for(const map of [before.selected,before.head])map.set(registryFile,changed);
   for(const tree of [before.f.accepted.tree.sha,before.headTree])before.routes.get("git/trees/"+tree+"?recursive=1").tree.find(row=>row.path===registryFile).sha=changed.sha;
-  assert.equal((await before.verify()).controllerSource.revision,before.D);
-  const next=controllerFixture(),text=fixtures.workflowText+"# explicitly reviewed P1\n",helper=source.REQUIRED_HELPERS[0],helperText=fixtures.helperText+"// reviewed P1 helper\n";
+  assert.equal((await B0.verifyControllerMaintenance(before.input,before.reads)).controllerSource.revision,before.D);
   for(const ref of [fixtures.identities.F,fixtures.identities.M,next.D]){next.f.files[ref][source.WORKFLOW]=text;next.f.files[ref][helper]=helperText}
   for(const [name,bytes]of[[source.WORKFLOW,text],[helper,helperText]]){
     const entry={path:name,mode:"100644",type:"blob",sha:oid(bytes)};
     next.selected.set(name,entry);if(proof.MAIN_CONTROLS.includes(name))next.routes.get("git/trees/"+next.headTree+"?recursive=1").tree.find(row=>row.path===name).sha=entry.sha;
   }
-  next.updateSelected();await assert.rejects(next.verify(),/Unknown|incomplete/);
-  const contract=clone(next.f.contract);contract.helpers[helper]=hash(Buffer.from(helperText));
-  next.f.policy.producers[hash(Buffer.from(text))]=contract; // Trusted B1 fixture registration, never PR policy or a live producer.
-  assert.equal((await next.verify()).controllerSource.revision,next.D);
+  next.updateSelected();await assert.rejects(B0.verifyControllerMaintenance(next.input,next.reads),/Unknown|incomplete/);
+  const B1=installed(before.f.files[before.D][registryFile]); // Exact complete-D control copied to the simulated B1.
+  assert.equal((await B1.verifyControllerMaintenance(next.input,next.reads)).controllerSource.revision,next.D);
   const pinned=controllerFixture();pinned.f.contract.helpers[registryFile]=hash(Buffer.from("old pinned validator"));
   pinned.f.files[fixtures.identities.M][registryFile]=pinned.f.files[pinned.D][registryFile];
-  await assert.rejects(pinned.verify(),/helper/); // Registration-first is blocked if P0 pins the changed registration helper.
+  const pinnedB0=installed(registryText({[p0]:pinned.f.contract}));
+  await assert.rejects(pinnedB0.verifyControllerMaintenance(pinned.input,pinned.reads),/helper/);
+  assert.deepEqual(source.ACCEPTED_PRODUCERS,{}); // No live/global registry was installed.
 });
 test("Controller2354 distinct controller frame cannot satisfy publication or merged promotion proof",async()=>{
   const f=controllerFixture(),facts=await f.verify(),m=await mergedFixture();
