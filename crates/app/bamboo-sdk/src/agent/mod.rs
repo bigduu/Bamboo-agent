@@ -3208,6 +3208,24 @@ mod constructor_parity_tests {
 
         fn assert_send<T: Send>(_: &T) {}
 
+        fn assert_original_user_once(messages: &[Message], user_id: &str) {
+            let matches: Vec<_> = messages
+                .iter()
+                .filter(|message| message.id == user_id)
+                .collect();
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].role, Role::User);
+            assert_eq!(matches[0].content, "one retained SDK user");
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| message.role == Role::User
+                        && message.content == "one retained SDK user")
+                    .count(),
+                1
+            );
+        }
+
         for continuous in [false, true] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -3299,19 +3317,11 @@ mod constructor_parity_tests {
             assert_eq!(requests.len(), if continuous { 4 } else { 1 });
             assert!(requests.iter().all(|body| body == &requests[0]));
             let sent: Vec<Message> = serde_json::from_slice(&requests[0]).unwrap();
-            let sent_users = sent
-                .iter()
-                .filter(|m| m.role == Role::User)
-                .collect::<Vec<_>>();
-            assert_eq!(sent_users.len(), 1);
-            assert_eq!(sent_users[0].id, user_id);
+            assert_original_user_once(&sent, &user_id);
             assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
             let observed = provider.messages.lock().unwrap();
             assert_eq!(observed.len(), 1);
-            assert_eq!(
-                observed[0].iter().filter(|m| m.role == Role::User).count(),
-                1
-            );
+            assert_original_user_once(&observed[0], &user_id);
             drop(observed);
 
             let persisted = agent
