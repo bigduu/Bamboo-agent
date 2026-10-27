@@ -301,6 +301,7 @@ function registerConsumer() {
     assert.ok(deploy.indexOf("docs-deploy.cjs prepare") < deploy.indexOf("uses: actions/upload-artifact@"));
     assert.ok(deploy.indexOf("docs-deploy.cjs guard") > deploy.indexOf("uses: actions/upload-artifact@"));
     assert.ok(deploy.indexOf("docs-deploy.cjs guard") < deploy.indexOf("uses: actions/deploy-pages@"));
+    assert.match(deploy, /uses: actions\/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5/);
     assert.equal(policy.split('require("./docs-deploy.test.cjs").register()').length, 2);
     assert.doesNotMatch(fs.readFileSync(".github/workflows/ci.yml", "utf8"), /run: node --test[^\n]*scripts\/docs-deploy\.test\.cjs/);
     assert.doesNotMatch(fs.readFileSync("scripts/docs-deploy-verify.py", "utf8"), /tarfile\.open\([^\n]*["']w|\.addfile\(|subprocess|os\.system/);
