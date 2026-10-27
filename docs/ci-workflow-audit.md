@@ -25,6 +25,10 @@ for `delegated-planner-acceptance.yml`, plus Bodhi accepted dev
 `93ba85d0dad4c76cf2c12d099a7b3f12050bf3f6` and trusted main
 `19f11149f5f1c19d07b80faec5b0ca88de74ba90`. These additions preserve the
 earlier snapshots above; they do not substitute a new source for an old run.
+The next addition uses Bamboo dev
+`6cfe65e4624d6c0e86651187221b9fad861709a9` for
+`observer-subscriptions.yml`. Its original feature-head recipe is reviewed
+separately from its future canonical-merge owner.
 
 ## Bamboo
 
@@ -49,6 +53,7 @@ earlier snapshots above; they do not substitute a new source for an old run.
 | `pr-cache-cleanup.yml` | Closed-PR cache lifecycle. No product build/test. Retain fork restrictions. |
 | `trusted-observer.yml` | Added by accepted PR2313 after the original audit. Path-scoped Linux stable API-only runtime of domain/storage/server libraries plus stricter all-features library Clippy. It checks feature-head source rather than the canonical tested merge. Its API-only configuration and package graph are distinct from embedded default CI; migrate the owner explicitly before retiring this route. Do not claim that matching case names already establish deduplication or new-contract source evidence. |
 | `delegated-planner-acceptance.yml` | Added by accepted PR2304 after the original audit. Linux stable API-only Plan library, immutable-artifact library and real CLI/restart cases, followed by all-features library/integration Clippy. It also checks feature-head source. Runtime/compiler overlap must be compared with the canonical runner using actual target/features/configuration; its required-child integration lint is an additional selection. It remains active pending a bounded ownership/source-context migration. |
+| `observer-subscriptions.yml` | Added by accepted PR2316. Linux stable API-only joint domain/engine/server libraries, 19 serial cases, plus the same five-library all-features strict Clippy configuration as Trusted Observer. The joint engine/dev-dependency graph differs from standalone default CI. Issue2338 preserves both original joint graphs, consolidates the identical lint, and reuses the one overlapping serde case only with a current-M identical compiler unit/features/profile/path/hash and prior real PASS. Its original feature-head checks remain historical evidence until that migration passes hosted acceptance. |
 
 Native TLS, Recorder and portable Skill selections are also embedded in
 `ci.yml`. Issue2319 must compare actual target/features/profile/toolchain within
@@ -56,6 +61,25 @@ each OS, rather than assuming separate job names justify repeated compilation.
 macOS dev-profile TLS unwind acceptance is distinct from test-profile runtime;
 Windows API-only Rust1.99 Actor inputs are distinct from stable embedded inputs.
 Coverage catalog counts are not native execution evidence.
+
+Original PR2322 head `8a1de1ff` completed real canonical Linux Unit/E2E acceptance in
+[run40441830591/1](https://github.com/bigduu/Bamboo-agent/actions/runs/40441830591):
+actual tested merge `c5007d4c`, all nine selected jobs green, 31 default contexts,
+serial/SSH and all 19 additive cases complete. This accepts that source only.
+The refreshed `95e3b5d5` includes accepted subscription source `6cfe65e4` and
+complete local documentation; its independent
+[run40452299792/1](https://github.com/bigduu/Bamboo-agent/actions/runs/40452299792)
+is still required. Dev now strictly requires Test, E2E Tests and the real
+Feature Unit and E2E job from Actions app15368 during this cutover. Preserve the
+earlier cancelled and partial RED runs; no runtime speedup is claimed.
+
+Native ownership #2319, browser runtime #2330, quality #2331 and retained
+Rustdoc #2321 have reviewed local candidates. Source foundation #2323, original
+native/crate outputs #2324/#2325 and dispatch factory #2336 also have reviewed
+local checkpoints. Whole-release wiring #2344 and the read-only public Main
+proof #2345 remain separate; default complete-producer registries are empty.
+No local fixture or prepared owner establishes new-contract publication, Main
+promotion, Docker consumption or Pages deployment acceptance.
 
 ## Lotus Next
 
