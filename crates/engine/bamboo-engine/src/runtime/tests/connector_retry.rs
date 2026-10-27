@@ -772,3 +772,56 @@ async fn actual_openai_bounded_consumer_stops_when_retry_after_cannot_fit_withou
         );
     }
 }
+
+struct LegacyLongHintProvider {
+    url: String,
+}
+#[async_trait]
+impl LLMProvider for LegacyLongHintProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let config = bamboo_llm::retry::RetryConfig {
+            max_attempts: 5,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(5),
+        };
+        let response =
+            bamboo_llm::retry::send_with_retry(&config, "legacy-owned", || client.post(&self.url))
+                .await?;
+        Err(LLMError::RequestFailed(format!(
+            "HTTP {} synthetic temporary failure",
+            response.status()
+        )))
+    }
+}
+
+#[tokio::test]
+async fn legacy_public_http_policy_cannot_be_reset_by_an_engine_turn_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "3600"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = Arc::new(LegacyLongHintProvider { url: server.uri() });
+    let (_home, agent, storage) = build_direct_execute_agent(provider, None, None).await;
+    let mut session = Session::new("legacy-long-hint", "test-model");
+    session.add_message(Message::user("one legacy synthetic message"));
+    storage.save_session(&session).await.unwrap();
+    let (tx, _rx) = mpsc::channel(128);
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        agent.execute(&mut session, direct_request(tx, CancellationToken::new())),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(matches!(error, AgentError::LLMNonRetryable(_)));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}

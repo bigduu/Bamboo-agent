@@ -2177,3 +2177,551 @@ async fn ticket_scope_initialization_publishes_runtime_service_once_after_author
     assert!(!app.initialize_scope(scope_owner(), expected).await.unwrap());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+mod owned_cancel_shutdown {
+    use super::*;
+    use async_trait::async_trait;
+    use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
+    use bamboo_domain::{Message, WorkspaceBinding};
+    use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
+    use futures::FutureExt;
+    use std::{
+        collections::HashMap,
+        panic::AssertUnwindSafe,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+    use tokio::sync::{mpsc, oneshot};
+
+    const WAIT: Duration = Duration::from_secs(20);
+    const TASK: &str = "owned-cancel-task";
+
+    struct Request {
+        messages: Vec<Message>,
+        reply: oneshot::Sender<LLMChunk>,
+    }
+
+    struct Provider {
+        requests: mpsc::UnboundedSender<Request>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LLMProvider for Provider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            _: Option<u32>,
+            model: &str,
+        ) -> std::result::Result<LLMStream, LLMError> {
+            assert_eq!(model, "fixture-model");
+            assert!(tools.iter().any(|tool| tool.function.name == "Task"));
+            assert!(self.calls.fetch_add(1, Ordering::SeqCst) < 2);
+            let (reply, response) = oneshot::channel();
+            self.requests
+                .send(Request {
+                    messages: messages.to_vec(),
+                    reply,
+                })
+                .map_err(|_| LLMError::Api("owned cancellation observer closed".into()))?;
+            let chunk = response
+                .await
+                .map_err(|_| LLMError::Api("owned cancellation provider closed".into()))?;
+            Ok(Box::pin(futures::stream::iter([
+                Ok(chunk),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    struct Fixture {
+        state: Option<crate::AppState>,
+        service: Option<Arc<TicketService>>,
+        release: Option<oneshot::Sender<()>>,
+        entered: oneshot::Receiver<()>,
+        registered: oneshot::Receiver<tokio::task::JoinHandle<()>>,
+        draining: oneshot::Receiver<()>,
+        task: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl Fixture {
+        async fn new(root: &Path, provider: Arc<Provider>) -> Self {
+            let mut config = config(true).read().await.clone();
+            config.features.ticket_dispatch = true;
+            config.run_budget.max_rounds = Some(4);
+            config.subagents_mut().max_concurrent = Some(1);
+            config
+                .memory_mut()
+                .get_or_insert_with(Default::default)
+                .auto_dream_enabled = false;
+            let state = crate::AppState::new_with_provider_and_memory_store(
+                root.to_path_buf(),
+                config,
+                provider.clone(),
+                bamboo_memory::memory_store::MemoryStore::new(root.join("jiandu")),
+            )
+            .await
+            .unwrap();
+            state.provider_registry.replace_with(ProviderRegistry::new(
+                HashMap::from([("openai".into(), provider as Arc<dyn LLMProvider>)]),
+                "openai".into(),
+            ));
+            let service = state.tickets.service().unwrap();
+            let (entered, entered_rx) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            let (registered, registered_rx) = oneshot::channel();
+            let (draining, draining_rx) = oneshot::channel();
+            *state.tickets.cancellation_probe.lock() = CancellationProbe {
+                tail: Some((entered, release_rx)),
+                registered: Some(registered),
+                draining: Some(draining),
+            };
+            Self {
+                state: Some(state),
+                service: Some(service),
+                release: Some(release),
+                entered: entered_rx,
+                registered: registered_rx,
+                draining: draining_rx,
+                task: None,
+            }
+        }
+
+        fn release_tail(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
+
+        async fn join_task(&mut self) -> std::result::Result<(), tokio::task::JoinError> {
+            if self.task.is_none() {
+                self.task = self.registered.try_recv().ok();
+            }
+            match self.task.take() {
+                Some(task) => task.await,
+                None => Ok(()),
+            }
+        }
+
+        // The caller catches assertion panics before reaching this cleanup.
+        // Even the broken, untracked task has an independently retained join.
+        async fn cleanup(&mut self) -> std::result::Result<(), tokio::task::JoinError> {
+            self.release_tail();
+            let joined = self.join_task().await;
+            if let Some(state) = &self.state {
+                state.shutdown().await;
+            }
+            drop(self.service.take());
+            drop(self.state.take());
+            joined
+        }
+    }
+
+    fn task_chunk() -> LLMChunk {
+        LLMChunk::ToolCalls(vec![ToolCall {
+            id: TASK.into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "Task".into(),
+                arguments: json!({"tasks":[{
+                    "id":"before-cancel", "content":"One canonical plan write", "status":"completed"
+                }]})
+                .to_string(),
+            },
+        }])
+    }
+
+    async fn start(
+        state: &crate::AppState,
+        service: &Arc<TicketService>,
+        owner: &Authority,
+        workspace: &ExecutionWorkspace,
+    ) -> (String, String) {
+        let project = state
+            .project_store
+            .create("Owned cancellation", None)
+            .unwrap();
+        let project = state
+            .project_store
+            .bind_workspace(
+                &project.id,
+                project.revision,
+                WorkspaceBinding {
+                    path: workspace.repo.clone(),
+                    label: None,
+                    git_common_dir: None,
+                },
+            )
+            .unwrap();
+        let create = service
+            .prepare_command(
+                owner,
+                "owned-cancel-create",
+                vec![
+                    Operation::Create {
+                        temp_id: "work".into(),
+                        kind: TicketKind::Work,
+                        parent: None,
+                        contract: contract(),
+                        depends_on: BTreeSet::new(),
+                    },
+                    Operation::AssociateProject {
+                        ticket_id: "work".into(),
+                        project_id: project.id.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        let work = state
+            .tickets
+            .update(owner.principal().clone(), &create)
+            .await
+            .unwrap()
+            .ids["work"]
+            .clone();
+        let snapshot = service.published().unwrap().1;
+        let ready = service
+            .prepare_command(
+                owner,
+                "owned-cancel-ready",
+                vec![
+                    Operation::SetProjectContext {
+                        work_id: work.clone(),
+                        context: ProjectContextSnapshot {
+                            project_id: project.id.clone(),
+                            project_revision: project.revision,
+                            resource_revision: project.resource_revision,
+                            workspace_binding: project.workspace_bindings[0].clone(),
+                            contract_revision: snapshot.tickets[&work].contract_revision,
+                            contract: contract(),
+                            sources: BTreeMap::new(),
+                        },
+                    },
+                    Operation::Ready {
+                        work_id: work.clone(),
+                    },
+                ],
+            )
+            .unwrap();
+        state
+            .tickets
+            .update(owner.principal().clone(), &ready)
+            .await
+            .unwrap();
+        let start = service
+            .prepare_command(
+                owner,
+                "owned-cancel-start",
+                vec![Operation::Start {
+                    work_id: work.clone(),
+                    temp_id: "assignment".into(),
+                    workspace: Some(workspace.clone()),
+                }],
+            )
+            .unwrap();
+        let dispatched = state
+            .tickets
+            .dispatch(owner.principal().clone(), &start)
+            .await
+            .unwrap();
+        assert_eq!(dispatched["errors"], json!([]));
+        (
+            work,
+            dispatched["receipt"]["ids"]["assignment"]
+                .as_str()
+                .unwrap()
+                .into(),
+        )
+    }
+
+    #[tokio::test]
+    async fn native_cancel_shutdown_joins_owned_tail_and_preserves_writer_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let physical = root.path().canonicalize().unwrap();
+        let workspace = prepared_git_workspace(&physical);
+        let (requests_tx, mut requests) = mpsc::unbounded_channel();
+        let provider = Arc::new(Provider {
+            requests: requests_tx,
+            calls: AtomicUsize::new(0),
+        });
+        let mut f = Fixture::new(&physical, provider.clone()).await;
+        let writer = Arc::downgrade(f.service.as_ref().unwrap());
+        let mut early_return = false;
+        let exercise = async {
+            let state = f.state.as_ref().unwrap();
+            let service = f.service.as_ref().unwrap();
+            let (_, owner) = state
+                .tickets
+                .authority(Principal::User {
+                    user_id: "host-owner".into(),
+                })
+                .await
+                .unwrap();
+            let binding = service.published().unwrap().1.binding;
+            let scope = physical
+                .join("tickets")
+                .join(binding.scope_id.strip_prefix("supervisor/").unwrap());
+            let (work, assignment) = start(state, service, &owner, &workspace).await;
+            let first = tokio::time::timeout(WAIT, requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            first.reply.send(task_chunk()).unwrap();
+            let held = tokio::time::timeout(WAIT, requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(held
+                .messages
+                .iter()
+                .any(|message| message.tool_call_id.as_deref() == Some(TASK)
+                    && message.tool_success == Some(true)));
+            let running = service.published().unwrap().1;
+            let runtime = running.assignments[&assignment].runtime.clone().unwrap();
+            let plan = canonical_bytes(&running.assignments[&assignment].plan).unwrap();
+            let task_receipt_id = format!(
+                "worker-plan/{}/{TASK}",
+                running.assignments[&assignment].dispatch_key
+            );
+            let task_receipt = canonical_bytes(&running.receipts[&task_receipt_id]).unwrap();
+            let cancel = service
+                .prepare_command(
+                    &owner,
+                    "owned-cancel",
+                    vec![Operation::Cancel {
+                        work_id: work.clone(),
+                    }],
+                )
+                .unwrap();
+            state
+                .tickets
+                .update(owner.principal().clone(), &cancel)
+                .await
+                .unwrap();
+            f.task = Some(
+                tokio::time::timeout(WAIT, &mut f.registered)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+            tokio::time::timeout(WAIT, &mut f.entered)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(service.published().unwrap().1.assignments[&assignment].process_stopped);
+            assert!(held.reply.send(task_chunk()).is_err());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+            let mut shutdown = Box::pin(state.shutdown());
+            early_return = tokio::time::timeout(WAIT, async {
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown => true,
+                    draining = &mut f.draining => { draining.unwrap(); false }
+                }
+            })
+            .await
+            .unwrap();
+            drop(shutdown);
+            let child = state
+                .storage
+                .load_session(&runtime.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(child.metadata["runtime.local_task.state"], "stopped");
+            assert!(matches!(
+                child.last_run_status().as_deref(),
+                Some("completed" | "error" | "timeout" | "cancelled" | "skipped")
+            ));
+            let stop_receipt: Value =
+                serde_json::from_str(&child.metadata["ticket.runtime.owned_stop.v1"]).unwrap();
+            assert_eq!(stop_receipt["receipt"], json!(runtime));
+            assert_eq!(stop_receipt["completed"], false);
+            assert!(
+                !uuid::Uuid::parse_str(stop_receipt["task_instance"].as_str().unwrap())
+                    .unwrap()
+                    .is_nil()
+            );
+            let cancelled = service.published().unwrap().1;
+            let cancel_receipt = canonical_bytes(&cancelled.receipts["owned-cancel"]).unwrap();
+            assert_eq!(cancelled.tickets[&work].state, WorkState::Cancelled);
+            assert_eq!(
+                cancelled.assignments[&assignment].state,
+                AssignmentState::Cancelled
+            );
+
+            let retained = if early_return {
+                None
+            } else {
+                // Drop the first shutdown waiter while the tail is held. A
+                // second shutdown must still wait on the same owned future.
+                let (draining, mut observed) = oneshot::channel();
+                state.tickets.cancellation_probe.lock().draining = Some(draining);
+                let mut resumed = Box::pin(state.shutdown());
+                tokio::time::timeout(WAIT, async {
+                    tokio::select! {
+                        biased;
+                        _ = &mut resumed => panic!("second shutdown returned before the owned tail"),
+                        draining = &mut observed => draining.unwrap(),
+                    }
+                }).await.unwrap();
+                assert!(futures::poll!(&mut resumed).is_pending());
+                if let Some(release) = f.release.take() {
+                    let _ = release.send(());
+                }
+                f.task.take().unwrap().await.unwrap();
+                tokio::time::timeout(WAIT, resumed).await.unwrap();
+                Some(service.clone())
+            };
+            drop(f.service.take());
+            drop(f.state.take());
+            // In RED the *only* strong Arc is the real detached canceller;
+            // in PASS it is our explicitly retained external negative control.
+            assert_eq!(writer.strong_count(), 1);
+            assert!(
+                matches!(TicketService::open(&scope, binding.clone()), Err(Error::AuthorityUnavailable(message)) if message.contains("another local writer holds the process lock"))
+            );
+            drop(retained);
+            f.release_tail();
+            f.join_task().await.unwrap();
+            assert!(
+                writer.upgrade().is_none(),
+                "every original TicketService owner must be gone"
+            );
+
+            f = Fixture::new(&physical, provider.clone()).await;
+            let snapshot = f.service.as_ref().unwrap().published().unwrap().1;
+            assert_eq!(snapshot.tickets[&work].state, WorkState::Cancelled);
+            assert!(snapshot.tickets[&work].active_assignment.is_none());
+            assert!(snapshot.tickets[&work].accepted_submission.is_none());
+            assert!(snapshot.assignments[&assignment].process_stopped);
+            assert_eq!(
+                canonical_bytes(&snapshot.assignments[&assignment].plan).unwrap(),
+                plan
+            );
+            assert_eq!(
+                canonical_bytes(&snapshot.receipts[&task_receipt_id]).unwrap(),
+                task_receipt
+            );
+            assert_eq!(
+                canonical_bytes(&snapshot.receipts["owned-cancel"]).unwrap(),
+                cancel_receipt
+            );
+            assert!(
+                bamboo_engine::ticket_worker_plan::TicketWorkerPlan::from_runtime_receipt(
+                    f.service.as_ref().unwrap().clone(),
+                    &assignment
+                )
+                .is_err()
+            );
+            let saved_child = f
+                .state
+                .as_ref()
+                .unwrap()
+                .storage
+                .load_session(&runtime.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                saved_child.metadata["ticket.runtime.owned_stop.v1"],
+                child.metadata["ticket.runtime.owned_stop.v1"]
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        };
+        let outcome = AssertUnwindSafe(exercise).catch_unwind().await;
+        let cleanup = f.cleanup().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        cleanup.unwrap();
+        assert!(!early_return, "Host shutdown returned while its detached cancellation task retained the sole writer Arc; real same-root open was denied until that task exited");
+    }
+
+    #[tokio::test]
+    async fn closed_cancellation_admission_cannot_spawn_a_new_writer_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let physical = root.path().canonicalize().unwrap();
+        let workspace = prepared_git_workspace(&physical);
+        let (requests, _received) = mpsc::unbounded_channel();
+        let provider = Arc::new(Provider {
+            requests,
+            calls: AtomicUsize::new(0),
+        });
+        let mut f = Fixture::new(&physical, provider.clone()).await;
+        let exercise = async {
+            let state = f.state.as_ref().unwrap();
+            let service = f.service.as_ref().unwrap();
+            let (_, owner) = state
+                .tickets
+                .authority(Principal::User {
+                    user_id: "host-owner".into(),
+                })
+                .await
+                .unwrap();
+            // Canonical queued work deliberately never receives a RunSpec.
+            let create = service
+                .prepare_command(
+                    &owner,
+                    "closed-create",
+                    vec![
+                        Operation::Create {
+                            temp_id: "work".into(),
+                            kind: TicketKind::Work,
+                            parent: None,
+                            contract: contract(),
+                            depends_on: BTreeSet::new(),
+                        },
+                        Operation::Ready {
+                            work_id: "work".into(),
+                        },
+                        Operation::Start {
+                            work_id: "work".into(),
+                            temp_id: "assignment".into(),
+                            workspace: Some(workspace),
+                        },
+                    ],
+                )
+                .unwrap();
+            let ids = service.execute(&owner, &create).unwrap().ids;
+            state.tickets.close_cancellation_tasks();
+            let cancel = service
+                .prepare_command(
+                    &owner,
+                    "closed-cancel",
+                    vec![Operation::Cancel {
+                        work_id: ids["work"].clone(),
+                    }],
+                )
+                .unwrap();
+            state
+                .tickets
+                .update(owner.principal().clone(), &cancel)
+                .await
+                .unwrap();
+            match f.registered.try_recv() {
+                Ok(task) => {
+                    f.task = Some(task);
+                    panic!("closed cancellation admission created a new asynchronous writer owner");
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(error) => panic!("cancellation registration observer disappeared: {error}"),
+            }
+            assert!(state.tickets.cancellation_probe.lock().tail.is_some());
+            assert!(state.tickets.cancellation_tasks.lock().is_empty());
+            let snapshot = service.published().unwrap().1;
+            assert_eq!(snapshot.tickets[&ids["work"]].state, WorkState::Cancelled);
+            assert!(snapshot.assignments[&ids["assignment"]].runtime.is_none());
+            assert!(!snapshot.assignments[&ids["assignment"]].process_stopped);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        };
+        let outcome = AssertUnwindSafe(exercise).catch_unwind().await;
+        let cleanup = f.cleanup().await;
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        cleanup.unwrap();
+    }
+}

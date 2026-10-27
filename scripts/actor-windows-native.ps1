@@ -1,3 +1,6 @@
+param([switch]$RecordHost, [switch]$RecordToolchain, [switch]$CompileAcceptance, [switch]$ExecuteAcceptance, [string]$Workspace, [string]$Evidence)
+
+$ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 function Get-ActorNativeIdentity($Workspace) {
@@ -25,13 +28,14 @@ function Get-ActorNativePath($Path, $Root) {
   return $full
 }
 
-function New-ActorNativeContext($Workspace, $Evidence) {
+function New-ActorNativeContext($Workspace, $Evidence, $TargetRoot = $null) {
   $workspacePath = (Resolve-Path -LiteralPath $Workspace).Path
   $identity = Get-ActorNativeIdentity $workspacePath
+  $ownedTarget = if ($TargetRoot) { Get-ActorNativePath $TargetRoot $workspacePath } else { Join-Path $workspacePath 'target' }
   return @{
     schemaVersion = 1
     workspace = $workspacePath
-    targetRoot = Join-Path $workspacePath 'target'
+    targetRoot = $ownedTarget
     evidence = (Resolve-Path -LiteralPath $Evidence).Path
     revision = $identity.revision
     tree = $identity.tree
@@ -216,4 +220,145 @@ function Assert-ActorNativeRun($Context, $Package, $Filter, $ExpectedCount, $Log
   }
   "$Filter : $ExpectedCount passed; zero failed/ignored" |
     Tee-Object -FilePath (Join-Path $Context.evidence 'verified-counts.txt') -Append
+}
+
+function Write-ActorNativeHostEvidence($Workspace, $Evidence) {
+  $evidence = $Evidence
+  New-Item -ItemType Directory -Force $evidence | Out-Null
+  @(
+    "checkout=$(git rev-parse HEAD)"
+    "github_sha=$env:GITHUB_SHA"
+    "pr_head=$env:PR_HEAD_SHA"
+    "runner_os=$env:RUNNER_OS"
+    "runner_arch=$env:RUNNER_ARCH"
+    "image_os=$env:ImageOS"
+    "image_version=$env:ImageVersion"
+    "stack=$env:RUST_MIN_STACK"
+    "frontend=$env:BAMBOO_FRONTEND_BUILD_MODE"
+    "lock_sha256=$((Get-FileHash Cargo.lock -Algorithm SHA256).Hash)"
+  ) | Tee-Object -FilePath "$evidence/host.txt"
+  Get-CimInstance Win32_OperatingSystem |
+    Select-Object Caption, Version, BuildNumber, OSArchitecture |
+    Format-List | Out-String | Tee-Object -FilePath "$evidence/host.txt" -Append
+  if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64') {
+    throw 'Acceptance requires native Windows x64'
+  }
+
+  # Do not infer junction support from cross-compilation or skipped tests.
+  $probe = Join-Path $env:RUNNER_TEMP 'actor-snapshot-junction-probe'
+  $target = Join-Path $probe 'target'
+  $link = Join-Path $probe 'link'
+  New-Item -ItemType Directory -Force $target | Out-Null
+  & cmd /C mklink /J $link $target 2>&1 |
+    Tee-Object -FilePath "$evidence/junction.txt"
+  if ($LASTEXITCODE -ne 0) { throw 'Native junction creation failed' }
+  $junction = Get-Item -LiteralPath $link -Force
+  $junction | Format-List FullName, LinkType, Target, Attributes |
+    Out-String | Tee-Object -FilePath "$evidence/junction.txt" -Append
+  if ($junction.LinkType -ne 'Junction') { throw 'Expected a real junction' }
+  & fsutil reparsepoint query $link 2>&1 |
+    Tee-Object -FilePath "$evidence/junction.txt" -Append
+  if ($LASTEXITCODE -ne 0) { throw 'Native junction query failed' }
+}
+
+function Write-ActorNativeToolchainEvidence($Workspace, $Evidence) {
+  $evidence = $Evidence
+  & rustc -vV 2>&1 | Tee-Object -FilePath "$evidence/toolchain.txt"
+  if ($LASTEXITCODE -ne 0) { throw 'rustc version failed' }
+  $version = Get-Content "$evidence/toolchain.txt"
+  if ($version -notcontains 'host: x86_64-pc-windows-msvc' -or
+      $version -notcontains 'release: 1.99.0') {
+    throw 'Acceptance requires Rust 1.99.0 on native Windows/MSVC'
+  }
+  & cargo -V 2>&1 | Tee-Object -FilePath "$evidence/toolchain.txt" -Append
+  if ($LASTEXITCODE -ne 0) { throw 'cargo version failed' }
+}
+
+function Compile-ActorNativeAcceptance($Workspace, $Evidence) {
+  $evidence = $Evidence
+  $nativeContext = New-ActorNativeContext $Workspace $evidence $env:CARGO_TARGET_DIR
+  function Assert-TestList($package, $filter, $expectedNames, $logName) {
+    Assert-ActorNativeList $nativeContext $package $filter $expectedNames $logName
+  }
+  # Keep independent package feature selections, then freeze and list
+  # their exact executables. Runtime never asks Cargo to compile again.
+  Assert-TestList 'bamboo-storage' 'v2::actor_snapshot_windows_tests::' @(
+    'changed_birth_stale_actor_and_root_authority_fail_without_repair'
+    'grow_after_open_is_capped_and_actual_bytes_debit_the_aggregate_budget'
+    'live_actor_fence_authorizes_self_and_descendants_but_not_siblings_or_foreign_roots'
+    'regular_file_symlink_replacement_is_rejected_and_open_handle_retains_original'
+    'nested_snapshot_is_private_read_only_and_stable_after_restart'
+    'pending_task_and_copy_journals_leave_owned_home_unchanged'
+    'retained_directory_and_file_handles_reject_reparse_replacement'
+    'stale_identity_and_tight_budgets_fail_without_partial_tree'
+    'unsupported_namespaces_selectors_and_object_kinds_fail_without_writes'
+  ) 'snapshot-list.log'
+  Assert-TestList 'bamboo-server' 'handlers::agent::actor_snapshot::tests::' @(
+    'canonical_gateway_requires_trusted_host_owner_and_keeps_codex_response_scope'
+    'corrupt_and_unsupported_authority_return_private_typed_errors_without_writes'
+    'snapshot_v2_negotiation_is_opt_in_with_isolated_etags_and_native_none_placement'
+  ) 'gateway-list.log'
+  Assert-TestList 'bamboo-storage' 'v2::actor_directory::tests::' @(
+    'active_child_cannot_rebind_its_own_project'
+    'active_grandchild_cannot_observe_middle_parent_project_rebind'
+    'active_root_allows_one_ui_revision_but_blocks_ambiguous_ui_gap'
+    'child_project_must_match_its_current_parent'
+    'corrupt_or_mismatched_authority_fails_closed_without_repair'
+    'delayed_resident_cleanup_cannot_retire_replacement_activation'
+    'duplicate_physical_actor_id_fails_closed_across_stale_stores'
+    'expired_owner_cannot_checkpoint_or_finish_new_attempt'
+    'host_policy_and_intent_survive_reassignment_and_physical_replacement'
+    'independent_stores_serialize_competing_owners'
+    'initialized_marker_prevents_lost_sidecar_from_resetting_attempt'
+    'only_host_binding_sets_policy_and_live_or_regressive_changes_are_rejected'
+    'orphaned_nested_child_cannot_publish_activation_authority'
+    'persisted_session_precedes_claim_and_attempt_survives_restart'
+    'recreated_middle_parent_cannot_revive_grandchild_fence'
+    'retirement_fences_owner_and_preserves_identity'
+    'root_project_aba_cannot_revive_an_old_active_fence'
+    'root_project_rebinds_only_when_no_activation_is_live'
+    'store_opened_before_creation_discovers_root_and_child_from_durable_files'
+  ) 'directory-list.log'
+  Assert-TestList 'bamboo-tools' 'local_task_resources::windows::tests::local_task_resources_windows_' @(
+    'foreground_cancel_reaps_descendants'
+    'background_scope_drain'
+    'fast_leader_descendants'
+    'execution_isolation'
+    'assignment_failure_reaps_suspended_child'
+  ) 'local-task-process-list.log'
+  Assert-TestList 'bamboo-tools' 'local_task_resources::windows::tests::initial_exec_windows_' @(
+    'live_cancel_drains_retained_job'
+    'cancel_after_leader_reap_drains_retained_job'
+    'delivery_closes_last_job_handle_without_killing_descendant'
+    'disarm_failure_retains_job_until_cleanup'
+    'setup_failure_retains_suspended_child_for_cleanup'
+  ) 'initial-exec-process-list.log'
+  Save-ActorNativeManifest $nativeContext
+}
+
+function Run-ActorNativeAcceptance($Workspace, $Evidence) {
+  $evidence = $Evidence
+  $nativeContext = Read-ActorNativeManifest $evidence
+  function Assert-TestRun($package, $filter, $expectedCount, $logName) {
+    Assert-ActorNativeRun $nativeContext $package $filter $expectedCount $logName
+  }
+  Assert-TestRun 'bamboo-storage' 'v2::actor_snapshot_windows_tests::' 9 'snapshot-run.log'
+  Assert-TestRun 'bamboo-server' 'handlers::agent::actor_snapshot::tests::' 3 'gateway-run.log'
+  Assert-TestRun 'bamboo-storage' 'v2::actor_directory::tests::' 19 'directory-run.log'
+  Assert-TestRun 'bamboo-tools' 'local_task_resources::windows::tests::local_task_resources_windows_' 5 'local-task-process-run.log'
+  Assert-TestRun 'bamboo-tools' 'local_task_resources::windows::tests::initial_exec_windows_' 5 'initial-exec-process-run.log'
+  # This receipts the selected native reader/process tests, not all of #1338 or #791.
+  if ($env:GITHUB_STEP_SUMMARY) { Get-Content "$evidence/verified-counts.txt" | Add-Content $env:GITHUB_STEP_SUMMARY }
+}
+
+foreach ($action in @('RecordHost', 'RecordToolchain', 'CompileAcceptance', 'ExecuteAcceptance')) {
+  if (Get-Variable -Name $action -ValueOnly) {
+    if (-not $Workspace -or -not $Evidence) { throw 'Native acceptance requires explicit workspace and evidence paths' }
+    switch ($action) {
+      RecordHost { Write-ActorNativeHostEvidence $Workspace $Evidence }
+      RecordToolchain { Write-ActorNativeToolchainEvidence $Workspace $Evidence }
+      CompileAcceptance { Compile-ActorNativeAcceptance $Workspace $Evidence }
+      ExecuteAcceptance { Run-ActorNativeAcceptance $Workspace $Evidence }
+    }
+  }
 }

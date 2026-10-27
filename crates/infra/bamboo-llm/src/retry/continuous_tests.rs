@@ -334,7 +334,7 @@ async fn bounded_managed_and_legacy_calls_stop_for_a_long_server_hint_without_se
         .expect("bounded policy must stop when a server hint does not fit")
         .unwrap();
         assert_eq!(response.status(), 429);
-        assert_eq!(observer.request_budget_managed(), managed);
+        assert!(observer.request_budget_managed());
         assert!(!observer.request_policy_active());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
@@ -429,4 +429,29 @@ async fn managed_headers_timeout_never_becomes_a_successful_body_deadline() {
         "ok"
     );
     server.await.unwrap();
+}
+
+#[tokio::test]
+async fn oversized_numeric_server_hints_stop_instead_of_becoming_short_backoff() {
+    for policy in [UpstreamRetry::Bounded, UpstreamRetry::UntilCancelled] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429).insert_header("Retry-After", "18446744073709551616"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = with_upstream_retry(
+            policy,
+            send_provider_request(&fast(4), "overflowing-server-hint", || {
+                client.post(server.uri())
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 429);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 }

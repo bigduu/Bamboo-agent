@@ -341,16 +341,57 @@ fn is_retryable_status(status: StatusCode) -> bool {
         )
 }
 
-/// Whether a `reqwest` transport error is transient (connect / timeout). Body or
-/// decode errors are not retried because they are not raised here (the body is
-/// untouched at this stage).
+/// Retry transient transport failures while establishing headers. Never infer
+/// retries from the outer "error sending request" text: invalid URLs, headers
+/// and serialization failures must remain terminal.
 fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect()
+    use std::error::Error;
+    if err.is_builder() || err.is_decode() {
+        return false;
+    }
+    if err.is_timeout() || err.is_connect() {
+        return true;
+    }
+    let mut source = err.source();
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+            ) {
+                return true;
+            }
+        }
+        // Hyper can represent EOF-before-headers without an io::Error source.
+        // Inspect this narrow cause only; it is never copied into public logs.
+        let text = cause.to_string().to_ascii_lowercase();
+        if [
+            "connection closed before message completed",
+            "connection reset",
+            "connection aborted",
+            "broken pipe",
+            "unexpected eof",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker))
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
-/// Parse a `Retry-After` header into a delay. Supports the delay-seconds form
-/// (e.g. `Retry-After: 2`). The HTTP-date form is intentionally ignored (rare
-/// for LLM APIs) and falls back to computed backoff.
+/// Parse delay-seconds without turning numeric overflow into a short backoff.
+/// The date parser below handles the HTTP-date and legacy RFC2822 forms.
 fn parse_retry_after(response: &Response) -> Option<Duration> {
     let value = response
         .headers()
@@ -359,7 +400,14 @@ fn parse_retry_after(response: &Response) -> Option<Duration> {
         .ok()?
         .trim()
         .to_string();
-    value.parse::<u64>().ok().map(Duration::from_secs)
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    // A syntactically numeric value larger than u64 cannot be safely waited;
+    // saturating preserves a stop decision instead of ignoring the server hint.
+    Some(Duration::from_secs(
+        value.parse::<u64>().unwrap_or(u64::MAX),
+    ))
 }
 
 /// Compute the exponential backoff delay for a given zero-based attempt index,
@@ -408,7 +456,12 @@ where
     F: Fn() -> RequestBuilder,
 {
     // Legacy/custom callers keep their finite policy even when invoked from
-    // a main execution that opted into managed continuous requests.
+    // a main execution that opted into managed continuous requests. The owner
+    // still bounds headers, but must not reset this retry/hint policy by
+    // replaying a whole turn. No active marker extends the outer watchdog.
+    let _ = INITIAL_HTTP_RETRY_OBSERVER.try_with(|observer| {
+        observer.budget_managed.store(true, Ordering::Relaxed);
+    });
     let deadline = Instant::now() + initial_request_limits().total_budget;
     retry_initial_request(
         config,
@@ -708,11 +761,20 @@ fn parse_retry_after_with_date(response: &Response) -> Option<Duration> {
             .get(reqwest::header::RETRY_AFTER)?
             .to_str()
             .ok()?;
-        let date = httpdate::parse_http_date(value).ok()?;
-        Some(
-            date.duration_since(std::time::SystemTime::now())
-                .unwrap_or_default(),
-        )
+        httpdate::parse_http_date(value)
+            .map(|date| {
+                date.duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default()
+            })
+            // Preserve the previously accepted numeric-zone RFC2822 form.
+            .or_else(|_| {
+                chrono::DateTime::parse_from_rfc2822(value).map(|date| {
+                    (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or_default()
+                })
+            })
+            .ok()
     })
 }
 

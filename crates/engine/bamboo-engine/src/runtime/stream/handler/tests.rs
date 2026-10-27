@@ -1459,7 +1459,8 @@ async fn managed_response_starts_a_fresh_bounded_stream_watchdog_and_forbids_tur
         &context,
     )
     .await
-    .unwrap_err();
+    .err()
+    .expect("managed stream must time out");
     assert!(matches!(error, AgentError::StreamTimeout(t) if !t.retry_safe()));
 }
 

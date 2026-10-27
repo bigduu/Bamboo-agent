@@ -64,6 +64,8 @@ pub struct CopilotProvider {
     request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
     models_cache: RwLock<Option<CopilotModelsCache>>,
+    #[cfg(test)]
+    test_model_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +75,14 @@ struct CopilotModelsCache {
 }
 
 impl CopilotProvider {
+    fn model_endpoint(&self, path: &str) -> String {
+        #[cfg(test)]
+        if let Some(base) = &self.test_model_base_url {
+            return format!("{}/{}", base.trim_end_matches('/'), path);
+        }
+        format!("https://api.githubcopilot.com/{path}")
+    }
+
     /// Create new Copilot provider (without auth handler)
     pub fn new() -> Self {
         Self {
@@ -87,6 +97,8 @@ impl CopilotProvider {
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
             models_cache: RwLock::new(None),
+            #[cfg(test)]
+            test_model_base_url: None,
         }
     }
 
@@ -104,6 +116,8 @@ impl CopilotProvider {
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
             models_cache: RwLock::new(None),
+            #[cfg(test)]
+            test_model_base_url: None,
         }
     }
 
@@ -140,6 +154,8 @@ impl CopilotProvider {
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
             models_cache: RwLock::new(None),
+            #[cfg(test)]
+            test_model_base_url: None,
         }
     }
 
@@ -591,7 +607,7 @@ impl CopilotProvider {
         session_log_id: &str,
         request_purpose: &str,
     ) -> Result<LLMStream> {
-        let url = "https://api.githubcopilot.com/responses";
+        let url = self.model_endpoint("responses");
         let mut effective_responses_options = responses_options.cloned().unwrap_or_default();
         if effective_responses_options.store == Some(true) {
             tracing::warn!(
@@ -679,7 +695,7 @@ impl CopilotProvider {
             .send_model_request(
                 || {
                     self.client
-                        .post(url)
+                        .post(&url)
                         .headers(request_headers.clone())
                         .json(&body)
                 },
@@ -705,7 +721,7 @@ impl CopilotProvider {
                             .send_model_request(
                                 || {
                                     self.client
-                                        .post(url)
+                                        .post(&url)
                                         .headers(refreshed_headers.clone())
                                         .json(&body)
                                 },
@@ -1168,7 +1184,7 @@ impl LLMProvider for CopilotProvider {
             tools.len()
         );
 
-        let url = "https://api.githubcopilot.com/chat/completions";
+        let url = self.model_endpoint("chat/completions");
 
         let request_headers = self.build_llm_headers(
             &token,
@@ -1181,7 +1197,7 @@ impl LLMProvider for CopilotProvider {
             .send_model_request(
                 || {
                     self.client
-                        .post(url)
+                        .post(&url)
                         .headers(request_headers.clone())
                         .json(&body)
                 },
@@ -1208,7 +1224,7 @@ impl LLMProvider for CopilotProvider {
                             .send_model_request(
                                 || {
                                     self.client
-                                        .post(url)
+                                        .post(&url)
                                         .headers(refreshed_headers.clone())
                                         .json(&body)
                                 },
@@ -2268,5 +2284,321 @@ mod continuous_model_request_tests {
         )
         .await;
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod actual_model_consumer_tests {
+    use super::*;
+    use crate::retry::{with_upstream_retry, UpstreamRetry, WorkPhysicalRequest};
+    use futures::StreamExt;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const MODEL: &str = "controlled-model";
+    const CHAT_SSE: &str =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"synthetic reply\"}}]}\n\ndata: [DONE]\n\n";
+    const RESPONSES_SSE: &str = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"synthetic reply\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"synthetic-response\"}}\n\n";
+
+    fn provider(base: String, responses_only: bool) -> CopilotProvider {
+        let mut provider = CopilotProvider::with_token("synthetic-token");
+        provider.client = Client::builder().no_proxy().build().unwrap();
+        provider.test_model_base_url = Some(base);
+        if responses_only {
+            provider = provider.with_responses_only_models(vec![MODEL.into()]);
+        }
+        provider
+    }
+
+    async fn assert_completed_stream(mut stream: LLMStream) {
+        let mut text = String::new();
+        let mut done = 0;
+        while let Some(item) = stream.next().await {
+            match item.expect("controlled stream must decode") {
+                LLMChunk::Token(token) => text.push_str(&token),
+                LLMChunk::Done => done += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "synthetic reply");
+        assert_eq!(done, 1);
+    }
+
+    fn expected_error(result: Result<LLMStream>) -> LLMError {
+        match result {
+            Ok(_) => panic!("controlled request must fail before a stream is established"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn production_model_endpoints_remain_fixed_without_a_test_override() {
+        let provider = CopilotProvider::new();
+        assert_eq!(
+            provider.model_endpoint("chat/completions"),
+            "https://api.githubcopilot.com/chat/completions"
+        );
+        assert_eq!(
+            provider.model_endpoint("responses"),
+            "https://api.githubcopilot.com/responses"
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_chat_and_responses_continuously_retry_transient_status_then_consume_sse() {
+        for (responses_only, endpoint, sse) in [
+            (false, "/chat/completions", CHAT_SSE),
+            (true, "/responses", RESPONSES_SSE),
+        ] {
+            for transient_status in [429, 503] {
+                let server = MockServer::start().await;
+                let hits = Arc::new(AtomicUsize::new(0));
+                let responder_hits = hits.clone();
+                Mock::given(method("POST"))
+                    .and(path(endpoint))
+                    .respond_with(move |_: &wiremock::Request| {
+                        if responder_hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                            ResponseTemplate::new(transient_status)
+                        } else {
+                            ResponseTemplate::new(200)
+                                .insert_header("content-type", "text/event-stream")
+                                .set_body_string(sse)
+                        }
+                    })
+                    .expect(2)
+                    .mount(&server)
+                    .await;
+                let provider = provider(server.uri(), responses_only);
+                let messages = [Message::user("controlled user")];
+                let stream = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    with_upstream_retry(
+                        UpstreamRetry::UntilCancelled,
+                        provider.chat_stream(&messages, &[], Some(64), MODEL),
+                    ),
+                )
+                .await
+                .expect("the actual model route must finish")
+                .expect("the transient response must be retried");
+                tokio::time::timeout(Duration::from_secs(2), assert_completed_stream(stream))
+                    .await
+                    .expect("the successful SSE stream must finish");
+                assert_eq!(hits.load(Ordering::SeqCst), 2);
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0].url.path(), endpoint);
+                assert_eq!(requests[1].url.path(), endpoint);
+                assert_eq!(requests[0].body, requests[1].body);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_model_terminal_statuses_stop_once_without_an_auth_handler() {
+        for (responses_only, endpoint) in [(false, "/chat/completions"), (true, "/responses")] {
+            for status in [400, 401, 403] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path(endpoint))
+                    .respond_with(ResponseTemplate::new(status).set_body_string("terminal error"))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let provider = provider(server.uri(), responses_only);
+                assert!(provider.auth_handler.is_none());
+                let messages = [Message::user("controlled user")];
+                let error = expected_error(
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        with_upstream_retry(
+                            UpstreamRetry::UntilCancelled,
+                            provider.chat_stream(&messages, &[], Some(64), MODEL),
+                        ),
+                    )
+                    .await
+                    .expect("a terminal response must finish"),
+                );
+                if status == 400 {
+                    assert!(matches!(error, LLMError::Api(_)));
+                } else {
+                    assert!(matches!(error, LLMError::Auth(_)));
+                }
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].url.path(), endpoint);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_chat_responses_only_error_falls_back_to_the_responses_route() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("use Responses API"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESPONSES_SSE),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = provider(server.uri(), false);
+        let messages = [Message::user("controlled user")];
+        let stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_upstream_retry(
+                UpstreamRetry::UntilCancelled,
+                provider.chat_stream(&messages, &[], Some(64), MODEL),
+            ),
+        )
+        .await
+        .expect("the compatibility fallback must finish")
+        .expect("the Responses fallback must succeed");
+        tokio::time::timeout(Duration::from_secs(2), assert_completed_stream(stream))
+            .await
+            .expect("the fallback stream must finish");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].url.path(), "/chat/completions");
+        assert_eq!(requests[1].url.path(), "/responses");
+    }
+
+    #[tokio::test]
+    async fn work_actual_chat_rejection_cannot_send_the_responses_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("use Responses API"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(RESPONSES_SSE))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let provider = provider(server.uri(), false);
+        let messages = [Message::user("controlled user")];
+        let work = WorkPhysicalRequest::default();
+        let error = expected_error(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                with_upstream_retry(
+                    UpstreamRetry::UntilCancelled,
+                    work.scope(provider.chat_stream(&messages, &[], Some(64), MODEL)),
+                ),
+            )
+            .await
+            .expect("the Work reservation must reject the fallback"),
+        );
+        assert!(matches!(error, LLMError::RequestFailed(ref message)
+            if message.contains("new Host reservation is required")));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/chat/completions");
+    }
+
+    async fn read_complete_post(socket: &mut TcpStream) -> Vec<u8> {
+        let mut received = Vec::new();
+        let mut buffer = [0u8; 2048];
+        let header_end = loop {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "peer closed before completing request headers");
+            received.extend_from_slice(&buffer[..count]);
+            if let Some(index) = received.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
+            assert!(
+                received.len() < 65_536,
+                "controlled request headers exceeded limit"
+            );
+        };
+        let headers = std::str::from_utf8(&received[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+            .expect("controlled JSON POST has a known body size");
+        while received.len() < header_end + content_length {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "peer closed before completing the request body");
+            received.extend_from_slice(&buffer[..count]);
+        }
+        received
+    }
+
+    fn post_body(request: &[u8]) -> &[u8] {
+        let header_end = request
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .expect("controlled POST headers")
+            + 4;
+        &request[header_end..]
+    }
+
+    #[tokio::test]
+    async fn actual_model_routes_retry_closed_connection_after_complete_post() {
+        for (responses_only, endpoint, sse) in [
+            (false, "/chat/completions", CHAT_SSE),
+            (true, "/responses", RESPONSES_SSE),
+        ] {
+            for policy in [UpstreamRetry::Bounded, UpstreamRetry::UntilCancelled] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (mut first, _) = listener.accept().await.unwrap();
+                    let original = read_complete_post(&mut first).await;
+                    assert!(
+                        original.starts_with(format!("POST {endpoint} HTTP/1.1\r\n").as_bytes())
+                    );
+                    // Close only after the entire first model POST arrived, before headers.
+                    drop(first);
+                    let (mut second, _) = listener.accept().await.unwrap();
+                    let retry = read_complete_post(&mut second).await;
+                    assert!(retry.starts_with(format!("POST {endpoint} HTTP/1.1\r\n").as_bytes()));
+                    assert_eq!(post_body(&original), post_body(&retry));
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        sse.len(),
+                        sse
+                    );
+                    second.write_all(response.as_bytes()).await.unwrap();
+                });
+                let provider = provider(format!("http://{address}"), responses_only);
+                let messages = [Message::user("controlled user")];
+                let stream = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    with_upstream_retry(
+                        policy,
+                        provider.chat_stream(&messages, &[], Some(64), MODEL),
+                    ),
+                )
+                .await
+                .expect("the initial disconnect retry must finish")
+                .expect("a closed connection before headers is transient");
+                tokio::time::timeout(Duration::from_secs(2), assert_completed_stream(stream))
+                    .await
+                    .expect("the retried stream must finish");
+                tokio::time::timeout(Duration::from_secs(2), server)
+                    .await
+                    .expect("the controlled server must finish")
+                    .unwrap();
+            }
+        }
     }
 }

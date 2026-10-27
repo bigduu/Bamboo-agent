@@ -68,7 +68,7 @@ exception remains narrow; it is not a general authentication retry rule.
 A managed headers policy owns its initial deadline. On successful establishment,
 the independent first-semantic/transport/semantic stream watchdog starts, and a
 stream failure remains terminal rather than replaying successful output or tools.
-Custom providers using public `send_provider_request` opt into the managed headers contract. The legacy public `send_with_retry` helper remains finite and does not inherit continuous mode; those custom providers retain their own bootstrap contract.
+Custom providers using public `send_provider_request` opt into the managed headers contract. The legacy public `send_with_retry` helper remains finite and does not inherit continuous mode; those custom providers retain the owner's headers timeout. Their retry receipt still forbids resetting a long server hint through an engine turn replay.
 
 SDK callers can use `agent.execute_with_upstream_retry(session, request, UpstreamRetry::UntilCancelled)`, importing the enum from `bamboo_sdk`. Existing requests, builders and execute entrypoints retain their bounded contract.
 

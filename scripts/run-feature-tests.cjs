@@ -16,11 +16,12 @@ const ROOT_BIRTH_CASES = ["root_birth_existing_root_progress_and_scope_reads_rem
   "root_birth_all_entrypoints_wait_for_retained_shared_authority", "root_birth_final_shared_writer_guard_and_missing_title_fail_closed",
   "root_birth_cancel_retains_exclusive_owner_and_pending_proof_stays_closed"];
 const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_without_transport_feature_fails_without_starting_exporter";
-// Retry-policy audit from accepted dev516c: stream_execution.rs is the only
-// changed sensitive record. Its cfg conditions, functions, modules and required
-// targets are unchanged; new ordinary retry cases use existing default catalogs.
-// Preserve all31 default packages, four feature contexts and all19 additions.
-const FEATURE_SOURCE_SHA256 = "52572eaddba2c3e19401ceaac93eb34a42d879404b2dc64c80855d84f8be43e9";
+// Audited from accepted devf0: retain TicketApplication cancellation/drain and
+// its existing default tests. Only stream_execution.rs changes the sensitive
+// closure for per-execution retry scoping; cfg, function/module ownership and
+// required targets are unchanged. New retry cases use default catalogs.
+// Preserve all31 default owners, four contexts and all19 additions.
+const FEATURE_SOURCE_SHA256 = "344b4cb7975bbf586256ef32b84b3e1a55692040c25037b1c16e840776ce0b49";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
