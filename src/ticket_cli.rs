@@ -470,14 +470,15 @@ fn binding(session: &Session) -> anyhow::Result<ScopeBinding> {
     let SessionAuthorityIdentity::Supervisor { incarnation_id } = session.authority_identity else {
         bail!("canonical Supervisor required")
     };
-    ensure!(
-        session.root_orchestration_only_enabled() && session.root_tool_authority_revision > 0,
-        "explicit attach required"
-    );
+    // Work uses the verified Supervisor incarnation, not its thinking mode.
+    // Preserve the existing offline store, principal and receipt checks below.
+    let binding_revision = session
+        .supervisor_orchestration_revision()
+        .context("canonical Supervisor orchestration authority required")?;
     Ok(ScopeBinding {
         scope_id: format!("supervisor/{incarnation_id}"),
         supervisor_session_id: session.id.clone(),
-        binding_revision: session.root_tool_authority_revision,
+        binding_revision,
     })
 }
 fn scope_root(data: &Path, session: &Session) -> anyhow::Result<PathBuf> {
