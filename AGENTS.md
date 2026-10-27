@@ -182,15 +182,15 @@ reads, the official check-suite query and original physical logs. Never inject
 fixture policy or turn an environment JSON/boolean into authority. Keep the
 production registry empty until every feature owner has actual accepted evidence.
 
-Phase A is helper-only and does not change publisher YAML. Its distinct
+Phase A was helper-only. Its distinct
 `sourceDispatch` receipt field uses the existing allocator, HMAC key and writer;
 it cannot upgrade a signed legacy reservation. C helpers must be ordinary files
 from the actual C checkout, outside S, before any candidate execution. Use S as
 verified data and preserve real `GITHUB_*` identities. Every write/retried PUT
 must use the same fresh source/ref/dev-protection/reservation guard. Native and
-crate adapters, the sole whole-release completion and dispatch wiring need the
-separate reviewed handoff; the legacy package/publish/complete path rejects this
-new contract. Main promotion/protection/production activation remain separate.
+crate adapters and dispatch wiring are staged separately by #2344 below; the
+legacy package/publish/complete path rejects this new contract. Main
+promotion/protection/production activation remain separate.
 
 B0 corrects the #2323 frontend hash semantics: wrapper `bundle_hash` describes
 extracted resources, while the raw ZIP has its own Git blob and SHA-256. Facts
@@ -200,6 +200,35 @@ registry or GitHub credentials. Only verify may select this committed Lotus Next
 data root; stage and legacy roots stay unchanged. Reuse S's original wrapper/ZIP
 bytes without restaging or recompression. The C verifier must check inner/outer
 wrapper bytes, the resource-directory hash and the complete universal lock.
+
+### Inactive original-output Source wiring (#2344)
+
+`publish-crate.yml` has an explicit `frozen-source-v2` dispatch branch. It loads
+actual protected-main C before product S and uses the real Source factory;
+the production producer registry stays empty, so new cuts still stop. This
+does not activate Main promotion, protection settings or production dispatch.
+Keep all historical workflow_run, v1/v2 receipts and frozen recovery contracts.
+
+Source preparation reuses the existing frontend artifact: two exact S files plus
+canonical `prepared-release.json`, bounded to 192 KiB as a file. Environment/job
+outputs carry a small typed locator. Every reader checks regular files, real
+paths, size, canonical JSON and hash. Preserve the original physical preparation
+attempt on failed-only retries; the Native selector also binds its hash to the
+official original preparation job/log. A copied plan cannot start a new native
+build or cache/toolchain/stamp step: rerun the full workflow to produce a fresh
+plan, which verifies every successful original before authorizing failed targets.
+Legacy carriers remain exactly two files with their existing 64 KiB JSON bound.
+
+Crate verification seals the first archive before its one verification compile;
+uploads/resume reuse that ZIP. Native collection runs even when a sibling fails
+and preserves exact original transport ZIPs. Missing successful originals stop.
+Only the finalizer may mark the whole Release public after fresh authenticated
+crate/registry closure, all native/host originals and latest required jobs pass.
+Crate `receipt.completed` alone is not whole completion. The sole public proof
+is the physical finalizer's canonical 64 KiB completion frame, immutable assets
+and independently verified official execution; JSON alone never authorizes Main.
+Preserve each crate's original physical origin even if that whole job later
+failed. The finalizer performs no Cargo compilation or host packaging.
 
 ### Bamboo #791 integration exception
 

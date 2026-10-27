@@ -267,7 +267,8 @@ async function readVerifiedClosure(expected, states, ports) {
     const value = await readVerifiedCrate(state, expected[index], ports); assert.equal(value.observedJob.status, "completed");
     assert.ok(await registryProof(expected[index], value.bytes, ports), "Published crate missing from registry");
     result.push({ name: expected[index].name, archive: value.proof.archive, origin: value.proof.origin,
-      verification: value.proof.verification, asset: value.asset, originalJob: value.observedJob });
+      verification: value.proof.verification, asset: value.asset, originalJob: value.observedJob,
+      registryChecksum: value.proof.archive.sha256 });
   }
   return { kind: "bamboo-verified-crate-closure/v1", publicationAuthorized: false, crates: result };
 }

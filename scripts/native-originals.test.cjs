@@ -108,6 +108,97 @@ function fixture(t) {
 }
 
 function register() {
+  test('2344 Source selector authenticates the whole preparation file through the original physical plan log', async t => {
+    const f = fixture(t), facts = { schemaVersion: 2, kind: 'bamboo-frozen-source-context/v2', publicationAuthorized: false,
+      source: { revision: f.identity.sourceRevision, tree: f.identity.sourceTree, acceptedMerge: f.identity.sourceRevision,
+        releaseRef: `release/${f.identity.sourceRevision}`, mainHistoryAnchor: '4'.repeat(40) },
+      controller: { revision: f.identity.workflowRevision, workflowPath: '.github/workflows/publish-crate.yml', event: 'workflow_dispatch', ref: 'refs/heads/main' },
+      feature: { pr: 99, runId: 90, logicalAttempt: 1, workflowId: 8, checkSuiteId: 9, producerDigest: '5'.repeat(64),
+        baseRevision: '6'.repeat(40), headRevision: '7'.repeat(40), snapshotRevision: '8'.repeat(40), workflowDefinitionRevision: '7'.repeat(40),
+        mergedAt: timestamp(30), physicalJobs: [] }, inputs: { fixtureDataOnly: true } }
+    f.identity.sourceDispatch = core.sourceDispatchContract(facts, f.identity.runId)
+    f.identity.ciRun = 'https://github.com/bigduu/Bamboo-agent/actions/runs/90'
+    const receipt = copy(f.preparation.receipt); Object.assign(receipt, { ciRun: f.identity.ciRun, sourceDispatch: f.identity.sourceDispatch,
+      frontendOriginals: { schemaVersion: 1, complete: true, assets: [
+        { assetId: 1, name: 'frontend-manifest.json', sizeBytes: 1, sha256: receipt.frontendBytes.manifestSha256 },
+        { assetId: 2, name: 'lotus-frontend.zip', sizeBytes: 1, sha256: receipt.frontendBytes.archiveSha256 }] } })
+    core.signReceipt(receipt, key); f.release.body = core.receiptBody(receipt)
+    Object.assign(f.preparation, core.createPreparation({ release: f.release, receipt }, f.identity, 2))
+    const readRun = f.context.readRun; f.context.readRun = async () => ({ ...await readRun(), event: 'workflow_dispatch' })
+    const preparing = f.prepareJob(), plan = await original.plan(f.context, preparing.id)
+    assert.equal(plan.preparationSha256, core.sha256(Buffer.from(core.canonicalJson(f.preparation))))
+    preparing.status = 'completed'; preparing.conclusion = 'success'
+    preparing.steps[0].status = 'completed'; preparing.steps[0].conclusion = 'success'
+    f.logs.set(preparing.id, timestamp(20) + ' ' + original.PLAN_PREFIX + Buffer.from(JSON.stringify(plan)).toString('base64'))
+    const current = job(f.identity, original.TARGETS[0], 555, 1, [original.SELECT])
+    current.status = 'in_progress'; current.conclusion = null; current.steps[0].status = 'in_progress'; current.steps[0].conclusion = null
+    f.rows.push(current)
+    assert.equal((await original.selectCurrent(f.context, plan, original.TARGETS[0], current)).action, 'build')
+    const changed = copy(f.preparation); changed.receipt.packageChecksums['bamboo-agent'] = '9'.repeat(64)
+    assert.throws(() => original.select(plan, f.identity, changed, original.TARGETS[0], current), /original preparation file/)
+    await assert.rejects(original.selectCurrent(f.context, { ...plan, preparationSha256: '0'.repeat(64) }, original.TARGETS[0], current), /original preparation file/)
+  })
+
+  test('2344 whole-release job proof keeps physical projections and requires every latest real success', async t => {
+    const identity = { runId: '100', runAttempt: 2, workflowRevision: '3'.repeat(40) }
+    const physical = Object.entries(original.WHOLE_STEPS).map(([name, steps], index) =>
+      ({ ...job(identity, original.TARGETS[0], 600 + index, 1, steps), name }))
+    const latest = physical.map(value => ({ ...copy(value), id: value.id + 100, run_attempt: 2 }))
+    const context = { identity, latestJobs: async () => copy(latest), jobs: async () => copy([...physical, ...latest]),
+      readJob: async id => copy([...physical, ...latest].find(value => value.id === id)) }
+    const proof = await original.wholeJobs(context)
+    assert.deepEqual(proof.map(value => value.physical.id), physical.map(value => value.id))
+    assert.deepEqual(proof.map(value => value.logical.id), latest.map(value => value.id))
+    assert.equal(proof[0].stepsSha256, core.sha256(Buffer.from(original.executionKey(physical[0]))))
+    for (const [name, mutate] of [
+      ['latest failure', (rows, all) => { rows[1].conclusion = 'failure'; all[physical.length + 1].conclusion = 'failure' }],
+      ['skipped critical step', (rows, all) => { rows[1].steps[0].conclusion = 'skipped'; all[physical.length + 1].steps[0].conclusion = 'skipped' }],
+      ['missing owner', rows => rows.pop()],
+      ['same-attempt ambiguity', (_rows, all) => all.push({ ...copy(physical[0]), id: 999 })],
+      ['changed direct physical', (_rows, _all, direct) => { direct.steps[0].name += ' changed' }],
+    ]) await t.test(name, async () => {
+      const rows = copy(latest), all = copy([...physical, ...latest]), direct = copy(physical[0]); mutate(rows, all, direct)
+      await assert.rejects(original.wholeJobs({ identity, latestJobs: async () => rows, jobs: async () => all,
+        readJob: async id => id === direct.id ? direct : all.find(value => value.id === id) }))
+    })
+  })
+
+  test('2344 whole completion binds the exact public closure and preserves an earlier failed crate origin', () => {
+    const identity = { repository: sidecar.REPOSITORY, sourceRevision: '1'.repeat(40), sourceTree: '2'.repeat(40),
+      workflowRevision: '3'.repeat(40), runId: '100', runAttempt: 2, version: '2026.10.123' }
+    const ref = (name, id = 1001) => ({ assetId: id, name, sha256: '4'.repeat(64), sizeBytes: 1 })
+    const manifestBytes = Buffer.from('original manifest bytes')
+    const names = [...original.TARGETS.map(sidecar.artifactName), sidecar.HOST_ASSET, sidecar.PROVENANCE, sidecar.MANIFEST]
+    const assets = names.map((name, index) => ({ id: 20 + index, name, state: 'uploaded', size: 1,
+      digest: `sha256:${name === sidecar.MANIFEST ? core.sha256(manifestBytes) : '4'.repeat(64)}` }))
+    const receipt = { completed: true, crates: ['bamboo-agent'], frontendOriginals: { assets: [ref('frontend-manifest.json'), ref('lotus-frontend.zip', 1002)] },
+      sourceDispatch: { runId: '100', context: { source: { releaseRef: `release/${identity.sourceRevision}` }, feature: { pr: 99, runId: 90 } } } }
+    const finalizer = { ...job(identity, original.TARGETS[0], 900, 2, [original.WHOLE_STEP]), name: original.WHOLE_JOB,
+      status: 'in_progress', conclusion: null, completed_at: null }
+    Object.assign(finalizer.steps[0], { status: 'in_progress', conclusion: null, completed_at: null })
+    const input = { context: { identity }, fresh: { release: { id: 42, tag_name: `v${identity.version}`,
+      target_commitish: identity.sourceRevision, draft: false, prerelease: false }, receipt, assets }, manifestBytes,
+      restored: { originals: original.TARGETS.map(target => ({ target, archive: ref(original.archiveName(target)), checkpoint: ref(original.checkpointName(target)) })),
+        preparedHost: { checkpoint: ref(original.HOST_CHECKPOINT) } }, receiptAsset: ref('release-provenance.json'),
+      crateClosure: { kind: 'bamboo-verified-crate-closure/v1', publicationAuthorized: false, crates: [{ name: 'bamboo-agent',
+        archive: { sha256: '5'.repeat(64) }, asset: { id: 333, name: 'crate.zip', digest: `sha256:${'6'.repeat(64)}`, size: 20 },
+        origin: { jobId: 12, attempt: 1 }, originalJob: { status: 'completed', conclusion: 'failure' },
+        verification: { exitCode: 0 }, registryChecksum: '5'.repeat(64) }] },
+      jobs: Object.keys(original.WHOLE_STEPS).map(name => ({ name, logical: { id: 200, attempt: 2 }, physical: { id: 100, attempt: 1 }, stepsSha256: '7'.repeat(64) })),
+      run: { workflow_id: 8, check_suite_id: 9, check_suite_node_id: 'CS_fixture' }, finalizer }
+    const { frame, line } = original.wholeCompletion(input)
+    assert.equal(line, original.WHOLE_PREFIX + Buffer.from(core.canonicalJson(frame)).toString('base64'))
+    assert.equal(frame.publicationAuthorized, false); assert.equal(frame.crates[0].origin.jobId, 12)
+    assert.equal(frame.crates[0].origin.attempt, 1); assert.equal(frame.controller.finalizerJobId, finalizer.id)
+    assert.deepEqual(frame.release.receiptAsset, input.receiptAsset)
+    assert.equal(frame.release.receiptSha256, core.sha256(Buffer.from(core.canonicalJson(receipt))))
+    assert.equal(JSON.stringify(frame).includes(key), false, 'Public data has no signing key')
+    assert.throws(() => original.wholeCompletion({ ...input, fresh: { ...input.fresh, release: { ...input.fresh.release, draft: true } } }))
+    assert.throws(() => original.wholeCompletion({ ...input, jobs: input.jobs.slice(1) }))
+    assert.throws(() => original.wholeCompletion({ ...input, crateClosure: { ...input.crateClosure, crates: [] } }))
+    assert.throws(() => original.wholeCompletion({ ...input, finalizer: { ...finalizer, status: 'completed', conclusion: 'success' } }))
+  })
+
   test('native originals have one existing automatic feature policy owner', () => {
     const source = fs.readFileSync('.github/workflows/ci.yml', 'utf8')
     const quick = source.split('  quick-checks:\n')[1].split(/\n  [a-z][\w-]*:\n/)[0]

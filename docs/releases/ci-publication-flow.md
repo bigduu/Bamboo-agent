@@ -111,7 +111,7 @@ never reinterpret those signed formats as the new read-only source context.
 
 ## Inactive Source-dispatch authority (#2336)
 
-Phase A adds helpers and contract tests; publisher YAML is unchanged. No complete
+Phase A added helpers and contract tests without changing publisher YAML. No complete
 production producer is registered, so real new-contract calls stop before an API
 read or reservation. Local mocked-module positives and tiny Git merge fixtures
 prove component contracts, not actual hosted feature acceptance or publication.
@@ -168,15 +168,73 @@ that disappears stops; only a just-created reservation in the current process
 may create its initial direct S tag. An interrupted untagged reservation stops
 conservatively rather than allocating a replacement.
 
-Phase B must hand off publisher ownership and consume this same factory/guard
-from the reviewed Native and Crate adapters. It must load C before S, retain the
-original-output contracts and use a fresh authenticated receipt for the sole
-whole-release completion. This Phase A factory refuses the legacy
+The #2344 wiring below consumes this same factory/guard from the reviewed Native
+and Crate adapters. It loads C before S, retains the original-output contracts
+and uses a fresh authenticated receipt for the sole whole-release completion.
+This Source factory refuses the legacy
 package/publish/complete operations. It cannot silently rebuild/repackage by
 falling back to them. Do not activate the empty producer registry, add another
 allocator/store/signer, import Main promotion authority, or dispatch production
 while those dependencies remain pending. Genuine v6 and frozen recovery bytes
 and the active legacy route remain unchanged.
+
+### Staged original-output wiring (#2344)
+
+The explicit `release_source_contract=frozen-source-v2` dispatch selects the new
+graph. It requires actual protected-main C, exact frozen accepted-dev S and the
+original feature locators above. C and S remain separate checkouts; GITHUB_SHA
+is never relabeled. The default complete-producer registry remains empty, so
+this code is inactive until a separately reviewed producer/controller cutover.
+No local mocked transport positive is production release acceptance. Existing
+legacy main-CI, manual/dry-run and frozen recovery routes keep their authority.
+
+| Job | Source-only responsibility |
+| --- | --- |
+| `automatic` | Real Source admission; existing single version reservation/direct S tag; verify locked S frontend bytes; authenticate every retained native original; package the host once and emit the current physical plan. |
+| `Publish and verify the crate closure` | Authenticate the reserved identity; C stamps temporary S manifests/lock; seal each original `.crate` ZIP and reuse it for registry PUT/retry/readback. |
+| `Complete executable (<target>)` | Read-only original selector before cache/Rust/stamp; retain a successful target or compile only a target allowed by the fresh plan. No HMAC or registry credentials. |
+| `Retain original native outputs` | Run even after a native sibling failure; verify physical job/log/artifact identities and retain successful original ZIP/checkpoint bytes without recompression. |
+| `Publish and verify complete executable assets` | Restore all original binaries/host, verify original crate ZIPs and exact registry bytes, require latest job successes, then publish immutable native assets and the whole Release. No compiler or packager. |
+
+Source preparation adds canonical `prepared-release.json` to the existing
+`bamboo-prepared-frontend-attempt-N` artifact beside the original wrapper/ZIP.
+Its 192 KiB limit applies to the file; `PREPARED_RELEASE` is a small typed
+run/physical-attempt/SHA-256 locator. Readers enforce regular files, real paths,
+size, canonical bytes and hash. Source workers download before their selector;
+the signed plan's `preparationSha256` and official physical preparation job/log
+bind the same snapshot. Private roles still authenticate its HMAC and call the
+real Source factory; a locator/file never grants publication. A failed-only
+retry retains original carrier attempt N even if GitHub copies a logical job to
+a later attempt. A newly executed Native selector rejects a copied old plan
+before cache/toolchain/stamp/build; a full workflow rerun produces a fresh plan,
+verifying every successful original before permitting failed targets. The old
+two-file carrier and full JSON's 64 KiB bound stay unchanged for legacy routes.
+
+The first `.crate` Buffer is controller-owned before verification. Two package
+operations retain that existing checksum boundary with one verification compile;
+registry throttling/unknown responses and later worker retries reuse the sealed
+ZIP. Persist each target's output and original job/attempt before finalization.
+An interrupted unknown preparation or a lost successful original stops rather
+than rerunning its build. Frontend assets retain exact IDs/bytes; upload only a
+missing unfinished asset, reuse identical unknown-response bytes, and stop on
+conflicts or lost completed assets. New Source uploads never use `--clobber`.
+
+The finalizer reads the fresh authenticated receipt, not stale preparation
+progress. Crate `receipt.completed` is only crate closure, and cannot authorize
+whole completion. The sole Source completion frame is
+`Bamboo whole release completion: <base64(canonical JSON)>`, decoded at most
+64 KiB, `kind=bamboo-whole-release-completion/v1`, `publicationAuthorized=false`.
+It binds S/tree/frozen ref/feature proof, actual C/run/check-suite/finalizer job,
+Release/tag/version, immutable receipt/frontend/crate/native/host references,
+registry checksums and latest logical plus original physical jobs. Every asset
+reference is `{assetId,name,sha256,sizeBytes}`. Per-crate origin remains its
+original physical producer even if that whole job later failed; latest whole
+crate job success is a separate requirement. Step hashes use SHA-256 of UTF-8
+`native-originals.executionKey(physical)` canonical bytes. Own finalizer is
+still running when it emits the frame; Main must independently prove its final
+successful step/job, trusted official C execution and all original assets/Source
+facts. The public consumer gets no signing key. #2345 and activation remain
+separate; a JSON frame or PR body is not Main authority.
 
 ## Phase contracts and activation
 
@@ -499,8 +557,11 @@ must be measured on a later accepted production run.
   and their actual attempt numbers. A full rerun must respect existing signed
   checkpoints and immutable asset identities.
 - Select frontend transport using the successful preparation's original attempt,
-  not the retrying job's current attempt. Native transport retention is bounded;
-  missing expired inputs require the normal verified rebuild route.
+  not the retrying job's current attempt. Legacy Native transport retention is
+  bounded. Source original outputs are durable Release assets: missing successful
+  originals stop; they never fall back to a rebuild. An expired preparation-only
+  carrier can be renewed by full preparation from the same authenticated
+  reservation and exact S bytes, without rebuilding retained product outputs.
 - If the same main CI run is retried, fresh admission may advance only that
   run's attempt while preserving all source and pre-merge bindings. Keep original
   signed reservation/checkpoint attempts intact; never relabel them as new work.

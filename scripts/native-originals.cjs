@@ -38,6 +38,7 @@ function binding(preparation) {
   return digest({ releaseId: preparation.releaseId, version: receipt.version,
     identity: receipt.identity, crates: receipt.crates, ciRun: receipt.ciRun,
     frontendBytes: receipt.frontendBytes, nativeOriginals: receipt.nativeOriginals,
+    ...(receipt.sourceDispatch ? { sourceDispatch: receipt.sourceDispatch, frontendOriginals: receipt.frontendOriginals } : {}),
     ...(receipt.validation ? { validation: receipt.validation } : {}) })
 }
 
@@ -154,7 +155,7 @@ async function refresh(context) {
   assert.equal(run.run_attempt, identity.runAttempt); assert.equal(run.status, 'in_progress')
   assert.equal(run.repository?.full_name, identity.repository)
   assert.equal(run.head_repository?.full_name, identity.repository)
-  assert.equal(run.event, 'workflow_run', 'Frozen-source dispatch remains inactive')
+  assert.equal(run.event, preparation.receipt.sourceDispatch ? 'workflow_dispatch' : 'workflow_run')
   const release = await context.readRelease(preparation.releaseId)
   assert.equal(release.id, preparation.releaseId); assert.equal(release.tag_name, `v${identity.version}`)
   assert.equal(release.target_commitish, identity.sourceRevision); assert.equal(release.prerelease, false)
@@ -344,6 +345,7 @@ async function plan(context, preparationJobId) {
   return core.signReceipt({ schemaVersion: 1, kind: PLAN_KIND, reservationSha256: fresh.reserved,
     runId: context.identity.runId, runAttempt: context.identity.runAttempt,
     controllerRevision: context.identity.workflowRevision, preparationJobId, targets,
+    ...(context.preparation.receipt.sourceDispatch ? { preparationSha256: digest(context.preparation) } : {}),
     hostCheckpoint: preparedHost.checkpoint }, context.signingKey)
 }
 
@@ -354,6 +356,7 @@ function select(planValue, identity, preparation, target, currentJob, { selectin
   assert.ok(TARGETS.includes(target))
   assert.equal(planValue.schemaVersion, 1); assert.equal(planValue.kind, PLAN_KIND)
   assert.equal(planValue.reservationSha256, contract(preparation, identity))
+  if (preparation.receipt.sourceDispatch) assert.equal(planValue.preparationSha256, digest(preparation), 'Plan differs from the original preparation file')
   assert.equal(planValue.runId, identity.runId); assert.equal(planValue.controllerRevision, identity.workflowRevision)
   assert.ok(positive(planValue.preparationJobId))
   assert.deepEqual(planValue.targets?.map(value => value.target), TARGETS)
@@ -444,8 +447,8 @@ async function restoreAll(context, outputDirectory) {
   return { builds, originals, preparedHost }
 }
 
-async function assemble(context, outputDirectory) {
-  const { builds, originals, preparedHost } = await restoreAll(context, outputDirectory)
+async function assemble(context, outputDirectory, restored) {
+  const { builds, originals, preparedHost } = restored || await restoreAll(context, outputDirectory)
   const manifest = sidecar.createManifest({ ...context.identity, artifacts: builds, browserHost: preparedHost.proof.manifest })
   const bytes = sidecar.manifestBytes(manifest)
   fs.writeFileSync(path.join(outputDirectory, sidecar.MANIFEST), bytes, { flag: 'wx' })
@@ -473,8 +476,86 @@ function completion(identity, release, assets, manifestBytes) {
     controllerRevision: identity.workflowRevision, runId: identity.runId, physicalAttempt: identity.runAttempt,
     manifestSha256: core.sha256(manifestBytes), assets: selected }
 }
+const WHOLE_PREFIX = 'Bamboo whole release completion: '
+const WHOLE_STEP = 'Verify all original outputs and publish whole release'
+const WHOLE_JOB = 'Publish and verify complete executable assets'
+const WHOLE_STEPS = { automatic: ['Authorize the frozen accepted dev source', 'Reserve or resume the exact release identity', PREPARE],
+  'Publish and verify the crate closure': ['Publish verified original crates'],
+  'Retain original native outputs': ['Retain and verify original native outputs'],
+  ...Object.fromEntries(TARGETS.map(target => [jobName(target), [SELECT]])) }
+const jobView = job => core.canonicalJson([job.id, job.run_id, job.run_attempt, job.name, job.head_sha, job.head_branch,
+  job.status, job.conclusion, job.started_at, job.completed_at, job.steps])
+async function wholeJobs(context) {
+  const latest = await context.latestJobs(), all = await context.jobs(), result = []
+  for (const [name, required] of Object.entries(WHOLE_STEPS)) {
+    const selected = latest.filter(job => job.name === name); assert.equal(selected.length, 1)
+    const logical = selected[0], family = all.filter(job => job.name === name)
+    assert.ok(family.length, 'Required whole-release job has no execution history')
+    assert.equal(new Set(family.map(job => job.run_attempt)).size, family.length)
+    for (const job of family) {
+      assert.equal(job.run_id, Number(context.identity.runId)); assert.equal(job.head_sha, context.identity.workflowRevision)
+      assert.equal(job.head_branch, 'main'); assert.ok(positive(job.id) && positive(job.run_attempt) && job.run_attempt <= context.identity.runAttempt)
+    }
+    const newest = family.sort((a, b) => b.run_attempt - a.run_attempt)[0]
+    assert.equal(jobView(newest), jobView(logical))
+    const key = executionKey(logical)
+    for (const label of required) assert.equal(step(logical, label)?.conclusion, 'success', 'Required whole-release step did not pass')
+    const physical = family.filter(job => job.status === 'completed' && job.conclusion === 'success' && executionKey(job) === key)
+      .sort((a, b) => a.run_attempt - b.run_attempt)[0]
+    assert.equal(jobView(await context.readJob(physical.id)), jobView(physical))
+    result.push({ name, logical: { id: logical.id, attempt: logical.run_attempt },
+      physical: { id: physical.id, attempt: physical.run_attempt }, stepsSha256: core.sha256(Buffer.from(key)) })
+  }
+  return result
+}
+function wholeCompletion({ context, fresh, restored, manifestBytes, crateClosure, receiptAsset, jobs, run, finalizer }) {
+  const { identity } = context, marker = fresh.receipt.sourceDispatch
+  assert.ok(marker); assert.equal(fresh.receipt.completed, true)
+  assert.equal(crateClosure.kind, 'bamboo-verified-crate-closure/v1'); assert.equal(crateClosure.publicationAuthorized, false)
+  assert.deepEqual(crateClosure.crates.map(value => value.name), fresh.receipt.crates)
+  assert.deepEqual(jobs.map(value => value.name), Object.keys(WHOLE_STEPS))
+  assert.deepEqual(restored.originals.map(value => value.target), TARGETS)
+  for (const value of crateClosure.crates) assert.equal(value.registryChecksum, value.archive.sha256)
+  const native = completion(identity, fresh.release, fresh.assets, manifestBytes)
+  assert.ok(positive(finalizer.id)); assert.equal(finalizer.name, WHOLE_JOB); assert.equal(finalizer.status, 'in_progress')
+  assert.equal(finalizer.run_attempt, identity.runAttempt); assert.equal(finalizer.head_sha, identity.workflowRevision)
+  assert.equal(finalizer.run_id, Number(identity.runId)); assert.equal(step(finalizer, WHOLE_STEP)?.status, 'in_progress')
+  for (const key of ['workflow_id', 'check_suite_id']) assert.ok(positive(run[key]))
+  assert.ok(typeof run.check_suite_node_id === 'string' && run.check_suite_node_id)
+  const frame = { schemaVersion: 1, kind: 'bamboo-whole-release-completion/v1', publicationAuthorized: false,
+    repository: { id: 1164779771, fullName: identity.repository },
+    source: { revision: identity.sourceRevision, tree: identity.sourceTree, releaseRef: marker.context.source.releaseRef,
+      featurePr: marker.context.feature.pr, featureRunId: marker.context.feature.runId, sourceDispatchSha256: digest(marker) },
+    controller: { revision: identity.workflowRevision, workflowPath: WORKFLOW, workflowId: run.workflow_id,
+      runId: Number(identity.runId), attempt: identity.runAttempt, checkSuiteId: run.check_suite_id,
+      checkSuiteNodeId: run.check_suite_node_id, finalizerJobId: finalizer.id },
+    release: { id: fresh.release.id, tag: fresh.release.tag_name, version: identity.version,
+      targetCommit: identity.sourceRevision, receiptAsset, receiptSha256: digest(fresh.receipt) },
+    frontend: fresh.receipt.frontendOriginals.assets,
+    crates: crateClosure.crates.map(value => ({ name: value.name, archiveSha256: value.archive.sha256,
+      zipAssetRef: { assetId: value.asset.id, name: value.asset.name, sha256: value.asset.digest.slice(7), sizeBytes: value.asset.size },
+      origin: { jobId: value.origin.jobId, attempt: value.origin.attempt },
+      verificationSha256: digest(value.verification), registryChecksum: value.registryChecksum })),
+    native: { manifestSha256: native.manifestSha256, assets: native.assets,
+      originals: restored.originals.map(value => ({ target: value.target, zipAssetRef: value.archive, checkpointRef: value.checkpoint })),
+      hostCheckpointRef: restored.preparedHost.checkpoint }, jobs }
+  const bytes = Buffer.from(core.canonicalJson(frame)); assert.ok(bytes.length <= 64 * 1024, 'Whole completion frame is oversized')
+  return { frame, line: WHOLE_PREFIX + bytes.toString('base64') }
+}
 
 function createContext(identity, preparation, env = process.env) {
+  assert.equal(preparation.receipt.sourceDispatch, undefined, 'Source writers require the real Source factory')
+  return nativeContext(identity, preparation, env, () => core.assertCurrentMain(identity.repository, identity.sourceRevision))
+}
+async function createFrozenContext(preparation) {
+  const authority = await core.makeFrozenSourceContext(), identity = core.preparationIdentity(authority, process.env.TARGET_VERSION)
+  core.authenticateReceipt(preparation.receipt, process.env.BAMBOO_RELEASE_SIGNING_KEY)
+  delete identity.frontend
+  contract(preparation, identity)
+  const context = nativeContext(identity, preparation, process.env, authority.assertSourceCurrent)
+  context.authority = authority; return context
+}
+function nativeContext(identity, preparation, env, guard) {
   assert.equal(env.GITHUB_REPOSITORY, sidecar.REPOSITORY)
   assert.equal(env.GITHUB_SHA, identity.workflowRevision, 'Actual controller SHA must not be relabeled as product source')
   assert.equal(env.GITHUB_WORKFLOW_SHA, identity.workflowRevision); assert.equal(env.GITHUB_RUN_ID, identity.runId)
@@ -501,9 +582,10 @@ function createContext(identity, preparation, env = process.env) {
   const context = { identity, preparation, signingKey: env.BAMBOO_RELEASE_SIGNING_KEY,
     file: name => { assert.equal(path.basename(name), name); return path.join(root, `${++sequence}-${name}`) },
     directory: (target, phase) => path.join(root, `${++sequence}-${phase}-${target}`),
-    guard: () => core.assertCurrentMain(identity.repository, identity.sourceRevision),
+    guard,
     readRun: id => get(`actions/runs/${id}`), readJob: id => get(`actions/jobs/${id}`),
     jobs: () => paged(`actions/runs/${identity.runId}/jobs?filter=all`, 'jobs'),
+    latestJobs: () => paged(`actions/runs/${identity.runId}/jobs?filter=latest`, 'jobs'),
     readLog: id => sidecar.execute('gh', ['api', `repos/${identity.repository}/actions/jobs/${id}/logs`], { maxBuffer: MAX_NATIVE_LOG }),
     readRelease: id => get(`releases/${id}`), readTag: version => get(`git/ref/tags/v${core.assertVersion(version)}`),
     listAssets: id => paged(`releases/${id}/assets`),
@@ -551,9 +633,10 @@ function preparedIdentity(preparation, env = process.env) {
 async function main() {
   const command = process.argv[2]
   assert.ok(['prepare', 'collect'].includes(command))
-  const preparation = JSON.parse(process.env.PREPARED_RELEASE)
-  const identity = preparedIdentity(preparation)
-  const context = createContext(identity, preparation)
+  const preparation = core.preparationInput()
+  const context = preparation.receipt.sourceDispatch ? await createFrozenContext(preparation) :
+    createContext(preparedIdentity(preparation), preparation)
+  const identity = context.identity
   if (command === 'prepare') {
     assert.equal(process.env.GITHUB_JOB, 'automatic')
     require('./sidecar-build.cjs').sourceState(new Set([
@@ -573,5 +656,6 @@ async function main() {
 module.exports = { TARGETS, KIND, PLAN_KIND, HOST_CHECKPOINT, HOST_INTENT, BUILD, UPLOAD, RECORD, SELECT, PREPARE,
   TRANSPORT_PREFIX, PLAN_PREFIX, SELECTION_PREFIX, MAX_ZIP, jobName, archiveName, checkpointName, transportName,
   binding, contract, executionKey, history, logRecord, emit, transportRecord, refresh, unpack,
-  retain, restore, host, plan, select, selectCurrent, workerSelection, collect, restoreAll, assemble, completion, createContext, preparedIdentity }
+  retain, restore, host, plan, select, selectCurrent, workerSelection, collect, restoreAll, assemble, completion, createContext, createFrozenContext, preparedIdentity,
+  saveAsset, wholeJobs, wholeCompletion, WHOLE_PREFIX, WHOLE_STEP, WHOLE_JOB, WHOLE_STEPS }
 if (require.main === module) main().catch(error => { console.error(error.message); process.exitCode = 1 })

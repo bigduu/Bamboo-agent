@@ -34,6 +34,136 @@ const signingKey = 'a'.repeat(64) // Synthetic test authority only.
 
 if (!legacySuite) require('./native-originals.test.cjs').register()
 
+test('2344 Source worker rejects copied preparation before cache output, toolchain, stamp or compiler', async t => {
+  const root = temporary(t), module = { exports: {} }, commands = []
+  const env = { RUNNER_TEMP: root, GITHUB_SHA: identity.workflowRevision, GITHUB_RUN_ATTEMPT: '2',
+    BAMBOO_RELEASE_TARGET: nativeTarget(), BAMBOO_EXECUTABLE_CONTRACT_VERSION: '2',
+    PREPARED_RELEASE: JSON.stringify({ receipt: { nativeOriginals: {}, sourceDispatch: {} } }),
+    NATIVE_ORIGINAL_PLAN: JSON.stringify({ runAttempt: 1 }), GITHUB_OUTPUT: path.join(root, 'output') }
+  const localRequire = name => {
+    if (name === './crate-release.cjs') return { preparationInput: () => JSON.parse(env.PREPARED_RELEASE) }
+    if (name === './sidecar-release.cjs') return { ...implementation, boundSourceContract: () => 2,
+      frozenWorkflowIdentity: async () => identity,
+      git: args => { commands.push(['git', ...args]); assert.equal(args[0], 'status'); return '' } }
+    if (name === 'node:child_process') return { spawnSync: () => { throw Error('Unexpected worker subprocess') } }
+    return require(name)
+  }
+  // Local adapter contract only: the real 0-argument Source factory and empty
+  // producer registry have separate tests. No candidate policy enters production.
+  const code = fs.readFileSync(path.join(__dirname, 'sidecar-build.cjs'), 'utf8').replace(/^#![^\n]*\n/, '')
+  require('node:vm').runInThisContext('(function(require,module,__dirname,__filename,process){\n' + code +
+    '\nmodule.exports.testMain = main\n})')(localRequire, module, __dirname, path.join(__dirname, 'sidecar-build.cjs'),
+    { env, argv: ['node', 'sidecar-build.cjs', 'cache-policy'], cwd: () => root, platform: process.platform, arch: process.arch })
+  await assert.rejects(module.exports.testMain(), /current physical attempt/)
+  assert.deepEqual(commands, [['git', 'status', '--porcelain', '--untracked-files=all']])
+  assert.equal(fs.existsSync(env.GITHUB_OUTPUT), false)
+  assert.equal(fs.existsSync(path.join(root, 'bamboo-executable-target')), false)
+})
+
+test('2344 Source cache ABI includes the actual C driver and stamper independently of S', async t => {
+  const root = temporary(t), controller = path.join(root, 'C'), product = path.join(root, 'S'), module = { exports: {} }
+  for (const directory of [controller, product]) fs.mkdirSync(path.join(directory, 'scripts'), { recursive: true })
+  for (const name of ['sidecar-build.cjs', 'crate-release-lock.py']) {
+    fs.writeFileSync(path.join(controller, 'scripts', name), `C ${name}`)
+    fs.writeFileSync(path.join(product, 'scripts', name), `different S ${name}`)
+  }
+  const env = { RUNNER_TEMP: root, GITHUB_SHA: identity.workflowRevision, BAMBOO_RELEASE_TARGET: nativeTarget(),
+    PREPARED_RELEASE: '{"receipt":{"nativeOriginals":{},"sourceDispatch":{}}}', NATIVE_ORIGINAL_PLAN: '{"runAttempt":2}',
+    GITHUB_OUTPUT: path.join(root, 'output') }
+  const localRequire = name => name === './crate-release.cjs' ? { preparationInput: () => JSON.parse(env.PREPARED_RELEASE) } : name === './sidecar-release.cjs' ? { ...implementation, boundSourceContract: () => 2,
+    frozenWorkflowIdentity: async () => identity, git: () => '' } : name === './native-originals.cjs' ? {
+    workerSelection: async () => ({ action: 'build' }) } : name === 'node:child_process' ? new Proxy({}, { get: () => () => {
+      throw Error('Unexpected cache-policy subprocess') } }) : require(name)
+  const code = fs.readFileSync(path.join(__dirname, 'sidecar-build.cjs'), 'utf8').replace(/^#![^\n]*\n/, '')
+  require('node:vm').runInThisContext('(function(require,module,__dirname,__filename,process){\n' + code +
+    '\nmodule.exports.testMain = main\n})')(localRequire, module, path.join(controller, 'scripts'), path.join(controller, 'scripts/sidecar-build.cjs'),
+    { env, argv: ['node', 'sidecar-build.cjs', 'cache-policy'], cwd: () => product, platform: process.platform, arch: process.arch })
+  await module.exports.testMain()
+  const abi = release.sha256(['sidecar-build.cjs', 'crate-release-lock.py'].map(name =>
+    `${name}:${release.fileIdentity(path.join(controller, 'scripts', name)).sha256}`).join('\n'))
+  assert.ok(fs.readFileSync(env.GITHUB_OUTPUT, 'utf8').includes(`-C${abi}\n`))
+  assert.equal(fs.existsSync(path.join(root, 'bamboo-executable-target')), false)
+})
+
+for (const scenario of ['complete', 'crate closure failure', 'latest job failure', 'fresh source failure']) {
+  test('2344 whole finalizer transport: ' + scenario, async t => {
+    const root = temporary(t), core = require('./crate-release.cjs'), original = require('./native-originals.cjs')
+    const rows = new Map(), events = [], lines = [], module = { exports: {} }, subprocesses = [], blocked = []
+    const asset = (name, bytes) => { const metadata = { id: 100 + rows.size, name, state: 'uploaded', size: bytes.length, digest: `sha256:${release.sha256(bytes)}` }
+      rows.set(name, { metadata, bytes: Buffer.from(bytes) }); return originalRef(metadata) }
+    const originalRef = value => ({ assetId: value.id, name: value.name, sha256: value.digest.slice(7), sizeBytes: value.size })
+    const receipt = { completed: true, crates: ['bamboo-agent'], sourceDispatch: { context: {
+      source: { releaseRef: `release/${identity.sourceRevision}` }, feature: { pr: 99, runId: 90 } } },
+      frontendOriginals: { assets: [asset('frontend-manifest.json', Buffer.from('wrapper')), asset('lotus-frontend.zip', Buffer.from('frontend original'))] } }
+    const published = { id: 42, tag_name: `v${identity.version}`, target_commitish: identity.sourceRevision, draft: true, prerelease: false }
+    const metadata = () => [...rows.values()].map(value => clone(value.metadata))
+    const jobs = Object.keys(original.WHOLE_STEPS).map(name => ({ name, logical: { id: 200, attempt: 2 }, physical: { id: 100, attempt: 1 }, stepsSha256: '7'.repeat(64) }))
+    const finalizer = { id: 900, name: original.WHOLE_JOB, run_id: 100, run_attempt: 2, head_sha: identity.workflowRevision,
+      status: 'in_progress', steps: [{ name: original.WHOLE_STEP, status: 'in_progress' }] }
+    let restores = 0, patched = 0
+    const context = { identity, file: name => path.join(root, name),
+      upload: async (file, name) => { events.push('asset:' + name); assert.ok(!rows.has(name)); asset(name, fs.readFileSync(file)) },
+      readRun: async () => ({ workflow_id: 8, check_suite_id: 9, check_suite_node_id: 'CS_fixture' }),
+      jobs: async () => [finalizer], readJob: async () => finalizer }
+    context.authority = { currentReservation: async () => ({ release: { ...published, assets: metadata() }, receipt: clone(receipt) }),
+      ensureFrontend: async (_release, _receipt, options) => assert.deepEqual(options, { sealed: true }), listAssets: async () => metadata(),
+      publishMetadata: async (_release, actual) => { events.push('fresh:source'); assert.deepEqual(actual, receipt)
+        if (scenario === 'fresh source failure') throw Error('fresh source stopped')
+        assert.ok(events.includes('crate:closure')); assert.equal(rows.has('release-provenance.json'), true)
+        patched++; published.draft = false } }
+    const localNative = { ...original, createFrozenContext: async prepared => { assert.equal(prepared.receipt.completed, false); return context },
+      wholeJobs: async () => { if (scenario === 'latest job failure') throw Error('latest job stopped'); return jobs },
+      restoreAll: async (_context, directory) => {
+        restores++; fs.mkdirSync(directory); const builds = release.TARGETS.map(target => {
+          const bytes = Buffer.alloc(65536, 1); fs.writeFileSync(path.join(directory, release.artifactName(target)), bytes)
+          return { target, assetName: release.artifactName(target), format: 'raw', buildMode: 'embedded', embeddedFrontend: true,
+            sha256: release.sha256(bytes), sizeBytes: bytes.length } })
+        const host = Buffer.from('once-prepared original host'); fs.writeFileSync(path.join(directory, release.HOST_ASSET), host)
+        return { builds, originals: release.TARGETS.map(target => ({ target, archive: originalRef({ id: 1, name: original.archiveName(target), digest: `sha256:${'8'.repeat(64)}`, size: 10 }), checkpoint: {} })),
+          preparedHost: { checkpoint: {}, proof: { manifest: { assetName: release.HOST_ASSET, sha256: release.sha256(host), sizeBytes: host.length,
+            files: release.HOST_FILES.map(name => ({ path: name, sha256: '8'.repeat(64), sizeBytes: 1 })) } } } }
+      },
+      assemble: async (_context, directory, restored) => {
+        const manifest = implementation.createManifest({ ...identity, artifacts: restored.builds, browserHost: restored.preparedHost.proof.manifest })
+        fs.writeFileSync(path.join(directory, release.MANIFEST), implementation.manifestBytes(manifest))
+        fs.writeFileSync(path.join(directory, release.PROVENANCE), 'inert provenance; transport contract only')
+        return manifest },
+      saveAsset: async (_context, file, name) => asset(name, fs.readFileSync(file)) }
+    const localCore = { ...core, preparationInput: () => ({ receipt: { completed: false } }), spawnCommand: args => {
+      subprocesses.push('registered-asset-read')
+      assert.equal(args[0], 'gh'); assert.equal(args[1], 'api')
+      assert.match(args[2], /^repos\/bigduu\/Bamboo-agent\/releases\/assets\/\d+$/)
+      assert.deepEqual(args.slice(3), ['-H', 'Accept: application/octet-stream'])
+      const id = Number(args[2].split('/').at(-1)), value = [...rows.values()].find(value => value.metadata.id === id)
+      assert.ok(value); return { status: 0, stdout: Buffer.from(value.bytes) }
+    }, readOriginalCrateClosure: async (_authority, fresh) => {
+      assert.equal(fresh.receipt.completed, true); events.push('crate:closure')
+      if (scenario === 'crate closure failure') throw Error('crate closure stopped')
+      return { kind: 'bamboo-verified-crate-closure/v1', publicationAuthorized: false, crates: [{ name: 'bamboo-agent',
+        archive: { sha256: '5'.repeat(64) }, asset: { id: 333, name: 'crate.zip', digest: `sha256:${'6'.repeat(64)}`, size: 20 },
+        origin: { jobId: 12, attempt: 1 }, verification: { exitCode: 0 }, registryChecksum: '5'.repeat(64) }] }
+    }, shouldMakeLatest: async () => true }
+    const localRequire = name => name === './native-originals.cjs' ? localNative : name === './crate-release.cjs' ? localCore :
+      name === 'node:child_process' ? new Proxy({}, { get: (_object, api) => () => {
+        blocked.push(String(api)); throw Error('Unregistered finalizer subprocess')
+      } }) : require(name)
+    // Transport/glue contract only. Real Source admission, ZIP/HMAC/registry
+    // validators have separate tests; no local fixture is a producer admission.
+    const code = fs.readFileSync(path.join(__dirname, 'sidecar-release.cjs'), 'utf8').replace(/^#![^\n]*\n/, '')
+    require('node:vm').runInThisContext('(function(require,module,__dirname,process,console){\n' + code + '\n})')(
+      localRequire, module, __dirname, { env: { RUNNER_TEMP: root, PREPARED_RELEASE: '{"receipt":{"completed":false}}' } }, { log: line => lines.push(line) })
+    if (scenario === 'complete') {
+      await module.exports.publishWholeSource(); assert.equal(patched, 1); assert.equal(restores, 1); assert.equal(lines.length, 1)
+      assert.ok(lines[0].startsWith(original.WHOLE_PREFIX)); const frame = JSON.parse(Buffer.from(lines[0].slice(original.WHOLE_PREFIX.length), 'base64'))
+      assert.equal(frame.native.assets.length, 6); assert.equal(frame.crates[0].origin.jobId, 12); assert.equal(frame.controller.finalizerJobId, 900)
+    } else {
+      await assert.rejects(module.exports.publishWholeSource(), /stopped/); assert.equal(patched, 0); assert.deepEqual(lines, [])
+      if (scenario !== 'fresh source failure') assert.equal(rows.size, 2, 'No incomplete closure uploaded native assets')
+    }
+    assert.deepEqual(blocked, []); assert.ok(subprocesses.every(value => value === 'registered-asset-read'))
+  })
+}
+
 function temporary(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-executables-test-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -776,10 +906,10 @@ test('publication detects corrupted server responses before exposing a manifest'
 
 test('workflow retains successful-CI authority and binds its native matrix to the accepted source contract', () => {
   const source = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
-  const matrix = source.split('  executables:\n')[1].split('  publish-executables:\n')[0]
+  const matrix = source.split('  executables:\n')[1].split('  retain-native-originals:\n')[0]
   const final = source.split('  publish-executables:\n')[1]
   assert.match(source, /group: bamboo-crate-publication\n  queue: max\n  cancel-in-progress: false/)
-  assert.equal(source.split('bamboo-release-controller/scripts/crate-release.cjs" plan').length - 1, 1)
+  assert.equal(source.split('${BAMBOO_PUBLISH_CONTROLLER}/scripts/crate-release.cjs" plan').length - 1, 1)
   const preparation = source.split('  automatic:\n')[1].split('  publish-crates:\n')[0]
   const crates = source.split('  publish-crates:\n')[1].split('  executables:\n')[0]
   assert.doesNotMatch(preparation, /crate-release\.cjs" publish|crate-release-lock\.py stamp/)
@@ -788,7 +918,7 @@ test('workflow retains successful-CI authority and binds its native matrix to th
   assert.doesNotMatch(crates, /steps\.source\./, 'The crate worker must inherit preparation evidence across jobs')
   assert.doesNotMatch(crates, /needs:.*executables|crate-release\.cjs" plan/)
   assert.match(crates, /crate-release\.cjs" resume/)
-  assert.ok(crates.indexOf('crate-release.cjs" resume') < crates.indexOf('crate-release-lock.py stamp'))
+  assert.ok(crates.indexOf('crate-release.cjs" resume') < crates.indexOf('name: Prepare workspace manifests for publish'))
   assert.match(matrix, /needs: automatic/)
   assert.doesNotMatch(matrix, /contents: write|secrets\.|api-only|cargo publish/)
   assert.ok(matrix.includes('matrix: ${{ fromJSON(needs.automatic.outputs.executable_matrix) }}'))
@@ -797,12 +927,12 @@ test('workflow retains successful-CI authority and binds its native matrix to th
   assert.ok(matrix.includes('name: bamboo-prepared-frontend-attempt-${{ fromJSON(needs.automatic.outputs.prepared_release).runAttempt }}'))
   assert.match(preparation, /name: bamboo-prepared-frontend-attempt-\$\{\{ github\.run_attempt \}\}/)
   assert.ok(preparation.indexOf('crate-release.cjs" plan') < preparation.indexOf('name: bamboo-prepared-frontend-attempt-'))
-  assert.doesNotMatch(matrix, /GH_TOKEN:/)
+  assert.match(matrix, /GH_TOKEN: \$\{\{ github\.token \}\}/)
   assert.match(matrix, /workspaces: \$\{\{ steps\.cache_policy\.outputs\.workspace \}\}/)
   assert.match(matrix, /cache-workspace-crates: false/)
   assert.match(matrix, /save-if: \$\{\{ steps\.cache_policy\.outputs\.save == 'true' \}\}/)
   assert.ok(final.includes('BAMBOO_EXECUTABLE_CONTRACT_VERSION: ${{ needs.automatic.outputs.executable_contract_version }}'))
-  assert.doesNotMatch(matrix, /inputs\./)
+  assert.doesNotMatch(matrix, /inputs\.(?:version|expected_source_sha|frontend_package)/)
   assert.match(matrix, /persist-credentials: false/)
   for (const target of release.LEGACY_TARGETS) {
     const key = release.targetOutputKey(target)
@@ -815,17 +945,17 @@ test('workflow retains successful-CI authority and binds its native matrix to th
     const step = downloads.find(block => block.includes('bamboo-executable-' + target + '-attempt-'))
     assert.ok(step)
     if (target === 'x86_64-apple-darwin') {
-      assert.match(step, /if: needs\.automatic\.outputs\.executable_contract_version == '1'/)
-    } else assert.doesNotMatch(step.split('\n      - ')[0], /\n        if:/)
+      assert.match(step, /if: env\.BAMBOO_SOURCE_MODE != 'true' && needs\.automatic\.outputs\.executable_contract_version == '1'/)
+    } else assert.match(step.split('\n      - ')[0], /if: env\.BAMBOO_SOURCE_MODE != 'true'/)
   }
   assert.ok(matrix.includes('name: bamboo-executable-${{ matrix.target }}-attempt-${{ github.run_attempt }}'))
   assert.doesNotMatch(matrix, /overwrite: true/)
   for (const match of source.matchAll(/uses: ([^\s]+)@([^\s]+)/g)) assert.match(match[2], /^[0-9a-f]{40}$/, 'Release actions must use immutable reviewed commits')
   assert.ok(final.includes('EXPECTED_BUILDS: ${{ toJSON(needs.executables.outputs) }}'))
-  assert.match(final, /needs: \[automatic, publish-crates, executables\]/)
+  assert.match(final, /needs: \[automatic, publish-crates, executables, retain-native-originals\]/)
   assert.match(final, /environment: bamboo-release\n    permissions:\n      contents: write/)
-  assert.match(final, /bamboo-release-controller\/scripts\/sidecar-release.cjs" publish/)
-  assert.doesNotMatch(final, /--clobber|cargo build|cargo publish|inputs\./)
+  assert.match(final, /\$\{BAMBOO_PUBLISH_CONTROLLER\}\/scripts\/sidecar-release.cjs" publish/)
+  assert.doesNotMatch(final, /--clobber|cargo build|cargo publish|inputs\.(?:version|expected_source_sha|frontend_package)/)
 })
 
 test('the actual source preflight rejects every missing or incompatible producer before reservation or crate publication', (t) => {
