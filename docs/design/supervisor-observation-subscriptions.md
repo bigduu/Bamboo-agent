@@ -51,3 +51,53 @@ snapshots. Wrong epochs/future cursors fail. A selector, JSONL or receipt-shaped
 DTO grants no authority. Failures persist a non-sensitive code with bounded
 backoff; eight failures block visibly, and exact retries cannot reset the cap.
 The ordinary Work fixture does not claim Planner #1059 or full Epic acceptance.
+
+
+## Terminal fault reporting (#2314)
+
+A terminal observation failure freezes one typed diagnostic inside the same
+subscription: Supervisor incarnation, parent/Child births, registration epoch,
+original error code/count and exhaustion time bind its stable event ID. A
+nonempty diagnostic upgrades Supervisor schema to 4; absent fields preserve
+schema 3 bytes, and later registration/subscription writers retain the maximum
+schema. Delivery failures cannot replace the original payload or retry ID.
+
+The Host delivers `observer_subscription_fault_v1` to the original Supervisor's
+canonical Inbox with `RespectSpecificWait`. It announces no available file,
+contains no target content/path and is not a ChildOutcome or control grant.
+Diagnostic admission requires the current native parent/Child registration and
+scope epoch, enabled original links and retained Host namespace absence. It can
+report its own failure when a physical source Root is unavailable. A rejected
+Host grant permits only a private canonical delivery-failure counter update,
+never target reads or Maildir admission. Revoked registrations cannot send.
+
+The integrated adapter retains the complete authority through actual Maildir
+jobs. Only its actual receipt marks `reported`; a crash before this checkpoint
+retries the same semantic event. `reported` is producer enqueue truth, not
+consumer ACK. Fault delivery has its own eight-error finite exponential backoff;
+exhaustion remains visibly unreported and exact retries never reset it. Inbox
+or canonical storage failure is never represented as a successful notification.
+A deleted/replaced Child likewise permits only the original Supervisor's bounded
+failure counter update; it cannot borrow the replacement's lifetime or authority.
+
+## Fault acceptance ownership
+
+The five `observer_fault_tests.rs` cases are ordinary, nonignored server library
+tests under `cfg(test)`. The existing server development dependency already
+enables storage `test-utils`; the new FileInbox fault checkpoint hook adds no
+Cargo feature, required-feature target or feature-only case. Relative to accepted
+CI `2ff2fa645ba597476a398cb7fdbe3fcc26948de2`, this is the only changed record in
+the feature-sensitive source closure. The 19 additive cases remain unchanged.
+
+The existing API-only subscription executor retains its original 19 cases and
+adds exactly those five fault cases, using the same joint domain/engine/server
+library graph, source/lock checks and strict five-library lint. Policy verifies
+both the full 24-case recipe and a byte-identical reconstruction of the accepted
+19-case recipe after removing only the five named cases, their file trigger and
+verdict wording. It rejects a missing/renamed fault case or any unrelated recipe
+change. This finite transition does not grant an automatic producer exception
+to any new workflow, or replace canonical merge-source feature acceptance.
+
+Actual API-only results stay bound to their original source; the 24-case result
+is not the 19-case additive catalog. #2338 owns the later canonical configuration
+migration. Every new source still requires its own normal checks and review.
