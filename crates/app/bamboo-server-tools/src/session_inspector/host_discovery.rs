@@ -100,11 +100,12 @@ impl HostSessionDiscovery {
             }
             authorized.push(AuthorizedSessionTarget {
                 session_id: id,
-                project_id: project,
+                project_id: Some(project),
                 created_at: observation.identity.created_at,
                 metadata_version: observation.metadata_version,
                 link_revision: 0,
                 authorization_revision: Some(binding.revision),
+                current_user_target: None,
             });
         }
         authorized.sort_by(|a, b| a.session_id.cmp(&b.session_id));
@@ -237,6 +238,10 @@ impl SessionDiscoveryPort for SessionDiscoveryRouter {
     ) -> Result<AuthorizedSessionPage, ToolError> {
         request.validate()?;
         let caller = original_caller(ctx)?;
+        if ctx.executing_supervisor_for(&caller.session_id).is_some() {
+            validate_original_caller(self.storage.as_ref(), ctx).await?;
+            return self.supervisor.list(ctx, request).await;
+        }
         match self
             .storage
             .find_host_session_scope(caller)
@@ -261,6 +266,10 @@ impl SessionDiscoveryPort for SessionDiscoveryRouter {
     ) -> Result<SessionProgressObservation, ToolError> {
         request.validate()?;
         let caller = original_caller(ctx)?;
+        if ctx.executing_supervisor_for(&caller.session_id).is_some() {
+            validate_original_caller(self.storage.as_ref(), ctx).await?;
+            return self.supervisor.inspect(ctx, request).await;
+        }
         match self
             .storage
             .find_host_session_scope(caller)
@@ -317,17 +326,17 @@ pub(super) async fn require_absent_host_for_legacy_history(
     require_legacy_supervisor(ctx)?;
     validate_original_caller(storage, ctx).await?;
     let caller = original_caller(ctx)?;
-    // Keep the final Host publication observation last: a caller validation
-    // await after it could otherwise miss a new installation or revocation.
-    if storage
-        .find_host_session_scope(caller)
+    let reference = ctx
+        .executing_supervisor_for(&caller.session_id)
+        .ok_or_else(authority_required)?
+        .supervisor_reference();
+    // The old private helper name is retained for its existing call sites;
+    // current Supervisor authority no longer borrows a finite Host scope.
+    storage
+        .inspect_supervisor_current_user_scope(&reference)
         .await
-        .map_err(authority_unavailable)?
-        .is_some()
-    {
-        return Err(ToolError::Execution("session_discovery_bounded_scope: an installed Host scope grants only metadata/bounded progress; use list/inspect".into()));
-    }
-    Ok(())
+        .map_err(authority_unavailable)?;
+    validate_original_caller(storage, ctx).await
 }
 
 #[cfg(test)]

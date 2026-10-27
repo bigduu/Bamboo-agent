@@ -37,6 +37,7 @@ pub mod workflow;
 
 // Storage port definitions (moved from application-agent)
 pub mod storage;
+pub mod supervisor_current_user;
 
 // Shared prompt markers (deduped from server/engine).
 pub mod prompt_markers;
@@ -59,6 +60,7 @@ pub use reasoning::{ReasoningEffort, DEFAULT_REASONING_EFFORT};
 pub use schedule::*;
 pub use session::*;
 pub use storage::*;
+pub use supervisor_current_user::*;
 pub use token_usage::{TokenUsage, MAX_DURABLE_TOKEN_COUNT};
 pub use tool_names::*;
 pub use tool_types::*;

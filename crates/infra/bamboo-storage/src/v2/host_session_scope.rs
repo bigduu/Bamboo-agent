@@ -56,8 +56,12 @@ pub(crate) struct HostScopedDeliveryGuards {
 }
 
 enum LegacySessionDeliveryAuthority {
-    Peer { _guard: PeerDeliveryGuard },
-    Supervisor { _guard: SupervisorFollowupGuard },
+    Peer {
+        _guard: PeerDeliveryGuard,
+    },
+    Supervisor {
+        _guard: Box<super::supervisor_management::CurrentUserTargetGuard>,
+    },
 }
 
 /// Compatibility authority, with a retained never-installed publication fence.
@@ -65,10 +69,64 @@ enum LegacySessionDeliveryAuthority {
 pub(crate) struct LegacySessionDeliveryGuards {
     pub(crate) inbox_dir: PathBuf,
     _authority: LegacySessionDeliveryAuthority,
-    _absence: HostSessionScopeAbsence,
+    _absence: Option<HostSessionScopeAbsence>,
+}
+
+/// The namespace publication fence is retained through physical Inbox work.
+/// Absence is a retained observation too, never permission to race installation.
+pub(crate) enum CurrentUserSendScope {
+    Scoped { scope: HostSessionScopeUse },
+    NeverInstalled { _absence: HostSessionScopeAbsence },
 }
 
 impl SessionStoreV2 {
+    pub(crate) async fn retain_current_user_send_scope(
+        &self,
+        caller: &SessionCallerReference,
+    ) -> io::Result<CurrentUserSendScope> {
+        match self.host_scope_registry.lookup(caller).await? {
+            Some(token) => Ok(CurrentUserSendScope::Scoped {
+                scope: self.host_scope_registry.retain(&token, caller).await?,
+            }),
+            None => Ok(CurrentUserSendScope::NeverInstalled {
+                _absence: self
+                    .host_scope_registry
+                    .retain_never_installed(&caller.session_id)
+                    .await?,
+            }),
+        }
+    }
+
+    pub(crate) fn validate_current_user_send_scope(
+        &self,
+        lease: &CurrentUserSendScope,
+        authority: &super::supervisor_management::CurrentUserTargetGuard,
+    ) -> io::Result<()> {
+        if let CurrentUserSendScope::Scoped { scope } = lease {
+            let binding = scope.token().binding();
+            binding
+                .caller
+                .check_session(&authority.source)
+                .map_err(|error| denied(error.to_string()))?;
+            let target = binding
+                .target(&authority.target.id, HostSessionRight::SendPeer)
+                .map_err(|error| denied(error.to_string()))?;
+            target
+                .observation
+                .check_session(&authority.target)
+                .map_err(|error| denied(error.to_string()))?;
+            let observed = bamboo_domain::SupervisorCurrentUserTarget::capture_with_ancestors(
+                &authority.target,
+                &target.observation.ancestors,
+            )
+            .map_err(denied)?;
+            if observed != authority.reference {
+                return Err(denied("host_session_scope_ancestry_changed"));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn lock_unscoped_peer_delivery(
         &self,
         caller: &SessionCallerReference,
@@ -95,7 +153,7 @@ impl SessionStoreV2 {
         Ok(LegacySessionDeliveryGuards {
             inbox_dir: authority.inbox_dir.clone(),
             _authority: LegacySessionDeliveryAuthority::Peer { _guard: authority },
-            _absence: absence,
+            _absence: Some(absence),
         })
     }
 
@@ -104,6 +162,7 @@ impl SessionStoreV2 {
         caller: &SessionCallerReference,
         supervisor: &bamboo_domain::SupervisorReference,
         target_id: &str,
+        target_created_at: chrono::DateTime<chrono::Utc>,
     ) -> io::Result<LegacySessionDeliveryGuards> {
         validate_session_id(&caller.session_id)?;
         if caller.session_id != supervisor.session_id
@@ -114,23 +173,24 @@ impl SessionStoreV2 {
         {
             return Err(denied("host_session_legacy_caller_mismatch"));
         }
-        let absence = self
-            .host_scope_registry
-            .retain_never_installed(&caller.session_id)
-            .await?;
-        let authority = self.lock_supervisor_followup(supervisor, target_id).await?;
-        let current = self
-            .peer_delivery_session(&caller.session_id, &caller.root_session_id)
-            .await?;
-        if !caller.matches_session(&current) {
+        let authority = self.lock_current_user_target(supervisor, target_id).await?;
+        if authority.target.created_at != target_created_at {
+            return Err(denied("Supervisor followup target lifetime changed"));
+        }
+        if !caller.matches_session(&authority.source) {
             return Err(denied("host_session_operation_caller_changed"));
         }
+        let relative = if authority.target.kind == SessionKind::Root {
+            Self::root_rel_path(target_id)
+        } else {
+            Self::child_rel_path(&authority.target.root_session_id, target_id)
+        };
         Ok(LegacySessionDeliveryGuards {
-            inbox_dir: self
-                .abs_path_from_rel(&Self::root_rel_path(target_id))
-                .join("inbox"),
-            _authority: LegacySessionDeliveryAuthority::Supervisor { _guard: authority },
-            _absence: absence,
+            inbox_dir: self.abs_path_from_rel(&relative).join("inbox"),
+            _authority: LegacySessionDeliveryAuthority::Supervisor {
+                _guard: Box::new(authority),
+            },
+            _absence: None,
         })
     }
 
@@ -179,6 +239,7 @@ impl SessionStoreV2 {
         &self,
         observation: &HostScopeSessionObservation,
         mut current: Session,
+        control_only: bool,
     ) -> io::Result<()> {
         let root = &observation.identity.root_session_id;
         for expected in &observation.ancestors {
@@ -189,7 +250,9 @@ impl SessionStoreV2 {
             if parent_id != expected.actor_id {
                 return Err(denied("host_session_scope_ancestry_changed"));
             }
-            let parent = self.peer_delivery_session(parent_id, root).await?;
+            let parent = self
+                .peer_delivery_session_view(parent_id, root, control_only)
+                .await?;
             parent
                 .validate_conversation_state()
                 .map_err(|error| denied(error.to_string()))?;
@@ -219,6 +282,25 @@ impl SessionStoreV2 {
         observations: &[HostScopeSessionObservation],
         scope: Option<HostSessionScopeUse>,
         extra_root_ids: &[String],
+    ) -> io::Result<HostScopedSessionGuards> {
+        self.lock_host_scope_observations_view(observations, scope, extra_root_ids, false)
+            .await
+    }
+
+    pub(super) async fn lock_host_scope_control_observations(
+        &self,
+        observations: &[HostScopeSessionObservation],
+    ) -> io::Result<HostScopedSessionGuards> {
+        self.lock_host_scope_observations_view(observations, None, &[], true)
+            .await
+    }
+
+    async fn lock_host_scope_observations_view(
+        &self,
+        observations: &[HostScopeSessionObservation],
+        scope: Option<HostSessionScopeUse>,
+        extra_root_ids: &[String],
+        control_only: bool,
     ) -> io::Result<HostScopedSessionGuards> {
         // Only a reserved Root birth needs exclusive lifecycle. Ordinary
         // scoped reads keep their existing shared concurrency contract.
@@ -254,7 +336,11 @@ impl SessionStoreV2 {
             // Canonical preflight only selects a lock order. It cannot authorize
             // a later read; every observation is checked again under the set.
             let current = self
-                .peer_delivery_session(&expected.session_id, &expected.root_session_id)
+                .peer_delivery_session_view(
+                    &expected.session_id,
+                    &expected.root_session_id,
+                    control_only,
+                )
                 .await?;
             observation
                 .check_session(&current)
@@ -287,7 +373,11 @@ impl SessionStoreV2 {
         for observation in observations {
             let expected = &observation.identity;
             let current = self
-                .peer_delivery_session(&expected.session_id, &expected.root_session_id)
+                .peer_delivery_session_view(
+                    &expected.session_id,
+                    &expected.root_session_id,
+                    control_only,
+                )
                 .await?;
             observation
                 .check_session(&current)
@@ -295,7 +385,8 @@ impl SessionStoreV2 {
             current
                 .check_execution_compatibility()
                 .map_err(|error| denied(error.to_string()))?;
-            self.check_host_scope_lineage(observation, current).await?;
+            self.check_host_scope_lineage(observation, current, control_only)
+                .await?;
         }
         Ok(guards)
     }

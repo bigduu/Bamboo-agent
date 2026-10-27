@@ -86,7 +86,11 @@ async fn owner_scope_cas_is_explicit_restartable_and_does_not_initialize_work() 
     assert_eq!(status, StatusCode::OK, "{observed}");
     assert_eq!(observed["scope"]["state_revision"], 0);
     assert_eq!(observed["scope"]["allowed_projects"], json!([]));
-    assert_eq!(observed["code"], "project_scope_uninitialized");
+    assert_eq!(observed["code"], "current_user_scope_ready");
+    assert_eq!(
+        observed["management_access"]["requires_project_authorization"],
+        false
+    );
     let request = f.update(0, vec![f.project.clone()]);
     let (status, configured) = f.call(Method::PUT, Some(request.clone())).await;
     assert_eq!(status, StatusCode::OK, "{configured}");
@@ -267,7 +271,7 @@ async fn owner_scope_revoke_and_regrant_never_attach_or_revive_existing_root() {
     );
     let service = SupervisorSessionService::new(f.state.storage.clone());
     assert!(
-        !service
+        service
             .inspect_link(&f.reference, &root.id)
             .await
             .unwrap()
@@ -285,7 +289,7 @@ async fn owner_scope_revoke_and_regrant_never_attach_or_revive_existing_root() {
         StatusCode::OK
     );
     let link = service.inspect_link(&f.reference, &root.id).await.unwrap();
-    assert!(!link.authorized);
+    assert!(link.authorized);
     assert!(!link.link.unwrap().enabled);
     assert_eq!(
         serde_json::to_value(
@@ -399,7 +403,7 @@ async fn model_scope(f: &Fixture) -> Value {
     let executing = f
         .state
         .storage
-        .load_root_authority(&f.reference.session_id)
+        .load_execution_admission_snapshot(&f.reference.session_id)
         .await
         .unwrap()
         .unwrap();
@@ -417,12 +421,14 @@ async fn model_scope(f: &Fixture) -> Value {
     let ctx = ctx.with_executing_supervisor(
         ExecutingSupervisorObservation::capture_from_executing_session(&executing),
     );
-    let outcome = f
-        .state
-        .tools_for(crate::tools::ToolSurface::Root)
-        .execute_with_context_outcome(&call, ctx)
-        .await
-        .unwrap();
+    let tools = f.state.tools_for(crate::tools::ToolSurface::Root);
+    let caller = Arc::new(bamboo_domain::SessionCallerReference::from(&executing));
+    let outcome = bamboo_agent_core::tools::with_executing_session_caller(
+        Some(caller),
+        tools.execute_with_context_outcome(&call, ctx),
+    )
+    .await
+    .unwrap();
     let ToolOutcome::Completed(result) = outcome else {
         panic!("scope is a bounded observation")
     };
@@ -434,10 +440,11 @@ async fn model_scope(f: &Fixture) -> Value {
 async fn model_scope_reports_owner_action_without_grant_or_work_readiness() {
     let f = Fixture::new().await;
     let scope = model_scope(&f).await;
-    assert_eq!(scope["code"], "project_scope_uninitialized");
-    assert_eq!(scope["owner_action"]["model_callable"], false);
-    assert_eq!(scope["owner_action"]["path"], URI);
-    assert_eq!(scope["owner_action"]["requires"], "existing_access");
+    assert_eq!(scope["code"], "current_user_scope_ready");
+    assert_eq!(scope["authority"], "current_user");
+    assert_eq!(scope["requires_project_authorization"], false);
+    assert_eq!(scope["legacy_scope_is_authorization"], false);
+    assert!(scope["owner_action"].is_null());
     assert_eq!(scope["work_scope"]["availability"], "not_observed");
     assert_eq!(scope["work_scope"]["status_path"], "/api/v1/tickets/scope");
     let observed = SupervisorSessionService::new(f.state.storage.clone())

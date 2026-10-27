@@ -83,6 +83,7 @@ impl SessionInboxPort for LegacyOnlyInbox {
         &self,
         caller: &SessionCallerReference,
         supervisor: &SupervisorReference,
+        target_created_at: chrono::DateTime<chrono::Utc>,
         envelope: &bamboo_domain::SessionMessageEnvelope,
     ) -> Result<bamboo_domain::SessionInboxReceipt, bamboo_domain::SessionInboxError> {
         if let Some((entered, release)) = &self.1 {
@@ -90,7 +91,22 @@ impl SessionInboxPort for LegacyOnlyInbox {
             release.notified().await;
         }
         self.0
-            .deliver_unscoped_supervisor_followup(caller, supervisor, envelope)
+            .deliver_unscoped_supervisor_followup(caller, supervisor, target_created_at, envelope)
+            .await
+    }
+    async fn deliver_supervisor_current_user_followup(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        envelope: &bamboo_domain::SessionMessageEnvelope,
+    ) -> Result<bamboo_domain::SessionInboxReceipt, bamboo_domain::SessionInboxError> {
+        if let Some((entered, release)) = &self.1 {
+            entered.notify_one();
+            release.notified().await;
+        }
+        self.0
+            .deliver_supervisor_current_user_followup(caller, supervisor, target, envelope)
             .await
     }
     async fn deliver(
@@ -164,6 +180,7 @@ async fn unsupported_host_inbox_never_retries_through_legacy_delivery() {
                 operation_id: "unsupported-operation".into(),
                 message: "bounded input".into(),
                 delivery_intent: Some(SessionMessageDeliveryIntent::QueueOnly),
+                target_ref: None,
             },
         )
         .await
@@ -268,7 +285,12 @@ async fn legacy_lookup_absence_cannot_survive_a_new_or_revoked_host_installation
             let tool = SessionMessageTool::new(messenger.clone()).with_scoped_sender(Arc::new(
                 CanonicalSessionSendAdapter::new(f.store.clone(), messenger),
             ));
-            let args = send(&target.id, "legacy-racing-operation", Some("trigger_turn"));
+            let args = if supervisor {
+                f.supervisor_send_args(&caller, &target.id, "legacy-racing-operation")
+                    .await
+            } else {
+                send(&target.id, "legacy-racing-operation", Some("trigger_turn"))
+            };
             let ctx = Fixture::ctx(&caller);
             let sending = tokio::spawn(async move { tool.invoke(args, ctx).await });
             tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified())
@@ -490,6 +512,7 @@ async fn host_trigger_failure_preserves_receipt_and_acked_retry_does_not_reactiv
         operation_id: "trigger-operation".into(),
         message: "instruction".into(),
         delivery_intent: Some(SessionMessageDeliveryIntent::TriggerTurn),
+        target_ref: None,
     };
     f.activation.fail.store(true, Ordering::SeqCst);
     let error = sender
@@ -527,67 +550,94 @@ async fn host_trigger_failure_preserves_receipt_and_acked_retry_does_not_reactiv
 
 #[tokio::test]
 async fn existing_supervisor_receipt_keeps_its_identity_when_host_scope_is_installed() {
-    let f = Fixture::new().await;
-    let target = f.new_root("supervisor-transition-target").await;
-    let supervisor = f.supervisor(&[&target.id]).await;
-    let tool = f.tool();
-    let args = send(
-        &target.id,
-        "existing-supervisor-operation",
-        Some("trigger_turn"),
-    );
-    let legacy = result(
-        tool.invoke(args.clone(), Fixture::ctx(&supervisor))
+    for current_user in [false, true] {
+        let f = Fixture::new().await;
+        let target = f.new_root("supervisor-transition-target").await;
+        let supervisor = f.supervisor(&[&target.id]).await;
+        let tool = f.tool();
+        let args = if current_user {
+            f.supervisor_send_args(&supervisor, &target.id, "existing-supervisor-operation")
+                .await
+        } else {
+            send(
+                &target.id,
+                "existing-supervisor-operation",
+                Some("trigger_turn"),
+            )
+        };
+        let legacy = if current_user {
+            result(
+                tool.invoke(args.clone(), Fixture::ctx(&supervisor))
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            // Execute the retained pre-selector protocol, not a fabricated receipt.
+            let reference = SupervisorReference {
+                session_id: supervisor.id.clone(),
+                incarnation_id: supervisor.supervisor_incarnation_id().unwrap(),
+            };
+            let receipt = f
+                .messenger
+                .supervisor_followup_observed(
+                    &SessionCallerReference::from(&supervisor),
+                    &reference,
+                    &target,
+                    "existing-supervisor-operation",
+                    "one bounded instruction",
+                )
+                .await
+                .unwrap();
+            json!({"message_id":receipt.delivery.id.to_string(),"inbox_generation":receipt.delivery.generation})
+        };
+        install(
+            &f,
+            &supervisor,
+            vec![],
+            &target,
+            &[HostSessionRight::SendPeer],
+            1,
+        )
+        .await;
+        let host = result(
+            tool.invoke(args.clone(), Fixture::ctx(&supervisor))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(legacy["message_id"], host["message_id"]);
+        assert_eq!(legacy["inbox_generation"], host["inbox_generation"]);
+        assert_eq!(f.inbox.inspect(&target.id).await.unwrap().generation, 1);
+        let mut changed = args.clone();
+        changed["message"] = json!("a different instruction");
+        assert!(tool
+            .invoke(changed, Fixture::ctx(&supervisor))
             .await
-            .unwrap(),
-    );
-    install(
-        &f,
-        &supervisor,
-        vec![],
-        &target,
-        &[HostSessionRight::SendPeer],
-        1,
-    )
-    .await;
-    let host = result(
-        tool.invoke(args.clone(), Fixture::ctx(&supervisor))
+            .is_err());
+        let mut changed = args.clone();
+        changed["delivery_intent"] = json!("queue_only");
+        assert!(tool
+            .invoke(changed, Fixture::ctx(&supervisor))
             .await
-            .unwrap(),
-    );
-    assert_eq!(legacy["message_id"], host["message_id"]);
-    assert_eq!(legacy["inbox_generation"], host["inbox_generation"]);
-    assert_eq!(f.inbox.inspect(&target.id).await.unwrap().generation, 1);
-    let mut changed = args.clone();
-    changed["message"] = json!("a different instruction");
-    assert!(tool
-        .invoke(changed, Fixture::ctx(&supervisor))
-        .await
-        .is_err());
-    let mut changed = args.clone();
-    changed["delivery_intent"] = json!("queue_only");
-    assert!(tool
-        .invoke(changed, Fixture::ctx(&supervisor))
-        .await
-        .is_err());
-    let claims = f.inbox.claim(&target.id, 10).await.unwrap();
-    assert_eq!(claims.len(), 1);
-    assert_eq!(claims[0].envelope.thread_id, None);
-    let activations = f.activation.requests.lock().await.len();
-    f.store
-        .revoke_host_session_scope(&supervisor.id, 1)
-        .await
-        .unwrap();
-    assert!(tool.invoke(args, Fixture::ctx(&supervisor)).await.is_err());
-    assert_eq!(f.activation.requests.lock().await.len(), activations);
+            .is_err());
+        let claims = f.inbox.claim(&target.id, 10).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].envelope.thread_id, None);
+        let activations = f.activation.requests.lock().await.len();
+        f.store
+            .revoke_host_session_scope(&supervisor.id, 1)
+            .await
+            .unwrap();
+        assert!(tool.invoke(args, Fixture::ctx(&supervisor)).await.is_err());
+        assert_eq!(f.activation.requests.lock().await.len(), activations);
+    }
 }
 
 #[tokio::test]
 async fn host_supervisor_queue_and_trigger_share_one_operation_address_without_legacy_authority() {
     let f = Fixture::new().await;
     let target = f.new_root("host-only-supervisor-target").await;
-    // This target is not attached. Only the installed SendPeer scope authorizes
-    // the writer; retaining old wire identity must not borrow Supervisor scope.
+    // No current-user selector is supplied. This explicit Host request must
+    // use its finite SendPeer scope and preserve inert QueueOnly semantics.
     let supervisor = f.supervisor(&[]).await;
     install(
         &f,

@@ -38,10 +38,7 @@ impl Fixture {
                 }),
             ))
             .await
-            .unwrap()
-            .with_supervisor_project_scope_authorizer(Arc::new(
-                super::supervisor_owner_authorization::test_support::ApprovedHostIntent,
-            )),
+            .unwrap(),
         );
         let workspace = home.path().join("workspaces").join("explicit-worker");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -60,32 +57,31 @@ impl Fixture {
             .await
             .unwrap();
         let supervisor = SupervisorReference::from(&original);
-        // Exercise the actual owner HTTP boundary, then the Host-wired model
-        // operation below. No in-process scope grant substitutes for the UI API.
+        // The real HTTP read exposes the default domain without a privileged
+        // authorizer or a scope PUT. Per-operation tool approval below remains
+        // independent; no Project ACL is injected into this fixture.
         let app = test::init_service(
             App::new()
                 .app_data(state.clone())
-                .app_data(web::Data::new(super::supervisor_owner_authorization::test_support::intent(&json!({
-                    "incarnation_id":supervisor.incarnation_id,"expected_state_revision":0,"allowed_projects":[project.id.clone()]
-                })).unwrap()))
                 .configure(crate::routes::configure_routes),
         )
         .await;
         let response = test::call_service(
             &app,
-            test::TestRequest::put()
+            test::TestRequest::get()
                 .uri("/api/v1/supervisor/default/scope")
                 .peer_addr("127.0.0.1:12345".parse().unwrap())
-                .set_json(json!({
-                    "incarnation_id":supervisor.incarnation_id,
-                    "expected_state_revision":0,"allowed_projects":[project.id.clone()],
-                }))
                 .to_request(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let receipt: Value = test::read_body_json(response).await;
-        assert_eq!(receipt["receipt"]["state_revision"], 1);
+        assert_eq!(receipt["scope"]["state_revision"], 0);
+        assert_eq!(receipt["management_access"]["default_all_projects"], true);
+        assert_eq!(
+            receipt["management_access"]["requires_project_authorization"],
+            false
+        );
         drop(app);
         let original = state
             .storage
@@ -144,7 +140,7 @@ impl Fixture {
     fn request(&self, operation_id: uuid::Uuid) -> Value {
         json!({"action":"create", "request": {
             "operation_id": operation_id,
-            "expected_state_revision": 1,
+            "expected_state_revision": 0,
             "project_id": self.project_id,
             "workspace_path": self.workspace,
             "title": "Independent implementation task",
@@ -217,8 +213,14 @@ async fn assert_create_is_independent_and_exact_retry(ultra: bool) {
         .unwrap()
         .unwrap();
     let scope = f.invoke(json!({"action":"scope"})).await;
-    assert_eq!(scope["state_revision"], 1);
-    assert_eq!(scope["allowed_projects"], json!([f.project_id]));
+    assert_eq!(scope["state_revision"], 0);
+    assert_eq!(scope["allowed_projects"], json!([]));
+    assert_eq!(scope["requires_project_authorization"], false);
+    assert!(scope["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["id"].as_str() == Some(f.project_id.as_str())));
     assert_eq!(scope["project_scope_configured"], true);
     let operation_id = uuid::Uuid::new_v4();
     let response = f.invoke(f.request(operation_id)).await;
@@ -248,7 +250,10 @@ async fn assert_create_is_independent_and_exact_retry(ultra: bool) {
         .await
         .unwrap();
     assert!(link.authorized);
-    assert_eq!(link.link.unwrap().revision, 1);
+    assert!(
+        link.link.is_none(),
+        "default management must not populate a legacy attachment"
+    );
     let replay = f.invoke(f.request(operation_id)).await;
     assert_eq!(replay["target_session_id"], id);
     assert_eq!(replay["receipt_id"], response["receipt_id"]);
@@ -437,21 +442,37 @@ async fn work_bound_supervisor_chat_case(standard: bool, stable_message_id: bool
             .unwrap();
         f.state.sessions.remove(&original.id);
     }
-    let before = service.published().unwrap();
     let scope = f.state.tickets.status().await;
-    assert_eq!(
-        scope["availability"]["kind"],
-        if standard { "forbidden" } else { "ready" }
-    );
+    assert_eq!(scope["availability"]["kind"], "ready");
     if standard {
-        assert_eq!(
-            scope["availability"]["reason_code"],
-            "supervisor_mode_required"
-        );
+        assert_eq!(scope["availability"]["reason_code"], "scope_ready");
         let input_before = f.state.session_inbox.inspect(&original.id).await.unwrap();
-        let denied = test::call_service(&app, test::TestRequest::post().uri("/api/v1/chat").peer_addr("127.0.0.1:12345".parse().unwrap()).set_json(json!({"session_id":original.id,"message":"Formal Work reply stays gated", "model":"supervisor-private-model", "thread_id":"work-only-thread"})).to_request()).await;
-        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-        let _: Value = test::read_body_json(denied).await;
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let threaded = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .peer_addr("127.0.0.1:12345".parse().unwrap())
+                .set_json(json!({
+                    "session_id": original.id,
+                    "message_id": message_id,
+                    "message": "Record this authenticated Work input",
+                    "model": "supervisor-private-model",
+                    "thread_id": "work-only-thread"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(threaded.status(), StatusCode::CREATED);
+        let threaded_receipt: Value = test::read_body_json(threaded).await;
+        assert_eq!(threaded_receipt["message_id"], message_id);
+        let published = service.published().unwrap();
+        let ingress = published.1.resolutions[&message_id]
+            .ingress
+            .as_ref()
+            .unwrap();
+        assert_eq!(ingress.thread_id.as_deref(), Some("work-only-thread"));
+        assert_eq!(ingress.text, "Record this authenticated Work input");
         assert_eq!(
             f.state
                 .session_inbox
@@ -459,10 +480,10 @@ async fn work_bound_supervisor_chat_case(standard: bool, stable_message_id: bool
                 .await
                 .unwrap()
                 .generation,
-            input_before.generation
+            input_before.generation + 1
         );
-        assert_eq!(service.published().unwrap().0, before.0);
     }
+    let before = service.published().unwrap();
     let mut chat = json!({
         "session_id": original.id,
         "message": "Coordinate an independent Root without submitting Work",
@@ -503,7 +524,7 @@ async fn work_bound_supervisor_chat_case(standard: bool, stable_message_id: bool
             &original.id
         )
         .await
-        .is_err());
+        .is_ok());
     } else {
         assert!(
             service.published().unwrap().1.resolutions.len() > before.1.resolutions.len(),
@@ -548,7 +569,7 @@ async fn work_bound_supervisor_chat_case(standard: bool, stable_message_id: bool
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[actix_web::test]
-async fn work_bound_standard_supervisor_admits_plain_root_chat_without_work_authority() {
+async fn work_bound_standard_supervisor_distinguishes_plain_chat_from_formal_ingress() {
     work_bound_supervisor_chat_case(true, false).await;
 }
 
@@ -560,6 +581,6 @@ async fn work_bound_ultra_supervisor_retains_formal_ingress_and_independent_root
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[actix_web::test]
-async fn work_bound_standard_supervisor_keeps_native_message_identity_without_work_reference() {
+async fn work_bound_standard_supervisor_keeps_native_message_identity_for_plain_chat() {
     work_bound_supervisor_chat_case(true, true).await;
 }
