@@ -42,6 +42,10 @@ function createReads(env = process.env, spawn = spawnSync, fetcher = fetch) {
       assert.ok(Number.isSafeInteger(maximum) && maximum > 0 && maximum <= 1024 * 1024 ** 2);
       return gh(["--method", "GET", `repos/${source.REPOSITORY}/releases/assets/${id(assetId)}`, "-H", "Accept: application/octet-stream"], maximum, true);
     },
+    artifactBytes: async (artifactId, maximum) => {
+      assert.ok(Number.isSafeInteger(maximum) && maximum > 0 && maximum <= 1024 * 1024 ** 2);
+      return gh(["--method", "GET", `repos/${source.REPOSITORY}/actions/artifacts/${id(artifactId)}/zip`], maximum, true);
+    },
     registryChecksum: async (name, version) => {
       assert.match(name, /^[A-Za-z0-9_-]{1,64}$/); core.assertVersion(version);
       const response = await fetcher(`https://crates.io/api/v1/crates/${name}/${encodeURIComponent(version)}`, {
