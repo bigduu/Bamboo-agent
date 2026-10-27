@@ -294,3 +294,30 @@ frames stay 64 KiB. Wrapper assets stay 1 MiB. New Source accepts ZIP blobs only
 up to 16 MiB, despite the broader legacy frontend carrier. Keep all original
 hash/ID/size and fresh-read checks. Use the focused #2351 commands in the local
 guide; do not repeat historical Source or product suites for this loader.
+
+## Staged Docker consumer (#2320)
+
+Docker consumes an authenticated completed release. Its only automatic event is
+completed `Publish Crate`; a manual selector names the exact original run. Tags
+and main pushes do not compile Bamboo or stage another frontend. Keep Docker
+controller D, publisher C and compiled source S separate. Reuse zero-argument
+`main-admission.cjs.createPublicReads()` and real `verifyPublishedSource`; JSON,
+digests and fixture policy are data, never publication authority. Production
+registries remain empty until the coordinated cutover.
+
+Copy only the original Linux x64 binary, exact three-file Host package and fixed
+runtime resources into the isolated context. Install the locked Host runtime
+dependencies with scripts disabled and its matching headless shell once. Do not
+run Cargo, frontend installation, Unit/E2E or the thirteen-file browser suite.
+Real ELF/loader, version, API/frontend and Host dependency smoke must pass before
+candidate push. A checksum or Ubuntu 22.04 label does not prove ABI compatibility.
+Keep UID 10001, `/data`, entrypoint, broker override and loopback compose defaults.
+
+Retain both architecture entries and require both before formal multi-arch,
+version or latest publication. ARM64 has a separate original producer/ABI hard
+dependency [#2353](https://github.com/bigduu/Bamboo-agent/issues/2353); never
+substitute x64, compile source or delete the entry. It does not silently extend
+the native three-target release manifest. Missing/ambiguous digest evidence stops
+finalization; the original release assets must remain available and verified.
+This nine-file slice is staged: Node/tiny archive fixtures are not image evidence.
+Real compatibility smoke and Docker control-closure/Ops activation remain pending.

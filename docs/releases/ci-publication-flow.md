@@ -669,3 +669,84 @@ Original wrapper assets have a 1 MiB role. New Source intentionally accepts ZIP
 blobs only up to 16 MiB (and bounded JSON/base64 reads), while the legacy carrier
 supports up to 256 MiB. This child does not expand Source or claim larger ZIP
 admission. Hashes, Git blobs, asset IDs/size/digest and fresh rechecks remain strict.
+
+## Staged completed-release Docker consumer (#2320)
+
+`docker-publish.yml` now selects a completed `Publish Crate` run, or an explicit
+same-repository `release_run` on manual dispatch. Tag creation and main pushes
+have no Docker producer. This is staged source: the default accepted feature and
+release registries are empty, current default dev fails the main-controller
+check, and no new-contract image/publication has been exercised. Activation also
+requires the separate Ops control-closure update; #2320 does not change
+`MAIN_CONTROLS`, default branch, protection, signing or version allocation.
+
+`docker-from-release.cjs` uses the inherited #2351 zero-argument public read port
+and calls the real `verifyPublishedSource` without policy injection. The original
+physical finalizer frame supplies locators only. Official source/controller,
+run/check suite, complete helper closure, raw original ZIP/asset bytes and crate
+registry proof remain the existing public verifier's responsibility. Failed,
+missing, expired, foreign or incomplete release evidence stops consumption.
+Keep Docker D, publisher C, tested M and compiled S identities unchanged.
+
+For x64, stage the original `x86_64-unknown-linux-gnu` executable and Host tar
+from that completed release. The Host manifest must enumerate exactly its three
+regular files with original byte hashes, and the lock must select Playwright
+1.62.1. Links, traversal, extra/duplicate members and hash mismatches fail. Never
+download a moving frontend, execute candidate scripts or copy the source tree.
+The isolated context contains only those verified files, D's fixed Dockerfile
+and a data-only source/version/asset/ABI descriptor.
+
+The runtime is pinned to the official multi-arch Node24 Bookworm index
+`sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205`.
+Official registry index and amd64/arm64 config metadata were read and hashed on
+2026-10-27; both configs report Node24.22.1. This was a metadata-only read with
+no image layers pulled. It is not compatibility evidence. The current original
+Linux producer is Ubuntu22.04; inspect the actual ELF64 architecture, DT_NEEDED
+and GLIBC/GLIBCXX/CXXABI requirements. Reject a newer-than-Bookworm GLIBC demand;
+the actual loader and smoke decide the remaining ABI/runtime requirements.
+
+The Dockerfile copies the binary and Host bytes unchanged, installs only the
+original locked runtime dependencies with `npm ci --omit=dev --ignore-scripts`,
+then installs their matching Chromium headless shell and required OS/FFmpeg
+dependencies once. There is no Rust toolchain, Cargo, frontend npm/Vite build,
+Unit/E2E or full browser suite. Preserve user10001, `/data`, port9562 and the
+existing server entrypoint and broker-agent override. Compose requires an
+explicit `BAMBOO_IMAGE` version/digest and never builds an unavailable image from
+the checkout; its loopback binding, capabilities and named data volume remain.
+
+Build the runtime image locally, before any push. Artifact smoke checks the
+exact Bamboo version, actual loader/no missing libraries, API health, embedded
+HTML/manifest, Node24/Host module and one headless dependency launch/normal close.
+Children inherit only runtime paths/locale, not publisher tokens or workflow
+write channels. No candidate repo, credentials or host volume enters a probe
+container. Uncertain writer scratch stays in that isolated runner/container
+lifecycle; a Node exit does not authorize host-directory deletion.
+
+After smoke, a fresh real completed-source check immediately precedes standard
+Docker push. Per-architecture candidate tags are temporary distribution outputs;
+they are not a complete multi-arch release. Retain source/C/run/version-bound
+digest records for 90days, keyed by consumer run, physical attempt and arch.
+Failed-job reruns may reuse the other original carrier; missing, changed or
+duplicate carriers stop finalization. A whole-workflow rerun is not a recovery
+protocol. Never compensate by compiling a missing upstream original.
+
+Both matrix entries remain mandatory. Additional Linux ARM64 originals and ABI
+acceptance are the hard dependency
+[#2353](https://github.com/bigduu/Bamboo-agent/issues/2353), outside the existing
+three-native-target manifest. Until supplied, the ARM route explicitly fails:
+no emulation, x64 substitution, source fallback, matrix deletion or partial
+multi-arch/version/latest push. The finalizer authenticates fresh source and two
+exact same-release digests, creates their manifest with standard Buildx, and
+checks both descriptors and the returned registry digest before scanning that
+exact image. The existing pinned Trivy warning-only policy is unchanged.
+
+Focused local commands are `node --test scripts/docker-from-release.test.cjs`,
+the single affected `crate resolver and Docker original consumer keep separate
+owners` test in `release-frontend-policy.test.cjs`, and
+`actionlint .github/workflows/docker-publish.yml`. Quick Checks imports the new
+consumer fixtures once. These use real tiny tar data, mocked read ports and
+static routing only; they do not pull/build/run/publish an image or certify ABI.
+The approved scope is nine core files (including that necessary existing owner
+assertion adjustment). Preserve historical fixtures and prior RED evidence.
+One real compatibility smoke and fully accepted upstream/ARM/authority cutover
+remain pending before calling this path active.

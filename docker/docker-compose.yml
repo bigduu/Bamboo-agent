@@ -1,9 +1,8 @@
 services:
   bamboo:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: bamboo-server:latest
+    # Select the verified published version or digest explicitly; compose never
+    # compiles a candidate checkout when that image is unavailable.
+    image: ${BAMBOO_IMAGE:?Set BAMBOO_IMAGE to ghcr.io/bigduu/bamboo:vVERSION or its verified digest}
     container_name: bamboo
     # Publish to the HOST loopback only. Do NOT widen this to 0.0.0.0 / a LAN IP
     # to expose the agent directly: a fresh instance has no credential (auth gate

@@ -1,103 +1,42 @@
-# Bamboo (bamboo-agent) container image
-#
-# Builds the `bamboo` binary and ships it on a slim Debian runtime. The image
-# serves two roles:
-#   - default: the unified HTTP server (`bamboo serve`, the ENTRYPOINT/CMD below)
-#   - broker worker: the orchestrator's DockerDeployer overrides the entrypoint
-#     to seed a writable data dir and run `bamboo broker-agent serve ...`
-#
-# NOTE: Pin the builder image to the same Debian release as the runtime image.
-# Using `rust:latest` can move to a newer glibc (e.g. 2.39) while the runtime
-# stays on Bookworm (glibc 2.36), producing:
-#   /lib/.../libc.so.6: version `GLIBC_2.39' not found
-# Keep builder+runtime aligned to avoid glibc ABI mismatches.
+# Only an authenticated original binary and Host package enter this context.
+# Node's official multi-architecture index/config metadata was verified on
+# 2026-10-27 (Node 24.22.1 on amd64/arm64); compatibility still requires smoke.
+FROM node:24-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205
 
-FROM rust:1-bookworm AS chef
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/bamboo/ms-playwright
+WORKDIR /opt/bamboo/browser-runtime
 
-# cargo-chef splits the build into a dependency layer (cached across
-# source-only changes) and a workspace layer. Without it, `COPY . .`
-# immediately before `cargo build` invalidates the single build layer on ANY
-# source change, forcing a full recompile of ~25 workspace crates' worth of
-# dependencies every time. Release builds retain `opt-level = 3` with LTO off.
-# The pinned version and `--locked` preserve build reproducibility.
-RUN cargo install cargo-chef --version 0.1.77 --locked
-
-WORKDIR /app
-
-FROM chef AS planner
-
-# `.dockerignore` keeps target/ and .git out; builtin_skills/ is embedded by
-# bamboo-skills' build.rs (include_bytes!), so it must stay in the build
-# context (do NOT exclude **/*.md).
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-FROM chef AS builder
-
-WORKDIR /app
-
-# Builds ONLY the dependency graph (crates.io deps) described by recipe.json.
-# This layer is invalidated by a Cargo.toml/Cargo.lock change, NOT by a
-# source-only change, so it's reused across builds where just application
-# code changed. cargo-chef replaces workspace build scripts with recipe
-# placeholders in this dependency-only layer; the real bamboo-server build
-# script and its required frontend package run only after the full COPY below.
-COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --locked --bin bamboo --recipe-path recipe.json
-
-# Now copy the full workspace (same .dockerignore exclusions as above) and
-# build the workspace's own crates. Dependencies are already compiled by the
-# `chef cook` layer, so this only recompiles bamboo's own source.
-COPY . .
-
-# Build from crates.io (default sparse registry). Builds on CI runners with
-# direct registry access — no vendoring, no registry mirrors.
-RUN cargo build --release --locked --bin bamboo
-
-# ===== Runtime image =====
-FROM debian:bookworm-slim
-
-WORKDIR /app
-
-# Runtime deps: TLS certs + curl (healthcheck) + OpenSSL for reqwest
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      ca-certificates \
-      curl \
-      libssl3 \
+# The original lock owns Host dependencies. This is a runtime-only install,
+# without package scripts, frontend installation, Vite or a Rust toolchain.
+COPY browser-runtime/package.json browser-runtime/package-lock.json ./
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl libssl3 libgcc-s1 libstdc++6 \
+    && npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && node node_modules/playwright-core/cli.js install --with-deps --only-shell chromium \
+    && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
+COPY browser-runtime/host.cjs ./host.cjs
+COPY bamboo /usr/local/bin/bamboo
+COPY originals.json /opt/bamboo/originals.json
 
-# Run as an unprivileged user. The container was previously PID-1 root with a
-# read-write host-config mount, so a compromise of the tool-executing agent
-# could rewrite the host's config / encryption key / sessions as root. A
-# system user with /data as its home closes that escalation. (#249)
+# Keep the existing unprivileged identity, data directory and broker override.
 RUN useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin bamboo \
     && mkdir -p /data \
-    && chown -R bamboo:bamboo /data
-
-COPY --from=builder /app/target/release/bamboo /usr/local/bin/bamboo
-
+    && chown bamboo:bamboo /data
+ENV HOME=/data
+ENV BAMBOO_BROWSER_HOST_SCRIPT=/opt/bamboo/browser-runtime/host.cjs
+ENV BAMBOO_BROWSER_NODE=/usr/local/bin/node
 ENV RUST_LOG=info
 ENV BAMBOO_DATA_DIR=/data
 ENV BAMBOO_PORT=9562
-# The server binds 0.0.0.0 INSIDE the container so a published port can reach
-# it; restrict *exposure* at the compose publish layer (127.0.0.1) rather than
-# here — see docker-compose.yml. Do not publish to the network directly: a fresh
-# instance is unauthenticated, and the server treats every private-LAN peer as
-# trusted-local (skipping the password check by design), so LAN exposure is
-# unauthenticated even with a password set — front it with an authenticating
-# reverse proxy instead.
 ENV BAMBOO_BIND=0.0.0.0
-
+WORKDIR /app
 EXPOSE 9562
-
 USER bamboo
-
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
   CMD curl -fsS http://127.0.0.1:9562/api/v1/health >/dev/null \
     && curl -fsS http://127.0.0.1:9562/ >/dev/null \
     && test -s /data/frontend/.frontend-manifest.json \
     || exit 1
-
 ENTRYPOINT ["bamboo"]
 CMD ["serve", "--port", "9562", "--bind", "0.0.0.0", "--data-dir", "/data"]
