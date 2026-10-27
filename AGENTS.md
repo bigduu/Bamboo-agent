@@ -319,6 +319,12 @@ dependency [#2353](https://github.com/bigduu/Bamboo-agent/issues/2353); never
 substitute x64, compile source or delete the entry. It does not silently extend
 the native three-target release manifest. Missing/ambiguous digest evidence stops
 finalization; the original release assets must remain available and verified.
+Before assembly, the same-run selector verifies official jobs/steps and original
+Actions ZIP/digest carriers. A retained success takes the real read-only reuse
+path, skipping assembly, smoke, push and another upload. A successful assembly
+without a complete authenticated carrier stops. Cross-consumer-run/D recovery is
+unsupported in code: the same Source run or an unknown prior producer points
+back to its original consumer instead of assembling again.
 This nine-file slice is staged: Node/tiny archive fixtures are not image evidence.
 Real compatibility smoke and Docker control-closure/Ops activation remain pending.
 The Host parser's decoded eight-MiB role limit is unchanged; only its bounded

@@ -728,9 +728,39 @@ After smoke, a fresh real completed-source check immediately precedes standard
 Docker push. Per-architecture candidate tags are temporary distribution outputs;
 they are not a complete multi-arch release. Retain source/C/run/version-bound
 digest records for 90days, keyed by consumer run, physical attempt and arch.
-Failed-job reruns may reuse the other original carrier; missing, changed or
-duplicate carriers stop finalization. A whole-workflow rerun is not a recovery
-protocol. Never compensate by compiling a missing upstream original.
+The first image selector reads complete official run/job/attempt data before
+assembly or any write. Same-run/D failed-job and full-workflow reruns reuse the
+unique earliest physical success, including copied-success projection; they
+do not create a third digest upload. Both final logical image owners must truly
+succeed, through a complete original producer or the real read-only reuse path.
+Original whole-job plus assembly/smoke/push/upload steps must have succeeded.
+Raw ZIP ID/digest/size, same-run/attempt/name, step creation window, strict single
+regular JSON member, selected release fields and fresh metadata/job readback
+all bind the retained carrier. A standard read-only remote digest lookup checks
+that the image still exists. Finalization reads these exact API-selected raw
+original carriers, rather than merging a directory glob of retry outputs.
+
+Previously successful assembly with missing/expired/unverifiable transport,
+push/transport failure or an unknown/cancelled outcome stops without reassembly.
+Only a completely known unfinished target with no successful assembly or
+registry write may retry. No OCI archive store, allocator, signing key or
+separate GitHub transport is added: raw ZIP reads use #2355's reviewed port.
+Never compensate by compiling a missing upstream original.
+
+Source and image selectors also inspect earlier consumer runs before building.
+The canonical Source-job locator log is data only. A previous consumer for this
+Source run/release/version stops the new run and points back to its original R;
+an unknown prior output also stops. Different-source prior execution is ignored
+only with an independently bound official same-D file; an unproven metadata
+role cannot be resolved by trusting a self-described JSON. Later queued runs do
+not become earlier origins. API/job headers bind metadata X to each other,
+while actual rerun `GITHUB_WORKFLOW_SHA` and ordinary checkout bind executed D.
+An empty prior job list is unknown history; only explicit skipped jobs prove
+that this earlier run did no work.
+The workflow_run platform roles still need real Ops observation before activation.
+Cross-run/D restoration is deliberately unsupported; repeat publisher completion
+events or manual dispatches cannot silently start another formal image output.
+Every registry write freshly rechecks the live consumer attempt and write step.
 
 Both matrix entries remain mandatory. Additional Linux ARM64 originals and ABI
 acceptance are the hard dependency

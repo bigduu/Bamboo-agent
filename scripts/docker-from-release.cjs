@@ -6,6 +6,7 @@ const assert = require("node:assert/strict"), fs = require("node:fs"), path = re
 const { spawnSync } = require("node:child_process");
 const core = require("./crate-release.cjs"), sidecar = require("./sidecar-release.cjs");
 const proof = require("./published-source-admission.cjs"), native = require("./native-originals.cjs");
+const source = require("./frozen-source-admission.cjs");
 const ROOT = path.resolve(__dirname, ".."), WORKFLOW = ".github/workflows/docker-publish.yml";
 // Official registry index/config metadata read 2026-10-27; both architectures
 // resolve to Node24.22.1. No image layer was downloaded to choose this pin.
@@ -13,6 +14,10 @@ const RUNTIME = "node:24-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa
 const PLATFORMS = Object.freeze(["linux/amd64", "linux/arm64"]);
 const IMAGE = "ghcr.io/" + sidecar.REPOSITORY.split("/")[0].toLowerCase() + "/bamboo";
 const SHA = /^[0-9a-f]{40}$/, DIGEST = /^sha256:[0-9a-f]{64}$/;
+const SELECT = "Select original image output", BUILD = "Assemble runtime image locally", SMOKE = "Verify loader, version, API, frontend and Host runtime";
+const PUSH = "Recheck source and push candidate digest", UPLOAD = "Retain this architecture digest", REUSE = "Verify retained original image digest";
+const SOURCE_JOB = "Authenticate completed release", SOURCE_STEP = "Read original completed publication", SOURCE_PREFIX = "Bamboo Docker source: ";
+const IMAGE_STEPS = [SELECT, "Copy authenticated binary and Host originals", BUILD, SMOKE, PUSH, UPLOAD];
 const positive = value => { assert.match(String(value), /^[1-9][0-9]*$/); assert.ok(Number.isSafeInteger(Number(value))); return Number(value); };
 const safeEnv = () => Object.fromEntries(["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SystemRoot"].filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
 function command(program, args, options = {}) {
@@ -129,6 +134,9 @@ function output(name, value) { assert.ok(!String(value).includes("\n")); fs.appe
 function selected(facts) { return { source: facts.source.revision, version: facts.release.version, releaseRun: facts.controller.runId, publisher: facts.controller.revision, releaseId: facts.release.id }; }
 async function stage() {
   const platform = process.env.DOCKER_PLATFORM, triple = target(platform), state = await authenticated();
+  const execution = await consumerExecution(state, "image"); passed(step(execution.current, SELECT));
+  assert.ok(!imageHistory(execution.jobs, execution.run, platform, execution.run.run_attempt).physical, "Stage cannot replace an original image");
+  await noPriorCarrier(execution, platform);
   const facts = state.facts, binaryRef = facts.native.assets.find(value => value.name === sidecar.artifactName(triple)); assert.ok(binaryRef);
   const hostRef = facts.native.assets.find(value => value.name === sidecar.HOST_ASSET), manifestRef = facts.native.assets.find(value => value.name === sidecar.MANIFEST);
   assert.ok(hostRef && manifestRef); const manifest = JSON.parse(await original(state.reads, manifestRef));
@@ -166,6 +174,7 @@ test -s /data/frontend/.frontend-manifest.json`]];
 }
 async function smoke() {
   const state = await authenticated(), image = imageReference(process.env.DOCKER_IMAGE);
+  const execution = await consumerExecution(state, "image"); passed(step(execution.current, BUILD));
   assert.equal(image, candidateImage(process.env.GITHUB_RUN_ID, process.env.GITHUB_RUN_ATTEMPT, process.env.DOCKER_PLATFORM));
   const commands = smokeCommands(image, state.facts.release.version);
   const version = command("docker", commands[0]).trim(); assert.equal(version, "bamboo " + state.facts.release.version);
@@ -178,17 +187,6 @@ function digestRecord(value, facts, platform) {
 }
 function digestFile(run, attempt, platform) {
   assert.ok(PLATFORMS.includes(platform)); return `docker-digest-${positive(run)}-${positive(attempt)}-${platform.slice(6)}.json`;
-}
-function readDigests(facts) {
-  const directory = path.join(process.env.RUNNER_TEMP, "docker-digests"), records = [];
-  for (const name of fs.readdirSync(directory)) {
-    assert.match(name, /^docker-digest-[1-9][0-9]*-[1-9][0-9]*-(?:amd64|arm64)\.json$/);
-    const file = path.join(directory, name), info = fs.lstatSync(file); assert.ok(info.isFile() && !info.isSymbolicLink() && info.size > 0 && info.size <= 4096);
-    const record = digestRecord(JSON.parse(fs.readFileSync(file)), facts);
-    assert.match(name, new RegExp("^docker-digest-" + positive(process.env.GITHUB_RUN_ID) + "-[1-9][0-9]*-" + record.platform.slice(6) + "\\.json$")); records.push(record);
-  }
-  assert.equal(records.length, 2, "Both original architecture digests are required; ambiguous or missing evidence stops");
-  assert.deepEqual(records.map(value => value.platform).sort(), [...PLATFORMS].sort()); return records;
 }
 function manifestReport(value, records) {
   assert.match(value.digest, DIGEST); assert.equal(value.manifests.length, 2);
@@ -210,23 +208,185 @@ function publicationTags(facts, value) {
   return tags;
 }
 function verifyLatest(before, after) { assert.deepEqual(latestIdentity(after), latestIdentity(before), "Official latest Release changed during Docker publication"); }
+function step(job, name) { const rows = (job.steps || []).filter(value => value.name === name); assert.equal(rows.length, 1, "Missing/ambiguous Docker step: " + name); return rows[0]; }
+function passed(value) { assert.equal(value.status, "completed"); assert.equal(value.conclusion, "success"); }
+function skipped(value) { assert.equal(value.status, "completed"); assert.equal(value.conclusion, "skipped"); }
+function jobHeader(job, run) {
+  positive(job.id); positive(job.run_attempt); assert.ok(job.run_attempt <= run.run_attempt);
+  assert.equal(job.run_id, run.id); assert.equal(job.head_sha, run.head_sha); assert.equal(job.head_branch, run.head_branch);
+}
+function consumerSuite(run, suite, exactController) {
+  source.checkedJSON(suite); assert.equal(suite.databaseId, run.check_suite_id);
+  assert.equal(suite.repository.databaseId, 1164779771); assert.equal(suite.repository.nameWithOwner, sidecar.REPOSITORY);
+  assert.equal(suite.app.databaseId, 15368); assert.equal(suite.app.slug, "github-actions"); assert.equal(suite.commit.oid, run.head_sha);
+  assert.equal(suite.workflowRun.databaseId, run.id); assert.equal(suite.workflowRun.workflow.databaseId, run.workflow_id);
+  assert.equal(suite.workflowRun.event, run.event); assert.equal(suite.workflowRun.runAttempt, run.run_attempt);
+  assert.equal(suite.workflowRun.file.path, WORKFLOW); assert.equal(suite.workflowRun.file.repositoryName, sidecar.REPOSITORY);
+  if (exactController) {
+    assert.equal(run.head_sha, exactController, "Unproven prior controller metadata role; stop for Ops");
+    assert.equal(suite.workflowRun.file.repositoryFileUrl, `https://github.com/${sidecar.REPOSITORY}/blob/${exactController}/${WORKFLOW}`);
+  }
+}
+async function consumerExecution(state, role) {
+  const env = process.env; assert.equal(env.GITHUB_JOB, role, "Actual job key must match CLI phase");
+  const { get, paged } = source.sourceReads(state.reads, {}), run = await get("actions/runs/" + positive(env.GITHUB_RUN_ID));
+  assert.equal(run.id, positive(env.GITHUB_RUN_ID)); assert.equal(run.run_attempt, positive(env.GITHUB_RUN_ATTEMPT)); assert.equal(run.status, "in_progress");
+  assert.equal(run.repository?.id, 1164779771); assert.equal(run.repository.full_name, sidecar.REPOSITORY);
+  assert.equal(run.head_repository?.id, 1164779771); assert.equal(run.head_repository.full_name, sidecar.REPOSITORY);
+  assert.equal(run.event, env.GITHUB_EVENT_NAME); assert.equal(run.path, WORKFLOW); assert.match(run.head_sha, SHA);
+  const workflow = await get("actions/workflows/" + positive(run.workflow_id)); assert.equal(workflow.id, run.workflow_id); assert.equal(workflow.path, WORKFLOW);
+  consumerSuite(run, await state.reads.checkSuite(run.check_suite_node_id));
+  // API head metadata and job headers bind each other. Executed D is the actual
+  // fixed-rerun GITHUB_WORKFLOW_SHA + ordinary clean checkout, not renamed X.
+  const jobs = await paged(`actions/runs/${run.id}/jobs?filter=all`, "jobs"); jobs.forEach(job => jobHeader(job, run));
+  const name = role === "image" ? "Repackage originals (" + process.env.DOCKER_PLATFORM + ")" : role === "source" ? SOURCE_JOB : "Publish complete multi-arch manifest";
+  const current = jobs.filter(job => job.name === name && job.run_attempt === run.run_attempt); assert.equal(current.length, 1); assert.equal(current[0].status, "in_progress");
+  return { get, paged, run, jobs, current: current[0] };
+}
+function sourceLine(state, consumerRun) {
+  return SOURCE_PREFIX + Buffer.from(core.canonicalJson({ ...selected(state.facts), consumerRun, controller: state.controller })).toString("base64");
+}
+function sourceLocator(log, run, physical) {
+  assert.ok(typeof log === "string" && Buffer.byteLength(log) <= 64 * 1024 * 1024);
+  const lines = log.split(/\r?\n/).filter(line => /^\d{4}-\d\d-\d\dT\S+Z /.test(line) && line.slice(line.indexOf(" ") + 1).startsWith(SOURCE_PREFIX)); assert.equal(lines.length, 1, "Missing/ambiguous original consumer source locator");
+  passed(step(physical, SOURCE_STEP)); const time = Date.parse(lines[0].split(" ")[0]), selectedStep = step(physical, SOURCE_STEP);
+  const second = value => Math.floor(Date.parse(value) / 1000);
+  assert.ok(Number.isFinite(time) && second(selectedStep.started_at) <= Math.floor(time / 1000) && Math.floor(time / 1000) <= second(selectedStep.completed_at));
+  const encoded = lines[0].slice(lines[0].indexOf(SOURCE_PREFIX) + SOURCE_PREFIX.length); assert.ok(encoded.length <= 4096 && /^[A-Za-z0-9+/]+={0,2}$/.test(encoded));
+  const bytes = Buffer.from(encoded, "base64"), value = JSON.parse(bytes.toString("utf8")); assert.equal(bytes.toString("base64"), encoded); assert.equal(core.canonicalJson(value), bytes.toString("utf8"));
+  assert.deepEqual(Object.keys(value).sort(), ["source", "version", "releaseRun", "publisher", "releaseId", "consumerRun", "controller"].sort());
+  assert.equal(value.consumerRun, run.id); positive(value.releaseRun); positive(value.releaseId); core.assertVersion(value.version);
+  for (const key of ["source", "publisher", "controller"]) assert.match(value[key], SHA); return value;
+}
+async function crossRunGuard(state, context) {
+  const publisher = await context.get("actions/runs/" + state.input.releaseRun); assert.equal(publisher.id, state.input.releaseRun); assert.ok(Number.isFinite(Date.parse(publisher.created_at)));
+  const currentTime = Date.parse(context.run.created_at); assert.ok(Number.isFinite(currentTime));
+  const runs = await context.paged(`actions/workflows/${context.run.workflow_id}/runs?created=${encodeURIComponent(publisher.created_at + ".." + context.run.created_at)}`, "workflow_runs");
+  for (const run of runs.filter(value => value.id !== context.run.id)) {
+    const time = Date.parse(run.created_at); assert.ok(Number.isFinite(time));
+    if (time > currentTime || time === currentTime && run.id > context.run.id) continue; // queued later consumers cannot become this run's origin
+    assert.equal(run.workflow_id, context.run.workflow_id); assert.equal(run.repository?.id, 1164779771); assert.equal(run.path, WORKFLOW);
+    const jobs = await context.paged(`actions/runs/${positive(run.id)}/jobs?filter=all`, "jobs"); jobs.forEach(job => jobHeader(job, run));
+    if (jobs.length && jobs.every(job => job.status === "completed" && job.conclusion === "skipped")) continue;
+    const family = jobs.filter(job => job.name === SOURCE_JOB && source.executionKey(job));
+    const origin = family.sort((a,b) => a.run_attempt - b.run_attempt)[0];
+    const locator = origin ? sourceLocator(await state.reads.jobLog(origin.id), run, origin) : null;
+    assert.ok(!locator || locator.releaseRun !== state.input.releaseRun && locator.releaseId !== state.facts.release.id &&
+      !(locator.source === state.facts.source.revision && locator.version === state.facts.release.version), "This formal output already has consumer run " + run.id + "; resume that original run");
+    // A foreign self-described locator cannot authorize another assembly. Only
+    // an official same-D executed file can prove this is a different release.
+    assert.ok(locator && locator.controller === state.controller && run.head_sha === state.controller, "Unknown prior consumer output; restore original run " + run.id);
+    consumerSuite(run, await state.reads.checkSuite(run.check_suite_node_id), state.controller);
+  }
+}
+async function freshConsumer(context, phaseStep) {
+  const fresh = await context.get("actions/runs/" + context.run.id);
+  for (const key of ["id", "run_attempt", "workflow_id", "head_sha", "head_branch", "path", "event", "check_suite_id", "check_suite_node_id"]) assert.deepEqual(fresh[key], context.run[key], "Consumer changed before registry write");
+  assert.equal(fresh.status, "in_progress"); const job = await context.get("actions/jobs/" + context.current.id); jobHeader(job, fresh);
+  assert.equal(job.id, context.current.id); assert.equal(job.run_attempt, fresh.run_attempt); assert.equal(job.status, "in_progress"); assert.equal(step(job, phaseStep).status, "in_progress");
+}
+function imageHistory(jobs, run, platform, beforeAttempt = run.run_attempt + 1, final = false) {
+  assert.ok(PLATFORMS.includes(platform)); const name = "Repackage originals (" + platform + ")";
+  const family = jobs.filter(job => job.name === name && job.run_attempt < beforeAttempt); family.forEach(job => jobHeader(job, run));
+  assert.equal(new Set(family.map(job => job.run_attempt)).size, family.length, "Ambiguous architecture attempt");
+  const latest = [...family].sort((a,b) => b.run_attempt - a.run_attempt)[0]; if (final) { assert.ok(latest); passed(latest); }
+  const originals = new Map();
+  for (const job of family) {
+    assert.equal(job.status, "completed", "Prior assembly is active/unknown");
+    const build = step(job, BUILD);
+    if (build.conclusion === "success") {
+      passed(job); for (const name of IMAGE_STEPS) passed(step(job, name));
+      const key = native.executionKey(job); if (!originals.has(key) || job.run_attempt < originals.get(key).run_attempt) originals.set(key, job);
+    } else {
+      for (const name of [SMOKE, PUSH, UPLOAD]) skipped(step(job, name));
+      assert.ok(build.status === "completed" && ["failure", "skipped"].includes(build.conclusion), "Unknown/cancelled assembly cannot retry");
+      assert.equal(step(job, REUSE).status, "completed"); assert.ok(["success", "failure", "skipped", "cancelled"].includes(step(job, REUSE).conclusion));
+      if (step(job, REUSE).conclusion === "success") { passed(job); passed(step(job, SELECT)); skipped(build); }
+    }
+  }
+  assert.ok(originals.size <= 1, "A second physical image assembly cannot replace originals"); const physical = [...originals.values()][0];
+  if (family.some(job => step(job, REUSE).conclusion !== "skipped")) assert.ok(physical, "Recorded reuse lost its original physical image; never reassemble");
+  if (physical) for (const job of family) if (step(job, BUILD).conclusion !== "success") skipped(step(job, BUILD));
+  if (final) assert.ok(physical, "Successful logical image has no original physical carrier");
+  if (final && step(latest, BUILD).conclusion !== "success") { passed(step(latest, SELECT)); passed(step(latest, REUSE)); for (const name of IMAGE_STEPS.slice(1)) skipped(step(latest, name)); }
+  return { latest, physical };
+}
+const DIGEST_ZIP_READER = String.raw`import io,stat,sys,zipfile
+raw=sys.stdin.buffer.read(65537); assert 0<len(raw)<=65536
+with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+ items=archive.infolist(); assert len(items)==1
+ item=items[0]; assert item.filename==sys.argv[1] and not item.is_dir() and not item.flag_bits&1
+ assert stat.S_IFMT(item.external_attr>>16) in (0,stat.S_IFREG) and 0<item.file_size<=4096
+ data=archive.read(item); assert len(data)==item.file_size
+ sys.stdout.write(data.decode('utf-8'))`;
+function decodeCarrier(bytes, filename, facts, platform) {
+  return digestRecord(JSON.parse(command("python3", ["-I", "-c", DIGEST_ZIP_READER, filename], { input: bytes, maxBuffer: 4096 })), facts, platform);
+}
+async function readCarrier(state, context, platform, physical) {
+  const direct = await context.get("actions/jobs/" + physical.id); assert.equal(source.fingerprint(direct), source.fingerprint(physical)); assert.equal(direct.run_attempt, physical.run_attempt);
+  const name = `docker-digest-${context.run.id}-${physical.run_attempt}-${PLATFORMS.indexOf(platform)}`;
+  const all = await context.paged(`actions/runs/${context.run.id}/artifacts`, "artifacts"), matches = all.filter(value => value.name === name); assert.equal(matches.length, 1, "Original digest carrier missing/ambiguous; never reassemble");
+  const artifact = matches[0]; assert.equal(artifact.expired, false); assert.match(artifact.digest, DIGEST); positive(artifact.id);
+  assert.ok(Number.isSafeInteger(artifact.size_in_bytes) && artifact.size_in_bytes > 0 && artifact.size_in_bytes <= 65536);
+  assert.equal(artifact.workflow_run?.id, context.run.id); assert.equal(artifact.workflow_run.head_sha, context.run.head_sha); assert.equal(artifact.workflow_run.head_branch, context.run.head_branch);
+  const upload = step(physical, UPLOAD), second = value => Math.floor(Date.parse(value) / 1000);
+  assert.ok(Number.isFinite(second(artifact.created_at)) && second(upload.started_at) <= second(artifact.created_at) && second(artifact.created_at) <= second(upload.completed_at));
+  const bytes = Buffer.from(await state.reads.artifactBytes(artifact.id, artifact.size_in_bytes)); assert.equal(bytes.length, artifact.size_in_bytes); assert.equal("sha256:" + core.sha256(bytes), artifact.digest);
+  const record = decodeCarrier(bytes, digestFile(context.run.id, physical.run_attempt, platform), state.facts, platform);
+  const fields = value => [value.id, value.name, value.expired, value.size_in_bytes, value.digest, value.created_at, value.workflow_run];
+  assert.deepEqual(fields(await context.get("actions/artifacts/" + artifact.id)), fields(artifact));
+  const fresh = await context.get("actions/jobs/" + physical.id); assert.equal(fresh.run_attempt, physical.run_attempt);
+  assert.equal(source.fingerprint(fresh), source.fingerprint(physical)); return record;
+}
+function remoteDigest(record) {
+  const value = JSON.parse(command("docker", ["buildx", "imagetools", "inspect", "--format", "{{json .Manifest}}", IMAGE + "@" + record.digest])); assert.equal(value.digest, record.digest);
+}
+async function noPriorCarrier(context, platform) {
+  assert.ok(PLATFORMS.includes(platform)); const pattern = new RegExp("^docker-digest-" + positive(context.run.id) + "-[1-9][0-9]*-" + PLATFORMS.indexOf(platform) + "$");
+  const artifacts = await context.paged(`actions/runs/${context.run.id}/artifacts`, "artifacts");
+  assert.ok(!artifacts.some(value => pattern.test(value.name)), "An orphan/expired original carrier exists; never reassemble without physical proof");
+}
+async function selectImage(state, verifyRemote = false) {
+  const context = await consumerExecution(state, "image"), platform = process.env.DOCKER_PLATFORM;
+  if (!verifyRemote) assert.equal(step(context.current, SELECT).status, "in_progress");
+  else { assert.equal(step(context.current, REUSE).status, "in_progress"); for (const name of ["Copy authenticated binary and Host originals", BUILD, SMOKE]) skipped(step(context.current, name)); }
+  await crossRunGuard(state, context); const history = imageHistory(context.jobs, context.run, platform, context.run.run_attempt);
+  if (!history.physical) { assert.equal(verifyRemote, false, "No original image exists"); await noPriorCarrier(context, platform); output("mode", "build"); return; }
+  const record = await readCarrier(state, context, platform, history.physical);
+  if (verifyRemote) remoteDigest(record); output("mode", "reuse"); output("digest", record.digest);
+}
 async function main() {
   const [phase] = process.argv.slice(2); assert.equal(process.argv.length, 3);
   if (phase === "stage") return stage(); if (phase === "smoke") return smoke();
   const state = await authenticated(), facts = state.facts;
-  if (phase === "source" || phase === "guard") { output("release_run", state.input.releaseRun); output("source", facts.source.revision); output("version", facts.release.version); return; }
+  if (phase === "source") {
+    const context = await consumerExecution(state, "source"); await crossRunGuard(state, context);
+    output("release_run", state.input.releaseRun); output("source", facts.source.revision); output("version", facts.release.version);
+    console.log(sourceLine(state, context.run.id)); return;
+  }
+  if (phase === "select" || phase === "reuse") return selectImage(state, phase === "reuse");
   if (phase === "push") {
+    const context = await consumerExecution(state, "image"); for (const name of [SELECT, BUILD, SMOKE]) passed(step(context.current, name));
+    await crossRunGuard(state, context);
     const platform = process.env.DOCKER_PLATFORM; target(platform);
     const image = candidateImage(process.env.GITHUB_RUN_ID, process.env.GITHUB_RUN_ATTEMPT, platform); assert.equal(process.env.DOCKER_IMAGE, image);
     // Fresh real completed-source proof above is immediately before the write.
+    await freshConsumer(context, PUSH);
     command("docker", ["push", image], { timeout: 15 * 60000 });
     const references = JSON.parse(command("docker", ["image", "inspect", "--format", "{{json .RepoDigests}}", image]));
     const matching = references.filter(value => value.startsWith(IMAGE + "@")); assert.equal(matching.length, 1);
     const record = digestRecord({ ...selected(facts), platform, digest: matching[0].slice(IMAGE.length + 1) }, facts);
     fs.writeFileSync(path.join(process.env.RUNNER_TEMP, digestFile(process.env.GITHUB_RUN_ID, process.env.GITHUB_RUN_ATTEMPT, platform)), JSON.stringify(record) + "\n", { flag: "wx" }); return;
   }
-  assert.equal(phase, "publish"); const records = readDigests(facts), versionTag = IMAGE + ":v" + facts.release.version;
+  assert.equal(phase, "publish"); const context = await consumerExecution(state, "merge"), records = [];
+  await crossRunGuard(state, context);
+  for (const platform of PLATFORMS) {
+    const original = imageHistory(context.jobs, context.run, platform, context.run.run_attempt + 1, true).physical;
+    const record = await readCarrier(state, context, platform, original); remoteDigest(record); records.push(record);
+  }
+  const versionTag = IMAGE + ":v" + facts.release.version;
   const latest = await state.reads.json("releases/latest"), tags = publicationTags(facts, latest);
+  await freshConsumer(context, "Recheck source and publish both architectures together");
   command("docker", ["buildx", "imagetools", "create", ...tags.flatMap(tag => ["--tag", tag]), ...records.map(value => IMAGE + "@" + value.digest)], { timeout: 5 * 60000 });
   verifyLatest(latest, await state.reads.json("releases/latest"));
   // Use Buildx's descriptor digest, not a hash of CLI-formatted JSON/newlines.
@@ -235,5 +395,7 @@ async function main() {
   if (tags.includes(IMAGE + ":latest")) assert.equal(manifestReport(inspect(IMAGE + ":latest"), records), digest);
   output("image", IMAGE + "@" + digest);
 }
-module.exports = { RUNTIME, IMAGE, PLATFORMS, safeEnv, eventRun, locate, target, verifyBytes, original, hostFiles, elfReport, imageReference, candidateImage, digestFile, smokeCommands, digestRecord, readDigests, manifestReport, latestIdentity, publicationTags, verifyLatest, authenticated };
+module.exports = { RUNTIME, IMAGE, PLATFORMS, SELECT, BUILD, SMOKE, PUSH, UPLOAD, REUSE, SOURCE_JOB, SOURCE_STEP, SOURCE_PREFIX,
+  safeEnv, eventRun, locate, target, verifyBytes, original, hostFiles, elfReport, imageReference, candidateImage, digestFile, smokeCommands, digestRecord,
+  manifestReport, latestIdentity, publicationTags, verifyLatest, consumerSuite, consumerExecution, freshConsumer, sourceLine, sourceLocator, crossRunGuard, imageHistory, decodeCarrier, readCarrier, noPriorCarrier, authenticated };
 if (require.main === module) main().catch(error => { console.error("Published Docker consumer: " + error.message); process.exitCode = 1; });
