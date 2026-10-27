@@ -7537,6 +7537,26 @@ impl Storage for SessionStoreV2 {
         self.management_history(supervisor, target_session_id).await
     }
 
+    async fn is_supervisor_observer_child(
+        &self,
+        parent: &Session,
+        child_id: &str,
+    ) -> io::Result<bool> {
+        self.observer_classification(parent, child_id).await
+    }
+
+    async fn supervisor_observer_activation(&self, child: &Session) -> io::Result<bool> {
+        self.observer_activation(child).await
+    }
+
+    async fn load_supervisor_observer_context_target(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<(Session, bamboo_domain::SupervisorObserverContext)> {
+        self.observer_context_target(caller, target_id).await
+    }
+
     async fn load_supervisor_context_target(
         &self,
         supervisor: &bamboo_domain::SupervisorReference,

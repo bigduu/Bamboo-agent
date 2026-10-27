@@ -966,14 +966,35 @@ impl ChildSessionAdapter {
     /// The parent's currently-active (non-terminal) children, derived from the
     /// session index (single source of truth).
     pub async fn active_child_ids(&self, parent_session_id: &str) -> Vec<String> {
-        self.storage
+        let active = self
+            .storage
             .list_child_run_statuses(parent_session_id)
             .await
             .unwrap_or_default()
             .into_iter()
             .filter(|(_, status)| !status.as_deref().is_some_and(is_terminal_child_status))
             .map(|(id, _)| id)
-            .collect()
+            .collect::<Vec<_>>();
+        let parent = self
+            .storage
+            .load_runtime_control_plane(parent_session_id)
+            .await
+            .ok()
+            .flatten();
+        let mut ordinary = Vec::with_capacity(active.len());
+        for id in active {
+            if let Some(parent) = &parent {
+                if matches!(
+                    self.storage.is_supervisor_observer_child(parent, &id).await,
+                    Ok(true)
+                ) {
+                    continue;
+                }
+            }
+            // An unavailable classification never removes a work obligation.
+            ordinary.push(id);
+        }
+        ordinary
     }
 
     /// The subset of `candidates` the session index POSITIVELY reports as

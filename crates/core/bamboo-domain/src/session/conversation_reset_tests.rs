@@ -101,6 +101,7 @@ fn source(supervisor: bool) -> Session {
         let project = ProjectId::parse("reset-project").unwrap();
         session.supervisor_management = Some(SupervisorManagementState {
             schema_version: 1,
+            observers: Default::default(),
             incarnation_id: incarnation,
             revision: 3,
             allowed_projects: [project.clone()].into(),

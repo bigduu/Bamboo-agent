@@ -111,11 +111,37 @@ fn codex_base_url(
 /// Composite router that delegates to the first matching external child runner.
 pub struct CompositeExternalChildRunner {
     runners: Vec<Arc<dyn ExternalChildRunner>>,
+    store: std::sync::RwLock<Option<Arc<bamboo_storage::SessionStoreV2>>>,
 }
 
 impl CompositeExternalChildRunner {
     pub fn new(runners: Vec<Arc<dyn ExternalChildRunner>>) -> Self {
-        Self { runners }
+        Self {
+            runners,
+            store: Default::default(),
+        }
+    }
+
+    async fn check_observer_route(&self, session: &bamboo_domain::Session) -> Result<(), String> {
+        use bamboo_domain::Storage;
+        let store = self
+            .store
+            .read()
+            .map_err(|_| "Child store lock is poisoned")?
+            .clone();
+        if let Some(store) = store {
+            if store
+                .supervisor_observer_activation(session)
+                .await
+                .map_err(|error| error.to_string())?
+                && !self.supports_native_ticket_budget()
+            {
+                return Err(
+                    "registered Observers require the supported native-only backend".into(),
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -148,6 +174,7 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
         run_id: &str,
         cancel: CancellationToken,
     ) -> Result<Option<Arc<dyn bamboo_domain::RuntimeSessionPersistence>>, String> {
+        self.check_observer_route(session).await?;
         for runner in &self.runners {
             if runner.should_handle(session).await {
                 return runner
@@ -252,6 +279,9 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
         event_tx: mpsc::Sender<AgentEvent>,
         cancel_token: CancellationToken,
     ) -> crate::runtime::runner::Result<()> {
+        self.check_observer_route(session)
+            .await
+            .map_err(AgentError::LLM)?;
         for runner in &self.runners {
             if runner.should_handle(session).await {
                 return runner
@@ -322,6 +352,9 @@ impl ExternalChildRunner for CompositeExternalChildRunner {
     }
 
     fn set_actor_directory_store(&self, store: Option<Arc<bamboo_storage::SessionStoreV2>>) {
+        if let Ok(mut current) = self.store.write() {
+            *current = store.clone();
+        }
         for runner in &self.runners {
             runner.set_actor_directory_store(store.clone());
         }

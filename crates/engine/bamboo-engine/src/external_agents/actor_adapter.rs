@@ -7148,6 +7148,12 @@ async fn ensure_active_nested_wait(
     creation: &bamboo_subagent::proto::ChildCreationIdentity,
     plain_input: Option<&PlainActorActivation>,
 ) -> Result<bool, AgentError> {
+    fn is_terminal_status(status: &str) -> bool {
+        matches!(
+            status,
+            "completed" | "error" | "timeout" | "cancelled" | "skipped"
+        )
+    }
     use bamboo_agent_core::storage::Storage;
     use bamboo_agent_core::tools::{ToolCtx, ToolOutcome};
 
@@ -7172,21 +7178,23 @@ async fn ensure_active_nested_wait(
         return Ok(true);
     }
 
-    let active = store
+    let statuses = store
         .list_child_run_statuses(child_id)
         .await
-        .map_err(|error| AgentError::LLM(format!("nested child status scan failed: {error}")))?
-        .into_iter()
-        .filter(|(_, status)| {
-            !status.as_deref().is_some_and(|status| {
-                matches!(
-                    status,
-                    "completed" | "error" | "timeout" | "cancelled" | "skipped"
-                )
-            })
-        })
-        .map(|(id, _)| id)
-        .collect::<Vec<_>>();
+        .map_err(|error| AgentError::LLM(format!("nested child status scan failed: {error}")))?;
+    let mut active = Vec::new();
+    for (id, status) in statuses {
+        if !status.as_deref().is_some_and(is_terminal_status)
+            && !store
+                .is_supervisor_observer_child(&caller, &id)
+                .await
+                .map_err(|error| {
+                    AgentError::LLM(format!("nested Observer classification failed: {error}"))
+                })?
+        {
+            active.push(id);
+        }
+    }
     if active.is_empty() {
         return Ok(false);
     }
@@ -7238,21 +7246,26 @@ async fn ensure_active_nested_wait(
     {
         return Ok(true);
     }
-    let still_active = store
+    let statuses = store
         .list_child_run_statuses(child_id)
         .await
         .map_err(|error| {
             AgentError::LLM(format!("nested child wait verification failed: {error}"))
-        })?
-        .into_iter()
-        .any(|(_, status)| {
-            !status.as_deref().is_some_and(|status| {
-                matches!(
-                    status,
-                    "completed" | "error" | "timeout" | "cancelled" | "skipped"
-                )
-            })
-        });
+        })?;
+    let mut still_active = false;
+    for (id, status) in statuses {
+        if !status.as_deref().is_some_and(is_terminal_status)
+            && !store
+                .is_supervisor_observer_child(&latest, &id)
+                .await
+                .map_err(|error| {
+                    AgentError::LLM(format!("nested Observer classification failed: {error}"))
+                })?
+        {
+            still_active = true;
+            break;
+        }
+    }
     if still_active {
         return Err(AgentError::LLM(
             "nested child remains active without a durable parent wait".into(),
