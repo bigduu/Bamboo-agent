@@ -7,6 +7,7 @@ on:
       - 'crates/app/bamboo-server/src/app_state/supervisor_epic_acceptance_tests.rs'
       - 'crates/app/bamboo-server/src/app_state/mod.rs'
       - 'crates/core/bamboo-domain/src/session/tool_authority.rs'
+      - 'crates/engine/bamboo-engine/src/runtime/runner/loop_execution/pipeline.rs'
       - 'crates/infra/bamboo-storage/src/v2/supervisor_management.rs'
       - 'crates/app/bamboo-server-tools/src/session_inspector/**'
       - '.github/workflows/supervisor-epic-acceptance.yml'
@@ -69,6 +70,28 @@ jobs:
           workspaces: . -> target/grouped-default
           save-if: false
 
+      - name: Verify inherited Supervisor journal and new-orphan deferral
+        shell: bash
+        run: |
+          set -euo pipefail
+          for case in \
+            partial_child_outcome_can_drive_tool_work_before_resuspending_exact_inherited_wait \
+            supervisor_new_orphan_wait_keeps_terminal_reply_deferred; do
+            target="runtime::runner::loop_execution::pipeline::tests::$case"
+            cargo test --locked -p bamboo-engine --lib -- "$target" --exact --test-threads=1 --color=never \
+              2>&1 | tee "$RUNNER_TEMP/epic-$case.log"
+            TEST_NAME="$target" TEST_LOG="$RUNNER_TEMP/epic-$case.log" python3 - <<'PY'
+          import os, pathlib, re
+          log = pathlib.Path(os.environ['TEST_LOG']).read_text()
+          binaries = re.findall(r'^\s*Running unittests [^\n]*\(([^()\n]+)\)\s*$', log, re.M)
+          assert len(binaries) == 1 and re.fullmatch(r'bamboo_engine-[0-9a-f]+', pathlib.Path(binaries[0]).name), binaries
+          names = re.findall(r'^test ([\w:]+) \.\.\. ok$', log, re.M)
+          assert names == [os.environ['TEST_NAME']], names
+          summaries = re.findall(r'^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;', log, re.M)
+          assert summaries == [('1', '0', '0')], summaries
+          PY
+          done
+
       - name: Run the complete original seven-row native composition
         shell: bash
         run: |
@@ -89,11 +112,11 @@ jobs:
           print('All original seven composition rows ran in the exact nonempty native fixture')
           PY
 
-      - name: Check the affected Host library under the original lint policy
+      - name: Check affected engine and Host libraries under the original lint policy
         shell: bash
         run: |
           set -euo pipefail
-          cargo clippy --locked --all-features --lib -p bamboo-server -- \
+          cargo clippy --locked --all-features --lib -p bamboo-engine -p bamboo-server -- \
             -D warnings -A deprecated -A clippy::module_inception \
             -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args \
             -A clippy::too-many-arguments -A clippy::while-let-loop \
