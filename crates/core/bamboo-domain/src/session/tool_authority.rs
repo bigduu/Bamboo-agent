@@ -126,6 +126,15 @@ pub enum RootToolAuthorityError {
 }
 
 impl Session {
+    /// A trusted Supervisor's delegation-only business authority is independent
+    /// of thinking mode. Callers still need Storage's canonical identity proof.
+    /// Legacy Standard starts at zero; keep every existing positive binding
+    /// revision unchanged rather than rebinding active Work on migration.
+    pub fn supervisor_orchestration_revision(&self) -> Option<u64> {
+        self.supervisor_incarnation_id()
+            .map(|_| self.root_tool_authority_revision.max(1))
+    }
+
     pub fn root_thinking_mode(&self) -> RootThinkingMode {
         RootThinkingMode::from_enabled(self.root_orchestration_only_enabled())
     }

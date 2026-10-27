@@ -1,5 +1,7 @@
 //! One canonical Supervisor relationship writer. No target mutation or registry.
 
+#[path = "supervisor_current_user.rs"]
+mod current_user;
 #[path = "observer_subscriptions.rs"]
 pub(super) mod subscriptions;
 
@@ -819,10 +821,9 @@ impl SessionStoreV2 {
             self.management_supervisor_locked(reference).await?;
             return self.load_session_unlocked(target_id).await;
         }
-        // This guard retains caller, link, Project and exact target lifetime
-        // validation through the complete physical read and overlay checks.
-        let _guard = self.lock_supervisor_followup(reference, target_id).await?;
-        self.load_session_unlocked(target_id).await
+        self.current_user_supervisor_history(reference, target_id)
+            .await
+            .map(Some)
     }
 
     pub(super) async fn management_context(
@@ -830,30 +831,8 @@ impl SessionStoreV2 {
         reference: &SupervisorReference,
         target_id: &str,
     ) -> io::Result<(Session, SupervisorLinkObservation)> {
-        let _guard = self.lock_supervisor_followup(reference, target_id).await?;
-        let current = self.management_supervisor_locked(reference).await?;
-        let state = current
-            .supervisor_management
-            .ok_or_else(|| denied("Supervisor scope missing"))?;
-        let link = state
-            .links
-            .get(target_id)
-            .cloned()
-            .ok_or_else(|| denied("Supervisor link missing"))?;
-        let target = self
-            .load_root_authority_unchecked(target_id)
-            .await?
-            .ok_or_else(|| denied("context view target disappeared"))?;
-        Ok((
-            target,
-            SupervisorLinkObservation {
-                supervisor: reference.clone(),
-                state_revision: state.revision,
-                target_session_id: target_id.to_owned(),
-                link: Some(link),
-                authorized: true,
-            },
-        ))
+        self.current_user_supervisor_context(reference, target_id)
+            .await
     }
 
     pub(super) async fn supervisor_orchestration_job(
@@ -867,10 +846,7 @@ impl SessionStoreV2 {
         let task = self.lock_runtime_task_sidecar_shared().await?;
         let sessions = self.management_session_locks(None).await?;
         let current = self.management_supervisor_locked(reference).await?;
-        if !current.root_orchestration_only_enabled()
-            || expected_revision == 0
-            || current.root_tool_authority_revision != expected_revision
-        {
+        if current.supervisor_orchestration_revision() != Some(expected_revision) {
             return Err(denied("Supervisor orchestration authority changed"));
         }
         let guards = Arc::new(SupervisorManagementGuards {
@@ -1329,47 +1305,8 @@ impl SessionStoreV2 {
         reference: &SupervisorReference,
         target_id: &str,
     ) -> io::Result<SupervisorLinkObservation> {
-        reference_is_valid(reference)?;
-        target_id_is_valid(target_id)?;
-        let _lifecycle = self.lock_session_lifecycle_shared().await?;
-        let _task = self.lock_runtime_task_sidecar_shared().await?;
-        // Revoked links remain observable even when their target is corrupt or
-        // deleted. Only an enabled link needs a canonical Root lock location;
-        // an absent preflight can report unauthorized, never grant a later
-        // replacement that appeared without belonging to the final lock set.
-        let enabled = {
-            let _supervisor = self
-                .acquire_session_maintenance_lock(&reference.session_id)
-                .await?;
-            self.management_supervisor_locked(reference)
-                .await?
-                .supervisor_management
-                .as_ref()
-                .and_then(|state| state.links.get(target_id))
-                .is_some_and(|link| link.enabled)
-        };
-        let target_present = enabled && self.preview_management_root(target_id).await?;
-        let _sessions = self
-            .management_root_session_locks(target_present.then_some(target_id))
-            .await?;
-        let current = self.management_supervisor_locked(reference).await?;
-        let state = current
-            .supervisor_management
-            .unwrap_or_else(|| empty_state(reference.incarnation_id));
-        let link = state.links.get(target_id).cloned();
-        let mut authorized = false;
-        if let Some(link) = link.as_ref().filter(|link| link.enabled && target_present) {
-            if let Some(target) = self.load_root_authority_unchecked(target_id).await? {
-                authorized = link_authorizes_target(&state, link, &target);
-            }
-        }
-        Ok(SupervisorLinkObservation {
-            supervisor: reference.clone(),
-            state_revision: state.revision,
-            target_session_id: target_id.to_string(),
-            link,
-            authorized,
-        })
+        self.current_user_supervisor_link(reference, target_id)
+            .await
     }
 }
 
