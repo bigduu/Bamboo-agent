@@ -84,6 +84,7 @@ impl LLMProvider for BlockingCompletedProvider {
 /// successor call.
 struct SuccessorRecordingProvider {
     calls: Arc<AtomicUsize>,
+    successor_call: usize,
     expected_message_id: String,
     successor_seen: Arc<Notify>,
     successor_match_count: Arc<AtomicUsize>,
@@ -143,12 +144,12 @@ impl LLMProvider for SuccessorRecordingProvider {
             .iter()
             .filter(|message| message.id == self.expected_message_id)
             .count();
-        if call == 1 {
+        if call < self.successor_call {
             assert_eq!(
                 matches, 0,
-                "terminal-race message must not reach the first provider run"
+                "queued message must not reach a provider before its successor"
             );
-        } else if call == 2 {
+        } else if call == self.successor_call {
             self.successor_match_count.store(matches, Ordering::SeqCst);
             self.successor_seen.notify_one();
         }
@@ -2256,6 +2257,7 @@ async fn terminal_delivery_runs_only_in_one_real_successor_execution() {
     let provider: Arc<dyn LLMProvider> = Arc::new(SuccessorRecordingProvider {
         calls: provider_calls.clone(),
         expected_message_id: message_id.clone(),
+        successor_call: 2,
         successor_seen: successor_seen.clone(),
         successor_match_count: successor_match_count.clone(),
     });
@@ -2433,6 +2435,7 @@ async fn legacy_boundary_checkpoint_failure_still_runs_one_successor() {
     let provider: Arc<dyn LLMProvider> = Arc::new(SuccessorRecordingProvider {
         calls: provider_calls.clone(),
         expected_message_id: legacy_id.clone(),
+        successor_call: 1,
         successor_seen: successor_seen.clone(),
         successor_match_count: successor_match_count.clone(),
     });
@@ -2453,7 +2456,9 @@ async fn legacy_boundary_checkpoint_failure_still_runs_one_successor() {
     )
     .await
     .expect("first run must complete after the injected checkpoint failure");
-    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    // The failed durable checkpoint leaves the claim recoverable and must not
+    // dispatch an empty prompt before the single retained successor.
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
 
     // The compatibility source is already CAS-cleared, while the typed claim
     // remains the sole recoverable copy. The boundary's observed generation
@@ -2518,7 +2523,7 @@ async fn legacy_boundary_checkpoint_failure_still_runs_one_successor() {
     })
     .await
     .expect("successor must finalize");
-    assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
     assert_eq!(harness.reservations.load(Ordering::SeqCst), 1);
     let settled = harness
         .storage
