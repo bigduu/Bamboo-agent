@@ -16,6 +16,7 @@ on:
       - 'crates/app/bamboo-server/src/app_state/builder.rs'
       - 'crates/app/bamboo-server/src/app_state/mod.rs'
       - 'crates/app/bamboo-server/src/app_state/wake_reconciler.rs'
+      - 'crates/engine/bamboo-engine/src/runtime/runner/state_bridge.rs'
       - '.github/workflows/observer-subscriptions.yml'
 
 permissions:
@@ -81,18 +82,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -p bamboo-domain -p bamboo-server --lib -- \
-            observer_subscription session::supervisor_management::tests:: --test-threads=1 --color=never \
+          cargo test --locked -p bamboo-domain -p bamboo-engine -p bamboo-server --lib -- \
+            observer_subscription session::supervisor_management::tests:: \
+            state_bridge::tests::inbox_checkpoint_failure_rolls_back_memory_and_leaves_claim_recoverable \
+            state_bridge::tests::non_typed_transcript_id_collision_never_acks_the_typed_claim \
+            state_bridge::tests::concurrent_durable_id_collision_after_claim_never_acks \
+            state_bridge::tests::concurrent_durable_typed_body_mismatch_after_claim_never_acks \
+            state_bridge::tests::permanent_receipt_without_typed_transcript_proof_leaves_cur_recoverable \
+            --test-threads=1 --color=never \
             2>&1 | tee "$RUNNER_TEMP/subscription-tests.log"
           python3 - <<'PY'
           import os, pathlib, re
           log = (pathlib.Path(os.environ['RUNNER_TEMP']) / 'subscription-tests.log').read_text()
           runs = list(re.finditer(r'^\s*Running unittests [^\n]*\(([^()\n]+)\)\s*$', log, re.M))
-          assert len(runs) == 2, [r.group(1) for r in runs]
+          assert len(runs) == 3, [r.group(1) for r in runs]
           results = {}
           for index, run in enumerate(runs):
               binary = pathlib.Path(run.group(1)).name
-              package = re.fullmatch(r'bamboo_(domain|server)-[0-9a-f]+', binary)
+              package = re.fullmatch(r'bamboo_(domain|engine|server)-[0-9a-f]+', binary)
               assert package, binary
               package = package.group(1)
               assert package not in results, package
@@ -104,7 +111,15 @@ jobs:
               names = set(re.findall(r'^test ([\w:]+) \.\.\. ok$', section, re.M))
               assert len(names) == passed, (package, passed, names)
               results[package] = names
-          assert set(results) == {'domain', 'server'}, results
+          assert set(results) == {'domain', 'engine', 'server'}, results
+          boundary = {
+              'inbox_checkpoint_failure_rolls_back_memory_and_leaves_claim_recoverable',
+              'non_typed_transcript_id_collision_never_acks_the_typed_claim',
+              'concurrent_durable_id_collision_after_claim_never_acks',
+              'concurrent_durable_typed_body_mismatch_after_claim_never_acks',
+              'permanent_receipt_without_typed_transcript_proof_leaves_cur_recoverable',
+          }
+          assert results['engine'] == {f'runtime::runner::state_bridge::tests::{name}' for name in boundary}, results['engine']
           window = {n for n in results['domain'] if n.startswith('observer_subscription::tests::')}
           assert len(window) == 6
           assert results['domain'] - window == {'session::supervisor_management::tests::supervisor_management_public_serde_is_legacy_compatible_and_children_drop_state'}
@@ -127,7 +142,7 @@ jobs:
           }
           expected |= {f'app_state::observer_subscriptions::tests::fault::{name}' for name in faults}
           assert results['server'] == expected, results['server'] ^ expected
-          print('Six canonical windows, exact legacy serde, seven subscription and five fault Host fixtures passed')
+          print('Six canonical windows, exact legacy serde, five fail-closed Inbox regressions, seven subscription and five fault Host fixtures passed')
           PY
 
       - name: Check affected production libraries under the original lint policy
@@ -138,7 +153,7 @@ jobs:
             -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
             -A clippy::too-many-arguments -A clippy::while-let-loop
             -A clippy::type_complexity -A dead-code)
-          cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-storage \
+          cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-engine -p bamboo-storage \
             -p bamboo-server-tools -p bamboo-server -- "${policy[@]}" \
             2>&1 | tee "$RUNNER_TEMP/subscription-clippy.log"
 

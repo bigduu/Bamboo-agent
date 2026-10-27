@@ -373,7 +373,7 @@ impl PlanStore {
         Some((hashes as u8, title.to_string()))
     }
 
-    fn index_plan_sections(session_id: &str, content: &str) -> PlanSectionArtifact {
+    pub fn index_plan_sections(session_id: &str, content: &str) -> PlanSectionArtifact {
         let lines: Vec<&str> = content.lines().collect();
         let mut sections = Vec::new();
         let mut heading_indices = Vec::new();

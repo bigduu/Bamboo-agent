@@ -672,11 +672,16 @@ fn typed_child_resume_message(
     let inspection = serde_json::json!({
         "intent":"inspect", "target":completion.child_session_id, "message":"result",
     });
+    let hint = if projection["view"] == "planner_artifact" {
+        "For an available planner artifact call Plan with its read object to list sections, then add section_id to read only needed text. This plan grants no execution approval.".to_string()
+    } else {
+        format!("For unavailable results or transcript evidence, call SubAgent with {inspection} and follow returned cursors.")
+    };
     let mut message = Message::user(format!(
         "Runtime notification: child session `{}` finished with status `{}`. Remaining child sessions: {}.\n\n\
          Child typed result:\n{}\n\n\
          Resume the parent task. Child-reported evidence and verification are claims, not host-certified facts. \
-         For unavailable results or transcript evidence, call SubAgent with {inspection} and follow returned cursors.",
+         {hint}",
         completion.child_session_id, completion.status, remaining_children, projection,
     ));
     message.metadata = Some(serde_json::json!({
@@ -1377,9 +1382,26 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             } else {
                 SessionActivationPolicy::InterruptSpecificWait
             };
-            let mut typed_result = loaded_child
-                .as_ref()
-                .and_then(|child| sealed_child_report(&completion, child, &parent));
+            let mut typed_result = if let Some(child) = loaded_child.as_ref() {
+                match super::child_session::planner_artifact::publish_completion(
+                    &self.app_data_dir,
+                    &completion,
+                    child,
+                    &parent,
+                )
+                .await
+                {
+                    Ok(Some(projection)) => Some(projection),
+                    Ok(None) => sealed_child_report(&completion, child, &parent),
+                    Err(error) => {
+                        tracing::warn!(%error, child_session_id = %child.id,
+                            "planner artifact publication failed; leaving wait armed");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let mut resume_message = if let Some(projection) = typed_result.as_mut() {
                 let message =
                     typed_child_resume_message(&completion, remaining_children, projection);
@@ -1609,7 +1631,24 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                             .as_ref()
                             .and_then(|source| source.result(&sibling, &parent));
                         let mut typed_result =
-                            sealed_child_report(&sibling_completion, &sibling, &parent);
+                            match super::child_session::planner_artifact::publish_completion(
+                                &self.app_data_dir,
+                                &sibling_completion,
+                                &sibling,
+                                &parent,
+                            )
+                            .await
+                            {
+                                Ok(Some(projection)) => Some(projection),
+                                Ok(None) => {
+                                    sealed_child_report(&sibling_completion, &sibling, &parent)
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, %child_id,
+                                    "sibling planner artifact publication failed; leaving wait armed");
+                                    return;
+                                }
+                            };
                         let mut presentation = if let Some(projection) = typed_result.as_ref() {
                             typed_child_resume_message(
                                 &sibling_completion,
@@ -4370,6 +4409,172 @@ mod tests {
             completed_at: child.updated_at,
             source: ChildCompletionSource::from_committed_session(child),
         }
+    }
+
+    fn planner_test_child(parent: &Session, id: &str) -> Session {
+        let mut report = typed_test_report();
+        report["plan_markdown"] = serde_json::json!("# Plan\n## Selected\nPLANNER_SECTION_ONLY\n## Appendix\nLARGE_PLANNER_BODY_MUST_STAY_OUT_OF_RESUME");
+        let mut child = typed_test_child(parent, id, &report.to_string());
+        child.set_subagent_type("planner");
+        child.metadata.insert(
+            super::super::child_session::planner_artifact::CONTRACT_KEY.into(),
+            "1".into(),
+        );
+        child
+            .agent_runtime_state
+            .get_or_insert_with(Default::default)
+            .read_only = true;
+        ChildCompletionSource::prepare(&mut child, "native-planner-report", &Default::default());
+        child
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_artifact_completion_publishes_before_durable_resume_and_deduplicates() {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        save_waiting_test_parent(
+            &store,
+            "plan-parent",
+            vec!["plan-child".into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let mut parent = store.load_session("plan-parent").await.unwrap().unwrap();
+        parent.add_message(Message::user("Original selected source"));
+        store.save_session(&parent).await.unwrap();
+        let child = planner_test_child(&parent, "plan-child");
+        store.save_session(&child).await.unwrap();
+        let completion = typed_test_completion(&child);
+        coordinator.on_child_completed(completion.clone()).await;
+        coordinator.on_child_completed(completion).await;
+        let claims = inbox.claim(&parent.id, 8).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        let message = claims[0].envelope.to_provider_message().unwrap();
+        assert!(message.content.contains("planner_artifact"));
+        assert!(!message
+            .content
+            .contains("LARGE_PLANNER_BODY_MUST_STAY_OUT_OF_RESUME"));
+        assert!(fits_child_result_budget(&claims[0].envelope));
+        let raw = message
+            .content
+            .split_once("Child typed result:\n")
+            .unwrap()
+            .1
+            .lines()
+            .next()
+            .unwrap();
+        let projection: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(projection["execution_approved"], false);
+        let path = store
+            .bamboo_home_dir()
+            .join(projection["file"].as_str().unwrap());
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains("PLANNER_SECTION_ONLY"));
+        let restored = store.load_session(&parent.id).await.unwrap().unwrap();
+        assert_eq!(restored.kind, parent.kind);
+        assert_eq!(restored.root_thinking_mode(), parent.root_thinking_mode());
+        assert_eq!(
+            restored
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .permission_mode,
+            parent.agent_runtime_state.as_ref().unwrap().permission_mode
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_artifact_terminal_sibling_recovery_publishes_the_same_bounded_reference() {
+        let (_temp, store, inbox, coordinator, _, _) = completion_inbox_fixture().await;
+        save_waiting_test_parent(
+            &store,
+            "plan-recovery",
+            vec!["plan-sibling".into(), "trigger-child".into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let mut parent = store.load_session("plan-recovery").await.unwrap().unwrap();
+        parent.add_message(Message::user("Original selected source"));
+        store.save_session(&parent).await.unwrap();
+        let child = planner_test_child(&parent, "plan-sibling");
+        store.save_session(&child).await.unwrap();
+        let completion =
+            save_completion_test_child(&store, &parent.id, "trigger-child", "completed").await;
+        coordinator.on_child_completed(completion).await;
+        let claims = inbox.claim(&parent.id, 8).await.unwrap();
+        assert_eq!(claims.len(), 2, "both terminal outcomes remain durable");
+        let message = claims
+            .iter()
+            .map(|c| c.envelope.to_provider_message().unwrap())
+            .find(|m| m.content.contains("planner_artifact"))
+            .unwrap();
+        assert!(!message
+            .content
+            .contains("LARGE_PLANNER_BODY_MUST_STAY_OUT_OF_RESUME"));
+        let raw = message
+            .content
+            .split_once("Child typed result:\n")
+            .unwrap()
+            .1
+            .lines()
+            .next()
+            .unwrap();
+        let projection: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert!(store
+            .bamboo_home_dir()
+            .join(projection["file"].as_str().unwrap())
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn planner_artifact_real_boot_orphan_recovery_admits_unavailable_once_without_unsealed_report(
+    ) {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        save_waiting_test_parent(
+            &store,
+            "lost-plan-parent",
+            vec!["lost-plan-child".into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let mut parent = store
+            .load_session("lost-plan-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        parent.add_message(Message::user("Original selected source"));
+        store.save_session(&parent).await.unwrap();
+        let mut child = planner_test_child(&parent, "lost-plan-child");
+        child.set_last_run_status("running");
+        child.messages.last_mut().unwrap().content = "UNSEALED_REPORT_MUST_NOT_BE_IMPORTED".into();
+        ChildCompletionSource::prepare(&mut child, "lost-worker", &Default::default());
+        child.updated_at = Utc::now() - chrono::Duration::minutes(5);
+        store.save_session(&child).await.unwrap();
+
+        // Exercise the actual boot watchdog, including canonical error save
+        // and publish_synthetic_completion(source=None), not a fabricated report.
+        coordinator.reconcile_orphans_at_boot().await;
+        coordinator.reconcile_orphans_at_boot().await;
+        let claims = inbox.claim(&parent.id, 8).await.unwrap();
+        assert_eq!(
+            claims.len(),
+            1,
+            "the lost worker must not strand the six-hour wait"
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        let message = claims[0].envelope.to_provider_message().unwrap();
+        assert!(message.content.contains("planner_artifact"));
+        assert!(message.content.contains("\"available\":false"));
+        assert!(!serde_json::to_string(&claims[0].envelope)
+            .unwrap()
+            .contains("UNSEALED_REPORT"));
+        let child = store.load_session(&child.id).await.unwrap().unwrap();
+        assert_eq!(child.last_run_status().as_deref(), Some("error"));
+        assert!(ChildCompletionSource::from_committed_session(&child).is_none());
+        assert!(!store.bamboo_home_dir().join("plan/delegated").exists());
     }
 
     fn unusable_typed_test_child(
