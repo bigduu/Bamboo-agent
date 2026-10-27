@@ -139,8 +139,16 @@ test("public Main proof authenticates earliest physical jobs when a rerun copies
 });
 test("public Main proof preserves a sealed crate from an earlier failed physical worker",async()=>{
   const f=await fixture(),old=clone(f.state.physical[1]);old.id=1999;old.conclusion="failure";old.steps[0].conclusion="failure";
-  f.state.physical[1].run_attempt=f.state.latest[1].run_attempt=2;f.state.physical.push(old);f.state.run.run_attempt=2;f.state.suite.workflowRun.runAttempt=2;
-  f.state.record.jobs[1].logical.attempt=f.state.record.jobs[1].physical.attempt=2;f.state.record.crates[0].origin.jobId=1999;
+  const current=f.state.physical[1];current.run_attempt=2;current.started_at=clock(311);current.completed_at=clock(360);
+  current.steps[0].started_at=clock(312);current.steps[0].completed_at=clock(313);f.state.latest[1]=clone(current);
+  const finalizer=clone(f.state.physical[6]);finalizer.id=2106;finalizer.run_attempt=2;finalizer.started_at=clock(400);finalizer.completed_at=clock(450);
+  finalizer.steps[0].started_at=clock(402);finalizer.steps[0].completed_at=clock(403);
+  f.state.physical[6].conclusion="skipped";f.state.physical[6].steps=[];
+  f.state.physical.push(old,finalizer);f.state.latest[6]=clone(finalizer);
+  f.state.run.run_attempt=2;f.state.run.updated_at=clock(500);f.state.suite.workflowRun.runAttempt=2;
+  f.state.record.controller.attempt=2;f.state.record.controller.finalizerJobId=2106;
+  f.state.record.jobs[1].logical.attempt=f.state.record.jobs[1].physical.attempt=2;
+  f.state.record.jobs[1].stepsSha256=hash(Buffer.from(native.executionKey(current)));f.state.record.crates[0].origin.jobId=1999;
   const result=await f.verify();assert.equal(result.crates[0].origin.jobId,1999);assert.equal(result.jobs[1].physical.attempt,2);
 });
 for(const field of ["run","assets","tag","release","frozen","jobs"])
