@@ -6,7 +6,7 @@
 //! the three duplicated `AgentLoopConfig` construction sites in the server
 //! layer (HTTP handler, spawn scheduler, schedule manager).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
@@ -18,7 +18,7 @@ use bamboo_agent_core::{AgentEvent, Role, Session};
 use bamboo_config::PermissionMode;
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::Config;
-use bamboo_llm::LLMProvider;
+use bamboo_llm::{LLMProvider, ProviderRegistry};
 use bamboo_metrics::MetricsCollector;
 use bamboo_skills::SkillManager;
 
@@ -929,10 +929,13 @@ impl AgentRuntime {
             .as_ref()
             .is_some_and(|state| state.plan_mode.is_some());
 
-        // Decompose the roster back into the loose locals the resolution logic
-        // below expects. This preserves the byte-for-byte `None → Config`
-        // fallbacks: a `None` role yields `None` name/provider exactly as the
-        // old loose fields did.
+        // Explicit SDK role overrides retain their supplied client/name seam.
+        // Unset roles use the same strict live defaults as Host consumers.
+        let explicit_roles = [
+            model_roster.fast.is_some(),
+            model_roster.background.is_some(),
+            model_roster.summarization.is_some(),
+        ];
         let fast_model = model_roster.fast_model();
         let fast_model_provider = model_roster.fast_model_provider();
         let background_model = model_roster.background_model();
@@ -947,6 +950,57 @@ impl AgentRuntime {
         } = model_roster;
         let active_provider =
             provider_name.unwrap_or_else(|| config.effective_default_provider().to_string());
+        let auxiliary_model_resolver = auxiliary_model_resolver.or_else(|| {
+            // A direct SDK client authorizes this declared account only. A
+            // different configured role needs an explicit Host resolver/client;
+            // never borrow the main client for another account's model name.
+            let registry = Arc::new(ProviderRegistry::new(
+                HashMap::from([(active_provider.clone(), llm.clone())]),
+                active_provider.clone(),
+            ));
+            let resolve = crate::model_areas::live_auxiliary_model_resolver(
+                self.config.clone(),
+                registry,
+                active_provider.clone(),
+            );
+            let overrides = AuxiliaryModelConfig {
+                fast_model_name: fast_model.clone().or_else(|| config.get_fast_model()),
+                fast_model_provider: fast_model_provider.clone(),
+                background_model_name: background_model
+                    .clone()
+                    .or_else(|| config.get_memory_background_model()),
+                background_model_provider: background_model_provider.clone(),
+                summarization_model_name: summarization_model
+                    .clone()
+                    .or_else(|| config.get_task_summary_model()),
+                summarization_model_provider: summarization_model_provider.clone(),
+                ..Default::default()
+            };
+            let resolver: Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync> =
+                Arc::new(move || {
+                    let mut current = resolve();
+                    if explicit_roles[0] {
+                        current.fast_model_name = overrides.fast_model_name.clone();
+                        current.fast_model_provider = overrides.fast_model_provider.clone();
+                        current.fast_model_error = None;
+                    }
+                    if explicit_roles[1] {
+                        current.background_model_name = overrides.background_model_name.clone();
+                        current.background_model_provider =
+                            overrides.background_model_provider.clone();
+                        current.background_model_error = None;
+                    }
+                    if explicit_roles[2] {
+                        current.summarization_model_name =
+                            overrides.summarization_model_name.clone();
+                        current.summarization_model_provider =
+                            overrides.summarization_model_provider.clone();
+                        current.summarization_model_error = None;
+                    }
+                    current
+                });
+            Some(resolver)
+        });
         let hook_runner = inputs
             .as_ref()
             .and_then(|inputs| inputs.sdk_hook_runner())
@@ -958,6 +1012,18 @@ impl AgentRuntime {
             });
 
         let mut effective_run_budget = config.run_budget.merged_with_override(run_budget.as_ref());
+        let legacy_vision_model_resolver = image_fallback
+            .as_ref()
+            .filter(|fallback| fallback.mode == crate::ImageFallbackMode::Vision)
+            .map(|fallback| {
+                crate::runtime::runner::image_fallback::legacy_vision_resolver(
+                    config.clone(),
+                    active_provider.clone(),
+                    llm.clone(),
+                    fallback.vision_model.clone(),
+                    app_data_dir.clone(),
+                )
+            });
         if let Some(control) = loop_control.as_ref() {
             effective_run_budget.max_rounds = Some(
                 effective_run_budget
@@ -1041,6 +1107,7 @@ impl AgentRuntime {
                 merged
             },
             image_fallback,
+            legacy_vision_model_resolver,
             vision_model_resolver: Some(
                 crate::runtime::runner::image_fallback::configured_vision_resolver(
                     self.config.clone(),

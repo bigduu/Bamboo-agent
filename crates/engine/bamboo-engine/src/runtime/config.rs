@@ -1052,6 +1052,9 @@ pub struct AgentLoopConfig {
     /// non-Vision main receives scoped references instead. Only a requested
     /// ViewImage call resolves the target; it never changes the main model.
     pub(crate) vision_model_resolver: Option<super::runner::image_fallback::VisionModelResolver>,
+    /// Explicit legacy conversation conversion has a separate target port.
+    pub(crate) legacy_vision_model_resolver:
+        Option<super::runner::image_fallback::LegacyVisionModelResolver>,
     /// Feature flags controlling prompt-time memory injection behavior.
     pub(crate) prompt_memory_flags: PromptMemoryFlags,
     /// Maximum tool calls allowed per round (default: 80).
@@ -1203,6 +1206,7 @@ impl Default for AgentLoopConfig {
             legacy_model_limits: None,
             image_fallback: None,
             vision_model_resolver: None,
+            legacy_vision_model_resolver: None,
             prompt_memory_flags: PromptMemoryFlags::default(),
             max_tool_calls_per_round: 80,
             max_consecutive_failures_per_tool: 3,

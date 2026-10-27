@@ -141,6 +141,7 @@ async fn execute_gold(
         goal: Some("Synthetic goal".into()),
         ..Default::default()
     });
+    request.app_data_dir = Some(dir.path().to_path_buf());
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         agent.execute(&mut session, request),
@@ -221,6 +222,75 @@ async fn entrypoint_routing_sdk_explicit_host_resolver_keeps_cross_provider_clie
 }
 
 #[tokio::test]
+async fn entrypoint_routing_sdk_default_constructor_keeps_chat_role_account_and_model() {
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+    for flag in [false, true] {
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        let sse = "data: {\"id\":\"synthetic\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"synthetic\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Synthetic completion\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+        for server in [&a, &b] {
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+                .mount(server)
+                .await;
+        }
+        let mut c = config(flag, "chat-a");
+        c.defaults.as_mut().unwrap().chat =
+            bamboo_domain::ProviderModelRef::new("chat-b", "main-b");
+        c.provider_instances.get_mut("chat-a").unwrap().base_url = Some(a.uri());
+        c.provider_instances.insert("chat-b".into(),serde_json::from_value(serde_json::json!({
+            "provider_type":"openai","enabled":true,"base_url":b.uri(),"model":"main-b","runtime_models":["main-b"],
+        })).unwrap());
+        let mut value = serde_json::to_value(&c).unwrap();
+        for id in ["chat-a", "chat-b"] {
+            value["provider_instances"][id]["api_key"] = "synthetic-no-real-key".into();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        let agent = bamboo_sdk::Agent::builder()
+            .tools(std::iter::empty())
+            .with_defaults_for_data_dir(dir.path().to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut session = agent.new_session("synthetic-default-sdk").unwrap();
+        session.add_message(Message::user("Synthetic constructor routing witness"));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.run_session(&mut session),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let requests_a = a
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.body_json::<serde_json::Value>().unwrap()["model"].clone())
+            .collect::<Vec<_>>();
+        let requests_b = b
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.body_json::<serde_json::Value>().unwrap()["model"].clone())
+            .collect::<Vec<_>>();
+        let expected = if flag {
+            (Vec::new(), vec![serde_json::json!("main-b")])
+        } else {
+            (vec![serde_json::json!("main-a")], Vec::new())
+        };
+        assert_eq!((requests_a, requests_b), expected, "flag={flag}");
+    }
+}
+
+#[tokio::test]
 async fn entrypoint_routing_legacy_image_transform_keeps_configured_vision_account() {
     use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
     let server = MockServer::start().await;
@@ -258,12 +328,13 @@ async fn entrypoint_routing_legacy_image_transform_keeps_configured_vision_accou
     session.add_message(user);
     let (tx, mut rx) = mpsc::channel(256);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let request =
+    let mut request =
         ExecuteRequestBuilder::new("Inspect synthetic pixel", tx, CancellationToken::new())
             .model("main-a")
             .provider_name("chat-a")
             .image_fallback(fallback)
             .build();
+    request.app_data_dir = Some(dir.path().to_path_buf());
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
         agent.execute(&mut session, request),

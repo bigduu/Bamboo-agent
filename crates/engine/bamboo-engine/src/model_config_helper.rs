@@ -791,7 +791,19 @@ pub fn resolve_image_fallback(
     };
 
     let vision_model = if mode == ImageFallbackMode::Vision {
-        config_snapshot.get_vision_model()
+        config_snapshot
+            .defaults
+            .as_ref()
+            .map(|defaults| {
+                defaults
+                    .vision
+                    .as_ref()
+                    .or(defaults.fast.as_ref())
+                    .unwrap_or(&defaults.chat)
+                    .model
+                    .clone()
+            })
+            .or_else(|| config_snapshot.get_vision_model())
     } else {
         None
     };
