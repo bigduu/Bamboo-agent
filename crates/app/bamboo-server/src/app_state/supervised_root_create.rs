@@ -188,9 +188,9 @@ impl SupervisedRootCreator {
         let _claim = self.operations.lock(&digest).await.map_err(|error| {
             ToolError::Execution(format!("creation claim unavailable: {error}"))
         })?;
-        let mut existing = if authority.is_host() {
-            // Exact Host operation truth is never expired/pruned by a retry.
-            // Its reserved birth must survive process restart and grant rotation.
+        let mut existing = if authority.retains_operation() {
+            // An observed caller's exact operation truth is never expired by a
+            // retry. Its reserved birth survives restart and grant rotation.
             self.operations.load_for_status(&digest).await
         } else {
             self.operations.load_claimed(&digest).await
@@ -216,14 +216,13 @@ impl SupervisedRootCreator {
                 ));
             }
         }
-        if authority.is_host() {
+        if authority.retains_operation() {
             if let Some(operation) = existing
                 .as_mut()
                 .filter(|record| record.expires_at.is_some())
             {
-                // A genuine Supervisor can retain the same operation when an
-                // explicit Host scope replaces its legacy route. Pin that
-                // already validated receipt before any terminal early return.
+                // The original executing caller and operation payload were
+                // validated above. Pin that receipt before any terminal return.
                 operation.expires_at = None;
                 self.operations.save(operation).await.map_err(|error| {
                     ToolError::Execution(format!(
@@ -402,9 +401,9 @@ impl SupervisedRootCreator {
             "activation_pending" | "activation_retry_required"
         ) {
             operation.mark_succeeded();
-            if authority.is_host() {
-                // Host operation identity is permanent even when a grant or
-                // conversation rotates. Never make a missing receipt a new op.
+            if authority.retains_operation() {
+                // Observed operation identity is permanent even when a grant
+                // or conversation rotates. Missing receipts are not new ops.
                 operation.expires_at = None;
             }
         }

@@ -528,13 +528,28 @@ async fn damaged_receipt_cannot_attach_a_historical_root_and_expiry_cannot_alloc
     let blocked = f.create(f.request.clone()).await;
     assert!(!blocked.success);
     assert_eq!(value(blocked)["code"], "operation_identity_conflict");
+    let observation = f
+        .creator
+        .store
+        .inspect_supervisor_link(&f.supervisor, &historical.id)
+        .await
+        .unwrap();
     assert!(
-        !f.creator
-            .store
-            .inspect_supervisor_link(&f.supervisor, &historical.id)
-            .await
-            .unwrap()
-            .authorized
+        observation.authorized,
+        "the current-user Root stays visible, without adopting it as this operation's target"
+    );
+    assert!(observation.link.is_none());
+    assert_eq!(
+        serde_json::to_value(
+            f.creator
+                .store
+                .load_session(&historical.id)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&historical).unwrap()
     );
     assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
 

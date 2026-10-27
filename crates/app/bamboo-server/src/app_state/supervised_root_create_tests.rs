@@ -442,15 +442,37 @@ async fn work_bound_supervisor_chat_case(standard: bool, stable_message_id: bool
             .unwrap();
         f.state.sessions.remove(&original.id);
     }
-    let before = service.published().unwrap();
     let scope = f.state.tickets.status().await;
     assert_eq!(scope["availability"]["kind"], "ready");
     if standard {
         assert_eq!(scope["availability"]["reason_code"], "scope_ready");
         let input_before = f.state.session_inbox.inspect(&original.id).await.unwrap();
-        let denied = test::call_service(&app, test::TestRequest::post().uri("/api/v1/chat").peer_addr("127.0.0.1:12345".parse().unwrap()).set_json(json!({"session_id":original.id,"message":"Formal Work reply stays gated", "model":"supervisor-private-model", "thread_id":"work-only-thread"})).to_request()).await;
-        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-        let _: Value = test::read_body_json(denied).await;
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let threaded = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/chat")
+                .peer_addr("127.0.0.1:12345".parse().unwrap())
+                .set_json(json!({
+                    "session_id": original.id,
+                    "message_id": message_id,
+                    "message": "Record this authenticated Work input",
+                    "model": "supervisor-private-model",
+                    "thread_id": "work-only-thread"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(threaded.status(), StatusCode::CREATED);
+        let threaded_receipt: Value = test::read_body_json(threaded).await;
+        assert_eq!(threaded_receipt["message_id"], message_id);
+        let published = service.published().unwrap();
+        let ingress = published.1.resolutions[&message_id]
+            .ingress
+            .as_ref()
+            .unwrap();
+        assert_eq!(ingress.thread_id.as_deref(), Some("work-only-thread"));
+        assert_eq!(ingress.text, "Record this authenticated Work input");
         assert_eq!(
             f.state
                 .session_inbox
@@ -458,10 +480,10 @@ async fn work_bound_supervisor_chat_case(standard: bool, stable_message_id: bool
                 .await
                 .unwrap()
                 .generation,
-            input_before.generation
+            input_before.generation + 1
         );
-        assert_eq!(service.published().unwrap().0, before.0);
     }
+    let before = service.published().unwrap();
     let mut chat = json!({
         "session_id": original.id,
         "message": "Coordinate an independent Root without submitting Work",
@@ -547,7 +569,7 @@ async fn work_bound_supervisor_chat_case(standard: bool, stable_message_id: bool
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[actix_web::test]
-async fn work_bound_standard_supervisor_admits_plain_root_chat_without_work_authority() {
+async fn work_bound_standard_supervisor_distinguishes_plain_chat_from_formal_ingress() {
     work_bound_supervisor_chat_case(true, false).await;
 }
 
@@ -559,6 +581,6 @@ async fn work_bound_ultra_supervisor_retains_formal_ingress_and_independent_root
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[actix_web::test]
-async fn work_bound_standard_supervisor_keeps_native_message_identity_without_work_reference() {
+async fn work_bound_standard_supervisor_keeps_native_message_identity_for_plain_chat() {
     work_bound_supervisor_chat_case(true, true).await;
 }
