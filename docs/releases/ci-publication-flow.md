@@ -51,8 +51,10 @@ promotion.
 Use the existing release allocator, credentials and recovery mechanisms. Keep
 publishing credentials out of test and build children that do not need them.
 If infrastructure fails, retain successful outputs and retry only the missing
-work with the same source/version. A product fix goes through a feature branch
-and a new `dev` acceptance before a new release cut.
+work with the same source/version. If a crate build may have started but its
+original archive and signed checksum cannot be confirmed, stop for recovery;
+do not rebuild it. A product fix goes through a feature branch and a new `dev`
+acceptance before a new release cut.
 
 ## Main and consumers
 
@@ -69,9 +71,19 @@ same frozen source. Retried image jobs reuse their verified candidate digests.
 ## Rollout and historical releases
 
 Land the feature and release workflow changes through the normal reviewed PR
-flow. Update the Main workflow controls before the first release using the new
-path. Until then, the installed legacy workflow remains active; do not assume a
-staged branch has changed production behavior.
+flow. During the first cutover, Main may still contain the legacy Docker workflow:
+GitHub selects a `workflow_run` listener from the default branch, so the new
+listener cannot run until promotion. Once the first release is verified, invoke
+the new Docker consumer once from protected `dev`, using that release's version
+and source, then promote the frozen source to Main:
+
+```bash
+gh workflow run docker-publish.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "version=$RELEASE_VERSION" -f "source=$CUT_SHA"
+```
+
+After promotion, the Main listener starts this consumer automatically for later
+completed publishers. Do not assume a staged branch has changed Main's triggers.
 
 Keep old release tags, source identities, signed receipts and recovery inputs.
 Their original instructions remain in the [historical guide](https://github.com/bigduu/Bamboo-agent/blob/ce89b4fcf4a45014cccb3bc7f817613ddcfa7eb2/docs/releases/ci-publication-flow.md).
