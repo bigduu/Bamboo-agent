@@ -1,4 +1,5 @@
 name: Publish Docker image (GHCR)
+# BAMBOO_RELEASE_IMAGE_CONSUMER_V1
 
 # Images consume a completed release. The x64 binary is reused; Linux ARM64
 # remains a separate native target, not a second build of the x64 binary.

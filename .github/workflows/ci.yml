@@ -1,4 +1,5 @@
 name: CI
+# BAMBOO_FEATURE_RELEASE_ROUTE_V1
 
 on:
   workflow_dispatch:
