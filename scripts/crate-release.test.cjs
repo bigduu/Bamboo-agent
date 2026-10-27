@@ -11,7 +11,8 @@ const { assertVersion, assertManualVersion, validateSource, validateReceipt, nex
   readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration, verifyRegistrySource, highestStableVersion,
   command, spawnCommand, assertCurrentMain, currentMainWrite, createPreparation, validatePreparation,
   resumePrepared, assertAdmissionCompatibility, nativeOriginalContract, sourceDispatchContract,
-  readFrozenSourceContext, makeFrozenSourceContext } = require('./crate-release.cjs')
+  readFrozenSourceContext, makeFrozenSourceContext, preserveFrontendOriginals, validateFrontendOriginals,
+  preparationInput, SOURCE_PREPARATION_KIND, SOURCE_PREPARATION_FILE, MAX_SOURCE_PREPARATION } = require('./crate-release.cjs')
 
 test('Raw2358 Source factory keeps original ANSI logs on its fixed bounded text port', async () => {
   const log = '2026-10-27T00:00:00Z \u001b[32mphysical feature log\u001b[0m\r\n', calls = []
@@ -103,6 +104,96 @@ const completedReceipt = (version, revision) => makeReceipt({ version,
 const preparationIdentity = { repository: identity.repository, sourceRevision, sourceTree: '1'.repeat(40),
   workflowRevision: '2'.repeat(40), runId: '123', runAttempt: 1, version: '2026.10.8', ciRun: null }
 const featureCiRun = 'https://github.com/bigduu/Bamboo-agent/actions/runs/100'
+const frontendOriginals = receipt => ({ schemaVersion: 1, complete: true, assets: [
+  { assetId: 101, name: 'frontend-manifest.json', sizeBytes: 1, sha256: receipt.frontendBytes.manifestSha256 },
+  { assetId: 102, name: 'lotus-frontend.zip', sizeBytes: 1, sha256: receipt.frontendBytes.archiveSha256 }] })
+
+function originalFrontendFixture() {
+  const bytes = [Buffer.from('original wrapper'), Buffer.from('original ZIP; no compression in this fixture')]
+  const receipt = makeReceipt({ sourceDispatch: sourceDispatchContract(dispatchFacts(), preparationIdentity.runId), ciRun: featureCiRun,
+    frontendBytes: { manifestSha256: sha256(bytes[0]), archiveSha256: sha256(bytes[1]) } })
+  const assets = [], stored = new Map(), writes = [], saves = []
+  const options = { receipt, bytes, listAssets: async () => assets.map(value => ({ ...value })),
+    readAsset: async id => Buffer.from(stored.get(id)), upload: async (name, value) => {
+      writes.push(name); const id = 100 + assets.length
+      assets.push({ id, name, size: value.length, state: 'uploaded', digest: `sha256:${sha256(value)}` }); stored.set(id, Buffer.from(value))
+    }, saveReceipt: async () => { saves.push(clone(receipt.frontendOriginals)) } }
+  return { options, assets, stored, writes, saves }
+}
+test('2344 frontend persists original IDs and retries only an unfinished missing asset without clobber', async () => {
+  const f = originalFrontendFixture(), upload = f.options.upload
+  f.options.upload = async (name, bytes) => { if (name === 'lotus-frontend.zip') throw Error('transient'); return upload(name, bytes) }
+  await assert.rejects(preserveFrontendOriginals(f.options), /transient/)
+  const first = clone(f.options.receipt.frontendOriginals.assets[0])
+  f.options.upload = upload; await preserveFrontendOriginals(f.options)
+  assert.deepEqual(f.writes, ['frontend-manifest.json', 'lotus-frontend.zip'])
+  assert.deepEqual(f.options.receipt.frontendOriginals.assets[0], first)
+  const before = clone(f.options.receipt.frontendOriginals)
+  await preserveFrontendOriginals({ ...f.options, sealed: true })
+  assert.deepEqual(f.options.receipt.frontendOriginals, before); assert.equal(f.writes.length, 2)
+})
+test('2344 frontend adopts exact unknown-response bytes but refuses lost, replaced or changed successful originals', async () => {
+  const f = originalFrontendFixture(), upload = f.options.upload
+  f.options.upload = async (...args) => { await upload(...args); throw Error('unknown response') }
+  await preserveFrontendOriginals(f.options); validateFrontendOriginals(f.options.receipt.frontendOriginals, f.options.receipt, true)
+  for (const scenario of ['lost', 'replaced', 'bytes']) {
+    const original = f.assets[0], saved = Buffer.from(f.stored.get(original.id))
+    if (scenario === 'lost') f.assets.shift()
+    if (scenario === 'replaced') f.assets[0] = { ...original, id: 999 }
+    if (scenario === 'bytes') f.stored.set(original.id, Buffer.from('changed'))
+    await assert.rejects(preserveFrontendOriginals(f.options))
+    if (scenario === 'lost') f.assets.unshift(original)
+    else f.assets[0] = original
+    f.stored.set(original.id, saved); assert.equal(f.writes.length, 2)
+  }
+})
+test('2344 Source file carrier retains original physical attempt with a small locator and rejects unsafe or forged data', t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-preparation-file-')))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const directory = path.join(root, 'bamboo-prepared-frontend'); fs.mkdirSync(directory)
+  const file = path.join(directory, SOURCE_PREPARATION_FILE)
+  // This is a transport-only data fixture, never Source/HMAC admission.
+  const preparation = { runId: '123', runAttempt: 1, receipt: { sourceDispatch: {}, retainedEvidence: 'x'.repeat(80 * 1024) } }
+  const bytes = Buffer.from(canonicalJson(preparation)); fs.writeFileSync(file, bytes)
+  const locator = { schemaVersion: 1, kind: SOURCE_PREPARATION_KIND, runId: '123', runAttempt: 1, sha256: sha256(bytes) }
+  const env = { RUNNER_TEMP: root, GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '2', PREPARED_RELEASE: JSON.stringify(locator) }
+  assert.ok(bytes.length > 64 * 1024 && bytes.length < MAX_SOURCE_PREPARATION)
+  assert.ok(Buffer.byteLength(env.PREPARED_RELEASE) < 512)
+  assert.deepEqual(preparationInput(env), preparation); assert.equal(preparationInput(env).runAttempt, 1)
+  for (const change of [{ runId: '124' }, { runAttempt: 3 }, { sha256: '0'.repeat(64) }, { unknown: true }]) {
+    assert.throws(() => preparationInput({ ...env, PREPARED_RELEASE: JSON.stringify({ ...locator, ...change }) }))
+  }
+  const pretty = Buffer.from(JSON.stringify(preparation, null, 2)); fs.writeFileSync(file, pretty)
+  assert.throws(() => preparationInput({ ...env, PREPARED_RELEASE: JSON.stringify({ ...locator, sha256: sha256(pretty) }) }), /canonical/)
+  const invalidUtf8 = Buffer.from(bytes); invalidUtf8[invalidUtf8.indexOf('xxxx')] = 255; fs.writeFileSync(file, invalidUtf8)
+  assert.throws(() => preparationInput({ ...env, PREPARED_RELEASE: JSON.stringify({ ...locator, sha256: sha256(invalidUtf8) }) }), /canonical/)
+  fs.writeFileSync(file, Buffer.alloc(MAX_SOURCE_PREPARATION + 1)); assert.throws(() => preparationInput(env))
+  fs.writeFileSync(file, bytes); const other = path.join(root, 'other.json'); fs.writeFileSync(other, bytes)
+  fs.rmSync(file); fs.symlinkSync(other, file); assert.throws(() => preparationInput(env))
+  assert.throws(() => preparationInput({ ...env, PREPARED_RELEASE: JSON.stringify(preparation) }), /original file carrier/)
+  const old = { receipt: { automatic: true } }; assert.deepEqual(preparationInput({ PREPARED_RELEASE: JSON.stringify(old) }), old)
+})
+test('2344 Source frontend accepts only the matching third file while historical carriers still require exactly two files', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-preparation-frontend-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const bytes = [Buffer.from('wrapper'), Buffer.from('original frontend zip')]
+  const hashes = { manifestSha256: sha256(bytes[0]), archiveSha256: sha256(bytes[1]) }
+  for (const [index, name] of ['frontend-manifest.json', 'lotus-frontend.zip'].entries()) fs.writeFileSync(path.join(root, name), bytes[index])
+  const sidecar = require('./sidecar-release.cjs'), old = makeReceipt({ frontendBytes: hashes })
+  const legacy = createPreparation({ release: release(old), receipt: old }, preparationIdentity, 2)
+  assert.equal(sidecar.preparedFrontend(preparationIdentity, { preparation: legacy, contractVersion: 2, inputDirectory: root }).files.length, 2)
+  const marker = sourceDispatchContract(dispatchFacts(), preparationIdentity.runId)
+  const receipt = makeReceipt({ frontendBytes: hashes, sourceDispatch: marker, ciRun: featureCiRun, nativeOriginals: nativeOriginalContract(preparationIdentity) })
+  receipt.frontendOriginals = frontendOriginals(receipt); signReceipt(receipt, signingKey)
+  const own = { ...preparationIdentity, sourceDispatch: marker, ciRun: featureCiRun }
+  const preparation = createPreparation({ release: release(receipt), receipt }, own, 2)
+  assert.throws(() => sidecar.preparedFrontend(own, { preparation, contractVersion: 2, inputDirectory: root }))
+  fs.writeFileSync(path.join(root, SOURCE_PREPARATION_FILE), canonicalJson(preparation))
+  assert.equal(sidecar.preparedFrontend(own, { preparation, contractVersion: 2, inputDirectory: root }).files.length, 2)
+  assert.throws(() => sidecar.preparedFrontend(preparationIdentity, { preparation: legacy, contractVersion: 2, inputDirectory: root }), /exactly/)
+  fs.writeFileSync(path.join(root, SOURCE_PREPARATION_FILE), 'another snapshot')
+  assert.throws(() => sidecar.preparedFrontend(own, { preparation, contractVersion: 2, inputDirectory: root }), /another preparation/)
+})
 
 function dispatchFacts() {
   return { schemaVersion: 2, kind: 'bamboo-frozen-source-context/v2', publicationAuthorized: false,
@@ -153,6 +244,7 @@ test('source dispatch preparation retains its discriminator and refuses the lega
   const sourceDispatch = sourceDispatchContract(dispatchFacts(), preparationIdentity.runId)
   const marker = nativeOriginalContract(preparationIdentity)
   const current = fixture({ sourceDispatch, ciRun: featureCiRun, nativeOriginals: marker }), allocated = await plan(current.context)
+  allocated.receipt.frontendOriginals = frontendOriginals(allocated.receipt); signReceipt(allocated.receipt, signingKey)
   const ownIdentity = { ...preparationIdentity, ciRun: featureCiRun, sourceDispatch, version: allocated.receipt.version }
   const prepared = createPreparation(allocated, ownIdentity, 2)
   assert.deepEqual(prepared.sourceDispatch, sourceDispatch)
@@ -1162,7 +1254,7 @@ test('trusted manual publication and automatic receipts share a queue while dry 
   assert.match(workflow, /workflow_run:\n    workflows: \[CI\]\n    types: \[completed\]\n    branches: \[main\]/)
   assert.match(workflow, /group: bamboo-crate-publication\n  queue: max\n  cancel-in-progress: false/)
   assert.match(workflow, /permissions:\n  contents: read/)
-  assert.match(manual, /if: github.event_name == 'workflow_dispatch' && !inputs\.dry_run/)
+  assert.match(manual, /if: github.event_name == 'workflow_dispatch' && inputs\.release_source_contract != 'frozen-source-v2' && !inputs\.dry_run/)
   assert.match(manual, /environment: bamboo-release/)
   assert.match(manual, /GH_TOKEN: \$\{\{ github\.token \}\}/)
   assert.ok(manual.indexOf('Authorize the trusted manual') < manual.indexOf('uses: actions/checkout'))
@@ -1172,7 +1264,7 @@ test('trusted manual publication and automatic receipts share a queue while dry 
   assert.equal(manual.split('CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}').length - 1, 1)
   assert.match(manual, /if: github.event.inputs.dry_run != 'true'/)
   assert.match(manual, /cargo publish --locked --allow-dirty -p/)
-  assert.match(dry, /if: github.event_name == 'workflow_dispatch' && inputs\.dry_run/)
+  assert.match(dry, /if: github.event_name == 'workflow_dispatch' && inputs\.release_source_contract != 'frozen-source-v2' && inputs\.dry_run/)
   assert.doesNotMatch(dry, /environment:|secrets\.|cargo publish|crate-release.cjs (?:plan|publish)/)
   for (const name of ['GH_TOKEN', 'CARGO_REGISTRY_TOKEN', 'BAMBOO_RELEASE_TOKEN',
     'BAMBOO_RELEASE_SIGNING_KEY', 'BAMBOO_RELEASE_SIGNING_KEY_SHA256']) {
@@ -1189,13 +1281,16 @@ test('trusted manual publication and automatic receipts share a queue while dry 
   assert.match(automatic, /github.event_name == 'workflow_run'/)
   assert.match(automatic, /environment: bamboo-release\n    permissions:\n      contents: write/)
   assert.match(automatic, /ref: \$\{\{ steps.source.outputs.revision \}\}\n          fetch-depth: 0\n          persist-credentials: false/)
-  assert.ok(automatic.indexOf('Authorize the exact source') < automatic.indexOf('uses: actions/checkout'))
+  assert.ok(automatic.indexOf('Authorize the exact source') < automatic.indexOf('ref: ${{ steps.source.outputs.revision }}'))
+  assert.match(automatic, /name: Authorize the exact source before checkout\n        if: env\.BAMBOO_SOURCE_MODE != 'true'/)
   assert.ok(automatic.indexOf('Verify checkout matches') < automatic.indexOf('node scripts/'))
   assert.doesNotMatch(automatic, /inputs\.version/)
-  assert.doesNotMatch(automatic, /workflow_dispatch|inputs\.complete_release|accepted_ci_run/)
+  assert.match(automatic, /github.event_name == 'workflow_dispatch' && inputs\.release_source_contract == 'frozen-source-v2'/)
+  assert.ok(automatic.includes("require(path.join(C, 'crate-release.cjs')).readFrozenSourceContext()"))
+  assert.doesNotMatch(automatic, /inputs\.complete_release|accepted_ci_run|publicationAuthorized: true/)
   assert.match(automatic, /SOURCE_VALIDATION: \$\{\{ steps.source.outputs.validation \}\}/)
   for (const name of ['BAMBOO_RELEASE_TOKEN', 'BAMBOO_RELEASE_SIGNING_KEY']) {
-    assert.equal(automatic.split(`secrets.${name}`).length - 1, 3, 'Preparation plus signed crate resume and publication share existing authority')
+    assert.equal(automatic.split(`secrets.${name}`).length - 1, 5, 'Source preparation and original-crate publication retain the existing authority')
   }
   assert.doesNotMatch(workflow, /VERSION="\$\{\{ github.event.inputs.version/)
   const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8')
@@ -1211,7 +1306,7 @@ test('automatic publication grants only job-local Actions reads for its CI proof
   const permissionBlock = automatic.match(/^    permissions:\n((?:      [a-z-]+: [a-z]+\n)+)/m)?.[1]
   assert.ok(permissionBlock, 'automatic publication must declare its token permissions')
   const verify = block => assert.deepEqual(Object.fromEntries(block.trim().split('\n')
-    .map(line => line.trim().split(': '))), { contents: 'write', actions: 'read' })
+    .map(line => line.trim().split(': '))), { contents: 'write', actions: 'read', checks: 'read', 'pull-requests': 'read' })
   verify(permissionBlock)
   for (const invalid of [
     '      contents: write\n',

@@ -264,6 +264,18 @@ test("crate A preserves its real failed whole-job outcome after another crate fa
   await assert.rejects(output.readVerifiedClosure([w.expected, expected("second")], [w.state], w.ports));
 });
 
+test("2344 public crate closure keeps the authenticated original origin and registry checksum", async () => {
+  const w = world(); await output.publishCrate(w.expected, w.ports); w.finish("failure");
+  const closure = await output.readVerifiedClosure([w.expected], [w.state], w.ports);
+  assert.equal(closure.publicationAuthorized, false);
+  assert.equal(closure.crates[0].registryChecksum, hash(w.bytes));
+  assert.deepEqual(closure.crates[0].origin, w.state.origin);
+  assert.equal(closure.crates[0].originalJob.conclusion, "failure");
+  assert.equal(w.counts.prepare, 1);
+  w.ports.registryArchive = async () => Buffer.from("changed registry bytes");
+  await assert.rejects(output.readVerifiedClosure([w.expected], [w.state], w.ports), /Registry archive differs/);
+});
+
 test("registry checksum, original bytes and published disappearance cannot become a successful resume", async t => {
   for (const mode of ["checksum", "bytes", "missing-published"]) await t.test(mode, async () => {
     const w = mode === "missing-published" ? world() : await verified(world());

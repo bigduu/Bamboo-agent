@@ -292,6 +292,16 @@ function workflowIdentity(env = process.env) {
     runAttempt: Number(env.GITHUB_RUN_ATTEMPT), ciRun: (validation?.ciRun || event.workflow_run).html_url,
     ...(validation ? { validation } : {}) }
 }
+async function frozenWorkflowIdentity() {
+  const core = require('./crate-release.cjs'), facts = await core.readFrozenCheckout(), env = process.env
+  const identity = { repository: REPOSITORY, version: core.assertVersion(env.TARGET_VERSION), sourceRevision: facts.source.revision,
+    sourceTree: facts.source.tree, workflowRevision: facts.controller.revision, runId: env.GITHUB_RUN_ID,
+    runAttempt: Number(env.GITHUB_RUN_ATTEMPT), ciRun: `https://github.com/${REPOSITORY}/actions/runs/${facts.feature.runId}`,
+    sourceDispatch: core.sourceDispatchContract(facts, env.GITHUB_RUN_ID) }
+  core.validatePreparation(core.preparationInput(), identity, 2)
+  assert.equal(boundSourceContract(), 2)
+  return identity // Read-only data; the selector authenticates the actual physical preparation log.
+}
 
 function gh(route, options = {}) {
   return execute('gh', ['api', `repos/${REPOSITORY}/${route}`], options)
@@ -336,7 +346,10 @@ function preparedFrontend(identity, { preparation, contractVersion, inputDirecto
     ['frontend-manifest.json', receipt.frontendBytes.manifestSha256, 1024 * 1024],
     ['lotus-frontend.zip', receipt.frontendBytes.archiveSha256, 256 * 1024 * 1024],
   ]
-  assert.deepEqual(fs.readdirSync(inputDirectory).sort(), expected.map(([name]) => name).sort(),
+  const extra = receipt.sourceDispatch ? [require('./crate-release.cjs').SOURCE_PREPARATION_FILE] : []
+  if (extra.length) assert.equal(fileIdentity(path.join(inputDirectory, extra[0]), 192 * 1024).sha256,
+    sha256(require('./crate-release.cjs').canonicalJson(preparation)), 'Frontend carrier contains another preparation')
+  assert.deepEqual(fs.readdirSync(inputDirectory).sort(), [...expected.map(([name]) => name), ...extra].sort(),
     'Preparation transport must contain exactly the preserved frontend files')
   const files = expected.map(([name, digest, maximum]) => {
     const file = path.join(inputDirectory, name)
@@ -568,8 +581,36 @@ async function publishAssets({ directory, release, readAsset, upload, listAssets
   return { reused: false }
 }
 
+async function publishWholeSource() {
+  const core = require('./crate-release.cjs'), originals = require('./native-originals.cjs')
+  const context = await originals.createFrozenContext(core.preparationInput()), authority = context.authority
+  const initial = await authority.currentReservation()
+  assert.equal(initial.receipt.completed, true, 'Crate-only closure is not yet complete')
+  await authority.ensureFrontend(initial.release, initial.receipt, { sealed: true })
+  const jobs = await originals.wholeJobs(context)
+  const directory = path.join(process.env.RUNNER_TEMP, 'bamboo-executable-release')
+  const restored = await originals.restoreAll(context, directory)
+  const manifest = await originals.assemble(context, directory, restored)
+  const crateClosure = await core.readOriginalCrateClosure(authority, await authority.currentReservation())
+  await publishAssets({ directory, release: { ...initial.release, assets: await authority.listAssets(initial.release.id) }, contractVersion: 2, readAsset: assetBytes,
+    upload: file => context.upload(file, path.basename(file)), listAssets: () => authority.listAssets(initial.release.id) })
+  const current = await authority.currentReservation(), receiptFile = context.file('release-provenance.json')
+  fs.writeFileSync(receiptFile, `${JSON.stringify(current.receipt, null, 2)}\n`, { flag: 'wx' })
+  const receiptAsset = await originals.saveAsset(context, receiptFile, 'release-provenance.json', 1024 * 1024)
+  assert.deepEqual(await originals.wholeJobs(context), jobs)
+  await authority.publishMetadata(current.release, current.receipt, await core.shouldMakeLatest(authority, current.release, current.receipt))
+  const final = await authority.currentReservation(), assets = await authority.listAssets(final.release.id)
+  const run = await context.readRun(Number(context.identity.runId)), rows = await context.jobs()
+  const own = rows.filter(job => job.name === originals.WHOLE_JOB && job.run_attempt === context.identity.runAttempt && job.status === 'in_progress')
+  assert.equal(own.length, 1); assert.deepEqual(await originals.wholeJobs(context), jobs)
+  const record = originals.wholeCompletion({ context, fresh: { ...final, assets }, restored,
+    manifestBytes: fs.readFileSync(path.join(directory, MANIFEST)), crateClosure, receiptAsset, jobs, run, finalizer: await context.readJob(own[0].id) })
+  console.log(record.line)
+  return manifest
+}
 async function main() {
   assert.equal(process.argv[2], 'publish')
+  if (process.env.GITHUB_EVENT_NAME === 'workflow_dispatch') return publishWholeSource()
   const identity = workflowIdentity()
   const contractVersion = boundSourceContract()
   const contract = contractForVersion(contractVersion)
@@ -587,7 +628,7 @@ async function main() {
   if (receipt.nativeOriginals) {
     assert.equal(contractVersion, 2)
     const originals = require('./native-originals.cjs')
-    const context = originals.createContext(identity, JSON.parse(process.env.PREPARED_RELEASE))
+    const context = originals.createContext(identity, require('./crate-release.cjs').preparationInput())
     context.buildHost = undefined // Finalization only restores prepared bytes.
     manifest = await recoverPublishedRelease({ ...recovery, originalsOnly: true })
     if (manifest) await originals.restoreAll(context)
@@ -620,6 +661,6 @@ async function main() {
 module.exports = { REPOSITORY, MANIFEST, HOST_ASSET, PROVENANCE, TARGETS, LEGACY_TARGETS, HOST_FILES, MAX_BINARY, MAX_HOST,
   contractForVersion, sourceContractVersion, boundSourceContract,
   artifactName, targetOutputKey, sha256, fileIdentity, createBrowserHost, createManifest, manifestBytes, validateManifestV1, validateManifestV2,
-  binaryArchitecture, execute, git, workflowIdentity, publishedRelease, preparedFrontend, assetBytes,
-  validateBuildReceipt, expectedBuildBindings, assembleRelease, recoverPublishedRelease, publishAssets }
+  binaryArchitecture, execute, git, workflowIdentity, frozenWorkflowIdentity, publishedRelease, preparedFrontend, assetBytes,
+  validateBuildReceipt, expectedBuildBindings, assembleRelease, recoverPublishedRelease, publishAssets, publishWholeSource }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })

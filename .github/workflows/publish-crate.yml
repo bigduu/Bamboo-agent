@@ -9,6 +9,24 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      release_source_contract:
+        description: "legacy manual or inactive frozen-source original-output contract"
+        required: true
+        default: legacy
+        type: choice
+        options: [legacy, frozen-source-v2]
+      release_ref:
+        description: "Exact release/<accepted dev SHA> for frozen-source-v2"
+        type: string
+        default: ""
+      feature_pr:
+        description: "Confirmed protected dev PR locator"
+        type: string
+        default: ""
+      accepted_ci_run:
+        description: "Original completed feature CI run locator"
+        type: string
+        default: ""
       expected_source_sha:
         description: "Exact accepted source commit selected by the release train"
         required: true
@@ -48,10 +66,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  BAMBOO_SOURCE_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.release_source_contract == 'frozen-source-v2' }}
 
 jobs:
   manual:
-    if: github.event_name == 'workflow_dispatch' && !inputs.dry_run && !fromJSON(toJSON(github.event.inputs)).complete_release
+    if: github.event_name == 'workflow_dispatch' && inputs.release_source_contract != 'frozen-source-v2' && !inputs.dry_run && !fromJSON(toJSON(github.event.inputs)).complete_release
     runs-on: ubuntu-latest
     environment: bamboo-release
     steps:
@@ -326,7 +345,7 @@ jobs:
           echo "Published Bamboo crates for version ${TARGET_VERSION}"
 
   dry-run:
-    if: github.event_name == 'workflow_dispatch' && inputs.dry_run && !fromJSON(toJSON(github.event.inputs)).complete_release
+    if: github.event_name == 'workflow_dispatch' && inputs.release_source_contract != 'frozen-source-v2' && inputs.dry_run && !fromJSON(toJSON(github.event.inputs)).complete_release
     runs-on: ubuntu-latest
     # No Environment or publication credentials, including on feature refs.
     env:
@@ -370,31 +389,71 @@ jobs:
           EOF
           python3 scripts/compute-publish-order.py
 
-  # Complete releases have one authority and allocator identity: successful actual-main CI.
-  # Experimental release-head dispatch must not compete with its main merge publication.
+  # Legacy actual-main CI and new frozen-source dispatch keep one queue/allocator.
+  # The Source resolver's empty complete-producer registry still denies new cuts.
   automatic:
     if: >-
-      github.event_name == 'workflow_run' &&
+      (github.event_name == 'workflow_run' &&
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
-      github.event.workflow_run.repository.full_name == github.repository
+      github.event.workflow_run.repository.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_source_contract == 'frozen-source-v2')
     runs-on: ubuntu-latest
     environment: bamboo-release
     permissions:
       contents: write
       actions: read
+      checks: read
+      pull-requests: read
     outputs:
       source: ${{ steps.source.outputs.revision }}
       source_validation: ${{ steps.source.outputs.validation }}
       version: ${{ steps.version.outputs.version }}
       prepared_release: ${{ steps.version.outputs.prepared_release }}
-      executable_contract_version: ${{ steps.executable_policy.outputs.version }}
-      executable_matrix: ${{ steps.executable_policy.outputs.matrix }}
+      executable_contract_version: ${{ steps.frozen_source.outputs.contract_version || steps.executable_policy.outputs.version }}
+      executable_matrix: ${{ steps.frozen_source.outputs.matrix || steps.executable_policy.outputs.matrix }}
+      native_original_plan: ${{ steps.originals.outputs.native_original_plan }}
+    defaults:
+      run:
+        working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.release_source_contract == 'frozen-source-v2' && 'product' || '.' }}
     steps:
+      - &source-controller-checkout
+        name: Checkout the actual trusted C controller before S
+        if: env.BAMBOO_SOURCE_MODE == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: controller
+          persist-credentials: false
+      - name: Setup Source controller Node.js
+        if: env.BAMBOO_SOURCE_MODE == 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: lts/*
+      - name: Authorize the frozen accepted dev source
+        id: frozen_source
+        if: env.BAMBOO_SOURCE_MODE == 'true'
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node - <<'JS'
+          const fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict')
+          const C = path.join(process.env.GITHUB_WORKSPACE, 'controller/scripts')
+          ;(async () => {
+            const facts = await require(path.join(C, 'crate-release.cjs')).readFrozenSourceContext()
+            const sidecar = require(path.join(C, 'sidecar-release.cjs'))
+            assert.deepEqual(facts.inputs.nativeTargets, sidecar.TARGETS)
+            const os = { 'aarch64-apple-darwin': 'macos-latest', 'x86_64-pc-windows-msvc': 'windows-2025', 'x86_64-unknown-linux-gnu': 'ubuntu-22.04' }
+            const matrix = { include: sidecar.TARGETS.map(target => ({ target, os: os[target], output_key: sidecar.targetOutputKey(target) })) }
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `revision=${facts.source.revision}\ncontract_version=2\nmatrix=${JSON.stringify(matrix)}\n`)
+          })().catch(error => { console.error(error); process.exitCode = 1 })
+          JS
       - name: Authorize the exact source before checkout
-        id: source
+        if: env.BAMBOO_SOURCE_MODE != 'true'
+        id: legacy_source
         env:
           GH_TOKEN: ${{ github.token }}
           ADMISSION_MODE: publication
@@ -427,8 +486,21 @@ jobs:
           })
           PYTHON
 
+      - name: Select the independently authenticated source
+        id: source
+        working-directory: ${{ github.workspace }}
+        env:
+          REVISION: ${{ steps.frozen_source.outputs.revision || steps.legacy_source.outputs.revision }}
+          VALIDATION: ${{ steps.legacy_source.outputs.validation }}
+        run: |
+          node - <<'JS'
+          const fs = require('node:fs'), assert = require('node:assert/strict')
+          assert.match(process.env.REVISION, /^[0-9a-f]{40}$/)
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `revision=${process.env.REVISION}\nvalidation=${process.env.VALIDATION || ''}\n`)
+          JS
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          path: ${{ env.BAMBOO_SOURCE_MODE == 'true' && 'product' || '.' }}
           ref: ${{ steps.source.outputs.revision }}
           fetch-depth: 0
           persist-credentials: false
@@ -441,6 +513,7 @@ jobs:
           test -z "$(git status --porcelain --untracked-files=all)"
 
       - name: Require the complete executable policy before reserving a version
+        if: env.BAMBOO_SOURCE_MODE != 'true'
         id: executable_policy
         # Historical successful CI may be delivered after this workflow ships.
         # Select only a complete frozen v1 or v2 source contract before uploads.
@@ -498,7 +571,9 @@ jobs:
           const { execFileSync } = require('node:child_process')
           const revision = process.env.GITHUB_WORKFLOW_SHA
           if (!/^[0-9a-f]{40}$/.test(revision)) throw new Error('Missing exact workflow source')
-          const root = path.join(process.env.RUNNER_TEMP, 'bamboo-release-controller')
+          const root = process.env.BAMBOO_SOURCE_MODE === 'true' ? path.join(process.env.GITHUB_WORKSPACE, 'controller') : path.join(process.env.RUNNER_TEMP, 'bamboo-release-controller')
+          fs.appendFileSync(process.env.GITHUB_ENV, `BAMBOO_PUBLISH_CONTROLLER=${root}\n`)
+          if (process.env.BAMBOO_SOURCE_MODE !== 'true') {
           fs.mkdirSync(path.join(root, 'scripts'), { recursive: true })
           for (const file of ['crate-release.cjs', 'crate-release-frontend.py', 'release-source.cjs',
             'sidecar-release.cjs', 'sidecar-build.cjs', 'sidecar-browser-host.py']) {
@@ -506,10 +581,12 @@ jobs:
             fs.writeFileSync(path.join(root, 'scripts', file), bytes, { flag: 'wx' })
           }
           console.log(`Controller ${revision}; product checkout remains unchanged`)
+          }
           JS
 
       - &automatic-frontend
         name: Resolve exact release frontend
+        if: env.BAMBOO_SOURCE_MODE != 'true'
         id: frontend
         env:
           FRONTEND_PACKAGE: "@bigduu/lotus-next"
@@ -518,6 +595,7 @@ jobs:
 
       - &automatic-stage
         name: Stage frontend package from npm
+        if: env.BAMBOO_SOURCE_MODE != 'true'
         # The shared resolver selects the committed Lotus Next lock by default
         # and permits only one fixed legacy rollback. LOTUS_SOURCE=package
         # hard-fails when the exact package is missing, so a fetch failure can
@@ -547,7 +625,9 @@ jobs:
 
       - name: Install isolated Cargo publication entrypoint
         # PATH also covers controller and Python metadata/package/publish calls.
-        run: node scripts/release-cargo-sandbox.cjs install
+        run: |
+          if [ "$BAMBOO_SOURCE_MODE" = true ]; then node "$BAMBOO_PUBLISH_CONTROLLER/scripts/release-cargo-sandbox.cjs" install
+          else node scripts/release-cargo-sandbox.cjs install; fi
 
       - name: Reserve or resume the exact release identity
         id: version
@@ -561,15 +641,36 @@ jobs:
           BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
           FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
           FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
-          BAMBOO_EXECUTABLE_CONTRACT_VERSION: ${{ steps.executable_policy.outputs.version }}
-        run: node "${{ runner.temp }}/bamboo-release-controller/scripts/crate-release.cjs" plan
+          BAMBOO_EXECUTABLE_CONTRACT_VERSION: ${{ steps.frozen_source.outputs.contract_version || steps.executable_policy.outputs.version }}
+        run: node "${BAMBOO_PUBLISH_CONTROLLER}/scripts/crate-release.cjs" plan
+      - name: Prepare and verify original native outputs
+        id: originals
+        if: env.BAMBOO_SOURCE_MODE == 'true'
+        env:
+          TARGET_VERSION: ${{ steps.version.outputs.version }}
+          PREPARED_RELEASE: ${{ steps.version.outputs.prepared_release }}
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+          BAMBOO_EXECUTABLE_CONTRACT_VERSION: "2"
+          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
+          BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
+        run: node "$BAMBOO_PUBLISH_CONTROLLER/scripts/native-originals.cjs" prepare
       - name: Transport the sealed frontend independently of draft Release visibility
+        if: env.BAMBOO_SOURCE_MODE != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: bamboo-prepared-frontend-attempt-${{ github.run_attempt }}
           path: |
             crates/app/bamboo-server/frontend_package/frontend-manifest.json
             crates/app/bamboo-server/frontend_package/lotus-frontend.zip
+          if-no-files-found: error
+          retention-days: 3
+      - name: Transport original Source preparation and exact frontend bytes
+        if: env.BAMBOO_SOURCE_MODE == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: bamboo-prepared-frontend-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bamboo-prepared-frontend/*
           if-no-files-found: error
           retention-days: 3
 
@@ -587,9 +688,14 @@ jobs:
       SOURCE_VALIDATION: ${{ needs.automatic.outputs.source_validation }}
       PREPARED_RELEASE: ${{ needs.automatic.outputs.prepared_release }}
       BAMBOO_EXECUTABLE_CONTRACT_VERSION: ${{ needs.automatic.outputs.executable_contract_version }}
+    defaults:
+      run:
+        working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.release_source_contract == 'frozen-source-v2' && 'product' || '.' }}
     steps:
+      - *source-controller-checkout
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          path: ${{ env.BAMBOO_SOURCE_MODE == 'true' && 'product' || '.' }}
           ref: ${{ needs.automatic.outputs.source }}
           fetch-depth: 0
           persist-credentials: false
@@ -599,8 +705,17 @@ jobs:
       - *release-controller
       - *automatic-frontend
       - *automatic-stage
+      - &source-preparation
+        name: Read the original Source preparation carrier
+        if: env.BAMBOO_SOURCE_MODE == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: bamboo-prepared-frontend-attempt-${{ fromJSON(needs.automatic.outputs.prepared_release).runAttempt }}
+          path: ${{ runner.temp }}/bamboo-prepared-frontend
       - name: Install isolated Cargo publication entrypoint
-        run: node scripts/release-cargo-sandbox.cjs install
+        run: |
+          if [ "$BAMBOO_SOURCE_MODE" = true ]; then node "$BAMBOO_PUBLISH_CONTROLLER/scripts/release-cargo-sandbox.cjs" install
+          else node scripts/release-cargo-sandbox.cjs install; fi
       - name: Authenticate and resume the prepared reservation without reallocating
         env:
           GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
@@ -609,17 +724,29 @@ jobs:
           BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
           FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
           FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
-        run: node "${{ runner.temp }}/bamboo-release-controller/scripts/crate-release.cjs" resume
+        run: node "${BAMBOO_PUBLISH_CONTROLLER}/scripts/crate-release.cjs" resume
 
       - name: Prepare workspace manifests for publish
-        run: python3 scripts/crate-release-lock.py stamp "${TARGET_VERSION}"
+        run: |
+          if [ "$BAMBOO_SOURCE_MODE" = true ]; then python3 "$BAMBOO_PUBLISH_CONTROLLER/scripts/crate-release-lock.py" stamp "$TARGET_VERSION"
+          else python3 scripts/crate-release-lock.py stamp "$TARGET_VERSION"; fi
 
       - name: Refresh the temporary stamped publication lockfile
         run: |
           cargo metadata --format-version 1 > /dev/null
-          python3 scripts/crate-release-lock.py
+          if [ "$BAMBOO_SOURCE_MODE" = true ]; then python3 "$BAMBOO_PUBLISH_CONTROLLER/scripts/crate-release-lock.py"
+          else python3 scripts/crate-release-lock.py; fi
 
+      - name: Publish verified original crates
+        if: env.BAMBOO_SOURCE_MODE == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
+          BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
+        run: node "$BAMBOO_PUBLISH_CONTROLLER/scripts/crate-release.cjs" publish-originals
       - name: Publish verified crates and complete the GitHub Release
+        if: env.BAMBOO_SOURCE_MODE != 'true'
         env:
           GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -627,15 +754,20 @@ jobs:
           BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
           FRONTEND_PACKAGE: ${{ steps.frontend.outputs.package_name }}
           FRONTEND_VERSION: ${{ steps.frontend.outputs.package_version }}
-        run: node "${{ runner.temp }}/bamboo-release-controller/scripts/crate-release.cjs" publish
+        run: node "${BAMBOO_PUBLISH_CONTROLLER}/scripts/crate-release.cjs" publish
 
   executables:
     name: Complete executable (${{ matrix.target }})
     needs: automatic
-    # The existing publisher alone allocates the version and authenticates main.
+    # The existing publisher alone allocates the version and authenticates C/S.
     # Desktop and standalone users consume these same complete executables.
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+      pull-requests: read
     outputs:
       aarch64_apple_darwin: ${{ steps.build.outputs.aarch64_apple_darwin }}
       x86_64_apple_darwin: ${{ steps.build.outputs.x86_64_apple_darwin }}
@@ -651,9 +783,15 @@ jobs:
       BAMBOO_RELEASE_TARGET: ${{ matrix.target }}
       BAMBOO_EXECUTABLE_CONTRACT_VERSION: ${{ needs.automatic.outputs.executable_contract_version }}
       PREPARED_RELEASE: ${{ needs.automatic.outputs.prepared_release }}
+      NATIVE_ORIGINAL_PLAN: ${{ needs.automatic.outputs.native_original_plan }}
+    defaults:
+      run:
+        working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.release_source_contract == 'frozen-source-v2' && 'product' || '.' }}
     steps:
+      - *source-controller-checkout
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          path: ${{ env.BAMBOO_SOURCE_MODE == 'true' && 'product' || '.' }}
           ref: ${{ needs.automatic.outputs.source }}
           fetch-depth: 0
           persist-credentials: false
@@ -661,16 +799,29 @@ jobs:
         with:
           node-version: lts/*
       - *release-controller
+      - *source-preparation
+      - name: Select original native output
+        id: select
+        if: env.BAMBOO_SOURCE_MODE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node "$BAMBOO_PUBLISH_CONTROLLER/scripts/sidecar-build.cjs" select
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: env.BAMBOO_SOURCE_MODE != 'true' || steps.select.outputs.action == 'build'
         with:
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        if: env.BAMBOO_SOURCE_MODE != 'true' || steps.select.outputs.action == 'build'
         with:
           targets: ${{ matrix.target }}
       - name: Bind dependency cache to the actual native target and source policy
+        if: env.BAMBOO_SOURCE_MODE != 'true' || steps.select.outputs.action == 'build'
         id: cache_policy
-        run: node "${{ runner.temp }}/bamboo-release-controller/scripts/sidecar-build.cjs" cache-policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node "${BAMBOO_PUBLISH_CONTROLLER}/scripts/sidecar-build.cjs" cache-policy
       - name: Restore compatible native release dependencies
+        if: env.BAMBOO_SOURCE_MODE != 'true' || steps.select.outputs.action == 'build'
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: ${{ steps.cache_policy.outputs.workspace }}
@@ -679,24 +830,79 @@ jobs:
           cache-on-failure: true
           save-if: ${{ steps.cache_policy.outputs.save == 'true' }}
       - name: Restore the original preparation attempt's sealed frontend bytes
+        if: env.BAMBOO_SOURCE_MODE != 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: bamboo-prepared-frontend-attempt-${{ fromJSON(needs.automatic.outputs.prepared_release).runAttempt }}
           path: ${{ runner.temp }}/bamboo-prepared-frontend
       - name: Build and verify the standard versioned Bamboo executable
+        if: env.BAMBOO_SOURCE_MODE != 'true' || steps.select.outputs.action == 'build'
         id: build
-        run: node "${{ runner.temp }}/bamboo-release-controller/scripts/sidecar-build.cjs"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node "${BAMBOO_PUBLISH_CONTROLLER}/scripts/sidecar-build.cjs"
       - name: Transport this platform's verified executable within the same run
+        id: transport
+        if: env.BAMBOO_SOURCE_MODE != 'true' || steps.select.outputs.action == 'build'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: bamboo-executable-${{ matrix.target }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/bamboo-executable-output/*
           if-no-files-found: error
           retention-days: 3
+      - name: Record original native transport
+        if: env.BAMBOO_SOURCE_MODE == 'true' && steps.select.outputs.action == 'build'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORIGINAL_ARTIFACT_ID: ${{ steps.transport.outputs.artifact-id }}
+          ORIGINAL_ARTIFACT_SHA256: ${{ steps.transport.outputs.artifact-digest }}
+          EXPECTED_NATIVE_BUILD: ${{ steps.build.outputs[matrix.output_key] }}
+        run: node "$BAMBOO_PUBLISH_CONTROLLER/scripts/sidecar-build.cjs" record-transport
+
+  retain-native-originals:
+    name: Retain original native outputs
+    needs: [automatic, executables]
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.release_source_contract == 'frozen-source-v2' && needs.automatic.result == 'success'
+    runs-on: ubuntu-latest
+    environment: bamboo-release
+    permissions:
+      contents: write
+      actions: read
+    defaults:
+      run:
+        working-directory: product
+    env:
+      SOURCE_REVISION: ${{ needs.automatic.outputs.source }}
+      TARGET_VERSION: ${{ needs.automatic.outputs.version }}
+      BAMBOO_EXECUTABLE_CONTRACT_VERSION: "2"
+      PREPARED_RELEASE: ${{ needs.automatic.outputs.prepared_release }}
+    steps:
+      - *source-controller-checkout
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.automatic.outputs.source }}
+          path: product
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: lts/*
+      - *release-controller
+      - *source-preparation
+      - name: Retain and verify original native outputs
+        env:
+          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
+          BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
+        run: node "$BAMBOO_PUBLISH_CONTROLLER/scripts/native-originals.cjs" collect
 
   publish-executables:
     name: Publish and verify complete executable assets
-    needs: [automatic, publish-crates, executables]
+    needs: [automatic, publish-crates, executables, retain-native-originals]
+    if: >-
+      always() && needs.automatic.result == 'success' && needs.publish-crates.result == 'success' &&
+      needs.executables.result == 'success' &&
+      (github.event_name != 'workflow_dispatch' || inputs.release_source_contract != 'frozen-source-v2' || needs.retain-native-originals.result == 'success')
     runs-on: ubuntu-latest
     environment: bamboo-release
     permissions:
@@ -707,9 +913,15 @@ jobs:
       TARGET_VERSION: ${{ needs.automatic.outputs.version }}
       EXPECTED_BUILDS: ${{ toJSON(needs.executables.outputs) }}
       BAMBOO_EXECUTABLE_CONTRACT_VERSION: ${{ needs.automatic.outputs.executable_contract_version }}
+      PREPARED_RELEASE: ${{ needs.automatic.outputs.prepared_release }}
+    defaults:
+      run:
+        working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.release_source_contract == 'frozen-source-v2' && 'product' || '.' }}
     steps:
+      - *source-controller-checkout
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          path: ${{ env.BAMBOO_SOURCE_MODE == 'true' && 'product' || '.' }}
           ref: ${{ needs.automatic.outputs.source }}
           fetch-depth: 0
           persist-credentials: false
@@ -717,6 +929,7 @@ jobs:
         with:
           node-version: lts/*
       - *release-controller
+      - *source-preparation
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
@@ -724,27 +937,38 @@ jobs:
       # the independent job-output attempt also supports rerunning failed jobs
       # while successful platforms retain their earlier native-job outputs.
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        if: env.BAMBOO_SOURCE_MODE != 'true'
         with:
           name: bamboo-executable-aarch64-apple-darwin-attempt-${{ fromJSON(needs.executables.outputs.aarch64_apple_darwin).runAttempt }}
           path: ${{ runner.temp }}/bamboo-executable-inputs/aarch64-apple-darwin
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        if: needs.automatic.outputs.executable_contract_version == '1'
+        if: env.BAMBOO_SOURCE_MODE != 'true' && needs.automatic.outputs.executable_contract_version == '1'
         with:
           name: bamboo-executable-x86_64-apple-darwin-attempt-${{ fromJSON(needs.executables.outputs.x86_64_apple_darwin).runAttempt }}
           path: ${{ runner.temp }}/bamboo-executable-inputs/x86_64-apple-darwin
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        if: env.BAMBOO_SOURCE_MODE != 'true'
         with:
           name: bamboo-executable-x86_64-pc-windows-msvc-attempt-${{ fromJSON(needs.executables.outputs.x86_64_pc_windows_msvc).runAttempt }}
           path: ${{ runner.temp }}/bamboo-executable-inputs/x86_64-pc-windows-msvc
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        if: env.BAMBOO_SOURCE_MODE != 'true'
         with:
           name: bamboo-executable-x86_64-unknown-linux-gnu-attempt-${{ fromJSON(needs.executables.outputs.x86_64_unknown_linux_gnu).runAttempt }}
           path: ${{ runner.temp }}/bamboo-executable-inputs/x86_64-unknown-linux-gnu
+      - name: Verify all original outputs and publish whole release
+        if: env.BAMBOO_SOURCE_MODE == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
+          BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
+        run: node "$BAMBOO_PUBLISH_CONTROLLER/scripts/sidecar-release.cjs" publish
       - name: Verify official provenance and publish immutable shared assets
+        if: env.BAMBOO_SOURCE_MODE != 'true'
         # Same publisher queue, Environment and credentials; no new allocator,
         # tag, registry publication, credential scope or replacement uploads.
         env:
           GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
           BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
           BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
-        run: node "${{ runner.temp }}/bamboo-release-controller/scripts/sidecar-release.cjs" publish
+        run: node "${BAMBOO_PUBLISH_CONTROLLER}/scripts/sidecar-release.cjs" publish

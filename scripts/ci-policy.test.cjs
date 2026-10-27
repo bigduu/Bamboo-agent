@@ -239,7 +239,7 @@ test('accepted dev facts bind actual tiny Git merge objects and reject a same-tr
 // boundary with the inert producer fixture. Production has no such parameter;
 // its empty registry is separately tested below. Every subprocess is intercepted
 // here: no Cargo, Python, GitHub request or source script is executed.
-function sourceControllerFixture(t, { mockAcceptedProducer = true } = {}) {
+function sourceControllerFixture(t, { mockAcceptedProducer = true, originalAdapter } = {}) {
   const model = frozenSourceFixture(), root = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'bamboo-source-controller-')))
   const controller = path.join(root, 'C'), product = path.join(root, 'S'), state = { writes: [], commands: [] }
   t.after(() => rmSync(root, { recursive: true, force: true }))
@@ -333,6 +333,7 @@ function sourceControllerFixture(t, { mockAcceptedProducer = true } = {}) {
   const module = { exports: {} }, baseRequire = require
   const localRequire = name => {
     if (name === 'node:child_process') return { spawnSync: cli }
+    if (name === './release-crate-output.cjs' && originalAdapter) return originalAdapter
     if (name === './frozen-source-admission.cjs' && mockAcceptedProducer) return { resolveFrozenSource: (input, reads, policy) => {
       assert.deepEqual(Object.keys(policy), ['mainHistoryAnchor'])
       assert.equal(policy.mainHistoryAnchor, 'd6325a732c7669f94962f604e4ce98966e374d73')
@@ -412,6 +413,122 @@ async function preparedSourceController(t) {
   fixture.state.writes.length = 0
   return { ...fixture, context, receipt, release }
 }
+test('2344 signed Source workers use the real factory and reserved crate list without another metadata producer', async t => {
+  const fixture = await preparedSourceController(t), { core, context, receipt, env, state } = fixture
+  receipt.frontendOriginals = { schemaVersion: 1, complete: true, assets: [
+    { assetId: 101, name: 'frontend-manifest.json', sizeBytes: 1, sha256: receipt.frontendBytes.manifestSha256 },
+    { assetId: 102, name: 'lotus-frontend.zip', sizeBytes: 1, sha256: receipt.frontendBytes.archiveSha256 },
+  ] }
+  await context.saveReceipt(fixture.release, receipt)
+  const prepared = core.createPreparation({ release: fixture.release, receipt }, core.preparationIdentity(context, receipt.version), 2)
+  Object.assign(env, { GITHUB_JOB: 'publish-executables', TARGET_VERSION: receipt.version, PREPARED_RELEASE: core.sourcePreparationOutput(prepared, env) })
+  const before = state.commands.length, worker = await core.makeFrozenSourceContext()
+  assert.deepEqual(worker.crates, receipt.crates)
+  assert.deepEqual((await worker.currentReservation()).receipt, receipt)
+  assert.ok(state.commands.slice(before).every(command => command[0] !== 'cargo' && command[0] !== 'python3'))
+  for (const blocked of ['package', 'cargoPublish', 'complete']) await assert.rejects(worker[blocked](), /original-output/)
+  const originalBody = state.release.body, changed = structuredClone(receipt)
+  changed.frontendOriginals.assets[0].assetId++
+  core.signReceipt(changed, fixture.key); state.release.body = core.receiptBody(changed)
+  await assert.rejects(worker.currentReservation(), /original IDs changed/)
+  state.release.body = originalBody
+  const writes = state.writes.length
+  const forged = core.canonicalJson({ ...prepared, receipt: { ...receipt, version: '2026.10.9' } })
+  writeFileSync(path.join(env.RUNNER_TEMP, 'bamboo-prepared-frontend/prepared-release.json'), forged)
+  env.PREPARED_RELEASE = JSON.stringify({ ...JSON.parse(env.PREPARED_RELEASE), sha256: sourceHash(forged) })
+  await assert.rejects(core.makeFrozenSourceContext(), /authentication/)
+  delete env.PREPARED_RELEASE
+  await assert.rejects(core.makeFrozenSourceContext(), /requires the original signed preparation/)
+  assert.equal(state.writes.length, writes)
+})
+test('2344 whole publication refreshes real Source admission and rejects changed protection before PATCH', async t => {
+  const fixture = await preparedSourceController(t)
+  fixture.receipt.packageChecksums['bamboo-agent'] = '9'.repeat(64) // Inert Source-guard contract; no crate acceptance claim.
+  fixture.receipt.completed = true; await fixture.context.saveReceipt(fixture.release, fixture.receipt)
+  fixture.env.GITHUB_JOB = 'publish-executables'; fixture.state.writes.length = 0
+  fixture.model.dev.protected = false
+  await assert.rejects(fixture.context.publishMetadata(fixture.release, fixture.receipt, true), /protected/)
+  assert.deepEqual(fixture.state.writes, [])
+})
+test('2344 retained crate adapter updates only crate progress through the existing authenticated Source writer', async t => {
+  const original = require('./release-crate-output.cjs'), sandbox = require('./release-cargo-sandbox.cjs')
+  let calls = 0
+  const fixture = sourceControllerFixture(t, { originalAdapter: { ...original, publishCrate: async (expected, ports) => {
+    calls++; assert.equal(expected.releaseId, 42); assert.equal(expected.pathInVcs, '')
+    assert.equal(typeof ports.upload, 'function'); assert.equal(typeof ports.guard, 'function')
+    const state = await ports.load(); original.record(state, expected); await ports.guard()
+    assert.equal(state.phase, 'published'); return state // Local adapter contract, no package/registry operation.
+  } } })
+  const { core, env, state } = fixture, context = await core.makeFrozenSourceContext()
+  const receipt = { schemaVersion: 1, version: '2026.10.8', identity: context.identity, crates: context.crates,
+    frontendBytes: context.frontendBytes, automatic: true, completed: false, packageChecksums: { 'bamboo-agent': '9'.repeat(64) }, ciRun: context.ciRun,
+    sourceDispatch: context.sourceDispatch, nativeOriginals: context.nativeOriginals,
+    frontendOriginals: { schemaVersion: 1, complete: true, assets: [
+      { assetId: 101, name: 'frontend-manifest.json', sizeBytes: 1, sha256: context.frontendBytes.manifestSha256 },
+      { assetId: 102, name: 'lotus-frontend.zip', sizeBytes: 1, sha256: context.frontendBytes.archiveSha256 }] } }
+  const inputs = core.originalCrateInputs({ ...receipt, releaseId: 42 }, 'bamboo-agent', '')
+  const origin = { controllerRevision: env.GITHUB_WORKFLOW_SHA, runId: 999, attempt: 1, jobId: 123,
+    jobKey: 'publish-crates', jobName: original.JOB, workflowPath: original.WORKFLOW }
+  const proof = { schemaVersion: 1, kind: original.KIND, inputs, origin,
+    archive: { name: 'bamboo-agent-2026.10.8.crate', size: 1, sha256: '9'.repeat(64) },
+    verification: { preparationCommand: ['package', '--locked', '--allow-dirty', '--no-verify', '-p', 'bamboo-agent'],
+      command: ['package', '--locked', '--allow-dirty', '-p', 'bamboo-agent'], image: sandbox.IMAGE, exitCode: 0 } }
+  receipt.crateOriginals = { 'bamboo-agent': { schemaVersion: 1, kind: original.KIND, inputs, origin, phase: 'published',
+    sealed: { size: 10, sha256: '8'.repeat(64), proof }, asset: { id: 333, name: original.assetName(inputs), size: 10, digest: `sha256:${'8'.repeat(64)}` } } }
+  core.signReceipt(receipt, fixture.key)
+  const release = await context.reserve(receipt); context.bindReservation(release, receipt); await context.ensureTag(release, receipt)
+  const prepared = core.createPreparation({ release, receipt }, core.preparationIdentity(context, receipt.version), 2)
+  Object.assign(env, { GITHUB_JOB: 'publish-crates', TARGET_VERSION: receipt.version, PREPARED_RELEASE: core.sourcePreparationOutput(prepared, env) })
+  const before = state.commands.length, worker = await core.makeFrozenSourceContext()
+  await core.publishOriginalCrates(worker)
+  const result = await worker.currentReservation(); assert.equal(calls, 1); assert.equal(result.release.draft, true)
+  assert.equal(result.receipt.completed, true); assert.deepEqual(result.receipt.crateOriginals['bamboo-agent'].origin, origin)
+  assert.ok(state.commands.slice(before).every(command => command[0] !== 'cargo' && command[0] !== 'python3'))
+  core.authenticateReceipt(result.receipt, fixture.key)
+})
+test('2344 Source graph has one factory, keyless pre-cache selectors, retained siblings and one whole finalizer', () => {
+  const source = readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+  const automatic = source.split('  automatic:\n')[1].split('  publish-crates:\n')[0]
+  const crates = source.split('  publish-crates:\n')[1].split('  executables:\n')[0]
+  const workers = source.split('  executables:\n')[1].split('  retain-native-originals:\n')[0]
+  const collector = source.split('  retain-native-originals:\n')[1].split('  publish-executables:\n')[0]
+  const finalizer = source.split('  publish-executables:\n')[1]
+  assert.ok(automatic.indexOf('ref: ${{ github.workflow_sha }}') < automatic.indexOf('Authorize the frozen accepted dev source'))
+  assert.ok(automatic.indexOf('Authorize the frozen accepted dev source') < automatic.indexOf('ref: ${{ steps.source.outputs.revision }}'))
+  assert.ok(automatic.indexOf('crate-release.cjs" plan') < automatic.indexOf('native-originals.cjs" prepare'))
+  assert.match(automatic, /native_original_plan: \$\{\{ steps\.originals\.outputs\.native_original_plan \}\}/)
+  assert.match(automatic, /path: \$\{\{ runner\.temp \}\}\/bamboo-prepared-frontend\/\*/)
+  assert.match(source, /&automatic-stage\n        name: Stage frontend package from npm\n        if: env\.BAMBOO_SOURCE_MODE != 'true'/)
+  assert.match(crates, /python3 "\$BAMBOO_PUBLISH_CONTROLLER\/scripts\/crate-release-lock.py" stamp/)
+  assert.equal(crates.split('crate-release.cjs" publish-originals').length, 2)
+  assert.doesNotMatch(workers, /secrets\.|contents: write|BAMBOO_RELEASE_SIGNING_KEY/)
+  assert.ok(workers.indexOf('*source-preparation') < workers.indexOf('Select original native output'))
+  for (const name of ['Setup Python', 'Bind dependency cache', 'Restore compatible native', 'Build and verify', 'Transport this platform']) {
+    const position = name === 'Setup Python' ? workers.indexOf('uses: actions/setup-python') : workers.indexOf(name)
+    assert.ok(workers.indexOf('Select original native output') < position)
+  }
+  for (const step of workers.split(/\n      - /).slice(1)) {
+    if (/uses: (?:actions\/setup-python|dtolnay\/rust-toolchain|Swatinem\/rust-cache|actions\/upload-artifact)|name: (?:Bind dependency cache|Build and verify)/.test(step)) {
+      assert.match(step, /if: env\.BAMBOO_SOURCE_MODE != 'true' \|\| steps\.select\.outputs\.action == 'build'/)
+    }
+  }
+  assert.match(collector, /needs: \[automatic, executables\]/)
+  assert.match(collector, /if: always\(\).*needs\.automatic\.result == 'success'/)
+  assert.match(collector, /native-originals.cjs" collect/)
+  assert.match(finalizer, /needs: \[automatic, publish-crates, executables, retain-native-originals\]/)
+  assert.match(finalizer, /needs\.retain-native-originals\.result == 'success'/)
+  assert.match(finalizer, /PREPARED_RELEASE: \$\{\{ needs\.automatic\.outputs\.prepared_release \}\}/)
+  assert.equal(finalizer.split('name: Verify all original outputs and publish whole release').length, 2)
+  assert.doesNotMatch(finalizer, /cargo (?:build|package|publish)|frontend-package.cjs stage/)
+  assert.doesNotMatch(source, /(?:GITHUB_SHA|GITHUB_WORKFLOW_SHA):/)
+  assert.deepEqual(frozenSource.ACCEPTED_PRODUCERS, {})
+  const controller = readFileSync('scripts/sidecar-release.cjs', 'utf8').split('async function publishWholeSource() {')[1].split('async function main()')[0]
+  assert.ok(controller.indexOf('readOriginalCrateClosure') < controller.indexOf('publishMetadata'))
+  assert.ok(controller.indexOf('wholeJobs') < controller.indexOf('publishMetadata'))
+  assert.equal(controller.split('console.log(record.line)').length, 2)
+  assert.doesNotMatch(controller, /Native original completion:|createBrowserHost|assembleRelease|recoverPublishedRelease/)
+})
+
 test('source dispatch local guard permits normal dev advance and refreshes the signed reservation before PATCH', async t => {
   const fixture = await preparedSourceController(t)
   fixture.model.advanceDev = true

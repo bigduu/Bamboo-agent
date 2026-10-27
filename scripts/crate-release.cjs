@@ -150,6 +150,13 @@ function validateReceipt(receipt, identity, crates, version = receipt?.version) 
     assert.equal(identity.repository, 'bigduu/Bamboo-agent')
     assert.equal(receipt.ciRun, `https://github.com/bigduu/Bamboo-agent/actions/runs/${marker.context.feature.runId}`)
     assert.equal(receipt.validation, undefined, 'Historical and frozen-source admissions cannot be mixed')
+    if (receipt.frontendOriginals) validateFrontendOriginals(receipt.frontendOriginals, receipt)
+    for (const [name, state] of Object.entries(receipt.crateOriginals || {})) {
+      assert.ok(crates.includes(name)); require('./release-crate-output.cjs').record(state,
+        originalCrateInputs({ ...receipt, releaseId: state.inputs.releaseId }, name, state.inputs.pathInVcs))
+      assert.equal(state.origin.controllerRevision, marker.context.controller.revision); assert.equal(state.origin.runId, Number(marker.runId))
+      if (state.sealed) assert.equal(receipt.packageChecksums[name], state.sealed.proof.archive.sha256)
+    }
   }
   if (Object.hasOwn(receipt, 'nativeOriginals')) {
     const marker = receipt.nativeOriginals
@@ -250,6 +257,7 @@ function validatePreparation(preparation, identity, contractVersion) {
     assert.equal(receipt.sourceDispatch.context.controller.revision, identity.workflowRevision)
     assert.equal(receipt.sourceDispatch.runId, identity.runId)
     assert.ok(receipt.nativeOriginals, 'Source dispatch requires original native outputs')
+    validateFrontendOriginals(receipt.frontendOriginals, receipt, true)
   }
   if (receipt.nativeOriginals) {
     assert.equal(contractVersion, 2, 'Original native lifecycle requires the three-target contract')
@@ -278,6 +286,59 @@ function createPreparation({ release, receipt }, identity, contractVersion) {
     ...(identity.sourceDispatch ? { sourceDispatch: identity.sourceDispatch } : {}) }, identity, contractVersion)
 }
 
+const SOURCE_PREPARATION_KIND = 'bamboo-source-preparation-file/v1'
+const SOURCE_PREPARATION_FILE = 'prepared-release.json'
+const MAX_SOURCE_PREPARATION = 192 * 1024
+function preparationDirectory(env) {
+  const root = fs.realpathSync(env.RUNNER_TEMP), directory = path.join(root, 'bamboo-prepared-frontend')
+  const stat = fs.lstatSync(directory)
+  assert.ok(stat.isDirectory() && !stat.isSymbolicLink() && fs.realpathSync(directory) === directory, 'Unsafe preparation directory')
+  return directory
+}
+function preparationInput(env = process.env) {
+  const locator = JSON.parse(env.PREPARED_RELEASE)
+  if (locator.kind !== SOURCE_PREPARATION_KIND) {
+    assert.equal(locator.receipt?.sourceDispatch, undefined, 'Source preparation must use its original file carrier')
+    return locator // Historical full-JSON transport, unchanged.
+  }
+  assert.deepEqual(Object.keys(locator).sort(), ['kind', 'runAttempt', 'runId', 'schemaVersion', 'sha256'])
+  assert.equal(locator.schemaVersion, 1); assert.equal(locator.runId, env.GITHUB_RUN_ID)
+  assert.ok(Number.isSafeInteger(locator.runAttempt) && locator.runAttempt > 0 && locator.runAttempt <= Number(env.GITHUB_RUN_ATTEMPT))
+  assert.match(locator.sha256, DIGEST)
+  const file = path.join(preparationDirectory(env), SOURCE_PREPARATION_FILE), stat = fs.lstatSync(file)
+  assert.ok(stat.isFile() && !stat.isSymbolicLink() && fs.realpathSync(file) === file && stat.size > 0 && stat.size <= MAX_SOURCE_PREPARATION)
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
+  let bytes
+  try {
+    const opened = fs.fstatSync(fd), buffer = Buffer.alloc(MAX_SOURCE_PREPARATION + 1)
+    assert.ok(opened.isFile() && opened.dev === stat.dev && opened.ino === stat.ino && opened.size === stat.size)
+    const count = fs.readSync(fd, buffer, 0, buffer.length, 0), after = fs.fstatSync(fd)
+    assert.equal(count, stat.size); assert.equal(after.size, stat.size); assert.equal(after.mtimeMs, opened.mtimeMs)
+    bytes = buffer.subarray(0, count)
+  } finally { fs.closeSync(fd) }
+  assert.equal(sha256(bytes), locator.sha256, 'Preparation carrier hash differs')
+  const value = JSON.parse(bytes)
+  assert.deepEqual(Buffer.from(canonicalJson(value)), bytes, 'Preparation carrier is not canonical')
+  assert.equal(value.runId, locator.runId); assert.equal(value.runAttempt, locator.runAttempt)
+  assert.ok(value.receipt?.sourceDispatch, 'Source carrier cannot upgrade a historical reservation')
+  return value // Data only. Private HMAC / official physical job-log checks follow.
+}
+function sourcePreparationOutput(preparation, env = process.env) {
+  const bytes = Buffer.from(canonicalJson(preparation))
+  assert.ok(bytes.length <= MAX_SOURCE_PREPARATION, 'Source preparation file exceeds its bound')
+  const root = fs.realpathSync(env.RUNNER_TEMP)
+  fs.mkdirSync(path.join(root, 'bamboo-prepared-frontend'))
+  const directory = preparationDirectory(env)
+  fs.writeFileSync(path.join(directory, SOURCE_PREPARATION_FILE), bytes, { flag: 'wx' })
+  for (const [index, name] of FRONTEND_NAMES.entries()) {
+    const data = fs.readFileSync(path.join(process.cwd(), 'crates/app/bamboo-server/frontend_package', name))
+    assert.equal(sha256(data), preparation.receipt.frontendBytes[index ? 'archiveSha256' : 'manifestSha256'])
+    fs.writeFileSync(path.join(directory, name), data, { flag: 'wx' })
+  }
+  return JSON.stringify({ schemaVersion: 1, kind: SOURCE_PREPARATION_KIND, runId: preparation.runId,
+    runAttempt: preparation.runAttempt, sha256: sha256(bytes) })
+}
+
 async function resumePrepared(context, preparation, identity, contractVersion) {
   validatePreparation(preparation, identity, contractVersion)
   await context.assertCurrentMain()
@@ -298,6 +359,7 @@ async function resumePrepared(context, preparation, identity, contractVersion) {
   assert.deepEqual(receipt.validation, preparation.receipt.validation)
   assert.deepEqual(receipt.frontendBytes, preparation.receipt.frontendBytes, 'Prepared frontend bytes changed')
   assert.deepEqual(receipt.nativeOriginals, preparation.receipt.nativeOriginals, 'Signed native lifecycle changed')
+  if (context.sourceDispatch) assert.deepEqual(receipt.frontendOriginals, preparation.receipt.frontendOriginals, 'Signed frontend original IDs changed')
   assert.ok(release.draft || receipt.completed, 'Public release has incomplete provenance')
   for (const [name, checksum] of Object.entries(preparation.receipt.packageChecksums)) {
     assert.equal(receipt.packageChecksums[name], checksum, 'Previously prepared package checksum changed')
@@ -678,6 +740,94 @@ async function preserveFrontend({ receipt, stagedBytes, assets, readAsset, verif
   await upload()
 }
 
+const FRONTEND_NAMES = ['frontend-manifest.json', 'lotus-frontend.zip']
+function validateFrontendOriginals(value, receipt, complete = false) {
+  assert.deepEqual(Object.keys(value || {}).sort(), ['assets', 'complete', 'schemaVersion'])
+  assert.equal(value.schemaVersion, 1); assert.equal(typeof value.complete, 'boolean')
+  assert.ok(Array.isArray(value.assets) && value.assets.length <= 2)
+  assert.equal(new Set(value.assets.map(asset => asset.name)).size, value.assets.length)
+  for (const asset of value.assets) {
+    assert.deepEqual(Object.keys(asset).sort(), ['assetId', 'name', 'sha256', 'sizeBytes'])
+    assert.ok(FRONTEND_NAMES.includes(asset.name) && Number.isSafeInteger(asset.assetId) && asset.assetId > 0)
+    assert.ok(Number.isSafeInteger(asset.sizeBytes) && asset.sizeBytes > 0 && asset.sizeBytes <= 256 * 1024 * 1024)
+    assert.equal(asset.sha256, receipt.frontendBytes[asset.name === FRONTEND_NAMES[0] ? 'manifestSha256' : 'archiveSha256'])
+  }
+  if (value.complete || complete) { assert.equal(value.complete, true); assert.equal(value.assets.length, 2) }
+  return value
+}
+async function preserveFrontendOriginals({ receipt, bytes, listAssets, readAsset, upload, saveReceipt, sealed = false }) {
+  assert.ok(receipt.sourceDispatch, 'Only the authenticated Source contract selects this lifecycle')
+  if (!receipt.frontendOriginals) {
+    assert.equal(sealed, false, 'Sealed frontend originals are missing')
+    receipt.frontendOriginals = { schemaVersion: 1, complete: false, assets: [] }; await saveReceipt()
+  }
+  const record = validateFrontendOriginals(receipt.frontendOriginals, receipt, sealed)
+  for (const [index, name] of FRONTEND_NAMES.entries()) {
+    const known = record.assets.find(asset => asset.name === name)
+    let matches = (await listAssets()).filter(asset => asset.name === name)
+    assert.ok(matches.length <= 1, 'Ambiguous original frontend asset')
+    if (!matches.length) {
+      assert.ok(!known && !record.complete && !sealed, 'Recorded frontend original disappeared')
+      let error
+      try { await upload(name, bytes[index]) } catch (failure) { error = failure }
+      matches = (await listAssets()).filter(asset => asset.name === name)
+      if (!matches.length && error) throw error
+    }
+    assert.equal(matches.length, 1, 'Frontend upload is unconfirmed')
+    const asset = matches[0], expected = { assetId: asset.id, name, sizeBytes: asset.size, sha256: asset.digest?.replace(/^sha256:/, '') }
+    assert.equal(asset.state, 'uploaded'); assert.equal(expected.sizeBytes, bytes[index].length)
+    assert.equal(expected.sha256, sha256(bytes[index]))
+    if (known) assert.deepEqual(expected, known, 'Original frontend asset ID or bytes changed')
+    assert.deepEqual(await readAsset(asset.id, asset.size), bytes[index], 'Original frontend asset bytes changed')
+    if (!known) { record.assets.push(expected); await saveReceipt() }
+  }
+  if (!record.complete) { record.complete = true; await saveReceipt() }
+  validateFrontendOriginals(record, receipt, true)
+}
+function originalCrateInputs(receipt, name, pathInVcs) {
+  return { repository: receipt.identity.repository, releaseId: receipt.releaseId, sourceRevision: receipt.identity.sourceRevision,
+    sourceTree: receipt.sourceDispatch.context.source.tree, version: receipt.version, name, pathInVcs, frontendBytes: receipt.frontendBytes }
+}
+async function publishOriginalCrates(context) {
+  const original = require('./release-crate-output.cjs'), sandbox = require('./release-cargo-sandbox.cjs')
+  let metadata
+  for (const name of context.crates) {
+    const fresh = await context.currentReservation(), previous = fresh.receipt.crateOriginals?.[name]
+    if (!previous && !metadata) metadata = jsonCommand(['cargo', 'metadata', '--format-version', '1', '--no-deps', '--locked'])
+    const manifest = metadata?.packages.find(value => value.name === name)?.manifest_path
+    assert.ok(previous || typeof manifest === 'string', 'Cargo metadata omitted the selected crate')
+    const vcs = previous?.inputs.pathInVcs ?? path.relative(process.cwd(), path.dirname(manifest)).split(path.sep).join('/')
+    const expected = originalCrateInputs({ ...fresh.receipt, releaseId: fresh.release.id }, name, vcs)
+    await original.publishCrate(expected, {
+      environment: process.env, read: context.read, readAsset: context.readAsset, guard: context.assertSourceCurrent,
+      load: async () => (await context.currentReservation()).receipt.crateOriginals?.[name] || null,
+      save: async (next, before) => {
+        const current = await context.currentReservation(), receipt = current.receipt
+        assert.deepEqual(receipt.crateOriginals?.[name] || null, before, 'Concurrent crate checkpoint changed')
+        receipt.crateOriginals = { ...receipt.crateOriginals, [name]: next }
+        if (next.sealed) receipt.packageChecksums[name] = next.sealed.proof.archive.sha256
+        await context.saveReceipt(current.release, receipt)
+      },
+      prepare: () => original.prepareFromSandbox(JSON.parse(fs.readFileSync(process.env.BAMBOO_CARGO_SANDBOX)), expected),
+      uploadAsset: (assetName, bytes) => context.uploadOriginal(fresh.release, assetName, bytes),
+      registry: context.registry, registryArchive: context.registryArchive,
+      upload: (bytes, info) => require('./release-cargo-upload.cjs').uploadArchive(bytes, info, process.env.CARGO_REGISTRY_TOKEN), wait: context.wait,
+    })
+  }
+  const fresh = await context.currentReservation()
+  for (const name of context.crates) assert.equal(fresh.receipt.crateOriginals?.[name]?.phase, 'published')
+  // This physical owner is still running. The whole-release finalizer separately
+  // rereads every original ZIP/registry byte and requires completed producer jobs.
+  fresh.receipt.completed = true; await context.saveReceipt(fresh.release, fresh.receipt)
+  return fresh
+}
+async function readOriginalCrateClosure(context, fresh) {
+  const expected = context.crates.map(name => originalCrateInputs({ ...fresh.receipt, releaseId: fresh.release.id }, name,
+    fresh.receipt.crateOriginals?.[name]?.inputs.pathInVcs))
+  return require('./release-crate-output.cjs').readVerifiedClosure(expected, context.crates.map(name => fresh.receipt.crateOriginals?.[name]),
+    { read: context.read, readAsset: context.readAsset, registry: context.registry, registryArchive: context.registryArchive })
+}
+
 async function registryFetch(url, allowMissing = false) {
   const response = await fetch(url, { headers: { 'User-Agent': 'bamboo-publish-crate/2.0 (+https://github.com/bigduu/Bamboo-agent)' } })
   if (allowMissing && response.status === 404) return null
@@ -734,6 +884,16 @@ function frozenSourceReads() {
     },
   }
 }
+async function paginatedAssets(read, releaseId) {
+  const values = [], ids = new Set()
+  for (let page = 1; page <= 20; page++) {
+    const rows = await read(`releases/${releaseId}/assets?per_page=100&page=${page}`)
+    assert.ok(Array.isArray(rows) && rows.length <= 100)
+    for (const asset of rows) { assert.ok(!ids.has(asset.id)); ids.add(asset.id); values.push(asset) }
+    if (rows.length < 100) return values
+  }
+  assert.fail('Original asset inventory is truncated')
+}
 
 function frozenDispatchInput() {
   const env = process.env
@@ -777,6 +937,10 @@ async function readFrozenSourceContext() {
   sourceDispatchContract(facts, process.env.GITHUB_RUN_ID)
   return facts
 }
+async function readFrozenCheckout() {
+  assert.equal(arguments.length, 0)
+  const facts = await readFrozenSourceContext(); assertFrozenController(facts); return facts
+}
 
 function assertFrozenController(facts) {
   const root = fs.realpathSync(path.resolve(__dirname, '..')), product = fs.realpathSync(process.cwd())
@@ -809,8 +973,7 @@ function assertFrozenController(facts) {
 // their historical workflow_run or recovery contracts.
 async function makeFrozenSourceContext() {
   assert.equal(arguments.length, 0, 'No caller-supplied source authorization')
-  const facts = await readFrozenSourceContext(), env = process.env
-  assertFrozenController(facts)
+  const facts = await readFrozenCheckout(), env = process.env
   const verificationEnv = Object.fromEntries(['PATH', 'HOME'].filter(name => env[name] !== undefined).map(name => [name, env[name]]))
   verificationEnv.TMPDIR = env.RUNNER_TEMP
   verificationEnv.LOTUS_SOURCE = 'committed'
@@ -833,14 +996,24 @@ async function makeFrozenSourceContext() {
     assert.deepEqual(receipt.nativeOriginals, context.nativeOriginals)
     assert.deepEqual(receipt.frontendBytes, context.frontendBytes)
     assert.deepEqual(receipt.frontendBytes, bound.frontendBytes)
+    if (prepared) assert.deepEqual(receipt.frontendOriginals, prepared.receipt.frontendOriginals, 'Reserved frontend original IDs changed')
     assert.ok(release.draft || receipt.completed, 'Reserved release became public without completion')
     const tag = github('bigduu/Bamboo-agent', `git/ref/tags/v${bound.version}`, undefined, undefined, bound.uncreatedTag)
     if (!tag) assert.ok(bound.uncreatedTag, 'Reserved version tag disappeared')
     else { assert.equal(tag.object?.type, 'commit'); assert.equal(tag.object.sha, facts.source.revision) }
     await assertAutomaticVersionOrder(context, release, receipt)
   }
-  context = makeVerifiedContext(env, 'bigduu/Bamboo-agent', facts.source.revision,
-    { html_url: `https://github.com/bigduu/Bamboo-agent/actions/runs/${facts.feature.runId}` }, true, false, { guard })
+  let prepared
+  if (env.PREPARED_RELEASE) {
+    prepared = preparationInput(env)
+    authenticateReceipt(prepared.receipt, env.BAMBOO_RELEASE_SIGNING_KEY)
+    assertSourceDispatchCompatibility(prepared.receipt.sourceDispatch, sourceDispatch)
+    assert.equal(env.TARGET_VERSION, prepared.receipt.version)
+  } else assert.ok(!env.GITHUB_JOB || env.GITHUB_JOB === 'automatic', 'A worker/finalizer requires the original signed preparation')
+  context = makeVerifiedContext({ ...env, FRONTEND_PACKAGE: facts.inputs.frontend.packageName,
+    FRONTEND_VERSION: facts.inputs.frontend.packageVersion }, 'bigduu/Bamboo-agent', facts.source.revision,
+    { html_url: `https://github.com/bigduu/Bamboo-agent/actions/runs/${facts.feature.runId}` }, true, false,
+    { guard, crates: prepared?.receipt.crates })
   assert.deepEqual(context.identity.frontend.lock, facts.inputs.frontend, 'Publication frontend lock differs from tested S')
   assert.equal(context.frontendBytes.manifestSha256, facts.inputs.frontendManifest.sha256)
   assert.equal(context.frontendBytes.archiveSha256, facts.inputs.frontendZip.sha256)
@@ -854,6 +1027,7 @@ async function makeFrozenSourceContext() {
     assertSourceDispatchCompatibility(receipt.sourceDispatch, sourceDispatch)
     assert.deepEqual(receipt.nativeOriginals, context.nativeOriginals)
     assert.deepEqual(receipt.frontendBytes, context.frontendBytes)
+    if (prepared) assert.deepEqual(receipt.frontendOriginals, prepared.receipt.frontendOriginals, 'Reserved frontend original IDs changed')
     const next = { id: release.id, version: receipt.version, frontendBytes: { ...receipt.frontendBytes },
       uncreatedTag: justReserved === release.id }
     if (bound) assert.deepEqual({ ...next, uncreatedTag: bound.uncreatedTag }, bound, 'Reservation identity changed')
@@ -864,11 +1038,13 @@ async function makeFrozenSourceContext() {
     assertSourceDispatchCompatibility(receipt.sourceDispatch, sourceDispatch)
     assert.deepEqual(receipt.nativeOriginals, context.nativeOriginals)
     assert.deepEqual(receipt.frontendBytes, context.frontendBytes)
+    if (prepared) assert.deepEqual(receipt.frontendOriginals, prepared.receipt.frontendOriginals, 'Reserved frontend original IDs changed')
     if (release) {
       assert.ok(bound, 'Missing bound Source-dispatch reservation')
       assert.equal(release.id, bound.id); assert.equal(release.tag_name, `v${bound.version}`)
       assert.equal(release.target_commitish, facts.source.revision)
       assert.deepEqual(receipt.frontendBytes, bound.frontendBytes)
+      for (const state of Object.values(receipt.crateOriginals || {})) assert.equal(state.inputs.releaseId, release.id)
     }
   }
   const reserve = context.reserve, ensureTag = context.ensureTag, saveReceipt = context.saveReceipt
@@ -884,7 +1060,42 @@ async function makeFrozenSourceContext() {
   }
   context.saveReceipt = async (release, receipt) => {
     checkRequest(release, receipt)
+    const previous = await context.readReceipt(github(context.identity.repository, `releases/${release.id}`), { required: true })
+    if (previous.frontendOriginals) for (const asset of previous.frontendOriginals.assets) {
+      assert.deepEqual(receipt.frontendOriginals?.assets.find(value => value.name === asset.name), asset, 'Frontend original cannot be replaced')
+    }
+    if (previous.frontendOriginals?.complete) assert.equal(receipt.frontendOriginals.complete, true)
     return saveReceipt(release, receipt)
+  }
+  context.read = frozenSourceReads().json
+  context.listAssets = async id => paginatedAssets(context.read, id)
+  context.readAsset = async (id, maximum = 68 * 1024 * 1024) => command(['gh', 'api', '--hostname', 'github.com',
+    `repos/bigduu/Bamboo-agent/releases/assets/${id}`, '-H', 'Accept: application/octet-stream'], { encoding: null, maxBuffer: maximum })
+  context.uploadOriginal = async (release, name, bytes) => {
+    assert.equal(path.basename(name), name); await guard()
+    const directory = fs.mkdtempSync(path.join(path.dirname(context.receiptFile), 'original-')), file = path.join(directory, name)
+    fs.writeFileSync(file, bytes, { flag: 'wx' })
+    return command(['gh', 'release', 'upload', `v${bound.version}`, file, '--repo', context.identity.repository])
+  }
+  context.ensureFrontend = async (release, receipt, options = {}) => preserveFrontendOriginals({ receipt,
+    bytes: FRONTEND_NAMES.map(name => fs.readFileSync(path.join(process.cwd(), 'crates/app/bamboo-server/frontend_package', name))),
+    listAssets: () => context.listAssets(release.id), readAsset: context.readAsset,
+    upload: (name, bytes) => context.uploadOriginal(release, name, bytes), saveReceipt: () => context.saveReceipt(release, receipt), ...options })
+  context.currentReservation = async () => {
+    assert.ok(bound, 'Source reservation has not been bound')
+    const release = await context.read(`releases/${bound.id}`), receipt = await context.readReceipt(release, { required: true })
+    checkRequest(release, receipt); return { release, receipt }
+  }
+  context.publishMetadata = async (release, receipt, latest) => {
+    assert.equal(env.GITHUB_JOB, 'publish-executables'); checkRequest(release, receipt)
+    assert.equal(receipt.completed, true); await guard()
+    return github(context.identity.repository, `releases/${release.id}`, { tag_name: `v${receipt.version}`,
+      draft: false, make_latest: latest ? 'true' : 'false', body: receiptBody(receipt) }, 'PATCH')
+  }
+  if (prepared) {
+    validatePreparation(prepared, preparationIdentity(context, prepared.receipt.version), 2)
+    const release = await context.read(`releases/${prepared.releaseId}`), receipt = await context.readReceipt(release, { required: true })
+    context.bindReservation(release, receipt); await guard()
   }
   // Wiring the original crate outputs and sole whole-release completion is a
   // separate reviewed lifecycle step. This factory can never fall back to the
@@ -932,7 +1143,7 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
   }
   assert.ok(['@bigduu/lotus-next', '@bigduu/lotus'].includes(identity.frontend.packageName))
   assertVersion(identity.frontend.packageVersion)
-  const crates = command(['python3', authority ? path.join(__dirname, 'compute-publish-order.py') : 'scripts/compute-publish-order.py'],
+  const crates = authority?.crates || command(['python3', authority ? path.join(__dirname, 'compute-publish-order.py') : 'scripts/compute-publish-order.py'],
     authority ? { cwd: process.cwd() } : {}).trim().split('\n')
   assert.ok(crates.length && crates.includes('bamboo-agent'))
   for (const crate of crates) assert.match(crate, /^[a-zA-Z0-9_-]+$/)
@@ -1032,6 +1243,7 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
       const response = await registryFetch(`https://crates.io/api/v1/crates/${name}/${version}`, true)
       return response ? (await response.json()).version : null
     },
+    registryArchive: async (name, version) => (await downloadArchive(name, version)).bytes,
     package: async (name, version) => {
       command(['cargo', 'package', '--locked', '--allow-dirty', '--no-verify', '-p', name])
       const target = jsonCommand(['cargo', 'metadata', '--format-version', '1', '--no-deps']).target_directory
@@ -1062,7 +1274,7 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
 }
 
 async function main() {
-  const context = makeContext()
+  const context = process.env.GITHUB_EVENT_NAME === 'workflow_dispatch' ? await makeFrozenSourceContext() : makeContext()
   if (process.argv[2] === 'plan') {
     const result = await plan(context)
     const version = result.receipt.version
@@ -1070,15 +1282,17 @@ async function main() {
     context.verifyReceipt(result.receipt)
     const identity = preparationIdentity(context, version)
     const prepared = createPreparation(result, identity, Number(process.env.BAMBOO_EXECUTABLE_CONTRACT_VERSION))
-    const output = JSON.stringify(prepared)
-    assert.ok(Buffer.byteLength(output) <= 64 * 1024, 'Release preparation exceeds its job-output bound')
+    const output = context.sourceDispatch ? sourcePreparationOutput(prepared) : JSON.stringify(prepared)
+    assert.ok(Buffer.byteLength(output) <= 64 * 1024, 'Release preparation locator/legacy JSON exceeds its job-output bound')
     fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\nreceipt_file=${context.receiptFile}\nprepared_release=${output}\n`)
     console.log(`Resolved automatic main release: ${version}`)
   } else if (process.argv[2] === 'resume') {
-    const prepared = JSON.parse(process.env.PREPARED_RELEASE)
+    const prepared = preparationInput()
     const result = await resumePrepared(context, prepared, preparationIdentity(context, process.env.TARGET_VERSION),
       Number(process.env.BAMBOO_EXECUTABLE_CONTRACT_VERSION))
     fs.writeFileSync(context.receiptFile, `${JSON.stringify(result.receipt, null, 2)}\n`)
+  } else if (process.argv[2] === 'publish-originals') {
+    assert.ok(context.sourceDispatch); await publishOriginalCrates(context)
   } else {
     assert.equal(process.argv[2], 'publish')
     const receipt = JSON.parse(fs.readFileSync(context.receiptFile, 'utf8'))
@@ -1101,5 +1315,7 @@ module.exports = { assertVersion, assertManualVersion, validateSource, validateR
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
   verifyRegistrySource, highestStableVersion, spawnCommand, command, createPreparation, validatePreparation, resumePrepared,
   assertAdmissionCompatibility, nativeOriginalContract, sourceDispatchContract, readFrozenSourceContext,
-  makeFrozenSourceContext, assertSourceDispatchCompatibility }
+  makeFrozenSourceContext, assertSourceDispatchCompatibility, validateFrontendOriginals, preserveFrontendOriginals,
+  readFrozenCheckout, preparationIdentity, paginatedAssets, originalCrateInputs, publishOriginalCrates, readOriginalCrateClosure,
+  SOURCE_PREPARATION_KIND, SOURCE_PREPARATION_FILE, MAX_SOURCE_PREPARATION, preparationInput, sourcePreparationOutput }
 if (require.main === module) main().catch((error) => { console.error(error); process.exitCode = 1 })

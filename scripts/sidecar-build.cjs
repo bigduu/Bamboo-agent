@@ -6,8 +6,9 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
+const { preparationInput } = require('./crate-release.cjs')
 const { contractForVersion, boundSourceContract, artifactName, targetOutputKey, fileIdentity, sha256, binaryArchitecture,
-  execute, git, workflowIdentity, preparedFrontend } = require('./sidecar-release.cjs')
+  execute, git, workflowIdentity, frozenWorkflowIdentity, preparedFrontend } = require('./sidecar-release.cjs')
 
 function nativeTarget(platform = process.platform, arch = process.arch) {
   const targets = { 'darwin/arm64': 'aarch64-apple-darwin', 'darwin/x64': 'x86_64-apple-darwin',
@@ -140,7 +141,7 @@ function evictWorkspaceArtifacts(metadata, targetDirectory, target) {
 }
 
 async function originalSelection(identity, target, selecting, env = process.env) {
-  const preparation = env.PREPARED_RELEASE ? JSON.parse(env.PREPARED_RELEASE) : undefined
+  const preparation = env.PREPARED_RELEASE ? preparationInput(env) : undefined
   if (!preparation?.receipt?.nativeOriginals) {
     assert.ok(!env.NATIVE_ORIGINAL_PLAN, 'Historical preparation cannot acquire an original-output plan')
     return null
@@ -155,8 +156,9 @@ async function originalSelection(identity, target, selecting, env = process.env)
 
 async function recordOriginalTransport(env = process.env) {
   const originals = require('./native-originals.cjs')
-  const preparation = JSON.parse(env.PREPARED_RELEASE)
-  const identity = originals.preparedIdentity(preparation, env), target = env.BAMBOO_RELEASE_TARGET
+  const preparation = preparationInput(env)
+  const identity = preparation.receipt.sourceDispatch ? await frozenWorkflowIdentity() : originals.preparedIdentity(preparation, env)
+  const target = env.BAMBOO_RELEASE_TARGET
   assert.equal(nativeTarget(), target)
   await originalSelection(identity, target, false, env)
   const receiptFile = path.join(env.RUNNER_TEMP, 'bamboo-executable-output', 'build-receipt.json')
@@ -176,7 +178,9 @@ async function recordOriginalTransport(env = process.env) {
 
 async function main() {
   if (process.argv[2] === 'record-transport') return recordOriginalTransport()
-  const identity = workflowIdentity()
+  const sourceMode = Boolean(process.env.PREPARED_RELEASE && preparationInput().receipt?.sourceDispatch)
+  const identity = sourceMode ? await frozenWorkflowIdentity() : workflowIdentity()
+  if (sourceMode) assert.equal(git(['status', '--porcelain', '--untracked-files=all']), '', 'Source worker must start clean')
   const contractVersion = boundSourceContract()
   const target = process.env.BAMBOO_RELEASE_TARGET
   assert.ok(contractForVersion(contractVersion).targets.includes(target))
@@ -193,13 +197,15 @@ async function main() {
     const policy = nativeCachePolicy({ root: process.cwd(), temporary: process.env.RUNNER_TEMP, contractVersion, target,
       cutRevision: identity.validation?.cutRevision,
       sourceParents: git(['show', '-s', '--format=%P', 'HEAD']), sourceMessage: git(['show', '-s', '--format=%B', 'HEAD']) })
+    if (sourceMode) policy.key += `-C${sha256(['sidecar-build.cjs', 'crate-release-lock.py']
+      .map(name => `${name}:${fileIdentity(path.join(__dirname, name)).sha256}`).join('\n'))}`
     fs.appendFileSync(process.env.GITHUB_OUTPUT, `workspace=${policy.workspace}\nkey=${policy.key}\nsave=${policy.save}\n`)
     return
   }
   assert.equal(process.argv[2], undefined)
   const temporary = path.resolve(process.env.RUNNER_TEMP)
   const { receipt, files } = preparedFrontend(identity, {
-    preparation: JSON.parse(process.env.PREPARED_RELEASE), contractVersion,
+    preparation: preparationInput(), contractVersion,
     inputDirectory: path.join(temporary, 'bamboo-prepared-frontend') })
   const output = path.join(temporary, 'bamboo-executable-output')
   const targetDirectory = path.join(temporary, 'bamboo-executable-target')
@@ -214,11 +220,12 @@ async function main() {
   allowed.add(`${frontendRoot}/frontend-manifest.json`)
   allowed.add(`${frontendRoot}/lotus-frontend.zip`)
   const python = process.platform === 'win32' ? 'python' : 'python3'
-  const manifestPaths = JSON.parse(execute(python, ['scripts/crate-release-lock.py', 'manifests'], { env: buildEnv }))
-  execute(python, ['scripts/crate-release-lock.py', 'stamp', identity.version], { env: buildEnv })
+  const stamper = sourceMode ? path.join(__dirname, 'crate-release-lock.py') : 'scripts/crate-release-lock.py'
+  const manifestPaths = JSON.parse(execute(python, [stamper, 'manifests'], { env: buildEnv }))
+  execute(python, [stamper, 'stamp', identity.version], { env: buildEnv })
   // Resolve only local stamped versions, then reject *any* external lock drift.
   execute('cargo', ['metadata', '--format-version', '1'], { env: buildEnv, maxBuffer: 64 * 1024 * 1024 })
-  execute(python, ['scripts/crate-release-lock.py'], { env: buildEnv })
+  execute(python, [stamper], { env: buildEnv })
   const metadata = JSON.parse(execute('cargo', ['metadata', '--format-version', '1', '--no-deps', '--locked'], { env: buildEnv }))
   // Independent non-published examples keep their own version. Require every
   // package actually managed by the existing stamper, including CLI and server.
