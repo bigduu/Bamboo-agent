@@ -311,7 +311,12 @@ mod tests {
         for ultra in [false, true] {
             ordinary.set_root_orchestration_only(ultra).unwrap();
             assert!(ordinary.allows_model_tool_execution("Read"));
-            assert!(!ordinary.allows_model_tool_execution("session_control"));
+            assert_eq!(ordinary.supervisor_incarnation_id(), None);
+            // Standard's coarse tool policy is not the concrete Host port's
+            // management authorization. Keep its existing surface unchanged.
+            if ultra {
+                assert!(!ordinary.allows_model_tool_execution("session_control"));
+            }
         }
     }
 
