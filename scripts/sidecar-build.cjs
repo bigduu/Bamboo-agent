@@ -139,12 +139,56 @@ function evictWorkspaceArtifacts(metadata, targetDirectory, target) {
   return removed
 }
 
+async function originalSelection(identity, target, selecting, env = process.env) {
+  const preparation = env.PREPARED_RELEASE ? JSON.parse(env.PREPARED_RELEASE) : undefined
+  if (!preparation?.receipt?.nativeOriginals) {
+    assert.ok(!env.NATIVE_ORIGINAL_PLAN, 'Historical preparation cannot acquire an original-output plan')
+    return null
+  }
+  assert.equal(env.GITHUB_SHA, identity.workflowRevision, 'Actual controller SHA must not be relabeled as product source')
+  const originals = require('./native-originals.cjs')
+  const value = env.NATIVE_ORIGINAL_PLAN ? JSON.parse(env.NATIVE_ORIGINAL_PLAN) : undefined
+  const selected = await originals.workerSelection(identity, preparation, value, target, selecting)
+  if (!selecting) assert.equal(selected.action, 'build', 'Retained native outputs cannot start another build or cache producer')
+  return selected
+}
+
+async function recordOriginalTransport(env = process.env) {
+  const originals = require('./native-originals.cjs')
+  const preparation = JSON.parse(env.PREPARED_RELEASE)
+  const identity = originals.preparedIdentity(preparation, env), target = env.BAMBOO_RELEASE_TARGET
+  assert.equal(nativeTarget(), target)
+  await originalSelection(identity, target, false, env)
+  const receiptFile = path.join(env.RUNNER_TEMP, 'bamboo-executable-output', 'build-receipt.json')
+  fileIdentity(receiptFile, 1024 * 1024)
+  const bytes = fs.readFileSync(receiptFile), build = JSON.parse(bytes)
+  const bound = JSON.parse(env.EXPECTED_NATIVE_BUILD)
+  assert.deepEqual(bound, { sha256: build.sha256, sizeBytes: build.sizeBytes,
+    receiptSha256: sha256(bytes), runAttempt: identity.runAttempt }, 'Receipt differs from the independent build-step output')
+  const allowed = new Set(git(['ls-files', '*Cargo.toml']).split('\n'))
+  for (const name of ['Cargo.lock', 'crates/app/bamboo-server/frontend_package/frontend-manifest.json',
+    'crates/app/bamboo-server/frontend_package/lotus-frontend.zip']) allowed.add(name)
+  assert.equal(sourceState(allowed).diffSha256, build.stampedDiffSha256, 'Source changed after native build')
+  const record = originals.transportRecord(identity, target, bytes,
+    { id: Number(env.ORIGINAL_ARTIFACT_ID), sha256: env.ORIGINAL_ARTIFACT_SHA256 })
+  originals.emit(originals.TRANSPORT_PREFIX, record)
+}
+
 async function main() {
+  if (process.argv[2] === 'record-transport') return recordOriginalTransport()
   const identity = workflowIdentity()
   const contractVersion = boundSourceContract()
   const target = process.env.BAMBOO_RELEASE_TARGET
   assert.ok(contractForVersion(contractVersion).targets.includes(target))
   assert.equal(nativeTarget(), target, 'Build and runtime verification require a native target')
+  const selection = await originalSelection(identity, target, process.argv[2] === 'select')
+  if (process.argv[2] === 'select') {
+    assert.ok(selection, 'Only the explicit new native lifecycle has a selector')
+    fs.appendFileSync(process.env.GITHUB_OUTPUT, `action=${selection.action}\n`)
+    require('./native-originals.cjs').emit(require('./native-originals.cjs').SELECTION_PREFIX,
+      { runId: identity.runId, runAttempt: identity.runAttempt, ...selection })
+    return
+  }
   if (process.argv[2] === 'cache-policy') {
     const policy = nativeCachePolicy({ root: process.cwd(), temporary: process.env.RUNNER_TEMP, contractVersion, target,
       cutRevision: identity.validation?.cutRevision,
@@ -220,5 +264,5 @@ async function main() {
 }
 
 module.exports = { nativeTarget, buildEnvironment, verifyBuildMessages, sourceState, verifyStampedVersions,
-  nativeCachePolicy, evictWorkspaceArtifacts }
+  nativeCachePolicy, evictWorkspaceArtifacts, originalSelection, recordOriginalTransport }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })

@@ -453,7 +453,7 @@ function assembleRelease({ identity, inputDirectory, outputDirectory, sourceRoot
 // Preserve the authenticated original build run/controller even across a new
 // recovery dispatch. Never adopt unsigned, foreign-source/CI or incomplete assets.
 async function recoverPublishedRelease({ identity, release, outputDirectory, sourceRoot,
-  frontendBytes, signingKey, readAsset, contractVersion = 2 }) {
+  frontendBytes, signingKey, readAsset, contractVersion = 2, originalsOnly = false }) {
   const contract = contractForVersion(contractVersion)
   assertContractAssets(release.assets, contractVersion)
   const checkpoint = release.assets.find((asset) => asset.name === contract.provenance)
@@ -461,6 +461,11 @@ async function recoverPublishedRelease({ identity, release, outputDirectory, sou
   const bytes = await readAsset(checkpoint, 1024 * 1024)
   assert.ok(bytes.length <= 1024 * 1024)
   const proof = authenticateReceipt(JSON.parse(bytes), signingKey)
+  if (originalsOnly) {
+    assert.equal(contractVersion, 2)
+    assert.equal(proof.nativeOriginals?.schemaVersion, 1, 'Missing original-output provenance')
+    assert.equal(typeof proof.manifestBytesBase64, 'string', 'New lifecycle requires the serialized original manifest; never invoke a packager')
+  }
   if (identity.validation) assertAdmissionCompatibility(proof.validation, identity.validation)
   assert.equal(proof.schemaVersion, contract.version)
   assert.equal(proof.kind, contract.kind)
@@ -578,10 +583,19 @@ async function main() {
   const recovery = { identity, release, outputDirectory: directory, sourceRoot: process.cwd(),
     frontendBytes: receipt.frontendBytes, signingKey: process.env.BAMBOO_RELEASE_SIGNING_KEY, readAsset: assetBytes,
     contractVersion }
-  const manifest = await recoverPublishedRelease(recovery) || assembleRelease({ ...recovery,
-    inputDirectory: path.join(process.env.RUNNER_TEMP, 'bamboo-executable-inputs'),
-    outputDirectory: directory, sourceRoot: process.cwd(), frontendBytes: receipt.frontendBytes,
-    expectedBuilds: JSON.parse(process.env.EXPECTED_BUILDS) })
+  let manifest
+  if (receipt.nativeOriginals) {
+    assert.equal(contractVersion, 2)
+    const originals = require('./native-originals.cjs')
+    const context = originals.createContext(identity, JSON.parse(process.env.PREPARED_RELEASE))
+    context.buildHost = undefined // Finalization only restores prepared bytes.
+    manifest = await recoverPublishedRelease({ ...recovery, originalsOnly: true })
+    if (manifest) await originals.restoreAll(context)
+    else manifest = await originals.assemble(context, directory)
+  } else manifest = await recoverPublishedRelease(recovery) || assembleRelease({ ...recovery,
+      inputDirectory: path.join(process.env.RUNNER_TEMP, 'bamboo-executable-inputs'),
+      outputDirectory: directory, sourceRoot: process.cwd(), frontendBytes: receipt.frontendBytes,
+      expectedBuilds: JSON.parse(process.env.EXPECTED_BUILDS) })
   assert.equal(git(['rev-parse', 'HEAD']), identity.sourceRevision)
   assert.equal(git(['status', '--porcelain', '--untracked-files=all']), '', 'Source drift blocks asset uploads')
   await publishAssets({ directory, release, readAsset: assetBytes, contractVersion,
@@ -589,6 +603,15 @@ async function main() {
     listAssets: () => JSON.parse(gh(`releases/${release.id}/assets?per_page=100`)) })
   assert.equal(git(['rev-parse', 'HEAD']), identity.sourceRevision)
   assert.equal(git(['status', '--porcelain', '--untracked-files=all']), '')
+  if (receipt.nativeOriginals) {
+    await guard()
+    const { release: current } = publishedRelease(identity, { signingKey: process.env.BAMBOO_RELEASE_SIGNING_KEY,
+      signingKeyDigest: process.env.BAMBOO_RELEASE_SIGNING_KEY_SHA256 })
+    assert.equal(current.id, release.id)
+    const completion = require('./native-originals.cjs').completion(identity, current, current.assets,
+      fs.readFileSync(path.join(directory, contract.manifest)))
+    require('./native-originals.cjs').emit('Native original completion: ', completion)
+  }
   console.log(JSON.stringify({ status: 'published-and-verified', version: identity.version,
     sourceRevision: identity.sourceRevision, manifestSha256: fileIdentity(path.join(directory, contract.manifest), 1024 * 1024).sha256,
     contractVersion, targets: contract.targets }))
