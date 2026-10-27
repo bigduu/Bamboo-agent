@@ -837,11 +837,13 @@ async fn supervisor_retry_keeps_its_reservation_and_raw_payload_across_legacy_ho
     assert_eq!(after.created_at, stored.created_at);
     assert_eq!(after.payload_fingerprint, stored.payload_fingerprint);
     assert_eq!(after.supervised_delivery, stored.supervised_delivery);
-    let calls = mock.calls.lock().unwrap();
-    assert!(
-        calls.is_empty(),
-        "Supervisor keeps its canonical input port rather than borrowing a finite Host mock"
-    );
+    {
+        let calls = mock.calls.lock().unwrap();
+        assert!(
+            calls.is_empty(),
+            "Supervisor keeps its canonical input port rather than borrowing a finite Host mock"
+        );
+    }
     assert_eq!(
         f.inbox
             .inspect(&stored.session_id)
