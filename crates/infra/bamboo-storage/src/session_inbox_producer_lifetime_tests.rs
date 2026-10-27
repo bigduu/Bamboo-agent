@@ -642,11 +642,19 @@ fn supervisor_followup_started_job_retains_full_original_relationship_lockset() 
         f.assert_waiting(&mutation);
         parked.barrier.release();
         f.finish(mutation);
-        assert!(
-            f.runtime
-                .block_on(f.inbox.deliver_supervisor_followup(&reference, &message))
-                .is_err(),
-            "authority recheck must precede exact-id retry: {change}"
-        );
+        let retry = f
+            .runtime
+            .block_on(f.inbox.deliver_supervisor_followup(&reference, &message));
+        if matches!(change, "detach" | "scope") {
+            assert!(
+                retry.is_ok(),
+                "legacy metadata does not revoke default-domain authority: {change}"
+            );
+        } else {
+            assert!(
+                retry.is_err(),
+                "canonical target change must precede exact-id retry: {change}"
+            );
+        }
     }
 }

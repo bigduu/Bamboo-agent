@@ -101,6 +101,37 @@ async fn current_user_two_projects_and_later_roots_need_no_manual_grants() {
         canonical_bytes(&store, &reference.session_id).await,
         supervisor
     );
+    // Directory control observations do not decode transcript content. A
+    // malformed private message still fails explicit history inspection; the
+    // metadata observation neither repairs it nor grants file/runner access.
+    let path = store.sessions_root_dir().join(&a.id).join("session.json");
+    let mut raw = tokio::fs::read_to_string(&path).await.unwrap();
+    let fields: std::collections::BTreeMap<String, &serde_json::value::RawValue> =
+        serde_json::from_str(&raw).unwrap();
+    let history = fields["messages"].get();
+    let start = history.as_ptr() as usize - raw.as_ptr() as usize;
+    let end = start + history.len();
+    raw.replace_range(
+        start..end,
+        r#"[{"invalid_private_transcript_fixture":true}]"#,
+    );
+    tokio::fs::write(&path, &raw).await.unwrap();
+    let page = store
+        .list_supervisor_current_user_targets(&reference, None, None, 20)
+        .await
+        .unwrap();
+    assert!(page.targets.iter().any(|target| target.session_id == a.id));
+    let filtered = store
+        .list_supervisor_current_user_targets(&reference, Some("project-b"), None, 1)
+        .await
+        .unwrap();
+    assert_eq!(filtered.targets.len(), 1);
+    assert_eq!(filtered.targets[0].session_id, b.id);
+    assert!(store
+        .load_supervisor_current_user_observed_session(&reference, &a.id)
+        .await
+        .is_err());
+    assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), raw);
 }
 
 #[tokio::test]

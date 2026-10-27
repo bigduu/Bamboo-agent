@@ -144,7 +144,13 @@ async fn managed_sessions_owner_attach_detach_is_cas_bound_and_preserves_targets
     assert_eq!(status, StatusCode::OK, "{empty}");
     assert_eq!(empty["capabilities"]["managed_sessions_http_v1"], true);
     assert_eq!(empty["scope"]["state_revision"], 0);
-    assert_eq!(empty["sessions"], json!([]));
+    assert_eq!(empty["sessions"].as_array().unwrap().len(), 2);
+    assert!(empty["legacy_links"].as_object().unwrap().is_empty());
+    assert_eq!(empty["management_access"]["kind"], "current_user");
+    assert_eq!(
+        empty["management_access"]["requires_session_attachment"],
+        false
+    );
     f.configure().await;
     let original = f.body(1, true);
     let (status, attached) = f
@@ -165,7 +171,8 @@ async fn managed_sessions_owner_attach_detach_is_cas_bound_and_preserves_targets
     assert_eq!(noop["receipt"]["state_revision"], 2);
     let (status, observed) = f.call(Method::GET, None, None).await;
     assert_eq!(status, StatusCode::OK, "{observed}");
-    assert_eq!(observed["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(observed["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(observed["legacy_links"].as_object().unwrap().len(), 1);
     assert_eq!(observed["sessions"][0]["session_id"], "target-a");
     assert_eq!(observed["sessions"][0]["authorized"], true);
     assert_eq!(observed["sessions"][0]["target_metadata_version"], 0);
@@ -177,8 +184,9 @@ async fn managed_sessions_owner_attach_detach_is_cas_bound_and_preserves_targets
     assert_eq!(detached["receipt"]["state_revision"], 3);
     let (status, observed) = f.call(Method::GET, None, None).await;
     assert_eq!(status, StatusCode::OK, "{observed}");
-    assert_eq!(observed["sessions"][0]["enabled"], false);
-    assert_eq!(observed["sessions"][0]["authorized"], false);
+    assert_eq!(observed["sessions"][0]["enabled"], true);
+    assert_eq!(observed["sessions"][0]["authorized"], true);
+    assert_eq!(observed["legacy_links"]["target-a"]["enabled"], false);
     assert_eq!(f.target_bytes("target-a").await, before);
     assert!(!f.state.config.read().await.features.ticket_mutation);
     assert!(!f.state.config.read().await.features.ticket_dispatch);
@@ -249,9 +257,15 @@ async fn managed_sessions_denied_targets_and_invalid_requests_have_no_side_effec
         f.call(Method::PUT, Some("target-a"), Some(extra)).await.0,
         StatusCode::BAD_REQUEST
     );
-    let (_, observed) = f.call(Method::GET, None, None).await;
+    let (status, observed) = f.call(Method::GET, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{observed}");
     assert_eq!(observed["scope"]["state_revision"], 1);
-    assert_eq!(observed["sessions"], json!([]));
+    assert!(observed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|target| target["session_id"] == "target-a"));
+    assert!(observed["legacy_links"].as_object().unwrap().is_empty());
     assert_eq!(f.target_bytes("target-a").await, before);
     assert!(!f.home.path().join("tickets").exists());
     f.state.shutdown().await;
@@ -299,9 +313,15 @@ async fn managed_sessions_access_requires_owner_and_optional_exact_intent() {
         .call(Method::PUT, Some("target-a"), Some(f.body(1, true)))
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
-    let (_, observed) = f.call(Method::GET, None, None).await;
+    let (status, observed) = f.call(Method::GET, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{observed}");
     assert_eq!(observed["scope"]["state_revision"], 1);
-    assert_eq!(observed["sessions"], json!([]));
+    assert!(observed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|target| target["session_id"] == "target-a"));
+    assert!(observed["legacy_links"].as_object().unwrap().is_empty());
     assert_eq!(f.target_bytes("target-a").await, before);
     let (status, response) = call(
         f.state.clone(),
@@ -343,8 +363,12 @@ async fn managed_sessions_stale_links_need_explicit_confirmation_and_deleted_tar
     assert_eq!(status, StatusCode::OK, "{observed}");
     assert_eq!(observed["scope"]["state_revision"], 2);
     assert_eq!(observed["sessions"][0]["enabled"], true);
-    assert_eq!(observed["sessions"][0]["authorized"], false);
-    assert_eq!(observed["sessions"][0]["target_metadata_version"], 0);
+    assert_eq!(observed["sessions"][0]["authorized"], true);
+    assert_eq!(observed["sessions"][0]["target_metadata_version"], 1);
+    assert_eq!(
+        observed["legacy_links"]["target-a"]["target_metadata_version"],
+        0
+    );
     assert_eq!(f.target_bytes("target-a").await, before);
     let (status, response) = f
         .call(Method::PUT, Some("target-a"), Some(f.body(2, true)))
@@ -356,13 +380,18 @@ async fn managed_sessions_stale_links_need_explicit_confirmation_and_deleted_tar
     assert_eq!(observed["sessions"][0]["target_metadata_version"], 1);
     f.state.storage.delete_session("target-a").await.unwrap();
     let (_, observed) = f.call(Method::GET, None, None).await;
-    assert_eq!(observed["sessions"][0]["authorized"], false);
+    assert!(observed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|target| target["session_id"] != "target-a"));
+    assert_eq!(observed["legacy_links"]["target-a"]["enabled"], true);
     let (status, response) = f
         .call(Method::PUT, Some("target-a"), Some(f.body(3, false)))
         .await;
     assert_eq!(status, StatusCode::OK, "{response}");
     let (_, observed) = f.call(Method::GET, None, None).await;
-    assert_eq!(observed["sessions"][0]["enabled"], false);
+    assert_eq!(observed["legacy_links"]["target-a"]["enabled"], false);
     assert_eq!(observed["scope"]["state_revision"], 4);
     f.state.shutdown().await;
 }
@@ -394,13 +423,13 @@ async fn managed_sessions_same_revision_race_commits_only_one_target() {
     let (status, observed) = f.call(Method::GET, None, None).await;
     assert_eq!(status, StatusCode::OK, "{observed}");
     assert_eq!(observed["scope"]["state_revision"], 2);
-    assert_eq!(observed["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(observed["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(observed["legacy_links"].as_object().unwrap().len(), 1);
     f.state.shutdown().await;
 }
 
 #[actix_web::test]
-async fn managed_sessions_target_authority_error_stays_local_but_source_authority_failure_does_not()
-{
+async fn managed_sessions_corrupt_canonical_target_and_source_fail_closed_without_repair() {
     let f = Fixture::new(false).await;
     f.configure().await;
     assert_eq!(
@@ -417,12 +446,10 @@ async fn managed_sessions_target_authority_error_stays_local_but_source_authorit
     tokio::fs::write(&target_proof, damaged).await.unwrap();
     let before = f.target_bytes("target-a").await;
     let (status, observed) = f.call(Method::GET, None, None).await;
-    assert_eq!(status, StatusCode::OK, "{observed}");
-    assert_eq!(observed["sessions"][0]["enabled"], true);
-    assert_eq!(observed["sessions"][0]["authorized"], false);
-    assert_eq!(
-        observed["sessions"][0]["authorization_error"],
-        "target_authority_unavailable"
+    assert_eq!(status, StatusCode::CONFLICT, "{observed}");
+    assert!(
+        observed.get("sessions").is_none(),
+        "unverified target metadata cannot authorize discovery"
     );
     assert_eq!(f.target_bytes("target-a").await, before);
     assert_eq!(tokio::fs::read(&target_proof).await.unwrap(), damaged);
@@ -431,10 +458,12 @@ async fn managed_sessions_target_authority_error_stays_local_but_source_authorit
         .await;
     assert_eq!(status, StatusCode::OK, "{response}");
     let (status, observed) = f.call(Method::GET, None, None).await;
-    assert_eq!(status, StatusCode::OK, "{observed}");
-    assert_eq!(observed["sessions"][0]["enabled"], false);
-    assert_eq!(observed["sessions"][0]["authorized"], false);
-    assert!(observed["sessions"][0].get("authorization_error").is_none());
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "legacy detach cannot repair canonical target authority: {observed}"
+    );
+    assert!(observed.get("sessions").is_none());
     assert_eq!(f.target_bytes("target-a").await, before);
     assert_eq!(tokio::fs::read(&target_proof).await.unwrap(), damaged);
     let source_proof = f
