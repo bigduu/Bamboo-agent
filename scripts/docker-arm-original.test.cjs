@@ -277,4 +277,12 @@ test("ARM builder config must match the actual fixed image and native architectu
     const bad={...image,[field]:field==="Config"?{Env:["RUST_VERSION=1.99.0"]}:"foreign"};assert.throws(()=>arm.checkBuilder(bad));
   }
 });
+test("ARM real Docker29 manifest-store shape labels observed identity separately from pinned config",()=>{
+  // Captured selected fields on local OrbStack29.8.2, 2026-10-27. The original
+  // once-only pull passed; the old config-ID assertion failed before any run.
+  const manifest="sha256:32f7944ed00949c44d3944a0a852b3e5ea862a610a38b43ac92a33aa87256b75";
+  const descriptor={digest:manifest,mediaType:"application/vnd.oci.image.manifest.v1+json",size:1942};
+  const observed={Id:manifest,RepoDigests:["rust@"+manifest],Descriptor:descriptor,Os:"linux",Architecture:"arm64",Config:{Env:["RUST_VERSION=1.99.1"]}};
+  assert.deepEqual(arm.checkBuilder(observed),{role:"manifest",id:manifest,repositoryDigest:"rust@"+manifest,descriptor});
+});
 });
