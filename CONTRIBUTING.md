@@ -205,311 +205,122 @@ bamboo/
 
 ## Release Process
 
-The automatic publisher also provides the standard complete Bamboo executables
-for standalone and desktop reuse. See [Shared Bamboo executables](docs/releases/shared-executable-assets.md)
-for the source-selected platform assets, source/version provenance, browser host archive,
-and consumer hash verification contract. These assets retain all release gates
-described below.
+Read the complete local [delivery workflow](docs/delivery-workflow.md),
+[Actions audit](docs/ci-workflow-audit.md) and
+[Bamboo phase guide](docs/releases/ci-publication-flow.md), then follow
+[Parallel Development](./gitflow.md) and [AGENTS.md](./AGENTS.md).
 
-Follow [Parallel Development](./gitflow.md) for ownership and evidence. Every
-feature PR into `dev` runs required `Test`, aggregating Unit, E2E and the live SSH
-fixture. One physical Linux executor preserves independent default package
-configurations in one target directory. Cargo runs ordinary library/binary,
-integration and documentation cases once; explicit feature owners run only
-catalogued additions. The ignored SSH case reuses its compiled executable. Applicable native
-acceptance also runs before dev admission. Before merge, owners must run affected tests locally and add or update coverage
-for changed behavior, recording exact source, commands and results. Failures are
-repaired in the feature branch before it enters dev; `Quick Checks` is auxiliary.
+Feature branches own Unit/E2E. Every feature PR into `dev` runs required `Test`,
+which aggregates its selected runtime and supporting owners on the actual merge
+source. Before merge, owners must run affected tests locally and add or update coverage
+for changed behavior, recording exact source, commands and results. Repair
+relevant failures on the feature branch before normal protected-dev admission.
+An integration branch is a finite acceptance slice, not a place to defer tests.
 
-The target train is `feature → dev → release/<40-character-cut-SHA> → main`. Freeze the
-exact accepted dev commit, reserve one version with the existing allocator, then
-build/package/publish the three native binaries once on that release source.
-Release branches do not rerun Unit/E2E or carry product repairs. Main promotes
-published stable code and records its immutable tag, manifest/provenance hashes
-and publisher run in the promotion description; it does not rebuild or retest.
-Keep source manifests at `0.0.0`; stamp disposable formal-build checkouts only.
-Repairs return through feature/dev tests and a fresh cut.
+The train is `feature → dev → release/<40-character-cut-SHA> → main`.
+Release branches do not rerun Unit/E2E or carry product repairs. Main promotion is read-only.
+The release phase reserves the final version and produces each supported formal
+output once. Main records stable code and immutable version/artifact references;
+its push and promotion events perform no product tests, compilation or packaging.
+A trusted controller dispatched from Main can build a separate frozen release
+source; that is the release phase, not a second Main build.
 
-**Cutover dependency:** #2311 installs feature admission only. The paragraphs
-below describe the temporary legacy release/main publication route, retained
-until the separate release-source admission change is accepted. Its checks,
-source proof and historical recovery must not be bypassed. Before the first new
-cut, integrate current main ancestry into dev through a normally tested feature
-PR. See [CI and publication flow](docs/releases/ci-publication-flow.md) for the
-implemented and pending phase boundaries. No new production dispatch is implied.
+### Activation checkpoint
 
-### Temporary legacy release gates
+The replacement entrypoints and Source/Main consumers are **staged**. At the
+#2363 checkpoint, Bamboo's default branch is `dev`; stable Main is still
+`d6325a732c7669f94962f604e4ce98966e374d73`. Its live legacy route has not been
+replaced merely because a prepared branch or policy fixture passed. Combined
+feature admission, complete producer registration, trusted controller installation,
+Main protection/default cutover and real release/consumer acceptance remain
+separate gates. The first new Source publication and first positive Main
+promotion have not been established by these documentation changes.
 
-### Validate a fixed snapshot
-
-For manual `CI` or `Frontend consumer acceptance` runs, select the intended
-branch/tag and supply `snapshot_sha` as the full lowercase 40-character SHA.
-It must equal that dispatch event's actual source SHA; mismatches fail closed.
-Record the ref, exact SHA/tree, workflow run and result. Do not silently replace
-it with a later moving `dev` head. Manual validation does not grant publication
-authority.
-
-CI on a main PR tests its actual synthetic merge result. The frontend workflow
-also runs on main PRs and validates the exact PR head with its original
-source-cleanliness, artifact and strict Clippy contracts. Preserve the two source
-identities; evidence is reusable only if all relevant source and build/test
-inputs match. The final release PR supplies the mandatory complete release CI,
-including after a repair `F`. An extra manual full CI on `F` is optional diagnosis,
-not a second mandatory full run. Preserve the separate exact-source repair
-evidence below.
-Ordinary dev PRs compile in CI but do not automatically run these full test suites.
-Existing path-scoped Windows/adapter checks retain their own triggers.
+Check [Zenith #399](https://github.com/bigduu/Zenith/issues/399), the phase guide
+and fresh remote state before operating a release. Preserve currently required
+checks, active queues and original evidence. Do not dispatch an inactive producer
+or use this target policy to waive an existing gate.
 
 ### Freeze the release scope
 
-1. After all changes and controls required for this release have normally merged
-   into protected `dev`, freshly read its actual current HEAD immediately before
-   creating the release branch. This is the cut; do not select an arbitrary
-   historical ancestor. Record the cut's UTC timestamp, full lowercase
-   40-character SHA, tree SHA, fresh branch-read receipt, and bounded release
-   scope in the release PR. Create `release/<cut-SHA>` at that exact recorded SHA.
-   Keep `dev` open for ongoing development after the cut.
+1. Finish the feature's affected local checks, selected Unit/E2E and review before
+   its normal PR enters protected `dev`. Keep the actual tested merge `M`, feature
+   head/base, accepted Dev merge `S` and their exact trees distinct. New Source
+   admission requires a confirmed accepted PR; a direct push or matching tree
+   does not manufacture that record.
+2. Select the accepted Dev cut, freshly read and record its exact SHA/tree, branch
+   receipt and UTC cut time, and create `release/<S>` at that recorded commit.
+   State the finite release scope and exact locked frontend identity. Ongoing
+   development may advance Dev without changing this frozen source.
+3. Keep `release/<S>` immutable. A product defect or failed relevant test returns
+   to its feature owner, passes the affected checks into Dev, and requires a new
+   recorded cut. Do not fix a frozen release, merge a broader integration head
+   into it or collect a release test-repair batch. A pending producer/consumer
+   identity must be accepted through feature/dev before selecting its new cut.
 
-   A bounded exception allows an early cut for an accepted backend checkpoint
-   while a known pending frontend consumer awaits its immutable producer. All
-   required backend changes and release controls must already have normally
-   merged into protected `dev`. Use the same fresh actual-HEAD read and normal
-   branch creation above; an old checkpoint is not a substitute for that read.
-   At cut time, explicitly record the known pending consumer: its immutable
-   producer ref, source revision, version and existing acceptance evidence,
-   exact allowed consumer paths, remaining producer/consumer gates, and bounded
-   release scope. Do not describe this known dependency as an unexpected fix.
+### Produce and retain formal outputs once
 
-   Keep one release owner and use an isolated release worktree. Other owners
-   may normally advance `dev` immediately after the branch and cut receipt exist;
-   they need not wait for the consumer or publication. After the producer's
-   accepted publication identity and complete artifact hashes are verified,
-   create the consumer's original head `F` from the frozen release. Apply the
-   separate `F` release-source and `U` protected-dev integration procedure
-   in step 3, including affected local tests, independent Code and Security
-   review, preserved ancestry and normal admission before fast-forwarding only
-   to `F`. Complete Linux/macOS/Windows validation on the final release PR.
-   Record the verified artifact hashes in `F`'s receipt. A pending or failed
-   producer/consumer gate blocks release promotion and publication, not ongoing
-   development. Never pull unrelated `dev` work into the release; a changed
-   producer identity or expanded consumer scope requires explicit scope review
-   through the normal process. This exception changes ordering only, not gates,
-   protection, publication authority or the `Promotion Source` contract.
-2. Open the release branch's PR into `main`. Freeze its scope: do not repeatedly
-   merge the latest `dev` tip or unrelated features into the release to chase
-   ongoing development. If a broader release is needed, explicitly choose and
-   record a new cut and scope on a new release branch.
-3. For a necessary release fix, branch from the frozen release head and keep
-   the original fix head `F` within the recorded release scope. Record `F`'s
-   exact SHA/tree and bounded diff as the intended release target. Obtain
-   independent Code and Security review and run affected local tests on that
-   exact `F`. Preserve `F` unchanged while admitting it to protected `dev`
-   (do not squash or rebase it into a different commit).
-   If `dev` has advanced, use a separate integration head `U` containing both
-   `F` and the current protected `dev` head. Keep `U` up to date as strict branch
-   protection requires, and submit it through normal current-head/base review
-   and required checks. Record `U`'s exact SHA/tree, review/check receipts, and
-   normal admission into `dev`, with exact `F` → `U` → accepted-`dev` ancestry.
-   Keep `F`'s local test/review evidence and `U`'s normal integration validation
-   separate. Neither replaces the final release PR's complete acceptance.
-   Bind both receipts to their respective
-   SHA/tree, even if the two heads coincide when no dev update is needed.
-   Only after both pass and `F` is admitted through `U`, fast-forward the release
-   branch to the recorded original fix head `F`; never substitute `U` or its
-   dev merge result for recorded `F`. Review must reject any other repair target,
-   even if its ancestry gate passes. Do not merge unrelated `dev` work into the
-   release. A changed `F` requires fresh source evidence and normal admission.
-   Run the complete release suite and Linux/macOS/Windows matrix on the final
-   release PR before promotion. An extra manual full CI on `F` is optional
-   diagnosis, not a second mandatory full run.
-   Pending or failing release-source or required integration checks block this
-   route; fix and rerun them, never change
-   the cut to evade a gate. Only if existing branch rules cannot preserve exact
-   `F` ancestry, or the necessary repair cannot stay within the recorded scope,
-   stop and explicitly agree a new cut/scope through the normal process.
-   Never bypass protection.
-4. The required `Promotion Source` gate verifies the actual same-repository
-   release branch against the PR's exact head, proves cut → release-head
-   ancestry, and proves release-head → protected-`dev` ancestry. Missing proof,
-   source drift, or an unbackmerged fix fails closed. Later `dev` commits do not
-   invalidate a frozen release. Static CI cannot prove the historical timing of
-   branch creation or judge release scope. In particular, an admitted `U` can
-   pass ancestry while containing unrelated `dev` work; this gate alone cannot
-   authorize `U` as the release target. Review must verify the fresh cut receipt
-   and actual normal branch creation, the recorded scope, and the separate `F`
-   release-source and `U` integration receipts before accepting a repair.
-5. Merge the release PR into `main` only after its current-head review, all
-   required checks, the full Linux/macOS/Windows matrix, and normal branch
-   protection pass. Main PR checks continue to test the synthetic merge result;
-   manual CI can additionally validate the exact release source. A new head or
-   changed base requires fresh review and checks, never relabeled old results.
+The Source controller `C` and frozen product `S` are separate checkouts and
+receipt fields. Keep actual GitHub SHA/ref identities unchanged. Use only the
+admitted producer and its existing version allocator; reserve the version before
+formal compilation. Source manifests retain `0.0.0`; stamp the final version in
+disposable publishing checkouts, without a post-build source JSON commit.
 
-Release source and version tags are immutable: never move or replace a frozen
-tag. This process adds no publication or deployment authorization, credentials,
-permissions, or protection exceptions. Existing publication prerequisites still
-apply.
+The release workflow builds/packages the standard three-platform binaries and
+managed crate outputs with their explicit target/profile/toolchain/locked inputs.
+See [Shared Bamboo executables](docs/releases/shared-executable-assets.md) for the
+fixed platform and Host asset contracts.
+A feature test executable and a final-version release binary are different
+outputs; a cache hit is not original-output evidence. Do not add another Unit,
+E2E, Rustdoc or frontend compiler path to release. Preserve distinct required
+artifact verification and publication-isolation inputs.
 
-After the normal protected release-branch promotion, successful same-repository
-main push CI queues publication of its exact tested commit to crates.io and a
-GitHub Release. The workflow must first reach main through that normal promotion;
-do not promote unrelated development solely to activate it. Source manifests
-keep `0.0.0`; temporary publication stamps an unused `YYYY.M.N` UTC version and
-embeds the committed frontend lock. Keep this successful-main-CI path as the
-single automatic Bamboo publisher. Downstream consumers verify the already-published
-Bamboo version, source and artifact hashes, then consume that release through
-their own protected flow. They do not allocate a second Bamboo version or
-dispatch duplicate publication.
+Checkpoint each successful output's original run/job/physical attempt, artifact
+ID, byte size and digest before finalization. Reuse successful siblings and exact
+retained bytes on recovery. Classify a failed target before an infrastructure
+retry; source repairs require feature/dev and a new cut. Missing or changed
+previously successful originals stop recovery; they do not authorize rebuilding
+or repackaging that output. Finalization joins and publishes verified originals.
 
-Main pushes also trigger documentation publication to public GitHub Pages.
-GHCR image publication is triggered separately by `v*`/`bamboo-v*` tag pushes or
-an explicit Docker workflow dispatch, not by a main push. Account for these
-side effects under the existing authorization and release prerequisites; the
-branch policy does not change their workflows.
+### Promote the published source
 
-Automatic runs and manual/Zenith dispatches using this workflow share one
-`bamboo-crate-publication` queue without canceling queued uploads. Previously
-frozen tags retain their own workflow definitions; this change does not
-retroactively add the queue or new guards to those tags.
+Only a completed publication can supply a normal Main promotion.
+The trusted Main-base reader checks the real source, controller, original jobs,
+version/tag, manifests/assets and exact Git postimage. A locator, local fixture,
+same-name green check or unconfirmed merge is not that proof. Record actual
+Main merge identity separately from the source that was built. Main never
+repeats product tests, compilation, packaging or publication after promotion.
+Docs and distribution consumers use authenticated originals; they cannot
+reconstruct missing bytes by running the source producer again.
 
-Before main activation, coordinate outstanding frozen-tag trains' explicit
-versions and same-source resume through [Zenith #322](https://github.com/bigduu/Zenith/issues/322)
-and [#370](https://github.com/bigduu/Zenith/issues/370), alongside the normal
-promotion and Environment configuration. Their historical workflows cannot join
-the new queue retroactively.
+### Validate a fixed snapshot
+
+In the prepared entrypoints, manual CI is an explicit same-SHA feature/dev
+diagnostic. It rejects Main, release refs, tags and unknown refs; it is not a
+formal-release or publication gate. Record the actual source, configuration,
+command and outcome. Standalone native/frontend/CodeQL diagnostics retain their
+own explicit inputs and cannot replace selected feature evidence.
+
+Historical workflows and recovery continue to use their original immutable
+controller, source, receipts and permissions. Keep failed, cancelled, skipped
+and unknown outcomes distinct. Do not rerun a failure merely to obtain green.
 
 ### Automatic main publication
 
-Both production jobs use the `bamboo-release` Environment; only the automatic
-job receives the GitHub/HMAC authority. Before
-checkout, a fixed bootstrap verifies the successful same-repository main push CI
-source and protected-dev controller history. It binds the server-recorded merged
-release PR's exact head/base, two-parent merge and unchanged release-head tree,
-cut → release-head → protected-dev ancestry, successful full pre-merge release CI
-(including all three `Platform Tests` jobs and Promotion Source), and successful
-main push admission. Main pushes reuse this authenticated pre-merge evidence rather
-than repeat the full Rust suite. Historical full main-CI evidence keeps its own
-contract; skipped jobs are never relabeled as executed full validation.
-Historical pre-merge producers retain their original platform-build requirements.
-Current release PRs preserve native platform tests without running an optimized
-executable build. The automatic main publisher alone builds the three versioned
-release executables after source admission and version/frontend preparation.
-Pre-merge jobs must complete strictly before the merge; failed-only reruns may
-retain earlier successful job attempts. Missing, ambiguous, stale or failed
-evidence stops before checkout or publication credentials. The main branch's
-protection flag is not publication evidence. The existing exact-head review
-remains responsible for cut scope and original F versus integration U; ancestry
-alone cannot distinguish their roles. The
-checkout uses the tested CI SHA, which may differ from the workflow's SHA.
-Pre-policy main commits cannot acquire the new publication authority. Queued
-sources must still equal fresh main before authorization, reservation, tag or
-receipt changes, each crate publish attempt, release completion and each native
-asset upload. API failures stop the write. Manual and historical recovery entry
-contracts, signing authority and allocator remain unchanged.
-
-If GitHub returns an explicitly empty PR association for that release CI run
-after merge, the bootstrap additionally authenticates its GitHub Actions check
-suite, executed workflow file, exact run/attempt and source job. Only the pinned,
-reviewed checkout-free CI producer may supply one historical validation snapshot
-record. That snapshot must preserve the exact ordered base/head parents and the
-reviewed release/main tree. The source job is bound to its original attempt;
-later partial reruns do not relabel it. Missing, conflicting, duplicated or
-unknown producer evidence rejects publication. A nonempty conflicting association
-cannot use this route. This exception does not authorize ordinary test logs,
-artifacts, comments or local receipts as publication proof. Updating the pinned
-producer requires normal code/security review and regression coverage.
-
-An authenticated draft body reserves source, frontend and version before any
-crate upload. Original frontend assets and each package checksum are preserved
-for recovery. Every downloaded crate must match its reserved checksum, Git source
-SHA and, for bamboo-server, original embedded frontend bytes. Only the complete
-verified closure becomes a public GitHub Release. Reruns reuse the matching
-source/frontend reservation; completed reruns verify without republishing.
-
-After this single reservation, the crate publisher and source-selected native
-matrix run concurrently. Preparation uploads exactly the preserved frontend
-manifest and ZIP as same-run transport; its independent job output binds the
-signed identity, hashes and original preparation attempt. Native workers verify
-these files without reading a private draft or receiving publication credentials.
-The crate worker authenticates the original reservation and resumes its fixed
-version without reallocating or replacing sealed frontend assets. Final asset
-publication waits for both the completed crate closure and all required native
-results. A public crate Release alone does not establish binary availability.
-
-Native dependency caches map the real runner-temp Cargo target directory and
-bind source profile, toolchain, lockfile, producer contract and target. Restored
-workspace binaries, fingerprints and generated frontend outputs are evicted
-before the formal build. Historical v1 and frozen restore-only sources cannot
-write these caches. Compiler/profile/wrapper restrictions remain intact.
-
-Authenticated reservations and registry versions advance the full-u64 allocator;
-unsigned names only occupy candidates. Verified registry/source ancestry prevents
-stale sources overtaking newer versions or GitHub latest, even after Release
-metadata deletion. Public target claims and copied receipts grant no recovery
-authority; transport failures stop publication.
-
-In that Environment, set `BAMBOO_RELEASE_TOKEN` with repository Contents/Workflows
-write, `BAMBOO_RELEASE_SIGNING_KEY` to 32 random bytes as 64 lowercase hex digits,
-and variable `BAMBOO_RELEASE_SIGNING_KEY_SHA256` to the SHA-256 of decoded key bytes.
-Keep these names absent from repository/org configuration and the key stable
-across token rotation. Missing/mismatched configuration stops publication; lost
-keys require manual evidence verification, never accepting or re-signing unsigned
-history. Tag authority is checked before upload.
+This heading preserves old links. The new normal flow has no Main-CI publisher:
+formal outputs belong to frozen-source release, and Main promotion reads their
+completed evidence. The historical v8 policy is preserved in an
+[immutable source snapshot](https://github.com/bigduu/Bamboo-agent/blob/ce89b4fcf4a45014cccb3bc7f817613ddcfa7eb2/CONTRIBUTING.md#release-process)
+and hash-bound fixture data, not as a new release entrypoint.
 
 ### Manual and Zenith publication
 
-Production manual dispatch retains the Cargo-only publication path on protected
-dev/main or a protected annotated `bamboo-release-source-<40-character-source-SHA>`
-tag. The tag suffix, required `expected_source_sha`, dispatched `GITHUB_SHA`,
-workflow SHA and clean checkout HEAD must match. Before checkout, an inline
-bootstrap verifies the exact workflow ref, protection status, a single annotated
-tag object peeling directly to that commit, protected dev/main ancestry, and the
-committed trusted-publication policy marker. Historical branch runs remain pinned
-to their dispatched SHA even if the protected branch advances while queued.
-Manual runs have Contents read and no GitHub release token or signing key. Only
-the final publish step receives the Environment `CARGO_REGISTRY_TOKEN`.
-
-Configure that Environment with exactly branch rules dev/main and a tag rule
-`bamboo-release-source-*`. The tag namespace needs two active repository rulesets:
-creation restricted with only RepositoryRole admin (actor_id 5) always-bypass,
-and update/deletion restricted with no bypass actors. A protected-ref flag alone
-does not prove these restrictions; verify their live configuration before use.
-Create accepted tags only after the hardened publisher is merged into protected
-history. Zenith separately accepts the new tag object, peeled source and matching
-root pointer through its normal PR flow; old `bamboo-bodhi-source-*` tags cannot
-be granted production authority by this workflow.
-
-Before activation, provision the existing owner-controlled crates.io credential
-in this Environment, verify its intended managed-crate publish scope, drain old
-queued/running frozen publishers, and remove repository/org Cargo-token copies.
-Old workflows must then fail for lack of credentials. This migration does not
-revoke a potentially shared token globally. Secret-free dry runs do not prove
-production token scope or real upload permission for the complete crate closure.
-
-After merging the credential-check workflow into a protected branch, dispatch
-`release-credentials-check.yml` there to verify the Environment GitHub and Cargo
-authentication and signing-key fingerprint without checking out source or
-uploading artifacts. This read-only check does not prove GitHub write scopes or
-publish permissions for every managed crate; the actual authorized publication
-must still verify those permissions and the resulting release identity.
-
-Pass a real Cargo SemVer `version`; empty/`latest` uses the source manifest and
-rejects `0.0.0`. Build metadata is unsupported. Stable versions cannot exceed the
-current UTC year/month; historical versions, u64 counters and prereleases remain
-valid. Inputs are parsed as environment data. Locked frontend and fixed legacy
-rollback inputs remain available.
-
-`dry_run=true` uses a separate job without an Environment and with publication
-credential variables explicitly empty, including on feature refs. It validates
-the exact dispatched source and stamped workspace buildability without uploads.
-Manual publication retains the existing dependency-order, propagation,
-rate-limit and skip-existing loop. It does not recover signed drafts, create
-GitHub Releases, change latest or add provenance to historical manual skips.
-
-Both publication paths use the isolated Cargo entrypoint delivered in
-[#1752](https://github.com/bigduu/Bamboo-agent/issues/1752), described below.
-The protected-ref credential migration is tracked in
-[#1699](https://github.com/bigduu/Bamboo-agent/issues/1699); its operational gates
-must finish before independent main publication is activated.
+Zenith is a policy/pointer wrapper, not a new cross-repository release producer.
+The retained fixed historical recovery routes keep their own version/source and
+credential boundaries. Never reinterpret an old manual skip, signed receipt or
+unpublished v8 fixture as new Source authority. Use the phase guide for current
+operator prerequisites and exact active entrypoints; this document grants no
+credential, protection, publication or deployment change.
 
 ## Additional Notes
 
@@ -526,45 +337,33 @@ must finish before independent main publication is activated.
 
 ### Existing Workflows
 
-Bamboo uses GitHub Actions for continuous integration and publishing:
+The following describes the prepared #2363 ownership. The activation checkpoint
+above and phase guide distinguish it from still-installed legacy Main definitions.
 
-- **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run the required
-  `Test` check over one physical Linux executor and owned target directory.
-  Independent default package configurations own ordinary library/binary,
-  integration and documentation cases; narrow feature owners run catalogued
-  additions. Compatible compiled outputs and the live SSH executable are reused.
-  `Quick Checks` remains auxiliary. Fix failed feature tests before dev admission.
-  The existing release suite, native platform checks and lightweight main
-  admission remain active until release-source publication cutover; that pending
-  change moves one versioned build/publication to release and leaves main with
-  read-only promotion records. Preserve the currently required gates meanwhile.
+- **CI**: Dev PRs own Unit/E2E, native/browser runtime, quality and retained Docs
+  on the actual clean merge. Required summaries reject incomplete selected
+  owners. Quick Checks owns Ubuntu Node policy once; Linux Cargo does not repeat
+  that suite. Preserve distinct native OS, target and feature configurations.
+- **Publish Crate**: the frozen-source release dispatcher uses trusted Main `C`,
+  accepted `S`, one allocator, original outputs and one finalizer. It does not
+  rerun product tests. Empty producer registries stop new cuts; local fixtures
+  are not production publication evidence.
+- **Main Admission**: the trusted-base reader verifies completed release or
+  supported controller metadata. No candidate product code, test or compiler runs.
+- **CodeQL**: feature quality owns all four language analyses with `build-mode:
+  none`. The standalone entrypoint is explicit diagnosis, not an automatic Main
+  copy or a Rust product build.
+- **Documentation**: feature Docs owns the retained site. The Main consumer
+  verifies and transfers original site bytes without Rustdoc or retarring.
+- **Docker**: the consumer verifies completed binary/Host originals; its distinct
+  ARM executable output and two runtime-image assembly/smoke configurations keep
+  their named owners. No consumer rebuild fallback replaces lost originals.
+- **Publication isolation and recovery**: keep their exact dummy-credential,
+  ENOSPC or historical-original contracts. They are neither a second ordinary
+  runtime suite nor permission to repair a frozen product source.
 
-- **CodeQL** (`.github/workflows/codeql.yml`) -- Runs the Actions, JavaScript/TypeScript, Python, and Rust analyses for pull requests into `main`, pushes to `main`, and explicit manual dispatches. Routine `dev` activity does not run CodeQL.
-- **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes successful main CI source commits to crates.io and GitHub Releases with verified same-source recovery. Manual/Zenith dispatches retain explicit versions, the exact locked frontend and `dry_run`.
-  One authenticated preparation feeds concurrent crate publication and native
-  builds; final publication joins both results. See the [phase guide](docs/releases/ci-publication-flow.md)
-  for identity, transport, cache and retry requirements.
-  Its Cargo PATH entrypoint, including metadata invoked from Python, runs the
-  digest-pinned official Rust 1.99.0 Bookworm image. Docker failure is fatal;
-  publication never falls back to host Cargo. The entrypoint needs Node,
-  Python 3.11+ and a local Unix Docker daemon, using an empty Docker client
-  config so host proxy configuration cannot inject worker variables.
-  Workers use a separate UID,
-  private PID namespace, no capabilities, no-new-privileges, and a read-only
-  root filesystem. Only disposable source and isolated Cargo/target data are
-  mounted. The exact Git SHA, stamped manifests and staged frontend are copied
-  without checkout credentials, host Git pointers or hooks. Workers cannot
-  modify the original source/controller; only regular Cargo.lock and selected
-  package archive bytes return after the container exits. Metadata paths map
-  back to the original workspace and its target/package directory.
-  GitHub/HMAC credentials never enter Cargo. Only `cargo publish` receives the
-  registry token; build scripts during that operation can still read that
-  intentional Cargo authority. Production token access is restricted through
-  the #1699 Environment migration. The Release Cargo Isolation workflow proves the Linux ancestor
-  boundary using dummy credentials and a real dependency build script, plus
-  metadata/check/package/publish-dry-run; a macOS Docker smoke alone is weaker.
-- **Publish Docker image** (`.github/workflows/docker-publish.yml`) -- Builds the multi-arch container image and pushes it to GHCR.
-- **Documentation** (`.github/workflows/docs.yml`) -- Builds documentation on every push to main. Deploys to GitHub Pages.
+See [CI and publication flow](docs/releases/ci-publication-flow.md) for the full
+entrypoint inventory, transport, cache, retry and credential prerequisites.
 
 ### Badge URLs
 
@@ -577,10 +376,12 @@ After workflows run, badges resolve to:
 
 ### Setup Checklist
 
-1. Push changes to GitHub to trigger CI.
-2. Enable GitHub Pages: **Settings > Pages > Source** set to **GitHub Actions**.
-3. Configure the protected `bamboo-release` Environment and its publication secrets as described above; keep Cargo-token copies absent from repository/org secrets.
-4. Verify badge status in README after pushing.
+1. Submit the feature PR to Dev and inspect its actual selected checks.
+2. Before Pages or publication setup, verify the phase guide's accepted controls,
+   original outputs and separate activation prerequisites.
+3. Follow the separately reviewed controller/protection cutover; this document
+   does not grant credential or production activation authority.
+4. Verify original run/artifact evidence; a badge alone does not prove publication.
 
 ## E2E Testing
 

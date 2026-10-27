@@ -648,6 +648,54 @@ const cacheCleanupWorkflow = readFileSync(
 )
 const codeqlWorkflow = readFileSync(".github/workflows/codeql.yml", "utf8")
 const contributing = readFileSync("CONTRIBUTING.md", "utf8")
+test("legacy v8 prose archive pins exact historical ranges and rejects changed data", () => {
+  assert.equal(typeof historical.contributingRelease, "string")
+  assert.equal(typeof historical.gitflowLegacy, "string")
+  const file = "scripts/tests/main-authority-bootstrap-fixture.cjs"
+  const loader = readFileSync(file, "utf8")
+  const original = readFileSync("scripts/tests/fixtures/main-authority-v8-testdata.json.gz")
+  const zlib = require("node:zlib")
+  const decoded = zlib.gunzipSync(original)
+  const load = (bytes, alter) => {
+    const module = { exports: {} }
+    runInNewContext(loader, { module, Buffer, __dirname: path.dirname(file), require: name => {
+      if (name === "node:fs") return { readFileSync: () => bytes }
+      if (name === "node:zlib" && alter) return { gunzipSync: (input, options) => {
+        assert.equal(options.maxOutputLength, 256 * 1024)
+        const value = JSON.parse(zlib.gunzipSync(input, options)); alter(value)
+        return Buffer.from(JSON.stringify(value))
+      } }
+      return require(name)
+    } })
+    return module.exports.legacyData()
+  }
+  assert.deepEqual({ ...load(original) }, { ...historical })
+  assert.ok(original.length <= 32768)
+  assert.ok(decoded.length <= 256 * 1024)
+  const changed = Buffer.from(original); changed[changed.length - 1] ^= 1
+  assert.throws(() => load(changed), /AssertionError/u)
+  for (const alter of [
+    value => { value.contributingRelease += "changed" },
+    value => { delete value.gitflowLegacy },
+    value => { value.documentRanges.contributingRelease.offset += 1 },
+    value => { value.documentRanges.gitflowLegacy.fileSha256 = "0".repeat(64) },
+  ]) assert.throws(() => load(original, alter), /AssertionError/u)
+})
+test("current contributor documents keep feature repairs and release-only outputs separate", () => {
+  const verify = source => {
+    assert.match(source, /docs\/delivery-workflow\.md/u)
+    assert.match(source, /Feature branches own Unit\/E2E/u)
+    assert.match(source, /Release branches do not rerun Unit\/E2E or carry product repairs/u)
+    assert.match(source, /Main promotion is read-only/u)
+    assert.match(source, /staged/u)
+    assert.match(source, /d6325a732c7669f94962f604e4ce98966e374d73/u)
+    assert.doesNotMatch(source, /For a necessary release fix|fast-forward the release to `F`|exact `F` → `U` → accepted-`dev` ancestry|Run the complete release suite and Linux\/macOS\/Windows matrix on the final/u)
+  }
+  for (const source of [contributing, readFileSync("gitflow.md", "utf8")]) {
+    verify(source)
+    assert.throws(() => verify(source.replace("Release branches do not rerun Unit/E2E or carry product repairs", "Release branches rerun Unit/E2E")))
+  }
+})
 const frozenCacheWriteHeader = [
   "  BAMBOO_RELEASE_CACHE_WRITE_ALLOWED: >-",
   "    ${{ !(",
@@ -1656,6 +1704,7 @@ const promotionScript = () => {
 }
 
 test("legacy v8 frozen promotion bootstrap remains read-only", () => {
+  const contributing = historical.contributingRelease
   const promotion = legacyJob("promotion-source")
   assert.match(promotion, /permissions:\n      contents: read\n/u)
   assert.equal((promotion.match(/^      - /gmu) || []).length, 1)
@@ -1699,8 +1748,8 @@ test("legacy v8 frozen promotion bootstrap remains read-only", () => {
   assert.match(contributing, /separate `F` release-source and `U` protected-dev integration procedure/u)
   assert.match(contributing, /independent Code and Security review and run affected local tests on that\n   exact `F`/u)
   assert.match(contributing, /Run the complete release suite and Linux\/macOS\/Windows matrix on the final\n   release PR before promotion/u)
-  // Current release guidance no longer contains the historical F/U repair path.
-  for (const source of [contributing, readFileSync("gitflow.md", "utf8")]) {
+  // Preserve the genuine ce89 prose without imposing it on current release guidance.
+  for (const source of [contributing, historical.gitflowLegacy]) {
     assert.match(source, /manual full CI on `F`[\s\S]*?optional diagnosis,[\s\S]*?not a second mandatory\s+full run/u)
   }
   assert.match(contributing, /This exception changes ordering only, not gates,\n   protection, publication authority or the `Promotion Source` contract/u)

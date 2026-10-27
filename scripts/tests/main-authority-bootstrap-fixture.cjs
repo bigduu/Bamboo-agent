@@ -13,19 +13,34 @@ function legacyData() {
   const bytes = fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-v8-testdata.json.gz'))
   const hash = value => createHash('sha256').update(value).digest('hex')
   assert.ok(bytes.length <= 32768)
-  assert.equal(hash(bytes), '2556561754c7f8c9b5f4aea7b861bac2e7b40bdb3ede1fa46a90db0610ffe113')
+  assert.equal(hash(bytes), '2f65416fb350f64999d9a1edec374d36fc57c1c978072533e97a2feb1b79730a')
   const value = JSON.parse(require('node:zlib').gunzipSync(bytes, { maxOutputLength: 256 * 1024 }))
   assert.equal(value.schemaVersion, 1); assert.equal(value.kind, 'bamboo-legacy-ci-publication-testdata/v8')
   assert.equal(value.fixtureOnly, true); assert.equal(value.sourceRevision, 'ce89b4fcf4a45014cccb3bc7f817613ddcfa7eb2')
   for (const [name, digest] of Object.entries({
     ci: 'f6dfca960521d915245bb3371064a3cbcf0424fa7cd739034f4228f29c20fd6f',
     publisher: 'ba29001500fd40eed3858d9b687b1f5c32d2cc1bb60e03738bfa416353961fb2',
+    contributingRelease: 'a38c33761f09031417fcf6b0af6ee4e7744c0474164eed25c0d1ecead1c7daa7',
+    gitflowLegacy: 'bdfc9e9de85708b83df24bd468ebcaaf85fa543dfd3afd9637377d5cf1b92af4',
   })) {
     assert.equal(typeof value[name], 'string'); assert.ok(Buffer.byteLength(value[name]) <= 128000)
     assert.equal(hash(value[name]), digest); assert.equal(value.sha256[name], digest)
   }
   assert.equal(value.sha256.admissionHelper, 'b87e7054a19a0a1d6fcda8d722d91059ec0d2838087dc0a27cefa7c8a73e7d54')
-  legacy = Object.freeze({ ci: value.ci, publisher: value.publisher })
+  // Exact UTF-8 byte ranges from the named immutable source files; not current guidance.
+  assert.deepEqual(value.documentRanges, {
+    contributingRelease: { path: 'CONTRIBUTING.md',
+      fileSha256: 'd936324de3dbbfabc8a824af243b94a6328e6a17d8d898699377d650bafd542e',
+      offset: 7614, length: 11506 },
+    gitflowLegacy: { path: 'gitflow.md',
+      fileSha256: 'fbb6f01a339ba6a921073a0f4f26ad5fa42fe076d3b70b0aafb2c3168d47c32f',
+      offset: 4492, length: 2016 },
+  })
+  for (const [name, range] of Object.entries(value.documentRanges)) {
+    assert.equal(Buffer.byteLength(value[name]), range.length)
+  }
+  legacy = Object.freeze({ ci: value.ci, publisher: value.publisher,
+    contributingRelease: value.contributingRelease, gitflowLegacy: value.gitflowLegacy })
   return legacy
 }
 const FULL = ['Validation Source', 'Test', 'E2E Tests', 'Lint',

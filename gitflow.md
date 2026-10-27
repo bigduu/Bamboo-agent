@@ -1,159 +1,118 @@
 # Parallel Development and Release Flow
 
-Use `feature/fix → integration/<batch> → dev` for related work; independent,
-bounded PRs may target `dev` directly. An integration batch is finite delivery
-scope, not another long-lived development branch. Dev requires successful CI
-compilation plus passing executor-local tests with coverage for changed behavior. Validate a recorded batch once on a frozen
-`release/<40-character-cut-SHA>` before promotion to `main`.
+Read the complete local [delivery workflow](./docs/delivery-workflow.md),
+[Actions audit](./docs/ci-workflow-audit.md), [Release Process](./CONTRIBUTING.md#release-process)
+and [Bamboo phase guide](./docs/releases/ci-publication-flow.md). Every agent uses
+that same contract, the owning Issue and the exact source/evidence checkpoint.
 
-The [Release Process](./CONTRIBUTING.md#release-process) is authoritative for cuts,
-release repairs and publication. The [review rules](./AGENTS.md#pull-request-review)
-and actual branch protection remain mandatory. This policy accepts that `dev`
-can be temporarily unstable; it does not relax release or security requirements.
-Use the [CI and publication flow](./docs/releases/ci-publication-flow.md) for
-phase ownership, evidence reuse, activation and recovery.
+The train is `feature → dev → release/<40-character-cut-SHA> → main`.
+Feature branches own Unit/E2E. Fix relevant failures before normal protected-dev
+admission; release is not an integration test-repair batch.
+Release branches do not rerun Unit/E2E or carry product repairs. Main promotion is read-only.
 
 ## Ownership and parallel work
 
-- Give each bounded Issue one owner, unique branch and isolated worktree. Record
-  the exact starting commit, affected paths, dependencies and acceptance criteria.
-  Declare dependent PRs and coordinate overlapping paths before implementation.
-- Give each integration batch one named integrator and branch pinned initially
-  to a recorded `dev` commit. Related feature PRs target that branch. Only the
-  integrator writes it and resolves cross-feature conflicts; others contribute
-  through their own branches. Explicitly hand off ownership before replacing it.
-- Workers run focused checks for changed behavior and dependencies. The integrator
-  reviews the combined diff and admits only the agreed scope to protected `dev`
-  through a normal PR or the verified direct-push route below. Do not present component results as batch acceptance.
-- Before dev admission, each owner runs the affected tests locally in their
-  isolated executor and adds or updates regression coverage for changed behavior.
-  Include relevant normal and failure cases. Record the tested source SHA/tree,
-  exact commands, test selection, results and coverage in the PR. Missing or
-  failing relevant local tests block merge; a successful compile is not a
-  substitute. Disclose unrun checks and the reason rather than claiming a pass.
-- PRs targeting dev must pass required `Test`, which aggregates disjoint Unit
-  and E2E runtime tests plus the live SSH fixture. One Linux executor preserves
-  independent default package contexts and explicitly catalogued feature
-  additions in one target directory. Ordinary library/binary, integration and
-  documentation cases run once; SSH reuses its compiled executable.
-  Applicable native-platform workflows also run before
-  admission. Fix failures in the feature branch before merging into dev.
-  `Quick Checks` remains auxiliary. Do not assume automatic coverage exists for
-  arbitrary integration PR targets.
-- Coordinate conflicting admissions and branch updates, not long-running heavy
-  validation. Update a candidate only when actual review/protection or a real
-  conflict requires it. Do not repeatedly refresh unrelated branches merely to
-  rerun the same full suite. Never bypass an actual required check.
-- The owner of a failing change investigates and repairs it or submits a bounded
-  revert through normal dev gates. Preserve the failing evidence and identify
-  affected dependents. Do not ignore a known defect relevant to the change or
-  turn a failed optional full snapshot run into a green result.
+- Give each bounded acceptance slice one owner, branch and isolated worktree.
+  Record its starting source, affected paths, dependencies and acceptance criteria.
+  Serialize overlapping edits and shared persistence/authority boundaries, not an
+  entire module merely because another independent owner is active.
+- Related work may use a finite `integration/<batch>` with one named integrator.
+  Workers submit focused PRs and affected tests; the integrator reviews the
+  combined source and admits it through the normal Dev PR. This is not another
+  long-lived branch or permission to defer tests to release.
+- Run the smallest meaningful affected checks while iterating. Record SHA/tree,
+  commands, selection, results and changed-behavior coverage before Dev admission.
+  Missing or failing relevant checks block merge; compilation is not runtime proof.
+- Feature PRs into Dev run selected Unit/E2E on their actual clean merge `M`.
+  Preserve independent default package contexts, narrow additive selections and
+  native-platform inputs. Each covered selection has one owner; reuse compatible
+  compiled executables rather than copying suites into another workflow.
+- The failing feature's owner investigates and repairs it or submits a bounded
+  revert through normal Dev gates. Preserve the failure and inform affected
+  dependents. Never skip the relevant assertion or move its repair to release.
 
-## Normal direct pushes to dev
+## Protected Dev admission
 
-Once the actual dev branch rule permits it, a normal fast-forward direct push is
-allowed. It still requires successful Unit/E2E execution, local affected tests with
-coverage evidence, applicable review, and every actual required check. Force
-pushes and protection overrides remain forbidden; main's rules are unchanged.
+Recheck the live exact PR head/base, required checks, reviews/threads, protection,
+mergeability and tested/accepted trees immediately before a normal merge. A new
+release source requires the confirmed accepted PR and its original pre-merge
+feature evidence. The old direct-push discussion cannot supply that record.
+Do not force a branch, bypass a real required check or synthesize a green status.
 
-The current dev Unit/E2E `Test` workflow runs for PRs targeting dev, not
-arbitrary branch pushes. A feature branch can obtain checks through the PR path before
-a permitted fast-forward admission. Verify that the intended target commit has
-the applicable successful checks and that tested source/tree and build inputs
-match. A synthetic-merge result is not automatically proof for another checkout.
-If equivalence or required status applicability is unproven, keep the normal PR
-route rather than push unchecked code. The local test/coverage obligation also
-applies to direct pushes; removing a PR requirement does not remove those gates.
+Keep feature head `F`, tested merge `M`, accepted Dev commit `S`, publisher
+controller `C` and final Main merge distinct. A matching tree or a copied logical
+success does not rename an original physical execution. Preserve job/attempt
+and complete source/configuration binding when reusing successful evidence.
 
-## Temporary legacy frozen batch acceptance
+## Immutable release source
 
-This section applies only to the retained release route until release-source
-admission is accepted. The new target contract is defined in Gate roles below.
+Select the accepted Dev cut and freshly record its exact SHA/tree, branch-read
+receipt, UTC cut time, finite scope and locked artifact inputs. Freeze
+`release/<S>` at that recorded commit. Dev may continue normally afterwards.
 
-After the intended changes enter `dev`, the release owner records one fresh dev
-cut and finite scope, then freezes a release candidate for full acceptance.
-Ongoing dev work can continue without invalidating that frozen candidate.
-Manual `CI` and frontend acceptance require `snapshot_sha` to equal the dispatch
-source's full lowercase 40-character SHA; a mismatch fails closed. See the
-[fixed-snapshot entrypoint](./CONTRIBUTING.md#validate-a-fixed-snapshot).
+Keep the frozen source immutable. A product defect, changed upstream identity
+or required source repair returns through feature/dev acceptance and gets a new
+cut. Do not fast-forward a frozen release to a repair head or a broader
+integration result. Pending producer/consumer gates must pass before cutting the
+source that will consume them; they do not authorize a release repair exception.
 
-Run the complete release suite and native platform-test matrix through the fixed
-candidate's required main promotion checks, recording the actual tested merge SHA/tree.
-Release CI preserves the native tests but does not build optimized release
-executables. The automatic main publisher builds each required executable once
-from the admitted main commit and reserved version/frontend identity.
-Preserve the separate frontend-head contract; reuse evidence only when all source
-and build/test inputs are equivalent. Do not add a second full run merely because
-an entrypoint has a different name. Only this passing, reviewed candidate may
-promote to `main`. Dev compilation and focused local tests cannot replace
-release acceptance. A failed or incomplete release check blocks promotion.
+Release reserves its final version before producing each formal output once for
+its exact source/version/target/profile/toolchain/locked-input identity. Feature
+test binaries and stamped release executables are distinct required outputs.
+The release phase verifies and publishes artifacts; it adds no Unit/E2E batch.
+Keep source versions at `0.0.0` and stamp disposable publishing checkouts only.
 
-Keep necessary repairs within the recorded scope. Record original fix `F`'s
-exact SHA/tree, affected local tests and independent Code and Security review.
-Preserve `F` through normal protected-dev integration `U` when needed, then
-fast-forward the release to `F` and complete the final release PR's full CI.
-An extra manual full CI on `F` is optional diagnosis, not a second mandatory
-full run. Follow the
-[release repair rules](./CONTRIBUTING.md#freeze-the-release-scope). Do not chase
-unrelated dev changes or substitute the broader `U` for the frozen release fix.
+## Original outputs and Main
+
+Retain successful original bytes and source/run/job/physical-attempt receipts
+before finalization. Retry only a classified failed infrastructure target with
+the same inputs; reuse successful siblings. A missing recorded-success original
+is a stop for explicit recovery, not permission to compile or package it again.
+A source fix requires a newly accepted cut.
+
+A completed publication supplies the stable source, tag/version, manifest and
+artifact identities for Main promotion. The trusted-base reader verifies actual
+Git postimages and original publication evidence without executing candidate
+product code. Main push/promotion performs no product test, compilation,
+packaging or republishing. Main keeps the stable source and immutable references;
+there is no post-build JSON source commit. Consumers authenticate original outputs
+instead of rebuilding them.
 
 ## Evidence and resource discipline
 
-- Record each check's SHA/tree, checkout or synthetic merge, toolchain,
-  lock/features, profile/flags, platform/environment, frontend artifact, command
-  and result link. Distinguish not run, running, passed, failed, cancelled and
-  inconclusive. Compilation is not runtime acceptance.
-- Before an expensive build, inspect existing receipts. Same-tree reuse requires
-  all relevant build/test inputs and contracts to match, including commit-derived
-  metadata. Revalidate affected changes. Never relabel another head's result or
-  synthesize a successful GitHub status; required checks belong to their actual
-  candidate under current protection rules.
-- Assign one writer per worktree, build target and test-output directory. Reuse
-  compatible caches only after the prior writer exits. Bound heavy concurrency
-  by measured memory, disk and workload cost; queue competing cold builds on the
-  same host instead of inventing thread counts or racing shared output.
-- Only the run's owner or explicitly designated integrator may cancel a
-  superseded run. Preserve its result and reason. Never cancel another active
-  batch/release, retry a real failure merely to get green, kill unrelated
-  processes or clean another worker's worktree/cache. Preserve uncertain work.
-
-## Close a batch once
-
-Inventory component PRs and verify their exact ancestors or changed postimages
-against the admitted candidate. Close superseded components with the accepted
-commit and equivalence evidence; do not separately merge identical slices into
-`dev`. Keep missing work open. Preserve discussions, source references and
-validation receipts; cleanup is a separate owned action.
+- Record actual SHA/tree, checkout or merge identity, toolchain, locks/features,
+  target, profile, frontend artifact, command and result. Keep running, passed,
+  failed, cancelled, skipped, unrun and inconclusive outcomes distinct.
+- Source-tree equality or a cache hit alone is not build/runtime/artifact reuse.
+  Every relevant input and original byte identity must match. New changes need
+  affected evidence; a different entrypoint name is not a second test owner.
+- Assign one writer per worktree and output/target directory. Bound concurrency
+  by actual resources, preserve other owners' caches/receipts and do not clean or
+  kill unrelated work. Only the run's owner or designated integrator may cancel
+  its superseded run, preserving the outcome and reason.
+- Continue from the existing Issue/PR and frozen checkpoint. Close an admitted
+  slice once with its actual evidence; do not merge equivalent components again.
 
 ## Gate roles and activation
 
-The required `Test` gate aggregates Unit, E2E and SSH results on the actual
-feature PR merge source. A missing, skipped, cancelled or failed selected job
-fails admission. No standalone dev-profile workspace build precedes these tests. One physical
-Linux executor preserves isolated default configurations and narrow feature
-additions, reusing compatible compiled artifacts. Unit/E2E remain logical target
-groups. Reuse the compiled ignored SSH executable
-in that same checkout. Keep native-specific acceptance before dev admission.
+The replacement entrypoints are **staged**, not established by local fixtures.
+At the #2363 checkpoint the default remains `dev` and stable Main remains
+`d6325a732c7669f94962f604e4ce98966e374d73`, with the legacy route still awaiting
+cutover. Complete combined-source feature acceptance, producer registration,
+trusted control installation and Main protection/default changes separately.
+The first new Source publication and first positive Main promotion have not
+been certified. Verify [Zenith #399](https://github.com/bigduu/Zenith/issues/399),
+the phase guide and live remote state before operating any path. Preserve real
+required gates and active historical recoveries; this policy is not a waiver or
+a production dispatch instruction.
 
-The target release path freezes the exact accepted dev cut, reserves one formal
-version with the existing allocator and builds/publishes each product once.
-Release branches do not rerun Unit/E2E or carry product repairs. Main promotes
-the exact published source and records immutable tag/manifest/provenance and
-workflow receipts in the promotion description; it does not rebuild or retest.
+The prepared feature entrypoint owns runtime, quality and Docs; manual CI is a
+same-SHA feature/dev diagnostic and rejects Main, release refs and tags. The
+prepared Source dispatcher owns final artifacts, while Main and distribution
+consumers read authenticated originals. Their empty registries and pending
+acceptance remain blockers, not reasons to invent an alternative publisher.
 
-Activation is staged. #2311 changes feature admission; the existing release
-suite and main-triggered publisher remain the live route until separate
-release-source admission is accepted. Preserve their required checks, queues,
-source proofs and historical recovery in the meantime. Do not dispatch an
-unimplemented route. Before the first new release, integrate current main
-ancestry into dev through an ordinary feature PR with Unit/E2E. A release fix
-returns through feature/dev and starts a new cut.
-
-Cover successful and failed feature routing, complete/disjoint target catalogs
-and aggregate failure propagation in policy tests. Never synthesize statuses,
-skip a required gate, force a branch or treat different source trees as the same
-tested product. Supersede iterative runs only within the same PR.
-
-Under the retained legacy release process, manual full CI on `F` is optional diagnosis,
-not a second mandatory full run. Keep that historical evidence separate from
-the feature-only test ownership and pending release-source cutover.
+The old frozen-release `F`/`U` repair procedure is historical only. Its genuine
+[ce89 policy snapshot](https://github.com/bigduu/Bamboo-agent/blob/ce89b4fcf4a45014cccb3bc7f817613ddcfa7eb2/gitflow.md)
+and hash-bound v8 test data preserve the original words and recovery evidence;
+they cannot authorize a new repair, test run or publication on a frozen release.
