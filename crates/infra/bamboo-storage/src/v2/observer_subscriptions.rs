@@ -11,6 +11,10 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+fn digest_hex(value: impl std::fmt::LowerHex) -> String {
+    format!("{value:x}")
+}
+
 struct LockedObserver {
     guards: Arc<SupervisorManagementGuards>,
     parent: Session,
@@ -392,13 +396,13 @@ impl SessionStoreV2 {
             }
             shards.push(shard);
         }
-        let files:Vec<_>=shards.iter().enumerate().map(|(index,bytes)|json!({"file":format!("{index}.jsonl"),"bytes":bytes.len(),"sha256":hex::encode(Sha256::digest(bytes.as_bytes()))})).collect();
+        let files:Vec<_>=shards.iter().enumerate().map(|(index,bytes)|json!({"file":format!("{index}.jsonl"),"bytes":bytes.len(),"sha256":digest_hex(Sha256::digest(bytes.as_bytes()))})).collect();
         let mut manifest = json!({"schema":"observer-change-shards.v1","observer_session_id":locked.child.id,
             "observer_created_at":locked.child.created_at,"supervisor_created_at":locked.parent.created_at,
             "supervisor_incarnation":locked.state.incarnation_id,"scope_epoch":window.scope_epoch,
             "oldest_sequence":window.history.first().map(|change|change.sequence),"enqueued_sequence":window.enqueued_sequence,
             "files":files,"truth":"derived enqueue references; consumer ACK remains canonical Inbox"});
-        let revision = hex::encode(Sha256::digest(
+        let revision = digest_hex(Sha256::digest(
             bamboo_domain::session::inbox::canonical_json_bytes(&manifest),
         ));
         manifest["revision"] = json!(revision);
@@ -485,7 +489,7 @@ fn verify_view(
         return Err(denied("Observer view selector or schema changed"));
     }
     let caller = SessionCallerReference::from(child);
-    let caller_sha256 = hex::encode(Sha256::digest(
+    let caller_sha256 = digest_hex(Sha256::digest(
         serde_json::to_vec(&caller).map_err(|error| invalid(error.to_string()))?,
     ));
     let expected = json!({"caller_session_id":child.id,"root_session_id":reference.session_id,"target_session_id":target.id,
@@ -506,7 +510,7 @@ fn verify_view(
     for (key, bytes) in [("status", &files.status), ("brief", &files.brief)] {
         let content =
             std::str::from_utf8(bytes).map_err(|_| invalid("Observer view is not UTF-8"))?;
-        let expected = json!({"bytes":bytes.len(),"lines":content.lines().count(),"sha256":hex::encode(Sha256::digest(bytes))});
+        let expected = json!({"bytes":bytes.len(),"lines":content.lines().count(),"sha256":digest_hex(Sha256::digest(bytes))});
         let max_lines = if key == "status" { 40 } else { 120 };
         if content.lines().count() > max_lines
             || content.lines().any(|line| line.len() > 512)
@@ -522,7 +526,7 @@ fn verify_view(
         .as_object_mut()
         .ok_or_else(|| invalid("Observer manifest object missing"))?
         .remove("revision");
-    if hex::encode(Sha256::digest(
+    if digest_hex(Sha256::digest(
         serde_json::to_vec(&manifest).map_err(|error| invalid(error.to_string()))?,
     )) != revision
     {
