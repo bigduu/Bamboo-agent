@@ -80,6 +80,28 @@ or canonical storage failure is never represented as a successful notification.
 A deleted/replaced Child likewise permits only the original Supervisor's bounded
 failure counter update; it cannot borrow the replacement's lifetime or authority.
 
+## Fault acceptance ownership
+
+The five `observer_fault_tests.rs` cases are ordinary, nonignored server library
+tests under `cfg(test)`. The existing server development dependency already
+enables storage `test-utils`; the new FileInbox fault checkpoint hook adds no
+Cargo feature, required-feature target or feature-only case. Relative to accepted
+CI `2ff2fa645ba597476a398cb7fdbe3fcc26948de2`, this is the only changed record in
+the feature-sensitive source closure. The 19 additive cases remain unchanged.
+
+The existing API-only subscription executor retains its original 19 cases and
+adds exactly those five fault cases, using the same joint domain/engine/server
+library graph, source/lock checks and strict five-library lint. Policy verifies
+both the full 24-case recipe and a byte-identical reconstruction of the accepted
+19-case recipe after removing only the five named cases, their file trigger and
+verdict wording. It rejects a missing/renamed fault case or any unrelated recipe
+change. This finite transition does not grant an automatic producer exception
+to any new workflow, or replace canonical merge-source feature acceptance.
+
+Actual API-only results stay bound to their original source; the 24-case result
+is not the 19-case additive catalog. #2338 owns the later canonical configuration
+migration. Every new source still requires its own normal checks and review.
+
 ## Original Epic composition and test ownership
 
 The canonical feature executor owns these ordinary, nonignored default library
