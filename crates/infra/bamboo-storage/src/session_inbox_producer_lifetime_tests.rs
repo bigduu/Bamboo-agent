@@ -674,6 +674,9 @@ fn assert_supervisor_followup_lifetime(current_user: bool) {
         f.assert_waiting(&mutation);
         parked.barrier.release();
         f.finish(mutation);
+        let fresh_inbox =
+            FileSessionInbox::new(f.other_store.clone(), SessionInboxLimits::default());
+        let before_retry = f.runtime.block_on(fresh_inbox.inspect("target")).unwrap();
         let retry = f.runtime.block_on(async {
             if current_user {
                 f.inbox
@@ -698,10 +701,13 @@ fn assert_supervisor_followup_lifetime(current_user: bool) {
             assert_eq!(retry.id, message.id, "same receipt: {change}");
         } else {
             assert!(
-            retry.is_err(),
-            "canonical target change must precede exact-id retry: {change}; current_user={current_user}"
-        );
+                retry.is_err(),
+                "canonical target change must precede exact-id retry: {change}; current_user={current_user}"
+            );
         }
+        let after_retry = f.runtime.block_on(fresh_inbox.inspect("target")).unwrap();
+        assert_eq!(after_retry.generation, before_retry.generation, "{change}");
+        assert_eq!(after_retry.pending, before_retry.pending, "{change}");
     }
 }
 

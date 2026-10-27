@@ -655,7 +655,7 @@ async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_st
             .clone();
         let mut changed = f.reload().await;
         changed.metadata_version += 1;
-        changed.model = "changed-target-model".into();
+        assert_eq!(changed.model, f.original.model);
         f.state.storage.save_session(&changed).await.unwrap();
         f.followup_targets
             .lock()

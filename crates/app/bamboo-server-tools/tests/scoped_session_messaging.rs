@@ -303,6 +303,21 @@ async fn original_supervisor_send_uses_its_existing_scoped_followup_writer() {
     let target = fixture.new_root("independent-worker").await;
     let supervisor = fixture.supervisor(&[&target.id]).await;
     let tool = fixture.tool();
+    let missing_selector = tool
+        .invoke(
+            send(&target.id, "followup-operation", Some("trigger_turn")),
+            Fixture::ctx(&supervisor),
+        )
+        .await
+        .unwrap_err();
+    assert!(missing_selector
+        .to_string()
+        .contains("scoped_session_send_target_reference_required"));
+    assert_eq!(
+        fixture.inbox.inspect(&target.id).await.unwrap().generation,
+        0
+    );
+    assert!(fixture.activation.requests.lock().await.is_empty());
     for intent in [None, Some("queue_only")] {
         let mut args = fixture
             .supervisor_send_args(&supervisor, &target.id, "followup-operation")
