@@ -22,6 +22,10 @@ server resources. The relevant checks belong in feature CI; a standalone manual
 run is diagnosis, not another automatic release or Main test. Lotus browser E2E
 is a separate frontend test.
 
+The shared `observer-api-lint.yml` owns the five-library API-only Clippy check
+for both Observer workflows. Their distinct runtime cases remain with their
+respective feature workflows.
+
 ## Release: build the final artifacts
 
 Create `release/<SHA>` at the accepted `dev` commit and keep that source fixed.
