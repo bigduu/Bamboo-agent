@@ -1699,7 +1699,8 @@ test("legacy v8 frozen promotion bootstrap remains read-only", () => {
   assert.match(contributing, /separate `F` release-source and `U` protected-dev integration procedure/u)
   assert.match(contributing, /independent Code and Security review and run affected local tests on that\n   exact `F`/u)
   assert.match(contributing, /Run the complete release suite and Linux\/macOS\/Windows matrix on the final\n   release PR before promotion/u)
-  for (const source of [contributing, readFileSync("gitflow.md", "utf8"), readFileSync("docs/releases/ci-publication-flow.md", "utf8")]) {
+  // Current release guidance no longer contains the historical F/U repair path.
+  for (const source of [contributing, readFileSync("gitflow.md", "utf8")]) {
     assert.match(source, /manual full CI on `F`[\s\S]*?optional diagnosis,[\s\S]*?not a second mandatory\s+full run/u)
   }
   assert.match(contributing, /This exception changes ordering only, not gates,\n   protection, publication authority or the `Promotion Source` contract/u)

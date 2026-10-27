@@ -8,7 +8,9 @@ Before CI or release work, read the complete local
 [Bamboo commands and test map](docs/releases/ci-publication-flow.md).
 Every agent follows the same feature/dev/release/main ownership and checkpoint
 procedure. The full shared documents are present in this repository; consult
-their activation table and verify live evidence before using a proposed path.
+their recorded source snapshots and verify live evidence before using a proposed
+path. The local entrypoint table below records the later #2363 composition; the
+shared audit is historical evidence, not a live trigger inventory.
 
 - Session memory is continuity for the current session. Project memory holds durable project facts and decisions; Global memory holds cross-project user context.
 - Recall with a short lexical query. Use Jiandu's compact default top three `id`/summary results, then `get` only the selected item that needs full context.
@@ -17,6 +19,37 @@ their activation table and verify live evidence before using a proposed path.
 - Never store secrets or tokens. Do not add embeddings, vectors, or a duplicate Bamboo persistence/index layer.
 
 Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream snapshot bytes. Bamboo owns prompt selection and budget, optional reranking, and the model and cadence used to refresh Dream.
+
+## CI entrypoints staged by #2363
+
+The composed source retires automatic release/main CI and the main-CI publisher.
+It has not passed combined-source dev admission or activated production. The
+complete feature/release producer registries remain empty; default/protection,
+38-control bootstrap and real positive release/promotion/Pages/Docker acceptance
+are separate gates. Native feature acceptance still has the server writer-lock
+lifecycle failure tracked in [#2364](https://github.com/bigduu/Bamboo-agent/issues/2364).
+Fix it through its feature owner; a local policy pass cannot waive that failure.
+
+| Entrypoint | Sole responsibility in this source |
+| --- | --- |
+| CI dev PR | Feature Unit/E2E, native/browser runtime, quality and Docs on the actual clean merge M. Both required summaries fail on incomplete selected owners. |
+| CI manual | Same-SHA feature/dev diagnostic only. Reject Main, `release/*`, tags and unknown refs. It cannot authorize a formal release. |
+| Publish Crate | Only `workflow_dispatch` using protected Main C, `frozen-source-v2` and frozen accepted-dev S. One allocator, original outputs and one finalizer; the empty registry stops new cuts. |
+| Main Admission | Read-only trusted-base source/release or controller maintenance proof. No product execution, test or compilation. |
+| Docs / Docker | Reuse authenticated originals through their staged consumers. Docs does not regenerate the site; Docker adds its one distinct ARM output and assembles/smokes the two runtime images. |
+| Standalone Actor / Ticket / frontend acceptance / CodeQL | Explicit manual diagnostics. Their automatic Main/PR/push routes are retired; feature owners retain the corresponding configurations. |
+| Release Cargo Isolation | Dev-PR publication-boundary acceptance and explicit manual diagnosis, using its own dummy-credential/ENOSPC inputs. No Main-PR route. |
+
+`frontend-acceptance.yml` checks embedded packaging/build-script/server-resource
+contracts; its automatic copy is retired because the feature executor and
+inventory own those selections. Its diagnostic is not the Lotus browser suite.
+Quick Checks is the sole Ubuntu Node policy owner. CI policy imports Main,
+public-release, Docs, Docker and ARM fixtures once; sidecar policy registers
+Native originals once, and crate policy retains its inline Source assertions.
+Do not add those modules as second top-level commands or repeat them in the
+Linux Cargo feature job. Keep the portable native-OS registrations distinct.
+The v8 CI/old publisher archive is fixed test data, never current acceptance or
+a dispatch fallback. Historical signed receipts/CURRENT/helper pins are unchanged.
 
 ## Parallel Development
 
@@ -68,9 +101,10 @@ or combined-member configuration, runtime suite or formal archive. Preserve API-
 npm-staged consumer configurations. Root Birth Strict Lint is manual diagnosis
 only; its exact analysis lane is owned by feature Lint and its runtime cases
 remain with the canonical default-storage executable. See the guide's quality
-owner table before adding another producer. A95/C2330/#2331 are combined WIP
-until exact-source hosted acceptance; legacy main/release gates stay active
-until the separate source-controller cutover. Do not claim that cutover here.
+owner table before adding another producer. A95/C2330/#2331 and the composed
+retirement source require exact-source hosted acceptance before dev admission.
+Retiring triggers in this source does not activate the empty producer registry
+or change the installed controllers and protection.
 
 ## Documentation producer staged by #2321
 
@@ -103,12 +137,12 @@ and require Main still equals this push. The consumer bounds ZIP and TAR to
 1 GiB. Missing, expired, changed or unsupported originals stop without rebuilding
 or a new durable-store fallback. Retries preserve the feature's physical attempt.
 
-The three literal Docs controls and actual Pages positive acceptance remain
-pending separate Ops installation. The production entrypoint stops while that
-closure is absent. Full legacy CI still retains its old Docs command until the
-coordinated cutover; do not claim Main is already free of compilation. Keep the
-d6a producer and its original evidence. `ci-policy.test.cjs` registers the new
-consumer Node contracts once in the existing Quick Checks owner; never add a
+The reviewed 38-path Main closure includes the three literal Docs controls;
+actual Ops installation and Pages positive acceptance remain pending. Missing
+installed controls stop the consumer. Current CI has no Main/release site
+producer. Keep the d6a producer and its original evidence. `ci-policy.test.cjs`
+registers the new consumer Node contracts once in the existing Quick Checks
+owner; never add a
 Main test job or another Rust documentation producer.
 
 ## Native feature ownership
@@ -116,8 +150,9 @@ Main test job or another Rust documentation producer.
 #2319 gives Windows and macOS one feature job, workspace and owned target each.
 `native-feature-tests` runs `node scripts/native-test-owner.cjs`; both required
 `Test` and `E2E Tests` require that whole matrix to succeed. Never start a second
-dev-PR Actor, Ticket, TLS or recorder producer. Their separate workflows/full
-jobs remain explicit manual or historical release routes until #2318 activation.
+dev-PR Actor, Ticket, TLS or recorder producer. The separate Actor/Ticket
+workflows are manual diagnostics; full CI is an explicit feature/dev diagnostic.
+There is no automatic release/Main native test route in this source.
 
 Preserve these configurations; a shared directory is not permission to unify
 their features or reuse an incompatible executable:
@@ -158,15 +193,14 @@ promotion description, without another build or test run. Keep source manifests
 at `0.0.0` and stamp only disposable formal-build checkouts. Repairs return
 through feature/dev tests and produce a new frozen cut.
 
-Cutover dependency: #2311 installs feature admission only. Existing frozen
-release acceptance and main-triggered publication remain active until the
-separate release-source admission change is accepted. Do not bypass those live
-gates or dispatch the new release route before that cutover. Before the first
-new cut, normally integrate current main ancestry into dev through a tested
-feature PR. Preserve historical signed receipts and immutable tags. Use the
-[Release Process](./CONTRIBUTING.md#release-process) and
-[CI and publication flow](./docs/releases/ci-publication-flow.md) to distinguish
-implemented feature admission from the pending release protocol.
+Before the first new cut, normally integrate current main ancestry into dev
+through a tested feature PR. Preserve historical signed receipts and immutable
+tags. Use the [CI and publication flow](./docs/releases/ci-publication-flow.md)
+for current entrypoints and pending activation. The older
+[Release Process](./CONTRIBUTING.md#release-process) is historical reference;
+its release-repair and main-CI publication procedure is superseded here. Do not
+dispatch a new cut before complete producer acceptance and the guarded Ops
+cutover; do not reactivate the retired path to bypass either gate.
 
 ## Pull Request Review
 
@@ -176,8 +210,8 @@ implemented feature admission from the pending release protocol.
 `publicationAuthorized: false`. Its default complete-producer registry is empty.
 Do not pass test fixture policy into an actual controller, treat that context as
 a signed reservation/publication receipt, or wire it into the live publisher.
-The current compile-only route, A339 and unexecuted C/native drafts do not earn
-v2 acceptance. Preserve all active legacy gates and genuine v6/HMAC recovery.
+Historical compile-only evidence, A339 and unaccepted C/native drafts do not
+earn v2 acceptance. Preserve genuine v6/HMAC recovery within its frozen scope.
 Future activation must pin a fully accepted feature producer and its helper
 closure, with complete Unit/E2E/native/quality ownership and original physical
 jobs. Independently prove the exact merged PR and normal B/F/M/S identities when
@@ -223,7 +257,9 @@ wrapper bytes, the resource-directory hash and the complete universal lock.
 actual protected-main C before product S and uses the real Source factory;
 the production producer registry stays empty, so new cuts still stop. This
 does not activate Main promotion, protection settings or production dispatch.
-Keep all historical workflow_run, v1/v2 receipts and frozen recovery contracts.
+The old `workflow_run` trigger is retired. Its shared aliases remain unreachable
+from every declared event; keep historical v1/v2 receipts, fixed v8 test data
+and frozen recovery contracts without granting them a new dispatch route.
 
 Source preparation reuses the existing frontend artifact: two exact S files plus
 canonical `prepared-release.json`, bounded to 192 KiB as a file. Environment/job
@@ -277,7 +313,7 @@ integration is accepted. Preserve dirty or uncertain worktrees.
 
 ## Release Branches
 
-Follow the authoritative [Release Process](./CONTRIBUTING.md#release-process).
+Follow the current [CI and publication flow](./docs/releases/ci-publication-flow.md).
 After release-source admission is enabled, cut a same-repository
 `release/<40-character-cut-SHA>` exactly at the freshly read, tested protected-dev
 commit. Record its timestamp, SHA, tree and source receipt. Keep that product
@@ -308,8 +344,9 @@ The existing Quick Checks owner imports the focused Main proof tests once.
 `Main Admission` job. The current default branch is dev: the workflow stops
 before checkout until the separate Ops cutover selects default Main. Never
 change default/protection, dispatch or register a producer merely to make this
-staged code green. Source/release registries remain inactive. Legacy automatic
-Main compilers/publishers are still live until their separate cutover.
+staged code green. Source/release registries remain inactive. #2363 removes
+the automatic Main compilers/publisher from this composed source; installation
+on the protected controllers remains separate.
 
 Before initial bootstrap, #2359 fixes the planned closure at 38 ordinary files:
 the original 25 plus Docs three, Docker four, the sole ARM helper and five legacy
@@ -326,15 +363,14 @@ always rejects bootstrap. Its separate exported Ops component can prove only
 the fixed legacy Main product tree plus actual accepted-D controls; that result
 cannot authorize a release, Docs deployment or Docker publication.
 
-This five-file prerequisite does not compose the separate Source2344, Docs2355,
-Docker2320 or ARM2353 implementations, or retire their live legacy triggers.
-Missing consumer/helper files must fail a real checkout/overlay; never add stubs
-or drop paths to force admission. Synthetic paths in `Closure2359` tests are
-inert fixture data. Run only that selected test prefix in the two existing Main
-test owners for this change. Before live Ops, finish the actual implementations,
-complete feature/registry acceptance and separate reviewed whole-control
-postimage. Every other stable product/version/lock/gitlink byte and mode stays
-legacy B. Preserve the genuine v6 and fixed2026.10.11 recovery contracts.
+The #2359 prerequisite fixed the closure without activating its consumers. The
+#2363 staged composition now includes Source2344, Docs2355, Docker2320, ARM2353
+and the retired automatic routes. Missing consumer/helper files still fail a
+real checkout/overlay; never add stubs or drop paths. Synthetic `Closure2359`
+paths are inert data. Run only affected selected cases for a closure change.
+Before live Ops, complete feature/registry acceptance and a separately reviewed
+whole-control postimage. Every other stable product/version/lock/gitlink byte
+and mode stays legacy B. Preserve the genuine v6 and fixed2026.10.11 recovery contracts.
 
 Keep PRT metadata F separate from executed B: actual run/job/check-suite and
 GraphQL file URL name F, while GITHUB_SHA/GITHUB_WORKFLOW_SHA and checkout are
