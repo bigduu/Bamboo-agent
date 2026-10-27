@@ -624,6 +624,49 @@ async function currentMainWrite(guard, write) {
   return write()
 }
 
+// Without a retained signed checksum, previous entry into the crate publisher
+// cannot prove which package finished compiling. Do not compile that ambiguity.
+function assertCrateCompilationAllowed(receipt, env, read) {
+  assert.equal(receipt.validation?.kind, 'bamboo-frozen-dev-release/v1')
+  assertFrozenPublisherRun(receipt, env.GITHUB_RUN_ID, false)
+  const runId = Number(env.GITHUB_RUN_ID), attempt = Number(env.GITHUB_RUN_ATTEMPT)
+  assert.ok(Number.isSafeInteger(runId) && runId > 0 && Number.isSafeInteger(attempt) && attempt > 0)
+  assert.match(env.GITHUB_SHA || '', SHA); assert.equal(env.GITHUB_WORKFLOW_SHA, env.GITHUB_SHA)
+  for (let prior = 1; prior < attempt; prior++) {
+    const data = read(`actions/runs/${runId}/attempts/${prior}/jobs?per_page=100`)
+    assert.equal(data.total_count, data.jobs.length, 'Incomplete prior crate jobs')
+    const jobs = data.jobs.filter(job => job.name === 'Publish and verify the crate closure')
+    assert.equal(jobs.length, 1, 'Missing or ambiguous prior crate publisher')
+    const [job] = jobs
+    for (const [key, value] of Object.entries({ run_id: runId, run_attempt: prior, head_sha: env.GITHUB_SHA, status: 'completed' })) {
+      assert.equal(job[key], value, 'Unknown prior crate publisher: ' + key)
+    }
+    assert.ok(Array.isArray(job.steps), 'Missing prior crate steps')
+    if (job.conclusion === 'skipped') { assert.equal(job.steps.length, 0); continue }
+    const steps = job.steps.filter(step => step.name === 'Publish verified crates and complete the GitHub Release')
+    assert.equal(steps.length, 1, 'Unknown prior crate compilation')
+    assert.equal(steps[0].status, 'completed')
+    assert.equal(steps[0].conclusion, 'skipped', 'Prior crate compilation started; require its retained signed original')
+  }
+}
+
+async function prepareFrozenCrateOriginal(expected, assets, { load, compile, persist }) {
+  assert.ok(assets.length <= 1, 'Ambiguous retained crate original')
+  let original
+  if (expected) {
+    assert.equal(assets.length, 1, 'Previously verified crate original is missing; do not rebuild')
+    original = await load(assets[0])
+    assert.equal(sha256(original.bytes), expected, 'Retained crate archive changed')
+  } else {
+    assert.equal(assets.length, 0, 'Unrecorded crate original needs explicit recovery')
+    original = await compile()
+    const stored = await persist(original)
+    assert.equal(sha256(stored), sha256(original.bytes), 'Retained crate archive readback changed')
+  }
+  original.retained = true
+  return original
+}
+
 function makeContext(env = process.env) {
   const repository = env.GITHUB_REPOSITORY
   assert.equal(repository, 'bigduu/Bamboo-agent')
@@ -770,26 +813,36 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
     },
     package: async (name, version, expected, release) => {
       if (frozen) {
-        const filename = name + '-' + version + '.crate', assets = github(repository, 'releases/' + release.id).assets
-        const matches = assets.filter(asset => asset.name === filename); assert.ok(matches.length <= 1)
-        let bytes
-        if (expected) {
-          assert.equal(matches.length, 1, 'Previously verified crate original is missing; do not rebuild')
-          bytes = command(['gh', 'api', 'repos/' + repository + '/releases/assets/' + matches[0].id,
-            '-H', 'Accept: application/octet-stream'], { encoding: null, maxBuffer: 64 * 1024 * 1024 })
-          assert.equal(sha256(bytes), expected, 'Retained crate archive changed')
-        } else {
-          assert.equal(matches.length, 0, 'Unrecorded crate original needs explicit recovery')
-          command(['cargo', 'package', '--locked', '--allow-dirty', '-p', name]) // One isolated verification compile.
-          const target = jsonCommand(['cargo', 'metadata', '--format-version', '1', '--no-deps']).target_directory
-          bytes = fs.readFileSync(path.join(target, 'package', filename))
+        const filename = name + '-' + version + '.crate', current = github(repository, 'releases/' + release.id)
+        const assets = current.assets.filter(asset => asset.name === filename), file = path.join(directory, filename)
+        const seal = bytes => {
+          const metadata = require('./release-cargo-upload.cjs').describeArchive(bytes, name, version)
+          fs.writeFileSync(file, bytes, { flag: 'wx' })
+          return { bytes, metadata, file, tag: release.tag_name, releaseId: release.id }
         }
-        const file = path.join(directory, filename)
-        fs.writeFileSync(file, bytes, { flag: 'wx' })
-        const upload = require('./release-cargo-upload.cjs')
-        originals.set(name, { bytes, metadata: upload.describeArchive(bytes, name, version), file,
-          tag: release.tag_name, releaseId: release.id, retained: Boolean(expected) })
-        return sha256(bytes)
+        const original = await prepareFrozenCrateOriginal(expected, assets, {
+          load: asset => seal(command(['gh', 'api', 'repos/' + repository + '/releases/assets/' + asset.id,
+            '-H', 'Accept: application/octet-stream'], { encoding: null, maxBuffer: 64 * 1024 * 1024 })),
+          compile: () => {
+            const reservation = authenticateReceipt(readBodyReceipt(current), env.BAMBOO_RELEASE_SIGNING_KEY)
+            validateReceipt(reservation, identity, crates, version)
+            assert.equal(reservation.packageChecksums[name], expected, 'Crate checksum advanced; reread the signed reservation')
+            assertCrateCompilationAllowed(reservation, env, route => github(repository, route))
+            assert.ok(!fs.existsSync(file), 'Unexplained crate original in scratch; do not rebuild')
+            command(['cargo', 'package', '--locked', '--allow-dirty', '-p', name]) // One isolated verification compile.
+            const target = jsonCommand(['cargo', 'metadata', '--format-version', '1', '--no-deps']).target_directory
+            return seal(fs.readFileSync(path.join(target, 'package', filename)))
+          },
+          persist: async original => {
+            await write(() => command(['gh', 'release', 'upload', original.tag, original.file, '--repo', repository]))
+            const matches = github(repository, 'releases/' + release.id).assets.filter(asset => asset.name === filename)
+            assert.equal(matches.length, 1, 'Retained crate original did not become visible')
+            return command(['gh', 'api', 'repos/' + repository + '/releases/assets/' + matches[0].id,
+              '-H', 'Accept: application/octet-stream'], { encoding: null, maxBuffer: 64 * 1024 * 1024 })
+          },
+        })
+        originals.set(name, original)
+        return sha256(original.bytes)
       }
       command(['cargo', 'package', '--locked', '--allow-dirty', '--no-verify', '-p', name])
       const target = jsonCommand(['cargo', 'metadata', '--format-version', '1', '--no-deps']).target_directory
@@ -798,14 +851,7 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
     cargoPublish: async (name) => {
       if (frozen) {
         const original = originals.get(name); assert.ok(original, 'Require the original verified crate Buffer')
-        if (!original.retained) {
-          await write(() => command(['gh', 'release', 'upload', original.tag, original.file, '--repo', repository]))
-          const asset = github(repository, 'releases/' + original.releaseId).assets.find(asset => asset.name === path.basename(original.file))
-          assert.ok(asset)
-          const bytes = command(['gh', 'api', 'repos/' + repository + '/releases/assets/' + asset.id,
-            '-H', 'Accept: application/octet-stream'], { encoding: null, maxBuffer: 64 * 1024 * 1024 })
-          assert.equal(sha256(bytes), sha256(original.bytes)); original.retained = true
-        }
+        assert.equal(original.retained, true, 'Crate original must be retained before checksum reservation/upload')
         return write(() => require('./release-cargo-upload.cjs').uploadArchive(original.bytes, original.metadata, env.CARGO_REGISTRY_TOKEN))
       }
       const result = await write(() => spawnCommand(['cargo', 'publish', '--locked', '--allow-dirty', '-p', name], {
@@ -880,5 +926,5 @@ module.exports = { assertVersion, assertManualVersion, validateSource, validateR
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
   verifyRegistrySource, highestStableVersion, spawnCommand, command, createPreparation, validatePreparation, resumePrepared,
-  assertAdmissionCompatibility, assertFrozenPublisherRun }
+  assertAdmissionCompatibility, assertFrozenPublisherRun, assertCrateCompilationAllowed, prepareFrozenCrateOriginal }
 if (require.main === module) main().catch((error) => { console.error(error); process.exitCode = 1 })

@@ -1638,3 +1638,92 @@ test('publisher checks the committed S cutover after source checkout and before 
   const source = fs.readFileSync('scripts/release-source.cjs', 'utf8')
   assert.ok(source.includes("command(['git', 'rev-parse', 'HEAD']).trim(), source"))
 })
+
+function crateRetryFixture(t) {
+  const source = minimalFrozenFixture(t)
+  const validation = require('./release-source.cjs').authorizeFrozenRelease(source.env, source.read, source.log)
+  const receipt = makeReceipt({ validation, publisherRunId: '77', ciRun: validation.ciRun.html_url })
+  const env = { GITHUB_RUN_ID: '77', GITHUB_RUN_ATTEMPT: '1', GITHUB_SHA: source.C, GITHUB_WORKFLOW_SHA: source.C }
+  const history = { total_count: 1, jobs: [{ name: 'Publish and verify the crate closure', run_id: 77,
+    run_attempt: 1, head_sha: source.C, status: 'completed', conclusion: 'failure', steps: [
+      { name: 'Publish verified crates and complete the GitHub Release', status: 'completed', conclusion: 'skipped' }] }] }
+  const read = route => { assert.equal(route, 'actions/runs/77/attempts/1/jobs?per_page=100'); return clone(history) }
+  return { receipt, env, history, read }
+}
+
+test('frozen crate compilation permits only the original run and confirmed unstarted earlier publishers', t => {
+  const { assertCrateCompilationAllowed } = require('./crate-release.cjs'), x = crateRetryFixture(t)
+  assert.doesNotThrow(() => assertCrateCompilationAllowed(x.receipt, x.env, () => { throw new Error('No earlier attempt') }))
+  x.env.GITHUB_RUN_ATTEMPT = '2'
+  assert.doesNotThrow(() => assertCrateCompilationAllowed(x.receipt, x.env, x.read))
+  const skipped = clone(x.history); skipped.jobs[0].conclusion = 'skipped'; skipped.jobs[0].steps = []
+  assert.doesNotThrow(() => assertCrateCompilationAllowed(x.receipt, x.env, () => skipped))
+  for (const change of [
+    h => { h.jobs[0].steps[0].conclusion = 'success' },
+    h => { h.jobs[0].steps[0].conclusion = 'failure' },
+    h => { h.jobs[0].steps[0].conclusion = 'cancelled' },
+    h => { h.jobs[0].steps[0].status = 'in_progress' },
+    h => { delete h.jobs[0].steps }, h => { h.jobs[0].steps = [] },
+    h => { h.jobs = []; h.total_count = 0 }, h => { h.total_count = 2 },
+    h => { h.jobs[0].head_sha = 'f'.repeat(40) }, h => { h.jobs[0].run_id = 78 },
+    h => { h.jobs[0].run_attempt = 2 }, h => { h.jobs[0].status = 'in_progress' },
+    h => { h.jobs[0].conclusion = 'skipped' },
+  ]) {
+    const history = clone(x.history); change(history)
+    assert.throws(() => assertCrateCompilationAllowed(x.receipt, x.env, () => history))
+  }
+  assert.throws(() => assertCrateCompilationAllowed(x.receipt, { ...x.env, GITHUB_RUN_ID: '88' }, x.read), /original publisher run 77/)
+})
+
+test('frozen crate originals persist before signed progress and a failed save cannot cause another compilation', async t => {
+  const { prepareFrozenCrateOriginal, assertCrateCompilationAllowed } = require('./crate-release.cjs')
+  const x = crateRetryFixture(t), originalBytes = Buffer.from('verified original crate bytes'), digest = sha256(originalBytes)
+  const remoteReceipt = clone(x.receipt), assets = [], calls = []
+  const operations = {
+    compile: () => {
+      assertCrateCompilationAllowed(remoteReceipt, x.env, x.read)
+      calls.push('compile'); return { bytes: Buffer.from(originalBytes) }
+    },
+    persist: original => { calls.push('retain'); assets.push({ bytes: Buffer.from(original.bytes) }); return Buffer.from(original.bytes) },
+    load: asset => { calls.push('load'); return { bytes: Buffer.from(asset.bytes) } },
+  }
+  const { context } = fixture({ validation: x.receipt.validation, ciRun: x.receipt.ciRun,
+    package: async (_name, _version, expected) => sha256((await prepareFrozenCrateOriginal(expected, assets, operations)).bytes),
+    saveReceipt: async (_release, receipt) => { calls.push('save'); signReceipt(receipt, signingKey); throw new Error('signed progress write failed') },
+    cargoPublish: async () => { throw new Error('Registry upload must wait for signed progress') },
+  })
+  await assert.rejects(() => publish(context, release(x.receipt), x.receipt), /signed progress write failed/)
+  assert.deepEqual(calls, ['compile', 'retain', 'save'])
+  assert.equal(remoteReceipt.packageChecksums[crates[0]], undefined, 'The remote signed save did not happen')
+  assert.deepEqual(assets[0].bytes, originalBytes, 'Original bytes survive before the failed signed save')
+  x.env.GITHUB_RUN_ATTEMPT = '2'
+  await assert.rejects(() => prepareFrozenCrateOriginal(undefined, assets, operations), /Unrecorded crate original/)
+  assert.equal(calls.filter(call => call === 'compile').length, 1)
+  // An uncertain save that really committed can use its authenticated checksum.
+  const committed = authenticateReceipt(clone(x.receipt), signingKey)
+  assert.equal(committed.packageChecksums[crates[0]], digest)
+  const recovered = await prepareFrozenCrateOriginal(committed.packageChecksums[crates[0]], assets, operations)
+  assert.deepEqual(recovered.bytes, originalBytes); assert.equal(recovered.retained, true)
+  assert.equal(calls.filter(call => call === 'compile').length, 1)
+})
+
+test('frozen crate failed retention and lost signed originals fail closed instead of recompiling', async t => {
+  const { prepareFrozenCrateOriginal, assertCrateCompilationAllowed } = require('./crate-release.cjs')
+  const x = crateRetryFixture(t), bytes = Buffer.from('verified original crate bytes'); let compilations = 0
+  const operations = {
+    compile: () => { assertCrateCompilationAllowed(x.receipt, x.env, x.read); compilations++; return { bytes } },
+    persist: () => { throw new Error('original upload failed') },
+    load: asset => ({ bytes: asset.bytes }),
+  }
+  await assert.rejects(() => prepareFrozenCrateOriginal(undefined, [], operations), /original upload failed/)
+  x.env.GITHUB_RUN_ATTEMPT = '2'; x.history.jobs[0].steps[0].conclusion = 'failure'
+  await assert.rejects(() => prepareFrozenCrateOriginal(undefined, [], operations), /Prior crate compilation started/)
+  assert.equal(compilations, 1)
+  await assert.rejects(() => prepareFrozenCrateOriginal(sha256(bytes), [], operations), /original is missing/)
+  await assert.rejects(() => prepareFrozenCrateOriginal(sha256(bytes), [{ bytes: Buffer.from('changed') }], operations), /archive changed/)
+  const readback = crateRetryFixture(t); let readbackCompilations = 0
+  await assert.rejects(() => prepareFrozenCrateOriginal(undefined, [], { ...operations,
+    compile: () => { assertCrateCompilationAllowed(readback.receipt, readback.env, readback.read); readbackCompilations++; return { bytes } },
+    persist: () => Buffer.from('changed readback') }), /readback changed/)
+  assert.equal(readbackCompilations, 1); assert.equal(compilations, 1)
+})
