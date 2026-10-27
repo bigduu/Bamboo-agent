@@ -82,11 +82,11 @@ difference in the test map. Runtime acceptance, lint analysis and formal release
 outputs have distinct purposes; none may be copied into another workflow merely
 to repeat its existing gate.
 
-Lotus retains supported Node Unit compatibility lanes, but its ordinary browser
-suite has one canonical Node24 dist producer and four case shards. Real Bamboo
-consumes that same dist. Do not build another dist or repeat the full browser
-suite solely because the test-runner Node version differs. Preserve complete
-case coverage and explicit native negative-control source variants.
+The Lotus target runs its Unit suite once on the minimum supported Node 22 and
+produces one canonical Node 24 dist for four browser case shards. Real Bamboo
+consumes that same dist. Do not repeat the Unit or browser suites or build
+another dist solely because the test-runner Node version differs. Preserve
+complete case coverage and explicit native negative-control source variants.
 The selected publication/verification browser still needs its OS dependencies
 and FFmpeg for video evidence. Removing an unused default Chromium download must
 not remove those real runtime prerequisites.

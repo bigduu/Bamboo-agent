@@ -79,19 +79,23 @@ same frozen source. Retried image jobs reuse their verified candidate digests.
 ## Rollout and historical releases
 
 Land the feature and release workflow changes through the normal reviewed PR
-flow. During the first cutover, Main may still contain the legacy Docker workflow:
-GitHub selects a `workflow_run` listener from the default branch, so the new
-listener cannot run until promotion. Once the first release is verified, invoke
-the new Docker consumer once from protected `dev`, using that release's version
-and source, then promote the frozen source to Main:
+flow. GitHub selects a `workflow_run` listener from the default branch. At the
+time of this guide, the default is protected `dev`, so merging the listener into
+`dev` enables automatic Docker consumption even before Main is promoted. After
+the first publisher succeeds, check its corresponding Docker run before doing
+anything else. Do not manually dispatch a duplicate consumer.
+
+If the expected automatic run is confirmed missing, recheck the live default
+branch and installed listener. Only when no consumer for this release is queued
+or running, use the existing recovery flow for its exact version and source:
 
 ```bash
 gh workflow run docker-publish.yml -R bigduu/Bamboo-agent --ref dev \
   -f "version=$RELEASE_VERSION" -f "source=$CUT_SHA"
 ```
 
-After promotion, the Main listener starts this consumer automatically for later
-completed publishers. Do not assume a staged branch has changed Main's triggers.
+Recheck the live default branch, installed listener and actual runs before
+recovery; a staged branch alone does not activate a listener.
 
 Keep old release tags, source identities, signed receipts and recovery inputs.
 Their original instructions remain in the [historical guide](https://github.com/bigduu/Bamboo-agent/blob/ce89b4fcf4a45014cccb3bc7f817613ddcfa7eb2/docs/releases/ci-publication-flow.md).
