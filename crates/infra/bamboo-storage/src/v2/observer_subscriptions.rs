@@ -298,9 +298,18 @@ impl SessionStoreV2 {
         now: DateTime<Utc>,
         failure: ObserverSubscriptionFailure,
     ) -> io::Result<()> {
-        let mut locked = self
-            .subscription_authority(reference, child_id, false)
-            .await?;
+        let mut locked = self.observer_failure_state(reference, child_id).await?;
+        let registration = locked
+            .state
+            .observers
+            .get(child_id)
+            .expect("verified registration");
+        let failure_owner = ObserverSubscriptionOwner {
+            supervisor_incarnation: reference.incarnation_id,
+            supervisor_created_at: registration.parent_created_at,
+            observer_session_id: child_id,
+            observer_created_at: registration.child_created_at,
+        };
         let subscription = locked
             .state
             .subscriptions
@@ -309,7 +318,7 @@ impl SessionStoreV2 {
         subscription.record_failure(now, failure);
         if subscription.failures == 8 {
             subscription
-                .capture_terminal_fault(&owner(reference, &locked.child), now)
+                .capture_terminal_fault(&failure_owner, now)
                 .map_err(invalid)?;
             locked.state.schema_version = locked
                 .state
@@ -402,51 +411,25 @@ impl SessionStoreV2 {
         child_id: &str,
         now: DateTime<Utc>,
     ) -> io::Result<()> {
-        reference_is_valid(reference)?;
-        target_id_is_valid(child_id)?;
-        // Only the current Supervisor's own relationship changes. No current
-        // Child (which may be gone/replaced), Host grant or target is borrowed.
-        let lifecycle = self.lock_session_lifecycle_shared().await?;
-        let task = self.lock_runtime_task_sidecar_shared().await?;
-        let sessions = self.management_session_locks(None).await?;
-        let guards = Arc::new(SupervisorManagementGuards {
-            sessions,
-            _task: task,
-            _lifecycle: super::LifecycleGuard::Shared { _guard: lifecycle },
-            _host_namespace: None,
-        });
-        let mut parent = self.management_supervisor_locked(reference).await?;
-        self.check_management_session_compatibility(&parent).await?;
-        let mut state = parent
-            .supervisor_management
-            .clone()
-            .ok_or_else(|| denied("Observer state missing"))?;
-        let registration = state
+        let mut locked = self.observer_failure_state(reference, child_id).await?;
+        let registration = locked
+            .state
             .observers
             .get(child_id)
-            .ok_or_else(|| denied("Observer registration missing"))?;
-        let subscription = state
+            .expect("verified registration");
+        let failure_owner = ObserverSubscriptionOwner {
+            supervisor_incarnation: reference.incarnation_id,
+            supervisor_created_at: registration.parent_created_at,
+            observer_session_id: child_id,
+            observer_created_at: registration.child_created_at,
+        };
+        let subscription = locked
+            .state
             .subscriptions
             .get_mut(child_id)
-            .ok_or_else(|| denied("Observer has no subscription"))?;
-        if !registration.enabled
-            || registration.parent_created_at != parent.created_at
-            || subscription.window.scope_epoch != registration.revision
-        {
-            return Err(denied(
-                "Observer diagnostic registration was revoked or changed",
-            ));
-        }
+            .expect("verified subscription");
         subscription
-            .capture_terminal_fault(
-                &ObserverSubscriptionOwner {
-                    supervisor_incarnation: reference.incarnation_id,
-                    supervisor_created_at: registration.parent_created_at,
-                    observer_session_id: child_id,
-                    observer_created_at: registration.child_created_at,
-                },
-                now,
-            )
+            .capture_terminal_fault(&failure_owner, now)
             .map_err(invalid)?;
         let fault = subscription
             .terminal_fault
@@ -456,11 +439,12 @@ impl SessionStoreV2 {
             return Ok(());
         }
         fault.delivery_failed(now);
-        state.schema_version = state
+        locked.state.schema_version = locked
+            .state
             .schema_version
             .max(bamboo_domain::SUPERVISOR_OBSERVER_FAULT_SCHEMA_VERSION);
-        state.revision = next_revision(state.revision)?;
-        self.publish_management_state(&mut parent, &state, &guards)
+        locked.state.revision = next_revision(locked.state.revision)?;
+        self.publish_management_state(&mut locked.parent, &locked.state, &locked.guards)
             .await
     }
 
