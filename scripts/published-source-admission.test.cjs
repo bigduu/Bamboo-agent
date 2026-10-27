@@ -386,3 +386,10 @@ test("Main2351 public "+role+" retains its own strict role bound",async()=>{
   ref.sizeBytes=maximum+1;f.state.assets.find(asset=>asset.id===ref.assetId).size=ref.sizeBytes;
   await assert.rejects(f.verify(),/exceeds its role bound/);assert.ok(!f.state.binaryReads.includes(ref.assetId));
 });
+test("Controller2354 locator accepts only a controller source locator without release fields",()=>{
+  const value={mode:"controller",sourceRevision:S,featurePr:2333,ciRun:123};
+  const text=value=>"<!-- bamboo-main-locator/v1\n"+JSON.stringify(value)+"\n-->";
+  assert.deepEqual(proof.mainLocator(text(value)),value);
+  for(const extra of [{releaseRun:900},{version:"2026.10.27"},{controlPaths:["src/lib.rs"]},{approved:true}])
+    assert.throws(()=>proof.mainLocator(text({...value,...extra})));
+});
