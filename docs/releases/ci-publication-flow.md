@@ -1,5 +1,12 @@
 # CI and publication flow
 
+Read the complete local [delivery-flow/v1](../delivery-workflow.md) and
+[Actions audit](../ci-workflow-audit.md) first. These shared copies come from
+Zenith `874ee7c`; this guide adds Bamboo's commands, configurations and test map.
+Use the same source checkpoint and original evidence when another agent takes
+over. Check current activation and actual runs; a prepared owner is not an
+accepted or published artifact.
+
 This is the operating guide for Bamboo's CI and automatic release path. The
 [Release Process](../../CONTRIBUTING.md#release-process) remains authoritative
 for cuts, original-source repairs, protected admission and credentials.
