@@ -36,7 +36,10 @@ terminal lifecycle events and tool-result persistence.
 
 The target is an exact `defaults.vision` provider instance/model, or the active
 instance's explicit `vision_model`. It never guesses fast/chat, a model name,
-or another provider account. The shared factory supports native provider
+or another provider account. An explicitly saved `defaults.vision` role is
+honored even when the primary-chat `features.provider_model_ref` rollout is
+omitted or false. Only an unset global Vision role permits the active-instance
+compatibility setting; an invalid explicit role fails closed. The shared factory supports native provider
 protocols and preserves the selected role's reasoning preference. The Session
 main model and provider do not change.
 
@@ -66,6 +69,13 @@ The request/stream remain inside cancellation scopes, with bounded time/output
 and the existing cumulative encoded tool-image budget.
 
 ## Offline regression coverage
+
+Saved-role regressions cover the primary-chat rollout flag omitted, false and
+true, including pure startup preflight, exact provider/model/reasoning identity,
+a valid legacy target that must not replace an invalid saved role, and live role
+changes between calls. Loopback fake providers verify that an already resolved
+request retains its complete target while the next request reads the new pair;
+disabled or explicitly non-Vision targets make no additional request.
 
 `vision_same_nonvision_main_rejects_uploads_but_describes_viewimage_output`
 uses the same main provider/effective model and valid Vision target for both
