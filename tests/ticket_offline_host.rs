@@ -54,6 +54,18 @@ async fn offline_cli_preserves_historical_work_revision_without_restart_reconcil
     assert_eq!(request.expected_epoch, before.1.authority_epoch);
     assert_eq!(std::fs::read(root.join("HEAD")).unwrap(), head);
 
+    let backup_root = dir.path().join("backup");
+    ticket_cli::run(ticket_cli::TicketCommands::Backup {
+        data_dir: data.clone(),
+        destination: backup_root.clone(),
+    })
+    .await
+    .unwrap();
+    let backup = TicketService::open_offline(&backup_root, historical.clone()).unwrap();
+    assert_eq!(backup.published().unwrap().1.binding, historical);
+    drop(backup);
+    assert_eq!(std::fs::read(root.join("HEAD")).unwrap(), head);
+
     // Reuse the original offline import/receipt path, then migrate the same
     // sealed binding. No Worker, provider, claim or runtime lease is created.
     let preview = ticket_cli::preview(&data, DEFAULT_SUPERVISOR_SESSION_ID)
@@ -87,13 +99,15 @@ async fn offline_cli_preserves_historical_work_revision_without_restart_reconcil
     let request: MigrationRequest = serde_json::from_value(plan["request"].clone()).unwrap();
     assert_eq!(request.binding, historical);
     let moved = ticket_cli::migrate(&data, &request).await.unwrap();
+    let repeated = ticket_cli::migrate(&data, &request).await.unwrap();
     assert_eq!(moved["status"], "migrated");
+    assert_eq!(repeated["receipt"], moved["receipt"]);
     let copy = TicketService::open_offline(&request.destination_root, historical.clone()).unwrap();
     let copied = copy.published().unwrap().1;
     assert_eq!(copied.binding, historical);
     assert_eq!(
-        copied.receipts["historical-import"],
-        serde_json::from_value(first["receipt"].clone()).unwrap()
+        serde_json::to_value(&copied.receipts["historical-import"]).unwrap(),
+        first["receipt"]
     );
     assert!(copied.assignments.is_empty());
     assert!(copied

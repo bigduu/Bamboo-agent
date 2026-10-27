@@ -117,6 +117,57 @@ fn supervisor_mode_compatibility_preserves_sealed_binding_work_and_receipts() {
 }
 
 #[test]
+fn offline_supervisor_mode_compatibility_preserves_head_and_rejects_foreign_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("scope");
+    let original = TicketService::open(&root, binding()).unwrap();
+    let work = create(&original, "offline historical revision", BTreeSet::new());
+    let before = original.published().unwrap();
+    drop(original);
+    let head = std::fs::read(root.join("HEAD")).unwrap();
+    let mut stable = binding();
+    stable.binding_revision = 1;
+    assert!(TicketService::open_offline(&root, stable.clone()).is_err());
+    let offline = TicketService::open_offline_supervisor_mode_compatible(&root, stable).unwrap();
+    let after = offline.published().unwrap();
+    assert!(matches!(offline.health(), Health::ReadOnly { .. }));
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.1.seq, before.1.seq);
+    assert_eq!(after.1.authority_epoch, before.1.authority_epoch);
+    assert_eq!(after.1.binding, before.1.binding);
+    assert_eq!(after.1.receipts, before.1.receipts);
+    assert_eq!(
+        canonical_bytes(&after.1.tickets[&work]).unwrap(),
+        canonical_bytes(&before.1.tickets[&work]).unwrap()
+    );
+    assert!(
+        TicketService::open_offline_supervisor_mode_compatible(&root, binding()).is_err(),
+        "offline inspection retains the same OS writer lock"
+    );
+    drop(offline);
+    for field in ["scope", "supervisor", "zero"] {
+        let mut wrong = binding();
+        wrong.binding_revision = 1;
+        match field {
+            "scope" => wrong.scope_id = "foreign namespace".into(),
+            "supervisor" => wrong.supervisor_session_id = "foreign supervisor".into(),
+            _ => wrong.binding_revision = 0,
+        }
+        assert!(
+            TicketService::open_offline_supervisor_mode_compatible(&root, wrong).is_err(),
+            "{field}"
+        );
+        assert_eq!(std::fs::read(root.join("HEAD")).unwrap(), head);
+    }
+    assert!(TicketService::open_offline_supervisor_mode_compatible(
+        dir.path().join("missing"),
+        binding()
+    )
+    .is_err());
+    assert!(!dir.path().join("missing").exists());
+}
+
+#[test]
 fn supervisor_mode_compatibility_denies_other_namespaces_and_zero_revision() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("scope");
