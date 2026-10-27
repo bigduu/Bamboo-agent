@@ -596,6 +596,10 @@ async fn prepare_round_inner(
 }
 
 #[cfg(test)]
+#[path = "round_prelude/model_routing_tests.rs"]
+mod model_routing_tests;
+
+#[cfg(test)]
 mod project_prompt_tests {
     use async_trait::async_trait;
     use bamboo_agent_core::{Message, Session};

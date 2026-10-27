@@ -3408,6 +3408,84 @@ mod tests {
         Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()))
     }
 
+    #[tokio::test]
+    async fn routing_contract_auto_dream_keeps_live_global_background_targets_without_account_retry(
+    ) {
+        use crate::app_context::model_routing_test_support::{Failure, RoutingContext};
+        for flag in [None, Some(false), Some(true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = RoutingContext::new(flag);
+            state
+                .config
+                .write()
+                .await
+                .memory_mut()
+                .get_or_insert_with(Default::default)
+                .auto_dream_enabled = true;
+            for provider in state.providers.values() {
+                *provider.failure.lock().unwrap() = Some(Failure::Auth);
+            }
+            let session_store = Arc::new(
+                SessionStoreV2::new(directory.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let storage: Arc<dyn Storage> = session_store.clone();
+            let session = RoutingContext::session();
+            storage.save_session(&session).await.unwrap();
+            let memory = MemoryStore::new(directory.path());
+            memory
+                .write_session_topic(&session.id, "default", "Synthetic routing context")
+                .await
+                .unwrap();
+            let context = AutoDreamContext {
+                session_store,
+                storage,
+                memory: memory.clone(),
+                provider: state.providers["chat-a"].clone(),
+                config: state.config.clone(),
+                provider_registry: state.registry.clone(),
+            };
+            assert!(run_auto_dream_once_with_store(&context, &memory)
+                .await
+                .is_err());
+            assert_eq!(state.models("memory-c"), vec!["background-c".to_string()]);
+            assert!(state.requests("chat-a").is_empty());
+            assert!(state.requests("fast-b").is_empty());
+
+            state
+                .config
+                .write()
+                .await
+                .defaults
+                .as_mut()
+                .unwrap()
+                .memory_background = None;
+            assert!(run_auto_dream_once_with_store(&context, &memory)
+                .await
+                .is_err());
+            assert_eq!(state.models("fast-b"), vec!["cheap-b".to_string()]);
+            assert!(state.requests("chat-a").is_empty());
+            state
+                .config
+                .write()
+                .await
+                .defaults
+                .as_mut()
+                .unwrap()
+                .memory_background = Some(bamboo_domain::ProviderModelRef::new(
+                "missing-account",
+                "unknown",
+            ));
+            assert!(run_auto_dream_once_with_store(&context, &memory)
+                .await
+                .is_err());
+            assert_eq!(state.requests("fast-b").len(), 1);
+            assert_eq!(state.requests("memory-c").len(), 1);
+            assert!(state.requests("chat-a").is_empty());
+        }
+    }
+
     fn test_time(seconds: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(seconds, 0).expect("valid test timestamp")
     }

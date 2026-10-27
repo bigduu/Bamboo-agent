@@ -162,6 +162,13 @@ impl RoutingContext {
         self.providers[id].requests.lock().unwrap().clone()
     }
 
+    pub(crate) fn models(&self, id: &str) -> Vec<String> {
+        self.requests(id)
+            .into_iter()
+            .map(|(model, _)| model)
+            .collect()
+    }
+
     pub(crate) fn assert_no_requests(&self) {
         for provider in self.providers.values() {
             assert!(provider.requests.lock().unwrap().is_empty());
