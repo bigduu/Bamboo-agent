@@ -13,6 +13,11 @@ on:
       - 'crates/engine/bamboo-engine/src/runtime/runner/tool_execution/supervisor_dispatch_tests.rs'
       - 'crates/engine/bamboo-engine/src/session_app/approval_replay.rs'
       - 'crates/app/bamboo-server-tools/src/skill_runtime/catalog_tests.rs'
+      - 'crates/infra/bamboo-storage/tests/supervisor_current_user_scope.rs'
+      - 'crates/infra/bamboo-storage/src/v2/supervisor_management.rs'
+      - 'crates/infra/bamboo-storage/src/v2/supervisor_current_user.rs'
+      - 'crates/app/bamboo-server-tools/src/session_inspector/**'
+      - 'crates/engine/bamboo-engine/src/ticket_runtime.rs'
       - '.github/workflows/supervisor-role-acceptance.yml'
 
 permissions:
@@ -54,6 +59,12 @@ jobs:
           shared-key: bamboo-ci-test-${{ runner.os }}
           workspaces: . -> target/grouped-default
           save-if: false
+      - name: Verify canonical current-user management without manual grants
+        run: |
+          set -euo pipefail
+          cargo test --locked -p bamboo-storage --test supervisor_current_user_scope \
+            -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/supervisor-current-user.log"
+          grep -Fq 'test result: ok. 5 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-current-user.log"
       - name: Verify direct file and process denial in both modes
         run: |
           set -euo pipefail
@@ -96,7 +107,7 @@ jobs:
       - name: Check affected production libraries under the original lint policy
         run: >-
           cargo clippy --locked --all-features --lib
-          -p bamboo-domain -p bamboo-agent-core -p bamboo-engine -p bamboo-server-tools --
+          -p bamboo-domain -p bamboo-agent-core -p bamboo-engine -p bamboo-server-tools -p bamboo-storage --
           -D warnings -A deprecated -A clippy::module_inception
           -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
           -A clippy::too-many-arguments -A clippy::while-let-loop
