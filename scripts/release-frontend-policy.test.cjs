@@ -151,6 +151,13 @@ test("CLI appends the exact resolution to GITHUB_OUTPUT", (t) => {
   );
 });
 
+function frontendPolicyOwners(ci) {
+  ci = ci.replace(/\r\n/g, "\n");
+  return Object.fromEntries([...ci.matchAll(/\n  ([a-z][a-z0-9-]*):\n([\s\S]*?)(?=\n  [a-z][a-z0-9-]*:\n|$)/g)]
+    .filter(([, , body]) => body.includes("scripts/release-frontend-policy.test.cjs"))
+    .map(([, name, body]) => [name, body]));
+}
+
 test("crate and Docker publishers share the fail-closed resolver contract", () => {
   const workflowPaths = [
     ".github/workflows/publish-crate.yml",
@@ -185,19 +192,19 @@ test("crate and Docker publishers share the fail-closed resolver contract", () =
     path.join(ROOT, ".github/workflows/ci.yml"),
     "utf8",
   );
-  const owners = Object.fromEntries([...ci.matchAll(/\n  ([a-z][a-z0-9-]*):\n([\s\S]*?)(?=\n  [a-z][a-z0-9-]*:\n|$)/g)]
-    .filter(([, , body]) => body.includes("scripts/release-frontend-policy.test.cjs"))
-    .map(([, name, body]) => [name, body]));
-  assert.deepEqual(Object.keys(owners), ["quick-checks", "test", "native-feature-tests", "build"]);
-  for (const body of Object.values(owners)) {
-    assert.equal(body.match(/scripts\/release-frontend-policy\.test\.cjs/g)?.length, 1);
+  for (const newline of ["\n", "\r\n"]) {
+    const owners = frontendPolicyOwners(ci.replace(/\r?\n/g, newline));
+    assert.deepEqual(Object.keys(owners), ["quick-checks", "test", "native-feature-tests", "build"]);
+    for (const body of Object.values(owners)) {
+      assert.equal(body.match(/scripts\/release-frontend-policy\.test\.cjs/g)?.length, 1);
+    }
+    assert.match(owners["quick-checks"], /if: github.event_name == 'pull_request' && github.base_ref == 'dev'/);
+    assert.match(owners["native-feature-tests"], /if: needs.validation-source.outputs.feature == 'true'/);
+    assert.match(owners["native-feature-tests"], /os: \[windows-2025, macos-latest\]/);
+    assert.match(owners.test, /Test frontend artifact and release policies\n        if: needs.validation-source.outputs.full == 'true'/);
+    assert.match(owners.build, /needs.validation-source.outputs.full == 'true'/);
+    assert.match(owners.build, /Test frontend artifact and release policies\n        if: runner.os != 'Linux'/);
   }
-  assert.match(owners["quick-checks"], /if: github.event_name == 'pull_request' && github.base_ref == 'dev'/);
-  assert.match(owners["native-feature-tests"], /if: needs.validation-source.outputs.feature == 'true'/);
-  assert.match(owners["native-feature-tests"], /os: \[windows-2025, macos-latest\]/);
-  assert.match(owners.test, /Test frontend artifact and release policies\n        if: needs.validation-source.outputs.full == 'true'/);
-  assert.match(owners.build, /needs.validation-source.outputs.full == 'true'/);
-  assert.match(owners.build, /Test frontend artifact and release policies\n        if: runner.os != 'Linux'/);
 });
 
 function publicationGuard(workflow) {
