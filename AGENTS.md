@@ -56,6 +56,28 @@ product checkout S and never rewrite GITHUB_SHA. See the
 [foundation contract](docs/releases/ci-publication-flow.md#inactive-frozen-source-foundation-2323)
 for the read adapter, pending owners and verification command.
 
+### Inactive Source-dispatch authority (#2336)
+
+`verifyAcceptedDevFacts` can inspect accepted feature evidence before a frozen
+ref exists or a dispatch starts. It returns `publicationAuthorized: false`,
+without a controller or frozen-ref claim. `resolveFrozenSource` adds the actual
+protected-main C and frozen-S checks. Neither data object is a signing capability.
+Only `crate-release.cjs`'s `makeFrozenSourceContext()` may construct the new writer;
+it reads the actual dispatch event and calls the real resolver with fixed GitHub
+reads, the official check-suite query and original physical logs. Never inject
+fixture policy or turn an environment JSON/boolean into authority. Keep the
+production registry empty until every feature owner has actual accepted evidence.
+
+Phase A is helper-only and does not change publisher YAML. Its distinct
+`sourceDispatch` receipt field uses the existing allocator, HMAC key and writer;
+it cannot upgrade a signed legacy reservation. C helpers must be ordinary files
+from the actual C checkout, outside S, before any candidate execution. Use S as
+verified data and preserve real `GITHUB_*` identities. Every write/retried PUT
+must use the same fresh source/ref/dev-protection/reservation guard. Native and
+crate adapters, the sole whole-release completion and dispatch wiring need the
+separate reviewed handoff; the legacy package/publish/complete path rejects this
+new contract. Main promotion/protection/production activation remain separate.
+
 ### Bamboo #791 integration exception
 
 For the #791 multi-agent epic, the user's 2026-09-28 delivery instruction takes

@@ -10,7 +10,8 @@ const { assertVersion, assertManualVersion, validateSource, validateReceipt, nex
   shouldMakeLatest, gitIsAncestor, canonicalJson, signReceipt, authenticateReceipt,
   readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration, verifyRegistrySource, highestStableVersion,
   command, spawnCommand, assertCurrentMain, currentMainWrite, createPreparation, validatePreparation,
-  resumePrepared, assertAdmissionCompatibility, nativeOriginalContract } = require('./crate-release.cjs')
+  resumePrepared, assertAdmissionCompatibility, nativeOriginalContract, sourceDispatchContract,
+  readFrozenSourceContext, makeFrozenSourceContext } = require('./crate-release.cjs')
 
 const clone = (value) => JSON.parse(JSON.stringify(value))
 const sourceRevision = 'a'.repeat(40)
@@ -72,6 +73,66 @@ const completedReceipt = (version, revision) => makeReceipt({ version,
 
 const preparationIdentity = { repository: identity.repository, sourceRevision, sourceTree: '1'.repeat(40),
   workflowRevision: '2'.repeat(40), runId: '123', runAttempt: 1, version: '2026.10.8', ciRun: null }
+const featureCiRun = 'https://github.com/bigduu/Bamboo-agent/actions/runs/100'
+
+function dispatchFacts() {
+  return { schemaVersion: 2, kind: 'bamboo-frozen-source-context/v2', publicationAuthorized: false,
+    source: { releaseRef: `release/${sourceRevision}`, revision: sourceRevision, acceptedMerge: sourceRevision,
+      tree: preparationIdentity.sourceTree, mainHistoryAnchor: '3'.repeat(40),
+      devObservedBefore: sourceRevision, devObservedAfter: sourceRevision },
+    controller: { revision: preparationIdentity.workflowRevision, workflowPath: '.github/workflows/publish-crate.yml',
+      event: 'workflow_dispatch', ref: 'refs/heads/main', mainObservedBefore: '2'.repeat(40), mainObservedAfter: '2'.repeat(40) },
+    feature: { pr: 2336, baseRevision: '4'.repeat(40), headRevision: '5'.repeat(40), snapshotRevision: '6'.repeat(40),
+      runId: 100, logicalAttempt: 1, workflowId: 123, checkSuiteId: 321, workflowDefinitionRevision: '5'.repeat(40),
+      mergedAt: '2026-10-27T01:03:00Z', producerDigest: '7'.repeat(64), physicalJobs: [] },
+    inputs: { fixtureDataOnly: true } }
+}
+
+test('source dispatch discriminator preserves immutable data and ignores only fresh branch observations', () => {
+  const facts = dispatchFacts(), marker = sourceDispatchContract(facts, preparationIdentity.runId)
+  assert.equal(marker.kind, 'bamboo-frozen-source-dispatch/v1')
+  assert.equal(facts.publicationAuthorized, false)
+  const advanced = clone(facts)
+  advanced.source.devObservedAfter = '8'.repeat(40); advanced.controller.mainObservedAfter = '9'.repeat(40)
+  assert.deepEqual(sourceDispatchContract(advanced, preparationIdentity.runId), marker)
+  assert.notDeepEqual(sourceDispatchContract(facts, '124'), marker)
+  const ciRun = 'https://github.com/bigduu/Bamboo-agent/actions/runs/100'
+  const body = receiptBody(makeReceipt({ sourceDispatch: marker, ciRun }))
+  assert.ok(body.includes(`Feature acceptance CI: ${ciRun}`))
+  assert.ok(body.includes('Release controller: https://github.com/bigduu/Bamboo-agent/actions/runs/123'))
+  assert.doesNotMatch(body, /Main publication CI:/)
+  assert.equal(typeof readFrozenSourceContext, 'function'); assert.equal(typeof makeFrozenSourceContext, 'function')
+  for (const changed of [ { ...facts, publicationAuthorized: true }, { ...facts, kind: 'untrusted' },
+    { ...facts, source: { ...facts.source, releaseRef: 'release/moving' } },
+    { ...facts, controller: { ...facts.controller, event: 'workflow_run' } } ]) {
+    assert.throws(() => sourceDispatchContract(changed, preparationIdentity.runId))
+  }
+})
+test('source dispatch reservation uses the existing allocator and cannot adopt a signed legacy reservation', async () => {
+  const sourceDispatch = sourceDispatchContract(dispatchFacts(), preparationIdentity.runId)
+  const current = fixture({ sourceDispatch, ciRun: featureCiRun }), allocated = await plan(current.context)
+  assert.deepEqual(allocated.receipt.sourceDispatch, sourceDispatch)
+  authenticateReceipt(allocated.receipt, signingKey)
+  const old = makeReceipt(), entry = release(old), original = entry.body
+  const previous = fixture({ sourceDispatch, ciRun: featureCiRun, releases: async () => [entry] })
+  await assert.rejects(plan(previous.context), /source.dispatch|Source.dispatch/i)
+  assert.equal(entry.body, original); assert.deepEqual(previous.calls, [])
+  const legacy = fixture({ releases: async () => [allocated.release] })
+  await assert.rejects(plan(legacy.context), /source.dispatch|Source.dispatch/i)
+})
+test('source dispatch preparation retains its discriminator and refuses the legacy package publisher', async () => {
+  const sourceDispatch = sourceDispatchContract(dispatchFacts(), preparationIdentity.runId)
+  const marker = nativeOriginalContract(preparationIdentity)
+  const current = fixture({ sourceDispatch, ciRun: featureCiRun, nativeOriginals: marker }), allocated = await plan(current.context)
+  const ownIdentity = { ...preparationIdentity, ciRun: featureCiRun, sourceDispatch, version: allocated.receipt.version }
+  const prepared = createPreparation(allocated, ownIdentity, 2)
+  assert.deepEqual(prepared.sourceDispatch, sourceDispatch)
+  validatePreparation(prepared, { ...ownIdentity, runAttempt: 2 }, 2)
+  assert.throws(() => validatePreparation(prepared, { ...ownIdentity, sourceDispatch: undefined }, 2))
+  assert.throws(() => validatePreparation(prepared, { ...ownIdentity, sourceDispatch: sourceDispatchContract(dispatchFacts(), '124') }, 2))
+  await assert.rejects(publish(current.context, allocated.release, allocated.receipt), /original.*output/i)
+  assert.ok(!current.calls.some(call => call.startsWith('package:') || call.startsWith('publish:')))
+})
 
 test('original native opt-in uses the existing allocator and cannot upgrade a signed historical reservation', async () => {
   const marker = nativeOriginalContract(preparationIdentity)

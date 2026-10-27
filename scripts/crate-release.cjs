@@ -15,6 +15,8 @@ const U64_MAX = 18446744073709551615n
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/
 const sha256 = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
 const AUTH_DOMAIN = 'bamboo-release-provenance/hmac-sha256/v1\0'
+const FROZEN_DISPATCH = 'bamboo-frozen-source-dispatch/v1'
+const MAIN_HISTORY_ANCHOR = 'd6325a732c7669f94962f604e4ce98966e374d73'
 
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
@@ -140,6 +142,15 @@ function validateReceipt(receipt, identity, crates, version = receipt?.version) 
   assert.deepEqual(receipt.crates, crates, 'Release publish closure changed')
   assert.equal(typeof receipt.automatic, 'boolean')
   assert.equal(typeof receipt.completed, 'boolean')
+  if (Object.hasOwn(receipt, 'sourceDispatch')) {
+    const marker = receipt.sourceDispatch
+    assert.equal(receipt.automatic, true, 'Source dispatch requires the canonical allocator')
+    assert.deepEqual(marker, sourceDispatchContract(marker?.context, marker?.runId))
+    assert.equal(marker.context.source.revision, identity.sourceRevision)
+    assert.equal(identity.repository, 'bigduu/Bamboo-agent')
+    assert.equal(receipt.ciRun, `https://github.com/bigduu/Bamboo-agent/actions/runs/${marker.context.feature.runId}`)
+    assert.equal(receipt.validation, undefined, 'Historical and frozen-source admissions cannot be mixed')
+  }
   if (Object.hasOwn(receipt, 'nativeOriginals')) {
     const marker = receipt.nativeOriginals
     assert.equal(receipt.automatic, true, 'Original native outputs require the canonical reservation')
@@ -157,6 +168,40 @@ function validateReceipt(receipt, identity, crates, version = receipt?.version) 
       'Completed release must record every package checksum')
   }
   return receipt
+}
+
+// This discriminator is signed by the existing writer. Its context remains
+// read-only data; constructing it never grants a factory or write capability.
+function sourceDispatchContract(facts, runId) {
+  assert.equal(facts?.schemaVersion, 2)
+  assert.equal(facts.kind, 'bamboo-frozen-source-context/v2')
+  assert.equal(facts.publicationAuthorized, false)
+  assert.match(runId, /^[1-9][0-9]*$/)
+  const context = JSON.parse(JSON.stringify(facts))
+  assert.deepEqual(Object.keys(context).sort(), ['controller', 'feature', 'inputs', 'kind', 'publicationAuthorized', 'schemaVersion', 'source'])
+  const { source, controller, feature } = context
+  for (const name of ['revision', 'tree', 'acceptedMerge', 'mainHistoryAnchor']) assert.match(source?.[name], SHA)
+  assert.equal(source.acceptedMerge, source.revision)
+  assert.equal(source.releaseRef, `release/${source.revision}`)
+  assert.match(controller?.revision, SHA)
+  assert.equal(controller.workflowPath, '.github/workflows/publish-crate.yml')
+  assert.equal(controller.event, 'workflow_dispatch'); assert.equal(controller.ref, 'refs/heads/main')
+  for (const name of ['baseRevision', 'headRevision', 'snapshotRevision', 'workflowDefinitionRevision']) assert.match(feature?.[name], SHA)
+  for (const name of ['pr', 'runId', 'logicalAttempt', 'workflowId', 'checkSuiteId']) {
+    assert.ok(Number.isSafeInteger(feature[name]) && feature[name] > 0)
+  }
+  assert.ok(Number.isFinite(Date.parse(feature.mergedAt))); assert.match(feature.producerDigest, DIGEST)
+  assert.ok(Array.isArray(feature.physicalJobs) && context.inputs && typeof context.inputs === 'object')
+  delete source.devObservedBefore; delete source.devObservedAfter
+  delete controller.mainObservedBefore; delete controller.mainObservedAfter
+  assert.ok(Buffer.byteLength(JSON.stringify(context)) <= 48 * 1024, 'Source-dispatch provenance exceeds its bound')
+  return { schemaVersion: 1, kind: FROZEN_DISPATCH, runId, context }
+}
+
+function assertSourceDispatchCompatibility(recorded, current) {
+  if (recorded === undefined && current === undefined) return
+  assert.ok(recorded && current, 'Source-dispatch reservation cannot adopt another admission contract')
+  assert.deepEqual(recorded, current, 'Source-dispatch immutable source/controller facts changed')
 }
 
 // A trusted controller may opt a NEW reservation into this lifecycle. There is
@@ -197,6 +242,15 @@ function validatePreparation(preparation, identity, contractVersion) {
   assert.ok(Number.isSafeInteger(preparation.releaseId) && preparation.releaseId > 0)
   const receipt = preparation.receipt
   validateReceipt(receipt, receipt?.identity, receipt?.crates, identity.version)
+  assertSourceDispatchCompatibility(preparation.sourceDispatch, identity.sourceDispatch)
+  assertSourceDispatchCompatibility(receipt.sourceDispatch, identity.sourceDispatch)
+  if (receipt.sourceDispatch) {
+    assert.equal(contractVersion, 2)
+    assert.equal(receipt.sourceDispatch.context.source.tree, identity.sourceTree)
+    assert.equal(receipt.sourceDispatch.context.controller.revision, identity.workflowRevision)
+    assert.equal(receipt.sourceDispatch.runId, identity.runId)
+    assert.ok(receipt.nativeOriginals, 'Source dispatch requires original native outputs')
+  }
   if (receipt.nativeOriginals) {
     assert.equal(contractVersion, 2, 'Original native lifecycle requires the three-target contract')
     assert.deepEqual(receipt.nativeOriginals, nativeOriginalContract(identity), 'Original controller/run must remain unchanged')
@@ -220,7 +274,8 @@ function createPreparation({ release, receipt }, identity, contractVersion) {
   return validatePreparation({ schemaVersion: 1, kind: 'bamboo-release-preparation/v1',
     repository: identity.repository, sourceRevision: identity.sourceRevision, sourceTree: identity.sourceTree,
     workflowRevision: identity.workflowRevision, runId: identity.runId, runAttempt: identity.runAttempt,
-    contractVersion, releaseId: release.id, receipt: JSON.parse(JSON.stringify(receipt)) }, identity, contractVersion)
+    contractVersion, releaseId: release.id, receipt: JSON.parse(JSON.stringify(receipt)),
+    ...(identity.sourceDispatch ? { sourceDispatch: identity.sourceDispatch } : {}) }, identity, contractVersion)
 }
 
 async function resumePrepared(context, preparation, identity, contractVersion) {
@@ -235,6 +290,9 @@ async function resumePrepared(context, preparation, identity, contractVersion) {
   assert.equal(release.target_commitish, identity.sourceRevision)
   const receipt = await context.readReceipt(release, { required: true })
   validateReceipt(receipt, context.identity, context.crates, identity.version)
+  assertSourceDispatchCompatibility(receipt.sourceDispatch, context.sourceDispatch)
+  assertSourceDispatchCompatibility(receipt.sourceDispatch, preparation.receipt.sourceDispatch)
+  if (context.bindReservation) context.bindReservation(release, receipt)
   assert.equal(receipt.automatic, true)
   assert.equal(receipt.ciRun, preparation.receipt.ciRun)
   assert.deepEqual(receipt.validation, preparation.receipt.validation)
@@ -302,6 +360,8 @@ async function plan(context) {
   if (release) {
     assert.equal(release.target_commitish, identity.sourceRevision, 'Reserved release target commit changed')
     const receipt = validateReceipt(receipts.find((entry) => entry.version === version), identity, crates, version)
+    assertSourceDispatchCompatibility(receipt.sourceDispatch, context.sourceDispatch)
+    if (context.bindReservation) context.bindReservation(release, receipt)
     assert.ok(release.draft || receipt.completed, 'Public release has incomplete provenance')
     await context.ensureTag(release, receipt)
     await context.ensureFrontend(release, receipt)
@@ -311,11 +371,13 @@ async function plan(context) {
     frontendBytes: context.frontendBytes, automatic: true, completed: false,
     ciRun: context.ciRun || null, packageChecksums: {},
     ...(context.validation ? { validation: context.validation } : {}),
+    ...(context.sourceDispatch ? { sourceDispatch: context.sourceDispatch } : {}),
     ...(context.nativeOriginals ? { nativeOriginals: context.nativeOriginals } : {}) }
   validateReceipt(receipt, identity, crates, version)
   // Reserve before uploading any crate. An uncertain GitHub write is recovered
   // by reading this exact tag on a rerun, never by allocating another version.
   const reserved = await context.reserve(receipt)
+  if (context.bindReservation) context.bindReservation(reserved, receipt)
   await context.ensureTag(reserved, receipt)
   await context.ensureFrontend(reserved, receipt)
   return { receipt, release: reserved }
@@ -323,6 +385,8 @@ async function plan(context) {
 
 async function publish(context, release, receipt) {
   assert.equal(context.automatic, true, 'Receipt controller is only for automatic main publication')
+  assertSourceDispatchCompatibility(receipt.sourceDispatch, context.sourceDispatch)
+  assert.equal(receipt.sourceDispatch, undefined, 'Source dispatch requires the original-output crate publisher and finalizer')
   await context.assertCurrentMain()
   context.assertSigningKey()
   context.verifyReceipt(receipt)
@@ -527,7 +591,9 @@ function receiptBody(receipt) {
   return `${receipt.completed ? 'Published' : 'Reserved'} Bamboo ${receipt.version}.\n\n` +
     `Source: [${sourceRevision}](https://github.com/${repository}/commit/${sourceRevision})\n\n` +
     `Frontend: ${frontend.packageName}@${frontend.packageVersion}\n\n` +
-    (receipt.ciRun ? `Main publication CI: ${receipt.ciRun}\n\n` : '') +
+    (receipt.ciRun ? `${receipt.sourceDispatch ? 'Feature acceptance CI' : 'Main publication CI'}: ${receipt.ciRun}\n\n` : '') +
+    (receipt.sourceDispatch ? `Release controller: https://github.com/${repository}/actions/runs/${receipt.sourceDispatch.runId} ` +
+      `(C ${receipt.sourceDispatch.context.controller.revision}).\n\n` : '') +
     (receipt.validation ? `Full pre-merge acceptance: ${receipt.validation.premerge.url} ` +
       `(attempt ${receipt.validation.premerge.runAttempt}, tested snapshot ${receipt.validation.premerge.snapshotRevision}).\n\n` : '') +
     'Provenance binds the source, preserved frontend bytes and each crate checksum.\n\n' +
@@ -635,6 +701,194 @@ async function currentMainWrite(guard, write) {
   return write()
 }
 
+const SUITE_QUERY = 'query($suite:ID!){node(id:$suite){... on CheckSuite{databaseId ' +
+  'repository{databaseId nameWithOwner} app{databaseId slug} commit{oid} ' +
+  'workflowRun{databaseId event runAttempt workflow{databaseId name} ' +
+  'file{path repositoryName repositoryFileUrl}}}}}'
+const FROZEN_CONTROLLER_FILES = Object.freeze([
+  'crate-release.cjs', 'frozen-source-admission.cjs', 'compute-publish-order.py',
+  'crate-release-frontend.py', 'crate-release-lock.py', 'release-cargo-sandbox.cjs',
+  'release-cargo-upload.cjs', 'release-crate-output.cjs', 'release-frontend-policy.cjs',
+  'frontend-package.cjs', 'lotus-next-artifact.cjs', 'sidecar-release.cjs',
+  'sidecar-build.cjs', 'sidecar-browser-host.py', 'native-originals.cjs', 'native-originals-zip.py',
+])
+
+function frozenSourceReads() {
+  const read = (args, maximum = 24 * 1024 * 1024) => command(['gh', 'api', '--hostname', 'github.com', ...args],
+    { maxBuffer: maximum, timeout: 30000 })
+  return {
+    json: async route => {
+      assert.ok(typeof route === 'string' && /^[A-Za-z0-9_./?=&%+-]+$/.test(route) &&
+        !route.startsWith('/') && !route.split('/').includes('..'), 'Invalid read-only source route')
+      return JSON.parse(read(['--method', 'GET', `repos/bigduu/Bamboo-agent/${route}`]))
+    },
+    checkSuite: async id => {
+      assert.match(id, /^[A-Za-z0-9_=-]{1,128}$/)
+      const result = JSON.parse(read(['graphql', '-f', `query=${SUITE_QUERY}`, '-f', `suite=${id}`]))
+      assert.ok(!result.errors, 'Official check-suite query failed')
+      return result.data?.node
+    },
+    jobLog: async id => {
+      assert.ok(Number.isSafeInteger(id) && id > 0)
+      return read(['--method', 'GET', `repos/bigduu/Bamboo-agent/actions/jobs/${id}/logs`], 262144)
+    },
+  }
+}
+
+function frozenDispatchInput() {
+  const env = process.env
+  assert.equal(env.GITHUB_EVENT_NAME, 'workflow_dispatch')
+  assert.ok(!env.GH_HOST || env.GH_HOST === 'github.com', 'Source dispatch requires the fixed GitHub origin')
+  assert.match(env.GITHUB_RUN_ID, /^[1-9][0-9]*$/)
+  assert.match(env.GITHUB_RUN_ATTEMPT, /^[1-9][0-9]*$/)
+  const event = JSON.parse(fs.readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))
+  assert.equal(event.repository?.full_name, 'bigduu/Bamboo-agent')
+  assert.equal(event.repository.id, 1164779771)
+  const input = event.inputs
+  assert.equal(input?.release_source_contract, 'frozen-source-v2', 'Missing explicit source-dispatch contract')
+  assert.ok(input.dry_run === undefined || input.dry_run === false || input.dry_run === 'false')
+  assert.ok(!input.version, 'Frozen-source versions come only from the existing allocator')
+  assert.ok(!input.frontend_package || input.frontend_package === '@bigduu/lotus-next')
+  assert.ok(!input.lotus_version || input.lotus_version === 'from_lock')
+  for (const key of ['feature_pr', 'accepted_ci_run']) assert.match(input[key], /^[1-9][0-9]*$/)
+  const featurePr = Number(input.feature_pr), ciRun = Number(input.accepted_ci_run)
+  assert.ok(Number.isSafeInteger(featurePr) && Number.isSafeInteger(ciRun))
+  return { sourceRevision: input.expected_source_sha, releaseRef: input.release_ref, featurePr, ciRun }
+}
+
+// Public read-only entrypoint. No injected policy, JSON proof, signer or write
+// adapter is accepted. Tests may mock transport/module boundaries, not install a
+// fixture producer into this production call.
+async function readFrozenSourceContext() {
+  assert.equal(arguments.length, 0, 'Source context accepts only the actual dispatch event')
+  const input = frozenDispatchInput(), reads = frozenSourceReads()
+  const facts = await require('./frozen-source-admission.cjs').resolveFrozenSource(input, reads,
+    { mainHistoryAnchor: MAIN_HISTORY_ANCHOR })
+  const run = await reads.json(`actions/runs/${process.env.GITHUB_RUN_ID}`)
+  assert.equal(run.id, Number(process.env.GITHUB_RUN_ID))
+  assert.equal(run.run_attempt, Number(process.env.GITHUB_RUN_ATTEMPT))
+  for (const repo of [run.repository, run.head_repository]) {
+    assert.equal(repo?.id, 1164779771); assert.equal(repo.full_name, 'bigduu/Bamboo-agent')
+  }
+  assert.equal(run.name, 'Publish Crate'); assert.equal(run.path, '.github/workflows/publish-crate.yml')
+  assert.equal(run.event, 'workflow_dispatch'); assert.equal(run.head_branch, 'main')
+  assert.equal(run.head_sha, process.env.GITHUB_WORKFLOW_SHA)
+  assert.equal(run.status, 'in_progress'); assert.equal(run.conclusion, null)
+  sourceDispatchContract(facts, process.env.GITHUB_RUN_ID)
+  return facts
+}
+
+function assertFrozenController(facts) {
+  const root = fs.realpathSync(path.resolve(__dirname, '..')), product = fs.realpathSync(process.cwd())
+  assert.notEqual(root, product, 'Trusted C helpers must be installed outside the product checkout S')
+  assert.equal(command(['git', 'rev-parse', 'HEAD'], { cwd: root }).trim(), facts.controller.revision)
+  assert.equal(command(['git', 'rev-parse', 'HEAD']).trim(), facts.source.revision)
+  assert.equal(command(['git', 'rev-parse', 'HEAD^{tree}']).trim(), facts.source.tree)
+  for (const name of FROZEN_CONTROLLER_FILES) {
+    const file = path.join(root, 'scripts', name), stat = fs.lstatSync(file)
+    assert.ok(stat.isFile() && !stat.isSymbolicLink() && fs.realpathSync(file).startsWith(root + path.sep),
+      'Controller helper must be a regular file inside C')
+    const entry = command(['git', 'ls-tree', facts.controller.revision, '--', `scripts/${name}`], { cwd: root }).trim()
+    assert.match(entry, new RegExp(`^100(?:644|755) blob [0-9a-f]{40}\\tscripts/${name.replaceAll('.', '\\.')}$`))
+    const original = command(['git', 'show', `${facts.controller.revision}:scripts/${name}`], { cwd: root, encoding: null })
+    assert.equal(sha256(fs.readFileSync(file)), sha256(original), 'Controller helper bytes differ from actual C')
+  }
+  // Read S only as verified data. Do not parse a candidate-controlled symlink or
+  // differing JSON before checking its immutable source identity. Cargo.lock is
+  // separately refreshed by the existing temporary stamping/lock contract.
+  for (const name of ['frontendLock', 'frontendManifest', 'frontendZip', 'nativeContract']) {
+    const input = facts.inputs[name], file = path.join(product, input.path), stat = fs.lstatSync(file)
+    assert.ok(stat.isFile() && !stat.isSymbolicLink() && fs.realpathSync(file).startsWith(product + path.sep),
+      'Frozen source input must be a regular file inside S')
+    assert.equal(sha256(fs.readFileSync(file)), input.sha256, 'Frozen source input bytes changed')
+  }
+}
+
+// The only new privileged factory calls the real read-only verifier itself.
+// It extends the existing allocator/HMAC writer; old factories/guards stay on
+// their historical workflow_run or recovery contracts.
+async function makeFrozenSourceContext() {
+  assert.equal(arguments.length, 0, 'No caller-supplied source authorization')
+  const facts = await readFrozenSourceContext(), env = process.env
+  assertFrozenController(facts)
+  const sourceDispatch = sourceDispatchContract(facts, env.GITHUB_RUN_ID)
+  let context, bound, justReserved
+  const guard = async () => {
+    const current = await readFrozenSourceContext()
+    assertSourceDispatchCompatibility(sourceDispatch, sourceDispatchContract(current, env.GITHUB_RUN_ID))
+    assertFrozenController(facts)
+    if (!bound) return
+    const release = github('bigduu/Bamboo-agent', `releases/${bound.id}`)
+    assert.equal(release.id, bound.id); assert.equal(release.tag_name, `v${bound.version}`)
+    assert.equal(release.target_commitish, facts.source.revision)
+    const receipt = readAuthenticatedReceipt(release, env.BAMBOO_RELEASE_SIGNING_KEY, { required: true })
+    validateReceipt(receipt, context.identity, context.crates, bound.version)
+    assertSourceDispatchCompatibility(receipt.sourceDispatch, sourceDispatch)
+    assert.deepEqual(receipt.nativeOriginals, context.nativeOriginals)
+    assert.deepEqual(receipt.frontendBytes, context.frontendBytes)
+    assert.deepEqual(receipt.frontendBytes, bound.frontendBytes)
+    assert.ok(release.draft || receipt.completed, 'Reserved release became public without completion')
+    const tag = github('bigduu/Bamboo-agent', `git/ref/tags/v${bound.version}`, undefined, undefined, bound.uncreatedTag)
+    if (!tag) assert.ok(bound.uncreatedTag, 'Reserved version tag disappeared')
+    else { assert.equal(tag.object?.type, 'commit'); assert.equal(tag.object.sha, facts.source.revision) }
+    await assertAutomaticVersionOrder(context, release, receipt)
+  }
+  context = makeVerifiedContext(env, 'bigduu/Bamboo-agent', facts.source.revision,
+    { html_url: `https://github.com/bigduu/Bamboo-agent/actions/runs/${facts.feature.runId}` }, true, false, { guard })
+  assert.deepEqual(context.identity.frontend.lock, facts.inputs.frontend, 'Publication frontend lock differs from tested S')
+  assert.equal(context.frontendBytes.manifestSha256, facts.inputs.frontendManifest.sha256)
+  assert.equal(context.frontendBytes.archiveSha256, facts.inputs.frontendZip.sha256)
+  context.sourceDispatch = sourceDispatch
+  context.nativeOriginals = nativeOriginalContract({ workflowRevision: facts.controller.revision, runId: env.GITHUB_RUN_ID })
+  context.assertSourceCurrent = guard
+  context.bindReservation = (release, receipt) => {
+    assert.ok(Number.isSafeInteger(release.id) && release.id > 0)
+    context.verifyReceipt(receipt)
+    validateReceipt(receipt, context.identity, context.crates)
+    assertSourceDispatchCompatibility(receipt.sourceDispatch, sourceDispatch)
+    assert.deepEqual(receipt.nativeOriginals, context.nativeOriginals)
+    assert.deepEqual(receipt.frontendBytes, context.frontendBytes)
+    const next = { id: release.id, version: receipt.version, frontendBytes: { ...receipt.frontendBytes },
+      uncreatedTag: justReserved === release.id }
+    if (bound) assert.deepEqual({ ...next, uncreatedTag: bound.uncreatedTag }, bound, 'Reservation identity changed')
+    bound ||= next
+  }
+  const checkRequest = (release, receipt, version = bound?.version) => {
+    validateReceipt(receipt, context.identity, context.crates, version)
+    assertSourceDispatchCompatibility(receipt.sourceDispatch, sourceDispatch)
+    assert.deepEqual(receipt.nativeOriginals, context.nativeOriginals)
+    assert.deepEqual(receipt.frontendBytes, context.frontendBytes)
+    if (release) {
+      assert.ok(bound, 'Missing bound Source-dispatch reservation')
+      assert.equal(release.id, bound.id); assert.equal(release.tag_name, `v${bound.version}`)
+      assert.equal(release.target_commitish, facts.source.revision)
+      assert.deepEqual(receipt.frontendBytes, bound.frontendBytes)
+    }
+  }
+  const reserve = context.reserve, ensureTag = context.ensureTag, saveReceipt = context.saveReceipt
+  context.reserve = async receipt => {
+    assert.equal(bound, undefined, 'Never allocate another Source-dispatch reservation')
+    checkRequest(undefined, receipt, receipt.version)
+    const release = await reserve(receipt); justReserved = release.id; return release
+  }
+  context.ensureTag = async (release, receipt) => {
+    checkRequest(release, receipt)
+    await guard(); await ensureTag(release, receipt)
+    assert.ok(bound, 'Missing bound reservation'); bound.uncreatedTag = false
+  }
+  context.saveReceipt = async (release, receipt) => {
+    checkRequest(release, receipt)
+    return saveReceipt(release, receipt)
+  }
+  // Wiring the original crate outputs and sole whole-release completion is a
+  // separate reviewed lifecycle step. This factory can never fall back to the
+  // old package/publish/complete implementation merely by enabling a producer.
+  for (const name of ['package', 'cargoPublish', 'complete']) context[name] = async () => {
+    assert.fail('Source dispatch requires the original-output publisher/finalizer adapter')
+  }
+  return context
+}
+
 function makeContext(env = process.env) {
   const repository = env.GITHUB_REPOSITORY
   assert.equal(repository, 'bigduu/Bamboo-agent')
@@ -654,14 +908,15 @@ function makeRecoveryContext(env = process.env) {
   return makeVerifiedContext(env, env.GITHUB_REPOSITORY, source, run, true)
 }
 
-function makeVerifiedContext(env, repository, sourceRevision, run, automatic, requireCurrentMain = false) {
-  assert.ok(env.CARGO_REGISTRY_TOKEN, 'Missing CARGO_REGISTRY_TOKEN')
+function makeVerifiedContext(env, repository, sourceRevision, run, automatic, requireCurrentMain = false, authority) {
+  if (!authority) assert.ok(env.CARGO_REGISTRY_TOKEN, 'Missing CARGO_REGISTRY_TOKEN')
   assertSigningConfiguration(env.BAMBOO_RELEASE_SIGNING_KEY, env.BAMBOO_RELEASE_SIGNING_KEY_SHA256)
-  const frontendDirectory = 'crates/app/bamboo-server/frontend_package'
+  const frontendDirectory = authority ? path.join(process.cwd(), 'crates/app/bamboo-server/frontend_package') :
+    'crates/app/bamboo-server/frontend_package'
   const manifest = JSON.parse(fs.readFileSync(`${frontendDirectory}/frontend-manifest.json`, 'utf8'))
   const identity = { repository, sourceRevision, frontend: frontendIdentity(
     env.FRONTEND_PACKAGE, env.FRONTEND_VERSION, manifest,
-    JSON.parse(fs.readFileSync('scripts/frontend-package-lock.json', 'utf8')),
+    JSON.parse(fs.readFileSync(authority ? path.join(process.cwd(), 'scripts/frontend-package-lock.json') : 'scripts/frontend-package-lock.json', 'utf8')),
   ) }
   const stagedFrontend = [fs.readFileSync(`${frontendDirectory}/frontend-manifest.json`),
     fs.readFileSync(`${frontendDirectory}/lotus-frontend.zip`)]
@@ -671,7 +926,8 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
   }
   assert.ok(['@bigduu/lotus-next', '@bigduu/lotus'].includes(identity.frontend.packageName))
   assertVersion(identity.frontend.packageVersion)
-  const crates = command(['python3', 'scripts/compute-publish-order.py']).trim().split('\n')
+  const crates = command(['python3', authority ? path.join(__dirname, 'compute-publish-order.py') : 'scripts/compute-publish-order.py'],
+    authority ? { cwd: process.cwd() } : {}).trim().split('\n')
   assert.ok(crates.length && crates.includes('bamboo-agent'))
   for (const crate of crates) assert.match(crate, /^[a-zA-Z0-9_-]+$/)
   assert.equal(new Set(crates).size, crates.length)
@@ -691,7 +947,7 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
     fs.writeFileSync(archive, bytes)
     return { bytes, entry: (file) => command(['tar', '-xOf', archive, `${name}-${version}/${file}`], { encoding: null }) }
   }
-  const guard = requireCurrentMain ? () => assertCurrentMain(repository, sourceRevision) : async () => {}
+  const guard = authority?.guard || (requireCurrentMain ? () => assertCurrentMain(repository, sourceRevision) : async () => {})
   const write = (action) => currentMainWrite(guard, action)
   const context = { automatic, identity, frontendBytes, crates, receiptFile,
     assertCurrentMain: guard,
@@ -829,7 +1085,8 @@ async function main() {
 function preparationIdentity(context, version, env = process.env) {
   return { ...context.identity, version, sourceTree: command(['git', 'rev-parse', 'HEAD^{tree}']).trim(),
     workflowRevision: env.GITHUB_WORKFLOW_SHA, runId: env.GITHUB_RUN_ID, runAttempt: Number(env.GITHUB_RUN_ATTEMPT),
-    ciRun: context.ciRun, ...(context.validation ? { validation: context.validation } : {}) }
+    ciRun: context.ciRun, ...(context.validation ? { validation: context.validation } : {}),
+    ...(context.sourceDispatch ? { sourceDispatch: context.sourceDispatch } : {}) }
 }
 
 module.exports = { assertVersion, assertManualVersion, validateSource, validateReceipt, nextVersion, selectVersion,
@@ -837,5 +1094,6 @@ module.exports = { assertVersion, assertManualVersion, validateSource, validateR
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
   verifyRegistrySource, highestStableVersion, spawnCommand, command, createPreparation, validatePreparation, resumePrepared,
-  assertAdmissionCompatibility, nativeOriginalContract }
+  assertAdmissionCompatibility, nativeOriginalContract, sourceDispatchContract, readFrozenSourceContext,
+  makeFrozenSourceContext, assertSourceDispatchCompatibility }
 if (require.main === module) main().catch((error) => { console.error(error); process.exitCode = 1 })

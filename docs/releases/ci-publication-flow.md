@@ -7,7 +7,7 @@ for cuts, original-source repairs, protected admission and credentials.
 
 ## Inactive frozen-source foundation (#2323)
 
-`scripts/frozen-source-admission.cjs` is an unused, read-only library. The live
+`scripts/frozen-source-admission.cjs` is an inactive, read-only library. The live
 phase contracts below remain active. This foundation does not change Actions,
 publishers, signed reservations, release recovery, protection or dispatches.
 Its default accepted-producer registry is empty: deployed compile-only/v6,
@@ -100,6 +100,58 @@ output durability, #2325 original crate archive reuse and #2320 Docker consumers
 Public main-promotion completion proof is another authority and is outside this
 foundation. Preserve genuine v6 and the frozen 2026.10.11 HMAC recovery bytes;
 never reinterpret those signed formats as the new read-only source context.
+
+## Inactive Source-dispatch authority (#2336)
+
+Phase A adds helpers and contract tests; publisher YAML is unchanged. No complete
+production producer is registered, so real new-contract calls stop before an API
+read or reservation. Local mocked-module positives and tiny Git merge fixtures
+prove component contracts, not actual hosted feature acceptance or publication.
+
+`verifyAcceptedDevFacts({sourceRevision, featurePr, ciRun}, reads, policy)` returns
+`bamboo-accepted-dev-facts/v2`, with `publicationAuthorized: false`. It needs no
+dispatch environment and reads no main/frozen ref. All original normal B/F/M/S,
+execution-before-merge, official workflow/check-suite, helper/input closure,
+pagination, protection and fresh-evidence checks remain. `resolveFrozenSource`
+wraps those facts with actual protected-main controller C, required stable-main
+ancestry and frozen `release/<S>` checks before and after the proof.
+
+`readFrozenSourceContext()` reads only the actual dispatch event and fixed-origin
+GitHub REST GETs, the existing read-only check-suite query and original job logs.
+It accepts no proof/policy argument. The event selects `release_source_contract:
+frozen-source-v2`, exact `expected_source_sha`, `release_ref`, `feature_pr` and
+`accepted_ci_run`; the allocator owns the version, and the locked Lotus Next
+input remains exact. The current publisher run must really be an in-progress
+main `workflow_dispatch` at C. Actual GITHUB_SHA and GITHUB_WORKFLOW_SHA stay C.
+
+Only `makeFrozenSourceContext()` calls this real verifier to construct a new
+guarded writer. It checks the literal C helper closure against ordinary Git
+blobs in an independent C checkout, and hashes immutable S frontend/contract data
+before parsing it. C's publish-order helper is the only metadata entrypoint;
+candidate scripts never become privileged helpers. Existing temporary Cargo
+manifest/lock stamping remains a separate checked preparation step.
+
+The existing signed receipt gains one `bamboo-frozen-source-dispatch/v1`
+discriminator in `sourceDispatch`; its nested source context remains read-only
+data. Identity, version allocator, HMAC domain/key and reservation store stay
+unchanged. Historical receipts are neither upgraded nor adopted by this route.
+Branch observations may advance normally, while original source, feature,
+controller and run identities stay fixed. The same guard refreshes source/ref,
+protected dev ancestry, actual controller run and the authenticated Release/tag
+reservation before every existing write or retried registry PUT. A retained tag
+that disappears stops; only a just-created reservation in the current process
+may create its initial direct S tag. An interrupted untagged reservation stops
+conservatively rather than allocating a replacement.
+
+Phase B must hand off publisher ownership and consume this same factory/guard
+from the reviewed Native and Crate adapters. It must load C before S, retain the
+original-output contracts and use a fresh authenticated receipt for the sole
+whole-release completion. This Phase A factory refuses the legacy
+package/publish/complete operations. It cannot silently rebuild/repackage by
+falling back to them. Do not activate the empty producer registry, add another
+allocator/store/signer, import Main promotion authority, or dispatch production
+while those dependencies remain pending. Genuine v6 and frozen recovery bytes
+and the active legacy route remain unchanged.
 
 ## Phase contracts
 

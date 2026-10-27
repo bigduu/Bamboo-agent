@@ -68,22 +68,7 @@ function runIdentity(run) {
 // The adapter is supplied by trusted controller code: fixed-origin REST GETs,
 // the existing read-only check-suite GraphQL query, and original job-log GETs.
 // There is deliberately no CLI, downloaded-code execution, token, signer or write adapter.
-async function resolveFrozenSource(input, reads, policy = {}) {
-  exactKeys(input, ["sourceRevision", "releaseRef", "featurePr", "ciRun"]);
-  const S = revision(input.sourceRevision);
-  assert.equal(input.releaseRef, `release/${S}`, "Frozen ref must name its exact cut");
-  assert.ok(positive(input.featurePr) && positive(input.ciRun), "Exact PR/run locators required");
-  const producers = policy.producers ?? ACCEPTED_PRODUCERS;
-  assert.ok(Object.keys(producers).length, "No accepted complete v2 feature producer; source foundation is inactive");
-  const env = policy.environment ?? process.env;
-  const C = revision(env.GITHUB_WORKFLOW_SHA);
-  assert.equal(env.GITHUB_SHA, C, "Actual controller SHA must remain separate from product source");
-  assert.equal(env.GITHUB_EVENT_NAME, "workflow_dispatch");
-  assert.equal(env.GITHUB_REPOSITORY, REPOSITORY);
-  assert.equal(env.GITHUB_REF, "refs/heads/main");
-  assert.equal(env.GITHUB_REF_PROTECTED, "true");
-  assert.equal(env.GITHUB_WORKFLOW_REF, `${REPOSITORY}/${CONTROLLER}@refs/heads/main`);
-  const mainHistoryAnchor = revision(policy.mainHistoryAnchor);
+function sourceReads(reads, policy) {
   const get = async route => checkedJSON(await reads.json(route));
   const paged = async (route, key) => {
     const values = [], seen = new Set(); let total;
@@ -127,10 +112,37 @@ async function resolveFrozenSource(input, reads, policy = {}) {
     }
     return revision(value.commit?.sha);
   };
-  const mainBefore = await branch("main", true);
-  await ancestor(C, mainBefore);
-  await ancestor(mainHistoryAnchor, S);
-  assert.equal(await branch(input.releaseRef), S, "Frozen branch moved");
+  const contentCache = new Map();
+  const blob = async (path, ref) => {
+    assert.ok(/^[A-Za-z0-9_./-]+$/.test(path) && !path.split("/").includes(".."));
+    const item = await get(`contents/${path}?ref=${revision(ref)}`);
+    assert.equal(item.path, path); revision(item.sha);
+    assert.ok(Number.isSafeInteger(item.size) && item.size >= 0 && item.size <= 16 * 1024 * 1024, "Source blob too large");
+    if (!contentCache.has(item.sha)) {
+      const body = item.encoding === "base64" ? item : await get(`git/blobs/${item.sha}`);
+      assert.equal(body.sha, item.sha); assert.equal(body.encoding, "base64");
+      assert.ok(typeof body.content === "string" && /^[A-Za-z0-9+/=\r\n]*$/.test(body.content));
+      const encoded = body.content.replace(/[\r\n]/g, ""), bytes = Buffer.from(encoded, "base64");
+      assert.equal(bytes.toString("base64"), encoded, "Malformed source base64"); assert.equal(bytes.length, item.size);
+      const oid = createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+      assert.equal(oid, item.sha, "Source bytes do not match Git blob identity"); contentCache.set(oid, bytes);
+    }
+    const bytes = contentCache.get(item.sha);
+    assert.equal(bytes.length, item.size);
+    return { path, blob: item.sha, sha256: hash(bytes), bytes };
+  };
+  return { get, paged, ancestor, branch, blob };
+}
+
+// Accepted-dev facts deliberately have no controller, dispatch or frozen-ref
+// prerequisite. This data can be inspected before a cut; it grants no writes.
+async function verifyAcceptedDevFacts(input, reads, policy = {}) {
+  exactKeys(input, ["sourceRevision", "featurePr", "ciRun"]);
+  const S = revision(input.sourceRevision);
+  assert.ok(positive(input.featurePr) && positive(input.ciRun), "Exact PR/run locators required");
+  const producers = policy.producers ?? ACCEPTED_PRODUCERS;
+  assert.ok(Object.keys(producers).length, "No accepted complete v2 feature producer; source foundation is inactive");
+  const { get, paged, ancestor, branch, blob } = sourceReads(reads, policy);
   const devBefore = await branch("dev", true);
   await ancestor(S, devBefore);
   const pr = await get(`pulls/${input.featurePr}`);
@@ -176,25 +188,6 @@ async function resolveFrozenSource(input, reads, policy = {}) {
   assert.ok(typeof fileURL === "string" && fileURL.startsWith(prefix));
   const Q = revision(fileURL.slice(prefix.length).split("/")[0]);
   assert.equal(fileURL, `${prefix}${Q}/${WORKFLOW}`, "Foreign workflow definition");
-  const contentCache = new Map();
-  const blob = async (path, ref) => {
-    assert.ok(/^[A-Za-z0-9_./-]+$/.test(path) && !path.split("/").includes(".."));
-    const item = await get(`contents/${path}?ref=${revision(ref)}`);
-    assert.equal(item.path, path); revision(item.sha);
-    assert.ok(Number.isSafeInteger(item.size) && item.size >= 0 && item.size <= 16 * 1024 * 1024, "Source blob too large");
-    if (!contentCache.has(item.sha)) {
-      const body = item.encoding === "base64" ? item : await get(`git/blobs/${item.sha}`);
-      assert.equal(body.sha, item.sha); assert.equal(body.encoding, "base64");
-      assert.ok(typeof body.content === "string" && /^[A-Za-z0-9+/=\r\n]*$/.test(body.content));
-      const encoded = body.content.replace(/[\r\n]/g, ""), bytes = Buffer.from(encoded, "base64");
-      assert.equal(bytes.toString("base64"), encoded, "Malformed source base64"); assert.equal(bytes.length, item.size);
-      const oid = createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
-      assert.equal(oid, item.sha, "Source bytes do not match Git blob identity"); contentCache.set(oid, bytes);
-    }
-    const bytes = contentCache.get(item.sha);
-    assert.equal(bytes.length, item.size);
-    return { path, blob: item.sha, sha256: hash(bytes), bytes };
-  };
   const definition = await blob(WORKFLOW, Q), contract = producers[definition.sha256];
   assert.ok(contract?.complete === true, "Unknown or incomplete feature producer");
   assert.equal(contract.workflowId, run.workflow_id);
@@ -321,21 +314,48 @@ async function resolveFrozenSource(input, reads, policy = {}) {
   assert.equal(freshPr.head?.ref, pr.head.ref); assert.equal(freshPr.merged_at, pr.merged_at);
   assert.equal(freshPr.head?.sha, F); assert.equal(freshPr.base?.ref, "dev"); repo(freshPr.head.repo); repo(freshPr.base.repo);
   const devAfter = await branch("dev", true); await ancestor(devBefore, devAfter);
-  const mainAfter = await branch("main", true); await ancestor(mainBefore, mainAfter);
-  assert.equal(await branch(input.releaseRef), S, "Frozen branch changed during proof");
   return {
-    schemaVersion: 2, kind: "bamboo-frozen-source-context/v2", publicationAuthorized: false,
-    source: { releaseRef: input.releaseRef, revision: S, tree, acceptedMerge: D, mainHistoryAnchor, devObservedBefore: devBefore, devObservedAfter: devAfter },
+    schemaVersion: 2, kind: "bamboo-accepted-dev-facts/v2", publicationAuthorized: false,
+    source: { revision: S, tree, acceptedMerge: D, devObservedBefore: devBefore, devObservedAfter: devAfter },
     feature: { pr: pr.number, baseRevision: B, headRevision: F, snapshotRevision: M, mergedAt: pr.merged_at,
       runId: run.id, logicalAttempt: run.run_attempt, workflowId: run.workflow_id, checkSuiteId: run.check_suite_id,
       workflowDefinitionRevision: Q, producerDigest: definition.sha256,
       physicalJobs: originals.map(({ logical, physical }) => ({ name: physical.name, jobId: physical.id,
         logicalJobId: logical.id, logicalAttempt: logical.run_attempt, physicalAttempt: physical.run_attempt,
         startedAt: physical.started_at, completedAt: physical.completed_at, stepsFingerprint: hash(executionKey(physical)) })) },
-    controller: { revision: C, workflowPath: CONTROLLER, event: env.GITHUB_EVENT_NAME, ref: env.GITHUB_REF, mainObservedBefore: mainBefore, mainObservedAfter: mainAfter },
     inputs,
   };
 }
 
+async function resolveFrozenSource(input, reads, policy = {}) {
+  exactKeys(input, ["sourceRevision", "releaseRef", "featurePr", "ciRun"]);
+  const S = revision(input.sourceRevision);
+  assert.equal(input.releaseRef, `release/${S}`, "Frozen ref must name its exact cut");
+  assert.ok(positive(input.featurePr) && positive(input.ciRun), "Exact PR/run locators required");
+  const producers = policy.producers ?? ACCEPTED_PRODUCERS;
+  assert.ok(Object.keys(producers).length, "No accepted complete v2 feature producer; source foundation is inactive");
+  const env = policy.environment ?? process.env;
+  const C = revision(env.GITHUB_WORKFLOW_SHA);
+  assert.equal(env.GITHUB_SHA, C, "Actual controller SHA must remain separate from product source");
+  assert.equal(env.GITHUB_EVENT_NAME, "workflow_dispatch");
+  assert.equal(env.GITHUB_REPOSITORY, REPOSITORY);
+  assert.equal(env.GITHUB_REF, "refs/heads/main");
+  assert.equal(env.GITHUB_REF_PROTECTED, "true");
+  assert.equal(env.GITHUB_WORKFLOW_REF, `${REPOSITORY}/${CONTROLLER}@refs/heads/main`);
+  const mainHistoryAnchor = revision(policy.mainHistoryAnchor);
+  const { ancestor, branch } = sourceReads(reads, policy);
+  const mainBefore = await branch("main", true);
+  await ancestor(C, mainBefore);
+  await ancestor(mainHistoryAnchor, S);
+  assert.equal(await branch(input.releaseRef), S, "Frozen branch moved");
+  const facts = await verifyAcceptedDevFacts({ sourceRevision: S, featurePr: input.featurePr, ciRun: input.ciRun }, reads, policy);
+  const mainAfter = await branch("main", true); await ancestor(mainBefore, mainAfter);
+  assert.equal(await branch(input.releaseRef), S, "Frozen branch changed during proof");
+  return { ...facts, kind: "bamboo-frozen-source-context/v2",
+    source: { ...facts.source, releaseRef: input.releaseRef, mainHistoryAnchor },
+    controller: { revision: C, workflowPath: CONTROLLER, event: env.GITHUB_EVENT_NAME, ref: env.GITHUB_REF,
+      mainObservedBefore: mainBefore, mainObservedAfter: mainAfter } };
+}
+
 module.exports = { REPOSITORY, WORKFLOW, CONTROLLER, INPUT_PATHS, COVERAGE, REQUIRED_HELPERS,
-  ACCEPTED_PRODUCERS, resolveFrozenSource };
+  ACCEPTED_PRODUCERS, verifyAcceptedDevFacts, resolveFrozenSource };

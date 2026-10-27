@@ -1,18 +1,18 @@
 const assert = require("node:assert/strict")
 const { createHash } = require("node:crypto")
-const { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } = require("node:fs")
+const { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } = require("node:fs")
 const { spawnSync } = require("node:child_process")
 const os = require("node:os")
 const path = require("node:path")
 const { test } = require("node:test")
-const { runInNewContext } = require("node:vm")
+const { runInNewContext, runInThisContext } = require("node:vm")
 
 const workflow = readFileSync(".github/workflows/ci.yml", "utf8")
 const frozenSource = require("./frozen-source-admission.cjs")
 const frozenFixture = JSON.parse(readFileSync("scripts/tests/frozen-source-admission-fixtures.json", "utf8"))
 const sourceHash = bytes => createHash("sha256").update(bytes).digest("hex")
-function frozenSourceFixture() {
-  const { B, F, M, S, C, anchor, devAdvance } = frozenFixture.identities
+function frozenSourceFixture(identities = frozenFixture.identities) {
+  const { B, F, M, S, C, anchor, devAdvance } = identities
   const repository = { id: 1164779771, full_name: "bigduu/Bamboo-agent" }, times = frozenFixture.times
   const model = {
     input: { sourceRevision: S, releaseRef: `release/${S}`, featurePr: 2333, ciRun: 123 },
@@ -65,7 +65,7 @@ function frozenSourceFixture() {
     return { path, sha, size: bytes.length, encoding: "base64", content: bytes.toString("base64") }
   }
   model.reads = {
-    async json(route) {
+    json(route) {
       model.calls.push(route); const nth = model.calls.filter(item => item === route).length
       let result
       if (route === "branches/main") result = model.main
@@ -108,12 +108,12 @@ function frozenSourceFixture() {
       }
       return result
     },
-    async checkSuite(id) {
+    checkSuite(id) {
       assert.equal(id, "CS_fixture"); model.suiteReads = (model.suiteReads ?? 0) + 1
       const result = clone(model.suite); if (model.raceSuite && model.suiteReads > 1) result.commit.oid = "a".repeat(40)
       return result
     },
-    async jobLog(id) { assert.equal(id, 100); return model.sourceLog },
+    jobLog(id) { assert.equal(id, 100); return model.sourceLog },
   }
   model.resolve = () => frozenSource.resolveFrozenSource(model.input, model.reads, model.policy)
   return model
@@ -167,6 +167,306 @@ function mutateSourceFixture(model, item) {
       while (rows.length <= 100) rows.push({ ...structuredClone(rows[0]), id: 2000 + rows.length, name: "Unselected historical branch " + rows.length })
     }
   }
+}
+test("accepted dev facts need neither dispatch context nor a frozen ref", async () => {
+  const model = frozenSourceFixture(), { releaseRef, ...input } = model.input
+  model.advanceDev = true
+  const reads = { ...model.reads, json: async route => {
+    assert.ok(!route.startsWith("branches/main") && !route.startsWith("branches/release"),
+      "Accepted-dev facts must not read a controller or frozen branch")
+    return model.reads.json(route)
+  } }
+  const proof = await frozenSource.verifyAcceptedDevFacts(input, reads, { producers: model.policy.producers })
+  assert.equal(proof.kind, "bamboo-accepted-dev-facts/v2")
+  assert.equal(proof.publicationAuthorized, false)
+  assert.equal(proof.source.revision, frozenFixture.identities.S)
+  assert.equal(proof.feature.snapshotRevision, frozenFixture.identities.M)
+  assert.equal(proof.feature.physicalJobs.length, frozenFixture.jobs.length)
+  assert.equal(proof.controller, undefined); assert.equal(proof.source.releaseRef, undefined)
+  assert.equal(proof.source.mainHistoryAnchor, undefined)
+  assert.equal(proof.source.devObservedAfter, frozenFixture.identities.devAdvance)
+})
+test("accepted dev facts keep the default producer registry inactive", async () => {
+  const model = frozenSourceFixture(), { releaseRef, ...input } = model.input
+  await assert.rejects(frozenSource.verifyAcceptedDevFacts(input, model.reads), /inactive/)
+  assert.deepEqual(model.calls, [])
+})
+test("accepted dev facts reject caller proof fields and retain temporal and dev-protection checks", async () => {
+  for (const scenario of ["proof", "late", "unprotected", "changedMerge", "foreignAssociation"]) {
+    const model = frozenSourceFixture(), { releaseRef, ...input } = model.input
+    if (scenario === "proof") input.publicationAuthorized = true
+    if (scenario === "late") for (const row of [model.latest[0], model.physical[0], model.attempts[1][0]]) {
+      row.completed_at = "2026-10-27T01:04:00Z"; row.steps[0].completed_at = row.completed_at
+    }
+    if (scenario === "unprotected") model.dev.protected = false
+    if (scenario === "changedMerge") model.raceMergedAt = true
+    if (scenario === "foreignAssociation") model.run.pull_requests = [{ number: 1 }]
+    await assert.rejects(frozenSource.verifyAcceptedDevFacts(input, model.reads, { producers: model.policy.producers }), scenario)
+  }
+})
+test('accepted dev facts bind actual tiny Git merge objects and reject a same-tree substitute', async t => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'bamboo-accepted-dev-git-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const env = { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0',
+    GIT_AUTHOR_NAME: 'Source fixture', GIT_AUTHOR_EMAIL: 'source@example.invalid', GIT_COMMITTER_NAME: 'Source fixture',
+    GIT_COMMITTER_EMAIL: 'source@example.invalid', GIT_AUTHOR_DATE: '2026-10-27T01:00:00Z', GIT_COMMITTER_DATE: '2026-10-27T01:00:00Z' }
+  const git = (args, input) => {
+    const result = spawnSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false', ...args],
+      { cwd: root, env, input, encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stderr); return result.stdout.trim()
+  }
+  git(['init', '--quiet'])
+  const initial = frozenSourceFixture()
+  for (const [file, bytes] of Object.entries(initial.files[frozenFixture.identities.S])) {
+    const destination = path.join(root, file); mkdirSync(path.dirname(destination), { recursive: true }); writeFileSync(destination, bytes)
+  }
+  git(['add', '.']); const tree = git(['write-tree'])
+  const commit = (parents, label) => git(['commit-tree', tree, ...parents.flatMap(parent => ['-p', parent])], label + '\n')
+  const anchor = commit([], 'anchor'), B = commit([anchor], 'base'), F = commit([B], 'feature')
+  const M = commit([B, F], 'actual tested merge'), S = commit([B, F], 'confirmed accepted merge'), C = commit([anchor], 'controller')
+  const model = frozenSourceFixture({ anchor, B, F, M, S, C, devAdvance: S })
+  const reads = { ...model.reads, json: route => {
+    if (route.startsWith('git/commits/')) {
+      const sha = route.slice('git/commits/'.length), text = git(['cat-file', '-p', sha])
+      return { sha, tree: { sha: text.match(/^tree ([0-9a-f]{40})$/m)[1] },
+        parents: [...text.matchAll(/^parent ([0-9a-f]{40})$/gm)].map(match => ({ sha: match[1] })) }
+    }
+    if (route.startsWith('compare/')) {
+      const [base, head] = route.slice(8).split('...'), merge = git(['merge-base', base, head])
+      return { status: base === head ? 'identical' : merge === base ? 'ahead' : 'diverged', base_commit: { sha: base }, merge_base_commit: { sha: merge } }
+    }
+    return model.reads.json(route)
+  } }
+  const { releaseRef, ...input } = model.input
+  const proof = await frozenSource.verifyAcceptedDevFacts(input, reads, { producers: model.policy.producers })
+  assert.equal(proof.source.tree, tree); assert.notEqual(S, M)
+  assert.equal(proof.inputs.cargoLock.blob, git(['rev-parse', `${S}:Cargo.lock`]))
+  assert.equal(proof.publicationAuthorized, false)
+  model.sourceLog = `${frozenFixture.times.started} Event source: ${C}; full validation: false\n`
+  await assert.rejects(frozenSource.verifyAcceptedDevFacts(input, reads, { producers: model.policy.producers }))
+  assert.ok(model.calls.every(route => !route.startsWith('branches/main') && !route.startsWith('branches/release')))
+  t.diagnostic(JSON.stringify({ localContractOnly: true, anchor, B, F, M, S, C, tree }))
+})
+
+// LOCAL CONTRACT ONLY: the VM replaces the existing resolver module's policy
+// boundary with the inert producer fixture. Production has no such parameter;
+// its empty registry is separately tested below. Every subprocess is intercepted
+// here: no Cargo, Python, GitHub request or source script is executed.
+function sourceControllerFixture(t, { mockAcceptedProducer = true } = {}) {
+  const model = frozenSourceFixture(), root = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'bamboo-source-controller-')))
+  const controller = path.join(root, 'C'), product = path.join(root, 'S'), state = { writes: [], commands: [] }
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  mkdirSync(path.join(controller, 'scripts'), { recursive: true })
+  mkdirSync(path.join(product, 'scripts'), { recursive: true })
+  const original = new Map(), scripts = readdirSync('scripts').filter(name => /\.(cjs|py)$/.test(name))
+  for (const name of scripts) {
+    const bytes = readFileSync(path.join('scripts', name)); original.set(`scripts/${name}`, bytes)
+    writeFileSync(path.join(controller, 'scripts', name), bytes)
+  }
+  for (const [file, bytes] of Object.entries(model.files[frozenFixture.identities.S])) {
+    const destination = path.join(product, file); mkdirSync(path.dirname(destination), { recursive: true }); writeFileSync(destination, bytes)
+  }
+  // A candidate copy is deliberately unusable. The factory must only invoke C.
+  writeFileSync(path.join(product, 'scripts', 'compute-publish-order.py'), 'raise RuntimeError("candidate helper must never execute")\n')
+  const key = 'a'.repeat(64), eventFile = path.join(root, 'event.json')
+  const event = { repository: { id: 1164779771, full_name: 'bigduu/Bamboo-agent' }, inputs: {
+    release_source_contract: 'frozen-source-v2', expected_source_sha: model.input.sourceRevision,
+    release_ref: model.input.releaseRef, feature_pr: String(model.input.featurePr), accepted_ci_run: String(model.input.ciRun) } }
+  writeFileSync(eventFile, JSON.stringify(event))
+  const env = { ...model.policy.environment, GITHUB_RUN_ID: '999', GITHUB_RUN_ATTEMPT: '1', GITHUB_EVENT_PATH: eventFile,
+    RUNNER_TEMP: path.join(root, 'tmp'), BAMBOO_RELEASE_SIGNING_KEY: key,
+    BAMBOO_RELEASE_SIGNING_KEY_SHA256: sourceHash(Buffer.from(key, 'hex')),
+    FRONTEND_PACKAGE: '@bigduu/lotus-next', FRONTEND_VERSION: '2026.10.27' }
+  state.publisher = { id: 999, run_attempt: 1, name: 'Publish Crate', path: '.github/workflows/publish-crate.yml',
+    event: 'workflow_dispatch', head_branch: 'main', head_sha: env.GITHUB_WORKFLOW_SHA, status: 'in_progress', conclusion: null,
+    repository: event.repository, head_repository: event.repository }
+  const result = stdout => ({ status: 0, stdout, stderr: '' })
+  const cli = (program, args, options) => {
+    state.commands.push([program, ...args])
+    if (program === 'git') {
+      if (args[0] === 'rev-parse') return result(args[1] === 'HEAD^{tree}' ? model.accepted.tree.sha :
+        options.cwd === controller ? env.GITHUB_WORKFLOW_SHA : model.input.sourceRevision)
+      if (args[0] === 'ls-tree') {
+        const name = args[3], bytes = original.get(name); assert.ok(bytes)
+        const oid = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')
+        return result(`100644 blob ${oid}\t${name}\n`)
+      }
+      if (args[0] === 'show') return result(original.get(args[1].split(':')[1]))
+      assert.fail('Unexpected Git command in local controller contract')
+    }
+    if (program === 'python3') {
+      assert.deepEqual(args, [path.join(controller, 'scripts', 'compute-publish-order.py')])
+      return result('bamboo-agent\n')
+    }
+    assert.equal(program, 'gh', 'No actual compiler/source subprocess is permitted')
+    assert.equal(args[0], 'api')
+    if (args.includes('graphql')) {
+      assert.ok(args.includes('--hostname') && args.includes('github.com'))
+      assert.ok(args.includes('suite=CS_fixture'))
+      const query = args.find(value => value.startsWith('query=')); assert.ok(query.startsWith('query=query($suite:ID!)'))
+      assert.ok(!query.includes('mutation'))
+      return result(JSON.stringify({ data: { node: model.reads.checkSuite('CS_fixture') } }))
+    }
+    const route = args.find(value => value.startsWith('repos/bigduu/Bamboo-agent/'))?.slice('repos/bigduu/Bamboo-agent/'.length)
+    assert.ok(route, 'Fixed repository only')
+    const method = args.includes('--method') ? args[args.indexOf('--method') + 1] : 'GET'
+    if (method !== 'GET') {
+      state.writes.push({ method, route })
+      const payload = JSON.parse(options.input)
+      if (method === 'POST' && route === 'releases') {
+        state.release = { ...payload, id: 42, prerelease: false, assets: [] }; return result(JSON.stringify(state.release))
+      }
+      if (method === 'POST' && route === 'git/refs') {
+        state.tag = { object: { type: 'commit', sha: payload.sha } }; return result(JSON.stringify(state.tag))
+      }
+      assert.equal(method, 'PATCH'); assert.equal(route, 'releases/42')
+      Object.assign(state.release, payload); return result(JSON.stringify(state.release))
+    }
+    let value
+    if (route === 'actions/runs/999') value = state.publisher
+    else if (route === 'releases/42') value = state.release
+    else if (route === 'releases?per_page=100') value = state.release ? [state.release] : []
+    else if (route.startsWith('git/ref/tags/v')) {
+      if (!state.tag) return { status: 1, stdout: JSON.stringify({ status: '404' }), stderr: '' }
+      value = state.tag
+    } else if (route.endsWith('/logs')) value = model.reads.jobLog(Number(route.split('/')[2]))
+    else value = model.reads.json(route)
+    return result(typeof value === 'string' ? value : JSON.stringify(args.includes('--slurp') ? [value] : value))
+  }
+  const module = { exports: {} }, baseRequire = require
+  const localRequire = name => {
+    if (name === 'node:child_process') return { spawnSync: cli }
+    if (name === './frozen-source-admission.cjs' && mockAcceptedProducer) return { resolveFrozenSource: (input, reads, policy) => {
+      assert.deepEqual(Object.keys(policy), ['mainHistoryAnchor'])
+      assert.equal(policy.mainHistoryAnchor, 'd6325a732c7669f94962f604e4ce98966e374d73')
+      return frozenSource.resolveFrozenSource(input, reads, { ...policy, producers: model.policy.producers, environment: env })
+    } }
+    if (name === './frozen-source-admission.cjs') return frozenSource
+    return baseRequire(name)
+  }
+  const code = readFileSync('scripts/crate-release.cjs', 'utf8').replace(/^#![^\n]*\n/, '')
+  const load = runInThisContext('(function(require,module,__dirname,process,fetch){\n' + code + '\n})',
+    { filename: 'local-source-controller-contract.cjs' })
+  const registryRead = async url => {
+    assert.match(url, /^https:\/\/crates.io\/api\/v1\/crates\/bamboo-agent$/)
+    return { status: 404, ok: false }
+  }
+  load(localRequire, module, path.join(controller, 'scripts'), { env, cwd: () => product }, registryRead)
+  return { model, env, event, state, core: module.exports, key, controller, product,
+    updateEvent: () => writeFileSync(eventFile, JSON.stringify(event)) }
+}
+test('source dispatch real factory rejects JSON proof, injected policy and every inactive production producer', async t => {
+  const fixture = sourceControllerFixture(t, { mockAcceptedProducer: false })
+  fixture.env.SOURCE_VALIDATION = JSON.stringify({ publicationAuthorized: true, schemaVersion: 2, producers: fixture.model.policy.producers })
+  await assert.rejects(fixture.core.makeFrozenSourceContext(), /inactive/)
+  await assert.rejects(fixture.core.readFrozenSourceContext(), /inactive/)
+  await assert.rejects(fixture.core.makeFrozenSourceContext({ publicationAuthorized: true }), /caller.supplied/)
+  await assert.rejects(fixture.core.readFrozenSourceContext({ producers: fixture.model.policy.producers }), /actual dispatch/)
+  assert.deepEqual(fixture.state.commands, []); assert.deepEqual(fixture.state.writes, [])
+})
+test('source dispatch local mocked-module factory verifies real resolver transport and C helpers without Cargo', async t => {
+  const fixture = sourceControllerFixture(t), { core, env, state, model } = fixture
+  const key = env.BAMBOO_RELEASE_SIGNING_KEY; delete env.BAMBOO_RELEASE_SIGNING_KEY
+  const facts = await core.readFrozenSourceContext(); assert.equal(facts.publicationAuthorized, false)
+  await assert.rejects(core.makeFrozenSourceContext(), /BAMBOO_RELEASE_SIGNING_KEY/)
+  assert.equal(facts.source.revision, model.input.sourceRevision); env.BAMBOO_RELEASE_SIGNING_KEY = key
+  const context = await core.makeFrozenSourceContext()
+  assert.equal(context.identity.sourceRevision, model.input.sourceRevision)
+  assert.equal(context.sourceDispatch.context.controller.revision, env.GITHUB_WORKFLOW_SHA)
+  assert.notEqual(context.identity.sourceRevision, env.GITHUB_SHA)
+  assert.equal(context.sourceDispatch.context.publicationAuthorized, false)
+  assert.deepEqual(state.writes, []); assert.ok(state.commands.some(command => command[0] === 'python3'))
+  for (const name of ['package', 'cargoPublish', 'complete']) await assert.rejects(context[name](), /original.output/)
+})
+test('source dispatch local factory rejects altered C helpers before metadata or writes', async t => {
+  const fixture = sourceControllerFixture(t)
+  writeFileSync(path.join(fixture.controller, 'scripts', 'crate-release.cjs'), '// altered controller bytes\n')
+  await assert.rejects(fixture.core.makeFrozenSourceContext(), /helper bytes/)
+  assert.ok(!fixture.state.commands.some(command => command[0] === 'python3'))
+  assert.deepEqual(fixture.state.writes, [])
+})
+test('source dispatch local factory rejects a C helper directory redirected into S', async t => {
+  const fixture = sourceControllerFixture(t), shadow = path.join(fixture.product, 'candidate-controller')
+  renameSync(path.join(fixture.controller, 'scripts'), shadow)
+  symlinkSync(shadow, path.join(fixture.controller, 'scripts'))
+  await assert.rejects(fixture.core.makeFrozenSourceContext(), /regular file inside C/)
+  assert.ok(!fixture.state.commands.some(command => command[0] === 'python3'))
+  assert.deepEqual(fixture.state.writes, [])
+})
+test('source dispatch local factory hashes S data before parsing it or running metadata', async t => {
+  const fixture = sourceControllerFixture(t), sentinel = 'untrusted-input-must-not-appear-in-errors'
+  writeFileSync(path.join(fixture.product, 'scripts', 'frontend-package-lock.json'), sentinel)
+  await assert.rejects(fixture.core.makeFrozenSourceContext(), error => {
+    assert.match(error.message, /source input bytes changed/)
+    assert.ok(!error.message.includes(sentinel)); return true
+  })
+  assert.ok(!fixture.state.commands.some(command => command[0] === 'python3'))
+  assert.deepEqual(fixture.state.writes, [])
+})
+async function preparedSourceController(t) {
+  const fixture = sourceControllerFixture(t), { core } = fixture, context = await core.makeFrozenSourceContext()
+  const receipt = core.signReceipt({ schemaVersion: 1, version: '2026.10.8', identity: context.identity, crates: context.crates,
+    frontendBytes: context.frontendBytes, automatic: true, completed: false, packageChecksums: {}, ciRun: context.ciRun,
+    sourceDispatch: context.sourceDispatch, nativeOriginals: context.nativeOriginals }, fixture.key)
+  const release = await context.reserve(receipt); context.bindReservation(release, receipt)
+  await context.ensureTag(release, receipt)
+  fixture.state.writes.length = 0
+  return { ...fixture, context, receipt, release }
+}
+test('source dispatch local guard permits normal dev advance and refreshes the signed reservation before PATCH', async t => {
+  const fixture = await preparedSourceController(t)
+  fixture.model.advanceDev = true
+  await fixture.context.saveReceipt(fixture.release, fixture.receipt)
+  assert.deepEqual(fixture.state.writes, [{ method: 'PATCH', route: 'releases/42' }])
+  assert.equal(fixture.core.readBodyReceipt(fixture.state.release).sourceDispatch.context.source.revision,
+    fixture.model.input.sourceRevision)
+})
+test('source dispatch local writer rejects changed version, release and source marker payloads before PATCH', async t => {
+  const fixture = await preparedSourceController(t)
+  for (const scenario of ['version', 'release', 'marker', 'frontend', 'ciRun']) {
+    const receipt = structuredClone(fixture.receipt), release = structuredClone(fixture.release)
+    if (scenario === 'version') receipt.version = '2026.10.9'
+    if (scenario === 'release') release.id = 43
+    if (scenario === 'marker') receipt.sourceDispatch.runId = '1000'
+    if (scenario === 'frontend') receipt.frontendBytes.archiveSha256 = 'a'.repeat(64)
+    if (scenario === 'ciRun') receipt.ciRun = 'https://github.com/bigduu/Bamboo-agent/actions/runs/124'
+    await assert.rejects(fixture.context.saveReceipt(release, receipt))
+    assert.deepEqual(fixture.state.writes, [])
+  }
+})
+test('source dispatch local guard preserves source/version order before a retried registry PUT', async t => {
+  const fixture = await preparedSourceController(t)
+  fixture.context.registryFrontier = async () => [{ version: '2026.10.7', sourceRevision: 'a'.repeat(40) }]
+  fixture.context.isAncestor = async () => false
+  let uploads = 0
+  await assert.rejects(async () => { await fixture.context.assertSourceCurrent(); uploads++ }, /source cannot|source version/)
+  assert.equal(uploads, 0); assert.deepEqual(fixture.state.writes, [])
+})
+for (const scenario of ['movedRef', 'devRewrite', 'unprotectedDev', 'unprotectedMain', 'failedFeature', 'publisherAttempt',
+  'changedRelease', 'missingTag', 'wrongTag', 'annotatedTag', 'changedReceipt', 'invalidMac', 'unknownSourceAPI']) {
+  test('source dispatch local guard refuses ' + scenario + ' before any registry PUT or Release PATCH', async t => {
+    const fixture = await preparedSourceController(t), { model, state, core } = fixture
+    if (scenario === 'movedRef') model.release.commit.sha = 'a'.repeat(40)
+    if (scenario === 'devRewrite') { model.advanceDev = true; model.rewriteDev = true }
+    if (scenario === 'unprotectedDev') model.dev.protected = false
+    if (scenario === 'unprotectedMain') model.main.protected = false
+    if (scenario === 'failedFeature') model.run.conclusion = 'failure'
+    if (scenario === 'publisherAttempt') state.publisher.run_attempt++
+    if (scenario === 'changedRelease') state.release.target_commitish = 'a'.repeat(40)
+    if (scenario === 'missingTag') state.tag = null
+    if (scenario === 'wrongTag') state.tag.object.sha = 'a'.repeat(40)
+    if (scenario === 'annotatedTag') state.tag.object.type = 'tag'
+    if (['changedReceipt', 'invalidMac'].includes(scenario)) {
+      const changed = core.readBodyReceipt(state.release); changed.sourceDispatch.runId = '1000'
+      if (scenario === 'changedReceipt') core.signReceipt(changed, fixture.key)
+      state.release.body = core.receiptBody(changed)
+    }
+    if (scenario === 'unknownSourceAPI') model.apiFailure = true
+    let uploads = 0
+    await assert.rejects(async () => { await fixture.context.assertSourceCurrent(); uploads++ })
+    await assert.rejects(fixture.context.saveReceipt(fixture.release, fixture.receipt))
+    assert.equal(uploads, 0); assert.deepEqual(state.writes, [])
+  })
 }
 test("frozen source foundation is inactive for every known incomplete deployed or unexecuted producer", async () => {
   assert.deepEqual(frozenSource.ACCEPTED_PRODUCERS, {})
