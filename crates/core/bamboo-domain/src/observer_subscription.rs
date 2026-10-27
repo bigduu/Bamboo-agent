@@ -376,6 +376,8 @@ pub struct ObserverSubscription {
     pub failures: u8,
     pub retry_at: Option<DateTime<Utc>>,
     pub last_error: Option<ObserverSubscriptionFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_fault: Option<ObserverTerminalFault>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,6 +386,72 @@ pub enum ObserverSubscriptionFailure {
     PublicationUnavailable,
     InboxUnavailable,
     AuthorityUnavailable,
+}
+
+/// An administrative diagnostic about this subscription, never source content
+/// or a ChildOutcome. Payload and identity freeze at the first terminal failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObserverFaultPayload {
+    pub supervisor_incarnation: Uuid,
+    pub supervisor_created_at: DateTime<Utc>,
+    pub observer_session_id: String,
+    pub observer_created_at: DateTime<Utc>,
+    pub scope_epoch: u64,
+    pub code: ObserverSubscriptionFailure,
+    pub failures: u8,
+    pub exhausted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObserverTerminalFault {
+    pub payload: ObserverFaultPayload,
+    pub event_id: SessionMessageId,
+    /// Producer receipt only. Consumer ACK remains exclusively in Inbox.
+    pub reported: bool,
+    pub delivery_failures: u8,
+    pub retry_at: Option<DateTime<Utc>>,
+}
+
+impl ObserverTerminalFault {
+    pub fn expected_event_id(&self) -> SessionMessageId {
+        SessionMessageId::stable(
+            "observer_subscription_fault_v1",
+            &serde_json::to_value(&self.payload).expect("typed diagnostic JSON"),
+        )
+    }
+    pub fn ready(&self, now: DateTime<Utc>) -> bool {
+        !self.reported && self.delivery_failures < 8 && self.retry_at.is_none_or(|at| at <= now)
+    }
+    pub fn delivery_failed(&mut self, now: DateTime<Utc>) {
+        self.delivery_failures = self.delivery_failures.saturating_add(1).min(8);
+        self.retry_at = (self.delivery_failures < 8)
+            .then(|| now + chrono::Duration::seconds(1_i64 << self.delivery_failures));
+    }
+    pub fn validate_for_owner(
+        &self,
+        owner: &ObserverSubscriptionOwner<'_>,
+        epoch: u64,
+    ) -> Result<(), &'static str> {
+        if self.payload.supervisor_incarnation != owner.supervisor_incarnation
+            || self.payload.supervisor_created_at != owner.supervisor_created_at
+            || self.payload.observer_session_id != owner.observer_session_id
+            || self.payload.observer_created_at != owner.observer_created_at
+            || self.payload.scope_epoch != epoch
+            || self.payload.failures != 8
+            || self.event_id != self.expected_event_id()
+            || self.delivery_failures > 8
+            || (!self.reported
+                && self.delivery_failures > 0
+                && self.delivery_failures < 8
+                && self.retry_at.is_none())
+            || ((self.reported || self.delivery_failures == 8) && self.retry_at.is_some())
+        {
+            return Err("invalid Observer terminal diagnostic");
+        }
+        Ok(())
+    }
 }
 
 impl ObserverSubscription {
@@ -399,6 +467,7 @@ impl ObserverSubscription {
             failures: 0,
             retry_at: None,
             last_error: None,
+            terminal_fault: None,
         };
         value.validate()?;
         Ok(value)
@@ -408,6 +477,8 @@ impl ObserverSubscription {
         if self.filter.is_empty()
             || !(1_000..=3_600_000).contains(&self.min_interval_ms)
             || self.failures > 8
+            || ((self.failures > 0) != self.last_error.is_some())
+            || (self.failures == 8 && self.retry_at.is_some())
             || self
                 .window
                 .history
@@ -417,12 +488,55 @@ impl ObserverSubscription {
         {
             return Err("invalid Observer subscription policy");
         }
+        if let Some(fault) = &self.terminal_fault {
+            if self.failures != 8 || Some(fault.payload.code) != self.last_error {
+                return Err("terminal diagnostic differs from original failure");
+            }
+        }
         Ok(())
     }
+    pub fn capture_terminal_fault(
+        &mut self,
+        owner: &ObserverSubscriptionOwner<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<bool, &'static str> {
+        if self.failures != 8 {
+            return Err("Observer retry cap has not been reached");
+        }
+        if let Some(fault) = &self.terminal_fault {
+            fault.validate_for_owner(owner, self.window.scope_epoch)?;
+            return Ok(false);
+        }
+        let payload = ObserverFaultPayload {
+            supervisor_incarnation: owner.supervisor_incarnation,
+            supervisor_created_at: owner.supervisor_created_at,
+            observer_session_id: owner.observer_session_id.into(),
+            observer_created_at: owner.observer_created_at,
+            scope_epoch: self.window.scope_epoch,
+            code: self.last_error.ok_or("terminal failure code missing")?,
+            failures: 8,
+            exhausted_at: now,
+        };
+        let mut fault = ObserverTerminalFault {
+            payload,
+            event_id: SessionMessageId::new(),
+            reported: false,
+            delivery_failures: 0,
+            retry_at: None,
+        };
+        fault.event_id = fault.expected_event_id();
+        self.terminal_fault = Some(fault);
+        Ok(true)
+    }
     pub fn ready(&self, now: DateTime<Utc>) -> bool {
-        self.failures < 8 && self.retry_at.is_none_or(|at| at <= now)
+        self.terminal_fault.is_none()
+            && self.failures < 8
+            && self.retry_at.is_none_or(|at| at <= now)
     }
     pub fn record_failure(&mut self, now: DateTime<Utc>, code: ObserverSubscriptionFailure) {
+        if self.failures >= 8 {
+            return;
+        }
         self.failures = self.failures.saturating_add(1).min(8);
         self.last_error = Some(code);
         self.retry_at = (self.failures < 8)
