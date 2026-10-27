@@ -181,6 +181,7 @@ impl SessionStoreV2 {
         &self,
         observation: &HostScopeSessionObservation,
         mut current: Session,
+        control_only: bool,
     ) -> io::Result<()> {
         let root = &observation.identity.root_session_id;
         for expected in &observation.ancestors {
@@ -191,7 +192,9 @@ impl SessionStoreV2 {
             if parent_id != expected.actor_id {
                 return Err(denied("host_session_scope_ancestry_changed"));
             }
-            let parent = self.peer_delivery_session(parent_id, root).await?;
+            let parent = self
+                .peer_delivery_session_view(parent_id, root, control_only)
+                .await?;
             parent
                 .validate_conversation_state()
                 .map_err(|error| denied(error.to_string()))?;
@@ -221,6 +224,25 @@ impl SessionStoreV2 {
         observations: &[HostScopeSessionObservation],
         scope: Option<HostSessionScopeUse>,
         extra_root_ids: &[String],
+    ) -> io::Result<HostScopedSessionGuards> {
+        self.lock_host_scope_observations_view(observations, scope, extra_root_ids, false)
+            .await
+    }
+
+    pub(super) async fn lock_host_scope_control_observations(
+        &self,
+        observations: &[HostScopeSessionObservation],
+    ) -> io::Result<HostScopedSessionGuards> {
+        self.lock_host_scope_observations_view(observations, None, &[], true)
+            .await
+    }
+
+    async fn lock_host_scope_observations_view(
+        &self,
+        observations: &[HostScopeSessionObservation],
+        scope: Option<HostSessionScopeUse>,
+        extra_root_ids: &[String],
+        control_only: bool,
     ) -> io::Result<HostScopedSessionGuards> {
         // Only a reserved Root birth needs exclusive lifecycle. Ordinary
         // scoped reads keep their existing shared concurrency contract.
@@ -256,7 +278,11 @@ impl SessionStoreV2 {
             // Canonical preflight only selects a lock order. It cannot authorize
             // a later read; every observation is checked again under the set.
             let current = self
-                .peer_delivery_session(&expected.session_id, &expected.root_session_id)
+                .peer_delivery_session_view(
+                    &expected.session_id,
+                    &expected.root_session_id,
+                    control_only,
+                )
                 .await?;
             observation
                 .check_session(&current)
@@ -289,7 +315,11 @@ impl SessionStoreV2 {
         for observation in observations {
             let expected = &observation.identity;
             let current = self
-                .peer_delivery_session(&expected.session_id, &expected.root_session_id)
+                .peer_delivery_session_view(
+                    &expected.session_id,
+                    &expected.root_session_id,
+                    control_only,
+                )
                 .await?;
             observation
                 .check_session(&current)
@@ -297,7 +327,8 @@ impl SessionStoreV2 {
             current
                 .check_execution_compatibility()
                 .map_err(|error| denied(error.to_string()))?;
-            self.check_host_scope_lineage(observation, current).await?;
+            self.check_host_scope_lineage(observation, current, control_only)
+                .await?;
         }
         Ok(guards)
     }

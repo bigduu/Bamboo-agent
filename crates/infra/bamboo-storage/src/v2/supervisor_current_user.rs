@@ -46,14 +46,16 @@ impl SessionStoreV2 {
         self.load_root_authority_unchecked(&root_id)
             .await?
             .ok_or_else(|| denied("canonical target Root authority is unavailable"))?;
-        let target = self.peer_delivery_session(target_id, &root_id).await?;
+        let target = self
+            .peer_delivery_control_session(target_id, &root_id)
+            .await?;
         let actor = bamboo_domain::ActorSession::from_session(&target)
             .map_err(|error| denied(&error.to_string()))?;
         if !target.authority_identity.is_ordinary() {
             return Err(denied("current-user target must be an ordinary Session"));
         }
         let ancestors = self
-            .validate_actor_lineage(&actor)
+            .validate_actor_control_lineage(&actor)
             .await
             .map_err(|error| other_io_error(error.to_string()))?;
         let observation = HostScopeSessionObservation::capture(&target, ancestors)
@@ -80,7 +82,7 @@ impl SessionStoreV2 {
         // representation that the final guard compares, after checking proof;
         // never rewrite either file merely to normalize an observation.
         let source = self
-            .peer_delivery_session(&reference.session_id, &reference.session_id)
+            .peer_delivery_control_session(&reference.session_id, &reference.session_id)
             .await?;
         if source.created_at != proof.created_at
             || source.authority_identity != proof.authority_identity
@@ -91,13 +93,13 @@ impl SessionStoreV2 {
             .map_err(|error| denied(&error.to_string()))?;
         let (_, target) = self.current_user_target_source(target_id).await?;
         let authority = self
-            .lock_host_scope_observations(&[caller, target.clone()], None, &[])
+            .lock_host_scope_control_observations(&[caller, target.clone()])
             .await?;
         // Re-read protected proof while the same source/target/ancestry guards
         // are held. Copying serialized observations never creates authority.
         let proof = self.management_supervisor_locked(reference).await?;
         let source = self
-            .peer_delivery_session(&reference.session_id, &reference.session_id)
+            .peer_delivery_control_session(&reference.session_id, &reference.session_id)
             .await?;
         if source.created_at != proof.created_at
             || source.authority_identity != proof.authority_identity
@@ -108,7 +110,7 @@ impl SessionStoreV2 {
             .await?
             .ok_or_else(|| denied("canonical target Root authority changed"))?;
         let current = self
-            .peer_delivery_session(target_id, &target.identity.root_session_id)
+            .peer_delivery_control_session(target_id, &target.identity.root_session_id)
             .await?;
         target
             .check_session(&current)
@@ -154,7 +156,8 @@ impl SessionStoreV2 {
         target_id: &str,
     ) -> io::Result<Session> {
         let guard = self.lock_current_user_target(reference, target_id).await?;
-        Ok(guard.target.clone())
+        self.peer_delivery_session(target_id, &guard.target.root_session_id)
+            .await
     }
 
     pub(crate) async fn current_user_supervisor_context(
@@ -215,6 +218,36 @@ impl SessionStoreV2 {
         Ok(ids)
     }
 
+    async fn current_user_project_candidate(&self, id: &str, query: &str) -> io::Result<bool> {
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session = self.acquire_session_maintenance_lock(id).await?;
+        let (relative, _) = self
+            .actor_authority_location(id)
+            .await
+            .map_err(|error| other_io_error(error.to_string()))?;
+        let raw = fs::read(self.abs_path_from_rel(&relative).join(RUNTIME_SIDECAR_FILE)).await?;
+        #[derive(Deserialize, Default)]
+        struct Project {
+            #[serde(default)]
+            project_id: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Candidate {
+            #[serde(default)]
+            metadata: Project,
+            #[serde(default)]
+            runtime_metadata: Option<Project>,
+        }
+        let candidate: Candidate =
+            serde_json::from_slice(&raw).map_err(|error| other_io_error(error.to_string()))?;
+        Ok(candidate
+            .runtime_metadata
+            .and_then(|m| m.project_id)
+            .or(candidate.metadata.project_id)
+            .is_some_and(|project| project.to_lowercase().contains(query)))
+    }
+
     pub(crate) async fn current_user_supervisor_page(
         &self,
         reference: &SupervisorReference,
@@ -239,6 +272,16 @@ impl SessionStoreV2 {
         for id in self.current_user_target_ids().await? {
             if after.is_some_and(|after| id.as_str() <= after) {
                 continue;
+            }
+            // Filter bounded control metadata before any canonical Main read.
+            // This candidate is never a grant: selected rows are revalidated
+            // below, including the query after the final protected read.
+            if let Some(query) = query.as_deref() {
+                if !id.to_lowercase().contains(query)
+                    && !self.current_user_project_candidate(&id, query).await?
+                {
+                    continue;
+                }
             }
             let target = self.current_user_supervisor_target(reference, &id).await?;
             if query.as_ref().is_some_and(|query| {

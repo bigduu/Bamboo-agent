@@ -661,6 +661,19 @@ fn reject_session_version_change(incoming: &Session, durable: &Session) -> io::R
     Ok(())
 }
 
+/// Control-plane decoding retains the exact Session/caller fields and shared
+/// pair validation, but serde skips the two transcript payloads entirely.
+/// Whole-Main framing is still validated; a prefix alone never grants authority.
+#[derive(Deserialize)]
+struct SessionControlPlane {
+    #[serde(default, rename = "messages")]
+    _messages: Option<serde::de::IgnoredAny>,
+    #[serde(default, rename = "provider_transcript")]
+    _provider_transcript: Option<serde::de::IgnoredAny>,
+    #[serde(flatten)]
+    session: Session,
+}
+
 /// Build the sidecar snapshot: the full session minus its `messages` history.
 /// Every field except `messages` is authoritative in the sidecar; on load the
 /// message history is taken back from `session.json`.
@@ -2171,13 +2184,32 @@ impl SessionStoreV2 {
         expected_kind: SessionKind,
         expected_root_id: &str,
     ) -> io::Result<Option<Session>> {
+        self.load_session_from_dir_strict_view(abs_dir, id, expected_kind, expected_root_id, false)
+            .await
+    }
+
+    /// Same canonical pair, revocation and proof validation as the full reader.
+    /// The control view never deserializes private messages/provider history.
+    async fn load_session_from_dir_strict_view(
+        &self,
+        abs_dir: &Path,
+        id: &str,
+        expected_kind: SessionKind,
+        expected_root_id: &str,
+        control_only: bool,
+    ) -> io::Result<Option<Session>> {
         let raw = match fs::read_to_string(abs_dir.join("session.json")).await {
             Ok(raw) => raw,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
         compact_main::validate_full_main(raw.as_bytes())?;
-        let mut main: Session = serde_json::from_str(&raw).map_err(|error| {
+        let mut main = if control_only {
+            serde_json::from_str::<SessionControlPlane>(&raw).map(|value| value.session)
+        } else {
+            serde_json::from_str::<Session>(&raw)
+        }
+        .map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid source session.json: {error}"),
@@ -2208,7 +2240,12 @@ impl SessionStoreV2 {
         let runtime_path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let sidecar = match fs::read_to_string(&runtime_path).await {
             Ok(raw) => {
-                let mut sidecar: Session = serde_json::from_str(&raw).map_err(|error| {
+                let mut sidecar = if control_only {
+                    serde_json::from_str::<SessionControlPlane>(&raw).map(|value| value.session)
+                } else {
+                    serde_json::from_str::<Session>(&raw)
+                }
+                .map_err(|error| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("invalid source runtime.json: {error}"),
@@ -2840,7 +2877,20 @@ impl SessionStoreV2 {
             .map_err(|error| other_io_error(error.to_string()))
     }
 
+    async fn peer_delivery_control_session(&self, id: &str, root_id: &str) -> io::Result<Session> {
+        self.peer_delivery_session_view(id, root_id, true).await
+    }
+
     async fn peer_delivery_session(&self, id: &str, root_id: &str) -> io::Result<Session> {
+        self.peer_delivery_session_view(id, root_id, false).await
+    }
+
+    async fn peer_delivery_session_view(
+        &self,
+        id: &str,
+        root_id: &str,
+        control_only: bool,
+    ) -> io::Result<Session> {
         let kind = if id == root_id {
             SessionKind::Root
         } else {
@@ -2852,7 +2902,13 @@ impl SessionStoreV2 {
             Self::child_rel_path(root_id, id)
         };
         let session = self
-            .load_session_from_dir_strict(&self.abs_path_from_rel(&rel), id, kind, root_id)
+            .load_session_from_dir_strict_view(
+                &self.abs_path_from_rel(&rel),
+                id,
+                kind,
+                root_id,
+                control_only,
+            )
             .await?
             .ok_or_else(|| other_io_error("peer Session no longer exists"))?;
         if session
@@ -7549,7 +7605,12 @@ impl Storage for SessionStoreV2 {
         target: &str,
     ) -> io::Result<(Session, bamboo_domain::SupervisorCurrentUserTarget)> {
         let guard = self.lock_current_user_target(supervisor, target).await?;
-        Ok((guard.target.clone(), guard.reference.clone()))
+        // History is requested explicitly. Retain the same physical guard set
+        // while reading it, so its observation cannot come from another birth.
+        let full = self
+            .peer_delivery_session(target, &guard.target.root_session_id)
+            .await?;
+        Ok((full, guard.reference.clone()))
     }
 
     async fn mutate_supervisor_management(
