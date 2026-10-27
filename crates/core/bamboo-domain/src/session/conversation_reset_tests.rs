@@ -102,6 +102,7 @@ fn source(supervisor: bool) -> Session {
         session.supervisor_management = Some(SupervisorManagementState {
             schema_version: 1,
             observers: Default::default(),
+            subscriptions: Default::default(),
             incarnation_id: incarnation,
             revision: 3,
             allowed_projects: [project.clone()].into(),
