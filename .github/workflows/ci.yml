@@ -98,7 +98,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "a68d346e1851e26b4b27e8d67ddbd27084be0e1e25415280b8183542a1d590e8"
+          ADMISSION_HELPER_SHA256: "cf41d9e30e2deb65f191e705e2e74e94f747b76cdf8574ea57b2d4a26fadf449"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -405,7 +405,7 @@ jobs:
     needs: validation-source
     if: needs.validation-source.outputs.feature == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/feature-tests
       CARGO_PROFILE_DEV_DEBUG: "0"

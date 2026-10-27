@@ -279,13 +279,13 @@ test("one feature executor preserves default configurations and complete explici
   }
   assert.equal(sourceFeatureHash(packages, require('node:fs').realpathSync('.')), FEATURE_SOURCE_SHA256,
     'New feature-sensitive source requires a reviewed ownership update')
-  assert.equal(FEATURE_CONTEXTS.flatMap(context => context.targets.flatMap(target => target.added)).length, 18)
+  assert.equal(FEATURE_CONTEXTS.flatMap(context => context.targets.flatMap(target => target.added)).length, 19)
   assert.deepEqual(FEATURE_CONTEXTS.map(context => [context.package, context.features]), [
     ['bamboo-infrastructure', ['otel-otlp', 'test-utils']], ['bamboo-tickets', ['test-utils']],
     ['bamboo-server', ['test-utils']], ['bamboo-agent', ['ticket-runtime-fixtures']]])
   for (const context of FEATURE_CONTEXTS) {
     assert.ok(packages.some(owner => owner.name === context.package))
-    assert.ok(!cargoArguments({ name: context.package }, context).includes('--all-features'))
+    assert.ok(!cargoArguments({ name: context.package }, context, true).includes('--all-features'))
   }
   assert.match(job('feature-tests'), /target\/feature-tests/u)
   assert.match(job('feature-tests'), /run: node scripts\/run-feature-tests.cjs/u)
@@ -293,6 +293,7 @@ test("one feature executor preserves default configurations and complete explici
 
 test("the feature executor bounds debug artifacts and records capacity without changing release profiles", () => {
   const feature = job("feature-tests")
+  assert.match(feature, /^    timeout-minutes: 90$/mu)
   for (const profile of ["DEV", "TEST"]) {
     const setting = `CARGO_PROFILE_${profile}_DEBUG: "0"`
     assert.ok(feature.includes(setting))
@@ -328,7 +329,8 @@ test("required Test performs only result admission for feature PRs without an un
 test("serial Root birth selectors reuse canonical storage compilation and preserve strict lint ownership", () => {
   const { SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES, cargoArguments } = require("./run-feature-tests.cjs")
   assert.deepEqual(SERIAL_STORAGE_FAMILIES, ["v2::root_birth_tests::", "v2::host_root_create::tests::",
-    "v2::supervisor_management_tests::", "v2::supervisor_management_lifetime_tests::", "v2::supervisor_proof_tests::"])
+    "v2::supervisor_management_tests::", "v2::supervisor_management_lifetime_tests::", "v2::supervisor_proof_tests::",
+    "v2::supervisor_management::observer_lock_order_tests::"])
   assert.deepEqual(SERIAL_STORAGE_FILTERS, ["root_birth_tests", "host_root_create::tests", "supervisor_management", "supervisor_proof"])
   const source = readFileSync("crates/infra/bamboo-storage/src/v2/root_birth_tests.rs", "utf8")
   assert.deepEqual([...source.matchAll(/async fn (root_birth_[a-z_]+)\(/gu)].map(match => match[1]).sort(), [...ROOT_BIRTH_CASES].sort())
@@ -339,6 +341,21 @@ test("serial Root birth selectors reuse canonical storage compilation and preser
   assert.match(lint, /cargo clippy --locked --all-features --lib -p bamboo-storage -- -D warnings/u)
   assert.match(lint, /test "\$actual" = "\$EXPECTED_SOURCE"/u)
 })
+
+function assertSubscriptionException(source) {
+  // Normal merge6cfe/PR2316 retains original F57c1 configuration. This is not
+  // actual-M acceptance or ownership migration; a future owner needs review.
+  assert.equal(createHash("sha256").update(source).digest("hex"), "e79b9f16140786a49761cd5baab66a5cf83faa5d793ed11464701c2b475175da")
+  assert.match(source, /pull_request:\n    branches: \[dev\]/u)
+  assert.match(source, /runs-on: ubuntu-latest/u)
+  assert.match(source, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
+  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+  assert.match(source, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+  assert.match(source, /test "\$actual" = "\$EXPECTED_SOURCE_SHA"/u)
+  assert.match(source, /cargo test --locked -p bamboo-domain -p bamboo-engine -p bamboo-server --lib --/u)
+  assert.match(source, /--test-threads=1 --color=never/u)
+  assert.match(source, /cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-engine -p bamboo-storage/u)
+}
 
 function assertLinuxTestOwnership(definitions) {
   const registered = {
@@ -357,9 +374,13 @@ function assertLinuxTestOwnership(definitions) {
       test: "Pinned legacy original-release-head consumer contract",
     },
     "release-cargo-isolation.yml": { isolation: "Synthetic credential/ENOSPC containment boundary" },
+    "trusted-observer.yml": { observer: "Accepted API-only/F multi-package Observer configuration; not M evidence" },
+    "delegated-planner-acceptance.yml": { planner: "New a64 API-only/F Planner targets; independent accepted configuration, not M evidence" },
+    "observer-subscriptions.yml": { observer: "Inherited 6cfe API-only/F subscription joint graph; temporary exact configuration, not M evidence" },
     "ticket-platform-adapter.yml": { "native-budget": "Explicit manual snapshot diagnosis; normal PR job is Windows" },
   }
   for (const [file, source] of Object.entries(definitions)) {
+    if (file === "observer-subscriptions.yml") assertSubscriptionException(source)
     if (!/^  pull_request:\s*$/mu.test(source)) continue
     const jobs = source.slice(source.indexOf("\njobs:\n") + 7)
       .split(/(?=^  [a-z][a-z0-9-]*:\n)/mu).filter(Boolean)
@@ -372,6 +393,28 @@ function assertLinuxTestOwnership(definitions) {
       if (!/\bcargo(?: \+[^\s]+)? test\b/u.test(code) &&
           !(/["']cargo["']/u.test(code) && /["']test["']/u.test(code))) continue
       assert.ok(registered[file]?.[id], `Ordinary Linux Rust tests must join the canonical feature executor: ${file}:${id}; consolidate targets or review an explicit scoped exception`)
+      if (file === "delegated-planner-acceptance.yml") {
+        // Newly inherited #2304 owner, not part of the original A95 baseline.
+        assert.equal(createHash("sha256").update(source).digest("hex"), "318e924773ffdeb0407c5b73b15a70c330f7f64eb7ef3260c1a955782d12d912")
+        assert.match(block, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
+        assert.match(block, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+        assert.match(block, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+        assert.match(block, /test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SOURCE_SHA"/u)
+        for (const command of ["cargo test --locked -p bamboo-server-tools --lib plan::tests::",
+          "cargo test --locked -p bamboo-engine --lib planner_artifact",
+          "cargo test --locked -p bamboo-agent --test required_child_context_packet",
+          "cargo clippy --locked --all-features -p bamboo-agent"]) assert.ok(block.includes(command))
+      }
+      if (file === "trusted-observer.yml") {
+        // Preserve this separately accepted F/config exactly; never relabel it as M.
+        assert.equal(createHash("sha256").update(source).digest("hex"), "7c26b1511759f5a40bad6a21dc44976a59f60c81f841cdf00396fa38e5d868ab")
+        assert.match(block, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
+        assert.match(block, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+        assert.match(block, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+        assert.match(block, /test "\$actual" = "\$EXPECTED_SOURCE_SHA"/u)
+        assert.match(block, /cargo test --locked -p bamboo-domain -p bamboo-storage -p bamboo-server --lib --/u)
+        assert.match(block, /cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-storage/u)
+      }
       if (file === "ticket-platform-adapter.yml") {
         assert.match(block, /^    if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''$/mu)
       }
@@ -401,12 +444,42 @@ test("all agents share canonical feature tests instead of adding ordinary Linux 
   const definitions = Object.fromEntries(readdirSync(directory).filter(file => /\.ya?ml$/u.test(file))
     .map(file => [file, readFileSync(path.join(directory, file), "utf8")]))
   assertLinuxTestOwnership(definitions)
+  for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
+    ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
+    ["-p bamboo-domain -p bamboo-storage -p bamboo-server --lib", "-p bamboo-server --lib"],
+    ["cargo clippy --locked --all-features --lib", "cargo clippy --locked --lib"]]) {
+    assert.throws(() => assertLinuxTestOwnership({ ...definitions,
+      "trusted-observer.yml": definitions["trusted-observer.yml"].replace(before, after) }))
+  }
+  for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
+    ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
+    ["--test required_child_context_packet", "--lib"], ["--all-features", "--no-default-features"]]) {
+    assert.throws(() => assertLinuxTestOwnership({ ...definitions,
+      "delegated-planner-acceptance.yml": definitions["delegated-planner-acceptance.yml"].replace(before, after) }))
+  }
   const duplicate = "name: New delegated planner acceptance\non:\n  pull_request:\n    branches: [dev]\njobs:\n  planner:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test --locked -p bamboo-agent --test required_child_context_packet\n"
-  assert.throws(() => assertLinuxTestOwnership({ ...definitions, "delegated-planner-acceptance.yml": duplicate }), /must join the canonical feature executor/u)
+  assert.throws(() => assertLinuxTestOwnership({ ...definitions, "unregistered-planner-acceptance.yml": duplicate }), /must join the canonical feature executor/u)
   const unregistered = workflow + "\n  extra-linux-tests:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test --locked -p bamboo-server --lib\n"
   assert.throws(() => assertLinuxTestOwnership({ ...definitions, "ci.yml": unregistered }), /must join the canonical feature executor/u)
   assert.throws(() => assertLinuxTestOwnership({ ...definitions, "ticket-platform-adapter.yml": definitions["ticket-platform-adapter.yml"]
     .replace("if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''", "if: github.event_name == 'pull_request'") }), /workflow_dispatch/u)
+})
+
+test("subscription exception retains exact F API-only graph without becoming merge-source evidence", () => {
+  const source = readFileSync(".github/workflows/observer-subscriptions.yml", "utf8")
+  assertLinuxTestOwnership({ "observer-subscriptions.yml": source })
+  for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
+    ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
+    ["EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}", "EXPECTED_SOURCE_SHA: ${{ github.sha }}"],
+    ["ubuntu-latest", "windows-latest"], ["branches: [dev]", "branches: [main]"],
+    ["-p bamboo-domain -p bamboo-engine -p bamboo-server --lib", "-p bamboo-server --lib"],
+    ["observer_subscription session::supervisor_management::tests::", "observer_subscription"],
+    ["--test-threads=1", "--test-threads=2"], ["--all-features", "--no-default-features"],
+    ["assert len(window) == 6", "assert len(window) >= 0"]]) {
+    assert.ok(source.includes(before), before)
+    assert.throws(() => assertLinuxTestOwnership({ "observer-subscriptions.yml": source.replace(before, after) }))
+  }
+  assert.throws(() => assertLinuxTestOwnership({ "unregistered-subscriptions.yml": source }), /must join the canonical feature executor/u)
 })
 
 function serverCommand(id) {
@@ -1712,5 +1785,160 @@ test("native Windows runs source-bound immutable artifacts and preserves process
     "Timed-out native output must be retained before termination",
     "A timed-out controller was incorrectly reported as successful"]) {
     assert.ok(actorWindowsControllerTests.includes(witness), `missing output-retention regression: ${witness}`)
+  }
+})
+
+test("actual source identity keeps unchanged Cargo fingerprints fresh", { timeout: 180000 }, (t) => {
+  const { realpathSync } = require("node:fs")
+  const directory = realpathSync(mkdtempSync(path.join(os.tmpdir(), "bamboo-source-watch-fixture-")))
+  const evidence = realpathSync(mkdtempSync(path.join(process.env.RUNNER_TEMP || os.tmpdir(), "bamboo-source-watch-evidence-")))
+  const modulePath = path.resolve("crates/infra/bamboo-skills/build/product_manual.rs")
+  const moduleBytes = readFileSync(modulePath)
+  const target = path.join(directory, "target")
+  const repo = path.join(directory, "repo")
+  const phases = [], commands = []
+  let passed = false
+  // Keep only compiler/runtime paths. Native children get neither host secrets
+  // nor workflow write channels, user Git configuration, or Cargo overrides.
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
+    /^(?:PATH|HOME|USERPROFILE|TMP|TEMP|TMPDIR|SYSTEMROOT|WINDIR|COMSPEC|PATHEXT|CARGO_HOME|RUSTUP_HOME|RUSTUP_TOOLCHAIN)$/i.test(key)))
+  Object.assign(env, { CARGO_TARGET_DIR: target, CARGO_INCREMENTAL: "0", CARGO_PROFILE_DEV_DEBUG: "0",
+    CARGO_TERM_COLOR: "never", CARGO_HTTP_TIMEOUT: "20", CARGO_NET_RETRY: "0",
+    CARGO_LOG: "cargo::core::compiler::fingerprint=info,cargo::compiler::fingerprint=info",
+    GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: os.devNull })
+  const lock = readFileSync("Cargo.lock", "utf8")
+  const versions = [...lock.matchAll(/\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"/g)]
+  const dependencies = [["hex", "0.4."], ["serde_json", "1."], ["sha2", "0.11."]].map(([name, prefix]) => {
+    const matches = versions.filter(row => row[1] === name && row[2].startsWith(prefix))
+    assert.equal(matches.length, 1, "Use the existing module's locked build dependency: " + name)
+    return `${name} = "=${matches[0][2]}"`
+  }).join("\n")
+  writeFileSync(path.join(evidence, "source-module.rs"), moduleBytes)
+  function run(program, args, cwd, label) {
+    const result = spawnSync(program, args, { cwd, env, encoding: "utf8", timeout: 60000, maxBuffer: 8 * 1024 * 1024 })
+    commands.push({ program, args, cwd, label, status: result.status, error: result.error?.code })
+    writeFileSync(path.join(evidence, label + ".stdout"), result.stdout || "")
+    writeFileSync(path.join(evidence, label + ".stderr"), result.stderr || "")
+    assert.equal(result.error, undefined, `${label}: ${result.error?.message}`)
+    assert.equal(result.status, 0, `${label}: ${result.stderr}`)
+    return (result.stdout || "").trim()
+  }
+  const git = (...args) => run("git", args, repo, "git-" + commands.length)
+  function fixture(name, base = repo) {
+    const manifest = path.join(base, "crates/infra", name)
+    mkdirSync(path.join(manifest, "src"), { recursive: true })
+    writeFileSync(path.join(manifest, "Cargo.toml"), `[package]\nname = "source-watch-${name}"\nversion = "0.0.0"\nedition = "2021"\n[workspace]\n[build-dependencies]\n${dependencies}\n`)
+    writeFileSync(path.join(manifest, "src/lib.rs"), 'pub const COUNTER: &str = env!("SOURCE_WATCH_COUNTER");\npub const IDENTITY: &str = include_str!(concat!(env!("OUT_DIR"), "/identity.json"));\n')
+    // Import the real module; source-module.rs above is evidence only. The
+    // counter measures execution, unlike replayed build-script-executed JSON.
+    writeFileSync(path.join(manifest, "build.rs"), `#[allow(dead_code)]\n#[path = ${JSON.stringify(modulePath)}]\nmod packaging;\nfn main() {\n  let root = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());\n  let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());\n  let counter = out.join("counter.txt");\n  let count = std::fs::read_to_string(&counter).ok().map(|v| v.parse::<u32>().unwrap()).unwrap_or(0) + 1;\n  std::fs::write(&counter, count.to_string()).unwrap();\n  let identity = packaging::source_identity(&root);\n  std::fs::write(out.join("identity.json"), serde_json::to_vec(&identity).unwrap()).unwrap();\n  println!("cargo:rustc-env=SOURCE_WATCH_COUNTER={count}");\n}\n`)
+    return manifest
+  }
+  const key = unit => JSON.stringify([unit.package_id, unit.target, unit.features, unit.profile, unit.filenames])
+  const previous = new Map()
+  function build(manifest, label, count, identity, fresh) {
+    const args = ["build", "--locked", "--message-format=json-render-diagnostics"]
+    const stdout = run("cargo", args, manifest, label)
+    const messages = stdout.split("\n").filter(Boolean).map(line => JSON.parse(line))
+    const units = messages.filter(row => row.reason === "compiler-artifact")
+    const product = units.filter(row => row.target.name === "source_watch_" + path.basename(manifest))
+    assert.equal(product.length, 1)
+    assert.ok(units.every(row => !row.target.name.startsWith("bamboo_")), "The fixture must not compile the Bamboo graph")
+    const output = messages.filter(row => row.reason === "build-script-executed" && row.package_id === product[0].package_id)
+    assert.equal(output.length, 1)
+    const out = output[0].out_dir
+    const actual = JSON.parse(readFileSync(path.join(out, "identity.json"), "utf8"))
+    const runs = Number(readFileSync(path.join(out, "counter.txt"), "utf8"))
+    const watches = [...readFileSync(path.join(out, "../output"), "utf8").matchAll(/^cargo:rerun-if-changed=(.+)$/gm)]
+      .map(match => path.resolve(manifest, match[1]))
+    const keys = units.map(key).sort()
+    const record = { label, manifest, expectedRuns: count, runs, identity: actual,
+      artifacts: units.length, fresh: units.filter(row => row.fresh).length, productFresh: product[0].fresh, watches }
+    phases.push(record)
+    writeFileSync(path.join(evidence, label + ".json"), JSON.stringify(record, null, 2) + "\n")
+    writeFileSync(path.join(evidence, label + ".counter.txt"), readFileSync(path.join(out, "counter.txt")))
+    writeFileSync(path.join(evidence, label + ".identity.json"), readFileSync(path.join(out, "identity.json")))
+    assert.equal(runs, count, `${label}: build-script invocation count; evidence=${evidence}`)
+    assert.deepEqual(actual, identity, label + ": exact source identity")
+    assert.ok(watches.every(file => existsSync(file) && file !== path.join(repo, ".git") && !file.startsWith(target)),
+      "Only existing bounded source-identity inputs may be watched")
+    if (fresh) {
+      assert.deepEqual(keys, previous.get(manifest), "An unchanged build must retain the exact Cargo units")
+      assert.ok(units.every(row => row.fresh), label + ": every unchanged unit must be fresh")
+    } else assert.equal(product[0].fresh, false, label + ": the changed identity must rebuild its product")
+    previous.set(manifest, keys)
+  }
+  try {
+    mkdirSync(path.join(repo, "builtin_skills"), { recursive: true })
+    const ordinary = fixture("ordinary")
+    git("init", "-q", "-b", "work")
+    git("config", "user.name", "Source Watch Fixture")
+    git("config", "user.email", "source-watch@example.invalid")
+    git("config", "commit.gpgsign", "false")
+    git("add", ".")
+    git("commit", "-qm", "fixture source")
+    git("checkout", "--detach", "-q")
+    assert.equal(existsSync(path.join(ordinary, ".cargo_vcs_info.json")), false)
+    assert.equal(existsSync(path.join(repo, ".git/packed-refs")), false)
+    run("cargo", ["generate-lockfile"], ordinary, "resolve-fixture")
+    let revision = git("rev-parse", "HEAD")
+    const checkout = sha => ({ revision: sha, status: "checkout_unverified", identity_source: "git" })
+    build(ordinary, "git-detached-first", 1, checkout(revision), false)
+    build(ordinary, "git-detached-unchanged", 1, checkout(revision), true)
+    writeFileSync(path.join(repo, "unrelated.txt"), "index refresh is not source cleanliness proof\n")
+    git("add", "unrelated.txt")
+    build(ordinary, "git-index-only", 1, checkout(revision), true)
+    git("commit", "--allow-empty", "-qm", "detached identity changed")
+    revision = git("rev-parse", "HEAD")
+    build(ordinary, "git-detached-changed", 2, checkout(revision), false)
+    build(ordinary, "git-detached-stable", 2, checkout(revision), true)
+    git("checkout", "-q", "work")
+    revision = git("rev-parse", "HEAD")
+    build(ordinary, "git-symbolic-first", 3, checkout(revision), false)
+    build(ordinary, "git-symbolic-unchanged", 3, checkout(revision), true)
+    git("commit", "--allow-empty", "-qm", "loose reference changed")
+    revision = git("rev-parse", "HEAD")
+    build(ordinary, "git-symbolic-changed", 4, checkout(revision), false)
+    build(ordinary, "git-symbolic-stable", 4, checkout(revision), true)
+    git("pack-refs", "--all", "--prune")
+    assert.equal(existsSync(path.join(repo, ".git/refs/heads/work")), false)
+    build(ordinary, "git-packed-first", 5, checkout(revision), false)
+    build(ordinary, "git-packed-unchanged", 5, checkout(revision), true)
+    git("commit", "--allow-empty", "-qm", "packed reference becomes loose")
+    revision = git("rev-parse", "HEAD")
+    assert.equal(existsSync(path.join(repo, ".git/refs/heads/work")), true)
+    build(ordinary, "git-packed-to-loose", 6, checkout(revision), false)
+    build(ordinary, "git-packed-to-loose-stable", 6, checkout(revision), true)
+
+    const archive = fixture("archive")
+    run("cargo", ["generate-lockfile", "--offline"], archive, "resolve-archive")
+    const vcs = path.join(archive, ".cargo_vcs_info.json")
+    const archived = (sha, dirty) => ({ revision: sha, status: "source_archive", dirty, identity_source: "cargo_vcs_info" })
+    writeFileSync(vcs, JSON.stringify({ git: { sha1: "a".repeat(40), dirty: true } }))
+    build(archive, "archive-first", 1, archived("a".repeat(40), true), false)
+    build(archive, "archive-unchanged", 1, archived("a".repeat(40), true), true)
+    writeFileSync(vcs, JSON.stringify({ git: { sha1: "b".repeat(40), dirty: false } }))
+    build(archive, "archive-changed", 2, archived("b".repeat(40), false), false)
+    build(archive, "archive-stable", 2, archived("b".repeat(40), false), true)
+    const unknown = { revision: null, status: "unknown", identity_source: "invalid_cargo_vcs_info" }
+    for (const [index, value] of ["{malformed", "{}", JSON.stringify({ git: { sha1: "latest" } })].entries()) {
+      writeFileSync(vcs, value)
+      build(archive, "archive-invalid-" + index, 3 + index, unknown, false)
+      build(archive, "archive-invalid-stable-" + index, 3 + index, unknown, true)
+    }
+    const noSource = fixture("unknown", path.join(directory, "unknown-source"))
+    run("cargo", ["generate-lockfile", "--offline"], noSource, "resolve-unknown")
+    const absent = { revision: null, status: "unknown", identity_source: "unknown" }
+    build(noSource, "unknown-first", 1, absent, false)
+    build(noSource, "unknown-unchanged", 1, absent, true)
+    passed = true
+  } finally {
+    writeFileSync(path.join(evidence, "result.json"), JSON.stringify({ passed,
+      modulePath, moduleSha256: createHash("sha256").update(moduleBytes).digest("hex"),
+      fixtureLockSha256: existsSync(path.join(repo, "crates/infra/ordinary/Cargo.lock"))
+        ? createHash("sha256").update(readFileSync(path.join(repo, "crates/infra/ordinary/Cargo.lock"))).digest("hex") : null,
+      phases, commands }, null, 2) + "\n")
+    rmSync(directory, { recursive: true, force: true })
+    t.diagnostic("Source-watch module/counter/fingerprint evidence: " + evidence)
   }
 })

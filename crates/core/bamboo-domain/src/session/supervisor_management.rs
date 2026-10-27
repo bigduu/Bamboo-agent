@@ -9,6 +9,10 @@ use uuid::Uuid;
 use crate::{ProjectId, SupervisorBootstrapReceipt, DEFAULT_SUPERVISOR_SESSION_ID};
 
 pub const SUPERVISOR_MANAGEMENT_SCHEMA_VERSION: u32 = 1;
+pub const SUPERVISOR_OBSERVER_SCHEMA_VERSION: u32 = 2;
+pub const SUPERVISOR_SUBSCRIPTION_SCHEMA_VERSION: u32 = 3;
+pub const MAX_SUPERVISOR_OBSERVERS: usize = 8;
+pub const MAX_SUPERVISOR_OBSERVER_TARGETS: usize = 8;
 pub const MAX_SUPERVISOR_PROJECTS: usize = 64;
 /// Includes disabled tombstones. Entries are never evicted or implicitly revived.
 pub const MAX_SUPERVISOR_LINKS: usize = 256;
@@ -40,6 +44,42 @@ pub struct SupervisorManagedLink {
     pub target_metadata_version: u64,
 }
 
+/// An explicit Host registration, not a role label or a transferable grant.
+/// Revocation preserves the exact Child's background classification forever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorObserverRegistration {
+    pub operation_id: Uuid,
+    pub revision: u64,
+    pub enabled: bool,
+    pub parent_created_at: DateTime<Utc>,
+    pub child_created_at: DateTime<Utc>,
+    pub target_links: BTreeMap<String, SupervisorManagedLink>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorObserverReceipt {
+    pub supervisor: SupervisorReference,
+    pub child_session_id: String,
+    pub operation_id: Uuid,
+    pub state_revision: u64,
+    pub registration_revision: u64,
+    pub enabled: bool,
+    pub changed: bool,
+}
+
+/// Only the canonical reader creates this observation. It expires with its
+/// retained physical read; serialized values are selectors, never authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorObserverContext {
+    pub supervisor: SupervisorReference,
+    pub parent_created_at: DateTime<Utc>,
+    pub child_created_at: DateTime<Utc>,
+    pub operation_id: Uuid,
+    pub registration_revision: u64,
+    pub target_link: SupervisorManagedLink,
+}
+
 /// Only the canonical Supervisor runtime may publish this state. A missing
 /// field means empty scope, no links and revision zero for legacy Supervisors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,13 +89,28 @@ pub struct SupervisorManagementState {
     pub revision: u64,
     pub allowed_projects: BTreeSet<ProjectId>,
     pub links: BTreeMap<String, SupervisorManagedLink>,
+    /// Empty v1 records serialize identically, preserving their existing proof.
+    /// Any nonempty registration upgrades to v2, which old writers reject.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub observers: BTreeMap<String, SupervisorObserverRegistration>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subscriptions: BTreeMap<String, crate::ObserverSubscription>,
 }
 
 impl SupervisorManagementState {
     /// Validate before authority use or publication, including typed values
     /// deserialized from a future or externally damaged record.
     pub fn validate(&self, incarnation_id: Uuid) -> Result<(), &'static str> {
-        if self.schema_version != SUPERVISOR_MANAGEMENT_SCHEMA_VERSION {
+        if !matches!(
+            self.schema_version,
+            SUPERVISOR_MANAGEMENT_SCHEMA_VERSION
+                | SUPERVISOR_OBSERVER_SCHEMA_VERSION
+                | SUPERVISOR_SUBSCRIPTION_SCHEMA_VERSION
+        ) || (self.schema_version == SUPERVISOR_MANAGEMENT_SCHEMA_VERSION
+            && !self.observers.is_empty())
+            || (self.schema_version < SUPERVISOR_SUBSCRIPTION_SCHEMA_VERSION
+                && !self.subscriptions.is_empty())
+        {
             return Err("unsupported Supervisor management schema version");
         }
         if incarnation_id.is_nil() || self.incarnation_id != incarnation_id || self.revision == 0 {
@@ -63,6 +118,7 @@ impl SupervisorManagementState {
         }
         if self.allowed_projects.len() > MAX_SUPERVISOR_PROJECTS
             || self.links.len() > MAX_SUPERVISOR_LINKS
+            || self.observers.len() > MAX_SUPERVISOR_OBSERVERS
         {
             return Err("Supervisor management capacity exceeded");
         }
@@ -78,7 +134,106 @@ impl SupervisorManagementState {
                 return Err("enabled Supervisor link is outside Project scope");
             }
         }
+        let mut operations = BTreeSet::new();
+        for (id, observer) in &self.observers {
+            validate_supervisor_target_id(id)?;
+            if id == DEFAULT_SUPERVISOR_SESSION_ID
+                || observer.operation_id.is_nil()
+                || !operations.insert(observer.operation_id)
+                || observer.revision == 0
+                || observer.revision > self.revision
+                || observer.target_links.is_empty()
+                || observer.target_links.len() > MAX_SUPERVISOR_OBSERVER_TARGETS
+            {
+                return Err("invalid Supervisor Observer registration");
+            }
+            for (target, link) in &observer.target_links {
+                validate_supervisor_target_id(target)?;
+                if target == id || !link.enabled || link.revision == 0 {
+                    return Err("invalid Supervisor Observer target");
+                }
+                if observer.enabled && self.links.get(target) != Some(link) {
+                    return Err("enabled Supervisor Observer has a stale target link");
+                }
+            }
+        }
+        if self.subscriptions.len() > MAX_SUPERVISOR_OBSERVERS {
+            return Err("too many Observer subscriptions");
+        }
+        for (id, subscription) in &self.subscriptions {
+            let registration = self
+                .observers
+                .get(id)
+                .ok_or("subscription has no Observer registration")?;
+            subscription.validate()?;
+            if subscription
+                .window
+                .enqueued_fingerprints
+                .keys()
+                .chain(
+                    subscription
+                        .window
+                        .history
+                        .iter()
+                        .map(|change| &change.target_session_id),
+                )
+                .chain(
+                    subscription
+                        .window
+                        .pending
+                        .iter()
+                        .map(|change| &change.target_session_id),
+                )
+                .any(|target| !registration.target_links.contains_key(target))
+            {
+                return Err("subscription contains an unassigned Observer target");
+            }
+            if subscription.window.scope_epoch > registration.revision
+                || (registration.enabled
+                    && subscription.window.scope_epoch != registration.revision)
+            {
+                return Err("subscription registration epoch changed");
+            }
+            subscription
+                .window
+                .validate_for_owner(&crate::ObserverSubscriptionOwner {
+                    supervisor_incarnation: self.incarnation_id,
+                    supervisor_created_at: registration.parent_created_at,
+                    observer_session_id: id,
+                    observer_created_at: registration.child_created_at,
+                })?;
+        }
+        // Leave room for the enclosing canonical proof within its 256 KiB cap.
+        if self.schema_version >= SUPERVISOR_OBSERVER_SCHEMA_VERSION
+            && serde_json::to_vec_pretty(self)
+                .map_err(|_| "invalid Supervisor Observer encoding")?
+                .len()
+                > 224 * 1024
+        {
+            return Err("Supervisor Observer state exceeds its canonical byte budget");
+        }
         Ok(())
+    }
+
+    /// Historical classification is distinct from current observation access.
+    /// Disabled tombstones never exempt a replacement Child or parent lifetime.
+    pub fn classifies_observer(&self, parent: &crate::Session, child: &crate::Session) -> bool {
+        self.validate(self.incarnation_id).is_ok()
+            && parent.authority_identity
+                == (crate::SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: self.incarnation_id,
+                })
+            && parent.id == DEFAULT_SUPERVISOR_SESSION_ID
+            && parent.kind == crate::SessionKind::Root
+            && child.kind == crate::SessionKind::Child
+            && child.authority_identity.is_ordinary()
+            && child.parent_session_id.as_deref() == Some(parent.id.as_str())
+            && child.root_session_id == parent.id
+            && child.parent_created_at == Some(parent.created_at)
+            && self.observers.get(&child.id).is_some_and(|observer| {
+                observer.parent_created_at == parent.created_at
+                    && observer.child_created_at == child.created_at
+            })
     }
 }
 
@@ -167,8 +322,17 @@ mod tests {
             revision: 1,
             allowed_projects: BTreeSet::from(["project-a".parse().unwrap()]),
             links: BTreeMap::new(),
+            observers: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
         };
         state.validate(incarnation_id).unwrap();
+        assert_eq!(
+            serde_json::to_string(&state).unwrap(),
+            format!(
+                r#"{{"schema_version":1,"incarnation_id":"{incarnation_id}","revision":1,"allowed_projects":["project-a"],"links":{{}}}}"#
+            ),
+            "legacy empty fields retain the exact original encoding"
+        );
         root.supervisor_management = Some(state);
         let encoded = serde_json::to_value(&root).unwrap();
         let decoded: Session = serde_json::from_value(encoded).unwrap();

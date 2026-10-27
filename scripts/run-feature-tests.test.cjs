@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
-const { spawnSync } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const { test } = require("node:test");
 const { selectedPackages, sourceFeatureHash, cargoArguments, sshExecutable, runSerialStorage,
   SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES,
@@ -20,7 +20,7 @@ function metadataFixture() {
 }
 function serialNames() {
   return [...ROOT_BIRTH_CASES.map((name) => SERIAL_STORAGE_FAMILIES[0] + name),
-    ...SERIAL_STORAGE_FAMILIES.slice(1).map((prefix) => prefix + "selected"), SERIAL_STORAGE_SELECTORS.at(-1)].sort();
+    ...SERIAL_STORAGE_FAMILIES.slice(1).map((prefix) => prefix + (prefix.includes("observer_lock_order_tests") ? "observer_lock_order_rejects_non_root_slots_before_waiting_for_supervisor" : "selected")), SERIAL_STORAGE_SELECTORS.at(-1)].sort();
 }
 
 test("ordinary owners preserve isolated defaults and feature owners select only explicit additions", () => {
@@ -36,14 +36,16 @@ test("ordinary owners preserve isolated defaults and feature owners select only 
       assert.deepEqual(args.slice(args.indexOf("--") + 1), SERIAL_STORAGE_SELECTORS.flatMap((name) => ["--skip", name]));
     } else assert.ok(!args.includes("--"));
   }
-  assert.equal(FEATURE_CONTEXTS.flatMap((context) => context.targets.flatMap((target) => target.added)).length, 18);
+  assert.equal(FEATURE_CONTEXTS.flatMap((context) => context.targets.flatMap((target) => target.added)).length, 19);
   for (const context of FEATURE_CONTEXTS) {
-    const args = cargoArguments({ name: context.package }, context);
-    assert.ok(!args.includes("--all-features"));
-    assert.deepEqual(args.slice(args.indexOf("--") + 1),
-      [...context.targets.flatMap((target) => target.added), "--exact", "--color=never"]);
-    assert.equal(new Set(context.targets.flatMap((target) => target.added)).size,
-      context.targets.flatMap((target) => target.added).length);
+    const compile = cargoArguments({ name: context.package }, context, true);
+    assert.ok(compile.includes("--no-run") && !compile.includes("--all-features"));
+    if (context.targets.length > 1) assert.throws(() => cargoArguments({ name: context.package }, context), /one target/);
+    for (const target of context.targets) {
+      const args = cargoArguments({ name: context.package }, { ...context, targets: [target] });
+      assert.deepEqual(args.slice(args.indexOf("--") + 1), [...target.added, "--exact", "--color=never"]);
+      assert.equal(new Set(target.added).size, target.added.length);
+    }
   }
   assert.throws(() => selectedPackages({ ...metadata, packages: metadata.packages.filter((item) => item.name !== "bamboo-broker") }));
   assert.throws(() => selectedPackages({ ...metadata, workspace_default_members: [...metadata.workspace_default_members, "bamboo-analytics"] }));
@@ -92,6 +94,86 @@ test("new or removed feature cases fail closed without rerunning common defaults
   for (const changed of [{ "lib/unit": ["common", "feature_only", "future_unowned_case"] },
     { "lib/unit": ["feature_only"] }, { "lib/unit": ["common"] }, { "lib/other": ["feature_only"] }]) {
     assert.throws(() => validateFeatureCatalog(context, before, changed));
+  }
+});
+
+test("A95 live target catalogs keep the shared helper additive only for publication", (t) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-target-runtime-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const helper = "fixture::startup_log_rejects_previous_launch_and_foreign_listener";
+  // Original run40425939556/Mbc2a artifact12702667670: publication was empty;
+  // files already passed this helper in its default harness. Preserve that RED.
+  const before = { "test/ticket_runtime_publication": [], "test/ticket_runtime_files": [
+    "actual_native_worker_writes_only_its_git_worktree_and_submits_managed_code",
+    "expired_capacity_lease_cannot_admit_same_worktree_while_native_pid_is_alive", helper,
+    "inspect_uses_fresh_connection_after_idle_peer_close_without_retry"] };
+  const context = FEATURE_CONTEXTS.find(item => item.package === "bamboo-agent");
+  // Publication's four names came from the original failure. The files extension
+  // is the existing reviewed source expectation, not an observed feature PASS.
+  const after = { "test/ticket_runtime_publication": [helper,
+    "actual_admission_exit_retains_exact_prepared_run_without_worker_execution",
+    "actual_intent_exit_before_or_after_head_never_launches_unpublished_or_unknown_work",
+    "actual_result_exit_recovers_submission_before_broker_ack_without_reexecution"].sort(),
+    "test/ticket_runtime_files": [...before["test/ticket_runtime_files"],
+      "actual_stopped_native_unknown_file_is_reconciled_offline_without_rewriting_or_acceptance"].sort() };
+  assert.equal(context.targets[0].added.filter(name => name === helper).length, 1);
+  assert.equal(context.targets[1].added.includes(helper), false);
+  validateFeatureCatalog(context, before, after);
+  assert.throws(() => validateFeatureCatalog({ ...context, targets: context.targets.map(target => ({
+    ...target, added: target.added.filter(name => name !== helper) })) }, before, after), /Unowned additive cases/);
+
+  const metadata = metadataFixture();
+  metadata.packages[0].targets = context.targets.map(target => ({ name: target.name, kind: [target.kind], test: true }));
+  metadata.packages[0].features["ticket-runtime-fixtures"] = [];
+  const packages = selectedPackages(metadata), sourceCatalogSha = sourceFeatureHash(packages, root);
+  for (const fault of ["none", "nonfresh", "foreign", "missing", "duplicate", "executable", "bytes", "repeated-default", "exit"]) {
+    const listings = new Map(), calls = [];
+    const result = runFeatureTests({ root, environment: { RUNNER_TEMP: root, CARGO_TARGET_DIR: path.join(root, "target") },
+      echoLog: false, featureContexts: [context], sourceCatalogSha,
+      runSsh: () => ({ status: 0 }), runSerial: () => ({ status: 0 }), execute: (command, args, options) => {
+        if (command !== "cargo") return { status: 0, stdout: listings.get(command).map(name => name + ": test\n").join("") };
+        if (args[0] === "metadata") return { status: 0, stdout: JSON.stringify(metadata) };
+        const featured = args.includes("--features"), runtime = featured && !args.includes("--no-run");
+        if (featured) calls.push(args);
+        const owner = packages.find(item => item.name === args[args.indexOf("-p") + 1]);
+        const selected = runtime ? owner.targets.filter(target => args[args.indexOf("--test") + 1] === target.name) : owner.targets;
+        const rows = selected.map(target => {
+          const binary = path.join(options.env.CARGO_TARGET_DIR, target.name + (featured ? "-feature" : ""));
+          if (!runtime) fs.writeFileSync(binary, "compiled " + target.name);
+          listings.set(binary, owner.name === "bamboo-agent" ? (featured ? after : before)["test/" + target.name] : ["ordinary"]);
+          return { reason: "compiler-artifact", package_id: owner.id, target, features: featured ? ["ticket-runtime-fixtures"] : [],
+            profile: { test: true }, fresh: runtime, filenames: [binary], executable: binary };
+        });
+        const publication = runtime && selected[0].name === "ticket_runtime_publication";
+        if (publication && fault === "nonfresh") rows[0].fresh = false;
+        if (publication && fault === "foreign") rows[0].package_id = "foreign";
+        if (publication && fault === "missing") rows.length = 0;
+        if (publication && fault === "duplicate") rows.push(rows[0]);
+        if (publication && fault === "executable") rows[0].executable += "-foreign";
+        if (publication && fault === "bytes") fs.writeFileSync(rows[0].executable, "changed");
+        for (const row of rows) fs.writeSync(options.stdio[1], JSON.stringify(row) + "\n");
+        if (runtime) {
+          const names = args.slice(args.indexOf("--") + 1).filter(name => !name.startsWith("--"));
+          if (!publication && fault === "repeated-default") names.push(helper);
+          for (const name of names) fs.writeSync(options.stdio[1], "test " + name + " ... ok\n");
+        }
+        return { status: publication && fault === "exit" ? 23 : 0 };
+      } });
+    assert.equal(calls.filter(args => args.includes("--no-run")).length, 1);
+    const runtimeCalls = calls.filter(args => !args.includes("--no-run"));
+    assert.equal(runtimeCalls.length, 2, "the other target retains its result after a failure");
+    assert.deepEqual(runtimeCalls.map(args => args[args.indexOf("--test") + 1]), context.targets.map(target => target.name));
+    assert.equal(runtimeCalls[0].includes(helper), true);
+    assert.equal(runtimeCalls[1].includes(helper), false, "files' default helper never repeats");
+    assert.equal(result.status === 0, fault === "none", fault);
+    const progress = JSON.parse(fs.readFileSync(path.join(result.directory, "progress.json"), "utf8"));
+    assert.equal(progress.complete, fault === "none", fault);
+    if (fault === "none") {
+      const runtime = result.contexts.filter(item => item.label.startsWith("feature-run-"));
+      assert.equal(runtime.length, 2);
+      assert.deepEqual(runtime.map(item => item.target.name), context.targets.map(target => target.name));
+      assert.ok(runtime.every(item => /^[0-9a-f]{64}$/.test(item.target.sha256)));
+    }
   }
 });
 
@@ -175,7 +257,7 @@ test("actual Cargo preserves a default-only production witness and reuses compat
       { ...options, encoding: "utf8" }) });
   assert.equal(result.status, 0, JSON.stringify(result.contexts));
   assert.equal(result.contexts.filter((context) => context.label.startsWith("default-")).length, 5);
-  assert.equal(calls.filter(([command, subcommand]) => command === "cargo" && subcommand === "test").length, 7);
+  assert.equal(calls.filter(([command, subcommand]) => command === "cargo" && subcommand === "test").length, 8);
   const expected = ["unit-library", "unit-binary", "integration", "ssh-live", "recorder-lifecycle", "storage-ordinary",
     "serial-merge", "default-production", "infra-common", "feature-transport", "feature-api", ...ROOT_BIRTH_CASES,
     ...SERIAL_STORAGE_FAMILIES.slice(1).map((_, index) => "serial-" + index)].sort();
@@ -186,8 +268,9 @@ test("actual Cargo preserves a default-only production witness and reuses compat
   assert.ok(first);
   assert.ok(units.some((item) => item.fresh && JSON.stringify(item.filenames) === JSON.stringify(first.filenames)),
     "the identical compatible dependency artifact is actually fresh on a later package context");
-  const featureRun = result.contexts.find((context) => context.label === "feature-run-bamboo-infrastructure");
-  assert.ok(featureRun.artifacts.length > 0 && featureRun.artifacts.every((item) => item.fresh));
+  const featureRuns = result.contexts.filter((context) => context.label.startsWith("feature-run-bamboo-infrastructure-"));
+  assert.equal(featureRuns.length, 2);
+  assert.ok(featureRuns.every(run => run.artifacts.length > 0 && run.artifacts.every(item => item.fresh)));
   assert.ok(result.contexts.flatMap((context) => context.artifacts || []).filter((item) => item.profile.test)
     .every((item) => item.profile.debuginfo === 0 && item.profile.debug_assertions));
   assert.match(fs.readFileSync(env.GITHUB_STEP_SUMMARY, "utf8"), /5 independent default package contexts; 1 explicit additive feature contexts/);
@@ -207,8 +290,9 @@ test("default, serial and SSH failures propagate while other default contexts re
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-context-status-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const metadata = metadataFixture(), packages = selectedPackages(metadata);
-  for (const [cargoStatus, serialStatus, sshStatus] of [[23, 0, 0], [0, 17, 0], [0, 0, 19], [23, 17, 19]]) {
+  for (const [cargoStatus, serialStatus, sshStatus] of [[23, 0, 0], [0, 17, 0], [0, 0, 19], [23, 17, 19], [0, 0, 0]]) {
     let testCalls = 0, serialCalls = 0, sshCalls = 0;
+    const existing = new Set(fs.readdirSync(root));
     const result = runFeatureTests({ root, environment: { ...process.env, RUNNER_TEMP: root,
       CARGO_TARGET_DIR: path.join(root, "target"), GITHUB_STEP_SUMMARY: "" }, echoLog: false, featureContexts: [],
       sourceCatalogSha: sourceFeatureHash(packages, root),
@@ -216,6 +300,17 @@ test("default, serial and SSH failures propagate while other default contexts re
         if (command !== "cargo") return { status: 0, stdout: serialNames().map((name) => name + ": test\n").join("") };
         if (args[0] === "metadata") return { status: 0, stdout: JSON.stringify(metadata) };
         assert.equal(args[0], "test"); testCalls++;
+        if (testCalls === 2) {
+          const directory = fs.readdirSync(root).find((name) => name.startsWith("bamboo-feature-tests-") && !existing.has(name));
+          const progress = JSON.parse(fs.readFileSync(path.join(root, directory, "progress.json"), "utf8"));
+          assert.equal(progress.complete, false); assert.equal(progress.phase, "cargo");
+          assert.deepEqual(progress.finished, ["default-bamboo-agent"]);
+          assert.equal(progress.contexts[0].status, cargoStatus, "previous context survives before the next call");
+          assert.equal(progress.source.root, root);
+          assert.equal(progress.source.sourceCatalogSha, sourceFeatureHash(packages, root));
+          assert.equal(progress.source.event.GITHUB_SHA, process.env.GITHUB_SHA || null);
+          assert.equal(progress.command[progress.command.indexOf("-p") + 1], "bamboo-broker");
+        }
         const name = args[args.indexOf("-p") + 1], owner = packages.find((item) => item.name === name);
         for (const target of owner.targets) {
           const binary = path.join(options.env.CARGO_TARGET_DIR, target.name); fs.writeFileSync(binary, "fixture");
@@ -228,5 +323,85 @@ test("default, serial and SSH failures propagate while other default contexts re
     assert.equal(result.status, cargoStatus || sshStatus || serialStatus);
     assert.equal(testCalls, packages.length); assert.equal(serialCalls, 1); assert.equal(sshCalls, 1);
     assert.equal(result.contexts.length, packages.length);
+    const progress = JSON.parse(fs.readFileSync(path.join(result.directory, "progress.json"), "utf8"));
+    assert.equal(progress.diagnosticOnly, true); assert.equal(progress.phase, "finished");
+    assert.equal(progress.complete, result.status === 0);
+    assert.deepEqual(progress.contexts, result.contexts);
   }
+});
+
+test("diagnostic snapshot completes only after the entire additive context plan succeeds", (t) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-progress-additive-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const metadata = metadataFixture(), packages = selectedPackages(metadata), listings = new Map();
+  metadata.packages[0].features.fixture = [];
+  const featureContexts = [{ package: "bamboo-agent", features: ["fixture"], targets: [
+    { kind: "lib", name: "bamboo_agent", added: ["extra"] }] }];
+  for (const runtimeStatus of [0, 19]) {
+    const existing = new Set(fs.readdirSync(root));
+    const directory = () => path.join(root, fs.readdirSync(root).find(name => name.startsWith("bamboo-feature-tests-") && !existing.has(name)));
+    const result = runFeatureTests({ root, environment: { RUNNER_TEMP: root, CARGO_TARGET_DIR: path.join(root, "target") },
+      echoLog: false, featureContexts, sourceCatalogSha: sourceFeatureHash(packages, root),
+      runSsh: () => ({ status: 0 }), runSerial: () => ({ status: 0 }), execute: (command, args, options) => {
+        if (command !== "cargo") return { status: 0, stdout: listings.get(command).map(name => name + ": test\n").join("") };
+        if (args[0] === "metadata") return { status: 0, stdout: JSON.stringify(metadata) };
+        const featured = args.includes("--features"), runtime = featured && !args.includes("--no-run");
+        if (runtime) {
+          const progress = JSON.parse(fs.readFileSync(path.join(directory(), "progress.json"), "utf8"));
+          assert.equal(progress.complete, false); assert.equal(progress.current, "feature-run-bamboo-agent-lib-bamboo_agent");
+          assert.equal(progress.contexts.at(-1).label, "feature-build-bamboo-agent");
+          assert.equal(progress.contexts.at(-1).status, 0);
+        }
+        const owner = packages.find(p => p.name === args[args.indexOf("-p") + 1]);
+        for (const target of owner.targets) {
+          const binary = path.join(options.env.CARGO_TARGET_DIR, target.name + (featured ? "-feature" : ""));
+          fs.writeFileSync(binary, "fixture"); listings.set(binary, featured ? ["base", "extra"] : ["base"]);
+          fs.writeSync(options.stdio[1], JSON.stringify({ reason: "compiler-artifact", package_id: owner.id, target,
+            features: featured ? ["fixture"] : [], profile: { test: true }, fresh: runtime, filenames: [binary], executable: binary }) + "\n");
+        }
+        if (runtime) fs.writeSync(options.stdio[1], "test extra ... ok\n");
+        return { status: runtime ? runtimeStatus : 0 };
+      } });
+    const progress = JSON.parse(fs.readFileSync(path.join(result.directory, "progress.json"), "utf8"));
+    assert.equal(progress.complete, runtimeStatus === 0); assert.equal(result.status === 0, runtimeStatus === 0);
+    assert.equal(progress.finished.length, packages.length + featureContexts.length);
+  }
+});
+
+test("diagnostic snapshot survives termination in the next context without claiming completion", { timeout: 8000 }, async (t) => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-progress-cli-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const script = path.join(root, "fixture.cjs"), metadata = metadataFixture();
+  fs.writeFileSync(script, `const fs=require('node:fs'),path=require('node:path');
+const r=require(${JSON.stringify(path.join(__dirname, "run-feature-tests.cjs"))}),root=${JSON.stringify(root)},metadata=${JSON.stringify(metadata)};
+let calls=0;
+r.runFeatureTests({root,environment:{RUNNER_TEMP:root,CARGO_TARGET_DIR:path.join(root,'target')},echoLog:false,featureContexts:[],
+sourceCatalogSha:r.sourceFeatureHash(r.selectedPackages(metadata),root),execute:(command,args,options)=>{
+  if(command!=='cargo')return {status:0,stdout:'ordinary: test\\n'};
+  if(args[0]==='metadata')return {status:0,stdout:JSON.stringify(metadata)};
+  if(++calls===2){process.stdout.write('entered-second-context\\n');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);}
+  const owner=metadata.packages.find(p=>p.name===args[args.indexOf('-p')+1]);
+  for(const target of owner.targets){const binary=path.join(options.env.CARGO_TARGET_DIR,target.name);fs.writeFileSync(binary,'fixture');
+    fs.writeSync(options.stdio[1],JSON.stringify({reason:'compiler-artifact',package_id:owner.id,target,features:[],profile:{test:true},fresh:false,filenames:[binary],executable:binary})+'\\n');}
+  return {status:0};
+}});`);
+  const child = spawn(process.execPath, [script], { cwd: root, env: { PATH: process.env.PATH, HOME: root }, stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+  let entered = false, observed = "";
+  const signal = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("fixture never reached its second context")); }, 5000);
+    child.once("error", reject);
+    child.stdout.on("data", (chunk) => { observed += chunk; if (!entered && observed.includes("entered-second-context")) { entered = true; child.kill("SIGKILL"); } });
+    child.once("close", (_, signal) => { clearTimeout(timer); resolve(signal); });
+  });
+  assert.equal(entered, true); assert.equal(signal, "SIGKILL");
+  const directory = fs.readdirSync(root).find((name) => name.startsWith("bamboo-feature-tests-"));
+  const progress = JSON.parse(fs.readFileSync(path.join(root, directory, "progress.json"), "utf8"));
+  assert.equal(progress.complete, false); assert.equal(progress.phase, "cargo");
+  assert.equal(progress.current, "default-bamboo-broker");
+  assert.deepEqual(progress.finished, ["default-bamboo-agent"]);
+  assert.equal(progress.contexts.length, 1); assert.equal(progress.contexts[0].status, 0);
+  assert.equal(progress.diagnosticOnly, true); assert.equal(progress.source.root, root);
+  assert.equal(progress.source.sourceCatalogSha, sourceFeatureHash(selectedPackages(metadata), root));
+  assert.equal(progress.source.event.GITHUB_SHA, null, "unknown local event identity stays explicit");
 });

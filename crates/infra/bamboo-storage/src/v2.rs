@@ -156,7 +156,9 @@ mod root_lifetime_tests;
 mod root_mode_actor_context_tests;
 mod supervisor;
 mod supervisor_management;
-pub(crate) use supervisor_management::SupervisorFollowupGuard;
+pub(crate) use supervisor_management::{
+    subscriptions::ObserverNoticeAuthority, SupervisorFollowupGuard,
+};
 #[cfg(test)]
 mod supervisor_management_lifetime_tests;
 #[cfg(test)]
@@ -7537,6 +7539,26 @@ impl Storage for SessionStoreV2 {
         self.management_history(supervisor, target_session_id).await
     }
 
+    async fn is_supervisor_observer_child(
+        &self,
+        parent: &Session,
+        child_id: &str,
+    ) -> io::Result<bool> {
+        self.observer_classification(parent, child_id).await
+    }
+
+    async fn supervisor_observer_activation(&self, child: &Session) -> io::Result<bool> {
+        self.observer_activation(child).await
+    }
+
+    async fn load_supervisor_observer_context_target(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<(Session, bamboo_domain::SupervisorObserverContext)> {
+        self.observer_context_target(caller, target_id).await
+    }
+
     async fn load_supervisor_context_target(
         &self,
         supervisor: &bamboo_domain::SupervisorReference,
@@ -9377,6 +9399,9 @@ mod tests {
         let storage = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await?);
         let paused = session_with_history("convoy-full-a", 2, "run-a");
         let unrelated = session_with_history("convoy-full-b", 2, "run-b");
+        // Existing Root updates share lifecycle authority; first births do not.
+        storage.save_session(&paused).await?;
+        storage.save_session(&unrelated).await?;
         let (reached, release) =
             storage.pause_full_save_before_filesystem_commit_for_test(&paused.id);
 
@@ -9404,6 +9429,7 @@ mod tests {
         let storage = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await?);
         let paused = session_with_history("convoy-runtime-a", 2, "run-a");
         let mut unrelated = session_with_history("convoy-runtime-b", 2, "run-b");
+        storage.save_session(&paused).await?;
         storage.save_session(&unrelated).await?;
         unrelated.agent_runtime_state = Some(AgentRuntimeState::new("run-b-next"));
         let (reached, release) =
@@ -9562,6 +9588,7 @@ mod tests {
         let second = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await?);
 
         let unrelated = session_with_history("cross-store-unrelated", 2, "run-b");
+        second.save_session(&unrelated).await?;
         let mut runtime = shared.clone();
         runtime.agent_runtime_state = Some(AgentRuntimeState::new("run-after-cross-store-full"));
         let (reached, release) =

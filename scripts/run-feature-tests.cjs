@@ -8,7 +8,7 @@ const os = require("node:os");
 const { createHash } = require("node:crypto");
 const { spawnSync } = require("node:child_process");
 const SERIAL_STORAGE_FAMILIES = ["root_birth_tests", "host_root_create::tests", "supervisor_management_tests",
-  "supervisor_management_lifetime_tests", "supervisor_proof_tests"].map((name) => "v2::" + name + "::");
+  "supervisor_management_lifetime_tests", "supervisor_proof_tests", "supervisor_management::observer_lock_order_tests"].map((name) => "v2::" + name + "::");
 const SERIAL_STORAGE_FILTERS = ["root_birth_tests", "host_root_create::tests", "supervisor_management", "supervisor_proof"];
 const SERIAL_STORAGE_SELECTORS = [...SERIAL_STORAGE_FAMILIES,
   "session_merge::tests::supervisor_management_race_rejects_staged_task_callbacks_and_fresh_invocation_succeeds"];
@@ -16,7 +16,7 @@ const ROOT_BIRTH_CASES = ["root_birth_existing_root_progress_and_scope_reads_rem
   "root_birth_all_entrypoints_wait_for_retained_shared_authority", "root_birth_final_shared_writer_guard_and_missing_title_fail_closed",
   "root_birth_cancel_retains_exclusive_owner_and_pending_proof_stays_closed"];
 const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_without_transport_feature_fails_without_starting_exporter";
-const FEATURE_SOURCE_SHA256 = "26fb3ce42d5e752252cc98cf02436cf40ba1c6df6458e776007442553a5d3af5";
+const FEATURE_SOURCE_SHA256 = "c5314706eab6baa083a6c777f6ce5f24461551dfeb36b51ff7c2e4b39a0cb93e";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
@@ -40,6 +40,7 @@ const FEATURE_CONTEXTS = [
     { name: "env_cache_isolation", kind: "test", added: ["scoped_env_cache_survives_parallel_global_publication_and_restores_nested_state"] }] },
   { package: "bamboo-agent", features: ["ticket-runtime-fixtures"], targets: [
     { name: "ticket_runtime_publication", kind: "test", added: [
+      "fixture::startup_log_rejects_previous_launch_and_foreign_listener",
       "actual_intent_exit_before_or_after_head_never_launches_unpublished_or_unknown_work",
       "actual_admission_exit_retains_exact_prepared_run_without_worker_execution",
       "actual_result_exit_recovers_submission_before_broker_ack_without_reexecution"] },
@@ -125,6 +126,7 @@ function sourceFeatureHash(packages, root) {
 function cargoArguments(owner, context, compileOnly = false) {
   const args = ["test", "--locked", "--no-fail-fast", "--message-format=json-render-diagnostics", "-p", owner.name];
   if (context) {
+    if (!compileOnly) assert.equal(context.targets.length, 1, "Runtime filters must belong to one target");
     args.push("--features", context.features.join(","));
     for (const target of context.targets) {
       assert.ok(["lib", "test"].includes(target.kind), "Review a new additive target kind");
@@ -201,7 +203,13 @@ function runSerialStorage(binary, options, execute = spawnSync) {
   return result;
 }
 function artifactKey(item) {
-  return JSON.stringify([item.package_id, item.target.name, item.target.kind, item.features, item.profile, item.filenames]);
+  return JSON.stringify([item.package_id, item.target.name, item.target.kind, item.features, item.profile, item.filenames, item.executable]);
+}
+function executableHash(file) {
+  const hash = createHash("sha256"), block = Buffer.alloc(1024 * 1024), fd = fs.openSync(file, "r");
+  try { let size; while ((size = fs.readSync(fd, block, 0, block.length, null))) hash.update(block.subarray(0, size)); }
+  finally { fs.closeSync(fd); }
+  return hash.digest("hex");
 }
 function evidence(item) {
   assert.ok(Array.isArray(item.features) && typeof item.fresh === "boolean" && item.profile && item.target);
@@ -235,7 +243,24 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
     "Feature-sensitive source changed; review and update its explicit case ownership before admission");
   const directory = fs.mkdtempSync(path.join(environment.RUNNER_TEMP || os.tmpdir(), "bamboo-feature-tests-"));
   const contexts = [], defaults = new Map();
+  const plan = [...packages.map((owner) => ({ label: "default-" + owner.name })),
+    ...featureContexts.map((context) => ({ label: "feature-" + context.package, features: context.features, targets: context.targets }))];
+  const finished = [], source = { root, sourceCatalogSha,
+    controllerSha256: createHash("sha256").update(fs.readFileSync(__filename)).digest("hex"),
+    event: Object.fromEntries(["GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_WORKFLOW_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"]
+      .map((key) => [key, environment[key] || null])) };
+  function checkpoint(phase, current, command = null, complete = false) {
+    // Diagnostics only: never read this file as a resume/skip or acceptance input.
+    // Rename within the existing evidence directory retains the last whole snapshot
+    // if this controller is killed while writing the next one.
+    const temporary = path.join(directory, "progress.json.tmp");
+    fs.writeFileSync(temporary, JSON.stringify({ diagnosticOnly: true, complete, phase, current, command,
+      source, targetDirectory: env.CARGO_TARGET_DIR, plan, finished, contexts }, null, 2) + "\n");
+    fs.renameSync(temporary, path.join(directory, "progress.json"));
+  }
+  checkpoint("planned", null);
   function cargo(label, args) {
+    checkpoint("cargo", label, ["cargo", ...args]);
     const logPath = path.join(directory, label + ".log"), fd = fs.openSync(logPath, "wx");
     let result;
     try { result = execute("cargo", args, { cwd: root, env, stdio: ["ignore", fd, "inherit"] }); }
@@ -246,9 +271,11 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
     const receipt = { label, command: ["cargo", ...args], targetDirectory: env.CARGO_TARGET_DIR,
       status: result.error ? 1 : result.status ?? 1, artifacts: units.map(evidence) };
     contexts.push(receipt);
+    checkpoint("cargo-finished", label, receipt.command);
     return { receipt, log, units };
   }
   function catalog(run, owner) {
+    checkpoint("catalog", run.receipt.label);
     const rows = run.units.filter((item) => item.package_id === owner.id && item.profile.test && item.executable);
     const result = {};
     for (const row of rows) {
@@ -275,6 +302,7 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
       }
       if (owner.name === "bamboo-storage") {
         const binary = compiledExecutable(run.log, owner, env.CARGO_TARGET_DIR, "bamboo_storage", "lib");
+        checkpoint("storage-serial", run.receipt.label);
         const serial = runSerial(binary, { ...packageOptions(owner, root, env),
           logPath: path.join(directory, "storage-serial.log"), echoLog }, execute);
         run.receipt.serialStatus = serial.error ? 1 : serial.status ?? 1;
@@ -283,6 +311,7 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
       if (owner.name === "bamboo-broker") {
         const binary = sshExecutable(run.log, owner, env.CARGO_TARGET_DIR);
         const sshEnv = { ...packageOptions(owner, root, env).env, BAMBOO_RUSSH_TEST_EXECUTABLE: binary };
+        checkpoint("live-ssh", run.receipt.label);
         const ssh = runSsh ? runSsh(binary, { cwd: root, env: sshEnv })
           : execute("bash", ["scripts/run-russh-live.sh"], { cwd: root, env: sshEnv, stdio: "inherit" });
         run.receipt.sshStatus = ssh.error ? 1 : ssh.status ?? 1;
@@ -293,6 +322,8 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
       else { run.receipt.status ||= 1; run.receipt.error = error.message; }
       if (echoLog) process.stderr.write(owner.name + ": " + error.message + "\n");
     }
+    finished.push("default-" + owner.name);
+    checkpoint("context-finished", "default-" + owner.name);
   }
   for (const context of featureContexts) {
     let compile;
@@ -302,25 +333,53 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
       compile = cargo("feature-build-" + owner.name, cargoArguments(owner, context, true));
       assert.equal(compile.receipt.status, 0, "Feature compilation failed");
       const current = catalog(compile, owner), previous = defaults.get(owner.name);
+      compile.receipt.catalog = current;
       validateFeatureCatalog(context, previous, current);
-      const runtime = cargo("feature-run-" + owner.name, cargoArguments(owner, context));
-      assert.equal(runtime.receipt.status, 0, "Additive feature runtime failed");
-      assert.deepEqual(successfulCases(runtime.log), context.targets.flatMap((target) => target.added).sort(),
-        "Run every additive case once and no ordinary case twice");
-      assert.deepEqual(runtime.units.map(artifactKey).sort(), compile.units.map(artifactKey).sort(), "Feature runtime must reuse the compiled unit set");
-      assert.ok(runtime.units.every((item) => item.fresh), "Feature runtime must reuse its existing Cargo artifacts");
-      runtime.receipt.cases = context.targets.flatMap((target) => target.added).sort();
+      const units = new Set(compile.units.map(artifactKey));
+      const targets = context.targets.map((target) => {
+        assert.ok(target.added.length, "A runtime target needs explicit additive cases");
+        const executable = compiledExecutable(compile.log, owner, env.CARGO_TARGET_DIR, target.name, target.kind);
+        return { target, executable, sha256: executableHash(executable) };
+      });
+      compile.receipt.targetExecutables = targets.map(({ target, executable, sha256 }) => ({ name: target.name, kind: target.kind, executable, sha256 }));
+      for (const selected of targets) {
+        const { target, executable, sha256 } = selected;
+        const label = "feature-run-" + owner.name + "-" + target.kind + "-" + target.name;
+        let runtime;
+        try {
+          // Filters belong to one harness, even when another target has the same name.
+          runtime = cargo(label, cargoArguments(owner, { ...context, targets: [target] }));
+          runtime.receipt.target = { name: target.name, kind: target.kind, executable, sha256 };
+          assert.equal(runtime.receipt.status, 0, "Additive feature runtime failed");
+          assert.deepEqual(successfulCases(runtime.log), [...target.added].sort(), "Run only this target's additive cases once");
+          const keys = runtime.units.map(artifactKey);
+          assert.equal(new Set(keys).size, keys.length, "Duplicate runtime compiler units");
+          assert.ok(keys.every((key) => units.has(key)), "Runtime units must belong to the original compilation");
+          assert.ok(runtime.units.every((item) => item.fresh), "Feature runtime must reuse its existing Cargo artifacts");
+          assert.equal(compiledExecutable(runtime.log, owner, env.CARGO_TARGET_DIR, target.name, target.kind), executable);
+          assert.equal(executableHash(executable), sha256, "Runtime must retain the original target executable bytes");
+          runtime.receipt.cases = [...target.added].sort();
+        } catch (error) {
+          if (!runtime) contexts.push({ label, status: 1, error: error.message });
+          else { runtime.receipt.status ||= 1; runtime.receipt.error = error.message; }
+          if (echoLog) process.stderr.write(label + ": " + error.message + "\n");
+        }
+      }
     } catch (error) {
       if (!compile) contexts.push({ label: "feature-" + context.package, status: 1, error: error.message });
       else { compile.receipt.status ||= 1; compile.receipt.error = error.message; }
       if (echoLog) process.stderr.write(context.package + ": " + error.message + "\n");
     }
+    finished.push("feature-" + context.package);
+    checkpoint("context-finished", "feature-" + context.package);
   }
   for (const receipt of contexts) fs.writeFileSync(path.join(directory, receipt.label + ".json"), JSON.stringify(receipt, null, 2) + "\n");
   const status = contexts.find((context) => context.status !== 0)?.status || 0;
   if (environment.GITHUB_STEP_SUMMARY) fs.appendFileSync(environment.GITHUB_STEP_SUMMARY,
     "Feature Unit/E2E: " + packages.length + " independent default package contexts; " + featureContexts.length +
     " explicit additive feature contexts; one owned target directory. Status: " + status + ".\n");
+  checkpoint("finished", null, null, status === 0 && finished.length === plan.length &&
+    contexts.length === packages.length + featureContexts.reduce((count, context) => count + 1 + context.targets.length, 0));
   return { status, contexts, directory, packages: packages.map((item) => item.name) };
 }
 

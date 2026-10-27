@@ -427,10 +427,10 @@ pub(super) fn build_root_tools(
     // Planning is delegated to one runtime-enforced read-only child. This keeps
     // the root session in its normal orchestrator posture and reuses the same
     // durable child/wait/completion path as `SubAgent`.
-    let plan_tool = Arc::new(crate::tools::PlanTool::new(
-        adapter.clone(),
-        adapter.clone(),
-    ));
+    let plan_tool = Arc::new(
+        crate::tools::PlanTool::new(adapter.clone(), adapter.clone())
+            .with_artifact_home(session_store.bamboo_home_dir().to_path_buf()),
+    );
     let tools_with_plan: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         tools_with_sub_agent,
         plan_tool,
