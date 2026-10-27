@@ -40,8 +40,10 @@ feature branch before merging; record exact source, commands and results.
 Ubuntu `Quick Checks` owns the 46 Supervisor component/protocol registrations
 and 15 frontend artifact/policy registrations once. Each native feature job
 runs the same 61 portable Node registrations once on its own OS; retain the
-Windows unsupported-platform assertions. These do not execute the separate
-`browser-runtime` Node suites, whose missing automatic owner is pending.
+Windows unsupported-platform assertions. The `Browser Runtime Unit and E2E`
+feature job owns all `browser-runtime` Node test files on Node 24; both feature
+aggregates require it to pass. Do not add a second automatic owner for those
+tests.
 Keep the standalone default storage authority families' serial selection in that same
 executor, reusing its compiled library-test executable without repeating cases.
 `Quick Checks` remains auxiliary and never substitutes for runtime tests.
