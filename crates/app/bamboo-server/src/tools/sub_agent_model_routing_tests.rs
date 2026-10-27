@@ -161,9 +161,12 @@ async fn routing_contract_subagent_precedence_and_hot_changes_preserve_exact_ref
                         .insert("coder".into(), expected.clone());
                 }
             }
+            let mut args = create_args(&harness);
+            args["prompt"] = json!(format!("Synthetic routing witness for step {step}"));
+            args["title"] = json!(format!("Synthetic routing step {step}"));
             let result = invoke_completed(
                 &harness.tool,
-                create_args(&harness),
+                args,
                 subagent_test_ctx(&harness.parent_session_id, "synthetic-valid-child-role"),
             )
             .await
