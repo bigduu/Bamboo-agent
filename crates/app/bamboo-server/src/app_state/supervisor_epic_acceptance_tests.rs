@@ -605,10 +605,26 @@ async fn host(home: &Path, probe: Arc<Probe>) -> AppState {
         .memory_mut()
         .get_or_insert_with(Default::default)
         .auto_dream_enabled = false;
-    let state =
+    let mut state =
         AppState::new_with_provider_for_legacy_ingress_test(home.into(), config, probe.clone())
             .await
             .unwrap();
+    // The test question is an input simulator on the same supported Root
+    // surface hot-reload seam as session_control's real clarification cases.
+    // Native activation still binds the actual Actor writer and event handoff.
+    let root = Arc::new(crate::tools::OverlayToolExecutor::new(
+        state.tools_for(crate::tools::ToolSurface::Root),
+        Arc::new(ExistingOwnerQuestion),
+    ));
+    state
+        .child_completion_coordinator
+        .set_root_tools(root.clone())
+        .await;
+    state.tool_factory = crate::tools::ToolSurfaceFactory::new(
+        state.tools_for(crate::tools::ToolSurface::Base),
+        state.tools_for(crate::tools::ToolSurface::WithTask),
+        root,
+    );
     state.provider_registry.replace_with(ProviderRegistry::new(
         HashMap::from([(PROVIDER.into(), probe as Arc<dyn LLMProvider>)]),
         PROVIDER.into(),
@@ -765,28 +781,35 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         }
     }
     let original_control = load(&state, CONTROL_ROOT).await;
-    // Produce the original blocker through a real provider tool call and
-    // runtime clarification persistence, on the already independent Root.
-    // The question itself is never assigned into Session by the fixture.
-    let mut blocked = load(&state, ROOT_A).await;
-    let tools = Arc::new(crate::tools::OverlayToolExecutor::new(
-        state.tools_for(crate::tools::ToolSurface::Root),
-        Arc::new(ExistingOwnerQuestion),
-    ));
-    let (events, mut receiver) = tokio::sync::mpsc::channel(100);
-    let drain = tokio::spawn(async move { while receiver.recv().await.is_some() {} });
-    state.agent.execute_direct(&mut blocked,bamboo_engine::ExecuteRequestBuilder::new(
+    // Produce the blocker through the actual Inbox/Host/Actor execution route,
+    // then its real tool call and runtime clarification checkpoint. The
+    // question itself is never assigned into Session by the fixture.
+    user(
+        &state,
+        ROOT_A,
         "Ask the existing owner which bounded approach is authorized; wait for their answer.",
-        events,tokio_util::sync::CancellationToken::new()).tools(tools)
-        .provider_override(probe.clone()).model(BLOCKED_MODEL).build()).await.unwrap();
-    drain.await.unwrap();
+    )
+    .await;
     let paused = wait(&state, ROOT_A, |session| {
-        session
-            .pending_question
-            .as_ref()
-            .is_some_and(|question| question.tool_call_id == "epic-existing-owner-question")
+        session.last_run_status().as_deref() == Some("suspended")
+            && session
+                .pending_question
+                .as_ref()
+                .is_some_and(|question| question.tool_call_id == "epic-existing-owner-question")
     })
     .await;
+    tokio::time::timeout(WAIT, async {
+        while state
+            .session_activation_router
+            .current_run_id(ROOT_A)
+            .await
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the actual blocked Root must release its execution owner before the snapshot");
     assert_eq!(paused.last_run_status().as_deref(), Some("suspended"));
     assert_eq!(probe.blocked_calls.load(Ordering::SeqCst), 1);
     // No configure_project_scope or attach call: Supervisor management is
@@ -795,6 +818,11 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
     // consume that contract; this fixture cannot manufacture it. Tracker
     // registration below deliberately retains its explicit fixed target set.
     let original_a = load(&state, ROOT_A).await;
+    assert_eq!(original_a.last_run_status().as_deref(), Some("suspended"));
+    assert_eq!(
+        serde_json::to_value(&original_a.pending_question).unwrap(),
+        serde_json::to_value(&paused.pending_question).unwrap()
+    );
     let original_b = load(&state, ROOT_B).await;
     let parent = load(&state, parent_id).await;
     let parent_identity = context_identity(&parent);
