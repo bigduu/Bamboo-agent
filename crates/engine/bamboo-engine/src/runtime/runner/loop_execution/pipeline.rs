@@ -1248,6 +1248,12 @@ async fn maybe_suspend_for_orphaned_children(
                 &child_id,
             )
             .await
+                && !storage
+                    .is_supervisor_observer_child(session, &child_id)
+                    .await
+                    .map_err(|error| {
+                        AgentError::Tool(format!("Observer classification unavailable: {error}"))
+                    })?
             {
                 ordinary.push(child_id);
             }
