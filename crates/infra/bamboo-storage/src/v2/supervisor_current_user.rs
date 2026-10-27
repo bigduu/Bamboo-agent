@@ -229,7 +229,21 @@ impl SessionStoreV2 {
             .actor_authority_location(id)
             .await
             .map_err(|error| other_io_error(error.to_string()))?;
-        let raw = fs::read(self.abs_path_from_rel(&relative).join(RUNTIME_SIDECAR_FILE)).await?;
+        let raw = match fs::read(self.abs_path_from_rel(&relative).join(RUNTIME_SIDECAR_FILE)).await
+        {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A legacy Child may have only canonical Main. Reuse its strict
+                // control view; Root runtime/proof and Child lifetime checks
+                // remain intact, and messages are never decoded for a query.
+                let (_, root_id) = Self::copy_source_identity_from_rel(id, &relative)?;
+                let candidate = self.peer_delivery_control_session(id, &root_id).await?;
+                return Ok(candidate
+                    .project_id_meta()
+                    .is_some_and(|project| project.to_lowercase().contains(query)));
+            }
+            Err(error) => return Err(error),
+        };
         #[derive(Deserialize, Default)]
         struct Project {
             #[serde(default)]
