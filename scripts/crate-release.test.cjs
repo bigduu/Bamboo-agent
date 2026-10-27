@@ -1078,7 +1078,7 @@ test('minimal frozen publisher limits CI reads and native credentials', () => {
 function workflowPython(name, filename = '.github/workflows/publish-crate.yml') {
   const archived = name === 'Authorize the exact source before checkout' ||
     (name === 'Authenticate completed release acceptance before checkout' && filename === '.github/workflows/ci.yml')
-  const source = archived ? require('./tests/main-authority-bootstrap-fixture.cjs').legacyData()[
+  const source = archived ? require('./tests/main-authority-bootstrap-fixture.cjs').acceptedDevData()[
     filename === '.github/workflows/ci.yml' ? 'ci' : 'publisher'] : fs.readFileSync(filename, 'utf8')
   const step = source.split(`      - name: ${name}`)[1]
   const match = step.match(/          python3 - <<'(PY(?:THON)?)'\n([\s\S]*?)\n          \1\n/)
@@ -1194,8 +1194,7 @@ test('historical server producer and verifier remain byte-pinned', () => {
 })
 
 test('historical v8 admission pins the archived workflow and helper without a circular hash', () => {
-  const { ci, publisher } = require('./tests/main-authority-bootstrap-fixture.cjs').legacyData()
-  const helper = fs.readFileSync('scripts/main-release-admission.py', 'utf8')
+  const { ci, publisher, admissionHelper: helper } = require('./tests/main-authority-bootstrap-fixture.cjs').acceptedDevData()
   const pin = /ADMISSION_HELPER_SHA256: "([0-9a-f]{64})"/g
   assert.deepEqual([...ci.matchAll(pin)].map(match => match[1]), [sha256(helper)])
   assert.deepEqual([...publisher.matchAll(pin)].map(match => match[1]), [sha256(helper)])

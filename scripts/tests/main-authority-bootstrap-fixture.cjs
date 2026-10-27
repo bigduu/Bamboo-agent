@@ -43,6 +43,34 @@ function legacyData() {
     contributingRelease: value.contributingRelease, gitflowLegacy: value.gitflowLegacy })
   return legacy
 }
+// Complete raw producer/controller tuple from the final accepted protected Dev.
+// The earlier ce89 policy/docs fixture above retains its own immutable identity.
+let acceptedDev
+function acceptedDevData() {
+  if (acceptedDev) return acceptedDev
+  const bytes = fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-v8-accepted-dev.json.gz'))
+  const hash = value => createHash('sha256').update(value).digest('hex')
+  assert.ok(bytes.length <= 32768)
+  assert.equal(hash(bytes), '17e281c13ec9973bc2fd4452c99ff0c4155433cbea1c42c0c48c37d0c74626a7')
+  const value = JSON.parse(require('node:zlib').gunzipSync(bytes, { maxOutputLength: 256 * 1024 }))
+  assert.equal(value.schemaVersion, 1); assert.equal(value.fixtureOnly, true)
+  assert.equal(value.kind, 'bamboo-accepted-dev-ci-publication-testdata/v8')
+  assert.equal(value.sourceRevision, 'f0eb67c378e87e203fe490c85c54a89683608624')
+  for (const [name, digest] of Object.entries({
+    ci: '511180e1a71c8b62db12324c2082b63a1c38ee289547c10b58a8b09ce4bbdc86',
+    publisher: 'f60967494a4ff359e71078aad7dd57ff6c75d3d16cd9f0dfd13fa9f35a684a7c',
+    admissionHelper: 'cf41d9e30e2deb65f191e705e2e74e94f747b76cdf8574ea57b2d4a26fadf449',
+  })) {
+    assert.equal(typeof value[name], 'string'); assert.ok(Buffer.byteLength(value[name]) <= 128000)
+    assert.equal(hash(value[name]), digest); assert.equal(value.sha256[name], digest)
+  }
+  const normalized = value.ci.replace(/ADMISSION_HELPER_SHA256: "[0-9a-f]{64}"/g,
+    'ADMISSION_HELPER_SHA256: "<PINNED_ADMISSION_HELPER>"')
+  assert.equal(hash(normalized), '64e739dc9583c0bf6969c5a297564c48cfa2b8afbdad66a0355116aab96d0902')
+  assert.equal(value.sha256.normalizedCi, hash(normalized))
+  acceptedDev = Object.freeze({ ci: value.ci, publisher: value.publisher, admissionHelper: value.admissionHelper })
+  return acceptedDev
+}
 const FULL = ['Validation Source', 'Test', 'E2E Tests', 'Lint',
   'MSRV (Rust 1.95)', 'Security Audit', 'cargo-deny (licenses/bans/advisories/sources)',
   'Documentation', 'TLS Fixture (macos-latest)', 'TLS Fixture (windows-latest)',
@@ -70,9 +98,9 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
   }
   git('init', '-q')
   // Frozen producer bytes, not an active workflow or a caller-authored receipt.
-  const definition = current ? Buffer.from(legacyData().ci)
+  const definition = current ? Buffer.from(acceptedDevData().ci)
     : fs.readFileSync(path.join(__dirname, `fixtures/main-authority-ci-${producer}.yml`))
-  const helper = fs.readFileSync('scripts/main-release-admission.py')
+  const helper = current ? Buffer.from(acceptedDevData().admissionHelper) : fs.readFileSync('scripts/main-release-admission.py')
   const helperDigest = createHash('sha256').update(helper).digest('hex')
   const producerHelper = grouped || (crates && !current)
     ? fs.readFileSync(path.join(__dirname, `fixtures/main-authority-admission-${producer}.py`)) : helper
@@ -746,4 +774,4 @@ with patch('subprocess.check_output', output):
     assert.equal(result.output, '')
   })
 }
-module.exports = { verify, legacyData }
+module.exports = { verify, legacyData, acceptedDevData }
