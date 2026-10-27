@@ -2,6 +2,14 @@
 
 Read [README.md](./README.md) for the product boundary. Use this canonical Jiandu memory contract:
 
+Before CI or release work, read the complete local
+[shared delivery workflow](docs/delivery-workflow.md),
+[Actions ownership audit](docs/ci-workflow-audit.md) and
+[Bamboo commands and test map](docs/releases/ci-publication-flow.md).
+Every agent follows the same feature/dev/release/main ownership and checkpoint
+procedure. The full shared documents are present in this repository; consult
+their activation table and verify live evidence before using a proposed path.
+
 - Session memory is continuity for the current session. Project memory holds durable project facts and decisions; Global memory holds cross-project user context.
 - Recall with a short lexical query. Use Jiandu's compact default top three `id`/summary results, then `get` only the selected item that needs full context.
 - Query before writing. Store one confirmed atomic fact with a specific title and a few useful keywords, entities, and tags.
