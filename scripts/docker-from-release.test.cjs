@@ -73,10 +73,12 @@ test("Docker locator reads original physical log, then delegates all authority",
   await assert.rejects(consumer.locate({ ...reads, json: async () => ({ total_count: 3, jobs }) }, 10), /Incomplete/);
   await assert.rejects(consumer.locate({ ...reads, jobLog: async () => line + "\n" + line }, 10), /duplicate/);
 });
-test("Docker preserves both architectures and explicitly blocks missing ARM originals", () => {
+test("Docker preserves standard native targets and maps the separate ARM original", () => {
   assert.deepEqual(consumer.PLATFORMS, ["linux/amd64", "linux/arm64"]);
   assert.equal(consumer.target("linux/amd64"), "x86_64-unknown-linux-gnu");
-  assert.throws(() => consumer.target("linux/arm64"), /#2353/);
+  assert.equal(consumer.target("linux/arm64"), "aarch64-unknown-linux-gnu");
+  assert.deepEqual(require("./sidecar-release.cjs").TARGETS,
+    ["aarch64-apple-darwin", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]);
   assert.throws(() => consumer.target("linux/386"), /Unknown Docker architecture/);
 });
 test("Docker original bytes require both exact size and SHA", () => {
