@@ -3084,6 +3084,9 @@ mod constructor_parity_tests {
             .session_delivery(bamboo_engine::SessionActivationRouter::new())
             .model("claude-test")
             .instruction("constructor fixture")
+            .test_memory_store(bamboo_memory::memory_store::MemoryStore::new(
+                root.join("jiandu"),
+            ))
             .with_defaults_for_data_dir(root.into())
             .await
             .unwrap()
