@@ -545,7 +545,7 @@ async function verifyMergedPromotion(input, reads, policy = {}) {
       physicalAttempt: docs[0].physicalAttempt, snapshotRevision: facts.feature.snapshotRevision, sourceTree: facts.source.tree,
       producerDigest: facts.feature.producerDigest, artifactName: "feature-docs-" + facts.feature.runId + "-" + docs[0].physicalAttempt } };
 }
-module.exports = { PREFIX, KIND, CONTROLLER_HELPERS, ACCEPTED_RELEASE_PRODUCERS, frame, assetReference, selectJobs, treeLeaves,
+module.exports = { PREFIX, KIND, CONTROLLER_HELPERS, ACCEPTED_RELEASE_PRODUCERS, frame, assetReference, selectJobs, treeLeaves, releaseIdentity, assetIdentities,
   verifyPublishedSource, verifyPromotion, MAIN_WORKFLOW, MAIN_WORKFLOW_SHA256, MAIN_JOB, MAIN_STEP, MAIN_PREFIX, MAIN_KIND,
   MAIN_CONTROLS, closure, promotionTree, mainLocator, mainAuthority, logFrame, mainFrameLine, mainSuite, mainExecution, verifyMergedPromotion,
   CONTROLLER_PREFIX, CONTROLLER_KIND, controllerTree, verifyControllerMaintenance, controllerLogFrame, controllerFrameLine };

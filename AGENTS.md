@@ -404,9 +404,31 @@ Docker consumes an authenticated completed release. Its only automatic event is
 completed `Publish Crate`; a manual selector names the exact original run. Tags
 and main pushes do not compile Bamboo or stage another frontend. Keep Docker
 controller D, publisher C and compiled source S separate. Reuse zero-argument
-`main-admission.cjs.createPublicReads()` and real `verifyPublishedSource`; JSON,
-digests and fixture policy are data, never publication authority. Production
-registries remain empty until the coordinated cutover.
+`main-admission.cjs.createPublicReads()`. #2361 makes the real Source job the
+sole full `verifyPublishedSource` caller. Its bounded canonical handoff is
+accepted only from the same R/D's original successful physical Source job,
+official attempt and step/log; JSON or an approval boolean grants no authority.
+Workers never fall back to the full verifier. Production registries remain
+empty until the coordinated cutover.
+
+Every public zero-argument `authenticated()` call re-authenticates that Source
+and refreshes Main/Dev protection, normal ancestry, frozen ref, exact accepted
+feature context, publisher jobs/completion, Release/tag/assets and registry
+checks. The completed original job fingerprints were independently proven once;
+fresh complete latest/all/original-attempt projections must still match them.
+Keep API metadata X distinct from actual workflow/checkout D. Equal current
+Main/Dev SHAs use the Source-proven anchor's reflexive ancestry; a changed head
+requires the official forward comparison. Main's own full verifier is unchanged.
+
+Only the real Source role may retry a failed first read-only proof, after
+complete old attempt evidence proves every Source ended without success and
+every declared downstream node was skipped with empty steps. The exact static
+image-name template may stand for its skipped two-platform matrix only after
+the bound D workflow's name/needs/matrix bytes match the fixed definition.
+Unknown, mixed or duplicate placeholders and started workers stop. An existing successful
+Source always uses its original proof; lost successful evidence cannot trigger
+another full proof. A whole rerun records guarded reuse, preserving the first
+physical full-proof identity; latest Source failure blocks workers.
 
 `arm-originals` is the sole Docker-only aarch64-unknown-linux-gnu producer.
 It runs on a real ARM runner, pins official Rust 1.99.1 Bookworm by ARM manifest
@@ -451,8 +473,13 @@ real read-only reuse path, skipping assembly, smoke, push and another upload.
 A successful assembly without a complete authenticated carrier stops. Cross-consumer-run/D recovery is
 unsupported in code: the same Source run or an unknown prior producer points
 back to its original consumer instead of assembling again.
-After carrier/history reads, rerun the real completed-publication verifier and
-compare the held source/release/controller/completion identity before each write.
+After carrier/history reads, re-authenticate the original Source and all live
+guards, comparing held source/release/controller/completion before each write.
+Image stage may only authenticate and copy immutable originals into owned
+scratch initially; its complete live guard and actual consumer-step check must
+finish before it emits any build-context output. On drift, retain scratch but
+emit no context and start no build. Do not add an argv/policy bypass or repeat
+the successful full Source download sweep in a worker.
 The Docker consumer is staged: Node/tiny archive fixtures are not image evidence.
 Real compatibility smoke and Docker control-closure/Ops activation remain pending.
 The Host parser's decoded eight-MiB role limit is unchanged; only its bounded

@@ -917,13 +917,13 @@ check, and no new-contract image/publication has been exercised. Activation also
 requires the separate Ops control-closure update; #2320 does not change
 `MAIN_CONTROLS`, default branch, protection, signing or version allocation.
 
-`docker-from-release.cjs` uses the inherited #2351 zero-argument public read port
-and calls the real `verifyPublishedSource` without policy injection. The original
-physical finalizer frame supplies locators only. Official source/controller,
-run/check suite, complete helper closure, raw original ZIP/asset bytes and crate
-registry proof remain the existing public verifier's responsibility. Failed,
-missing, expired, foreign or incomplete release evidence stops consumption.
-Keep Docker D, publisher C, tested M and compiled S identities unchanged.
+`docker-from-release.cjs` uses the inherited #2351 zero-argument public read port.
+The Source job alone calls the real `verifyPublishedSource` without policy
+injection, including official source/controller, complete helper closure,
+physical executions, raw original ZIP/assets and registry proof. The original
+publisher finalizer frame supplies locators to this full verifier. Failed,
+missing, expired, foreign or incomplete evidence stops consumption. Keep
+Docker D, publisher C, tested M and compiled S identities unchanged.
 
 For x64, stage the original `x86_64-unknown-linux-gnu` executable and Host tar
 from that completed release. The Host manifest must enumerate exactly its three
@@ -1000,9 +1000,13 @@ The workflow_run platform roles still need real Ops observation before activatio
 Cross-run/D restoration is deliberately unsupported; repeat publisher completion
 events or manual dispatches cannot silently start another formal image output.
 Every registry write freshly rechecks the live consumer attempt and write step.
-Immediately before that check, rerun the real zero-argument completed-publication
-proof after the long carrier/history reads; reject a changed held Docker D,
-source S, Release, publisher C or completion identity. Mocked CLI fixtures prove
+Immediately before that check, re-authenticate the actual original Source and
+refresh its mutable guards after long carrier/history reads; reject changed
+held Docker D, source S, Release, publisher C or completion identity. Stage
+authenticates/copies immutable originals into owned scratch first, then performs
+the complete live guard and actual current-step check before any build-context
+output. Drift retains scratch for diagnosis and exposes no context or build.
+Mocked CLI fixtures prove
 that changes during a carrier read prevent the registry command, not publication
 acceptance.
 
@@ -1026,6 +1030,66 @@ owners` test in `release-frontend-policy.test.cjs`, and
 `actionlint .github/workflows/docker-publish.yml`. Quick Checks imports the new
 consumer fixtures once. These use real tiny tar data, mocked read ports and
 static routing only; they do not pull/build/run/publish an image or certify ABI.
+
+### One Docker Source proof (#2361, staged)
+
+The existing Source log transport carries one canonical, at most 64-KiB decoded
+`bamboo-docker-source-proof/v1` record with `publicationAuthorized:false`.
+Authentication requires the real same-run/D Source job, complete original
+attempt membership, direct job identity, completed required step and unique
+in-window log record. Actual `GITHUB_WORKFLOW_SHA` and ordinary clean checkout
+bind executed D; the official API/job/file URL metadata binds X to itself.
+A same-name/App check or supplied success JSON cannot replace this proof.
+
+Its successful full proof independently attests immutable definitions, original
+downloads and completed physical fingerprints. Workers check fresh complete
+latest/all/original-attempt inventories against those fingerprints instead of
+repeating their direct-job GETs. Every live guard still checks default/protected
+Main, enforced Dev checks, frozen S ref, unchanged merged feature/CI context,
+current publisher projection and original canonical completion digest,
+Release/body/tag/complete asset identities and public registry checks. Original
+consumed bytes retain their hash/size and before/after metadata checks.
+
+Source proves publisher C and Docker D ancestors of actual Main H, and S an
+ancestor of actual Dev A. An unchanged 40-hex head is reflexively that verified
+anchor. Changed heads require official forward ancestry comparisons, retaining
+all protection checks. This reuses immutable facts, not API responses. The
+public zero-argument factory always executes the full live guard; only stage's
+private loader may defer that guard until its final pre-context boundary.
+Main's independent full publication verifier and inactive registries are unchanged.
+
+Copied successes preserve the earliest physical Source. A complete workflow
+rerun emits a reuse record linked directly to its original full proof; it does
+not claim a second full verification. Latest failed/pending/skipped Source
+blocks workers. Missing recorded-success logs stop, with no full-verifier
+fallback or cross-run/D restoration. Only Source can retry an unsuccessful
+first read: every earlier attempt must have one finished non-successful Source
+and every exact declared downstream job (including images and scan) must be
+completed/skipped with empty steps. The exact literal
+`Repackage originals (${{ matrix.platform }})` may represent the unexpanded
+two-platform matrix only when the clean, bound D workflow's 542-byte
+name/needs/permissions/matrix block hashes to
+`d73e12ecbc812790eb16e488ae56db50691cf606249a6584ae9b8e983b621218`.
+Both fully expanded image names remain supported. Unknown/mixed/duplicate
+placeholders, missing attempt evidence or any started worker stop. A generic
+skipped name does not establish this shape. No automatic retry loop is added.
+
+The fixed inert 30-crate, 12-feature-job, seven-publisher-job, first-attempt
+profile measured 791 REST requests across Source, all authentication/guard roles
+and seven current-step refreshes. Its unchanged asset/carrier/latest paths add
+56 audited requests, giving a conservative 847 bound; 64 GraphQL queries and
+600 public crates.io reads are separate. The original 869-budget RED is retained.
+Only one full verification completes in the cold path; the frame measured
+28,684 bytes. These are fixture counts, not hosted runtime or a universal quota
+bound: final producer profiles, pagination, histories and failed-read retries
+need fresh accounting before activation. No product tests/compilers, new
+credential, store or API transport are introduced by this handoff.
+
+While iterating, run only the newly affected `Docker Source2361` name selections
+and the existing affected carrier/metadata contracts; successful old suites do
+not need repetition for documentation edits. Quick Checks continues registering
+the same Docker test module once. Tiny archives and inert CLI ports prove the
+guard paths; native Source-R outputs and actual image acceptance remain pending.
 
 ### Docker ARM original producer (#2353, staged)
 
