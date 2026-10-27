@@ -7,9 +7,16 @@ use std::sync::Arc;
 async fn fixture(
     flag: bool,
     rejection: &str,
-) -> (tempfile::TempDir, AppState, Arc<Capture>, Session) {
+) -> (
+    tempfile::TempDir,
+    AppState,
+    Arc<Capture>,
+    Arc<Capture>,
+    Session,
+) {
     let dir = tempfile::tempdir().unwrap();
     let main = Arc::new(Capture::default());
+    let secondary = Arc::new(Capture::default());
     let mut config = crate::model_entrypoint_routing_tests::config(flag, "chat-a");
     config.provider_instances.insert(
         "broken-b".into(),
@@ -28,13 +35,16 @@ async fn fixture(
     .unwrap();
     *state.config.write().await = config;
     let registry = ProviderRegistry::new(
-        HashMap::from([("chat-a".into(), main.clone() as Arc<dyn LLMProvider>)]),
+        HashMap::from([
+            ("chat-a".into(), main.clone() as Arc<dyn LLMProvider>),
+            ("broken-b".into(), secondary.clone() as Arc<dyn LLMProvider>),
+        ]),
         "chat-a".into(),
     );
-    registry.set_runtime_models(HashMap::from([(
-        "chat-a".into(),
-        vec!["main-a".into(), "cheap".into()],
-    )]));
+    registry.set_runtime_models(HashMap::from([
+        ("chat-a".into(), vec!["main-a".into(), "cheap".into()]),
+        ("broken-b".into(), vec!["main-a".into(), "model-b".into()]),
+    ]));
     state.provider_registry.replace_with(registry);
     let mut session = Session::new("synthetic-resume", "main-a");
     bamboo_engine::session_app::provider_model::persist_model_ref(
@@ -44,7 +54,7 @@ async fn fixture(
     session.add_message(Message::user("Previous synthetic input"));
     state.storage.save_session(&session).await.unwrap();
     state.session_store.save_session(&session).await.unwrap();
-    (dir, state, main, session)
+    (dir, state, main, secondary, session)
 }
 
 fn args(dir: &std::path::Path, provider: Option<String>) -> HeadlessArgs {
@@ -67,9 +77,10 @@ fn args(dir: &std::path::Path, provider: Option<String>) -> HeadlessArgs {
 #[tokio::test]
 async fn entrypoint_routing_headless_provider_only_rejects_bad_target_before_parent_pin_or_prompt_mutation(
 ) {
+    let mut outcomes = Vec::new();
     for flag in [false, true] {
         for rejection in ["unknown", "disabled", "missing-model"] {
-            let (dir, state, main, original) = fixture(flag, rejection).await;
+            let (dir, state, main, secondary, original) = fixture(flag, rejection).await;
             let storage = state.storage.clone();
             let provider = if rejection == "unknown" {
                 "unknown-b"
@@ -82,28 +93,25 @@ async fn entrypoint_routing_headless_provider_only_rejects_bad_target_before_par
             )
             .await
             .unwrap();
-            assert!(
-                result.is_err(),
-                "explicit {rejection}, flag={flag} was accepted"
-            );
             let calls = main.calls.lock().unwrap().clone();
-            assert!(
-                calls.is_empty(),
-                "provider-only rejection dispatched the retained parent: {calls:?}"
-            );
+            let secondary_calls = secondary.calls.lock().unwrap().clone();
             let saved = storage.load_session(&original.id).await.unwrap().unwrap();
-            assert_eq!(
-                saved.messages.len(),
-                original.messages.len(),
-                "invalid target must not append the new prompt"
-            );
+            outcomes.push(serde_json::json!({"flag":flag,"rejection":rejection,"resultError":result.err(),
+                "mainCalls":calls,"selectedCalls":secondary_calls,"newMessages":saved.messages.len().saturating_sub(original.messages.len())}));
         }
     }
+    assert!(
+        outcomes.iter().all(|row| !row["resultError"].is_null()
+            && row["mainCalls"].as_array().unwrap().is_empty()
+            && row["selectedCalls"].as_array().unwrap().is_empty()
+            && row["newMessages"] == 0),
+        "{outcomes:#?}"
+    );
 }
 
 #[tokio::test]
 async fn entrypoint_routing_headless_unset_override_keeps_legitimate_parent_inheritance() {
-    let (dir, state, main, _) = fixture(true, "missing-model").await;
+    let (dir, state, main, _, _) = fixture(true, "missing-model").await;
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         run_with_state(args(dir.path(), None), state),

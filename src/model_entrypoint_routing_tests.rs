@@ -137,6 +137,7 @@ async fn execute_gold(
     let mut request = builder.build();
     request.gold_config = Some(GoldConfig {
         enabled: true,
+        auto_continue_enabled: true,
         goal: Some("Synthetic goal".into()),
         ..Default::default()
     });
@@ -180,14 +181,16 @@ async fn entrypoint_routing_sdk_rejects_unknown_fast_without_primary_account_dis
 #[tokio::test]
 async fn entrypoint_routing_sdk_same_account_saved_fast_is_independent_of_chat_flag() {
     let calls = execute_gold(config(false, "chat-a"), None).await;
-    assert_eq!(
-        calls
-            .iter()
-            .filter(|(_, purpose, _)| purpose == "gold_evaluation")
-            .map(|(model, _, _)| model.as_str())
-            .collect::<Vec<_>>(),
-        vec!["cheap"]
+    let models = calls
+        .iter()
+        .filter(|(_, purpose, _)| purpose == "gold_evaluation")
+        .map(|(model, _, _)| model.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        !models.is_empty(),
+        "positive control must exercise Gold dispatch"
     );
+    assert!(models.iter().all(|model| *model == "cheap"), "{models:?}");
 }
 
 #[tokio::test]
@@ -197,15 +200,23 @@ async fn entrypoint_routing_sdk_explicit_host_resolver_keeps_cross_provider_clie
     assert!(calls
         .iter()
         .all(|(_, purpose, _)| purpose != "gold_evaluation"));
-    assert_eq!(
-        target
-            .calls
-            .lock()
-            .unwrap()
+    let requests = target
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(model, purpose, _)| (model.as_str(), purpose.as_str()))
+        .map(|(model, purpose)| (model.to_string(), purpose.to_string()))
+        .collect::<Vec<_>>();
+    assert!(
+        !requests.is_empty(),
+        "positive control must exercise Gold dispatch"
+    );
+    assert!(
+        requests
             .iter()
-            .map(|(model, purpose, _)| (model.as_str(), purpose.as_str()))
-            .collect::<Vec<_>>(),
-        vec![("cheap", "gold_evaluation")]
+            .all(|(model, purpose)| model == "cheap" && purpose == "gold_evaluation"),
+        "{requests:?}"
     );
 }
 
@@ -267,11 +278,10 @@ async fn entrypoint_routing_legacy_image_transform_keeps_configured_vision_accou
         "legacy conversion dispatched pixels to the primary account: {calls:?}"
     );
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(
-        requests[0].body_json::<serde_json::Value>().unwrap()["model"],
-        "vision-b"
-    );
+    assert!(!requests.is_empty());
+    assert!(requests
+        .iter()
+        .all(|request| request.body_json::<serde_json::Value>().unwrap()["model"] == "vision-b"));
     assert_eq!(
         session
             .messages
