@@ -1901,9 +1901,10 @@ mod tests {
             "e",
         )
         .await;
-        assert!(
-            refresh.admission_error.is_none(),
-            "preserve original non-error checkpoint branch"
+        assert_eq!(
+            refresh.admission_error.as_deref(),
+            Some(INBOX_CLAIM_UNRESOLVED),
+            "an uncheckpointed claim must stop before provider dispatch"
         );
         assert_eq!(refresh.merged, 0);
         assert!(refresh.committed_messages.is_empty());
