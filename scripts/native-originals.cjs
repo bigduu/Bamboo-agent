@@ -116,8 +116,7 @@ function history(rows, identity, target, { beforeAttempt = identity.runAttempt +
 }
 
 function logRecord(log, prefix) {
-  assert.ok(typeof log === 'string' && Buffer.byteLength(log) <=
-    (prefix === TRANSPORT_PREFIX ? MAX_NATIVE_LOG : 512 * 1024), 'Missing/oversized original log')
+  assert.ok(typeof log === 'string' && Buffer.byteLength(log) <= MAX_NATIVE_LOG, 'Missing/oversized original log')
   const records = log.split(/\r?\n/).filter(line => /^\d{4}-\d\d-\d\dT\S+Z /.test(line) && line.slice(line.indexOf(' ') + 1).startsWith(prefix))
   assert.equal(records.length, 1, 'Missing/duplicate original output record')
   const encoded = records[0].slice(records[0].indexOf(prefix) + prefix.length)
@@ -404,7 +403,7 @@ async function workerSelection(identity, preparation, planValue, target, selecti
   assert.equal(current.length, 1, 'Missing/duplicate current physical native job')
   return selectCurrent({ identity, preparation,
     readJob: async id => get(`actions/jobs/${id}`),
-    readLog: async id => sidecar.execute('gh', ['api', `repos/${identity.repository}/actions/jobs/${id}/logs`], { maxBuffer: 512 * 1024 }),
+    readLog: async id => sidecar.execute('gh', ['api', `repos/${identity.repository}/actions/jobs/${id}/logs`], { maxBuffer: MAX_NATIVE_LOG }),
   }, planValue, target, current[0], { selecting })
 }
 

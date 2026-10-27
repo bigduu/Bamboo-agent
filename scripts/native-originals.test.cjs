@@ -265,6 +265,40 @@ function register() {
     await assert.rejects(original.selectCurrent(f.context, value, original.TARGETS[0], current))
   })
 
+  test('native originals plan reader accepts a large whole-job prefix while bounding the single plan frame', async t => {
+    const f = fixture(t), preparing = f.prepareJob(), value = await original.plan(f.context, preparing.id)
+    preparing.status = 'completed'; preparing.conclusion = 'success'
+    preparing.steps[0].status = 'completed'; preparing.steps[0].conclusion = 'success'
+    const current = job(f.identity, original.TARGETS[0], 777, 1, [original.SELECT])
+    current.status = 'in_progress'; current.conclusion = null
+    current.steps[0].status = 'in_progress'; current.steps[0].conclusion = null; f.rows.push(current)
+    let frame; original.emit(original.PLAN_PREFIX, value, line => { frame = `${timestamp(19)} ${line}\n` })
+    const log = `${timestamp(10)} ${'legitimate package verification output '.repeat(18000)}\n${frame}`
+    assert.ok(Buffer.byteLength(log) > 512 * 1024)
+    await t.test('whole-job parser', () => assert.deepEqual(original.logRecord(log, original.PLAN_PREFIX), value))
+    await t.test('read-only worker loader', async () => {
+      const execute = sidecar.execute
+      try {
+        sidecar.execute = (program, args, options = {}) => {
+          assert.equal(program, 'gh'); const route = args[1]
+          if (route.includes('/attempts/1/jobs?')) return JSON.stringify({ total_count: f.rows.length, jobs: f.rows })
+          if (route.endsWith(`/jobs/${current.id}`)) return JSON.stringify(current)
+          if (route.endsWith(`/jobs/${preparing.id}`)) return JSON.stringify(preparing)
+          assert.ok(route.endsWith(`/jobs/${preparing.id}/logs`))
+          assert.ok(options.maxBuffer >= Buffer.byteLength(log), 'Whole-job stdout exceeded the read-only loader buffer')
+          assert.ok(options.maxBuffer <= 64 * 1024 * 1024, 'Whole-job reads remain bounded')
+          return log
+        }
+        assert.equal((await original.workerSelection(f.identity, f.preparation, value, original.TARGETS[0], true)).action, 'build')
+      } finally { sidecar.execute = execute }
+    })
+    await t.test('single frame remains capped at 128 KiB', () => {
+      const oversized = Buffer.from(JSON.stringify({ padding: 'x'.repeat(100000) })).toString('base64')
+      assert.ok(oversized.length > 128 * 1024)
+      assert.throws(() => original.logRecord(`${timestamp(19)} ${original.PLAN_PREFIX}${oversized}\n`, original.PLAN_PREFIX))
+    })
+  })
+
   test('native originals revalidate original bytes after a pure selector failure but finalization still requires latest success', async t => {
     const f = fixture(t); f.add(original.TARGETS[0]); await original.collect(f.context)
     f.identity.runAttempt = 3
