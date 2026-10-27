@@ -510,8 +510,7 @@ fn maildir_fault_cleanup_keeps_physical_holder_and_primary_outcome() {
     }
 }
 
-#[test]
-fn supervisor_followup_started_job_retains_full_original_relationship_lockset() {
+fn assert_supervisor_followup_lifetime(current_user: bool) {
     for change in ["detach", "scope", "project", "version", "recreate"] {
         let mut f = Fixture::new();
         let reference: bamboo_domain::SupervisorReference = f.runtime.block_on(async {
@@ -561,22 +560,55 @@ fn supervisor_followup_started_job_retains_full_original_relationship_lockset() 
             .block_on(f.other_store.load_session("target"))
             .unwrap()
             .unwrap();
+        let caller = bamboo_domain::SessionCallerReference::from(
+            &f.runtime
+                .block_on(f.store.load_session(&reference.session_id))
+                .unwrap()
+                .unwrap(),
+        );
+        let observed = f
+            .runtime
+            .block_on(
+                f.store
+                    .inspect_supervisor_current_user_target(&reference, "target"),
+            )
+            .unwrap();
         let mut message = SessionMessageEnvelope::user_input("target", "authorized followup");
         message.source = SessionMessageSource::Session {
             session_id: reference.session_id.clone(),
         };
         message.kind = SessionMessageKind::PeerMessage;
+        if current_user {
+            let operation = uuid::Uuid::new_v4().to_string();
+            message.id = bamboo_domain::supervisor_current_user_message_id(
+                &reference, &observed, &operation,
+            );
+            message.correlation_id = Some(operation);
+        }
         let job_ref = reference.clone();
         let job_message = message.clone();
+        let job_caller = caller.clone();
+        let job_observed = observed.clone();
         let mut parked = Parked::start(
             f.inbox.clone(),
             "maildir_replace",
             message_path(&f, &message, 1),
             move |inbox| async move {
-                inbox
-                    .deliver_supervisor_followup(&job_ref, &job_message)
-                    .await
-                    .map(|_| ())
+                let receipt = if current_user {
+                    inbox
+                        .deliver_supervisor_current_user_followup(
+                            &job_caller,
+                            &job_ref,
+                            &job_observed,
+                            &job_message,
+                        )
+                        .await
+                } else {
+                    inbox
+                        .deliver_supervisor_followup(&job_ref, &job_message)
+                        .await
+                };
+                receipt.map(|_| ())
             },
         );
         parked.shutdown();
@@ -642,19 +674,39 @@ fn supervisor_followup_started_job_retains_full_original_relationship_lockset() 
         f.assert_waiting(&mutation);
         parked.barrier.release();
         f.finish(mutation);
-        let retry = f
-            .runtime
-            .block_on(f.inbox.deliver_supervisor_followup(&reference, &message));
-        if matches!(change, "detach" | "scope") {
-            assert!(
-                retry.is_ok(),
-                "legacy metadata does not revoke default-domain authority: {change}"
-            );
+        let retry = f.runtime.block_on(async {
+            if current_user {
+                f.inbox
+                    .deliver_supervisor_current_user_followup(
+                        &caller, &reference, &observed, &message,
+                    )
+                    .await
+            } else {
+                f.inbox
+                    .deliver_supervisor_followup(&reference, &message)
+                    .await
+            }
+        });
+        // Legacy ID-only delivery has no frozen metadata selector. Its exact
+        // retry must retain the first receipt under metadata-only changes;
+        // the current-user protocol still rejects the old target observation.
+        if matches!(change, "detach" | "scope")
+            || (!current_user && matches!(change, "project" | "version"))
+        {
+            let retry = retry.unwrap_or_else(|error| panic!("{change}: {error}"));
+            assert_eq!(retry.generation, 1, "no redelivery: {change}");
+            assert_eq!(retry.id, message.id, "same receipt: {change}");
         } else {
             assert!(
-                retry.is_err(),
-                "canonical target change must precede exact-id retry: {change}"
-            );
+            retry.is_err(),
+            "canonical target change must precede exact-id retry: {change}; current_user={current_user}"
+        );
         }
     }
+}
+
+#[test]
+fn supervisor_followup_started_job_retains_full_original_relationship_lockset() {
+    assert_supervisor_followup_lifetime(false);
+    assert_supervisor_followup_lifetime(true);
 }

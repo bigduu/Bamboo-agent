@@ -660,7 +660,7 @@ async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_st
         f.followup_targets
             .lock()
             .unwrap()
-            .insert("native-stale-followup".into(), observed);
+            .insert("native-stale-followup".into(), observed.clone());
         let denied = Box::pin(f.model_followup("native-stale-followup", ultra)).await;
         assert!(serde_json::from_str::<Value>(&denied).is_err(), "{denied}");
         assert_eq!(
@@ -687,10 +687,9 @@ async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_st
             serde_json::to_value(&after.messages).unwrap()
         );
 
-        // A retained exact-target tool permission cannot replace current
-        // Project/management authority. Start with a live link, then exercise
-        // the canonical owner's revoke/regrant operations through the Host
-        // service. Regrant must leave the disabled link disabled.
+        // Legacy Project/link changes do not revoke default-domain access or
+        // repair a stale selector. Keep the old target observation through
+        // both metadata mutations and retain the no-provider/no-write checks.
         let current = service.inspect_scope(&f.reference).await.unwrap();
         service
             .attach(&f.reference, current.state_revision, TARGET)
@@ -717,8 +716,12 @@ async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_st
                 .await
                 .unwrap();
             let link = service.inspect_link(&f.reference, TARGET).await.unwrap();
-            assert!(!link.authorized);
+            assert!(link.authorized);
             assert!(!link.link.unwrap().enabled);
+            f.followup_targets
+                .lock()
+                .unwrap()
+                .insert(operation.into(), observed.clone());
             let denied = Box::pin(f.model_followup(operation, ultra)).await;
             assert!(serde_json::from_str::<Value>(&denied).is_err(), "{denied}");
             assert_eq!(
@@ -746,15 +749,20 @@ async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_st
             );
         }
 
-        // Fresh explicit Host attachment is the positive control. Do not
-        // reinstall or widen the existing typed tool permission to obtain it.
-        let current = service.inspect_scope(&f.reference).await.unwrap();
-        service
-            .attach(&f.reference, current.state_revision, TARGET)
-            .await
-            .unwrap();
+        // A fresh canonical selector is the positive control, with the legacy
+        // link still disabled. No new attachment or permission is needed.
+        assert!(
+            !service
+                .inspect_link(&f.reference, TARGET)
+                .await
+                .unwrap()
+                .link
+                .unwrap()
+                .enabled
+        );
         let calls_before = f.probe.requests.lock().unwrap().len();
-        let restored = Box::pin(f.model_followup("native-scope-explicit-reattach", ultra)).await;
+        let restored =
+            Box::pin(f.model_followup("native-fresh-selector-without-attach", ultra)).await;
         let restored: Value = serde_json::from_str(&restored).expect(&restored);
         assert_eq!(restored["admitted"], true);
         f.settled(calls_before + 3).await;

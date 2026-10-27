@@ -860,7 +860,8 @@ mod tests {
             assert_eq!(result["scope"]["readable"], true);
         }
         let mut stale = body;
-        stale["binding_revision"] = serde_json::json!(supervisor.root_tool_authority_revision + 1);
+        stale["binding_revision"] =
+            serde_json::json!(supervisor.supervisor_orchestration_revision().unwrap() + 1);
         let response = test::call_service(
             &app,
             test::TestRequest::post()
@@ -872,10 +873,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let result: serde_json::Value = test::read_body_json(response).await;
-        assert_eq!(
-            result["error"]["message"],
-            "Supervisor scope binding changed"
-        );
+        assert_eq!(result["error"]["message"], "Existing scope binding differs");
         assert_eq!(result["error"]["type"], "api_error");
         assert_eq!(result["code"], "scope_binding_mismatch");
         assert_eq!(result["scope"], state.tickets.status().await);

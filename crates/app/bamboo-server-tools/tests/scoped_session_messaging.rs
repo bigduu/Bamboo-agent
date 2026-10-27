@@ -304,11 +304,16 @@ async fn original_supervisor_send_uses_its_existing_scoped_followup_writer() {
     let supervisor = fixture.supervisor(&[&target.id]).await;
     let tool = fixture.tool();
     for intent in [None, Some("queue_only")] {
+        let mut args = fixture
+            .supervisor_send_args(&supervisor, &target.id, "followup-operation")
+            .await;
+        if let Some(intent) = intent {
+            args["delivery_intent"] = json!(intent);
+        } else {
+            args.as_object_mut().unwrap().remove("delivery_intent");
+        }
         let error = tool
-            .invoke(
-                send(&target.id, "followup-operation", intent),
-                Fixture::ctx(&supervisor),
-            )
+            .invoke(args, Fixture::ctx(&supervisor))
             .await
             .unwrap_err();
         assert!(error
