@@ -413,16 +413,76 @@ pub fn get_vision_model_from_config(config: &Config) -> Result<String, LLMError>
 }
 
 fn resolve_role_ref_chain<'a>(
+    config: &Config,
     provider_registry: &Arc<ProviderRegistry>,
     candidates: impl IntoIterator<Item = Option<&'a bamboo_domain::ProviderModelRef>>,
 ) -> Option<ResolvedModel> {
+    match try_resolve_role_ref_chain(config, provider_registry, candidates) {
+        Ok(model) => model,
+        Err(error) => {
+            tracing::warn!(%error, "Configured auxiliary model route is unavailable");
+            None
+        }
+    }
+}
+
+fn try_resolve_role_ref_chain<'a>(
+    config: &Config,
+    provider_registry: &Arc<ProviderRegistry>,
+    candidates: impl IntoIterator<Item = Option<&'a bamboo_domain::ProviderModelRef>>,
+) -> Result<Option<ResolvedModel>, LLMError> {
     // A present-but-invalid reference fails closed. Automatic fallback applies
     // only when a role is unset, never when an explicit provider id is stale.
-    let model_ref = candidates.into_iter().flatten().next()?;
-    let provider = ProviderModelRouter::new(provider_registry.clone())
-        .route(model_ref)
-        .ok()?;
-    Some(ResolvedModel::from_ref(provider, model_ref))
+    let Some(model_ref) = candidates.into_iter().flatten().next() else {
+        return Ok(None);
+    };
+    if model_ref.provider.trim().is_empty()
+        || model_ref.model.trim().is_empty()
+        || model_ref.provider.trim() != model_ref.provider
+        || model_ref.model.trim() != model_ref.model
+    {
+        return Err(LLMError::Api(
+            "Configured auxiliary provider/model reference is invalid".into(),
+        ));
+    }
+    if let Some(instance) = config.provider_instances.get(&model_ref.provider) {
+        if !instance.enabled {
+            return Err(LLMError::Auth(format!(
+                "Provider instance '{}' is disabled",
+                model_ref.provider
+            )));
+        }
+        if bamboo_config::explicit_runtime_models(instance)
+            .map_err(LLMError::Api)?
+            .is_some_and(|models| !models.contains(&model_ref.model))
+        {
+            return Err(LLMError::Api(format!(
+                "Model '{}' is not admitted to runtime for provider '{}'",
+                model_ref.model, model_ref.provider
+            )));
+        }
+    }
+    let provider = ProviderModelRouter::new(provider_registry.clone()).route(model_ref)?;
+    Ok(Some(ResolvedModel::from_ref(provider, model_ref)))
+}
+
+fn try_resolve_legacy_role(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+    model: Option<String>,
+) -> Result<Option<ResolvedModel>, LLMError> {
+    if config
+        .provider_instances
+        .get(provider_name)
+        .is_some_and(|instance| !instance.enabled)
+    {
+        return Err(LLMError::Auth(format!(
+            "Provider instance '{provider_name}' is disabled"
+        )));
+    }
+    let model_ref = model.map(|model| bamboo_domain::ProviderModelRef::new(provider_name, model));
+    try_resolve_role_ref_chain(config, provider_registry, [model_ref.as_ref()])
 }
 
 /// Resolve the task summarization model for conversation/task compression.
@@ -456,10 +516,9 @@ pub fn try_resolve_task_summary_model(
             .as_ref()
             .or(defaults.fast.as_ref())
             .unwrap_or(&defaults.chat);
-        let provider = ProviderModelRouter::new(provider_registry.clone()).route(model_ref)?;
-        return Ok(Some(ResolvedModel::from_ref(provider, model_ref)));
+        return try_resolve_role_ref_chain(config, provider_registry, [Some(model_ref)]);
     }
-    Ok(resolve_fast_model(config, provider_name, provider_registry))
+    try_resolve_fast_model(config, provider_name, provider_registry)
 }
 
 /// Resolve the background/fast summarization model considering both
@@ -475,21 +534,37 @@ pub fn resolve_background_model(
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
-    if config.features.provider_model_ref {
-        if let Some(defaults) = config.defaults.as_ref() {
-            return resolve_role_ref_chain(
-                provider_registry,
-                [
-                    defaults.memory_background.as_ref(),
-                    defaults.fast.as_ref(),
-                    Some(&defaults.chat),
-                ],
-            );
+    match try_resolve_background_model(config, provider_name, provider_registry) {
+        Ok(model) => model,
+        Err(error) => {
+            tracing::warn!(%error, "Configured background route is unavailable");
+            None
         }
     }
-    let model_name = get_memory_background_model_for_provider(config, provider_name)?;
-    let provider = provider_registry.get(provider_name)?;
-    Some(ResolvedModel::new(provider, model_name))
+}
+
+pub fn try_resolve_background_model(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Result<Option<ResolvedModel>, LLMError> {
+    if let Some(defaults) = config.defaults.as_ref() {
+        return try_resolve_role_ref_chain(
+            config,
+            provider_registry,
+            [
+                defaults.memory_background.as_ref(),
+                defaults.fast.as_ref(),
+                Some(&defaults.chat),
+            ],
+        );
+    }
+    try_resolve_legacy_role(
+        config,
+        provider_name,
+        provider_registry,
+        get_memory_background_model_for_provider(config, provider_name),
+    )
 }
 
 /// Resolve the fast model for lightweight tasks like title generation.
@@ -498,17 +573,33 @@ pub fn resolve_fast_model(
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
-    if config.features.provider_model_ref {
-        if let Some(defaults) = config.defaults.as_ref() {
-            return resolve_role_ref_chain(
-                provider_registry,
-                [defaults.fast.as_ref(), Some(&defaults.chat)],
-            );
+    match try_resolve_fast_model(config, provider_name, provider_registry) {
+        Ok(model) => model,
+        Err(error) => {
+            tracing::warn!(%error, "Configured fast route is unavailable");
+            None
         }
     }
-    let model_name = get_fast_model_for_provider(config, provider_name)?;
-    let provider = provider_registry.get(provider_name)?;
-    Some(ResolvedModel::new(provider, model_name))
+}
+
+pub fn try_resolve_fast_model(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Result<Option<ResolvedModel>, LLMError> {
+    if let Some(defaults) = config.defaults.as_ref() {
+        return try_resolve_role_ref_chain(
+            config,
+            provider_registry,
+            [defaults.fast.as_ref(), Some(&defaults.chat)],
+        );
+    }
+    try_resolve_legacy_role(
+        config,
+        provider_name,
+        provider_registry,
+        get_fast_model_for_provider(config, provider_name),
+    )
 }
 
 /// Resolve the vision-capable model for image understanding.
@@ -517,17 +608,16 @@ pub fn resolve_vision_model(
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
-    if config.features.provider_model_ref {
-        if let Some(defaults) = config.defaults.as_ref() {
-            return resolve_role_ref_chain(
-                provider_registry,
-                [
-                    defaults.vision.as_ref(),
-                    defaults.fast.as_ref(),
-                    Some(&defaults.chat),
-                ],
-            );
-        }
+    if let Some(defaults) = config.defaults.as_ref() {
+        return resolve_role_ref_chain(
+            config,
+            provider_registry,
+            [
+                defaults.vision.as_ref(),
+                defaults.fast.as_ref(),
+                Some(&defaults.chat),
+            ],
+        );
     }
     let model_name = if let Some(instance) = config.provider_instances.get(provider_name) {
         if !instance.enabled {
@@ -555,17 +645,16 @@ pub fn resolve_planning_model(
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
-    if config.features.provider_model_ref {
-        if let Some(defaults) = config.defaults.as_ref() {
-            return resolve_role_ref_chain(
-                provider_registry,
-                [
-                    defaults.planning.as_ref(),
-                    defaults.fast.as_ref(),
-                    Some(&defaults.chat),
-                ],
-            );
-        }
+    if let Some(defaults) = config.defaults.as_ref() {
+        return resolve_role_ref_chain(
+            config,
+            provider_registry,
+            [
+                defaults.planning.as_ref(),
+                defaults.fast.as_ref(),
+                Some(&defaults.chat),
+            ],
+        );
     }
     resolve_fast_model(config, provider_name, provider_registry)
 }
@@ -578,17 +667,16 @@ pub fn resolve_search_model(
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
-    if config.features.provider_model_ref {
-        if let Some(defaults) = config.defaults.as_ref() {
-            return resolve_role_ref_chain(
-                provider_registry,
-                [
-                    defaults.search.as_ref(),
-                    defaults.fast.as_ref(),
-                    Some(&defaults.chat),
-                ],
-            );
-        }
+    if let Some(defaults) = config.defaults.as_ref() {
+        return resolve_role_ref_chain(
+            config,
+            provider_registry,
+            [
+                defaults.search.as_ref(),
+                defaults.fast.as_ref(),
+                Some(&defaults.chat),
+            ],
+        );
     }
     resolve_fast_model(config, provider_name, provider_registry)
 }
@@ -601,17 +689,16 @@ pub fn resolve_code_review_model(
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Option<ResolvedModel> {
-    if config.features.provider_model_ref {
-        if let Some(defaults) = config.defaults.as_ref() {
-            return resolve_role_ref_chain(
-                provider_registry,
-                [
-                    defaults.code_review.as_ref(),
-                    defaults.fast.as_ref(),
-                    Some(&defaults.chat),
-                ],
-            );
-        }
+    if let Some(defaults) = config.defaults.as_ref() {
+        return resolve_role_ref_chain(
+            config,
+            provider_registry,
+            [
+                defaults.code_review.as_ref(),
+                defaults.fast.as_ref(),
+                Some(&defaults.chat),
+            ],
+        );
     }
     resolve_fast_model(config, provider_name, provider_registry)
 }
@@ -626,19 +713,17 @@ pub fn resolve_subagent_model_ref(
     provider_registry: &Arc<ProviderRegistry>,
     subagent_type: &str,
 ) -> Option<bamboo_domain::ProviderModelRef> {
-    if config.features.provider_model_ref {
-        let router = ProviderModelRouter::new(provider_registry.clone());
-        if let Some(defaults) = config.defaults.as_ref() {
-            let candidate_refs = [
-                defaults.subagent_models.get(subagent_type),
-                defaults.sub_agent.as_ref(),
-                defaults.fast.as_ref(),
-                Some(&defaults.chat),
-            ];
+    let router = ProviderModelRouter::new(provider_registry.clone());
+    if let Some(defaults) = config.defaults.as_ref() {
+        let candidate_refs = [
+            defaults.subagent_models.get(subagent_type),
+            defaults.sub_agent.as_ref(),
+            defaults.fast.as_ref(),
+            Some(&defaults.chat),
+        ];
 
-            let model_ref = candidate_refs.into_iter().flatten().next()?;
-            return router.route(model_ref).ok().map(|_| model_ref.clone());
-        }
+        let model_ref = candidate_refs.into_iter().flatten().next()?;
+        return router.route(model_ref).ok().map(|_| model_ref.clone());
     }
 
     resolve_fast_model(config, provider_name, provider_registry)
@@ -769,6 +854,82 @@ mod tests {
             })
             .collect();
         Arc::new(ProviderRegistry::new(providers, default.to_string()))
+    }
+
+    #[test]
+    fn routing_contract_saved_auxiliary_roles_keep_complete_targets_for_every_chat_flag() {
+        use crate::app_context::model_routing_test_support::RoutingContext;
+        for flag in [None, Some(false), Some(true)] {
+            let state = RoutingContext::new(flag);
+            let mut config = state.config.try_read().unwrap().clone();
+            let defaults = config.defaults.as_mut().unwrap();
+            let memory = ProviderModelRef::new("memory-c", "background-c");
+            let fast = ProviderModelRef::new("fast-b", "cheap-b");
+            defaults.task_summary = Some(memory.clone());
+            defaults.vision = Some(memory.clone());
+            defaults.planning = Some(memory.clone());
+            defaults.search = Some(fast.clone());
+            defaults.code_review = Some(memory.clone());
+            defaults.sub_agent = Some(fast.clone());
+            defaults.subagent_models.insert("planner".into(), memory);
+            // Reserved planning/search/code-review selectors are tested as
+            // selectors only: they do not constitute a wired model consumer.
+            for (resolved, provider, model) in [
+                (
+                    resolve_fast_model(&config, "chat-a", &state.registry),
+                    "fast-b",
+                    "cheap-b",
+                ),
+                (
+                    resolve_task_summary_model(&config, "chat-a", &state.registry),
+                    "memory-c",
+                    "background-c",
+                ),
+                (
+                    resolve_background_model(&config, "chat-a", &state.registry),
+                    "memory-c",
+                    "background-c",
+                ),
+                (
+                    resolve_vision_model(&config, "chat-a", &state.registry),
+                    "memory-c",
+                    "background-c",
+                ),
+                (
+                    resolve_planning_model(&config, "chat-a", &state.registry),
+                    "memory-c",
+                    "background-c",
+                ),
+                (
+                    resolve_search_model(&config, "chat-a", &state.registry),
+                    "fast-b",
+                    "cheap-b",
+                ),
+                (
+                    resolve_code_review_model(&config, "chat-a", &state.registry),
+                    "memory-c",
+                    "background-c",
+                ),
+                (
+                    resolve_subagent_model(&config, "chat-a", &state.registry, "coder"),
+                    "fast-b",
+                    "cheap-b",
+                ),
+                (
+                    resolve_subagent_model(&config, "chat-a", &state.registry, "planner"),
+                    "memory-c",
+                    "background-c",
+                ),
+            ] {
+                let resolved = resolved.unwrap();
+                assert_eq!(resolved.model_name, model, "flag {flag:?}");
+                assert!(Arc::ptr_eq(
+                    &resolved.provider,
+                    &state.registry.get(provider).unwrap()
+                ));
+            }
+            state.assert_no_requests();
+        }
     }
 
     #[test]

@@ -199,7 +199,6 @@ async fn resolve_gold_provider_and_model(
     session: &Session,
     gold_config: &GoldConfig,
 ) -> Result<GoldAuxiliaryTarget, String> {
-    // Resolve fast model eagerly for the fallback chain.
     let config_snapshot = state.config().read().await.clone();
     let provider_name = gold_provider_name(&config_snapshot, session);
     let stream_timeout = config_snapshot.stream_timeout;
@@ -209,93 +208,52 @@ async fn resolve_gold_provider_and_model(
             .get("auxiliary_evaluation_max_concurrency")
             .and_then(serde_json::Value::as_u64),
     );
-    let fast_model_name = crate::model_config_helper::resolve_fast_model(
-        &config_snapshot,
-        &provider_name,
-        state.provider_registry(),
-    )
-    .map(|resolved| resolved.model_name);
-
-    // Prefer: gold_config.model_name → fast model → session model.
-    let model = gold_config
+    let explicit_model = gold_config
         .model_name
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or(fast_model_name)
+        .filter(|model| !model.is_empty());
+    // A dedicated bare Gold model belongs to the executing account. Otherwise
+    // use the complete global Fast target; never carry only its model name into
+    // a session/default provider, or reinterpret a rejected role as unset.
+    if explicit_model.is_none() {
+        if let Some(fast) = crate::model_config_helper::try_resolve_fast_model(
+            &config_snapshot,
+            &provider_name,
+            state.provider_registry(),
+        )
+        .map_err(|error| format!("Configured Gold fallback route is unavailable: {error}"))?
+        {
+            let selected_provider = config_snapshot
+                .defaults
+                .as_ref()
+                .map(|defaults| {
+                    defaults
+                        .fast
+                        .as_ref()
+                        .unwrap_or(&defaults.chat)
+                        .provider
+                        .clone()
+                })
+                .unwrap_or_else(|| provider_name.clone());
+            return Ok(gold_auxiliary_target(
+                fast.provider,
+                fast.model_name,
+                selected_provider,
+                stream_timeout,
+                configured_limit,
+            ));
+        }
+    }
+    let model = explicit_model
         .or_else(|| {
             let model = session.model.trim();
-            if model.is_empty() || model == "unknown" {
-                None
-            } else {
-                Some(model.to_string())
-            }
+            (!model.is_empty() && model != "unknown").then_some(model)
         })
-        .ok_or_else(|| "gold model name is required".to_string())?;
-
-    if let Some(model_ref) = session_effective_model_ref(session) {
-        let target = ProviderModelRef::new(model_ref.provider.clone(), model.clone());
-        if let Some(provider) = state.get_provider_for_model_ref(&target) {
-            return Ok(gold_auxiliary_target(
-                provider,
-                model,
-                provider_name,
-                stream_timeout,
-                configured_limit,
-            ));
-        }
-        if let Some(provider) = state.provider_registry().get(&model_ref.provider) {
-            return Ok(gold_auxiliary_target(
-                provider,
-                model,
-                provider_name,
-                stream_timeout,
-                configured_limit,
-            ));
-        }
-        if let Some(provider) = state.get_provider_for_endpoint(&model_ref.provider).await {
-            return Ok(gold_auxiliary_target(
-                provider,
-                model,
-                provider_name,
-                stream_timeout,
-                configured_limit,
-            ));
-        }
-    }
-
-    if let Some(metadata_provider_name) = session
-        .metadata
-        .get("provider_name")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if let Some(provider) = state.provider_registry().get(metadata_provider_name) {
-            return Ok(gold_auxiliary_target(
-                provider,
-                model,
-                metadata_provider_name.to_string(),
-                stream_timeout,
-                configured_limit,
-            ));
-        }
-        if let Some(provider) = state
-            .get_provider_for_endpoint(metadata_provider_name)
-            .await
-        {
-            return Ok(gold_auxiliary_target(
-                provider,
-                model,
-                metadata_provider_name.to_string(),
-                stream_timeout,
-                configured_limit,
-            ));
-        }
-    }
-
-    if let Some(provider) = state.provider_registry().get_default() {
+        .ok_or_else(|| "gold model name is required".to_string())?
+        .to_string();
+    let target = ProviderModelRef::new(&provider_name, &model);
+    if let Some(provider) = state.get_provider_for_model_ref(&target) {
         return Ok(gold_auxiliary_target(
             provider,
             model,
@@ -304,13 +262,24 @@ async fn resolve_gold_provider_and_model(
             configured_limit,
         ));
     }
-
-    Ok(gold_auxiliary_target(
-        state.get_provider().await,
-        model,
-        provider_name,
-        stream_timeout,
-        configured_limit,
+    // A standalone context may supply one direct provider without a registry.
+    // Retain that SDK seam only without an explicit account/role configuration;
+    // a rejected configured route must never escape through get_default().
+    if state.provider_registry().is_empty()
+        && config_snapshot.defaults.is_none()
+        && config_snapshot.provider_instances.is_empty()
+        && session_effective_model_ref(session).is_none()
+    {
+        return Ok(gold_auxiliary_target(
+            state.get_provider().await,
+            model,
+            provider_name,
+            stream_timeout,
+            configured_limit,
+        ));
+    }
+    Err(format!(
+        "Configured Gold provider/model route is unavailable for '{provider_name}'"
     ))
 }
 
@@ -379,6 +348,54 @@ mod provider_selection_tests {
             );
             assert!(state.requests("chat-a").is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn routing_contract_explicit_gold_wins_without_resolving_an_invalid_fast_role() {
+        use crate::app_context::model_routing_test_support::RoutingContext;
+        let state = RoutingContext::new(Some(false));
+        state
+            .config
+            .write()
+            .await
+            .defaults
+            .as_mut()
+            .unwrap()
+            .fast
+            .as_mut()
+            .unwrap()
+            .provider = "missing-fast".into();
+        let session = RoutingContext::session();
+        let gold = GoldConfig {
+            model_name: Some("explicit-gold".into()),
+            ..Default::default()
+        };
+        super::evaluate_gold_state_for_pending_question(
+            state.as_ref(),
+            &session.id,
+            &session,
+            &gold,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state.requests("chat-a"),
+            vec![("explicit-gold".into(), "gold_evaluation".into())]
+        );
+        assert!(state.requests("fast-b").is_empty());
+
+        let mut invalid_session = session.clone();
+        invalid_session.model_ref.as_mut().unwrap().provider = "missing-session-account".into();
+        assert!(super::evaluate_gold_state_for_pending_question(
+            state.as_ref(),
+            &invalid_session.id,
+            &invalid_session,
+            &gold
+        )
+        .await
+        .is_err());
+        assert_eq!(state.requests("chat-a").len(), 1);
+        assert!(state.requests("fast-b").is_empty());
     }
 
     #[tokio::test]

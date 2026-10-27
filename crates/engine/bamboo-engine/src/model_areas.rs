@@ -63,17 +63,13 @@ pub fn resolve_global_area_models(
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> GlobalAreaModels {
-    let refs = config
-        .defaults
-        .as_ref()
-        .filter(|_| config.features.provider_model_ref)
-        .map(|defaults| {
-            let fast = defaults.fast.as_ref().unwrap_or(&defaults.chat);
-            (
-                fast.clone(),
-                defaults.memory_background.as_ref().unwrap_or(fast).clone(),
-            )
-        });
+    let refs = config.defaults.as_ref().map(|defaults| {
+        let fast = defaults.fast.as_ref().unwrap_or(&defaults.chat);
+        (
+            fast.clone(),
+            defaults.memory_background.as_ref().unwrap_or(fast).clone(),
+        )
+    });
     let (summarization, summarization_error) =
         match try_resolve_task_summary_model(config, provider_name, provider_registry) {
             Ok(model) => (model, None),

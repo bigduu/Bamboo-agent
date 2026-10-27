@@ -210,11 +210,12 @@ async fn try_llm_title(
     let config_snapshot = { state.config().read().await.clone() };
     let provider_name = title_provider_name(&config_snapshot, session);
 
-    let resolved = crate::model_config_helper::resolve_fast_model(
+    let resolved = crate::model_config_helper::try_resolve_fast_model(
         &config_snapshot,
         &provider_name,
         state.provider_registry(),
     )
+    .map_err(|error| format!("configured fast model unavailable: {error}"))?
     .ok_or_else(|| "no fast model resolved".to_string())?;
 
     let messages: Vec<Message> = build_title_messages(first_user_text);
