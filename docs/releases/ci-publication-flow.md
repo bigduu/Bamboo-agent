@@ -10,9 +10,9 @@ accepted or published artifact.
 This is the current local entrypoint and test map. The shared documents above
 record their own earlier audit snapshots; the #2363 composition below adds the
 later staged source changes. [Parallel Development](../../gitflow.md) defines
-ownership and local evidence. The older
-[Release Process](../../CONTRIBUTING.md#release-process) is a historical reference;
-its release-repair and main-CI publication instructions are superseded here.
+ownership and local evidence. The
+[Release Process](../../CONTRIBUTING.md#release-process) gives aligned contributor
+steps and the same pending activation gates.
 
 ## Entrypoint ownership after #2363 (staged source)
 

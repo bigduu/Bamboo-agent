@@ -196,9 +196,9 @@ through feature/dev tests and produce a new frozen cut.
 Before the first new cut, normally integrate current main ancestry into dev
 through a tested feature PR. Preserve historical signed receipts and immutable
 tags. Use the [CI and publication flow](./docs/releases/ci-publication-flow.md)
-for current entrypoints and pending activation. The older
-[Release Process](./CONTRIBUTING.md#release-process) is historical reference;
-its release-repair and main-CI publication procedure is superseded here. Do not
+for current entrypoints and pending activation. The
+[Release Process](./CONTRIBUTING.md#release-process) follows the same staged
+feature/release/Main contract and records its activation limits. Do not
 dispatch a new cut before complete producer acceptance and the guarded Ops
 cutover; do not reactivate the retired path to bypass either gate.
 
