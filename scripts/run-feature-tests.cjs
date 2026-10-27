@@ -16,11 +16,11 @@ const ROOT_BIRTH_CASES = ["root_birth_existing_root_progress_and_scope_reads_rem
   "root_birth_all_entrypoints_wait_for_retained_shared_authority", "root_birth_final_shared_writer_guard_and_missing_title_fail_closed",
   "root_birth_cancel_retains_exclusive_owner_and_pending_proof_stays_closed"];
 const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_without_transport_feature_fails_without_starting_exporter";
-// Audited delta from accepted CI2ff: only session_inbox.rs changes the sensitive
-// source closure, adding four test/test-utils fault-injection guards. The five
-// new Host cases belong to the existing default server library catalog, not
-// FEATURE_CONTEXTS. Cargo features, required targets and all19 additions stay.
-const FEATURE_SOURCE_SHA256 = "bc328e00d36541a03c873b58b3ff6e44a722fc1a3a3800cdc0d834444e3a9b67";
+// Retry-policy audit from accepted dev516c: stream_execution.rs is the only
+// changed sensitive record. Its cfg conditions, functions, modules and required
+// targets are unchanged; new ordinary retry cases use existing default catalogs.
+// Preserve all31 default packages, four feature contexts and all19 additions.
+const FEATURE_SOURCE_SHA256 = "52572eaddba2c3e19401ceaac93eb34a42d879404b2dc64c80855d84f8be43e9";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
