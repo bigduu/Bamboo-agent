@@ -607,7 +607,7 @@ fn assert_supervisor_followup_lifetime(current_user: bool) {
                     inbox
                         .deliver_supervisor_followup(
                             &job_ref,
-                            job_observed.session_created_at,
+                            job_observed.created_at,
                             &job_message,
                         )
                         .await
@@ -690,7 +690,7 @@ fn assert_supervisor_followup_lifetime(current_user: bool) {
                     .await
             } else {
                 f.inbox
-                    .deliver_supervisor_followup(&reference, observed.session_created_at, &message)
+                    .deliver_supervisor_followup(&reference, observed.created_at, &message)
                     .await
             }
         });
