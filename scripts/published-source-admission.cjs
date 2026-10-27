@@ -26,7 +26,7 @@ const MAIN_PREFIX = "Bamboo Main admission: ", MAIN_KIND = "bamboo-main-admissio
 // Legacy automatic Main compilers must be retired by the separate Ops cutover.
 const MAIN_CONTROLS = Object.freeze([MAIN_WORKFLOW, source.WORKFLOW, source.CONTROLLER,
   "scripts/main-admission.cjs", "scripts/published-source-admission.cjs", ...CONTROLLER_HELPERS,
-  "AGENTS.md", "docs/releases/ci-publication-flow.md"]);
+  "AGENTS.md", "docs/releases/ci-publication-flow.md", "docs/delivery-workflow.md", "docs/ci-workflow-audit.md"]);
 const keys = (value, names) => assert.deepEqual(Object.keys(value || {}).sort(), [...names].sort(), "Unexpected proof fields");
 const positive = value => { assert.ok(Number.isSafeInteger(value) && value > 0); return value; };
 const revision = value => { assert.match(value, SHA); return value; };
@@ -432,7 +432,7 @@ async function verifyMergedPromotion(input, reads, policy = {}) {
   const run = await get("actions/runs/" + input.admissionRun); assert.equal(run.id, input.admissionRun);
   assert.equal(run.head_sha, F); assert.equal(run.head_branch, pr.head.ref);
   const selected = await mainExecution(run, reads), record = logFrame(await reads.jobLog(selected.physical.id));
-  assert.ok(Number.isFinite(Date.parse(pr.merged_at)) && Date.parse(selected.physical.completed_at) < Date.parse(pr.merged_at), "Admission must physically complete before promotion");
+  assert.ok(Number.isFinite(Date.parse(pr.merged_at)) && Date.parse(selected.physical.completed_at) <= Date.parse(pr.merged_at), "Admission must complete no later than recorded promotion");
   same(record.execution, { revision: B, metadataRevision: F, workflowPath: MAIN_WORKFLOW, workflowId: run.workflow_id,
     runId: run.id, physicalAttempt: selected.physical.run_attempt, jobId: selected.physical.id,
     checkSuiteId: run.check_suite_id, checkSuiteNodeId: run.check_suite_node_id });

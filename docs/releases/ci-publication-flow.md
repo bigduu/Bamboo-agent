@@ -593,7 +593,8 @@ permissions, no Environment or publication credentials, and runs no candidate
 code, Cargo, npm, browser, Unit/E2E, package or publication command. An initial
 guard stops before checkout while default remains dev. The helper independently
 rechecks actual repository default, enforced Main context/app, event, protected
-Main B, clean checkout and the entire fixed 23-file ordinary B closure.
+Main B, clean checkout and the entire fixed 25-file ordinary B closure, including
+both complete linked local shared documents.
 
 The CLI accepts no mode, policy or approval JSON. Its one bounded locator in the
 PR body is data, never authority:

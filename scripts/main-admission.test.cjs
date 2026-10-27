@@ -126,6 +126,7 @@ function bootstrapFixture() {
   const f = frozenSourceFixture(), S = f.input.sourceRevision, B = controller.LEGACY_BASE, F = h("a"), M = h("0"), tree = h("9");
   for (const file of proof.MAIN_CONTROLS) if (!(file in f.files[S])) f.files[S][file] = "inert accepted-D control " + file;
   f.files[S][proof.MAIN_WORKFLOW] = workflow.toString();
+  for (const file of ["docs/delivery-workflow.md", "docs/ci-workflow-audit.md"]) f.files[S][file] = fs.readFileSync(path.join(__dirname, "..", file), "utf8");
   const leaves = entries => new Map(Object.entries(entries).map(([file, bytes]) => [file, { mode: "100644", sha: blob(bytes).sha }]));
   const product = leaves({ "src/lib.rs": "stable product", "Cargo.lock": "stable lock", "scripts/frontend-package-lock.json": "stable frontend lock" });
   product.set("vendor/module", { mode: "160000", sha: h("7") });
@@ -152,6 +153,11 @@ test("Main2351 Ops bootstrap reads actual accepted-D facts and preserves every l
   const f = bootstrapFixture(), result = await controller.verifyBootstrap(f.input, f.reads, f.f.policy);
   assert.equal(result.publicationAuthorized, false); assert.equal(result.legacyProductTree, controller.LEGACY_TREE);
   assert.equal(result.feature.snapshotRevision, f.f.snapshot.sha); assert.ok(f.f.calls.includes("pulls/2333"));
+  for (const file of ["docs/delivery-workflow.md", "docs/ci-workflow-audit.md"]) {
+    assert.ok(proof.MAIN_CONTROLS.includes(file));
+    const entry = f.routes.get("git/trees/" + f.tree + "?recursive=1").tree.find(row => row.path === file);
+    assert.equal(entry.sha, blob(fs.readFileSync(path.join(__dirname, "..", file))).sha); assert.equal(entry.mode, "100644");
+  }
   await assert.rejects(controller.verifyBootstrap(f.input, f.reads), /inactive/);
 });
 test("Main2351 Ops bootstrap ignores unrelated repository counters and rejects caller control policy", async () => {

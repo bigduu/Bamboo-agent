@@ -295,6 +295,14 @@ test("Main2351 merged proof permits normal Main advance and a changing closed PR
   };
   assert.equal((await m.verify()).promotion.mergeRevision,m.P);
 });
+test("Main2351 merged proof accepts official same-second physical completion and merge",async()=>{
+  const m=await mergedFixture();m.f.state.extraPr.merged_at=m.state.all[0].completed_at;
+  assert.equal((await m.verify()).promotion.mergeRevision,m.P);
+});
+test("Main2351 merged proof rejects physical completion one second after merge",async()=>{
+  const m=await mergedFixture();m.f.state.extraPr.merged_at=clock(499);
+  await assert.rejects(m.verify(),/no later than recorded promotion/);
+});
 for(const fault of ["candidate-event","candidate-path","different-workflow","file-as-B","green-stub","skipped-step","duplicate-job","missing-original",
   "late-execution","fake-P","P-tree","source-history","frame-B","frame-M","frame-source","frame-release","frame-attempt","bootstrap","locator-race","main-rewrite","default-dev","required-app"])
 test("Main2351 merged proof rejects "+fault,async()=>{

@@ -266,8 +266,9 @@ change default/protection, dispatch or register a producer merely to make this
 staged code green. Source/release registries remain inactive. Legacy automatic
 Main compilers/publishers are still live until their separate cutover.
 
-After activation, only actual trusted B is checked out. The fixed 23 ordinary
-B controls include the full release-helper and Main-reader closure; candidate
+After activation, only actual trusted B is checked out. The fixed 25 ordinary
+B controls include the full release-helper and Main-reader closure plus both
+complete linked local shared documents; candidate
 paths/policy/approval JSON cannot select a partial closure. Do not run product
 S code, package managers, compilers or tests in this workflow. The normal CLI
 always rejects bootstrap. Its separate exported Ops component can prove only
