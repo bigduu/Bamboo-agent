@@ -2,41 +2,6 @@ name: Actor Snapshot Windows
 
 on:
   workflow_dispatch:
-  pull_request:
-    branches: [main]
-    paths:
-      - '.github/workflows/actor-snapshot-windows.yml'
-      - 'scripts/actor-windows-native.ps1'
-      - 'scripts/actor-windows-native.test.ps1'
-      # Generic CI policy assertions run in CI's Node checks, without a native build.
-      # Shared build inputs can change the native reader or its test binaries.
-      - '.cargo/config.toml'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/**/Cargo.toml'
-      # Snapshot and Directory share the store, session types and write paths.
-      - 'crates/infra/bamboo-storage/**'
-      # Native Child Bash uses Windows Job Objects in the task resource owner.
-      - 'crates/engine/bamboo-tools/**'
-      - 'crates/core/bamboo-domain/**'
-      # The gateway exercises real AppState, host authentication and run tokens.
-      - 'crates/app/bamboo-server/src/app_state/**'
-      - 'crates/app/bamboo-server/src/lib.rs'
-      - 'crates/app/bamboo-server/src/routes/agent.rs'
-      - 'crates/app/bamboo-server/src/routes/bamboo_v1.rs'
-      - 'crates/app/bamboo-server/src/routes/mod.rs'
-      - 'crates/app/bamboo-server/src/codex_run_tokens.rs'
-      - 'crates/app/bamboo-server/src/error.rs'
-      - 'crates/app/bamboo-server/src/handlers/agent/actor_snapshot.rs'
-      - 'crates/app/bamboo-server/src/handlers/agent/mod.rs'
-      - 'crates/app/bamboo-server/src/handlers/settings/mod.rs'
-      - 'crates/app/bamboo-server/src/handlers/settings/access_control.rs'
-      - 'crates/engine/bamboo-engine/src/external_agents/actor_adapter.rs'
-      - 'crates/infra/bamboo-config/src/config.rs'
-      - 'crates/infra/bamboo-config/src/encryption.rs'
-      - 'crates/infra/bamboo-config/src/lib.rs'
-      - 'crates/app/bamboo-server/build.rs'
-      - 'crates/app/bamboo-server/frontend_build.rs'
 
 permissions:
   contents: read

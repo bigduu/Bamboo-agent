@@ -7,8 +7,6 @@ on:
         description: Exact 40-character SHA of the selected ref for source acceptance
         required: true
         type: string
-  pull_request:
-    branches: [main]
 
 permissions:
   contents: read

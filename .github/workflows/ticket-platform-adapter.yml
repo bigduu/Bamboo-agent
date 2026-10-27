@@ -8,11 +8,6 @@ on:
         required: false
         default: ''
         type: string
-  pull_request:
-    branches: [main]
-    paths:
-      - 'crates/infra/bamboo-tickets/**'
-      - '.github/workflows/ticket-platform-adapter.yml'
 
 permissions:
   contents: read

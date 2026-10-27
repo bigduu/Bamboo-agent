@@ -2,85 +2,101 @@ name: Documentation
 
 on:
   push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+    branches: [main]
 
-env:
-  CARGO_TERM_COLOR: always
-
-  # This frozen batch restores existing caches without adding paid storage.
-  # The main anchor also covers its first normal promotion push.
-  BAMBOO_RELEASE_CACHE_WRITE_ALLOWED: >-
-    ${{ !(
-      startsWith(github.ref, 'refs/heads/bamboo/release/da348-') ||
-      github.ref == 'refs/heads/release/da348a63f1d019a22df547c78575c500b6b1294e' ||
-      startsWith(github.head_ref, 'bamboo/release/da348-') ||
-      github.head_ref == 'release/da348a63f1d019a22df547c78575c500b6b1294e' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-       (github.event.before == 'dbafb74522794012fc8f0a61e761817b3913989a' ||
-        contains(github.event.head_commit.message, 'release/da348a63f1d019a22df547c78575c500b6b1294e')))
-    ) }}
+permissions:
+  contents: read
+  actions: read
 
 jobs:
-  build-docs:
-    name: Build Documentation
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rust-docs
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          shared-key: bamboo-docs-${{ runner.os }}
-          cache-on-failure: true
-          save-if: ${{ env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
-
-      - name: Build documentation
-        run: cargo doc --no-deps --all-features --document-private-items
-
-      - name: Add redirect
-        run: |
-          echo '<meta http-equiv="refresh" content="0;url=bamboo_agent/index.html">' > target/doc/index.html
-
-      - name: Upload documentation artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: documentation
-          path: target/doc
-
   deploy-docs:
-    name: Deploy to GitHub Pages
-    needs: build-docs
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    name: Deploy accepted feature documentation
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
       pages: write
       id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Download documentation artifact
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Locate the accepted feature site
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PYDOC'
+          import json, os, re, subprocess
+          repository, source = os.environ['GITHUB_REPOSITORY'], os.environ['GITHUB_SHA']
+          def api(route):
+              return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repository}/{route}'], text=True))
+          def one(rows):
+              assert len(rows) == 1, 'Missing or ambiguous accepted documentation source'
+              return rows[0]
+          promotion = one([pr for pr in api(f'commits/{source}/pulls?per_page=100')
+                           if pr['merged_at'] and pr['merge_commit_sha'] == source and pr['base']['ref'] == 'main'
+                           and pr['head']['repo']['full_name'] == repository])
+          cut = re.fullmatch(r'release/([0-9a-f]{40})', promotion['head']['ref'])
+          assert cut and promotion['head']['sha'] == cut[1], 'Expected the unchanged frozen release cut'
+          accepted = cut[1]
+          subprocess.check_call(['git', 'merge-base', '--is-ancestor', accepted, source])
+          feature = one([pr for pr in api(f'commits/{accepted}/pulls?per_page=100')
+                         if pr['merged_at'] and pr['merge_commit_sha'] == accepted and pr['base']['ref'] == 'dev'
+                         and pr['head']['repo']['full_name'] == repository])
+          head = feature['head']['sha']
+          runs = api(f'actions/workflows/ci.yml/runs?event=pull_request&head_sha={head}&status=success&per_page=100')['workflow_runs']
+          runs = [run for run in runs if run['head_sha'] == head and run['event'] == 'pull_request'
+                  and run['conclusion'] == 'success' and run['head_repository']['full_name'] == repository
+                  and run['updated_at'] <= feature['merged_at']]
+          assert runs, 'No successful pre-merge feature CI; documentation will not be rebuilt on main'
+          run = max(runs, key=lambda row: row['id'])
+          artifacts = api(f"actions/runs/{run['id']}/artifacts?per_page=100")
+          assert artifacts['total_count'] <= 100, 'Documentation artifact list is incomplete'
+          sites = []
+          for artifact in artifacts['artifacts']:
+              match = re.fullmatch(rf"documentation-{run['id']}-([1-9][0-9]*)", artifact['name'])
+              if match and not artifact['expired'] and 0 < int(match[1]) <= run['run_attempt']:
+                  sites.append((int(match[1]), artifact['name']))
+          assert sites and len({attempt for attempt, _ in sites}) == len(sites), 'Original documentation is missing or ambiguous'
+          attempt, name = max(sites)
+          tree = subprocess.check_output(['git', 'rev-parse', f'{accepted}^{{tree}}'], text=True).strip()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key, value in {'run': run['id'], 'attempt': attempt, 'artifact': name,
+                                 'pr': feature['number'], 'head': head, 'tree': tree}.items():
+                  output.write(f'{key}={value}\n')
+          PYDOC
+      - name: Download the original feature site
         uses: actions/download-artifact@v8
         with:
-          name: documentation
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.source.outputs.run }}
+          name: ${{ steps.source.outputs.artifact }}
           path: doc
-
-      - name: Setup Pages
-        uses: actions/configure-pages@v6
-
-      - name: Upload to GitHub Pages
-        uses: actions/upload-pages-artifact@v5
+      - name: Verify the accepted source before deployment
+        env:
+          EXPECTED_RUN: ${{ steps.source.outputs.run }}
+          EXPECTED_ATTEMPT: ${{ steps.source.outputs.attempt }}
+          EXPECTED_PR: ${{ steps.source.outputs.pr }}
+          EXPECTED_HEAD: ${{ steps.source.outputs.head }}
+          EXPECTED_TREE: ${{ steps.source.outputs.tree }}
+        run: |
+          python3 - <<'PYDOC'
+          import json, os, re
+          with open('doc/_bamboo-ci-source.json') as original:
+              source = json.load(original)
+          for field, key in [('GITHUB_RUN_ID', 'RUN'), ('GITHUB_RUN_ATTEMPT', 'ATTEMPT'), ('PR_NUMBER', 'PR'), ('PR_HEAD_SHA', 'HEAD'), ('tree', 'TREE')]:
+              assert source[field] == os.environ['EXPECTED_' + key], f'Documentation {field} changed'
+          assert source['GITHUB_REPOSITORY'] == os.environ['GITHUB_REPOSITORY']
+          assert re.fullmatch(r'[0-9a-f]{40}', source['GITHUB_SHA']), 'Missing original tested merge SHA'
+          PYDOC
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: doc
-
-      - name: Deploy to GitHub Pages
+      - uses: actions/deploy-pages@v5
         id: deployment
-        uses: actions/deploy-pages@v5

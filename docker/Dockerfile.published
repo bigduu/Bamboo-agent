@@ -1,0 +1,21 @@
+# The Linux executable is the original, versioned release asset. It already
+# contains the published frontend; this image does not run Cargo or Vite.
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin bamboo \
+    && mkdir -p /data && chown bamboo:bamboo /data
+
+COPY .docker-release/bamboo /usr/local/bin/bamboo
+WORKDIR /app
+ENV RUST_LOG=info BAMBOO_DATA_DIR=/data BAMBOO_PORT=9562 BAMBOO_BIND=0.0.0.0
+EXPOSE 9562
+USER bamboo
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:9562/api/v1/health >/dev/null \
+    && curl -fsS http://127.0.0.1:9562/ >/dev/null \
+    && test -s /data/frontend/.frontend-manifest.json || exit 1
+ENTRYPOINT ["bamboo"]
+CMD ["serve", "--port", "9562", "--bind", "0.0.0.0", "--data-dir", "/data"]
