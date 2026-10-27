@@ -1,5 +1,6 @@
-//! Prepared #1048 composition. This file is deliberately not wired into mod.rs
-//! until the Observer and current-user default resolver dependencies are accepted.
+//! Original #1048 composition, now wired as a tests-first acceptance target.
+//! The current-user default resolver is an explicit production dependency;
+//! its absence must produce a real failure rather than manual scope grants.
 //! Planner API was checked against accepted a64a852810b7104954e9fd1f60230df09b48eef2.
 //! Supervisor's delegation-only policy is independently owned by #2334/#2335;
 //! default-all resolution/legacy-scope migration remains an unaccepted dependency.

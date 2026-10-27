@@ -632,6 +632,9 @@ mod tests;
 #[cfg(test)]
 mod model_limit_snapshot_tests;
 
+#[cfg(test)]
+mod supervisor_epic_acceptance_tests;
+
 #[derive(Debug, Clone, Copy)]
 pub struct ConfigUpdateEffects {
     pub reload_provider: bamboo_config::patch::ReloadMode,
