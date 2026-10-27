@@ -16,7 +16,12 @@ const ROOT_BIRTH_CASES = ["root_birth_existing_root_progress_and_scope_reads_rem
   "root_birth_all_entrypoints_wait_for_retained_shared_authority", "root_birth_final_shared_writer_guard_and_missing_title_fail_closed",
   "root_birth_cancel_retains_exclusive_owner_and_pending_proof_stays_closed"];
 const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_without_transport_feature_fails_without_starting_exporter";
-const FEATURE_SOURCE_SHA256 = "dbd4112a82f5a22ccf32f05854a9312200e41219a1ea243b0a8cabf68a6fd1bc";
+// Audited delta from accepted CI2ff: FileInbox adds four test/test-utils fault
+// guards; ticket_application.rs, storage/v2.rs and tickets/service.rs/store.rs
+// change existing current-user/Work compatibility code in sensitive files.
+// Cargo features, required targets and all19 FEATURE_CONTEXTS additions stay;
+// new fault/Epic cases belong to the existing ordinary default library catalog.
+const FEATURE_SOURCE_SHA256 = "d1eede796df5b3d77748132c05f8c0c3a1a593636d8cf5fd8efa8e7752d1aba0";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [

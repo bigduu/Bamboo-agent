@@ -89,7 +89,12 @@ impl ObserverSubscriptionCoordinator {
             .subscriptions
             .iter()
             .filter(|(id, subscription)| {
-                subscription.ready(now)
+                (subscription.ready(now)
+                    || (subscription.failures == 8
+                        && subscription
+                            .terminal_fault
+                            .as_ref()
+                            .is_none_or(|fault| fault.ready(now))))
                     && state.observers.get(*id).is_some_and(|registration| {
                         registration.enabled
                             && registration.revision == subscription.window.scope_epoch
@@ -105,6 +110,27 @@ impl ObserverSubscriptionCoordinator {
             session_id: parent.id.clone(),
             incarnation_id,
         };
+        if subscription.failures == 8 {
+            match self
+                .inbox
+                .deliver_supervisor_observer_fault(&reference, id, now)
+                .await
+            {
+                Ok(_) => {
+                    if let Err(error) = self
+                        .activation
+                        .reconcile_wake(&reference.session_id, now)
+                        .await
+                    {
+                        tracing::warn!(observer_id=%id,%error,"Observer diagnostic enqueued; parent wake remains under Inbox recovery");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(observer_id=%id,%error,"Observer fault remains unreported; bounded delivery retry is canonical")
+                }
+            }
+            return;
+        }
         let result = self.reconcile(&reference, id, subscription, now).await;
         if let Err((failure, error)) = result {
             tracing::warn!(observer_id=%id,%error,"Observer subscription pass failed; recording bounded retry");

@@ -342,10 +342,29 @@ test("serial Root birth selectors reuse canonical storage compilation and preser
   assert.match(lint, /test "\$actual" = "\$EXPECTED_SOURCE"/u)
 })
 
+const OBSERVER_FAULT_HOST_CASES = [
+  "fault_cap_from_actual_publication_failure_notifies_idle_parent_once",
+  "fault_preserves_live_work_wait_and_original_user_input",
+  "fault_parent_inbox_before_checkpoint_reopens_and_never_replays_provider",
+  "fault_missing_source_can_report_but_revoked_registration_cannot",
+  "fault_delivery_failure_is_bounded_durable_and_preserves_original_payload",
+]
+
 function assertSubscriptionException(source) {
-  // Normal merge6cfe/PR2316 retains original F57c1 configuration. This is not
-  // actual-M acceptance or ownership migration; a future owner needs review.
-  assert.equal(createHash("sha256").update(source).digest("hex"), "e79b9f16140786a49761cd5baab66a5cf83faa5d793ed11464701c2b475175da")
+  // Finite F transition: keep the accepted S19 recipe byte-for-byte after
+  // removing only the five exact fault cases, their path and verdict wording.
+  // This remains API-only feature-head evidence, never canonical-M admission.
+  const extension = "          faults = {\n" + OBSERVER_FAULT_HOST_CASES
+    .map(name => `              '${name}',\n`).join("") +
+    "          }\n          expected |= {f'app_state::observer_subscriptions::tests::fault::{name}' for name in faults}\n"
+  assert.ok(source.includes(extension), "Require all five exact fault cases")
+  const original = source
+    .replace("      - 'crates/app/bamboo-server/src/app_state/observer_fault_tests.rs'\n", "")
+    .replace(extension, "")
+    .replace("print('Six canonical windows, exact legacy serde, five fail-closed Inbox regressions, seven subscription and five fault Host fixtures passed')",
+      "print('Six canonical windows, exact legacy serde, five fail-closed Inbox regressions and all seven actual subscription Host fixtures passed')")
+  assert.equal(createHash("sha256").update(original).digest("hex"), "e79b9f16140786a49761cd5baab66a5cf83faa5d793ed11464701c2b475175da")
+  assert.equal(createHash("sha256").update(source).digest("hex"), "dca281c6768f86c159d026e0436da2d4f0645d01139287ad43d10e959105646b")
   assert.match(source, /pull_request:\n    branches: \[dev\]/u)
   assert.match(source, /runs-on: ubuntu-latest/u)
   assert.match(source, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
@@ -495,6 +514,28 @@ test("Supervisor API-only diagnostics are manual and bind the exact dispatch bef
   assert.equal((source.match(/test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SOURCE_SHA"/gu) || []).length, 2)
 })
 
+test("Original Epic API-only diagnostic binds its exact dispatch source", () => {
+  const source = readFileSync(".github/workflows/supervisor-epic-acceptance.yml", "utf8")
+  assert.match(source, /^  workflow_dispatch:$/mu)
+  assert.doesNotMatch(source, /^  (?:pull_request|push):/mu)
+  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ inputs\.snapshot_sha \}\}/u)
+  assert.match(source, /DISPATCH_SOURCE_SHA: \$\{\{ github\.sha \}\}/u)
+  assert.match(source, /ref: \$\{\{ inputs\.snapshot_sha \}\}/u)
+  assert.match(source, /cancel-in-progress: false/u)
+  const marker = "      - name: Require a fixed diagnostic source\n"
+  assert.ok(source.indexOf(marker) < source.indexOf("      - uses: actions/checkout@"))
+  const block = source.split(marker)[1].split("\n      - ")[0]
+  const script = block.split("        run: |\n")[1].replace(/^          /gmu, "")
+  const sha = "a".repeat(40)
+  for (const [snapshot, dispatched, valid] of [[sha, sha, true], [sha, "b".repeat(40), false],
+    ["b".repeat(40), "b".repeat(40), true], ["A".repeat(40), "A".repeat(40), false],
+    ["a".repeat(39), sha, false], ["", "", false], [sha + "\n", sha, false], ["$(exit 0)", sha, false]]) {
+    const result = spawnSync("bash", ["-c", script], { encoding: "utf8",
+      env: { PATH: process.env.PATH, EXPECTED_SOURCE_SHA: snapshot, DISPATCH_SOURCE_SHA: dispatched } })
+    assert.equal(result.status === 0, valid, "foreign/malformed diagnostic source must fail closed")
+  }
+})
+
 test("subscription exception retains exact F API-only graph without becoming merge-source evidence", () => {
   const source = readFileSync(".github/workflows/observer-subscriptions.yml", "utf8")
   assertLinuxTestOwnership({ "observer-subscriptions.yml": source })
@@ -508,6 +549,10 @@ test("subscription exception retains exact F API-only graph without becoming mer
     ["assert len(window) == 6", "assert len(window) >= 0"]]) {
     assert.ok(source.includes(before), before)
     assert.throws(() => assertLinuxTestOwnership({ "observer-subscriptions.yml": source.replace(before, after) }))
+  }
+  for (const name of OBSERVER_FAULT_HOST_CASES) {
+    assert.ok(source.includes(name), name)
+    assert.throws(() => assertLinuxTestOwnership({ "observer-subscriptions.yml": source.replace(name, name + "_unowned") }))
   }
   assert.throws(() => assertLinuxTestOwnership({ "unregistered-subscriptions.yml": source }), /must join the canonical feature executor/u)
 })

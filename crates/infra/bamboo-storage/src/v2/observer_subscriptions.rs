@@ -37,6 +37,7 @@ pub(crate) struct ObserverNoticeAuthority {
     locked: LockedObserver,
     pub(crate) envelope: SessionMessageEnvelope,
     pub(crate) inbox_dir: PathBuf,
+    fault: bool,
 }
 
 fn owner<'a>(reference: &SupervisorReference, child: &'a Session) -> ObserverSubscriptionOwner<'a> {
@@ -353,12 +354,32 @@ impl SessionStoreV2 {
         failure: ObserverSubscriptionFailure,
     ) -> io::Result<()> {
         let mut locked = self.observer_failure_state(reference, child_id).await?;
+        let registration = locked
+            .state
+            .observers
+            .get(child_id)
+            .expect("verified registration");
+        let failure_owner = ObserverSubscriptionOwner {
+            supervisor_incarnation: reference.incarnation_id,
+            supervisor_created_at: registration.parent_created_at,
+            observer_session_id: child_id,
+            observer_created_at: registration.child_created_at,
+        };
         let subscription = locked
             .state
             .subscriptions
             .get_mut(child_id)
             .ok_or_else(|| denied("Observer has no subscription"))?;
         subscription.record_failure(now, failure);
+        if subscription.failures == 8 {
+            subscription
+                .capture_terminal_fault(&failure_owner, now)
+                .map_err(invalid)?;
+            locked.state.schema_version = locked
+                .state
+                .schema_version
+                .max(bamboo_domain::SUPERVISOR_OBSERVER_FAULT_SCHEMA_VERSION);
+        }
         locked.state.revision = next_revision(locked.state.revision)?;
         self.publish_management_state(&mut locked.parent, &locked.state, &locked.guards)
             .await
@@ -433,7 +454,154 @@ impl SessionStoreV2 {
             locked,
             envelope,
             inbox_dir,
+            fault: false,
         }))
+    }
+
+    /// A rejected delivery may record only its diagnostic counter. It cannot
+    /// mint an Observer read grant or an Inbox authority after Host revocation.
+    pub(crate) async fn record_observer_fault_delivery_failure(
+        &self,
+        reference: &SupervisorReference,
+        child_id: &str,
+        now: DateTime<Utc>,
+    ) -> io::Result<()> {
+        let mut locked = self.observer_failure_state(reference, child_id).await?;
+        let registration = locked
+            .state
+            .observers
+            .get(child_id)
+            .expect("verified registration");
+        let failure_owner = ObserverSubscriptionOwner {
+            supervisor_incarnation: reference.incarnation_id,
+            supervisor_created_at: registration.parent_created_at,
+            observer_session_id: child_id,
+            observer_created_at: registration.child_created_at,
+        };
+        let subscription = locked
+            .state
+            .subscriptions
+            .get_mut(child_id)
+            .expect("verified subscription");
+        subscription
+            .capture_terminal_fault(&failure_owner, now)
+            .map_err(invalid)?;
+        let fault = subscription
+            .terminal_fault
+            .as_mut()
+            .expect("terminal captured");
+        if !fault.ready(now) {
+            return Ok(());
+        }
+        fault.delivery_failed(now);
+        locked.state.schema_version = locked
+            .state
+            .schema_version
+            .max(bamboo_domain::SUPERVISOR_OBSERVER_FAULT_SCHEMA_VERSION);
+        locked.state.revision = next_revision(locked.state.revision)?;
+        self.publish_management_state(&mut locked.parent, &locked.state, &locked.guards)
+            .await
+    }
+
+    /// Administrative diagnostics never read a target source. They still
+    /// require the original native Child, live canonical links/epoch and Host
+    /// namespace absence; revoked registrations cannot send to their old parent.
+    pub(crate) async fn begin_observer_fault(
+        &self,
+        reference: &SupervisorReference,
+        child_id: &str,
+        now: DateTime<Utc>,
+    ) -> io::Result<Arc<ObserverNoticeAuthority>> {
+        let mut locked = self
+            .subscription_authority(reference, child_id, false)
+            .await?;
+        let subscription = locked
+            .state
+            .subscriptions
+            .get_mut(child_id)
+            .ok_or_else(|| denied("Observer has no subscription"))?;
+        if subscription.window.scope_epoch != locked.registration.revision {
+            return Err(denied("Observer diagnostic epoch changed"));
+        }
+        let created = subscription
+            .capture_terminal_fault(&owner(reference, &locked.child), now)
+            .map_err(invalid)?;
+        let fault = subscription
+            .terminal_fault
+            .as_ref()
+            .expect("terminal captured");
+        if !fault.ready(now) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Observer diagnostic is reported or delivery is blocked",
+            ));
+        }
+        let envelope=SessionMessageEnvelope{
+            id:fault.event_id.clone(),source:SessionMessageSource::Runtime{subsystem:"supervisor_observation".into()},
+            target_session_id:reference.session_id.clone(),kind:SessionMessageKind::RuntimeInstruction,
+            body:SessionMessageBody::RuntimeInstruction(SessionRuntimeInstruction{
+                instruction:"observer_subscription_fault_v1".into(),
+                content:Some(SessionMessageContent::text(format!("Observer subscription exhausted its bounded retries. This diagnostic grants no control and announces no readable source file: {}",serde_json::to_string(&fault.payload).map_err(|error|invalid(error.to_string()))?))),
+                data:Some(serde_json::to_value(&fault.payload).map_err(|error|invalid(error.to_string()))?),provider_message:None,
+            }),created_at:fault.payload.exhausted_at,thread_id:None,in_reply_to:None,attempt:None,correlation_id:None,
+        };
+        if created {
+            locked.state.schema_version = locked
+                .state
+                .schema_version
+                .max(bamboo_domain::SUPERVISOR_OBSERVER_FAULT_SCHEMA_VERSION);
+            locked.state.revision = next_revision(locked.state.revision)?;
+            self.publish_management_state(&mut locked.parent, &locked.state, &locked.guards)
+                .await?;
+        }
+        envelope
+            .validate()
+            .map_err(|error| invalid(error.to_string()))?;
+        let inbox_dir = self.sessions_dir.join(&reference.session_id).join("inbox");
+        Ok(Arc::new(ObserverNoticeAuthority {
+            locked,
+            envelope,
+            inbox_dir,
+            fault: true,
+        }))
+    }
+
+    /// Private integrated completion; a receipt-shaped public DTO has no port
+    /// to mark a diagnostic reported. Delivery failure never replaces payload.
+    pub(crate) async fn finish_observer_fault(
+        &self,
+        authority: &Arc<ObserverNoticeAuthority>,
+        receipt: Option<&SessionInboxReceipt>,
+        now: DateTime<Utc>,
+    ) -> io::Result<()> {
+        if !authority.fault {
+            return Err(denied("view is not a diagnostic delivery"));
+        }
+        let locked = &authority.locked;
+        let mut state = locked.state.clone();
+        let fault = state
+            .subscriptions
+            .get_mut(&locked.child.id)
+            .and_then(|subscription| subscription.terminal_fault.as_mut())
+            .ok_or_else(|| denied("terminal diagnostic disappeared"))?;
+        if let Some(receipt) = receipt {
+            if receipt.id != authority.envelope.id
+                || receipt.generation == 0
+                || authority.envelope.target_session_id != locked.parent.id
+            {
+                return Err(denied(
+                    "diagnostic receipt has a different event or mailbox",
+                ));
+            }
+            fault.reported = true;
+            fault.retry_at = None;
+        } else {
+            fault.delivery_failed(now);
+        }
+        state.revision = next_revision(state.revision)?;
+        let mut parent = locked.parent.clone();
+        self.publish_management_state(&mut parent, &state, &locked.guards)
+            .await
     }
 
     async fn publish_observer_changes(
@@ -487,6 +655,9 @@ impl SessionStoreV2 {
         receipt: &SessionInboxReceipt,
         now: DateTime<Utc>,
     ) -> io::Result<()> {
+        if authority.fault {
+            return Err(denied("fault is not a view delivery"));
+        }
         let locked = &authority.locked;
         let reference = observer_parent_reference(&locked.parent)
             .ok_or_else(|| denied("Observer Supervisor changed"))?;

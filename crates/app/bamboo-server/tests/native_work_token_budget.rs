@@ -2,7 +2,7 @@
 use actix_web::{http::StatusCode, test, web, App};
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
-use bamboo_domain::{Message, WorkspaceBinding};
+use bamboo_domain::{Message, Storage, WorkspaceBinding};
 use bamboo_llm::{provider::ProviderModelInfo, LLMChunk, LLMError, LLMProvider, LLMStream};
 use bamboo_tickets::{
     Authority, Contract, Operation, Principal, ProjectContextSnapshot, StepStatus, TicketKind,
@@ -72,9 +72,50 @@ fn ledger(service: &bamboo_tickets::TicketService, _authority: &Authority) -> Wo
 
 #[actix_web::test]
 async fn native_host_reserves_before_calls_and_blocks_exhausted_continuation() {
-    for exhausted in [false, true] {
+    for (binding_revision, initial_ultra, exhausted) in [
+        (1, false, false),
+        (1, false, true),
+        (7, false, false),
+        (7, true, false),
+        (7, false, true),
+        (7, true, true),
+    ] {
         let root = tempfile::tempdir().unwrap();
         let physical = root.path().canonicalize().unwrap();
+        if binding_revision == 7 {
+            // Seed an existing, sealed historical scope using the real public
+            // stores before the Host opens it. No ledger bytes are rewritten.
+            let storage = bamboo_storage::SessionStoreV2::new(physical.clone())
+                .await
+                .unwrap();
+            let bootstrap = storage
+                .get_or_create_default_supervisor(MODEL)
+                .await
+                .unwrap();
+            let mut supervisor = storage
+                .load_session(&bootstrap.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            supervisor
+                .set_root_orchestration_only(initial_ultra)
+                .unwrap();
+            storage.save_session(&supervisor).await.unwrap();
+            let (mut binding, supervisor) =
+                bamboo_engine::ticket_runtime::verified_scope_binding(&storage, &supervisor.id)
+                    .await
+                    .unwrap();
+            assert_eq!(binding.binding_revision, 1);
+            binding.binding_revision = binding_revision;
+            let historical = bamboo_tickets::TicketService::open(
+                physical
+                    .join("tickets")
+                    .join(supervisor.supervisor_incarnation_id().unwrap().to_string()),
+                binding.clone(),
+            )
+            .unwrap();
+            assert_eq!(historical.published().unwrap().1.binding, binding);
+        }
         let workspace = execution_workspace(&physical);
         let (send, mut requests) = mpsc::unbounded_channel();
         let local = Arc::new(LocalProvider {
@@ -93,6 +134,19 @@ async fn native_host_reserves_before_calls_and_blocks_exhausted_continuation() {
             })
             .await
             .unwrap();
+        let sealed_binding = service.published().unwrap().1.binding;
+        assert_eq!(sealed_binding.binding_revision, binding_revision);
+        let initial_supervisor = state
+            .storage
+            .load_root_authority(&sealed_binding.supervisor_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            initial_supervisor.root_orchestration_only_enabled(),
+            initial_ultra
+        );
+        assert_eq!(initial_supervisor.supervisor_orchestration_revision(), Some(1));
         let manifest = state
             .project_store
             .create("Native token budget", None)
@@ -218,6 +272,22 @@ async fn native_host_reserves_before_calls_and_blocks_exhausted_continuation() {
                 .is_some(),
             "actual Native admission"
         );
+        if binding_revision == 7 {
+            // The captured capability must revalidate the same sealed scope
+            // after a real mode change while its first provider call is held.
+            let mut supervisor = state
+                .storage
+                .load_session(&sealed_binding.supervisor_session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            supervisor
+                .set_root_orchestration_only(!initial_ultra)
+                .unwrap();
+            state.storage.save_session(&supervisor).await.unwrap();
+            assert_eq!(supervisor.supervisor_orchestration_revision(), Some(1));
+            assert_eq!(service.published().unwrap().1.binding, sealed_binding);
+        }
         first.reply.send(LLMChunk::ToolCalls(vec![ToolCall { id: "budget-task".into(), tool_type: "function".into(), function: FunctionCall { name: "Task".into(), arguments: json!({"tasks":[{"id":"step","content":"Finish the attributable plan","status":"completed"}]}).to_string() } }])).unwrap();
         if !exhausted {
             let second = tokio::time::timeout(WAIT, requests.recv())
@@ -275,6 +345,26 @@ async fn native_host_reserves_before_calls_and_blocks_exhausted_continuation() {
         .unwrap();
         let snapshot = service.published().unwrap().1;
         let budget = ledger(&service, &owner);
+        assert_eq!(snapshot.binding, sealed_binding);
+        let child = state
+            .storage
+            .load_runtime_control_plane(
+                &snapshot.assignments[&assignment]
+                    .runtime
+                    .as_ref()
+                    .unwrap()
+                    .session_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bamboo_engine::ticket_runtime::read_dispatch(&child)
+                .unwrap()
+                .unwrap()
+                .binding,
+            sealed_binding
+        );
         assert_eq!(
             snapshot.assignments[&assignment].plan.steps[0].status,
             Some(StepStatus::Completed),
@@ -316,5 +406,5 @@ async fn native_host_reserves_before_calls_and_blocks_exhausted_continuation() {
             .all(|r| r.request.work_id == work && r.request.project_id == manifest.id));
         state.shutdown().await;
     }
-    eprintln!("native_work_token_budget: actual Host reservation/usage/exhaustion PASS, local provider=3, external=0");
+    eprintln!("native_work_token_budget: actual Host reservation/usage/exhaustion and historical binding/mode roundtrip PASS, local provider=9, external=0");
 }
