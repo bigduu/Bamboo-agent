@@ -1603,3 +1603,38 @@ test('frozen Dev reservation renders its real feature acceptance without histori
   assert.doesNotMatch(body, /Main publication CI:|Full pre-merge acceptance:/)
   assert.deepEqual(readBodyReceipt({ body }), result.receipt, 'Display rendering must preserve the signed receipt')
 })
+
+test('frozen source routing rejects old Dev and triggers that would restore Main or Docker builds', () => {
+  const { assertFrozenSourceWorkflows } = require('./release-source.cjs')
+  const files = {
+    '.github/workflows/ci.yml': '# BAMBOO_FEATURE_RELEASE_ROUTE_V1\non:\n  pull_request:\n    branches: [dev, main]\n  workflow_dispatch:\npermissions:\n  contents: read\n',
+    '.github/workflows/docker-publish.yml': '# BAMBOO_RELEASE_IMAGE_CONSUMER_V1\non:\n  workflow_run:\n    workflows: [Publish Crate]\n  workflow_dispatch:\njobs:\n',
+    '.github/workflows/publish-crate.yml': '# BAMBOO_FROZEN_DEV_PUBLISHER_V1\non:\n  workflow_dispatch:\njobs:\n',
+  }
+  const check = data => assertFrozenSourceWorkflows(file => data[file])
+  assert.doesNotThrow(() => check(files))
+  assert.doesNotThrow(() => check(Object.fromEntries(Object.entries(files).map(([file, body]) => [file, body.replaceAll('\n', '\r\n')]))))
+  const old = require('./tests/main-authority-bootstrap-fixture.cjs').acceptedDevData()
+  assert.throws(() => check({ ...files, '.github/workflows/ci.yml': old.ci,
+    '.github/workflows/publish-crate.yml': old.publisher }), /reviewed cutover/, 'The real earlier accepted Dev D must stay on historical recovery')
+  for (const file of Object.keys(files)) {
+    for (const change of [
+      text => text.replace(/^#.*\n/, ''),
+      text => text.replace('on:\n', 'on:\n  push:\n'),
+      text => text.replace('on:\n', 'on:\n  "push":\n'),
+      text => text.replace('on:\n', 'on: [push]\n'),
+      text => text + '\n"on": [push]\n',
+    ]) assert.throws(() => check({ ...files, [file]: change(files[file]) }))
+  }
+  assert.throws(() => check({ ...files, '.github/workflows/docker-publish.yml': files['.github/workflows/docker-publish.yml'].replace('  workflow_run:\n', '') }))
+  assert.throws(() => check({ ...files, '.github/workflows/publish-crate.yml': files['.github/workflows/publish-crate.yml'].replace('workflow_dispatch', 'workflow_run') }))
+})
+
+test('publisher checks the committed S cutover after source checkout and before any reservation', () => {
+  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8').split('  automatic:\n')[1].split('  publish-crates:\n')[0]
+  const check = workflow.indexOf('release-source.cjs" source-contract')
+  assert.ok(workflow.indexOf('ref: ${{ steps.source.outputs.revision }}') < check)
+  assert.ok(check < workflow.indexOf('crate-release.cjs" plan'))
+  const source = fs.readFileSync('scripts/release-source.cjs', 'utf8')
+  assert.ok(source.includes("command(['git', 'rev-parse', 'HEAD']).trim(), source"))
+})

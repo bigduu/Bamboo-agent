@@ -123,6 +123,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Require the frozen source to retain the completed release cutover
+        run: node "${{ runner.temp }}/bamboo-release-controller/scripts/release-source.cjs" source-contract
+
       - name: Require the complete executable policy before reserving a version
         id: executable_policy
         # Historical successful CI may be delivered after this workflow ships.

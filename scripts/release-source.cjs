@@ -161,9 +161,42 @@ function authorizeFrozenRelease(env = process.env, read = githubRead, log = id =
   frozenGuard(validation, env, read, event)
   return validation
 }
-module.exports = { ...module.exports, FEATURE_CHECKS, authorizeFrozenRelease, frozenGuard }
+// The immutable product source must contain the completed cutover too: promoting
+// an older tested Dev cut would restore Main builds or the old tag Docker build.
+function assertFrozenSourceWorkflows(read = file => require('node:fs').readFileSync(file, 'utf8')) {
+  for (const [file, marker, required] of [
+    ['.github/workflows/ci.yml', '# BAMBOO_FEATURE_RELEASE_ROUTE_V1', ['pull_request', 'workflow_dispatch']],
+    ['.github/workflows/docker-publish.yml', '# BAMBOO_RELEASE_IMAGE_CONSUMER_V1', ['workflow_run', 'workflow_dispatch']],
+    ['.github/workflows/publish-crate.yml', '# BAMBOO_FROZEN_DEV_PUBLISHER_V1', ['workflow_dispatch']],
+  ]) {
+    const text = read(file); assert.ok(Buffer.byteLength(text) <= 256 * 1024)
+    const lines = text.replace(/\r\n/g, '\n').split('\n')
+    assert.equal(lines.filter(line => line === marker).length, 1, 'Source lacks the reviewed cutover: ' + file)
+    const root = line => line.length && !/^\s|^#/.test(line)
+    const declarations = lines.filter(root)
+    assert.ok(declarations.every(line => /^[a-z][a-z_-]*:/.test(line)), 'Noncanonical workflow declaration: ' + file)
+    assert.deepEqual(declarations.filter(line => /^on:/.test(line)), ['on:'], 'Require one block event declaration: ' + file)
+    const start = lines.indexOf('on:') + 1
+    const next = lines.findIndex((line, index) => index >= start && root(line))
+    const rows = lines.slice(start, next < 0 ? undefined : next).filter(line => /^  \S/.test(line) && !/^  #/.test(line))
+    const events = rows.map(line => {
+      const match = /^  ([a-z_]+):(?:\s*#.*)?$/.exec(line)
+      assert.ok(match, 'Noncanonical workflow event: ' + file)
+      return match[1]
+    })
+    assert.deepEqual(events.sort(), [...required].sort(), 'Source retains an old or unknown trigger: ' + file)
+  }
+}
+module.exports = { ...module.exports, FEATURE_CHECKS, authorizeFrozenRelease, frozenGuard, assertFrozenSourceWorkflows }
 if (require.main === module) {
-  const validation = authorizeFrozenRelease()
-  require('node:fs').appendFileSync(process.env.GITHUB_OUTPUT,
-    'revision=' + validation.sourceRevision + '\nvalidation=' + JSON.stringify(validation) + '\n')
+  if (process.argv[2] === 'source-contract') {
+    const source = frozenInputs(process.env, sourceEvent(process.env))
+    assert.equal(require('./crate-release.cjs').command(['git', 'rev-parse', 'HEAD']).trim(), source)
+    assertFrozenSourceWorkflows()
+  } else {
+    assert.equal(process.argv[2], undefined)
+    const validation = authorizeFrozenRelease()
+    require('node:fs').appendFileSync(process.env.GITHUB_OUTPUT,
+      'revision=' + validation.sourceRevision + '\nvalidation=' + JSON.stringify(validation) + '\n')
+  }
 }
