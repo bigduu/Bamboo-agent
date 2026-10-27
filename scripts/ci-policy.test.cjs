@@ -366,8 +366,8 @@ function assertSubscriptionException(source) {
     .replace(extension, "")
     .replace("print('Six canonical windows, exact legacy serde, five fail-closed Inbox regressions, seven subscription and five fault Host fixtures passed')",
       "print('Six canonical windows, exact legacy serde, five fail-closed Inbox regressions and all seven actual subscription Host fixtures passed')")
-  assert.equal(createHash("sha256").update(original).digest("hex"), "ada1eed323eeb271ca3411d54ec5da774046b2b0bc3fba15358c30aa9b195110")
-  assert.equal(createHash("sha256").update(source).digest("hex"), "45e0b535db3cefb7a7094a58432b18c8269781101af0450ef7910d4747ccf64f")
+  assert.equal(createHash("sha256").update(original).digest("hex"), "5a9ec1ee32d1e0faaee714a21bba5e64775b6a2bc61bc0ea90c88f29f6823431")
+  assert.equal(createHash("sha256").update(source).digest("hex"), "4ba96e60f4fb4b2a28aa1614e385a76f90f1c9d648d4a17a5a78166e72b4a0e5")
   assert.match(source, /on:\n  workflow_dispatch:\n/u)
   assert.doesNotMatch(source.split("\npermissions:")[0], /pull_request:|push:/u)
   assert.match(source, /runs-on: ubuntu-latest/u)
