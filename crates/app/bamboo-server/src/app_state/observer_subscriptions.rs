@@ -156,7 +156,7 @@ impl ObserverSubscriptionCoordinator {
             // Inbox item or active native run prevents publishing another view.
             let backlog = self
                 .inbox
-                .backlog(id)
+                .inspect(id)
                 .await
                 .map_err(|error| (Failure::InboxUnavailable, error.to_string()))?;
             if backlog.pending > 0

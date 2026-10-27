@@ -376,13 +376,13 @@ async fn subscription_real_inbox_crash_retry_reopens_and_preserves_frozen_pendin
         },
     );
     assert!(inbox.deliver(&forged).await.is_err());
-    assert_eq!(inbox.backlog(OBSERVER).await.unwrap().generation, 0);
+    assert_eq!(inbox.inspect(OBSERVER).await.unwrap().generation, 0);
     inbox.interrupt_next_observer_cursor_for_testing();
     assert!(inbox
         .deliver_supervisor_observation(&f.reference, OBSERVER, now)
         .await
         .is_err());
-    let physical = inbox.backlog(OBSERVER).await.unwrap();
+    let physical = inbox.inspect(OBSERVER).await.unwrap();
     assert!(physical.activation_generation > 0);
     assert_eq!(f.subscription().await.window.enqueued_sequence, 0);
     let blocked = f.home.path().join("coordination/observer-changes");
@@ -392,7 +392,7 @@ async fn subscription_real_inbox_crash_retry_reopens_and_preserves_frozen_pendin
         .await
         .is_err());
     assert_eq!(f.subscription().await.window.enqueued_sequence, 0);
-    assert_eq!(inbox.backlog(OBSERVER).await.unwrap(), physical);
+    assert_eq!(inbox.inspect(OBSERVER).await.unwrap(), physical);
     std::fs::remove_file(blocked).unwrap();
     let mut target = load(&f.state, ROOT_A).await;
     target
@@ -417,7 +417,7 @@ async fn subscription_real_inbox_crash_retry_reopens_and_preserves_frozen_pendin
         .await
         .unwrap();
     assert_eq!(receipt.delivery.id, change.event_id);
-    assert_eq!(recovered.backlog(OBSERVER).await.unwrap(), physical);
+    assert_eq!(recovered.inspect(OBSERVER).await.unwrap(), physical);
     let parent = reopened
         .load_root_authority(&f.reference.session_id)
         .await
@@ -467,7 +467,7 @@ async fn subscription_failed_publication_is_visible_bounded_and_never_enqueues()
     );
     assert!(!subscription.ready(now + chrono::Duration::days(1)));
     assert!(subscription.window.pending.is_none());
-    let backlog = f.state.session_inbox.backlog(OBSERVER).await.unwrap();
+    let backlog = f.state.session_inbox.inspect(OBSERVER).await.unwrap();
     assert_eq!(backlog.activation_generation, 0);
     assert_eq!(f.probe.calls.load(Ordering::SeqCst), 0);
     f.state.shutdown().await;
@@ -629,7 +629,7 @@ async fn subscription_rotates_derived_shards_has_gap_and_revocation_is_final() {
     let target = f.publish(ROOT_B).await;
     let due = now + chrono::Duration::hours(1);
     f.stage(ROOT_B, &target, due).await;
-    let before = f.state.session_inbox.backlog(OBSERVER).await.unwrap();
+    let before = f.state.session_inbox.inspect(OBSERVER).await.unwrap();
     f.state
         .session_store
         .revoke_supervisor_observer(&f.reference, f.revision().await, OBSERVER)
@@ -643,7 +643,7 @@ async fn subscription_rotates_derived_shards_has_gap_and_revocation_is_final() {
         .await
         .is_err());
     assert_eq!(
-        f.state.session_inbox.backlog(OBSERVER).await.unwrap(),
+        f.state.session_inbox.inspect(OBSERVER).await.unwrap(),
         before
     );
     assert!(f
@@ -811,7 +811,7 @@ async fn subscription_owned_and_active_backpressure_coalesces_until_real_consump
         .await;
     assert_eq!(f.subscription().await.window.enqueued_sequence, 1);
     assert_eq!(f.probe.calls.load(Ordering::SeqCst), 0);
-    assert_eq!(inbox.backlog(OBSERVER).await.unwrap().claimed, 1);
+    assert_eq!(inbox.inspect(OBSERVER).await.unwrap().claimed, 1);
     // Release the actual owned lease; the existing native consumer performs the
     // transcript checkpoint+ACK. A producer receipt never substitutes for it.
     inbox.release_owned(OBSERVER, &claims[0]).await.unwrap();
