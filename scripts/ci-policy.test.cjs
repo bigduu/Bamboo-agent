@@ -5,6 +5,7 @@ const { spawnSync } = require("node:child_process")
 const os = require("node:os")
 const path = require("node:path")
 const { test } = require("node:test")
+require("./docs-deploy.test.cjs").register()
 const { runInNewContext, runInThisContext } = require("node:vm")
 
 const workflow = readFileSync(".github/workflows/ci.yml", "utf8")
@@ -597,11 +598,10 @@ test("feature Docs has one canonical producer and both required summaries reject
     ['"$DOCS_RESULT"', '"success"'],
     ["DOCS_RESULT: ${{ needs.docs.result }}", "DOCS_RESULT: success"],
   ]) assert.throws(() => assertOwner(workflow.replace(from, to)))
-  const legacy = readFileSync(".github/workflows/docs.yml", "utf8")
-  assert.match(legacy, /branches: \[ main, master \]/u)
-  assert.match(legacy, /cargo doc --no-deps --all-features --document-private-items/u)
-  assert.match(legacy, /if: github.event_name == 'push' && github.ref == 'refs\/heads\/main'/u)
-  assert.doesNotMatch(legacy, /branches:.*dev|feature-docs-/u)
+  const consumer = readFileSync(".github/workflows/docs.yml", "utf8")
+  assert.match(consumer, /branches: \[main\]/u)
+  assert.doesNotMatch(consumer, /cargo |rust-toolchain|rust-cache|upload-pages-artifact|pull_request|master/u)
+  assert.match(consumer, /needs\.inspect-docs\.outputs\.mode == 'promotion'/u)
 })
 
 test("feature Docs real tiny tar and source receipt reject changed, unsafe and incomplete inputs", (t) => {
@@ -1805,7 +1805,7 @@ const frontendWorkflow = readFileSync(
 test("this frozen batch cannot save cache on source, integration, promotion or main push", () => {
   const actor = readFileSync(".github/workflows/actor-snapshot-windows.yml", "utf8")
   const docs = readFileSync(".github/workflows/docs.yml", "utf8")
-  const sources = [workflow, frontendWorkflow, actor, docs]
+  const sources = [workflow, frontendWorkflow, actor]
   const header = frozenCacheWriteHeader.join("\n")
   const expression = frozenCacheWriteHeader.slice(1).join("\n").trim().slice(3, -2)
   const cutRef = "release/da348a63f1d019a22df547c78575c500b6b1294e"
@@ -1854,9 +1854,9 @@ test("this frozen batch cannot save cache on source, integration, promotion or m
     assert.equal(source.split(header).length, 2, "one shared batch predicate must govern each workflow")
     for (const [name, github, expected] of cases) assert.equal(evaluate(expression, github, true), expected, name)
   }
-  assert.equal(caches, 16, "all planned source/dev/main cache actions remain covered")
+  assert.equal(caches, 15, "all remaining source/dev/main cache actions remain covered after retiring Docs compilation")
   assert.ok(actor.includes(cacheSaveIf("github.event_name == 'pull_request' && github.base_ref == 'dev'")))
-  assert.match(docs, /cache-on-failure: true\n          save-if: \$\{\{ env\.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' \}\}/u)
+  assert.doesNotMatch(docs, /rust-cache|actions\/cache|BAMBOO_RELEASE_CACHE_WRITE_ALLOWED/u)
   const publisher = readFileSync(".github/workflows/publish-crate.yml", "utf8")
   const nativePublisher = publisher.split('  executables:\n')[1].split('  publish-executables:\n')[0]
   assert.match(nativePublisher, /uses: Swatinem\/rust-cache@[0-9a-f]{40}/u)

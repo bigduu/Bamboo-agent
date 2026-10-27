@@ -88,12 +88,28 @@ authorization or external artifact API identity. Never overwrite an attempt or
 silently follow input/site links. Run the targeted `feature Docs` policy fixtures
 and affected CI routing checks; they use tiny real tar files, not Rustdoc.
 
-This producer is staged until exact-source hosted acceptance. The Main consumer
-depends on shared v2 promotion authority and is not wired: legacy `docs.yml`
-still builds main/master PRs and pushes, and full legacy CI retains its old docs
-command. Preserve those live routes until cutover. The future authenticated
-consumer must copy the successful original tar bytes; missing/expired evidence
-stops deployment without recompilation or repackaging. Bootstrap cannot deploy.
+#2355 stages the `docs.yml` Main-push consumer. Its zero-argument entrypoint reads
+actual protected-main C and uses the real shared `verifyMergedPromotion` only
+for `mode=promotion`. The metadata job may identify a shared-parser-recognized
+bootstrap/controller event and skip Pages; unknown modes stop. Never treat a
+locator, receipt or a green metadata job as a published promotion.
+
+Read the original physical Docs upload log and artifact API identity, then
+verify the original ZIP, source/configuration-bound receipt and every TAR file.
+Copy `artifact.tar` through the existing Pages Actions transfer without Rustdoc,
+retarring, runtime tests or source execution. Only that verified transfer gets
+Pages/OIDC permissions; recheck the real Main promotion after large local reads
+and require Main still equals this push. The consumer bounds ZIP and TAR to
+1 GiB. Missing, expired, changed or unsupported originals stop without rebuilding
+or a new durable-store fallback. Retries preserve the feature's physical attempt.
+
+The three literal Docs controls and actual Pages positive acceptance remain
+pending separate Ops installation. The production entrypoint stops while that
+closure is absent. Full legacy CI still retains its old Docs command until the
+coordinated cutover; do not claim Main is already free of compilation. Keep the
+d6a producer and its original evidence. `ci-policy.test.cjs` registers the new
+consumer Node contracts once in the existing Quick Checks owner; never add a
+Main test job or another Rust documentation producer.
 
 ## Native feature ownership
 
