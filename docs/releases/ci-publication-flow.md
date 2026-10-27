@@ -26,9 +26,55 @@ admission; the recorder's Linux lifecycle is already in the canonical executor.
 Ordinary Linux orchestration/context tests do not get separate compilation jobs.
 Fix failures in feature branches.
 
+#2319 consolidates feature native acceptance into `Native Feature
+(windows-2025)` and `Native Feature (macos-latest)`. Each owns one workspace and
+`target/native-feature`; both required summaries reject a failed, skipped,
+cancelled or missing matrix result. Actor/Ticket standalone workflows no longer
+start another dev-PR producer. Explicit manual and full legacy release checks
+remain available; this change does not activate release-source publication.
+
+The three portable Node suites register 46 Supervisor, 6 Lotus artifact and
+9 frontend policy cases. Ubuntu `Quick Checks` runs these 61 registrations once;
+each Windows/macOS native feature job runs them once before Cargo. Windows
+retains the explicit unsupported-platform refusal assertions. These counts
+describe registration, not hosted execution or the separate `browser-runtime`
+Node suites; that class still needs an automatic feature owner.
+
+| Native configuration | Cases currently selected from source | Runtime owner |
+| --- | --- | --- |
+| Windows Rust 1.99/MSVC/API-only, independent storage/server/tools defaults | 41: 9 snapshot + 3 gateway + 19 directory + 5 scoped + 5 initial processes | Existing Actor immutable-executable controller inside the Windows owner |
+| Windows stable/default server, embedded frontend, test opt-0 | 7 TLS + 7 frontend contract | One server Cargo invocation, two enumerated test targets |
+| Recorder default package on both OSes | 2 Unit + 2 native lifecycle | Actual Cargo binary plus original `CARGO_BIN_EXE` and cwd |
+| Windows default Ticket | 1 unsupported-filesystem case | Windows owner, exact selection |
+| Portable Skill source/read/catalog | Windows 22/17/46; macOS 24/17/47 | Independent default skills/server-tools contexts |
+| macOS TLS dev/all-features, server opt-z | 8 including real backtrace | macOS owner with oversized-unwind diagnostic rejection |
+| macOS frontend default/test opt-0 | 7 | macOS owner; distinct from dev-profile server |
+
+These are source/cfg expectations, not a claim of hosted runtime success. The
+driver enumerates actual compiled names and requires the selected runtime count
+with zero failures/ignores, recording source/tree, compiler, features/profile,
+frontend mode, executable hashes and compatible-unit freshness. Expected totals
+are 145 Cargo runtime cases on Windows and 107 on macOS. The original 41 Actor names, real junction
+and process evidence remain guarded. Default storage cannot acquire server
+test-utils; different frontend modes and macOS dev/test profiles do not share
+incompatible executables. Compatible dependencies share the owned target.
+
+Run `node --test scripts/native-test-owner.test.cjs scripts/ci-routing.test.cjs`
+for controller fixtures. Native execution is
+`node scripts/native-test-owner.cjs` on the matching disposable runner, with
+`CARGO_TARGET_DIR` set to its own `target/native-feature`; it deliberately has no
+cross-platform or compilation fallback. Per-attempt evidence includes partial
+command logs and `native-owner.json`. Never publish raw host process/env logs.
+
+New source authority #2318 must wait for accepted #2311 plus complete #2319
+native receipts. Its release path must not repeat these cases. A339/v7 was not
+published or present in the audited frozen sources; retain its commit/run as
+runtime evidence without treating it as complete v8 native acceptance. Actual
+v6 and earlier frozen workflow/helper contracts remain unchanged.
+
 | Phase | Target contract | Activation |
 | --- | --- | --- |
-| Feature -> dev | Disjoint Unit/E2E, native acceptance and current review pass on the feature merge source. | Implemented by #2311. |
+| Feature -> dev | Disjoint Unit/E2E, native acceptance and current review pass on the feature merge source. | Prepared by #2311/#2319; activation requires their exact-source hosted runs and protected dev admission. |
 | Release source | Freeze the exact tested dev cut and reserve one formal version with the existing allocator. | Pending release-source admission. |
 | Release artifacts | Stamp disposable checkouts; build/package/publish each native product once. No Unit/E2E repetition or product repairs. | Pending release-source admission. |
 | Main promotion | Verify the exact published source and retain tag, manifest/provenance hashes and publisher run in the promotion description. No build/test. | Pending release-source admission. |
