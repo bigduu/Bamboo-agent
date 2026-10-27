@@ -34,6 +34,7 @@ its own final source and does not establish success for the earlier candidates.
 | Security Audit | Ubuntu/stable: install pinned cargo-audit 0.22.2, `cargo audit --deny warnings` | Original `.cargo/audit.toml`; no new exemptions. |
 | cargo-deny | Pinned action `3c634983`, cargo-deny 0.20.2: `check` | The action defaults to `--all-features` in its Rust 1.85/Alpine container; original targets/licenses/bans/advisories/sources remain. This is distinct from audit and MSRV. |
 | Feature CodeQL | Ubuntu, actions/javascript-typescript/python/rust, init/analyze v4, `build-mode: none` | Four analyses with no product compilation, browser execution or repeated Node tests. |
+| Documentation (#2321 staged producer) | Ubuntu/stable: `cargo doc --locked --no-deps --all-features --document-private-items` | One supported site configuration on the 30 default members; both required summaries consume the real job result. Original tar and complete integrity receipt retained per physical attempt. |
 | Frontend Package Inventory | Ubuntu: committed bytes verification; stable Cargo only for `cargo package --locked -p bamboo-server --allow-dirty --list` | Inventory requires build.rs, frontend_build.rs, manifest and zip. No additional product compilation, runtime suite, build target/cache, version stamping or final archive. |
 
 Ordinary embedded compilation/runtime, including the real `CARGO_BIN_EXE_bamboo`
@@ -57,9 +58,38 @@ comment about all-feature Unit execution was not execution evidence.
 The existing main/manual CodeQL, original release frontend-head contract and
 full legacy quality routes remain active until #2318 cutover. Thus this slice
 fills feature ownership without claiming release/main repetition is already
-removed. Rustdoc/Docker/ABI, native release outputs and final crate archives
-belong to their separate slices; #2331 neither creates nor activates source
+removed. Rustdoc is staged below; Docker/ABI, native release outputs and final
+crate archives belong to their separate slices; #2331 neither creates nor activates source
 authority, version allocation, publication or promotion protocols.
+
+## Documentation originals and pending Main consumer
+
+#2321 stages the sole dev-PR site producer in CI's `Documentation` job. It checks
+the actual merge M and clean source before/after generation, clears only its
+owned `target/doc`, and preserves the `bamboo_agent/index.html` redirect. The
+supported configuration uses all features and private items on Cargo's 30
+default members, excluding Analytics and the recorder example. Doctests remain
+with their runtime owners; CodeQL remains a separate analysis without a build.
+
+`feature-docs-<run>-<physicalAttempt>` retains `artifact.tar` and `receipt.json`
+for 90 days. The receipt includes every site file's path/size/SHA-256, the raw
+tar hash, actual M/tree, distinct workflow controller SHA/ref, repository/run/
+attempt, toolchain, selected manifests, configuration and lock/workflow hashes.
+Bounded regular-file reads and real tar verification reject links, unsafe paths,
+missing/changed files and source drift. Receipt integrity does not establish
+publication authority: the future consumer must separately authenticate the
+official workflow/run/jobs, original artifact API ID/digest and promoted source
+through the shared v2 Main admission interface. Equal trees are insufficient.
+
+Only the producer is implemented here, pending its own hosted acceptance. The
+read-only Main consumer is not connected; legacy `docs.yml` still builds
+main/master PRs and pushes and retains its existing main-only Pages permissions
+and environment. Full legacy CI keeps its old `cargo doc --no-deps` route until
+the coordinated authority cutover. These repetitions are pending, not removed.
+The future consumer must copy the original tar rather than rebuild or repackage;
+its Pages transfer has a separate one-day retention boundary. Missing, expired
+or changed originals stop deployment. There is no new store or allocator, and
+bootstrap never authorizes Pages deployment.
 
 ## Native and browser feature owners
 

@@ -41,6 +41,192 @@ const job = (id) => {
     : workflow.slice(contentStart, contentStart + nextJob)
 }
 
+const docsStep = (name, source = workflow) => {
+  const block = source.slice(source.indexOf("\n  docs:\n")).split(/\n  security:\n/u)[0]
+  const step = block.split(`      - name: ${name}\n`)[1]?.split(/\n      - /u)[0]
+  assert.ok(step, name)
+  return step
+}
+const docsShell = (name) => docsStep(name).match(/        run: \|\n([\s\S]*)/u)[1].replace(/^          /gmu, "").trimEnd()
+
+test("feature Docs has one canonical producer and both required summaries reject incomplete Docs", () => {
+  const assertOwner = (source) => {
+    const block = source.slice(source.indexOf("\n  docs:\n")).split(/\n  security:\n/u)[0]
+    assert.match(block, /^    if: needs.validation-source.outputs.feature == 'true' \|\| needs.validation-source.outputs.full == 'true'$/mu)
+    const build = docsStep("Build feature documentation once", source)
+    assert.match(build, /^        if: needs.validation-source.outputs.feature == 'true'$/mu)
+    assert.match(build, /^          cargo doc --locked --no-deps --all-features --document-private-items$/mu)
+    assert.doesNotMatch(build, /--workspace|--no-verify|continue-on-error|\|\| true/u)
+    assert.match(docsStep("Build documentation", source), /if: needs.validation-source.outputs.full == 'true'\n        run: cargo doc --no-deps/u)
+    const freeze = docsStep("Freeze original feature documentation tar and receipt", source)
+    assert.match(freeze, /^        if: needs.validation-source.outputs.feature == 'true'$/mu)
+    const upload = docsStep("Retain original feature documentation tar and receipt", source)
+    assert.match(upload, /if: success\(\) && needs.validation-source.outputs.feature == 'true'/u)
+    assert.match(upload, /name: feature-docs-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}/u)
+    assert.match(upload, /if-no-files-found: error\n          retention-days: 90/u)
+    assert.ok(block.indexOf("Verify feature documentation source stayed clean") < block.indexOf("Retain original feature documentation"))
+    assert.match(docsStep("Verify feature documentation source stayed clean", source), /if: always\(\) && needs.validation-source.outputs.feature == 'true'/u)
+    assert.doesNotMatch(block, /continue-on-error|pages: write|id-token: write|deploy-pages|cargo (?:test|build)/u)
+    for (const id of ["test", "e2e-test"]) {
+      const summary = source.split(`\n  ${id}:\n`)[1].split(/\n  [a-z][a-z0-9-]*:\n/u)[0]
+      assert.match(summary, /^    needs: \[[^\]]*\bdocs\b[^\]]*\]$/mu)
+      assert.match(summary, /DOCS_RESULT: \$\{\{ needs.docs.result \}\}/u)
+      assert.equal((summary.match(/"\$DOCS_RESULT"/gu) || []).length, 2)
+    }
+  }
+  assertOwner(workflow)
+  for (const [from, to] of [
+    ["cargo doc --locked --no-deps --all-features --document-private-items", "cargo doc --workspace"],
+    ["if: success() && needs.validation-source.outputs.feature == 'true'", "if: always()"],
+    ["retention-days: 90", "retention-days: 1"],
+    ['"$DOCS_RESULT"', '"success"'],
+    ["DOCS_RESULT: ${{ needs.docs.result }}", "DOCS_RESULT: success"],
+  ]) assert.throws(() => assertOwner(workflow.replace(from, to)))
+  const legacy = readFileSync(".github/workflows/docs.yml", "utf8")
+  assert.match(legacy, /branches: \[ main, master \]/u)
+  assert.match(legacy, /cargo doc --no-deps --all-features --document-private-items/u)
+  assert.match(legacy, /if: github.event_name == 'push' && github.ref == 'refs\/heads\/main'/u)
+  assert.doesNotMatch(legacy, /branches:.*dev|feature-docs-/u)
+})
+
+test("feature Docs real tiny tar and source receipt reject changed, unsafe and incomplete inputs", (t) => {
+  const shell = docsShell("Freeze original feature documentation tar and receipt")
+  const producer = shell.match(/^python3 - <<'PY'\n([\s\S]*)\nPY$/u)[1]
+  const rootManifest = readFileSync("Cargo.toml", "utf8")
+  const defaults = [...rootManifest.match(/default-members = \[([\s\S]*?)\]/u)[1].matchAll(/^\s*"([^"]+)",/gmu)].map(match => match[1])
+  assert.equal(defaults.length, 30)
+  const sources = Object.fromEntries(["Cargo.toml", "Cargo.lock", ".cargo/config.toml", ".github/workflows/ci.yml",
+    ...defaults.map(member => path.posix.join(member, "Cargo.toml"))].map(file => [file, readFileSync(file, "utf8")]))
+  const members = defaults.map(member => ({ manifest: path.posix.join(member, "Cargo.toml"),
+    name: sources[path.posix.join(member, "Cargo.toml")].match(/^name\s*=\s*"([^"]+)"/mu)[1] }))
+  const env = Object.fromEntries(["PATH", "HOME", "TMPDIR", "SYSTEMROOT", "LANG"].filter(key => process.env[key]).map(key => [key, process.env[key]]))
+  const python = ["python3.12", "python3"].find(candidate => spawnSync(candidate, ["-c", "import pathlib; assert hasattr(pathlib.Path(), 'is_relative_to')"], { env }).status === 0)
+  assert.ok(python)
+  const result = spawnSync(python, ["-c", String.raw`
+import copy, io, json, os, pathlib, shutil, subprocess, sys, tarfile, tempfile
+payload = json.load(sys.stdin)
+ns = {"__name__": "fixture"}; exec(compile(payload["producer"], "actual-ci-docs-producer", "exec"), ns)
+checks = []
+def reject(name, call):
+    try: call()
+    except (AssertionError, KeyError, ValueError, OSError, tarfile.TarError): checks.append(name)
+    else: raise AssertionError("Accepted negative: " + name)
+with tempfile.TemporaryDirectory(prefix="bamboo-feature-docs-") as scratch:
+    base = pathlib.Path(scratch).resolve(); root = base / "source"; root.mkdir(); os.chdir(root)
+    for name, text in payload["sources"].items():
+        file = root / name; file.parent.mkdir(parents=True, exist_ok=True); file.write_text(text)
+    (root / ".gitignore").write_text("/target/\n")
+    def git(*args): return subprocess.check_output(["git", "-c", "core.hooksPath=/dev/null", *args], text=True).strip()
+    git("init", "-q"); git("add", "."); git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "tiny docs source")
+    temporary = base / "runner"; temporary.mkdir()
+    packages = [{"id": item["name"], "name": item["name"], "manifest_path": str(root / item["manifest"])} for item in payload["members"]]
+    metadata = {"workspace_root": str(root), "target_directory": str(root / "target"), "workspace_default_members": [item["id"] for item in packages], "packages": packages}
+    metadata_file = temporary / "feature-docs-metadata.json"
+    metadata_file.write_text(json.dumps(metadata))
+    for tool in ["rustc", "cargo", "rustdoc"]: (temporary / ("feature-docs-" + tool + ".txt")).write_text(tool + " fixture-version\n")
+    os.environ.update(GITHUB_SHA=git("rev-parse", "HEAD"), GITHUB_EVENT_NAME="pull_request", GITHUB_BASE_REF="dev", GITHUB_REF="refs/pull/42/merge",
+        GITHUB_REPOSITORY="bigduu/Bamboo-agent", GITHUB_WORKFLOW_SHA="c" * 40, GITHUB_WORKFLOW_REF="bigduu/Bamboo-agent/.github/workflows/ci.yml@refs/pull/42/merge",
+        GITHUB_RUN_ID="12345", GITHUB_RUN_ATTEMPT="2", RUNNER_TEMP=str(temporary), RUNNER_OS="Linux", RUNNER_ARCH="X64")
+    site = root / "target/doc"; (site / "bamboo_agent").mkdir(parents=True); (site / "static.files/nested").mkdir(parents=True)
+    (site / "bamboo_agent/index.html").write_text("<h1>tiny docs 中文</h1>")
+    (site / "static.files/nested/app.js").write_text("const docs = true;\n"); (site / "static.files/empty").write_bytes(b"")
+    ns["produce"](); output = temporary / "feature-docs-12345-2"; archive = output / "artifact.tar"
+    receipt = json.loads((output / "receipt.json").read_text())
+    context = {key: copy.deepcopy(receipt[key]) for key in ["source", "controller", "run", "artifactName", "configuration", "inputs", "toolchain", "runner"]}
+    assert receipt["source"]["sha"] != receipt["controller"]["sha"] and receipt["source"]["tree"] == git("rev-parse", "HEAD^{tree}")
+    assert receipt["fileCount"] == 4 and len(receipt["configuration"]["defaultMembers"]) == 30
+    assert receipt["configuration"]["command"] == ["cargo", "doc", "--locked", "--no-deps", "--all-features", "--document-private-items"]
+    assert (site / "index.html").read_text() == '<meta http-equiv="refresh" content="0;url=bamboo_agent/index.html">\n'
+    copied = output / "original-copy.tar"; shutil.copyfile(archive, copied); ns["verify_receipt"](receipt, copied, context)
+    checks += ["real tar roundtrip and full manifest", "actual clean source with distinct controller", "original tar copied byte for byte"]
+    def changed(parts, value):
+        item = copy.deepcopy(receipt); target = item
+        for part in parts[:-1]: target = target[part]
+        target[parts[-1]] = value; ns["verify_receipt"](item, archive, context)
+    for route, value in [("schema", "foreign"), ("complete", False), ("source/sha", "b"*40), ("source/tree", "b"*40),
+        ("controller/sha", "b"*40), ("controller/ref", "refs/heads/main"), ("run/repository", "foreign/repo"), ("run/id", 12346),
+        ("run/physicalAttempt", 3), ("run/event", "push"), ("run/ref", "refs/pull/43/merge"), ("artifactName", "other"),
+        ("configuration/command", ["cargo", "doc"]), ("configuration/defaultMembers", []), ("configuration/sourceConfigSha256", {}),
+        ("configurationSha256", "0"*64), ("inputs/cargoLockSha256", "0"*64), ("inputs/sourceWorkflowSha256", "0"*64),
+        ("toolchain/rustdoc", "changed"), ("runner/os", "Windows"), ("tar/file", "other.tar"), ("tar/sha256", "0"*64),
+        ("tar/sizeBytes", 1), ("files", receipt["files"][:-1]), ("fileCount", 0), ("siteBytes", 0)]:
+        reject("receipt " + route, lambda route=route, value=value: changed(route.split("/"), value))
+    for field in receipt:
+        item = copy.deepcopy(receipt); del item[field]
+        reject("missing " + field, lambda item=item: ns["verify_receipt"](item, archive, context))
+    for label, mutate in [("unknown field", lambda item: item.update(extra=True)),
+        ("manifest hash", lambda item: item["files"][0].update(sha256="0"*64)),
+        ("manifest size", lambda item: item["files"][0].update(sizeBytes=1)),
+        ("manifest order", lambda item: item["files"].reverse())]:
+        item = copy.deepcopy(receipt); mutate(item); item["siteBytes"] = sum(file["sizeBytes"] for file in item["files"])
+        reject(label, lambda: ns["verify_receipt"](item, archive, context))
+    for limit in ["MAX_FILES", "MAX_ENTRIES", "MAX_SITE_BYTES", "MAX_TAR_BYTES", "MAX_RECEIPT_BYTES"]:
+        original = ns[limit]; ns[limit] = 1
+        reject("bounded " + limit, lambda: ns["verify_receipt"](receipt, archive, context)); ns[limit] = original
+    for name in ["../escape", "/absolute", "a/../escape", "a//b", "./a", ".", "C:/escape", "a\\b", "a\nname"]:
+        reject("unsafe path " + repr(name), lambda name=name: ns["safe_path"](name))
+    raw = archive.read_bytes(); corrupt = output / "corrupt.tar"
+    for label, data in [("truncated tar", raw[:700]), ("changed tar bytes", b"X" + raw[1:])]:
+        corrupt.write_bytes(data); reject(label, lambda: ns["verify_receipt"](receipt, corrupt, context))
+    for label, name, kind in [("traversal", "../escape", tarfile.REGTYPE), ("symlink", "evil", tarfile.SYMTYPE),
+        ("hardlink", "evil", tarfile.LNKTYPE), ("unexpected", "extra", tarfile.REGTYPE), ("duplicate", receipt["files"][0]["path"], tarfile.DIRTYPE),
+        ("missing file", "", None), ("changed content", "", None)]:
+        with tarfile.open(corrupt, "w") as tar:
+            with tarfile.open(archive, "r:") as good:
+                for member in good:
+                    if label == "missing file" and member.name == receipt["files"][0]["path"]: continue
+                    stream = good.extractfile(member) if member.isfile() else None
+                    if label == "changed content" and member.name == receipt["files"][0]["path"]:
+                        data = stream.read(); stream.close(); stream = io.BytesIO(b"X" + data[1:])
+                    tar.addfile(member, stream)
+            if kind is not None:
+                member = tarfile.TarInfo(name); member.type = kind; member.linkname = "bamboo_agent/index.html" if kind in [tarfile.SYMTYPE, tarfile.LNKTYPE] else ""
+                tar.addfile(member, io.BytesIO(b"") if member.isfile() else None)
+        item = copy.deepcopy(receipt); item["tar"].update(sha256=ns["file_hash"](corrupt, output), sizeBytes=corrupt.stat().st_size)
+        reject("tar " + label, lambda: ns["verify_receipt"](item, corrupt, context))
+    outside = base / "outside"; outside.mkdir(); (outside / "file").write_text("outside")
+    for label, create in [("input symlink", lambda link: link.symlink_to(outside / "file")), ("input hardlink", lambda link: os.link(outside / "file", link))]:
+        link = temporary / "unsafe"; create(link); reject(label, lambda: ns["read_text"](link, temporary, 65536)); link.unlink()
+    link = temporary / "parent-link"; link.symlink_to(outside, target_is_directory=True)
+    reject("input ancestor symlink", lambda: ns["read_text"](link / "file", temporary, 65536)); link.unlink()
+    reject("input parent traversal", lambda: ns["read_text"](temporary / "../outside/file", temporary, 65536))
+    os.environ["GITHUB_RUN_ATTEMPT"] = "3"
+    redirect = site / "index.html"; redirect_bytes = redirect.read_bytes(); redirect.unlink(); os.link(outside / "file", redirect)
+    reject("redirect hardlink before write", ns["produce"]); assert (outside / "file").read_text() == "outside"
+    redirect.unlink(); redirect.write_bytes(redirect_bytes)
+    link = site / "linked"; link.symlink_to(outside / "file")
+    reject("site symlink", ns["produce"]); link.unlink()
+    for route, value in [("workspace_root", str(outside)), ("target_directory", str(outside)), ("workspace_default_members", metadata["workspace_default_members"] * 2), ("packages", packages[:-1])]:
+        changed_metadata = copy.deepcopy(metadata); changed_metadata[route] = value; metadata_file.write_text(json.dumps(changed_metadata))
+        reject("metadata " + route, ns["produce"])
+    metadata_file.write_text(json.dumps(metadata))
+    for key, value in [("GITHUB_SHA", "0"*40), ("GITHUB_EVENT_NAME", "push"), ("GITHUB_BASE_REF", "main"), ("GITHUB_REF", "refs/heads/dev"),
+        ("GITHUB_REPOSITORY", "foreign/repo"), ("GITHUB_WORKFLOW_SHA", "latest"), ("GITHUB_WORKFLOW_REF", "refs/heads/main"), ("GITHUB_RUN_ID", "0"), ("GITHUB_RUN_ATTEMPT", "0")]:
+        original = os.environ[key]; os.environ[key] = value; reject("source context " + key, ns["produce"]); os.environ[key] = original
+    (root / "dirty").write_text("untracked"); reject("dirty source", ns["produce"]); (root / "dirty").unlink()
+    original_verify = ns["verify_receipt"]
+    def dirty_after_verify(*args): original_verify(*args); (root / "dirty").write_text("post-build drift")
+    ns["verify_receipt"] = dirty_after_verify; reject("post-build source drift", ns["produce"]); (root / "dirty").unlink(); ns["verify_receipt"] = original_verify
+    os.environ["GITHUB_RUN_ATTEMPT"] = "2"; reject("completed attempt overwrite", ns["produce"]); assert archive.read_bytes() == raw
+    # Only a failing compiler stub is executed: this proves failure propagation, never compilation acceptance.
+    tools = base / "tools"; tools.mkdir(); (tools / "python3").symlink_to(sys.executable)
+    for tool in ["rustc", "rustdoc"]:
+        file = tools / tool; file.write_text("#!/bin/sh\nprintf fixture-version\\n\n"); file.chmod(0o755)
+    cargo = tools / "cargo"; cargo.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$RUNNER_TEMP/cargo-calls"\ncase "$1" in metadata) printf "{}";; -V) printf fixture-version;; doc) exit 29;; *) exit 99;; esac\n'); cargo.chmod(0o755)
+    child = {key: os.environ[key] for key in ["HOME", "PATH", "GITHUB_SHA", "GITHUB_EVENT_NAME", "GITHUB_BASE_REF", "GITHUB_REF", "GITHUB_REPOSITORY", "GITHUB_WORKFLOW_SHA", "GITHUB_WORKFLOW_REF", "GITHUB_RUN_ID", "RUNNER_TEMP", "RUNNER_OS", "RUNNER_ARCH"]}
+    child.update(PATH=str(tools) + os.pathsep + child["PATH"], GITHUB_RUN_ATTEMPT="99")
+    failed = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", payload["build"] + "\n" + payload["freeze"]], env=child, capture_output=True, text=True)
+    assert failed.returncode == 29, failed.stderr
+    assert (temporary / "cargo-calls").read_text().splitlines() == ["metadata --locked --format-version 1 --no-deps", "-V", "doc --locked --no-deps --all-features --document-private-items"]
+    assert not (temporary / "feature-docs-12345-99").exists(); checks.append("compiler failure creates no retained receipt")
+print(json.dumps(checks))
+`], { env, input: JSON.stringify({ producer, sources, members, build: docsShell("Build feature documentation once"), freeze: shell }), encoding: "utf8", timeout: 30000, maxBuffer: 2 << 20 })
+  assert.equal(result.status, 0, result.stderr + result.stdout)
+  const checks = JSON.parse(result.stdout)
+  assert.ok(checks.length >= 80, checks.length)
+  t.diagnostic(`${checks.length} actual tiny-tar/source integrity cases; no Cargo/Rustdoc executed`)
+})
+
 const comprehensiveOnly =
   "if: needs.validation-source.outputs.full == 'true'"
 

@@ -64,6 +64,29 @@ owner table before adding another producer. A95/C2330/#2331 are combined WIP
 until exact-source hosted acceptance; legacy main/release gates stay active
 until the separate source-controller cutover. Do not claim that cutover here.
 
+## Documentation producer staged by #2321
+
+CI's `Documentation` job owns dev-PR documentation on the actual clean merge M;
+both required summaries consume its real result. Its supported command is
+`cargo doc --locked --no-deps --all-features --document-private-items`, using
+the 30 workspace default members rather than `--workspace`. Analytics and the
+recorder example remain outside that selection. Keep this distinct from doctests
+and CodeQL's `build-mode: none` analysis.
+
+Retain the original site tar plus complete file/hash manifest and source,
+controller, run/physical-attempt, configuration and toolchain receipt for 90 days
+under `feature-docs-<run>-<attempt>`. The receipt checks integrity, not Main
+authorization or external artifact API identity. Never overwrite an attempt or
+silently follow input/site links. Run the targeted `feature Docs` policy fixtures
+and affected CI routing checks; they use tiny real tar files, not Rustdoc.
+
+This producer is staged until exact-source hosted acceptance. The Main consumer
+depends on shared v2 promotion authority and is not wired: legacy `docs.yml`
+still builds main/master PRs and pushes, and full legacy CI retains its old docs
+command. Preserve those live routes until cutover. The future authenticated
+consumer must copy the successful original tar bytes; missing/expired evidence
+stops deployment without recompilation or repackaging. Bootstrap cannot deploy.
+
 ## Native feature ownership
 
 #2319 gives Windows and macOS one feature job, workspace and owned target each.
