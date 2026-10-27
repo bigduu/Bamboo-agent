@@ -68,6 +68,13 @@ jobs:
           cargo test --locked -p bamboo-storage --test supervisor_current_user_scope \
             -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/supervisor-current-user.log"
           grep -Fq 'test result: ok. 7 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-current-user.log"
+          cargo test --locked -p bamboo-storage --test patrol_notice \
+            -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/supervisor-role-notice.log"
+          grep -Fq 'test result: ok. 2 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-role-notice.log"
+          cargo test --locked -p bamboo-storage --lib session_inbox::supervisor_tests:: \
+            -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/supervisor-inbox-guards.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-inbox-guards.log"
+          ! grep -Fq 'test result: ok. 0 passed;' "$RUNNER_TEMP/supervisor-inbox-guards.log"
       - name: Verify existing Work binding survives Supervisor mode changes
         run: |
           set -euo pipefail
@@ -95,6 +102,10 @@ jobs:
               2>&1 | tee "$RUNNER_TEMP/supervisor-work-$case.log"
             grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-work-$case.log"
           done
+          cargo test --locked -p bamboo-server --lib app_state::supervised_root_create \
+            -- --test-threads=1 2>&1 | tee "$RUNNER_TEMP/supervisor-native-root.log"
+          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-native-root.log"
+          ! grep -Fq 'test result: ok. 0 passed;' "$RUNNER_TEMP/supervisor-native-root.log"
       - name: Verify direct file and process denial in both modes
         run: |
           set -euo pipefail
@@ -121,6 +132,9 @@ jobs:
             runtime::runner::tool_execution::supervisor_dispatch_tests::supervisor_native_direct_files_and_processes_never_enter_executor_in_both_modes \
             -- --exact --test-threads=1 --nocapture
           grep -Fq 'test result: ok. 1 passed; 0 failed; 0 ignored' "$RUNNER_TEMP/supervisor-role-native.log"
+          run_nonempty work-owner cargo test --locked -p bamboo-engine --lib \
+            ticket_runtime::tests::only_canonical_ticket_child_of_the_current_supervisor_avoids_orphan_wait \
+            -- --exact --test-threads=1
           run_nonempty engine cargo test --locked -p bamboo-engine --lib supervisor_ \
             -- --test-threads=1 \
             --skip supervisor_native_direct_files_and_processes_never_enter_executor_in_both_modes

@@ -192,9 +192,9 @@ async fn installed_host_scope_serves_root_child_and_supervisor_without_role_impe
         assert_eq!(
             page["sessions"][0]["session_id"],
             if is_supervisor {
-                &fixture.targets[0].id
+                fixture.targets[0].id.as_str()
             } else {
-                &fixture.targets[1].id
+                fixture.targets[1].id.as_str()
             }
         );
         assert_eq!(page["sessions"][0]["link_revision"], 0);

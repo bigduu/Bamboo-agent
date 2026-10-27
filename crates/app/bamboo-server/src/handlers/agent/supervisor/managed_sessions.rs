@@ -1,5 +1,5 @@
-//! Owner-selected existing Roots over the canonical Supervisor management ports.
-//! A listed relationship is an observation, never a retained execution grant.
+//! Current-user discovery plus retained legacy link annotations.
+//! A listed selector is an observation, never a retained execution grant.
 use std::{collections::BTreeMap, io};
 
 use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse};
@@ -26,7 +26,7 @@ pub struct ManagedSessionUpdate {
 fn error(status: StatusCode, code: &str, message: impl ToString) -> HttpResponse {
     HttpResponse::build(status).json(json!({
         "error":crate::error::error_value(message.to_string()), "code":code,
-        "recovery":"Reload the managed Sessions and explicitly select the intended existing Root in its allowed Project. Refresh incarnation/revision after a conflict. An uncertain mutation needs canonical readback, never an automatic retry. This operation starts no task and changes no target permissions."
+        "recovery":"Refresh canonical incarnation/revision after a legacy annotation conflict. Default Supervisor current-user access needs no Project authorization or attachment. An uncertain mutation needs canonical readback, never an automatic retry. This operation starts no task and changes no target permissions."
     }))
 }
 
@@ -36,12 +36,6 @@ fn changed_scope() -> HttpResponse {
         "scope_revision_conflict",
         "Supervisor identity or management scope changed; reload the managed Sessions",
     )
-}
-
-fn same_scope(left: &SupervisorScopeObservation, right: &SupervisorScopeObservation) -> bool {
-    left.supervisor == right.supervisor
-        && left.state_revision == right.state_revision
-        && left.allowed_projects == right.allowed_projects
 }
 
 async fn management_snapshot(

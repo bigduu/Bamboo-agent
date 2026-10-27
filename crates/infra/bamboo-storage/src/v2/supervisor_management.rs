@@ -672,10 +672,7 @@ impl SessionStoreV2 {
         let current = self.management_supervisor_locked(reference).await?;
         self.check_management_session_compatibility(&current)
             .await?;
-        if orchestration_revision == 0
-            || !current.root_orchestration_only_enabled()
-            || current.root_tool_authority_revision != orchestration_revision
-        {
+        if current.supervisor_orchestration_revision() != Some(orchestration_revision) {
             return Err(denied("Supervisor orchestration binding changed"));
         }
         Ok(SupervisorFollowupGuard {

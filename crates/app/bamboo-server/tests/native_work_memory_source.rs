@@ -247,10 +247,25 @@ async fn adopted_native_source_needs_current_project_and_never_mutates_tickets()
         .unwrap();
     supervisor.set_root_orchestration_only(false).unwrap();
     state.storage.save_session(&supervisor).await.unwrap();
+    // Thinking mode does not revoke the canonical Supervisor role. The
+    // already-stale Project resource fence still rejects the adopted source.
     assert!(matches!(
         state.read_work_memory_source(&work, pin.memory_id()).await,
-        Err(Error::ScopeDenied(_))
+        Err(Error::RevisionConflict)
     ));
+    state.storage.delete_session(&supervisor.id).await.unwrap();
+    state
+        .storage
+        .get_or_create_default_supervisor("replacement")
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            state.read_work_memory_source(&work, pin.memory_id()).await,
+            Err(Error::ScopeDenied(_))
+        ),
+        "a different canonical incarnation cannot borrow the old Work scope"
+    );
     assert_eq!(
         canonical_bytes(&service.published().unwrap()).unwrap(),
         before

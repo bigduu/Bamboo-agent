@@ -296,7 +296,7 @@ async fn invalid_project_workspace_and_stale_scope_have_no_root_or_link_side_eff
         let result = f.create(request).await;
         assert!(!result.success, "{case}: {}", result.result);
         let expected = match case {
-            "foreign_project" => "scope_denied",
+            "foreign_project" => "project_unavailable",
             "foreign_workspace" => "project_workspace_conflict",
             "missing_directory" => "workspace_invalid",
             "unbound_directory" => "project_workspace_unbound",
@@ -329,6 +329,12 @@ async fn recovered_root_before_link_and_link_before_input_use_the_reserved_lifet
                 .create_and_attach_supervised_root(&f.supervisor, 1, &candidate)
                 .await
                 .unwrap();
+            // Retained old relation bytes are migration metadata, not a new
+            // prerequisite for creating or recovering this current-user Root.
+            SupervisorSessionService::new(f.creator.store.clone())
+                .attach(&f.supervisor, 1, &candidate.id)
+                .await
+                .unwrap();
         } else {
             // Simulate a crash after the existing canonical Root save but
             // before management publication. The reservation preceded it.
@@ -336,7 +342,10 @@ async fn recovered_root_before_link_and_link_before_input_use_the_reserved_lifet
         }
         let result = accepted(f.create(f.request.clone()).await);
         assert_eq!(result["target_session_id"], record.session_id);
-        assert_eq!(result["link_revision"], 1);
+        assert_eq!(
+            result["link_revision"],
+            if linked { json!(1) } else { Value::Null }
+        );
         assert_eq!(result["generation"], 1);
         assert_eq!(f.count().await, 2);
         let canonical = f
@@ -402,7 +411,7 @@ async fn caller_cancellation_does_not_drop_the_durable_creation_drive() {
 }
 
 #[tokio::test]
-async fn revoked_or_replaced_links_and_deleted_targets_never_recover_creation_authority() {
+async fn legacy_link_changes_do_not_revoke_default_role_but_deleted_lifetimes_stay_blocked() {
     for case in ["detach", "reattach", "delete", "scope", "incarnation"] {
         let f = Fixture::new().await;
         let first = accepted(f.create(f.request.clone()).await);
@@ -410,6 +419,7 @@ async fn revoked_or_replaced_links_and_deleted_targets_never_recover_creation_au
         let service = SupervisorSessionService::new(f.creator.store.clone());
         match case {
             "detach" | "reattach" => {
+                service.attach(&f.supervisor, 1, id).await.unwrap();
                 service.detach(&f.supervisor, 2, id).await.unwrap();
                 if case == "reattach" {
                     service.attach(&f.supervisor, 3, id).await.unwrap();
@@ -420,7 +430,7 @@ async fn revoked_or_replaced_links_and_deleted_targets_never_recover_creation_au
             }
             "scope" => {
                 service
-                    .configure_project_scope(&f.supervisor, 2, Default::default())
+                    .configure_project_scope(&f.supervisor, 1, Default::default())
                     .await
                     .unwrap();
             }
@@ -436,7 +446,12 @@ async fn revoked_or_replaced_links_and_deleted_targets_never_recover_creation_au
         }
         let count = f.count().await;
         let replay = f.create(f.request.clone()).await;
-        assert!(!replay.success, "{case}: {}", replay.result);
+        assert_eq!(
+            replay.success,
+            matches!(case, "detach" | "reattach" | "scope"),
+            "{case}: {}",
+            replay.result
+        );
         assert_eq!(f.count().await, count, "{case}");
         assert_eq!(f.activation.calls.load(Ordering::SeqCst), 1, "{case}");
         if case == "delete" {
@@ -548,18 +563,20 @@ async fn damaged_receipt_cannot_attach_a_historical_root_and_expiry_cannot_alloc
 }
 
 #[tokio::test]
-async fn scope_observation_reports_uninitialized_scope_without_granting_or_creating() {
+async fn scope_observation_keeps_default_access_with_legacy_empty_scope_without_creating() {
     let f = Fixture::new().await;
     let scoped = value(f.creator.scope(&f.supervisor).await.unwrap());
     assert_eq!(scoped["allowed_projects"], json!([f.request.project_id]));
-    assert_eq!(scoped["code"], "project_scope_configured");
+    assert_eq!(scoped["code"], "current_user_scope_ready");
+    assert_eq!(scoped["requires_project_authorization"], false);
     SupervisorSessionService::new(f.creator.store.clone())
         .configure_project_scope(&f.supervisor, 1, Default::default())
         .await
         .unwrap();
     let uninitialized = value(f.creator.scope(&f.supervisor).await.unwrap());
-    assert_eq!(uninitialized["project_scope_configured"], false);
-    assert_eq!(uninitialized["code"], "project_scope_uninitialized");
+    assert_eq!(uninitialized["project_scope_configured"], true);
+    assert_eq!(uninitialized["code"], "current_user_scope_ready");
+    assert_eq!(uninitialized["legacy_scope_is_authorization"], false);
     assert_eq!(uninitialized["allowed_projects"], json!([]));
     assert_eq!(f.count().await, 1);
     assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
