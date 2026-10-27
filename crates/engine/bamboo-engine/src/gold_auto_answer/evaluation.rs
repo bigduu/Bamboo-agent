@@ -359,6 +359,102 @@ mod provider_selection_tests {
     use bamboo_domain::ReasoningEffort;
     use bamboo_llm::{LLMError, LLMProvider, LLMRequestOptions, LLMStream};
 
+    #[tokio::test]
+    async fn routing_contract_gold_pending_question_keeps_the_fast_provider_model_pair() {
+        use crate::app_context::model_routing_test_support::RoutingContext;
+        for flag in [None, Some(false), Some(true)] {
+            let state = RoutingContext::new(flag);
+            let session = RoutingContext::session();
+            super::evaluate_gold_state_for_pending_question(
+                state.as_ref(),
+                &session.id,
+                &session,
+                &GoldConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                state.requests("fast-b"),
+                vec![("cheap-b".into(), "gold_evaluation".into())]
+            );
+            assert!(state.requests("chat-a").is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_contract_gold_invalid_fast_and_provider_failures_never_switch_accounts() {
+        use crate::app_context::model_routing_test_support::{Failure, RoutingContext};
+        for flag in [None, Some(false), Some(true)] {
+            for invalid in 0..3 {
+                let state = RoutingContext::new(flag);
+                match invalid {
+                    0 => {
+                        state
+                            .config
+                            .write()
+                            .await
+                            .defaults
+                            .as_mut()
+                            .unwrap()
+                            .fast
+                            .as_mut()
+                            .unwrap()
+                            .provider = "missing-account".into()
+                    }
+                    1 => {
+                        state
+                            .config
+                            .write()
+                            .await
+                            .provider_instances
+                            .get_mut("fast-b")
+                            .unwrap()
+                            .enabled = false;
+                        state.registry.remove("fast-b");
+                    }
+                    _ => state
+                        .registry
+                        .set_runtime_models(std::collections::HashMap::from([
+                            (
+                                "chat-a".into(),
+                                vec!["main-a".into(), "legacy-fast-a".into()],
+                            ),
+                            ("fast-b".into(), Vec::new()),
+                        ])),
+                }
+                let session = RoutingContext::session();
+                assert!(super::evaluate_gold_state_for_pending_question(
+                    state.as_ref(),
+                    &session.id,
+                    &session,
+                    &GoldConfig::default()
+                )
+                .await
+                .is_err());
+                state.assert_no_requests();
+            }
+            for failure in [Failure::Auth, Failure::Quota, Failure::Network] {
+                let state = RoutingContext::new(flag);
+                *state.providers["fast-b"].failure.lock().unwrap() = Some(failure);
+                let session = RoutingContext::session();
+                assert!(super::evaluate_gold_state_for_pending_question(
+                    state.as_ref(),
+                    &session.id,
+                    &session,
+                    &GoldConfig::default()
+                )
+                .await
+                .is_err());
+                assert_eq!(
+                    state.requests("fast-b"),
+                    vec![("cheap-b".into(), "gold_evaluation".into())]
+                );
+                assert!(state.requests("chat-a").is_empty());
+                assert!(state.requests("memory-c").is_empty());
+            }
+        }
+    }
+
     #[derive(Default)]
     struct RecordingRejectingProvider {
         requests: Mutex<Vec<(String, Option<ReasoningEffort>)>>,

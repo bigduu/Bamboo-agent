@@ -30,6 +30,10 @@ use bamboo_storage::LockedSessionStore;
 use crate::events::AccountEventSink;
 use crate::runtime::execution::runner_state::AgentRunner;
 
+#[cfg(test)]
+#[path = "app_context/model_routing_test_support.rs"]
+pub(crate) mod model_routing_test_support;
+
 /// Shared application context the agent-session-orchestration cluster depends
 /// on, in place of the server's concrete `AppState`.
 ///

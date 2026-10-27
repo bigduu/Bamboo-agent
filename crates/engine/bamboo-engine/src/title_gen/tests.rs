@@ -2,6 +2,66 @@
 
 use super::*;
 
+#[tokio::test]
+async fn routing_contract_title_uses_saved_global_fast_and_live_replacement_for_every_flag() {
+    use crate::app_context::model_routing_test_support::RoutingContext;
+    for flag in [None, Some(false), Some(true)] {
+        let state = RoutingContext::new(flag);
+        let context: Arc<dyn AgentSessionContext> = state.clone();
+        let session = RoutingContext::session();
+        assert_eq!(
+            try_llm_title(&context, &session, "Synthetic title request")
+                .await
+                .unwrap(),
+            "Synthetic routing title"
+        );
+        assert_eq!(
+            state.requests("fast-b"),
+            vec![("cheap-b".into(), "title_generation".into())]
+        );
+        assert!(state.requests("chat-a").is_empty());
+        state.config.write().await.defaults.as_mut().unwrap().fast = Some(
+            bamboo_domain::ProviderModelRef::new("memory-c", "background-c"),
+        );
+        try_llm_title(&context, &session, "Synthetic replacement request")
+            .await
+            .unwrap();
+        assert_eq!(
+            state.requests("memory-c"),
+            vec![("background-c".into(), "title_generation".into())]
+        );
+        assert!(state.requests("chat-a").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn routing_contract_title_invalid_explicit_fast_never_dispatches_a_fallback() {
+    use crate::app_context::model_routing_test_support::RoutingContext;
+    for flag in [None, Some(false), Some(true)] {
+        let state = RoutingContext::new(flag);
+        state
+            .config
+            .write()
+            .await
+            .defaults
+            .as_mut()
+            .unwrap()
+            .fast
+            .as_mut()
+            .unwrap()
+            .provider = "missing-account".into();
+        let context: Arc<dyn AgentSessionContext> = state.clone();
+        assert!(try_llm_title(
+            &context,
+            &RoutingContext::session(),
+            "Synthetic invalid route"
+        )
+        .await
+        .is_err());
+        state.assert_no_requests();
+    }
+}
+
 #[test]
 fn test_heuristic_title_strips_code_fences_and_caps_length() {
     let input = "```rust\nfn main() {}\n```\nHelp me debug this Rust program please";
