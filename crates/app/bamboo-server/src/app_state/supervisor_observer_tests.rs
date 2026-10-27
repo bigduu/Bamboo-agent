@@ -437,9 +437,22 @@ async fn native_case(with_work_wait: bool) {
     tokio::time::timeout(WAIT, f.probe.entered.notified())
         .await
         .unwrap();
+    // Match normal chat admission: a staged coordinator message alone does
+    // not authorize a user input or wake an idle parent. Respect the existing
+    // Work wait while retaining the input for its eventual safe consumption.
+    let user_admission = f
+        .state
+        .session_messenger
+        .admit_with_activation_intent(
+            SessionMessageEnvelope::user_input(parent_id, USER),
+            bamboo_domain::SessionActivationPolicy::RespectSpecificWait,
+            None,
+        )
+        .await
+        .unwrap();
     f.state
         .session_messenger
-        .admit(SessionMessageEnvelope::user_input(parent_id, USER))
+        .activate_prepared(&user_admission)
         .await
         .unwrap();
     if !with_work_wait {
