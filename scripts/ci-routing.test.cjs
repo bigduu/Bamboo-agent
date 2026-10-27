@@ -255,4 +255,9 @@ test("Docker receives the completed publisher's matching run and attempt", () =>
   assert.doesNotMatch(docker.split("\njobs:\n")[0], /^  push:/m);
   assert.match(docker, /executable\['digest'\] == 'sha256:' \+ entries\[0\]\['sha256'\]/);
   assert.doesNotMatch(read("docker/Dockerfile.published"), /\b(?:cargo|rustc|vite) (?:build|run|install)\b/i);
+  const arm = read("docker/Dockerfile");
+  assert.match(read("Cargo.toml"), /libduckdb-sys = \{ path = "third_party\/libduckdb-sys" \}/);
+  const patchCopy = arm.indexOf("COPY --from=planner /app/third_party/libduckdb-sys");
+  assert.ok(patchCopy >= 0 && patchCopy < arm.indexOf("RUN cargo chef cook"),
+    "The local Cargo patch must exist in the dependency stage before chef cook");
 });
