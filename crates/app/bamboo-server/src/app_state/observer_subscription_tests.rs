@@ -38,6 +38,10 @@ const WAIT: Duration = Duration::from_secs(40);
 struct Probe {
     calls: AtomicUsize,
     parent_calls: AtomicUsize,
+    parent_inputs: StdMutex<Vec<Vec<Message>>>,
+    parent_request_diagnostics: StdMutex<Vec<Value>>,
+    diagnostic_home: StdMutex<Option<std::path::PathBuf>>,
+    diagnostic_phase: StdMutex<&'static str>,
     observed: StdMutex<Vec<ObserverViewChange>>,
     hold_reader: AtomicBool,
     reader_entered: Notify,
@@ -46,8 +50,123 @@ struct Probe {
     work_release: Notify,
 }
 
+// Read only this test's bounded physical transport. These are diagnostics,
+// never admission authority; atomic writes may advance between observations.
+fn provider_boundary_snapshot(home: &std::path::Path) -> Value {
+    fn read(path: &std::path::Path) -> Option<Value> {
+        let file = std::fs::File::open(path).ok()?;
+        let mut reader = std::io::Read::take(file, 128 * 1024);
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+    fn collect(
+        value: &Value,
+        reports: &mut BTreeSet<String>,
+        cursors: &mut BTreeSet<u64>,
+        runs: &mut BTreeSet<String>,
+    ) {
+        match value {
+            Value::Object(object) => {
+                if object
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("OBSERVATION "))
+                {
+                    if let Some(id) = object.get("id").and_then(Value::as_str) {
+                        reports.insert(id.into());
+                    }
+                }
+                if let Some(cursor) = object.get("last_admitted_sequence").and_then(Value::as_u64) {
+                    cursors.insert(cursor);
+                }
+                if let Some(run) = object.get("run_id").and_then(Value::as_str) {
+                    if !run.is_empty() {
+                        runs.insert(run.into());
+                    }
+                }
+                for value in object.values() {
+                    collect(value, reports, cursors, runs);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    collect(value, reports, cursors, runs);
+                }
+            }
+            _ => {}
+        }
+    }
+    let root = home
+        .join("sessions")
+        .join(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID);
+    let mut persisted = Vec::new();
+    for name in ["session.json", "runtime.json"] {
+        let mut reports = BTreeSet::new();
+        let mut cursors = BTreeSet::new();
+        let mut runs = BTreeSet::new();
+        if let Some(value) = read(&root.join(name)) {
+            collect(&value, &mut reports, &mut cursors, &mut runs);
+        }
+        persisted.push(json!({"file":name,"report_ids":reports,"cursors":cursors,"run_ids":runs.into_iter().take(4).collect::<Vec<_>>()}));
+    }
+    let mut transport = Vec::new();
+    for queue in ["new", "cur"] {
+        if let Ok(entries) = std::fs::read_dir(root.join("inbox").join(queue)) {
+            for entry in entries.flatten().take(8) {
+                if let Some(wrapper) = read(&entry.path()) {
+                    let envelope = wrapper
+                        .get("body")
+                        .filter(|value| value.get("id").is_some())
+                        .unwrap_or(&wrapper);
+                    transport.push(json!({"queue":queue,"id":envelope.get("id"),"kind":envelope.get("kind"),
+                        "correlation_id":envelope.get("correlation_id"),"generation":wrapper.get("generation"),
+                        "report1":envelope.to_string().contains("OBSERVATION 1"),"report2":envelope.to_string().contains("OBSERVATION 2")}));
+                }
+            }
+        }
+    }
+    json!({"persisted":persisted,"transport":transport})
+}
+
 #[async_trait]
 impl LLMProvider for Probe {
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&bamboo_llm::provider::LLMRequestOptions>,
+    ) -> Result<LLMStream, LLMError> {
+        if model == PARENT {
+            let home = self.diagnostic_home.lock().unwrap().clone();
+            let boundary = home.as_deref().map(provider_boundary_snapshot);
+            let phase = *self.diagnostic_phase.lock().unwrap();
+            let bounded: Vec<_> = messages.iter().enumerate()
+                .filter(|(index, _)| *index < 2 || *index + 4 >= messages.len())
+                .map(|(_, message)| json!({
+                    "role":format!("{:?}",message.role),"characters":message.content.chars().count(),
+                    "report1":message.content.contains("OBSERVATION 1"),
+                    "report2":message.content.contains("OBSERVATION 2"),
+                    "prefix":message.content.chars().take(240).collect::<String>(),
+                    "parts":message.content_parts.as_ref().map(Vec::len),
+                    "runtime_kind":message.metadata.as_ref().and_then(|value|value.get("runtime_kind")),
+                })).collect();
+            let mut diagnostics = self.parent_request_diagnostics.lock().unwrap();
+            if diagnostics.len() < 16 {
+                diagnostics.push(
+                    json!({"purpose":options.and_then(|value|value.request_purpose.as_deref()),
+                    "session_id":options.and_then(|value|value.session_id.as_deref()),
+                    "tools":tools.len(),"messages":messages.len(),"bounded":bounded,
+                    "phase":phase,"observed_at":Utc::now(),"boundary":boundary}),
+                );
+            }
+        }
+        self.chat_stream(messages, tools, max_output_tokens, model)
+            .await
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
@@ -111,7 +230,8 @@ impl LLMProvider for Probe {
             }
             PARENT => {
                 self.parent_calls.fetch_add(1, Ordering::SeqCst);
-                LLMChunk::Token("Parent completed its own Work.".into())
+                self.parent_inputs.lock().unwrap().push(messages.to_vec());
+                LLMChunk::Token("Parent processed its current canonical input.".into())
             }
             _ => panic!("source Roots must not invoke a provider: {model}"),
         };
@@ -132,6 +252,7 @@ impl LLMProvider for Probe {
 }
 
 async fn host(home: &std::path::Path, probe: Arc<Probe>) -> AppState {
+    *probe.diagnostic_home.lock().unwrap() = Some(home.into());
     let mut config = Config::from_data_dir(Some(home.into()));
     config.provider = PROVIDER.into();
     config.subagents_mut().max_concurrent = Some(2);
@@ -173,10 +294,12 @@ impl Fixture {
         parent.set_provider_name(PROVIDER);
         parent.workspace = Some(workspace.to_string_lossy().into());
         parent.set_workspace_path_meta(workspace.to_string_lossy());
+        // A fresh canonical Supervisor has no runtime sidecar until its first
+        // run. Initialize the fixture's requested runtime policy just as the
+        // actual Observer fixture does, before admitting any execution.
         parent
             .agent_runtime_state
-            .as_mut()
-            .unwrap()
+            .get_or_insert_with(Default::default)
             .set_permission_mode(SessionPermissionMode::Bypass);
         state.storage.save_session(&parent).await.unwrap();
         let mut projects = BTreeSet::new();
@@ -658,6 +781,7 @@ async fn subscription_rotates_derived_shards_has_gap_and_revocation_is_final() {
 #[tokio::test]
 async fn subscription_native_two_projects_changes_and_restart_do_not_clear_original_work_wait() {
     let f = Fixture::new().await;
+    *f.probe.diagnostic_phase.lock().unwrap() = "create-existing-work";
     let work = f.child("subscription-held-work", false, WORK).await;
     let parent = load(&f.state, &f.reference.session_id).await;
     let creator = f.state.supervisor_observer_creator();
@@ -674,7 +798,9 @@ async fn subscription_native_two_projects_changes_and_restart_do_not_clear_origi
         .agent_runtime_state
         .unwrap()
         .waiting_for_children;
+    *f.probe.diagnostic_phase.lock().unwrap() = "create-observer";
     f.child(OBSERVER, true, READER).await;
+    *f.probe.diagnostic_phase.lock().unwrap() = "subscribe-initial-notice";
     f.state
         .subscribe_supervisor_observer(ObserverSubscriptionStart {
             supervisor: f.reference.clone(),
@@ -688,6 +814,7 @@ async fn subscription_native_two_projects_changes_and_restart_do_not_clear_origi
         .await
         .unwrap();
     settled(&f.state, OBSERVER).await;
+    *f.probe.diagnostic_phase.lock().unwrap() = "second-project-notice";
     assert_eq!(f.probe.calls.load(Ordering::SeqCst), 2);
     let now = Utc::now() + chrono::Duration::seconds(2);
     f.state.observer_subscriptions.tick(now).await;
@@ -711,6 +838,89 @@ async fn subscription_native_two_projects_changes_and_restart_do_not_clear_origi
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([ROOT_A, ROOT_B])
     );
+    // A partial Observer report may wake the parent to reason while its
+    // original Work wait stays armed. This is not completion of that Work.
+    let reporting_parent = tokio::time::timeout(WAIT, async {
+        loop {
+            let parent = load(&f.state, &parent.id).await;
+            if parent.last_run_status().as_deref() == Some("suspended")
+                && f.state
+                    .session_activation_router
+                    .current_run_id(&parent.id)
+                    .await
+                    .is_none()
+                && ["OBSERVATION 1", "OBSERVATION 2"].iter().all(|marker| {
+                    parent
+                        .messages
+                        .iter()
+                        .any(|message| message.content.contains(marker))
+                })
+            {
+                break parent;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both real reports must settle without satisfying the Work wait");
+    assert_eq!(
+        reporting_parent
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .waiting_for_children,
+        wait
+    );
+    for marker in ["OBSERVATION 1", "OBSERVATION 2"] {
+        assert_eq!(
+            reporting_parent
+                .messages
+                .iter()
+                .filter(|message| message.content.contains(marker))
+                .count(),
+            1
+        );
+    }
+    let parent_calls = f.probe.parent_calls.load(Ordering::SeqCst);
+    assert!(
+        (1..=2).contains(&parent_calls),
+        "only the two report notifications may activate the parent"
+    );
+    {
+        let inputs = f.probe.parent_inputs.lock().unwrap();
+        assert_eq!(inputs.len(), parent_calls);
+        let canonical: Vec<_> = reporting_parent
+            .messages
+            .iter()
+            .filter(|message| message.content.contains("OBSERVATION "))
+            .map(|message| {
+                json!({"id":message.id,"metadata":message.metadata,
+                "compressed":serde_json::to_value(message).unwrap().get("compressed").cloned()})
+            })
+            .collect();
+        assert!(inputs.iter().all(|messages| messages
+            .iter()
+            .any(|message| message.content.contains("OBSERVATION "))),
+            "actual provider input lacks its committed reports; requests={:?}; canonical={canonical:?}",
+            f.probe.parent_request_diagnostics.lock().unwrap());
+        assert!(["OBSERVATION 1", "OBSERVATION 2"]
+            .iter()
+            .all(|marker| inputs
+                .last()
+                .unwrap()
+                .iter()
+                .any(|message| message.content.contains(marker))));
+    }
+    assert!(f
+        .state
+        .session_activation_router
+        .current_run_id(&work.id)
+        .await
+        .is_some());
+    assert!(!load(&f.state, &work.id)
+        .await
+        .metadata
+        .contains_key("runtime.child_completion_source_v1"));
     let calls = f.probe.calls.load(Ordering::SeqCst);
     f.state
         .observer_subscriptions
@@ -742,7 +952,17 @@ async fn subscription_native_two_projects_changes_and_restart_do_not_clear_origi
             .waiting_for_children,
         wait
     );
-    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        f.probe.parent_calls.load(Ordering::SeqCst),
+        parent_calls,
+        "unchanged/noise passes must not wake the parent"
+    );
+    assert!(f
+        .state
+        .session_activation_router
+        .current_run_id(&work.id)
+        .await
+        .is_some());
     f.probe.work_release.notify_one();
     settled(&f.state, &work.id).await;
     f.state.shutdown().await;
@@ -952,6 +1172,182 @@ async fn subscription_status_filter_ignores_question_and_task_noise_but_tracks_r
     assert_eq!(f.subscription().await.window.enqueued_sequence, 0);
     assert_eq!(f.probe.calls.load(Ordering::SeqCst), 0);
     f.state.shutdown().await;
+}
+
+#[tokio::test]
+async fn subscription_unavailable_observer_retries_are_bounded_without_borrowing_authority() {
+    for scenario in ["deleted", "replaced", "missing-runtime", "missing-sidecar"] {
+        let f = Fixture::new().await;
+        f.register(all()).await;
+        let original = load(&f.state, OBSERVER).await;
+        let child_directory = f
+            .home
+            .path()
+            .join("sessions")
+            .join(&f.reference.session_id)
+            .join("children")
+            .join(OBSERVER);
+        assert!(child_directory.join("runtime.json").is_file());
+        let caller = match scenario {
+            "deleted" => {
+                assert!(f.state.storage.delete_session(OBSERVER).await.unwrap());
+                original.clone()
+            }
+            "replaced" => {
+                assert!(f.state.storage.delete_session(OBSERVER).await.unwrap());
+                let replacement = f.child(OBSERVER, true, READER).await;
+                assert_ne!(replacement.created_at, original.created_at);
+                replacement
+            }
+            "missing-sidecar" => {
+                std::fs::rename(
+                    child_directory.join("runtime.json"),
+                    f.home.path().join("unavailable-observer-runtime.json"),
+                )
+                .unwrap();
+                original.clone()
+            }
+            _ => {
+                let mut missing = original.clone();
+                missing.agent_runtime_state = None;
+                f.state.storage.save_session(&missing).await.unwrap();
+                let missing = load(&f.state, OBSERVER).await;
+                assert!(missing.agent_runtime_state.is_none());
+                missing
+            }
+        };
+        let physical_child = (
+            std::fs::read(child_directory.join("session.json")).ok(),
+            std::fs::read(child_directory.join("runtime.json")).ok(),
+        );
+        assert!(
+            f.state
+                .storage
+                .load_supervisor_observer_context_target(
+                    &bamboo_domain::SessionCallerReference::from(&caller),
+                    ROOT_A,
+                )
+                .await
+                .is_err(),
+            "{scenario} must not acquire an observation grant"
+        );
+        let now = Utc::now();
+        for attempt in 0..8 {
+            f.state
+                .observer_subscriptions
+                .tick(now + chrono::Duration::minutes(attempt * 6))
+                .await;
+            assert_eq!(
+                f.subscription().await.failures,
+                attempt as u8 + 1,
+                "{scenario}"
+            );
+        }
+        let exhausted = f.subscription().await;
+        assert_eq!(exhausted.failures, 8, "{scenario}");
+        assert!(exhausted.retry_at.is_none());
+        assert!(exhausted.last_error.is_some());
+        assert_eq!(exhausted.window.enqueued_sequence, 0);
+        assert!(exhausted.window.pending.is_none());
+        assert!(!exhausted.ready(now + chrono::Duration::days(1)));
+        f.state
+            .observer_subscriptions
+            .tick(now + chrono::Duration::days(1))
+            .await;
+        let after = f.subscription().await;
+        assert_eq!(
+            (after.failures, after.retry_at, after.last_error),
+            (exhausted.failures, exhausted.retry_at, exhausted.last_error)
+        );
+        assert_eq!(after.window, exhausted.window);
+        assert!(
+            f.state
+                .observer_subscriptions
+                .inbox
+                .deliver_supervisor_observation(
+                    &f.reference,
+                    OBSERVER,
+                    now + chrono::Duration::days(1),
+                )
+                .await
+                .is_err(),
+            "administrative counters cannot authorize {scenario} delivery"
+        );
+        assert_eq!(f.probe.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            f.state
+                .session_inbox
+                .inspect(&f.reference.session_id)
+                .await
+                .unwrap()
+                .generation,
+            0
+        );
+        assert_eq!(
+            (
+                std::fs::read(child_directory.join("session.json")).ok(),
+                std::fs::read(child_directory.join("runtime.json")).ok(),
+            ),
+            physical_child,
+            "{scenario} Child bytes must remain unchanged"
+        );
+        if scenario == "deleted" {
+            assert!(!child_directory.exists());
+        }
+        let mut old_reference = f.reference.clone();
+        old_reference.incarnation_id = Uuid::new_v4();
+        let before = serde_json::to_value(load(&f.state, &f.reference.session_id).await).unwrap();
+        assert!(f
+            .state
+            .session_store
+            .record_observer_subscription_failure(
+                &old_reference,
+                OBSERVER,
+                now,
+                bamboo_domain::ObserverSubscriptionFailure::AuthorityUnavailable,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(load(&f.state, &f.reference.session_id).await).unwrap(),
+            before
+        );
+        f.state
+            .session_store
+            .revoke_supervisor_observer(&f.reference, f.revision().await, OBSERVER)
+            .await
+            .unwrap();
+        let revoked = serde_json::to_value(load(&f.state, &f.reference.session_id).await).unwrap();
+        assert!(f
+            .state
+            .session_store
+            .record_observer_subscription_failure(
+                &f.reference,
+                OBSERVER,
+                now,
+                bamboo_domain::ObserverSubscriptionFailure::AuthorityUnavailable,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            serde_json::to_value(load(&f.state, &f.reference.session_id).await).unwrap(),
+            revoked
+        );
+        f.state.shutdown().await;
+        let reopened = SessionStoreV2::new(f.home.path().into()).await.unwrap();
+        let parent = reopened
+            .load_root_authority(&f.reference.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let durable = &parent.supervisor_management.as_ref().unwrap().subscriptions[OBSERVER];
+        assert_eq!(
+            (durable.failures, durable.retry_at, durable.last_error),
+            (exhausted.failures, exhausted.retry_at, exhausted.last_error)
+        );
+        assert_eq!(durable.window, exhausted.window);
+    }
 }
 
 #[path = "observer_fault_tests.rs"]
