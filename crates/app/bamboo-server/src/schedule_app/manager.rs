@@ -1214,19 +1214,26 @@ fn resolve_run_config_from_config(
             .map(|target| target.provider.clone())
             .unwrap_or_else(|| config_snapshot.effective_default_provider().to_string()),
     );
-    let (model_provider, model_error) = match target
-        .as_ref()
-        .map(|target| {
-            bamboo_engine::model_config_helper::try_resolve_exact_model(
-                &config_snapshot,
-                provider_registry,
-                target,
-            )
-        })
-        .transpose()
-    {
-        Ok(target) => (target.map(|target| target.provider), snapshot_error),
-        Err(error) => (None, Some(error.to_string())),
+    let (model_provider, model_error) = if job.run_config.workflow_target.is_some() {
+        // Workflow schedules execute their admitted tools without an LLM.
+        // Their session's bookkeeping model needs no provider dispatch, while
+        // failure to read the live configuration is still authoritative.
+        (None, snapshot_error)
+    } else {
+        match target
+            .as_ref()
+            .map(|target| {
+                bamboo_engine::model_config_helper::try_resolve_exact_model(
+                    &config_snapshot,
+                    provider_registry,
+                    target,
+                )
+            })
+            .transpose()
+        {
+            Ok(target) => (target.map(|target| target.provider), snapshot_error),
+            Err(error) => (None, Some(error.to_string())),
+        }
     };
     let provider_type = provider_name.as_deref().and_then(|name| {
         bamboo_engine::model_config_helper::resolve_provider_type(
