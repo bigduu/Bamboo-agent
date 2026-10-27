@@ -2840,6 +2840,8 @@ test("actual source identity keeps unchanged Cargo fingerprints fresh", { timeou
 // The existing Quick Checks owner executes this read-only contract exactly once.
 require("./published-source-admission.test.cjs")
 require("./main-admission.test.cjs")
+require("./docker-from-release.test.cjs")
+require("./docker-arm-original.test.cjs")
 
 test("Main2351 workflow contract", () => {
   const main = readFileSync(".github/workflows/main-admission.yml", "utf8")

@@ -1,57 +1,126 @@
 name: Publish Docker image (GHCR)
 
-# Builds the `bamboo` container image and publishes it to GitHub Container
-# Registry so it can be pulled and run directly:
-#
-#   docker pull ghcr.io/<owner>/bamboo:latest
-#   docker run --rm -p 9562:9562 ghcr.io/<owner>/bamboo:latest          # server
-#   # or as a broker worker, driven by deploy_agent env=docker on the host.
-#
-# Multi-arch (amd64 + arm64) is built on NATIVE per-arch runners and merged
-# into one manifest — a Rust release build under QEMU arm64 emulation is far
-# too slow. (If arm64 runners are unavailable, e.g. a private repo without the
-# larger-runner plan, drop the arm64 matrix entry or switch to a single QEMU
-# job with docker/setup-qemu-action.)
-#
-# The Bamboo repository and release producers default to the same verified,
-# crate-owned Lotus Next artifact. Legacy Lotus remains one explicit,
-# fixed-version rollback selection during the bounded migration window.
-
+# Consume a completed release, never a tag that may precede its final assets.
+# Staged: source registries/complete Main closure and real ARM/ABI acceptance
+# remain activation dependencies; no publication evidence is supplied by fixtures.
 on:
+  workflow_run:
+    workflows: [Publish Crate]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
-      frontend_package:
-        description: "Frontend package; legacy Lotus is the explicit fixed-version rollback path"
+      release_run:
+        description: "Exact completed same-repository release run; never a moving tag"
         required: true
-        type: choice
-        default: "@bigduu/lotus-next"
-        options:
-          - "@bigduu/lotus-next"
-          - "@bigduu/lotus"
-      lotus_version:
-        description: "Exact selected frontend npm version; from_lock uses the committed Lotus Next lock or fixed legacy rollback version"
-        required: false
-        default: "from_lock"
         type: string
-  push:
-    tags:
-      - "v*"
-      - "bamboo-v*"
 
+permissions:
+  contents: read
+  actions: read
+  checks: read
+  pull-requests: read
+concurrency:
+  group: bamboo-docker-distribution
+  cancel-in-progress: false
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/bamboo
-  # The docker/* actions still bundle a Node.js 20 runtime; GitHub force-migrates
-  # JS actions to Node 24 on 2026-06-16. Opt in now so this workflow runs on
-  # Node 24 ahead of the cutover (consistent with the repo-wide Node 24 sweep).
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
 
 jobs:
-  build:
-    name: Build (${{ matrix.platform }})
+  source:
+    name: Authenticate completed release
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      release_run: ${{ steps.proof.outputs.release_run }}
+      source: ${{ steps.proof.outputs.source }}
+      version: ${{ steps.proof.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+      - name: Read original completed publication
+        id: proof
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-from-release.cjs source
+
+  arm-originals:
+    name: Produce Docker ARM executable original
+    needs: source
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    env:
+      DOCKER_RELEASE_RUN: ${{ needs.source.outputs.release_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Select ARM executable original
+        id: arm
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-arm-original.cjs select
+      - name: Prepare frozen ARM source and dependencies
+        if: steps.arm.outputs.mode == 'build'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-arm-original.cjs prepare
+      - name: Compile the sole versioned ARM binary
+        if: steps.arm.outputs.mode == 'build'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-arm-original.cjs compile
+      - name: Verify ARM binary and record receipt
+        if: steps.arm.outputs.mode == 'build'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-arm-original.cjs capture
+      - name: Retain ARM binary and receipt
+        if: steps.arm.outputs.mode == 'build'
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: docker-arm-original-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/bamboo-arm-original/out/bamboo
+            ${{ runner.temp }}/bamboo-arm-original/out/receipt.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Authenticate retained ARM original
+        if: steps.arm.outputs.mode == 'build'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARM_ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARM_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: node scripts/docker-arm-original.cjs seal
+      - name: Verify retained ARM executable original
+        if: steps.arm.outputs.mode == 'reuse'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-arm-original.cjs reuse
+
+  image:
+    name: Repackage originals (${{ matrix.platform }})
+    needs: [source, arm-originals]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
+      actions: read
+      checks: read
+      pull-requests: read
       packages: write
     strategy:
       fail-fast: false
@@ -59,219 +128,132 @@ jobs:
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
+          # Uses only the completed ARM job's authenticated original binary.
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
+    env:
+      DOCKER_RELEASE_RUN: ${{ needs.source.outputs.release_run }}
+      DOCKER_PLATFORM: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          node-version: lts/*
-
-      - name: Resolve exact release frontend
-        id: frontend
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+      - name: Select original image output
+        id: selection
         env:
-          # Tag pushes have no workflow inputs and therefore resolve the
-          # committed Lotus Next lock rather than a moving npm tag.
-          FRONTEND_PACKAGE: ${{ github.event.inputs.frontend_package || '@bigduu/lotus-next' }}
-          FRONTEND_VERSION: ${{ github.event.inputs.lotus_version || 'from_lock' }}
-        run: node scripts/release-frontend-policy.cjs
-
-      - name: Stage frontend package from npm
-        # The shared resolver selects the committed Lotus Next lock by default
-        # and permits only one fixed legacy rollback. LOTUS_SOURCE=package
-        # hard-fails when the exact package is missing instead of falling back.
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-from-release.cjs select
+      - name: Copy authenticated binary and Host originals
+        if: steps.selection.outputs.mode == 'build'
+        id: originals
         env:
-          LOTUS_PACKAGE_NAME: ${{ steps.frontend.outputs.package_name }}
-          LOTUS_VERSION: ${{ steps.frontend.outputs.package_version }}
-          EXPECTED_FRONTEND_NAME: ${{ steps.frontend.outputs.frontend_name }}
-        run: |
-          set -euo pipefail
-          npm install --no-save --no-package-lock --ignore-scripts "${LOTUS_PACKAGE_NAME}@${LOTUS_VERSION}"
-          LOTUS_SOURCE=package node scripts/frontend-package.cjs stage
-          FRONTEND_PACKAGE_DIR="crates/app/bamboo-server/frontend_package"
-          test -f "${FRONTEND_PACKAGE_DIR}/lotus-frontend.zip"
-          test -f "${FRONTEND_PACKAGE_DIR}/frontend-manifest.json"
-          EMBEDDED_NAME="$(node -p "require('./${FRONTEND_PACKAGE_DIR}/frontend-manifest.json').frontend_name")"
-          EMBEDDED="$(node -p "require('./${FRONTEND_PACKAGE_DIR}/frontend-manifest.json').frontend_version")"
-          echo "Embedded frontend: ${EMBEDDED_NAME}@${EMBEDDED}"
-          if [ "${EMBEDDED_NAME}" != "${EXPECTED_FRONTEND_NAME}" ]; then
-            echo "::error::Embedded frontend ${EMBEDDED_NAME} does not match expected ${EXPECTED_FRONTEND_NAME}"
-            exit 1
-          fi
-          if [ "${EMBEDDED}" != "${LOTUS_VERSION}" ]; then
-            echo "::error::Embedded frontend version ${EMBEDDED} does not match resolved ${LOTUS_VERSION}"
-            exit 1
-          fi
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-from-release.cjs stage
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Assemble runtime image locally
+        if: steps.selection.outputs.mode == 'build'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute image repo (lowercase)
-        id: repo
-        run: echo "name=$(echo '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: docker/Dockerfile
+          context: ${{ steps.originals.outputs.context }}
+          file: ${{ steps.originals.outputs.context }}/Dockerfile
           platforms: ${{ matrix.platform }}
-          cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
-          outputs: type=image,name=${{ steps.repo.outputs.name }},push-by-digest=true,name-canonical=true,push=true
-
-      - name: Smoke-test API and embedded frontend
-        shell: bash
+          tags: ${{ steps.originals.outputs.image }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.source.outputs.source }}
+            org.opencontainers.image.version=${{ needs.source.outputs.version }}
+          load: true
+          push: false
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=docker-runtime-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=docker-runtime-${{ matrix.platform }}
+      - name: Verify loader, version, API, frontend and Host runtime
+        if: steps.selection.outputs.mode == 'build'
         env:
-          IMAGE_REF: ${{ steps.repo.outputs.name }}@${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          CONTAINER_NAME="bamboo-frontend-smoke-${{ strategy.job-index }}"
-          cleanup() {
-            status=$?
-            trap - EXIT
-            if [ "${status}" -ne 0 ]; then
-              docker logs "${CONTAINER_NAME}" || true
-            fi
-            docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
-            exit "${status}"
-          }
-          trap cleanup EXIT
-
-          docker pull "${IMAGE_REF}"
-          docker run --detach --name "${CONTAINER_NAME}" \
-            --publish 127.0.0.1::9562 "${IMAGE_REF}"
-          HOST_PORT="$(docker port "${CONTAINER_NAME}" 9562/tcp | tail -1 | awk -F: '{print $NF}')"
-          ROOT_RESPONSE="$(mktemp)"
-          ROOT_HEADERS="$(mktemp)"
-
-          ready=0
-          for _ in $(seq 1 30); do
-            if curl -fsS "http://127.0.0.1:${HOST_PORT}/api/v1/health" >/dev/null \
-              && curl -fsS "http://127.0.0.1:${HOST_PORT}/" \
-                --dump-header "${ROOT_HEADERS}" --output "${ROOT_RESPONSE}" \
-              && test -s "${ROOT_RESPONSE}" \
-              && grep -Eiq '^content-type: *text/html' "${ROOT_HEADERS}"; then
-              ready=1
-              break
-            fi
-            sleep 1
-          done
-          if [ "${ready}" -ne 1 ]; then
-            echo "::error::Built image did not serve both the Bamboo API and embedded frontend"
-            exit 1
-          fi
-          docker exec "${CONTAINER_NAME}" \
-            test -s /data/frontend/.frontend-manifest.json
-
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v7
+          GH_TOKEN: ${{ github.token }}
+          DOCKER_IMAGE: ${{ steps.originals.outputs.image }}
+        run: node scripts/docker-from-release.cjs smoke
+      - name: Log in after artifact compatibility passes
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
-          name: digest-${{ strategy.job-index }}
-          path: /tmp/digests/*
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Verify retained original image digest
+        if: steps.selection.outputs.mode == 'reuse'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-from-release.cjs reuse
+      - name: Recheck source and push candidate digest
+        if: steps.selection.outputs.mode == 'build'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOCKER_IMAGE: ${{ steps.originals.outputs.image }}
+        run: node scripts/docker-from-release.cjs push
+      - name: Retain this architecture digest
+        if: steps.selection.outputs.mode == 'build'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: docker-digest-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/docker-digest-*.json
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 90
 
   merge:
-    name: Merge multi-arch manifest
+    name: Publish complete multi-arch manifest
+    needs: [source, image]
     runs-on: ubuntu-latest
-    needs: build
     permissions:
       contents: read
+      actions: read
+      checks: read
+      pull-requests: read
       packages: write
+    outputs:
+      image: ${{ steps.manifest.outputs.image }}
+    env:
+      DOCKER_RELEASE_RUN: ${{ needs.source.outputs.release_run }}
     steps:
-      - name: Download digests
-        uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          path: /tmp/digests
-          pattern: digest-*
-          merge-multiple: true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          registry: ${{ env.REGISTRY }}
+          node-version: "24"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute image repo (lowercase)
-        id: repo
-        run: echo "name=$(echo '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
-      - name: Docker metadata (tags)
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ steps.repo.outputs.name }}
-          # Triggers are workflow_dispatch + tag push, so `latest` always applies;
-          # tag pushes also get the tag name, and every build gets a commit-sha
-          # and a date tag for traceability.
-          tags: |
-            type=raw,value=latest
-            type=ref,event=tag
-            type=sha,format=short
-            type=raw,value={{date 'YYYY.MM.DD'}}
-
-      - name: Create and push manifest list
-        working-directory: /tmp/digests
-        run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ steps.repo.outputs.name }}@sha256:%s ' *)
-
-      - name: Inspect published image
-        run: |
-          docker buildx imagetools inspect ${{ steps.repo.outputs.name }}:latest
+          password: ${{ github.token }}
+      - name: Recheck source and publish both architectures together
+        id: manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-from-release.cjs publish
 
   image-scan:
-    name: Scan published image (Trivy)
-    runs-on: ubuntu-latest
+    name: Scan exact published image (Trivy)
     needs: merge
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: read
     steps:
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute image repo (lowercase)
-        id: repo
-        run: echo "name=$(echo '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
-      # CVE scan of the image actually published to GHCR. Starts warn-only
-      # (exit-code 0, ignore-unfixed) so pre-existing, not-yet-patched
-      # base-image CVEs don't block publishing — tighten once the baseline is
-      # triaged. Pinned by commit SHA: trivy-action's tags were compromised
-      # in a supply-chain attack in 2026-03 (credential-stealer injected into
-      # tags 0.0.1-0.34.2); this SHA is a signed, verified post-incident
-      # release. (bamboo-agent#254)
-      - name: Trivy scan
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+          password: ${{ github.token }}
+      # Preserve the existing pinned, warning-only scan policy.
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ steps.repo.outputs.name }}:latest
+          image-ref: ${{ needs.merge.outputs.image }}
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true

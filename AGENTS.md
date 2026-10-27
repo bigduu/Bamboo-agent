@@ -397,3 +397,65 @@ existing bounds, child environments and JSON/binary policy; never strip escapes,
 enable the flag globally or treat readable logs as source/publication authority.
 Use the three existing test owners' `Raw2358` inert-port cases for this boundary,
 without repeating product, browser or historical acceptance suites.
+
+## Staged Docker consumer (#2320)
+
+Docker consumes an authenticated completed release. Its only automatic event is
+completed `Publish Crate`; a manual selector names the exact original run. Tags
+and main pushes do not compile Bamboo or stage another frontend. Keep Docker
+controller D, publisher C and compiled source S separate. Reuse zero-argument
+`main-admission.cjs.createPublicReads()` and real `verifyPublishedSource`; JSON,
+digests and fixture policy are data, never publication authority. Production
+registries remain empty until the coordinated cutover.
+
+`arm-originals` is the sole Docker-only aarch64-unknown-linux-gnu producer.
+It runs on a real ARM runner, pins official Rust 1.99.1 Bookworm by ARM manifest
+digest, stamps disposable S using C's external stamper and compiles only the
+default embedded bamboo-agent/bamboo release binary once. Resolve/fetch public
+locked dependencies in isolation, then compile offline without container network
+or credentials. Do not call the standard three-target CLI, alter its six assets
+or completed receipt, run Unit/E2E, fetch moving npm or regenerate frontend.
+Consume standard R's exact authenticated frontend ZIP/wrapper, equal to S,
+within new Source limits of 16 MiB / 1 MiB. Keep real GITHUB identities unchanged.
+
+Retain exactly bare `bamboo` and `receipt.json` for 90days. The official physical
+upload log, original attempt/job, artifact ID/digest and completion frame bind
+the receipt; JSON is data. Raw ZIP is capped at 1 GiB, binary at 1 GiB-8 MiB and
+receipt/frame at 64 KiB. A started compilation without complete authenticated
+originals stops, including failed/cancelled/unknown outcomes; never rebuild it
+on retry. Copied successes and full reruns reuse the original physical output.
+Cross-run/D recovery is unsupported. ELF/symbol checks are static; actual final
+Bookworm loading and dependency smoke still own compatibility. Main closure,
+registrations, official event metadata roles and genuine ARM execution remain
+activation dependencies. See the guide's ARM producer contract before changes.
+
+Image assembly copies the published Linux x64 binary or authenticated Actions
+ARM original, exact three-file Host package and fixed runtime resources into
+the isolated context. Install the locked Host runtime
+dependencies with scripts disabled and its matching headless shell once. Do not
+run Cargo, frontend installation, Unit/E2E or the thirteen-file browser suite.
+Real ELF/loader, version, API/frontend and Host dependency smoke must pass before
+candidate push. A checksum or Ubuntu 22.04 label does not prove ABI compatibility.
+Keep UID 10001, `/data`, entrypoint, broker override and loopback compose defaults.
+
+Retain both architecture entries and require both before formal multi-arch,
+version or latest publication. ARM64 uses the separate original producer
+[#2353](https://github.com/bigduu/Bamboo-agent/issues/2353); consumers never
+substitute x64, compile source or delete the entry. It does not silently extend
+the native three-target release manifest. Missing/ambiguous digest evidence stops
+finalization; the original release assets must remain available and verified.
+Before assembly, the same-run selector verifies official jobs/steps and original
+Actions ZIP/digest carriers, including the original upload log's unique ID,
+size and download URL inside its physical step. A retained success takes the
+real read-only reuse path, skipping assembly, smoke, push and another upload.
+A successful assembly without a complete authenticated carrier stops. Cross-consumer-run/D recovery is
+unsupported in code: the same Source run or an unknown prior producer points
+back to its original consumer instead of assembling again.
+After carrier/history reads, rerun the real completed-publication verifier and
+compare the held source/release/controller/completion identity before each write.
+The Docker consumer is staged: Node/tiny archive fixtures are not image evidence.
+Real compatibility smoke and Docker control-closure/Ops activation remain pending.
+The Host parser's decoded eight-MiB role limit is unchanged; only its bounded
+base64 JSON pipe includes expansion overhead. Historical recovery writes its
+version tag; `latest` additionally requires the exact official latest Release
+ID/tag/source before and after the write. Keep all Docker actions immutable.

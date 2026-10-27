@@ -151,10 +151,9 @@ test("CLI appends the exact resolution to GITHUB_OUTPUT", (t) => {
   );
 });
 
-test("crate and Docker publishers share the fail-closed resolver contract", () => {
+test("crate resolver and Docker original consumer keep separate owners", () => {
   const workflowPaths = [
     ".github/workflows/publish-crate.yml",
-    ".github/workflows/docker-publish.yml",
   ];
   for (const relativePath of workflowPaths) {
     const source = fs.readFileSync(path.join(ROOT, relativePath), "utf8");
@@ -180,6 +179,16 @@ test("crate and Docker publishers share the fail-closed resolver contract", () =
     assert.doesNotMatch(source, /@bigduu\/lotus@\$\{LOTUS_VERSION\}/);
     assert.doesNotMatch(source, /lotus_version \|\| 'latest'/);
   }
+
+  const docker = fs.readFileSync(path.join(ROOT, ".github/workflows/docker-publish.yml"), "utf8");
+  assert.match(docker, /workflows: \[Publish Crate\]/);
+  assert.match(docker, /node scripts\/docker-from-release\.cjs source/);
+  assert.match(docker, /node scripts\/docker-from-release\.cjs stage/);
+  assert.match(docker, /node scripts\/docker-arm-original\.cjs compile/);
+  assert.doesNotMatch(docker, /frontend_package:|lotus_version:|release-frontend-policy\.cjs|frontend-package\.cjs|\bnpm\b|\bcargo\b/);
+  const consumer = fs.readFileSync(path.join(ROOT, "scripts/docker-from-release.cjs"), "utf8");
+  assert.match(consumer, /\.createPublicReads\(\)/);
+  assert.match(consumer, /proof\.verifyPublishedSource\(input, reads\)/);
 
   const ci = fs.readFileSync(
     path.join(ROOT, ".github/workflows/ci.yml"),
