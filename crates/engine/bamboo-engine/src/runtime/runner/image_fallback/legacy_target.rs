@@ -31,6 +31,16 @@ fn selected_target(
         .filter(|model| !model.is_empty());
     if let Some(target) = configured.as_ref() {
         if requested.is_none_or(|model| model == target.model) {
+            if target.provider != active_provider
+                && config
+                    .defaults
+                    .as_ref()
+                    .is_some_and(|defaults| defaults.vision.is_none())
+            {
+                return Err(AgentError::LLM(
+                    "Legacy image conversion needs an explicit Vision role to use another account; Fast/Chat alone do not authorize that image destination. Original images were preserved and no image was sent.".into(),
+                ));
+            }
             return Ok(target.clone());
         }
     }

@@ -160,6 +160,9 @@ pub struct Agent {
     /// Effective configured model used only when creating a new session. This
     /// must not alter an existing caller-supplied session during execution.
     session_model: Option<String>,
+    /// Account identity of the assembled client, independent of live defaults.
+    provider_scope: Option<String>,
+    primary_reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
     /// Default first-class Project membership for newly-created/unassigned sessions.
     project_id: Option<bamboo_domain::ProjectId>,
     /// Concrete session-index handle, present only when assembled via
@@ -307,6 +310,8 @@ impl Agent {
             system_prompt: None,
             model: None,
             session_model: None,
+            provider_scope: None,
+            primary_reasoning_effort: None,
             project_id: None,
             session_store: None,
             permission_checker: None,
@@ -332,6 +337,8 @@ impl Agent {
             system_prompt,
             model,
             session_model,
+            provider_scope: None,
+            primary_reasoning_effort: None,
             project_id,
             session_store,
             permission_checker,
@@ -601,8 +608,14 @@ impl Agent {
     pub async fn execute(
         &self,
         session: &mut Session,
-        request: ExecuteRequest,
+        mut request: ExecuteRequest,
     ) -> Result<(), AgentError> {
+        if request.model_roster.model.is_none() && !session.model.trim().is_empty() {
+            request.model_roster.model = Some(session.model.clone());
+        }
+        if request.model_roster.provider_name.is_none() {
+            request.model_roster.provider_name = self.provider_scope.clone();
+        }
         #[cfg(test)]
         constructor_parity_tests::observe_inputs(&session.id, None);
         self.inner.execute_direct(session, request).await
@@ -876,8 +889,11 @@ impl Agent {
             if let Some(store) = execution.session_store.as_ref() {
                 builder = builder.app_data_dir(store.bamboo_home_dir().to_path_buf());
             }
-            if let Some(model) = execution.model.clone() {
-                builder = builder.model(model);
+            // Preparation already applied any explicit SDK model override.
+            // Without one the caller's existing Session model stays authoritative.
+            builder = builder.model(session.model.clone());
+            if let Some(provider) = execution.provider_scope.clone() {
+                builder = builder.provider_name(provider);
             }
             if let Some(guard) = sdk_guard.as_ref() {
                 builder = builder.tools(guard.tools(execution.inner.default_tools().clone()));
@@ -885,14 +901,11 @@ impl Agent {
 
             #[cfg(test)]
             constructor_parity_tests::observe_inputs(&session.id, inputs.as_ref());
+            let mut request = builder.build();
+            request.reasoning_effort = execution.primary_reasoning_effort;
             execution
                 .inner
-                .execute_direct_registered_with_inputs(
-                    session,
-                    builder.build(),
-                    direct_lease,
-                    inputs,
-                )
+                .execute_direct_registered_with_inputs(session, request, direct_lease, inputs)
                 .await
         })
     }
