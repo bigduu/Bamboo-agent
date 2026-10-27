@@ -8,7 +8,7 @@ const os = require("node:os");
 const { createHash } = require("node:crypto");
 const { spawnSync } = require("node:child_process");
 const SERIAL_STORAGE_FAMILIES = ["root_birth_tests", "host_root_create::tests", "supervisor_management_tests",
-  "supervisor_management_lifetime_tests", "supervisor_proof_tests"].map((name) => "v2::" + name + "::");
+  "supervisor_management_lifetime_tests", "supervisor_proof_tests", "supervisor_management::observer_lock_order_tests"].map((name) => "v2::" + name + "::");
 const SERIAL_STORAGE_FILTERS = ["root_birth_tests", "host_root_create::tests", "supervisor_management", "supervisor_proof"];
 const SERIAL_STORAGE_SELECTORS = [...SERIAL_STORAGE_FAMILIES,
   "session_merge::tests::supervisor_management_race_rejects_staged_task_callbacks_and_fresh_invocation_succeeds"];
@@ -16,7 +16,7 @@ const ROOT_BIRTH_CASES = ["root_birth_existing_root_progress_and_scope_reads_rem
   "root_birth_all_entrypoints_wait_for_retained_shared_authority", "root_birth_final_shared_writer_guard_and_missing_title_fail_closed",
   "root_birth_cancel_retains_exclusive_owner_and_pending_proof_stays_closed"];
 const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_without_transport_feature_fails_without_starting_exporter";
-const FEATURE_SOURCE_SHA256 = "9778bacf709b92a96304a36b8e451bec00bd2cf947b75a42704f2b4422f25ea9";
+const FEATURE_SOURCE_SHA256 = "9f0d689cb1a4c8219176ece52d96135b76da08fef5fd0fbd94d95435d21e1131";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
@@ -40,6 +40,7 @@ const FEATURE_CONTEXTS = [
     { name: "env_cache_isolation", kind: "test", added: ["scoped_env_cache_survives_parallel_global_publication_and_restores_nested_state"] }] },
   { package: "bamboo-agent", features: ["ticket-runtime-fixtures"], targets: [
     { name: "ticket_runtime_publication", kind: "test", added: [
+      "fixture::startup_log_rejects_previous_launch_and_foreign_listener",
       "actual_intent_exit_before_or_after_head_never_launches_unpublished_or_unknown_work",
       "actual_admission_exit_retains_exact_prepared_run_without_worker_execution",
       "actual_result_exit_recovers_submission_before_broker_ack_without_reexecution"] },
@@ -125,6 +126,7 @@ function sourceFeatureHash(packages, root) {
 function cargoArguments(owner, context, compileOnly = false) {
   const args = ["test", "--locked", "--no-fail-fast", "--message-format=json-render-diagnostics", "-p", owner.name];
   if (context) {
+    if (!compileOnly) assert.equal(context.targets.length, 1, "Runtime filters must belong to one target");
     args.push("--features", context.features.join(","));
     for (const target of context.targets) {
       assert.ok(["lib", "test"].includes(target.kind), "Review a new additive target kind");
@@ -201,7 +203,13 @@ function runSerialStorage(binary, options, execute = spawnSync) {
   return result;
 }
 function artifactKey(item) {
-  return JSON.stringify([item.package_id, item.target.name, item.target.kind, item.features, item.profile, item.filenames]);
+  return JSON.stringify([item.package_id, item.target.name, item.target.kind, item.features, item.profile, item.filenames, item.executable]);
+}
+function executableHash(file) {
+  const hash = createHash("sha256"), block = Buffer.alloc(1024 * 1024), fd = fs.openSync(file, "r");
+  try { let size; while ((size = fs.readSync(fd, block, 0, block.length, null))) hash.update(block.subarray(0, size)); }
+  finally { fs.closeSync(fd); }
+  return hash.digest("hex");
 }
 function evidence(item) {
   assert.ok(Array.isArray(item.features) && typeof item.fresh === "boolean" && item.profile && item.target);
@@ -325,14 +333,38 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
       compile = cargo("feature-build-" + owner.name, cargoArguments(owner, context, true));
       assert.equal(compile.receipt.status, 0, "Feature compilation failed");
       const current = catalog(compile, owner), previous = defaults.get(owner.name);
+      compile.receipt.catalog = current;
       validateFeatureCatalog(context, previous, current);
-      const runtime = cargo("feature-run-" + owner.name, cargoArguments(owner, context));
-      assert.equal(runtime.receipt.status, 0, "Additive feature runtime failed");
-      assert.deepEqual(successfulCases(runtime.log), context.targets.flatMap((target) => target.added).sort(),
-        "Run every additive case once and no ordinary case twice");
-      assert.deepEqual(runtime.units.map(artifactKey).sort(), compile.units.map(artifactKey).sort(), "Feature runtime must reuse the compiled unit set");
-      assert.ok(runtime.units.every((item) => item.fresh), "Feature runtime must reuse its existing Cargo artifacts");
-      runtime.receipt.cases = context.targets.flatMap((target) => target.added).sort();
+      const units = new Set(compile.units.map(artifactKey));
+      const targets = context.targets.map((target) => {
+        assert.ok(target.added.length, "A runtime target needs explicit additive cases");
+        const executable = compiledExecutable(compile.log, owner, env.CARGO_TARGET_DIR, target.name, target.kind);
+        return { target, executable, sha256: executableHash(executable) };
+      });
+      compile.receipt.targetExecutables = targets.map(({ target, executable, sha256 }) => ({ name: target.name, kind: target.kind, executable, sha256 }));
+      for (const selected of targets) {
+        const { target, executable, sha256 } = selected;
+        const label = "feature-run-" + owner.name + "-" + target.kind + "-" + target.name;
+        let runtime;
+        try {
+          // Filters belong to one harness, even when another target has the same name.
+          runtime = cargo(label, cargoArguments(owner, { ...context, targets: [target] }));
+          runtime.receipt.target = { name: target.name, kind: target.kind, executable, sha256 };
+          assert.equal(runtime.receipt.status, 0, "Additive feature runtime failed");
+          assert.deepEqual(successfulCases(runtime.log), [...target.added].sort(), "Run only this target's additive cases once");
+          const keys = runtime.units.map(artifactKey);
+          assert.equal(new Set(keys).size, keys.length, "Duplicate runtime compiler units");
+          assert.ok(keys.every((key) => units.has(key)), "Runtime units must belong to the original compilation");
+          assert.ok(runtime.units.every((item) => item.fresh), "Feature runtime must reuse its existing Cargo artifacts");
+          assert.equal(compiledExecutable(runtime.log, owner, env.CARGO_TARGET_DIR, target.name, target.kind), executable);
+          assert.equal(executableHash(executable), sha256, "Runtime must retain the original target executable bytes");
+          runtime.receipt.cases = [...target.added].sort();
+        } catch (error) {
+          if (!runtime) contexts.push({ label, status: 1, error: error.message });
+          else { runtime.receipt.status ||= 1; runtime.receipt.error = error.message; }
+          if (echoLog) process.stderr.write(label + ": " + error.message + "\n");
+        }
+      }
     } catch (error) {
       if (!compile) contexts.push({ label: "feature-" + context.package, status: 1, error: error.message });
       else { compile.receipt.status ||= 1; compile.receipt.error = error.message; }
@@ -347,7 +379,7 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
     "Feature Unit/E2E: " + packages.length + " independent default package contexts; " + featureContexts.length +
     " explicit additive feature contexts; one owned target directory. Status: " + status + ".\n");
   checkpoint("finished", null, null, status === 0 && finished.length === plan.length &&
-    contexts.length === packages.length + 2 * featureContexts.length);
+    contexts.length === packages.length + featureContexts.reduce((count, context) => count + 1 + context.targets.length, 0));
   return { status, contexts, directory, packages: packages.map((item) => item.name) };
 }
 

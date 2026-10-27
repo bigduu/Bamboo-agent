@@ -279,13 +279,13 @@ test("one feature executor preserves default configurations and complete explici
   }
   assert.equal(sourceFeatureHash(packages, require('node:fs').realpathSync('.')), FEATURE_SOURCE_SHA256,
     'New feature-sensitive source requires a reviewed ownership update')
-  assert.equal(FEATURE_CONTEXTS.flatMap(context => context.targets.flatMap(target => target.added)).length, 18)
+  assert.equal(FEATURE_CONTEXTS.flatMap(context => context.targets.flatMap(target => target.added)).length, 19)
   assert.deepEqual(FEATURE_CONTEXTS.map(context => [context.package, context.features]), [
     ['bamboo-infrastructure', ['otel-otlp', 'test-utils']], ['bamboo-tickets', ['test-utils']],
     ['bamboo-server', ['test-utils']], ['bamboo-agent', ['ticket-runtime-fixtures']]])
   for (const context of FEATURE_CONTEXTS) {
     assert.ok(packages.some(owner => owner.name === context.package))
-    assert.ok(!cargoArguments({ name: context.package }, context).includes('--all-features'))
+    assert.ok(!cargoArguments({ name: context.package }, context, true).includes('--all-features'))
   }
   assert.match(job('feature-tests'), /target\/feature-tests/u)
   assert.match(job('feature-tests'), /run: node scripts\/run-feature-tests.cjs/u)
@@ -329,7 +329,8 @@ test("required Test performs only result admission for feature PRs without an un
 test("serial Root birth selectors reuse canonical storage compilation and preserve strict lint ownership", () => {
   const { SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES, cargoArguments } = require("./run-feature-tests.cjs")
   assert.deepEqual(SERIAL_STORAGE_FAMILIES, ["v2::root_birth_tests::", "v2::host_root_create::tests::",
-    "v2::supervisor_management_tests::", "v2::supervisor_management_lifetime_tests::", "v2::supervisor_proof_tests::"])
+    "v2::supervisor_management_tests::", "v2::supervisor_management_lifetime_tests::", "v2::supervisor_proof_tests::",
+    "v2::supervisor_management::observer_lock_order_tests::"])
   assert.deepEqual(SERIAL_STORAGE_FILTERS, ["root_birth_tests", "host_root_create::tests", "supervisor_management", "supervisor_proof"])
   const source = readFileSync("crates/infra/bamboo-storage/src/v2/root_birth_tests.rs", "utf8")
   assert.deepEqual([...source.matchAll(/async fn (root_birth_[a-z_]+)\(/gu)].map(match => match[1]).sort(), [...ROOT_BIRTH_CASES].sort())
@@ -358,6 +359,7 @@ function assertLinuxTestOwnership(definitions) {
       test: "Pinned legacy original-release-head consumer contract",
     },
     "release-cargo-isolation.yml": { isolation: "Synthetic credential/ENOSPC containment boundary" },
+    "trusted-observer.yml": { observer: "Accepted API-only/F multi-package Observer configuration; not M evidence" },
     "ticket-platform-adapter.yml": { "native-budget": "Explicit manual snapshot diagnosis; normal PR job is Windows" },
   }
   for (const [file, source] of Object.entries(definitions)) {
@@ -373,6 +375,16 @@ function assertLinuxTestOwnership(definitions) {
       if (!/\bcargo(?: \+[^\s]+)? test\b/u.test(code) &&
           !(/["']cargo["']/u.test(code) && /["']test["']/u.test(code))) continue
       assert.ok(registered[file]?.[id], `Ordinary Linux Rust tests must join the canonical feature executor: ${file}:${id}; consolidate targets or review an explicit scoped exception`)
+      if (file === "trusted-observer.yml") {
+        // Preserve this separately accepted F/config exactly; never relabel it as M.
+        assert.equal(createHash("sha256").update(source).digest("hex"), "7c26b1511759f5a40bad6a21dc44976a59f60c81f841cdf00396fa38e5d868ab")
+        assert.match(block, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
+        assert.match(block, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+        assert.match(block, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+        assert.match(block, /test "\$actual" = "\$EXPECTED_SOURCE_SHA"/u)
+        assert.match(block, /cargo test --locked -p bamboo-domain -p bamboo-storage -p bamboo-server --lib --/u)
+        assert.match(block, /cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-storage/u)
+      }
       if (file === "ticket-platform-adapter.yml") {
         assert.match(block, /^    if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''$/mu)
       }
@@ -402,6 +414,13 @@ test("all agents share canonical feature tests instead of adding ordinary Linux 
   const definitions = Object.fromEntries(readdirSync(directory).filter(file => /\.ya?ml$/u.test(file))
     .map(file => [file, readFileSync(path.join(directory, file), "utf8")]))
   assertLinuxTestOwnership(definitions)
+  for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
+    ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
+    ["-p bamboo-domain -p bamboo-storage -p bamboo-server --lib", "-p bamboo-server --lib"],
+    ["cargo clippy --locked --all-features --lib", "cargo clippy --locked --lib"]]) {
+    assert.throws(() => assertLinuxTestOwnership({ ...definitions,
+      "trusted-observer.yml": definitions["trusted-observer.yml"].replace(before, after) }))
+  }
   const duplicate = "name: New delegated planner acceptance\non:\n  pull_request:\n    branches: [dev]\njobs:\n  planner:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test --locked -p bamboo-agent --test required_child_context_packet\n"
   assert.throws(() => assertLinuxTestOwnership({ ...definitions, "delegated-planner-acceptance.yml": duplicate }), /must join the canonical feature executor/u)
   const unregistered = workflow + "\n  extra-linux-tests:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test --locked -p bamboo-server --lib\n"
