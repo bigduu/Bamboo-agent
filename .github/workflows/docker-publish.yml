@@ -24,6 +24,7 @@ permissions:
 
 concurrency:
   group: bamboo-docker-release-${{ github.event.workflow_run.id || inputs.version }}
+  queue: max
   cancel-in-progress: false
 
 env:
@@ -47,7 +48,7 @@ jobs:
         with:
           github-token: ${{ github.token }}
           run-id: ${{ github.event.workflow_run.id }}
-          name: bamboo-completed-release-${{ github.event.workflow_run.id }}
+          name: bamboo-completed-release-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           path: ${{ runner.temp }}/release
       - name: Verify release, tag, manifest and original Linux binary identity
         id: verify
@@ -119,6 +120,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     concurrency:
       group: bamboo-image-${{ needs.release.outputs.version }}-${{ matrix.platform }}
+      queue: max
       cancel-in-progress: false
     permissions:
       contents: read
@@ -290,6 +292,7 @@ jobs:
     runs-on: ubuntu-latest
     concurrency:
       group: bamboo-image-manifest
+      queue: max
       cancel-in-progress: false
     permissions:
       contents: read
