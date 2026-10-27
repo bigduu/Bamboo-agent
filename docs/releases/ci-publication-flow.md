@@ -1,59 +1,58 @@
 # CI and publication flow
 
+Read the complete local [delivery-flow/v1](../delivery-workflow.md) and
+[Actions audit](../ci-workflow-audit.md) first. These shared copies come from
+Zenith `28b6e0e`; this guide adds Bamboo's commands, configurations and test map.
+Use the same source checkpoint and original evidence when another agent takes
+over. Check current activation and actual runs; a prepared owner is not an
+accepted or published artifact.
+
 This is the operating guide for Bamboo's CI and automatic release path. The
 [Release Process](../../CONTRIBUTING.md#release-process) remains authoritative
 for cuts, original-source repairs, protected admission and credentials.
 [Parallel Development](../../gitflow.md) defines ownership and local evidence.
 
-## Phase contracts
+## Phase contracts and activation
 
-| Phase | Trigger and owner | Required result |
+Feature admission is implemented by #2311. Required `Test` aggregates Unit, E2E
+and SSH runtime results on every dev PR. One physical Linux executor preserves
+independent default package configurations plus the recorder in one owned target
+directory. Ordinary library/binary, integration and documentation cases run once;
+explicit feature owners run only catalogued additions. The controller records
+each configuration's features/profile and actual compiled-artifact freshness.
+Serial storage and ignored SSH reuse their default context executables.
+Unit/E2E remain logical reporting groups. Applicable native acceptance runs before dev
+admission; the recorder's Linux lifecycle is already in the canonical executor.
+Ordinary Linux orchestration/context tests do not get separate compilation jobs.
+Fix failures in feature branches.
+
+| Phase | Target contract | Activation |
 | --- | --- | --- |
-| Development admission | A bounded PR to `dev`; its owner | Required `Test` compiles the locked workspace; affected local tests, regression coverage and current review pass. |
-| Frozen release acceptance | Same-repository `release/<cut-SHA>` PR to `main`; one release owner | Full tests, all-feature checks, lint, security and Linux/macOS/Windows native tests pass on the actual PR merge source. The frontend workflow separately validates the original release head. |
-| Main admission | Normal release merge pushes `main`; CI | Authenticate the completed release acceptance against the actual ordered merge parents, reviewed release tree, source ancestry and original job attempts. |
-| Publication preparation | Successful main-push CI; the canonical publisher | Independently authenticate source/evidence, reserve one version and transport its exact sealed frontend bytes. |
-| Crate publication | Isolated Cargo publisher, concurrent with native builds | Resume the same reservation, stamp disposable manifests, publish in dependency order, then verify registry checksums, source and embedded frontend. |
-| Native builds | Source-selected native runners, concurrent with crate publication | Verify prepared frontend transport and perform the release executable build of the actual versioned main source without publication credentials. |
-| Final assets | The existing final publisher, after both branches succeed | Authenticate completed crates and all required native receipts, then verify immutable uploads. The final manifest signals complete binary availability. |
+| Feature -> dev | Disjoint Unit/E2E, native acceptance and current review pass on the feature merge source. | Implemented by #2311. |
+| Release source | Freeze the exact tested dev cut and reserve one formal version with the existing allocator. | Pending release-source admission. |
+| Release artifacts | Stamp disposable checkouts; build/package/publish each native product once. No Unit/E2E repetition or product repairs. | Pending release-source admission. |
+| Main promotion | Verify the exact published source and retain tag, manifest/provenance hashes and publisher run in the promotion description. No build/test. | Pending release-source admission. |
 
-```mermaid
-flowchart TD
-  dev[Reviewed dev admission] --> frozen[Full frozen release acceptance]
-  frozen --> main[Normal main merge and lightweight admission]
-  main --> prepare[One signed version and sealed frontend preparation]
-  prepare --> crates[Publish and verify crate closure]
-  prepare --> native[Build required native targets]
-  crates --> final[Verify both branches and publish final manifest]
-  native --> final
-```
+Keep source manifests at `0.0.0`. Immutable tags and Release manifests/provenance
+are the version/artifact record; do not move release HEAD to add a post-build
+JSON record. Before the first new cut, normally integrate current main ancestry
+into dev through a feature PR passing Unit/E2E. A repair returns through
+feature/dev and creates a fresh cut.
 
-The full Rust suite belongs to frozen release acceptance. Main admission is a
-real verification gate that reuses that result; it is not a claim that tests ran
-again on main. A missing or failed proof stops publication. A successful dev
-compile does not establish release acceptance.
+The existing release suite and main-triggered publisher remain active until the
+separate source-admission cutover is accepted. The remaining sections document
+that temporary legacy route and historical recovery, not permission to skip its
+live gates. In that route release PRs still run complete acceptance, main CI
+reuses it, and the canonical publisher reserves the version and builds native
+assets after main. Preserve original proof/source/run identities throughout the
+migration. Do not trigger an unimplemented release route or add another publisher.
 
-The release PR's three `Platform Tests` jobs retain native Supervisor, portable
-Skill and frontend contract coverage. They do not run `cargo build --release`.
-The three optimized executable builds happen only in the automatic main
-publisher, after the actual main source, version and frontend bytes are bound.
-Historical producers keep their original build-job acceptance requirements.
+Keep required check names stable. A missing, skipped, cancelled or failed
+selected dependency fails required `Test`. Native Cargo matrices keep
+`fail-fast: false` and independent failed-job reruns. More jobs or a cache hit
+alone do not prove a speedup; report compile/execution/queue timing separately.
 
-Unit and E2E retain ordinary native Cargo jobs for the other 29 crates. Server
-jobs use eight static matrix rows: seven library blocks and one integration tail.
-Library blocks assign each name to the first matching namespace in the order
-browser, chat, execute, settings, app-state, remaining handlers, then remaining
-library tests; each block skips every earlier filter, including nested matches.
-The integration tail has no library-name filters. Unit selects the default
-integration targets, compiles examples and runs doctests; E2E selects all-feature
-integration targets. Failed jobs can be rerun independently. Each library block
-still compiles the server test binary, so more jobs alone do not prove a net
-speedup; record compile, execution, queue and complete-CI timings separately.
-
-Keep required check names stable. Do not use empty success jobs, synthesized
-statuses, `[skip ci]`, or workflow-level path filters to bypass required gates.
-The current repository's verified capabilities, rather than an assumed merge
-queue or auto-merge setting, determine its admission route.
+## Temporary legacy release and recovery procedure
 
 ## Freeze once and preserve source identities
 

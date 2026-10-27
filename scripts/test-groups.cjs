@@ -105,14 +105,65 @@ function parseList(output) {
 function equalNames(actual, expected) {
   if (canonical([...actual].sort()) !== canonical([...expected].sort())) fail('Selected --list names differ from the frozen selection');
 }
-function parseCounts(output, expected, ignored) {
-  const lines = output.split(/\r?\n/).filter(line => /^test result:/.test(line));
-  const match = lines.length === 1 && lines[0].match(/^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out; finished in .+$/);
-  if (!match) fail('Missing or duplicate libtest result summary');
-  const [passed, failed, skipped, measured, filtered] = match.slice(2).map(Number);
-  if (passed + failed + skipped !== expected || skipped !== ignored || measured !== 0 ||
-      ((failed === 0) !== (match[1] === 'ok'))) fail('Runtime counts differ from the frozen selection/ignored semantics');
-  return { passed, failed, ignored: skipped, measured, filtered };
+function parseCounts(output, selection, expectedFiltered) {
+  if (!Array.isArray(selection) || selection.some(t => typeof t.name !== 'string' || typeof t.ignored !== 'boolean') ||
+      new Set(selection.map(t => t.name)).size !== selection.length || !Number.isSafeInteger(expectedFiltered) || expectedFiltered < 0) fail('Invalid frozen runtime selection');
+  const selected = new Map(selection.map(t => [t.name, t.ignored])), frames = [], nested = [];
+  const verdict = /^(ok|FAILED|ignored(?:, .*)?)$/;
+  let result;
+  const finish = (frame, status) => {
+    const name = frame.current, ignored = status.startsWith('ignored');
+    if (!name) fail('Libtest verdict without an active case');
+    if (frames.length === 1 && selected.get(name) !== ignored) fail('Runtime ignored verdict differs from frozen selection');
+    frame.cases.set(name, status); frame.current = null;
+  };
+  // Serial libtest can print the parent's prefix and a child's running header
+  // on one line. Only a child frame's closure allows the parent's own verdict.
+  for (let line of output.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    if (result) fail('Duplicate or trailing output after outer libtest summary');
+    for (;;) {
+      const running = line.match(/^running (\d+) tests?$/), frame = frames.at(-1);
+      if (running) {
+        if (frame && !frame.current) fail('Nested libtest frame without an active parent');
+        if (!frame && Number(running[1]) !== selection.length) fail('Runtime counts differ from frozen selection');
+        if (frames.length >= 64) fail('Excessive nested libtest frames');
+        frames.push({ count: Number(running[1]), cases: new Map(), current: null }); break;
+      }
+      if (!frame) fail('Missing outer libtest running frame');
+      const start = line.match(/^test (.+?) \.\.\. (.*)$/);
+      if (start) {
+        if (frame.current || frame.cases.has(start[1]) || frame.cases.size >= frame.count) fail('Duplicate or overlapping libtest case');
+        if (frames.length === 1 && !selected.has(start[1])) fail('Runtime case differs from frozen selection');
+        frame.current = start[1]; line = start[2];
+        if (!line) break;
+        // Consume an immediate verdict or the child's header in the same line.
+        continue;
+      }
+      if (verdict.test(line)) { finish(frame, line); break; }
+      if (line.startsWith('test result:')) {
+        const match = line.match(/^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out; finished in .+$/);
+        if (!match || frame.current || frame.cases.size !== frame.count) fail('Missing, truncated or incomplete libtest frame');
+        const [passed, failed, ignored, measured, filtered] = match.slice(2).map(Number);
+        const values = [...frame.cases.values()];
+        if (passed !== values.filter(v => v === 'ok').length || failed !== values.filter(v => v === 'FAILED').length ||
+            ignored !== values.filter(v => v.startsWith('ignored')).length || measured !== 0 ||
+            ((failed === 0) !== (match[1] === 'ok'))) fail('Runtime counts differ from case ledger');
+        if (frames.length === 1 && filtered !== expectedFiltered) fail('Runtime filtered counts differ from frozen inventory');
+        const counts = { passed, failed, ignored, measured, filtered };
+        frames.pop();
+        if (frames.length) nested.push({ parent: frames.at(-1).current, ...counts });
+        else result = counts;
+        break;
+      }
+      // Panic/failure diagnostics are retained in the original stdout. They
+      // never close a pending parent or create an extra counted outer case.
+      if (!frame.current && frame.cases.size !== frame.count) fail('Unexpected unframed libtest output');
+      break;
+    }
+  }
+  if (!result || frames.length) fail('Missing or truncated outer libtest summary');
+  return nested.length ? { ...result, nested } : result;
 }
 
 // Use the shortest pure namespace filter, verified with --list before execution.
@@ -427,7 +478,10 @@ async function runGroups(root, evidence, requested, { all = false, retryFailed =
           const processReport = reportProcess(processResult); result.processes.push(processReport);
           let counts;
           try {
-            counts = parseCounts(processResult.stdout, command.names.length, command.ignored);
+            const names = new Set(command.names);
+            const selection = target.tests.filter(t => names.has(t.name))
+              .map(t => ({ name: t.name, ignored: mode === 'default' && t.ignored }));
+            counts = parseCounts(processResult.stdout, selection, target.tests.length - selection.length);
             processReport.counts = counts;
             for (const key of ['passed', 'failed', 'ignored']) result.counts[key] += counts[key];
           } catch (e) { processReport.countError = e.message; }
