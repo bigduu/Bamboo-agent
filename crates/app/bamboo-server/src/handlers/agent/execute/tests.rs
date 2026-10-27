@@ -235,7 +235,7 @@ mod execution_input_http {
     }
 
     #[actix_web::test]
-    async fn execute_http_retry_mode_reaches_the_real_provider_and_stop_cancels_backoff() {
+    async fn execute_http_retry_mode_reaches_the_real_provider_and_stop_retires_exact_run() {
         use std::sync::atomic::AtomicUsize;
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -260,6 +260,7 @@ mod execution_input_http {
             let session = owned_http_session(&state, &id);
             state.storage.save_session(&session).await.unwrap();
             queue_owned_root(&state, &id).await;
+            let mut events = state.get_session_event_sender(&id).await.subscribe();
             let app = test::init_service(
                 actix_web::App::new()
                     .app_data(state.clone())
@@ -339,11 +340,14 @@ mod execution_input_http {
                     .cancel_token
                     .is_cancelled());
             }
-            tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
-                .await
-                .unwrap();
+            wait_for_owned_terminal_with_cancellation(&state, &id, &run_id, &mut events, stop)
+                .await;
             assert_eq!(count.load(Ordering::SeqCst), if stop { 1 } else { 4 });
             let cold = state.storage.load_session(&id).await.unwrap().unwrap();
+            assert_eq!(
+                cold.last_run_status().as_deref(),
+                Some(if stop { "cancelled" } else { "completed" })
+            );
             assert_eq!(
                 cold.messages
                     .iter()
@@ -351,6 +355,9 @@ mod execution_input_http {
                     .count(),
                 1
             );
+            tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+                .await
+                .unwrap();
         }
     }
 
@@ -516,6 +523,74 @@ mod execution_input_http {
                 test::call_service(&app, test::TestRequest::post().uri(&uri).to_request()).await;
             assert_eq!(response.status(), StatusCode::OK);
             assert!(legacy.is_cancelled());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[actix_web::test]
+    async fn stop_http_requires_supervisor_owner_for_exact_and_headerless_requests() {
+        use crate::app_state::AgentRunner;
+        let (_home, state, _fault) = state(None).await;
+        let supervisor = state
+            .storage
+            .get_or_create_default_supervisor("test-model")
+            .await
+            .unwrap();
+        let id = supervisor.id;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        for canonical in [false, true] {
+            let uri = if canonical {
+                format!("/api/v1/sessions/{id}/stop")
+            } else {
+                format!("/api/v1/stop/{id}")
+            };
+            for exact in [false, true] {
+                let mut runner = AgentRunner::new();
+                runner.status = AgentStatus::Running;
+                let run_id = runner.run_id.clone();
+                let token = runner.cancel_token.clone();
+                state.agent_runners.write().await.insert(id.clone(), runner);
+                for remote in [true, false] {
+                    let mut request = test::TestRequest::post().uri(&uri).peer_addr(
+                        if remote {
+                            "192.0.2.1:12345"
+                        } else {
+                            "127.0.0.1:12345"
+                        }
+                        .parse()
+                        .unwrap(),
+                    );
+                    if exact {
+                        request = request.insert_header(("Bamboo-Run-Id", run_id.as_str()));
+                    }
+                    let response = test::call_service(&app, request.to_request()).await;
+                    assert_eq!(
+                        response.status(),
+                        if remote {
+                            StatusCode::FORBIDDEN
+                        } else {
+                            StatusCode::OK
+                        },
+                        "Supervisor Stop requires its verified owner for either request form",
+                    );
+                    assert_eq!(token.is_cancelled(), !remote);
+                    let runners = state.agent_runners.read().await;
+                    let current = runners.get(&id).unwrap();
+                    assert_eq!(current.run_id, run_id);
+                    assert!(if remote {
+                        matches!(current.status, AgentStatus::Running)
+                    } else {
+                        matches!(current.status, AgentStatus::Cancelled)
+                    });
+                }
+            }
         }
         tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
             .await
@@ -1042,6 +1117,21 @@ mod execution_input_http {
         run: &str,
         events: &mut tokio::sync::broadcast::Receiver<bamboo_agent_core::AgentEvent>,
     ) {
+        wait_for_owned_terminal_with_cancellation(state, id, run, events, false).await;
+    }
+
+    async fn wait_for_owned_terminal_with_cancellation(
+        state: &web::Data<crate::AppState>,
+        id: &str,
+        run: &str,
+        events: &mut tokio::sync::broadcast::Receiver<bamboo_agent_core::AgentEvent>,
+        cancelled: bool,
+    ) {
+        let expected_actor = if cancelled {
+            bamboo_domain::ActorActivationStatus::Cancelled
+        } else {
+            bamboo_domain::ActorActivationStatus::Succeeded
+        };
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 if matches!(events.recv().await.unwrap(),
@@ -1060,14 +1150,18 @@ mod execution_input_http {
                     if matches!(runner.status, AgentStatus::Pending | AgentStatus::Running) {
                         false
                     } else {
-                        assert!(matches!(runner.status, AgentStatus::Completed), "{:?}", runner.status);
+                        assert!(if cancelled {
+                            matches!(runner.status, AgentStatus::Cancelled)
+                        } else {
+                            matches!(runner.status, AgentStatus::Completed)
+                        }, "{:?}", runner.status);
                         true
                     }
                 };
                 let actor = bamboo_domain::ActorDirectoryPort::inspect_actor(state.session_store.as_ref(), id)
                     .await.unwrap().activation.unwrap();
                 assert_eq!(actor.run_id, run);
-                if terminal && actor.status == bamboo_domain::ActorActivationStatus::Succeeded
+                if terminal && actor.status == expected_actor
                     && state.session_activation_router.current_run_id(id).await.is_none()
                 {
                     assert!(actor.finished_at.is_some());
