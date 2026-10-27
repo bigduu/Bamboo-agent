@@ -98,7 +98,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "e5eac1e84335ccaee4ab54c481a64099207fc667d129c62a9e04843da85aaa2a"
+          ADMISSION_HELPER_SHA256: "a4e688d3a584095eabc18b989b993b2761580d1a747e4335fbd277975c9bc4cb"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -249,7 +249,7 @@ jobs:
       actions: read
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
-    needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-dev, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]
+    needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]
     # A source-gate failure must fail required Test, never turn it into a skip.
     if: always() && !cancelled()
     runs-on: ubuntu-latest
@@ -270,7 +270,7 @@ jobs:
           SECURITY_RESULT: ${{ needs.security.result }}
           DENY_RESULT: ${{ needs.deny.result }}
           CODEQL_RESULT: ${{ needs.feature-codeql.result }}
-          FRONTEND_DEV_RESULT: ${{ needs.frontend-dev.result }}
+          FRONTEND_INVENTORY_RESULT: ${{ needs.frontend-inventory.result }}
         shell: bash
         run: |
           set -euo pipefail
@@ -282,7 +282,7 @@ jobs:
               test "$QUICK_RESULT" = success
               test "$NATIVE_RESULT" = success
               test "$BROWSER_RUNTIME_RESULT" = success
-              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$CODEQL_RESULT" "$FRONTEND_DEV_RESULT"; do
+              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$CODEQL_RESULT" "$FRONTEND_INVENTORY_RESULT"; do
                 test "$result" = success
               done
               ;;
@@ -993,7 +993,7 @@ jobs:
 
   e2e-test:
     name: E2E Tests
-    needs: [validation-source, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-dev, e2e-crates, test-ssh]
+    needs: [validation-source, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-inventory, e2e-crates, test-ssh]
     if: always() && !cancelled() && (needs.validation-source.outputs.full == 'true' || needs.validation-source.outputs.feature == 'true')
     runs-on: ubuntu-latest
     steps:
@@ -1012,7 +1012,7 @@ jobs:
           SECURITY_RESULT: ${{ needs.security.result }}
           DENY_RESULT: ${{ needs.deny.result }}
           CODEQL_RESULT: ${{ needs.feature-codeql.result }}
-          FRONTEND_DEV_RESULT: ${{ needs.frontend-dev.result }}
+          FRONTEND_INVENTORY_RESULT: ${{ needs.frontend-inventory.result }}
         run: |
           set -euo pipefail
           case "$SOURCE_RESULT:$FEATURE_VALIDATION:$FULL_VALIDATION" in
@@ -1020,7 +1020,7 @@ jobs:
               test "$FEATURE_RESULT" = success
               test "$NATIVE_RESULT" = success
               test "$BROWSER_RUNTIME_RESULT" = success
-              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$CODEQL_RESULT" "$FRONTEND_DEV_RESULT"; do
+              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$CODEQL_RESULT" "$FRONTEND_INVENTORY_RESULT"; do
                 test "$result" = success
               done
               ;;
@@ -1166,15 +1166,13 @@ jobs:
           source_status="$(git status --porcelain --untracked-files=all)"
           test -z "$source_status"
 
-  frontend-dev:
-    name: Frontend Dev Build and Package Inventory
+  frontend-inventory:
+    name: Frontend Package Inventory
     needs: validation-source
     if: needs.validation-source.outputs.feature == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/frontend-dev
-      BAMBOO_FRONTEND_BUILD_MODE: embedded
       LOTUS_SOURCE: committed
     steps:
       - uses: actions/checkout@v7
@@ -1198,19 +1196,8 @@ jobs:
       - name: Verify the committed frontend
         run: node scripts/frontend-package.cjs verify
 
+      # Cargo supplies the read-only package listing; compilation belongs to A.
       - uses: dtolnay/rust-toolchain@stable
-
-      - uses: swatinem/rust-cache@v2
-        with:
-          shared-key: bamboo-ci-frontend-dev-${{ runner.os }}
-          workspaces: . -> target/frontend-dev
-          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
-
-      - name: Build default members in the original dev profile
-        run: |
-          rustc --version --verbose
-          cargo --version --verbose
-          cargo build --locked
 
       - name: Verify server package inventory
         shell: bash

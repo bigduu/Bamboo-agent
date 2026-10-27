@@ -34,13 +34,15 @@ its own final source and does not establish success for the earlier candidates.
 | Security Audit | Ubuntu/stable: install pinned cargo-audit 0.22.2, `cargo audit --deny warnings` | Original `.cargo/audit.toml`; no new exemptions. |
 | cargo-deny | Pinned action `3c634983`, cargo-deny 0.20.2: `check` | The action defaults to `--all-features` in its Rust 1.85/Alpine container; original targets/licenses/bans/advisories/sources remain. This is distinct from audit and MSRV. |
 | Feature CodeQL | Ubuntu, actions/javascript-typescript/python/rust, init/analyze v4, `build-mode: none` | Four analyses with no product compilation, browser execution or repeated Node tests. |
-| Frontend Dev Build and Package Inventory | Ubuntu/stable/default members/dev profile: `cargo build --locked`; `cargo package --locked -p bamboo-server --allow-dirty --list` | Explicit embedded/committed frontend verification; inventory requires build.rs, frontend_build.rs, manifest and zip. No extra regular runtime suite, version stamping or final archive. |
+| Frontend Package Inventory | Ubuntu: committed bytes verification; stable Cargo only for `cargo package --locked -p bamboo-server --allow-dirty --list` | Inventory requires build.rs, frontend_build.rs, manifest and zip. No additional product compilation, runtime suite, build target/cache, version stamping or final archive. |
 
-Default dev optimization (including server opt-z), ordinary test opt-0,
-MSRV check artifacts, all-feature graphs, API-only Actor and npm-staged release
-consumers remain distinct inputs. Sharing a target is allowed only within a
+Ordinary embedded compilation/runtime, including the real `CARGO_BIN_EXE_bamboo`
+frontend case, belongs to A's canonical default-package executor. Inventory adds
+no extra dev opt-1/server opt-z or combined-member build configuration. MSRV
+check artifacts, all-feature graphs, API-only Actor and npm-staged release
+consumers remain distinct valid inputs. Share compiled outputs only within a
 compatible compiler/features/profile/frontend identity; a restored cache is not
-execution evidence. Quick Checks owns feature formatting once. The three
+execution evidence. Quick Checks owns feature formatting once. All three
 focused frontend runtime targets remain in A's canonical default-package tests.
 
 Before converting Root Birth Strict Lint to a manual exact-snapshot diagnostic,

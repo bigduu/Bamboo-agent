@@ -417,8 +417,8 @@ test("serial Root birth selectors reuse canonical storage compilation and preser
   assert.doesNotMatch(lint, /pull_request:|head\.sha|cargo (?:build|test)/u)
 })
 
-test("feature quality keeps distinct strict analysis, MSRV, security and frontend modes", () => {
-  for (const id of ["lint", "msrv", "security", "deny", "feature-codeql", "frontend-dev"]) {
+test("feature quality keeps strict analysis and read-only inventory without another product build", () => {
+  for (const id of ["lint", "msrv", "security", "deny", "feature-codeql", "frontend-inventory"]) {
     const block = job(id)
     assert.match(block, /^    runs-on: ubuntu-latest$/mu)
     assert.match(block, /needs\.validation-source\.outputs\.feature == 'true'/u)
@@ -437,10 +437,11 @@ test("feature quality keeps distinct strict analysis, MSRV, security and fronten
   assert.match(codeql, /fail-fast: false/u)
   assert.match(codeql, /security-events: write/u)
   assert.doesNotMatch(codeql, /cargo |autobuild|contents: write/u)
-  const frontend = job("frontend-dev")
-  assert.match(frontend, /BAMBOO_FRONTEND_BUILD_MODE: embedded\n      LOTUS_SOURCE: committed/u)
+  const frontend = job("frontend-inventory")
+  assert.match(frontend, /name: Frontend Package Inventory/u)
+  assert.match(frontend, /LOTUS_SOURCE: committed/u)
   assert.match(frontend, /run: node scripts\/frontend-package.cjs verify/u)
-  assert.equal((frontend.match(/cargo build --locked/gu) || []).length, 1)
+  assert.doesNotMatch(frontend, /cargo (?:build|test|check|clippy)|rust-cache|CARGO_TARGET_DIR|BAMBOO_FRONTEND_BUILD_MODE/u)
   assert.match(frontend, /cargo package --locked -p bamboo-server --allow-dirty --list/u)
   assert.doesNotMatch(frontend, /--all-features|--no-default-features|--release|PROFILE_|test:|--test|stage/u)
   assert.equal((job("quick-checks").match(/cargo fmt --all -- --check/gu) || []).length, 1)
@@ -473,7 +474,7 @@ test("strict Clippy preserves all three configurations and every failure after c
 test("frontend package inventory rejects a missing entry or Cargo failure without another runtime suite", (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-quality-package-"))
   t.after(() => rmSync(directory, { recursive: true, force: true }))
-  const step = job("frontend-dev").split("      - name: Verify server package inventory\n")[1].split("\n      - name:")[0]
+  const step = job("frontend-inventory").split("      - name: Verify server package inventory\n")[1].split("\n      - name:")[0]
   const shell = step.split("        run: |\n")[1].split("\n").map(line => line.replace(/^          /u, "")).join("\n")
   const entries = ["build.rs", "frontend_build.rs", "frontend_package/frontend-manifest.json", "frontend_package/lotus-frontend.zip"]
   writeFileSync(path.join(directory, "cargo"), '#!/bin/bash\n[[ "$*" == "package --locked -p bamboo-server --allow-dirty --list" ]] || exit 97\ncat "$INVENTORY"\nexit "$CARGO_STATUS"\n', { mode: 0o755 })
@@ -728,7 +729,7 @@ test("promotion retains required checks without repeating platform coverage", ()
 test("all-feature E2E crates retain the workspace stack and required summary", () => {
   assert.match(workflow, /^  RUST_MIN_STACK: "8388608"$/mu)
   assert.match(job("e2e-crates"), /--all-features --lib --tests/u)
-  assert.match(job("e2e-test"), /needs: \[validation-source, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-dev, e2e-crates, test-ssh\]/u)
+  assert.match(job("e2e-test"), /needs: \[validation-source, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-inventory, e2e-crates, test-ssh\]/u)
   assert.match(job("e2e-test"), /always\(\) && !cancelled\(\)/u)
 })
 
@@ -1152,7 +1153,7 @@ test("this frozen batch cannot save cache on source, integration, promotion or m
     assert.equal(source.split(header).length, 2, "one shared batch predicate must govern each workflow")
     for (const [name, github, expected] of cases) assert.equal(evaluate(expression, github, true), expected, name)
   }
-  assert.equal(caches, 17, "all planned source/dev/main cache actions remain covered")
+  assert.equal(caches, 16, "all planned source/dev/main cache actions remain covered")
   assert.ok(actor.includes(cacheSaveIf("github.event_name == 'pull_request' && github.base_ref == 'dev'")))
   assert.match(docs, /cache-on-failure: true\n          save-if: \$\{\{ env\.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' \}\}/u)
   const publisher = readFileSync(".github/workflows/publish-crate.yml", "utf8")

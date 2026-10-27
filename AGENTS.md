@@ -46,15 +46,17 @@ executor, reusing its compiled library-test executable without repeating cases.
 
 #2331 prepares required feature quality on the same actual merge source M.
 Both `Test` and `E2E Tests` require Lint, MSRV, audit, deny, all four CodeQL
-languages and Frontend Dev Build and Package Inventory. Keep all three strict
+languages and Frontend Package Inventory. Keep all three strict
 Clippy selections: default members/all-features, workspace/all-features and
 standalone storage/all-features/lib (one build job). They share one analysis
 target, but their feature graphs remain distinct. Preserve Rust 1.95 MSRV and
 the existing warning/advisory policies; a real Clippy or compiler failure blocks
 admission and must not become an allowlist, skip or release repair.
-CodeQL uses `build-mode: none`; the frontend dev build keeps default features
-and embedded committed bytes. Its package listing is a separate output, not a
-second regular test suite or a formal release archive. Preserve API-only and
+CodeQL uses `build-mode: none`; frontend inventory verifies committed bytes and
+lists the server package without another product build. Ordinary embedded
+compilation/runtime belongs to the canonical Linux executor, including its real
+`CARGO_BIN_EXE_bamboo` frontend case. Inventory adds no separate dev optimization
+or combined-member configuration, runtime suite or formal archive. Preserve API-only and
 npm-staged consumer configurations. Root Birth Strict Lint is manual diagnosis
 only; its exact analysis lane is owned by feature Lint and its runtime cases
 remain with the canonical default-storage executable. See the guide's quality
