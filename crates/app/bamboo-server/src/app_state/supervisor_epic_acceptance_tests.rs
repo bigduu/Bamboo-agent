@@ -90,6 +90,14 @@ fn tool_json(messages: &[Message], id: &str) -> Option<Value> {
     }
     Some(result)
 }
+fn tool_arguments(messages: &[Message], id: &str) -> Value {
+    let call = messages
+        .iter()
+        .flat_map(|message| message.tool_calls.iter().flatten())
+        .find(|call| call.id == id)
+        .expect("canonical recorded tool call");
+    serde_json::from_str(&call.function.arguments).unwrap()
+}
 fn artifact(messages: &[Message]) -> Option<Value> {
     messages.iter().rev().find_map(|message| {
         let (_, tail) = message.content.split_once("Child typed result:\n")?;
@@ -112,6 +120,7 @@ struct Probe {
     planner_release: Notify,
     observed: Mutex<BTreeSet<String>>,
     control_revision: Mutex<Option<String>>,
+    followup_target: Mutex<Option<Value>>,
     denied_control_exports: Mutex<BTreeSet<String>>,
     denied_control_reads: Mutex<BTreeSet<String>>,
 }
@@ -131,6 +140,7 @@ impl Probe {
             planner_release: Notify::new(),
             observed: Mutex::new(BTreeSet::new()),
             control_revision: Mutex::new(None),
+            followup_target: Mutex::new(None),
             denied_control_exports: Mutex::new(BTreeSet::new()),
             denied_control_reads: Mutex::new(BTreeSet::new()),
         }
@@ -207,6 +217,18 @@ impl Probe {
             2,
             "default catalog spans both current-user Projects"
         );
+        let followup_target = entries
+            .iter()
+            .find(|entry| entry["session_id"] == ROOT_B)
+            .unwrap()
+            .get("current_user_target")
+            .filter(|target| target.is_object())
+            .expect("canonical discovery returns the original worker selection")
+            .clone();
+        assert_eq!(followup_target["session_id"], ROOT_B);
+        // This observed DTO selects a lifetime; it grants no permission. Keep
+        // it unchanged on the stable-operation retry after a cold restart.
+        *self.followup_target.lock().unwrap() = Some(followup_target.clone());
         // This third Root shares Project A and is visible to the Supervisor
         // by default, but deliberately lies outside the Tracker's two targets.
         let Some(control_catalog) = tool_json(messages, "epic-control-catalog") else {
@@ -282,7 +304,8 @@ impl Probe {
                     "session_control",
                     &followup_id,
                     json!({"action":"followup",
-                    "target_session_id":ROOT_B,"operation_id":OPERATION,"message":FOLLOWUP}),
+                    "target_session_id":ROOT_B,"target_ref":followup_target,
+                    "operation_id":OPERATION,"message":FOLLOWUP}),
                 );
             }
             return LLMChunk::Token(if cold { COLD_DONE } else { DONE }.into());
@@ -400,7 +423,9 @@ impl Probe {
                 "session_control",
                 &attack_id,
                 json!({"action":"followup",
-                "target_session_id":ROOT_B,"operation_id":"6c934c1d-38cd-48db-b35e-fb5a6fed8071","message":"DENIED_TRACKER_ACTION"}),
+                "target_session_id":ROOT_B,
+                "target_ref":self.followup_target.lock().unwrap().clone().expect("real catalog observed before Tracker release"),
+                "operation_id":"6c934c1d-38cd-48db-b35e-fb5a6fed8071","message":"DENIED_TRACKER_ACTION"}),
             );
         }
         let denied = messages
@@ -1008,6 +1033,12 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
     let calls = probe.requests.load(Ordering::SeqCst);
     let tracker_calls = probe.tracker_calls.load(Ordering::SeqCst);
     let first_receipt = tool_json(&before_restart.messages, "epic-plan-followup").unwrap();
+    let first_followup = tool_arguments(&before_restart.messages, "epic-plan-followup");
+    assert_eq!(
+        first_followup["target_ref"],
+        *probe.followup_target.lock().unwrap().as_ref().unwrap(),
+        "the original worker selector comes from real discovery"
+    );
     assert_eq!(first_receipt["admitted"], true);
     assert!(first_receipt["receipt_id"].as_str().is_some());
     assert!(first_receipt["generation"]
@@ -1061,6 +1092,11 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
     let final_worker = quiet(&reopened, ROOT_B).await;
     let cold = quiet(&reopened, parent_id).await;
     let cold_receipt = tool_json(&cold.messages, "epic-cold-followup").unwrap();
+    assert_eq!(
+        tool_arguments(&cold.messages, "epic-cold-followup"),
+        first_followup,
+        "cold retry preserves the exact target selection, operation and input"
+    );
     assert_eq!(cold_receipt["receipt_id"], first_receipt["receipt_id"]);
     assert_eq!(cold_receipt["generation"], first_receipt["generation"]);
     assert_eq!(probe.tracker_calls.load(Ordering::SeqCst), tracker_calls);
