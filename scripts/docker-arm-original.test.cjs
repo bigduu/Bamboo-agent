@@ -36,7 +36,9 @@ function fixture() {
   const run = { id: 50, run_attempt: 2, workflow_id: 70, head_sha: "e".repeat(40), head_branch: "main", created_at: at(0) }, physical = job();
   const context = { run, jobs: [physical] }, binary = Buffer.alloc(65536); binary.write("7f454c460201",0,"hex"); binary.writeUInt16LE(3,16); binary.writeUInt16LE(183,18);
   const receipt = { schemaVersion: 1, kind: arm.KIND, identity: arm.binding(state,context,physical),
-    build: { command: ["cargo",...arm.ARGS], target: arm.TARGET, features: [], profile: "release", frontendMode: "embedded", builder: arm.BUILDER, builderConfig: arm.CONFIG,
+    build: { command: ["cargo",...arm.ARGS], target: arm.TARGET, features: [], profile: "release", frontendMode: "embedded", builder: arm.BUILDER, pinnedBuilderConfig: arm.CONFIG,
+      builderStore: {role:"manifest",id:arm.BUILDER_MANIFEST,repositoryDigest:arm.REPOSITORY_DIGEST,
+        descriptor:{digest:arm.BUILDER_MANIFEST,mediaType:"application/vnd.oci.image.manifest.v1+json",size:1942}},
       rustc: "rustc 1.99.1 (fixture)\nrelease: 1.99.1\nhost: aarch64-unknown-linux-gnu", cargo: "cargo 1.99.1 (fixture)", versionOutput: "bamboo 2026.10.27",
       sourceLockSha256: "3".repeat(64), stampedLockSha256: "4".repeat(64), stampedDiffSha256: "5".repeat(64), stampedPaths: ["Cargo.lock","Cargo.toml"], metadataSha256: "6".repeat(64), cargoMessagesSha256: "7".repeat(64) },
     binary: { sha256: sha(binary), sizeBytes: binary.length }, abi: { needed: ["libc.so.6","libssl.so.3"], symbolVersions: ["GLIBC_2.36"], interpreter: "/lib/ld-linux-aarch64.so.1" } };
@@ -272,7 +274,8 @@ test("ARM stamper glob validates ordinary directories before any Python manifest
   fs.symlinkSync(outside,path.join(directory,"crates/infra/foreign"));assert.throws(()=>arm.stampInputs(work),/link/);
 });
 test("ARM builder config must match the actual fixed image and native architecture",()=>{
-  const image={Id:arm.CONFIG,Os:"linux",Architecture:"arm64",Config:{Env:["RUST_VERSION=1.99.1"]}};arm.checkBuilder(image);
+  const image={Id:arm.CONFIG,Os:"linux",Architecture:"arm64",RepoDigests:[arm.REPOSITORY_DIGEST],Config:{Env:["RUST_VERSION=1.99.1"]}};
+  assert.deepEqual(arm.checkBuilder(image),{role:"config",id:arm.CONFIG,repositoryDigest:arm.REPOSITORY_DIGEST,descriptor:null});
   for(const field of ["Id","Os","Architecture","Config"]) {
     const bad={...image,[field]:field==="Config"?{Env:["RUST_VERSION=1.99.0"]}:"foreign"};assert.throws(()=>arm.checkBuilder(bad));
   }
@@ -284,5 +287,27 @@ test("ARM real Docker29 manifest-store shape labels observed identity separately
   const descriptor={digest:manifest,mediaType:"application/vnd.oci.image.manifest.v1+json",size:1942};
   const observed={Id:manifest,RepoDigests:["rust@"+manifest],Descriptor:descriptor,Os:"linux",Architecture:"arm64",Config:{Env:["RUST_VERSION=1.99.1"]}};
   assert.deepEqual(arm.checkBuilder(observed),{role:"manifest",id:manifest,repositoryDigest:"rust@"+manifest,descriptor});
+});
+for(const variant of ["unknown-id","foreign-index-id","missing-repo","foreign-repo","missing-descriptor","descriptor-index","descriptor-type","descriptor-size","classic-inconsistent-descriptor","rust-version"])test("ARM closed image identity rejects "+variant,()=>{
+  const manifest=arm.BUILDER_MANIFEST,index="sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8";
+  const image={Id:manifest,Os:"linux",Architecture:"arm64",RepoDigests:[arm.REPOSITORY_DIGEST],Descriptor:{digest:manifest,mediaType:"application/vnd.oci.image.manifest.v1+json",size:1942},Config:{Env:["RUST_VERSION=1.99.1"]}};
+  if(variant==="unknown-id")image.Id="sha256:"+"0".repeat(64);
+  if(variant==="foreign-index-id")image.Id=index;
+  if(variant==="missing-repo")delete image.RepoDigests;
+  if(variant==="foreign-repo")image.RepoDigests=["rust@"+index];
+  if(variant==="missing-descriptor")delete image.Descriptor;
+  if(variant==="descriptor-index")image.Descriptor.digest=index;
+  if(variant==="descriptor-type")image.Descriptor.mediaType="application/vnd.oci.image.index.v1+json";
+  if(variant==="descriptor-size")image.Descriptor.size++;
+  if(variant==="classic-inconsistent-descriptor"){image.Id=arm.CONFIG;image.Descriptor.digest=index;}
+  if(variant==="rust-version")image.Config.Env.push("RUST_VERSION=1.99.0");
+  assert.throws(()=>arm.checkBuilder(image));
+});
+test("ARM builder receipt preserves both closed observed-store roles and rejects relabeling",()=>{
+  const f=fixture();arm.validateReceipt(f.receipt,f.state,f.context,f.physical);
+  f.receipt.build.builderStore={role:"config",id:arm.CONFIG,repositoryDigest:arm.REPOSITORY_DIGEST,descriptor:null};arm.validateReceipt(f.receipt,f.state,f.context,f.physical);
+  for(const mutate of [b=>b.pinnedBuilderConfig=arm.BUILDER_MANIFEST,b=>b.builderStore.id=arm.BUILDER_MANIFEST,b=>b.builderStore.role="unknown",b=>b.builderStore.repositoryDigest="foreign",b=>b.builderStore.descriptor={digest:"foreign",mediaType:"index",size:1942},b=>b.builderConfig=arm.CONFIG]) {
+    const value=structuredClone(f.receipt);mutate(value.build);assert.throws(()=>arm.validateReceipt(value,f.state,f.context,f.physical));
+  }
 });
 });

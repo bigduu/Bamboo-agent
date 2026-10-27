@@ -9,6 +9,7 @@ const build = require("./sidecar-build.cjs"), ROOT = path.resolve(__dirname, "..
 // Official index/config/Dockerfile metadata: #2353 read-only handoff, 2026-10-27.
 const BUILDER = "docker.io/library/rust:1.99.1-bookworm@sha256:32f7944ed00949c44d3944a0a852b3e5ea862a610a38b43ac92a33aa87256b75";
 const CONFIG = "sha256:288b8fa317be20e10d5784cf65883a3b44977e2b0202635b9658970bba88d570";
+const BUILDER_MANIFEST = BUILDER.split("@")[1], REPOSITORY_DIGEST = "rust@" + BUILDER_MANIFEST;
 const TARGET = "aarch64-unknown-linux-gnu", KIND = "bamboo-docker-arm-original/v1", PREFIX = "Bamboo Docker ARM original: ";
 const SELECT = "Select ARM executable original", PREPARE = "Prepare frozen ARM source and dependencies";
 const COMPILE = "Compile the sole versioned ARM binary", CAPTURE = "Verify ARM binary and record receipt";
@@ -48,9 +49,27 @@ function containerArgs(work, phase, args) {
     "--env", "BAMBOO_FRONTEND_BUILD_MODE=embedded", "--env", "CARGO_TARGET_DIR=" + work.target,
     "--entrypoint", args[0], BUILDER, ...args.slice(1)];
 }
+function validateBuilderStore(value) {
+  keys(value, ["role", "id", "repositoryDigest", "descriptor"]);
+  assert.equal(value.repositoryDigest, REPOSITORY_DIGEST);
+  assert.ok(["config", "manifest"].includes(value.role));
+  assert.equal(value.id, value.role === "config" ? CONFIG : BUILDER_MANIFEST, "Unknown Docker store identity");
+  if (value.descriptor !== null) {
+    keys(value.descriptor, ["digest", "mediaType", "size"]);
+    assert.deepEqual(value.descriptor, { digest: BUILDER_MANIFEST, mediaType: "application/vnd.oci.image.manifest.v1+json", size: 1942 });
+  }
+  if (value.role === "manifest") assert.ok(value.descriptor, "Manifest store requires its exact single-ARM descriptor");
+  return value;
+}
 function checkBuilder(image) {
-  assert.equal(image.Id, CONFIG); assert.equal(image.Os, "linux"); assert.equal(image.Architecture, "arm64");
-  assert.ok(image.Config.Env.includes("RUST_VERSION=1.99.1"));
+  assert.equal(image.Os, "linux"); assert.equal(image.Architecture, "arm64");
+  assert.deepEqual(image.Config.Env.filter(value => value.startsWith("RUST_VERSION=")), ["RUST_VERSION=1.99.1"]);
+  assert.ok(Array.isArray(image.RepoDigests) && image.RepoDigests.includes(REPOSITORY_DIGEST));
+  assert.ok([CONFIG, BUILDER_MANIFEST].includes(image.Id), "Unknown Docker image ID/index");
+  // Classic stores expose the config ID; containerd stores expose the manifest
+  // ID. Both must bind this one pinned ARM manifest/config pair, never an index.
+  return validateBuilderStore({ role: image.Id === CONFIG ? "config" : "manifest", id: image.Id, repositoryDigest: REPOSITORY_DIGEST,
+    descriptor: image.Descriptor == null ? null : { digest: image.Descriptor.digest, mediaType: image.Descriptor.mediaType, size: image.Descriptor.size } });
 }
 function frontend(facts) {
   assert.equal(facts.frontend.length, 2);
@@ -69,10 +88,11 @@ function validateReceipt(value, state, context, physical) {
   keys(value, ["schemaVersion", "kind", "identity", "build", "binary", "abi"]);
   assert.equal(value.schemaVersion, 1); assert.equal(value.kind, KIND); assert.deepEqual(value.identity, binding(state, context, physical));
   const b = value.build;
-  keys(b, ["command", "target", "features", "profile", "frontendMode", "builder", "builderConfig", "rustc", "cargo", "versionOutput",
+  keys(b, ["command", "target", "features", "profile", "frontendMode", "builder", "pinnedBuilderConfig", "builderStore", "rustc", "cargo", "versionOutput",
     "sourceLockSha256", "stampedLockSha256", "stampedDiffSha256", "stampedPaths", "metadataSha256", "cargoMessagesSha256"]);
   assert.deepEqual(b.command, ["cargo", ...ARGS]); assert.equal(b.target, TARGET); assert.deepEqual(b.features, []);
-  assert.equal(b.profile, "release"); assert.equal(b.frontendMode, "embedded"); assert.equal(b.builder, BUILDER); assert.equal(b.builderConfig, CONFIG);
+  assert.equal(b.profile, "release"); assert.equal(b.frontendMode, "embedded"); assert.equal(b.builder, BUILDER); assert.equal(b.pinnedBuilderConfig, CONFIG);
+  validateBuilderStore(b.builderStore);
   assert.match(b.rustc, /^release: 1\.99\.1$/m); assert.match(b.rustc, /^host: aarch64-unknown-linux-gnu$/m);
   assert.match(b.cargo, /^cargo 1\.99\.\d+ /); assert.equal(b.versionOutput, "bamboo " + state.facts.release.version);
   for (const name of ["sourceLockSha256", "stampedLockSha256", "stampedDiffSha256", "metadataSha256", "cargoMessagesSha256"]) hash(b[name]);
@@ -258,7 +278,7 @@ async function prepare(state, context, work) {
   const stampedManifests = manifestHashes(work, manifests);
   const inspect = args => command("docker", containerArgs(work, "prepare", args), { timeout: 20 * 60000 });
   assert.equal(inspect(["uname", "-m"]).trim(), "aarch64");
-  checkBuilder(JSON.parse(command("docker", ["image", "inspect", BUILDER, "--format", "{{json .}}"], { maxBuffer: 1024 ** 2 })));
+  const builderStore = checkBuilder(JSON.parse(command("docker", ["image", "inspect", BUILDER, "--format", "{{json .}}"], { maxBuffer: 1024 ** 2 })));
   const rustc = inspect(["rustc", "-Vv"]).trim(), cargo = inspect(["cargo", "-V"]).trim();
   assert.match(rustc, /^release: 1\.99\.1$/m); assert.match(rustc, /^host: aarch64-unknown-linux-gnu$/m);
   inspect(["/bin/sh", "-ec", "command -v cc; command -v ar; command -v readelf; command -v pkg-config; pkg-config --modversion openssl"]);
@@ -271,7 +291,7 @@ async function prepare(state, context, work) {
   assert.deepEqual(manifestHashes(work, manifests), stampedManifests, "Dependency preparation changed a stamped manifest");
   const stamped = sourceState(work), allowed = new Set([...manifests, "Cargo.lock"]);
   for (const file of stamped.paths) assert.ok(allowed.has(file), "Unexpected stamped source path");
-  writeJSON(path.join(work.root, "prepared.json"), { identity: binding(state, context, context.current), manifests, stamped, rustc, cargo,
+  writeJSON(path.join(work.root, "prepared.json"), { identity: binding(state, context, context.current), manifests, stamped, rustc, cargo, builderStore,
     sourceLockSha256, stampedLockSha256: sha(fs.readFileSync(path.join(work.source, "Cargo.lock"))), metadataSha256: sha(metadataBytes) });
 }
 function capture(state, context, work) {
@@ -288,7 +308,7 @@ function capture(state, context, work) {
   const versionOutput = inspect([binary, "--version"]).trim(); assert.equal(versionOutput, "bamboo " + state.facts.release.version);
   assert.deepEqual(sourceState(work), data.stamped);
   const value = { schemaVersion: 1, kind: KIND, identity: data.identity, binary: sidecar.fileIdentity(binary, MAX_BINARY, 65536), abi,
-    build: { command: ["cargo", ...ARGS], target: TARGET, features: [], profile: "release", frontendMode: "embedded", builder: BUILDER, builderConfig: CONFIG,
+    build: { command: ["cargo", ...ARGS], target: TARGET, features: [], profile: "release", frontendMode: "embedded", builder: BUILDER, pinnedBuilderConfig: CONFIG, builderStore: data.builderStore,
       rustc: data.rustc, cargo: data.cargo, versionOutput, sourceLockSha256: data.sourceLockSha256, stampedLockSha256: data.stampedLockSha256,
       stampedDiffSha256: data.stamped.diffSha256, stampedPaths: data.stamped.paths, metadataSha256: data.metadataSha256, cargoMessagesSha256: sha(raw) } };
   validateReceipt(value, state, context, context.current); const receipt = Buffer.from(JSON.stringify(value, null, 2) + "\n"); assert.ok(receipt.length <= MAX_RECEIPT);
@@ -334,7 +354,7 @@ async function main() {
   const line = PREFIX + Buffer.from(core.canonicalJson(completion(state, context, context.current, result.artifact, result))).toString("base64");
   assert.ok(Buffer.byteLength(line) <= MAX_RECEIPT); console.log(line);
 }
-module.exports = { BUILDER, CONFIG, TARGET, KIND, PREFIX, SELECT, PREPARE, COMPILE, CAPTURE, UPLOAD, SEAL, REUSE, PRODUCTION,
+module.exports = { BUILDER, CONFIG, BUILDER_MANIFEST, REPOSITORY_DIGEST, TARGET, KIND, PREFIX, SELECT, PREPARE, COMPILE, CAPTURE, UPLOAD, SEAL, REUSE, PRODUCTION,
   MAX_ZIP, MAX_BINARY, MAX_RECEIPT, ARGS, artifactName, childEnv, containerArgs, frontend, binding, validateReceipt, history, noOrphan,
   decodeOriginal, completion, readFrame, loadOriginal, readOriginal, manifestHashes, stampInputs, checkBuilder };
 if (require.main === module) main().catch(error => { console.error("Docker ARM original: " + error.message); process.exitCode = 1; });
