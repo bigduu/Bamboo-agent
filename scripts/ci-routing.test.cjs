@@ -8,7 +8,7 @@ const { test } = require("node:test");
 const ci = fs.readFileSync(".github/workflows/ci.yml", "utf8");
 const frontend = fs.readFileSync(".github/workflows/frontend-acceptance.yml", "utf8");
 const publisher = fs.readFileSync(".github/workflows/publish-crate.yml", "utf8");
-const qualityFields = ["LINT_RESULT", "MSRV_RESULT", "SECURITY_RESULT", "DENY_RESULT", "CODEQL_RESULT", "FRONTEND_INVENTORY_RESULT"];
+const qualityFields = ["LINT_RESULT", "MSRV_RESULT", "SECURITY_RESULT", "DENY_RESULT", "DOCS_RESULT", "CODEQL_RESULT", "FRONTEND_INVENTORY_RESULT"];
 const qualitySuccess = Object.fromEntries(qualityFields.map(name => [name, "success"]));
 function job(source, id) {
   const marker = `\n  ${id}:\n`;
@@ -34,7 +34,7 @@ function assertRouting(source) {
   assert.doesNotMatch(quick, /cargo (build|test|check|clippy)|continue-on-error|--test-skip/);
   const full = job(source, "test");
   assert.match(full, /^    name: Test$/m);
-  assert.match(full, /^    needs: \[validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
+  assert.match(full, /^    needs: \[validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
   assert.match(full, /^    if: always\(\) && !cancelled\(\)$/m);
   assert.match(full, /- name: Require validation admission\n        env:\n          SOURCE_RESULT: \$\{\{ needs.validation-source.result \}\}\n          FULL_VALIDATION: \$\{\{ needs.validation-source.outputs.full \}\}/);
   assert.match(full, /test "\$SOURCE_RESULT" = success/);
@@ -188,12 +188,12 @@ test("source guards propagate Git inspection errors and reject dirty or mismatch
   const guards = [];
   for (const source of [job(ci, "test"), job(frontend, "lint"), job(frontend, "build"), job(frontend, "test"),
     fs.readFileSync(".github/workflows/root-birth-acceptance.yml", "utf8"),
-    ...["lint", "msrv", "security", "deny", "feature-codeql", "frontend-inventory"].map(id => job(ci, id))]) {
+    ...["lint", "msrv", "security", "deny", "docs", "feature-codeql", "frontend-inventory"].map(id => job(ci, id))]) {
     for (const step of source.split(/(?=^      - )/m)) {
       if (step.includes("source_status=") || step.includes("status=$(git status")) guards.push(script(step));
     }
   }
-  assert.equal(guards.length, 21);
+  assert.equal(guards.length, 23);
   for (const shell of guards) {
     const run = (overrides = {}) => spawnSync("bash", ["-c", shell], { cwd: repo, encoding: "utf8", env: { ...process.env,
       PATH: `${bin}${path.delimiter}${process.env.PATH}`, REAL_GIT: realGit, FAIL_STATUS: "0",
@@ -217,7 +217,7 @@ function assertSharedBuild(source) {
   const [settings, ...steps] = build.split(/(?=^      - )/m);
   assert.match(settings, /^    name: Test$/m);
   assert.match(settings, /^    if: always\(\) && !cancelled\(\)$/m);
-  assert.match(settings, /^    needs: \[validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
+  assert.match(settings, /^    needs: \[validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
   assert.ok(settings.includes("timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"));
   assert.doesNotMatch(settings, /^    continue-on-error:/m);
   assert.doesNotMatch(build, /cargo build/);
@@ -240,7 +240,7 @@ test("one required Test requires successful Unit, E2E and SSH jobs", () => {
   for (const [from, to] of [
     ["name: Test\n", "name: Dev Build\n"],
     ['test "$E2E_RESULT" = success', 'true'],
-    ["needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]", "needs: quick-checks"],
+    ["needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]", "needs: quick-checks"],
     ["name: Test CI workflow policy\n        if: needs.validation-source.outputs.full == 'true'", "name: Test CI workflow policy"],
     ["name: Check formatting\n        if: needs.validation-source.outputs.full == 'true'", "name: Check formatting"],
     ["name: Require all crate tests and the SSH fixture\n        if: needs.validation-source.outputs.full == 'true'", "name: Require all crate tests and the SSH fixture"],
@@ -282,13 +282,13 @@ test("both summaries reject every incomplete quality owner and preserve legacy/m
   for (const field of ["CRATE_RESULT", "SSH_RESULT"]) assert.notEqual(run({ FULL_VALIDATION: "true", FEATURE_VALIDATION: "false", [field]: "skipped" }).status, 0);
   for (const overrides of [{ FEATURE_VALIDATION: "" }, { FULL_VALIDATION: "true" }, { FEATURE_VALIDATION: "false" }]) assert.notEqual(run(overrides).status, 0);
   const testShell = script(job(ci, "test").split("      - uses:")[0]);
-  for (const field of qualityFields.slice(0, 4)) for (const value of ["failure", "cancelled", "skipped", "", undefined]) {
+  for (const field of qualityFields.slice(0, 5)) for (const value of ["failure", "cancelled", "skipped", "", undefined]) {
     assert.notEqual(run({ FULL_VALIDATION: "true", FEATURE_VALIDATION: "false", [field]: value }).status, 0);
     assert.notEqual(spawnSync("bash", ["-c", testShell], { env: { ...process.env, ...qualitySuccess,
       SOURCE_RESULT: "success", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false",
       GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "main", [field]: value } }).status, 0);
   }
-  for (const id of ["test", "e2e-test"]) for (const owner of ["lint", "msrv", "security", "deny", "feature-codeql", "frontend-inventory"]) {
+  for (const id of ["test", "e2e-test"]) for (const owner of ["lint", "msrv", "security", "deny", "docs", "feature-codeql", "frontend-inventory"]) {
     assert.ok(job(ci, id).match(/^    needs: \[([^\]]+)\]$/m)[1].split(", ").includes(owner));
     assert.ok(job(ci, id).includes(`needs.${owner}.result`));
   }

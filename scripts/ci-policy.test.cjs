@@ -672,7 +672,7 @@ test("native summaries reject failed, cancelled, skipped and missing crate resul
     const results = Object.fromEntries(variables.map((name) => [name, "success"]))
     const run = (overrides = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", command], {
       env: { ...process.env, SOURCE_RESULT: "success", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false",
-        LINT_RESULT: "success", MSRV_RESULT: "success", SECURITY_RESULT: "success", DENY_RESULT: "success", ...results, ...overrides }, encoding: "utf8",
+        LINT_RESULT: "success", MSRV_RESULT: "success", SECURITY_RESULT: "success", DENY_RESULT: "success", DOCS_RESULT: "success", ...results, ...overrides }, encoding: "utf8",
     })
     assert.equal(run().status, 0)
     for (const variable of variables) {
@@ -729,7 +729,7 @@ test("promotion retains required checks without repeating platform coverage", ()
 test("all-feature E2E crates retain the workspace stack and required summary", () => {
   assert.match(workflow, /^  RUST_MIN_STACK: "8388608"$/mu)
   assert.match(job("e2e-crates"), /--all-features --lib --tests/u)
-  assert.match(job("e2e-test"), /needs: \[validation-source, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-inventory, e2e-crates, test-ssh\]/u)
+  assert.match(job("e2e-test"), /needs: \[validation-source, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, e2e-crates, test-ssh\]/u)
   assert.match(job("e2e-test"), /always\(\) && !cancelled\(\)/u)
 })
 

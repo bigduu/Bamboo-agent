@@ -98,7 +98,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "a4e688d3a584095eabc18b989b993b2761580d1a747e4335fbd277975c9bc4cb"
+          ADMISSION_HELPER_SHA256: "30238922ca2cd8310d7bde1978c8c8808482147d13dd3f4aec983342681fc37c"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -249,7 +249,7 @@ jobs:
       actions: read
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
-    needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]
+    needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]
     # A source-gate failure must fail required Test, never turn it into a skip.
     if: always() && !cancelled()
     runs-on: ubuntu-latest
@@ -269,6 +269,7 @@ jobs:
           MSRV_RESULT: ${{ needs.msrv.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
           DENY_RESULT: ${{ needs.deny.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
           CODEQL_RESULT: ${{ needs.feature-codeql.result }}
           FRONTEND_INVENTORY_RESULT: ${{ needs.frontend-inventory.result }}
         shell: bash
@@ -282,13 +283,13 @@ jobs:
               test "$QUICK_RESULT" = success
               test "$NATIVE_RESULT" = success
               test "$BROWSER_RUNTIME_RESULT" = success
-              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$CODEQL_RESULT" "$FRONTEND_INVENTORY_RESULT"; do
+              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$DOCS_RESULT" "$CODEQL_RESULT" "$FRONTEND_INVENTORY_RESULT"; do
                 test "$result" = success
               done
               ;;
             pull_request:main:true|workflow_dispatch::true)
               test "$FEATURE_VALIDATION" = false
-              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT"; do
+              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$DOCS_RESULT"; do
                 test "$result" = success
               done
               ;;
@@ -993,7 +994,7 @@ jobs:
 
   e2e-test:
     name: E2E Tests
-    needs: [validation-source, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-inventory, e2e-crates, test-ssh]
+    needs: [validation-source, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, e2e-crates, test-ssh]
     if: always() && !cancelled() && (needs.validation-source.outputs.full == 'true' || needs.validation-source.outputs.feature == 'true')
     runs-on: ubuntu-latest
     steps:
@@ -1011,6 +1012,7 @@ jobs:
           MSRV_RESULT: ${{ needs.msrv.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
           DENY_RESULT: ${{ needs.deny.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
           CODEQL_RESULT: ${{ needs.feature-codeql.result }}
           FRONTEND_INVENTORY_RESULT: ${{ needs.frontend-inventory.result }}
         run: |
@@ -1020,14 +1022,14 @@ jobs:
               test "$FEATURE_RESULT" = success
               test "$NATIVE_RESULT" = success
               test "$BROWSER_RUNTIME_RESULT" = success
-              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$CODEQL_RESULT" "$FRONTEND_INVENTORY_RESULT"; do
+              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$DOCS_RESULT" "$CODEQL_RESULT" "$FRONTEND_INVENTORY_RESULT"; do
                 test "$result" = success
               done
               ;;
             success:false:true)
               test "$CRATE_RESULT" = success
               test "$SSH_RESULT" = success
-              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT"; do
+              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$DOCS_RESULT"; do
                 test "$result" = success
               done
               ;;
@@ -1285,10 +1287,21 @@ jobs:
   docs:
     name: Documentation
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true' || needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind feature documentation to the actual clean merge source
+        if: needs.validation-source.outputs.feature == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1299,8 +1312,187 @@ jobs:
           shared-key: bamboo-ci-docs-${{ runner.os }}
           save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
+      # The old full-validation configuration remains independent until cutover.
       - name: Build documentation
+        if: needs.validation-source.outputs.full == 'true'
         run: cargo doc --no-deps
+
+      - name: Build feature documentation once
+        if: needs.validation-source.outputs.feature == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, shutil
+          root = pathlib.Path.cwd().resolve()
+          site = root / "target/doc"
+          assert not (root / "target").is_symlink() and not site.is_symlink() and site.resolve().is_relative_to(root)
+          if site.exists():
+              assert site.is_dir()
+              shutil.rmtree(site)  # Only this job's restored documentation output.
+          PY
+          cargo metadata --locked --format-version 1 --no-deps > "$RUNNER_TEMP/feature-docs-metadata.json"
+          rustc -vV > "$RUNNER_TEMP/feature-docs-rustc.txt"
+          cargo -V > "$RUNNER_TEMP/feature-docs-cargo.txt"
+          rustdoc -V > "$RUNNER_TEMP/feature-docs-rustdoc.txt"
+          cargo doc --locked --no-deps --all-features --document-private-items
+
+      - name: Freeze original feature documentation tar and receipt
+        if: needs.validation-source.outputs.feature == 'true'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, stat, subprocess, tarfile
+
+          MAX_FILES, MAX_ENTRIES = 100000, 200000
+          MAX_SITE_BYTES, MAX_TAR_BYTES, MAX_RECEIPT_BYTES = 1 << 30, 2 << 30, 32 << 20
+          COMMAND = ["cargo", "doc", "--locked", "--no-deps", "--all-features", "--document-private-items"]
+
+          def digest(stream):
+              value = hashlib.sha256()
+              while block := stream.read(1 << 20):
+                  value.update(block)
+              return value.hexdigest()
+
+          def file_hash(file):
+              with file.open("rb") as stream:
+                  return digest(stream)
+
+          def safe_path(name):
+              path = pathlib.PurePosixPath(name)
+              assert name and not path.is_absolute() and ".." not in path.parts
+              assert path.as_posix() == name and "\\" not in name
+              assert len(name.encode()) <= 4096 and all(ord(char) >= 32 for char in name)
+
+          def verify_archive(archive, files):
+              assert 0 < len(files) <= MAX_FILES and archive.stat().st_size <= MAX_TAR_BYTES
+              expected = {item["path"]: item for item in files}
+              assert len(expected) == len(files)
+              seen, found, total = set(), set(), 0
+              with tarfile.open(archive, "r:") as tar:
+                  for entry in tar:
+                      safe_path(entry.name)
+                      assert entry.name not in seen and len(seen) < MAX_ENTRIES
+                      seen.add(entry.name)
+                      assert entry.isdir() or entry.isfile(), "No links or special files"
+                      if entry.isdir():
+                          continue
+                      item = expected[entry.name]
+                      total += entry.size
+                      assert total <= MAX_SITE_BYTES and entry.size == item["sizeBytes"]
+                      with tar.extractfile(entry) as stream:
+                          assert digest(stream) == item["sha256"], "Changed documentation bytes"
+                      found.add(entry.name)
+              assert found == set(expected), "Missing documentation files"
+
+          def produce():
+              root = pathlib.Path.cwd().resolve()
+              git = lambda *args: subprocess.check_output(["git", *args], text=True).strip()
+              sha, tree = git("rev-parse", "HEAD"), git("rev-parse", "HEAD^{tree}")
+              assert re.fullmatch("[0-9a-f]{40}", sha) and os.environ["GITHUB_SHA"] == sha
+              assert not git("status", "--porcelain", "--untracked-files=all")
+              assert os.environ["GITHUB_EVENT_NAME"] == "pull_request" and os.environ["GITHUB_BASE_REF"] == "dev"
+              ref, repo = os.environ["GITHUB_REF"], os.environ["GITHUB_REPOSITORY"]
+              assert re.fullmatch(r"refs/pull/[1-9][0-9]*/merge", ref) and repo == "bigduu/Bamboo-agent"
+              workflow_sha, workflow_ref = os.environ["GITHUB_WORKFLOW_SHA"], os.environ["GITHUB_WORKFLOW_REF"]
+              assert re.fullmatch("[0-9a-f]{40}", workflow_sha)
+              assert workflow_ref == repo + "/.github/workflows/ci.yml@" + ref
+              run_id, attempt = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
+              assert re.fullmatch("[1-9][0-9]*", run_id) and re.fullmatch("[1-9][0-9]*", attempt)
+              temporary = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve()
+              metadata = json.loads((temporary / "feature-docs-metadata.json").read_text())
+              selected = set(metadata["workspace_default_members"])
+              members = []
+              for package in metadata["packages"]:
+                  if package["id"] not in selected:
+                      continue
+                  manifest = pathlib.Path(package["manifest_path"])
+                  assert not manifest.is_symlink() and manifest.resolve().is_relative_to(root)
+                  members.append({"name": package["name"], "manifest": manifest.relative_to(root).as_posix(),
+                                  "manifestSha256": file_hash(manifest)})
+              members.sort(key=lambda item: item["name"])
+              assert len(members) == len(selected) == 30 and len({item["name"] for item in members}) == 30
+              assert not {"bamboo-analytics", "bamboo-tool-event-recorder-example"} & {item["name"] for item in members}
+              configuration = {"command": COMMAND, "defaultMembers": members,
+                               "sourceConfigSha256": {name: file_hash(root / name) for name in ["Cargo.toml", ".cargo/config.toml"]}}
+              configuration_digest = hashlib.sha256(json.dumps(configuration, sort_keys=True).encode()).hexdigest()
+              toolchain = {}
+              for tool in ["rustc", "cargo", "rustdoc"]:
+                  text = (temporary / ("feature-docs-" + tool + ".txt")).read_text()
+                  assert 0 < len(text.encode()) <= 65536
+                  toolchain[tool] = text.strip()
+              site = root / "target/doc"
+              assert not (root / "target").is_symlink() and site.is_dir() and not site.is_symlink() and site.resolve().is_relative_to(root)
+              assert (site / "bamboo_agent/index.html").is_file() and (site / "bamboo_agent/index.html").stat().st_size > 0
+              assert not (site / "index.html").is_symlink()
+              (site / "index.html").write_text('<meta http-equiv="refresh" content="0;url=bamboo_agent/index.html">\n')
+              entries, files, total = [], [], 0
+              for file in site.rglob("*"):
+                  name, info = file.relative_to(site).as_posix(), file.lstat()
+                  safe_path(name)
+                  assert not file.is_symlink() and (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode))
+                  assert len(entries) < MAX_ENTRIES
+                  entries.append((name, file, info))
+                  if stat.S_ISREG(info.st_mode):
+                      assert info.st_nlink == 1, "No hard links"
+                      total += info.st_size
+                      assert total <= MAX_SITE_BYTES and len(files) < MAX_FILES
+                      files.append({"path": name, "sizeBytes": info.st_size, "sha256": file_hash(file)})
+              files.sort(key=lambda item: item["path"])
+              artifact_name = "feature-docs-" + run_id + "-" + attempt
+              output = temporary / artifact_name
+              output.mkdir()  # A completed physical attempt is never overwritten.
+              archive = output / "artifact.tar"
+              with tarfile.open(archive, "w", format=tarfile.PAX_FORMAT) as tar:
+                  for name, file, info in sorted(entries):
+                      item = tarfile.TarInfo(name)
+                      item.uid = item.gid = item.mtime = 0
+                      item.mode = 0o755 if stat.S_ISDIR(info.st_mode) else 0o644
+                      item.type = tarfile.DIRTYPE if stat.S_ISDIR(info.st_mode) else tarfile.REGTYPE
+                      item.size = 0 if item.isdir() else info.st_size
+                      if item.isdir():
+                          tar.addfile(item)
+                      else:
+                          with file.open("rb") as stream:
+                              tar.addfile(item, stream)
+              verify_archive(archive, files)
+              receipt = {"schema": "bamboo.feature-docs.v1", "complete": True,
+                         "source": {"sha": sha, "tree": tree},
+                         "controller": {"sha": workflow_sha, "ref": workflow_ref},
+                         "run": {"repository": repo, "id": int(run_id), "physicalAttempt": int(attempt), "event": "pull_request", "ref": ref},
+                         "artifactName": artifact_name, "configuration": configuration, "configurationSha256": configuration_digest,
+                         "inputs": {"cargoLockSha256": file_hash(root / "Cargo.lock"), "sourceWorkflowSha256": file_hash(root / ".github/workflows/ci.yml")},
+                         "toolchain": toolchain, "runner": {"os": os.environ["RUNNER_OS"], "arch": os.environ["RUNNER_ARCH"]},
+                         "tar": {"file": "artifact.tar", "sha256": file_hash(archive), "sizeBytes": archive.stat().st_size},
+                         "files": files, "fileCount": len(files), "siteBytes": total}
+              encoded = (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode()
+              assert len(encoded) <= MAX_RECEIPT_BYTES
+              (output / "receipt.json").write_bytes(encoded)
+              assert git("rev-parse", "HEAD") == sha and not git("status", "--porcelain", "--untracked-files=all")
+
+          if __name__ == "__main__":
+              produce()
+          PY
+
+      - name: Verify feature documentation source stayed clean
+        if: always() && needs.validation-source.outputs.feature == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+
+      - name: Retain original feature documentation tar and receipt
+        if: success() && needs.validation-source.outputs.feature == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: feature-docs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/feature-docs-${{ github.run_id }}-${{ github.run_attempt }}/artifact.tar
+            ${{ runner.temp }}/feature-docs-${{ github.run_id }}-${{ github.run_attempt }}/receipt.json
+          if-no-files-found: error
+          retention-days: 90
 
   security:
     name: Security Audit
