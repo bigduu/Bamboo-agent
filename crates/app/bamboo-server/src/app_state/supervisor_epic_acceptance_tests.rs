@@ -47,6 +47,7 @@ const ROOT_A: &str = "epic-existing-a";
 const ROOT_B: &str = "epic-existing-b";
 const CONTROL_ROOT: &str = "epic-negative-control";
 const PRIVATE_CONTROL: &str = "UNASSIGNED_CURRENT_USER_ROOT_PRIVATE_HISTORY";
+const TARGET_GRANT_REJECTION: &str = "context_view: Observer has no current view grant";
 const USER: &str = "EPIC_USER: plan, then execute exactly one authorized followup on Root B";
 const COLD: &str = "EPIC_COLD: reread the same plan and retry the identical followup";
 const FOLLOWUP: &str =
@@ -368,6 +369,15 @@ impl Probe {
                 "unassigned {action} must be denied: {}",
                 result.content
             );
+            // The current port exposes no structured target-grant code:
+            // Store PermissionDenied is preserved by context_view's execution
+            // error. Require that exact authorization failure for BOTH calls.
+            // ENOENT, caller provenance, or a selector mismatch would otherwise
+            // also return false for the Supervisor-published revision and would
+            // not prove that the Observer's narrower target grant was enforced.
+            assert!(result.content.contains(TARGET_GRANT_REJECTION),
+                "unassigned {action} must fail at the Observer target-grant check before view IO/provenance, got: {}",
+                result.content);
             assert!(!result.content.contains(PRIVATE_CONTROL));
             let denials = if action == "export_context" {
                 &self.denied_control_exports
