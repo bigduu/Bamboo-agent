@@ -6,9 +6,9 @@ Before CI or release work, read the complete local
 [shared delivery workflow](docs/delivery-workflow.md),
 [Actions ownership audit](docs/ci-workflow-audit.md) and
 [Bamboo commands and test map](docs/releases/ci-publication-flow.md).
-Every agent follows the same feature/dev/release/main ownership and checkpoint
-procedure. The full shared documents are present in this repository; consult
-their activation table and verify live evidence before using a proposed path.
+Every agent follows the same feature/dev/release/main workflow. The shared
+review documents include historical snapshots; use the local guide and actual
+workflow files for the current implementation and rollout status.
 
 - Session memory is continuity for the current session. Project memory holds durable project facts and decisions; Global memory holds cross-project user context.
 - Recall with a short lexical query. Use Jiandu's compact default top three `id`/summary results, then `get` only the selected item that needs full context.
@@ -52,7 +52,7 @@ executor, reusing its compiled library-test executable without repeating cases.
 `native-feature-tests` runs `node scripts/native-test-owner.cjs`; both required
 `Test` and `E2E Tests` require that whole matrix to succeed. Never start a second
 dev-PR Actor, Ticket, TLS or recorder producer. Their separate workflows/full
-jobs remain explicit manual or historical release routes until #2318 activation.
+jobs are retained for explicit diagnosis or historical recovery.
 
 Preserve these configurations; a shared directory is not permission to unify
 their features or reuse an incompatible executable:
@@ -81,9 +81,8 @@ another owner or call a cache hit runtime evidence.
 For this ownership change, run Node driver/policy/routing and the frozen authority
 fixtures locally. Real Windows PowerShell/process/junction and macOS unwind
 acceptance must pass on the matching native runners before dev admission.
-The future #2318 source controller must depend on accepted #2311 and this complete
-native map, with real unskipped job/case receipts. A339/v7 runtime evidence does
-not establish this v8 native contract. Preserve the actual v6 historical bytes.
+Keep the results from the actual feature source and retain historical release
+receipts. Skipped jobs and a cache hit do not establish test acceptance.
 
 The intended release contract is feature tests -> accepted dev cut -> one version
 reservation and release build/publication -> main promotion of the published
@@ -93,15 +92,10 @@ promotion description, without another build or test run. Keep source manifests
 at `0.0.0` and stamp only disposable formal-build checkouts. Repairs return
 through feature/dev tests and produce a new frozen cut.
 
-Cutover dependency: #2311 installs feature admission only. Existing frozen
-release acceptance and main-triggered publication remain active until the
-separate release-source admission change is accepted. Do not bypass those live
-gates or dispatch the new release route before that cutover. Before the first
-new cut, normally integrate current main ancestry into dev through a tested
-feature PR. Preserve historical signed receipts and immutable tags. Use the
-[Release Process](./CONTRIBUTING.md#release-process) and
-[CI and publication flow](./docs/releases/ci-publication-flow.md) to distinguish
-implemented feature admission from the pending release protocol.
+Use the [Release Process](./CONTRIBUTING.md#release-process) and
+[CI and publication flow](./docs/releases/ci-publication-flow.md) for the same
+workflow. During rollout, check the installed workflow before releasing and
+preserve existing signed receipts and immutable tags.
 
 ## Pull Request Review
 
@@ -114,25 +108,20 @@ integration baseline. Review integration changes locally and use focused checks
 while assembling it. Submit one PR to `dev` with required Unit/E2E and local
 test/coverage evidence under the current feature-admission policy. Complete
 affected regression before dev admission; the target release path builds the
-accepted product without repeating those tests. Do not request or
-wait for GitHub Codex PR review for this epic. Close superseded component PRs and clean only safely merged worktrees after the final
-integration is accepted. Preserve dirty or uncertain worktrees.
+accepted product without repeating those tests. Do not request or wait for GitHub
+Codex PR review for this epic. Close superseded component PRs and clean only
+safely merged worktrees after final integration. Preserve dirty or uncertain
+worktrees.
 
-- Every non-draft pull request that enters review must have a Codex review for
-  its current head and base. If no current review is already running or complete,
-  add a pull-request comment whose entire body is `@codex review`; do not rely
-  only on automatic review triggering.
-- Wait for the `Codex Review Summary` to finish. A 👍 reaction on the trigger or
-  an explicit Codex zero-findings result confirms a clean run; a `Completed`
-  summary alone only confirms that the run ended. Review suggestions or inline
-  comments are findings that must be resolved. Inspect the summary, review body,
-  reactions, and unresolved threads instead of treating an empty
-  `reviewDecision` or a `COMMENTED` review as approval.
-- Any head commit or base change invalidates the earlier Codex result. After the
-  update, resolve applicable findings and trigger a fresh exact-head review.
-- Green CI does not mean review passed. Add `review:agent` and remove
-  `review:needed` only after the current-head Codex review has finished with no
-  unresolved findings and the remaining acceptance and merge gates pass.
+### General review
+
+- Every PR needs an independent review of its current head and base. Any agent
+  may perform that review using the same acceptance criteria and record its
+  findings. Resolve applicable findings and review affected changes again after
+  the head or base changes.
+- Merge only after the required checks pass and unresolved review threads are
+  addressed. Human approval is required when the user or branch protection asks
+  for it. Use `review:agent` only after the independent review is complete.
 
 ## Release Branches
 
