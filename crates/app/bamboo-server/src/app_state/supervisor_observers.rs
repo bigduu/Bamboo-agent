@@ -3,7 +3,7 @@
 //! replacement Child or adopts a failed creation merely from its role label.
 
 use super::AppState;
-use bamboo_domain::{Storage, SupervisorObserverReceipt, SupervisorReference};
+use bamboo_domain::{SupervisorObserverReceipt, SupervisorReference};
 use bamboo_engine::session_app::child_session::ChildSessionPort;
 use std::{collections::BTreeSet, io};
 use uuid::Uuid;
