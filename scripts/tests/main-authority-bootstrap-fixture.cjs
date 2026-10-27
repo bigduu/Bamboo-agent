@@ -16,13 +16,14 @@ const FULL = ['Validation Source', 'Test', 'E2E Tests', 'Lint',
 const PLATFORMS = ['Build (ubuntu-latest)', 'Build (macos-latest)', 'Build (windows-latest)']
 
 async function verify(t, bootstrap, producer = 'v1', mode = 'publication', options = {}) {
-  assert.match(producer, /^v(?:[123456]|4-main-3488)$/)
+  assert.match(producer, /^v(?:[1234567]|4-main-3488)$/)
   assert.ok(['publication', 'main'].includes(mode))
-  const current = producer === 'v6', grouped = producer === 'v3'
+  const current = producer === 'v7', grouped = producer === 'v3'
+  const serverPartitioned = current || producer === 'v6'
   const actualMain = producer === 'v4-main-3488'
   const legacyCrates = producer === 'v4' || actualMain
-  const crates = legacyCrates || producer === 'v5' || current, light = grouped || crates
-  const platformLabel = current || producer === 'v5' ? 'Platform Tests' : 'Build'
+  const crates = legacyCrates || producer === 'v5' || serverPartitioned, light = grouped || crates
+  const platformLabel = serverPartitioned || producer === 'v5' ? 'Platform Tests' : 'Build'
   const platforms = PLATFORMS.map(name => name.replace('Build', platformLabel))
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-main-authority-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
@@ -40,13 +41,16 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
   const producerHelper = grouped || (crates && !current)
     ? fs.readFileSync(path.join(__dirname, `fixtures/main-authority-admission-${producer}.py`)) : helper
   const producerHelperDigest = createHash('sha256').update(producerHelper).digest('hex')
-  const cratePackages = crates ? [...definition.toString().split('  test-crates:\n')[1]
-    .split(/\n  [a-z0-9-]+:/)[0].matchAll(/^          - ([a-z0-9-]+)$/gm)].map(match => match[1]) : []
-  const serverBlocks = current ? [...definition.toString().split('  test-crates:\n')[1]
-    .split(/\n  [a-z0-9-]+:/)[0].matchAll(/^            server_block: ([a-z-]+)$/gm)].map(match => match[1]) : []
+  const packagesByLabel = {}, blocksByLabel = {}
+  for (const [label, id] of [['Test', 'test-crates'], ['E2E', 'e2e-crates']]) {
+    const job = crates ? definition.toString().split(`  ${id}:\n`)[1].split(/\n  [a-z0-9-]+:/)[0] : ''
+    packagesByLabel[label] = [...job.matchAll(/^          - ([a-z0-9-]+)$/gm)].map(match => match[1])
+    blocksByLabel[label] = serverPartitioned ? [...job.matchAll(/^            server_block: ([a-z-]+)$/gm)].map(match => match[1]) : []
+  }
+  const cratePackages = packagesByLabel.Test
   const crateNames = ['Test SSH', ...['Test', 'E2E'].flatMap(label => [
-    ...cratePackages.map(crate => `${label} (${crate})`),
-    ...serverBlocks.map(block => `${label} (bamboo-server/${block})`)])]
+    ...packagesByLabel[label].map(crate => `${label} (${crate})`),
+    ...blocksByLabel[label].map(block => `${label} (bamboo-server/${block})`)])]
   fs.mkdirSync(path.join(directory, '.github/workflows'), { recursive: true })
   fs.writeFileSync(path.join(directory, '.github/workflows/ci.yml'), definition)
   git('add', '.github/workflows/ci.yml')
@@ -116,21 +120,23 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
   const mainSkipped = grouped ? ['Test Build', 'E2E Build', 'Test SSH Build', 'Test SSH',
     'Test Block (${{ matrix.id }})', 'E2E Block (${{ matrix.id }})', 'Test Doctest (${{ matrix.id }})',
     'Test Block 2 (${{ matrix.id }})', 'E2E Block 2 (${{ matrix.id }})']
-    : ['Test SSH', ...['Test', 'E2E'].map(label => current
+    : ['Test SSH', ...['Test', 'E2E'].map(label => serverPartitioned
       ? label + " (${{ matrix.crate }}${{ ((matrix.server_block && format('/{0}', matrix.server_block)) || '') }})"
       : label + ' (${{ matrix.crate }})')]
   const jobs = (id, promotion) => ({ jobs: (!promotion && light
     ? ['Validation Source', 'Test', 'Main Release Admission', 'Quick Checks', 'Promotion Source',
       'E2E Tests', 'Lint', 'MSRV (Rust 1.95)', 'Security Audit', 'cargo-deny (licenses/bans/advisories/sources)',
-      'Documentation', 'TLS Fixture (${{ matrix.os }})', 'ToolEvent Recorder E2E (${{ matrix.os }})', platformLabel + ' (${{ matrix.os }})', ...mainSkipped]
-    : [...FULL, ...(grouped ? groupedNames : crates ? crateNames : []), ...(promotion ? [...platforms, 'Promotion Source'] : [])]).map((name, i) => ({
+      'Documentation', 'TLS Fixture (${{ matrix.os }})', 'ToolEvent Recorder E2E (${{ matrix.os }})', platformLabel + ' (${{ matrix.os }})', ...mainSkipped,
+      ...(current ? ['Feature Unit and E2E'] : [])]
+    : [...FULL, ...(grouped ? groupedNames : crates ? crateNames : []), ...(current ? ['Feature Unit and E2E'] : []),
+      ...(promotion ? [...platforms, 'Promotion Source'] : [])]).map((name, i) => ({
     id: id * 100 + i, name, run_id: id, run_attempt: 1,
     head_sha: promotion ? head : source, head_branch: promotion ? release : 'main',
     steps: crates && promotion && crateNames.includes(name) ? ['Set up job', name === 'Test SSH' ? 'Run SSH fixture'
       : name.startsWith('Test (') ? (name.includes('bamboo-server/') ? 'Test server block' : 'Test crate')
       : (name.includes('bamboo-server/') ? 'Run E2E server block' : 'Run E2E crate tests'), 'Complete job']
       .map((name, i) => ({ name, number: i + 1, status: 'completed', conclusion: 'success' })) : steps,
-    status: 'completed', conclusion: (promotion && grouped && emptyNames.includes(name)) ||
+    status: 'completed', conclusion: name === 'Feature Unit and E2E' || (promotion && grouped && emptyNames.includes(name)) ||
       (!promotion && light && !['Validation Source', 'Test', 'Main Release Admission'].includes(name)) ? 'skipped' : 'success',
     completed_at: '2026-10-20T02:59:00Z' })) })
   const commitObject = (sha) => ({ sha, tree: { sha: git('rev-parse', `${sha}^{tree}`) },
@@ -286,7 +292,7 @@ with patch('subprocess.check_output', output):
     const expand = list => list.flatMap(job => {
       if (job.name.includes('${{ matrix.crate }}')) {
         const label = job.name.startsWith('Test ') ? 'Test' : 'E2E'
-        return [...cratePackages, ...serverBlocks.map(block => `bamboo-server/${block}`)].map((crate, index) => ({
+        return [...packagesByLabel[label], ...blocksByLabel[label].map(block => `bamboo-server/${block}`)].map((crate, index) => ({
           ...copy(job), id: job.id * 100 + index, name: `${label} (${crate})` }))
       }
       if (!job.name.includes('${{ matrix.os }}')) return [job]
@@ -345,7 +351,7 @@ with patch('subprocess.check_output', output):
       job.run_attempt = 2
       x.routes['actions/runs/222/attempts/2/jobs?per_page=10&page=1'] = {jobs: [copy(job)]}
     }]] : []),
-    ...(current ? [['failed server block alone retains the other native job attempts', x => {
+    ...(serverPartitioned ? [['failed server block alone retains the other native job attempts', x => {
       x.routes['actions/runs/222'].run_attempt = 2
       x.routes.graphql.data.node.workflowRun.runAttempt = 2
       const job = x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.find(j => j.name === 'Test (bamboo-server/browser)')
@@ -358,7 +364,7 @@ with patch('subprocess.check_output', output):
     assert.equal(result.status, 0, result.stderr)
     if (crates) assert.deepEqual(result.calls.trim().split('\n').filter(route => route.endsWith('/logs')),
       ['actions/jobs/22200/logs'], 'Native crate jobs need no grouped result logs or receipts')
-    if (current) for (const label of ['Test', 'E2E']) for (const block of serverBlocks) {
+    if (serverPartitioned) for (const label of ['Test', 'E2E']) for (const block of blocksByLabel[label]) {
       assert.ok(result.stdout.includes(`${label} (bamboo-server/${block})=`), 'The authenticated job-attempt log includes every server block')
     }
     const output = result.output.trimEnd().split('\n')
@@ -466,12 +472,12 @@ with patch('subprocess.check_output', output):
       ['skipped Cargo step', (_, job) => { job.steps[1].conclusion = 'skipped' }],
       ['failed Cargo step', (_, job) => { job.steps[1].conclusion = 'failure' }],
     ]) negatives.push([`${name} cannot hide behind green summaries`, x => eachCrate(x, change)])
-    for (const name of ['Test SSH', `E2E (${cratePackages.at(-1)})`]) {
+    for (const name of ['Test SSH', `E2E (${packagesByLabel.E2E.at(-1)})`]) {
       negatives.push([`full acceptance requires successful ${name}`, x => {
         x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.find(job => job.name === name).conclusion = 'skipped'
       }])
     }
-    if (current) for (const label of ['Test', 'E2E']) for (const block of serverBlocks) {
+    if (serverPartitioned) for (const label of ['Test', 'E2E']) for (const block of blocksByLabel[label]) {
       const name = `${label} (bamboo-server/${block})`
       for (const state of ['missing', 'skipped']) negatives.push([`server block ${name} cannot be ${state}`, x => {
         const list = x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs
@@ -480,7 +486,7 @@ with patch('subprocess.check_output', output):
         else list[index].conclusion = state
       }])
     }
-    if (current) for (const [name, change] of [
+    if (serverPartitioned) for (const [name, change] of [
       ['an unsplit server job cannot replace its blocks', list => {
         list.splice(list.findIndex(job => job.name === 'Test (bamboo-server/browser)'), 1)
         list.push({ ...copy(list[1]), name: 'Test (bamboo-server)' })
@@ -525,7 +531,9 @@ with patch('subprocess.check_output', output):
       }
       const platformHelper = fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v5.py'))
       const foreignHelpers = current ? [alternate, platformHelper,
-        fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v4.py'))]
+        fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v4.py')),
+        fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v6.py'))]
+        : producer === 'v6' ? [helper, alternate, platformHelper]
         : producer === 'v5' ? [helper, alternate,
           fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v4.py'))] : [helper, platformHelper]
       for (const body of foreignHelpers) negatives.push(['verifier digest cannot cross its authenticated workflow family: ' +
@@ -555,7 +563,7 @@ with patch('subprocess.check_output', output):
         const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
         jobs.splice(jobs.findIndex(job => job.name === platforms.at(-1)), 1)
       }])
-      if (current) for (const label of ['Test', 'E2E']) {
+      if (serverPartitioned) for (const label of ['Test', 'E2E']) {
         negatives.push([`${label} skipped matrix must use the observed jobs API literal`, x => {
           const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
           jobs.find(job => job.name.startsWith(`${label} (`)).name =
@@ -564,11 +572,11 @@ with patch('subprocess.check_output', output):
         negatives.push([`${label} partial expanded skipped matrix cannot hide a server block`, x => {
           expandedSkipped(x)
           const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
-          jobs.splice(jobs.findIndex(job => job.name === `${label} (bamboo-server/browser)`), 1)
+          jobs.splice(jobs.findIndex(job => job.name === `${label} (bamboo-server/${blocksByLabel[label][0]})`), 1)
         }])
         negatives.push([`${label} literal and expanded skipped native jobs cannot be mixed`, x => {
           const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
-          jobs.push({ ...copy(jobs.at(-1)), id: 99999, name: `${label} (bamboo-server/browser)` })
+          jobs.push({ ...copy(jobs.at(-1)), id: 99999, name: `${label} (bamboo-server/${blocksByLabel[label][0]})` })
         }])
       }
     } else {

@@ -109,6 +109,7 @@ TEST_JOBS = {}
 GROUPED_PLANS = {}
 CRATE_PACKAGES = {}
 SERVER_BLOCKS = {}
+FEATURE_REVISIONS = set()
 
 def platform_jobs(revision):
     return PLATFORM_JOBS.get(revision, PLATFORMS)
@@ -121,7 +122,7 @@ def crate_jobs(ci, jobs):
         ("Test", "Test crate"), ("E2E", "Run E2E crate tests")) for package in packages[label]}
     for label, step in (("Test", "Test server block"), ("E2E", "Run E2E server block")):
         commands.update({f"{label} (bamboo-server/{block})": step
-                         for block in SERVER_BLOCKS.get(ci["head_sha"], ())})
+                         for block in SERVER_BLOCKS.get(ci["head_sha"], {}).get(label, ())})
     commands["Test SSH"] = "Run SSH fixture"
     actual = {job["name"] for job in jobs
               if re.match(r"^(?:Test|E2E) \(", job["name"]) or job["name"] == "Test SSH"}
@@ -233,6 +234,9 @@ def full_jobs(ci, promotion=False, before=None):
     # jobs from earlier attempts. Do not invent an all-jobs-same-attempt rule.
     jobs = pages(f"actions/runs/{ci['id']}/jobs?filter=latest", "jobs")
     contract = producer_definition(ci["head_sha"]) if promotion else "full"
+    if ci["head_sha"] in FEATURE_REVISIONS:
+        feature = [job for job in jobs if job["name"] == "Feature Unit and E2E"]
+        assert len(feature) == 1 and feature[0]["conclusion"] == "skipped", "Feature execution cannot repeat on a legacy release"
     tests = grouped_jobs(ci, jobs, before) if contract == "grouped" else crate_jobs(ci, jobs) if contract == "crates" else ()
     for name in FULL + (platform_jobs(ci["head_sha"]) + ("Promotion Source",) if promotion else ()) + tests:
         found = [job for job in jobs if job["name"] == name]
@@ -309,7 +313,10 @@ REVIEWED_PRODUCERS = frozenset((PRODUCER_V1, PRODUCER_V2))
 # by a sentinel. Then independently authenticate the actual helper bytes below.
 # This breaks the workflow -> helper -> workflow hash cycle, without excluding
 # a job, global environment, trigger, command or permission from review.
-CURRENT_PRODUCER = "20ca6ba17401c2d9cae9019cbb693eea29386ab77814bfda5d793ee4efb45649"
+CURRENT_PRODUCER = "7c3eee1e513c3e56448a95355e6c6e3d8224c431d48d9f4969dee271abc5ef05"
+# Preserve the previously reviewed default/all-feature server partitions.
+LEGACY_SERVER_BLOCK_PRODUCER = "20ca6ba17401c2d9cae9019cbb693eea29386ab77814bfda5d793ee4efb45649"
+LEGACY_SERVER_BLOCK_HELPER = "4ccc047bbaeedab71e93db9b6470f5a3131c1b395260f852baebef19ff9109b7"
 # Published F4 kept one job per crate and the native Platform Tests matrix.
 LEGACY_PLATFORM_PRODUCER = "b8e4760f405745ab787f94373908efe9055c4eb1bfa848bdedbc7e3bd2b6c385"
 LEGACY_PLATFORM_HELPER = "4b26870d8c3a978c9fab601182a8d4074ecfc3f12a3cb2840cde93e548cd0400"
@@ -341,8 +348,9 @@ def producer_definition(revision):
         return "full"
     pins = re.findall(PIN, raw)
     normalized = hashlib.sha256(re.sub(PIN, NORMALIZED_PIN, raw)).hexdigest()
-    assert normalized in {CURRENT_PRODUCER, LEGACY_PLATFORM_PRODUCER, LEGACY_CRATE_PRODUCER, LEGACY_GROUPED_PRODUCER, LEGACY_ADMISSION_PRODUCER}, "Unknown source-admission producer"
+    assert normalized in {CURRENT_PRODUCER, LEGACY_SERVER_BLOCK_PRODUCER, LEGACY_PLATFORM_PRODUCER, LEGACY_CRATE_PRODUCER, LEGACY_GROUPED_PRODUCER, LEGACY_ADMISSION_PRODUCER}, "Unknown source-admission producer"
     expected_helpers = {CURRENT_PRODUCER: {ADMISSION_SCRIPT_SHA256},
+                        LEGACY_SERVER_BLOCK_PRODUCER: {LEGACY_SERVER_BLOCK_HELPER},
                         LEGACY_PLATFORM_PRODUCER: {LEGACY_PLATFORM_HELPER},
                         LEGACY_CRATE_PRODUCER: {LEGACY_MAIN_CRATE_HELPER, LEGACY_CRATE_HELPER},
                         LEGACY_GROUPED_PRODUCER: {LEGACY_GROUPED_HELPER},
@@ -353,7 +361,7 @@ def producer_definition(revision):
     assert helper["encoding"] == "base64" and len(helper["content"]) <= 180000
     body = base64.b64decode(helper["content"], validate=False)
     assert len(body) <= 128000 and hashlib.sha256(body).hexdigest() == expected_helper, "Admission helper bytes changed"
-    if normalized in {CURRENT_PRODUCER, LEGACY_PLATFORM_PRODUCER, LEGACY_CRATE_PRODUCER}:
+    if normalized in {CURRENT_PRODUCER, LEGACY_SERVER_BLOCK_PRODUCER, LEGACY_PLATFORM_PRODUCER, LEGACY_CRATE_PRODUCER}:
         packages = {}
         server_blocks = {}
         for job, label in (("test-crates", "Test"), ("e2e-crates", "E2E")):
@@ -364,19 +372,23 @@ def producer_definition(revision):
             packages[label] = tuple(re.findall(rb"^          - ([a-z0-9-]+)$", entries.group(1), re.M))
             assert len(packages[label]) == len(set(packages[label])), "Duplicate crate matrix entry"
             packages[label] = tuple(item.decode() for item in packages[label])
-            if normalized == CURRENT_PRODUCER:
+            if normalized in {CURRENT_PRODUCER, LEGACY_SERVER_BLOCK_PRODUCER}:
                 entries = re.search(rb"^        include:\n((?:          - crate: bamboo-server\n            server_block: [a-z-]+\n)+)", block.group(1), re.M)
                 assert entries, "Missing static server blocks"
                 server_blocks[label] = tuple(item.decode() for item in re.findall(
                     rb"^            server_block: ([a-z-]+)$", entries.group(1), re.M))
-                assert server_blocks[label] == ("browser", "chat", "execute", "settings", "app-state", "handlers", "other", "integration"), "Unexpected server blocks"
+                expected = ("browser", "chat", "execute", "settings", "app-state", "handlers", "other", "integration")
+                assert server_blocks[label] == expected, "Unexpected server blocks"
                 assert "bamboo-server" not in packages[label], "Server also has an unsplit crate job"
         assert packages["Test"] == packages["E2E"], "Default and E2E crate lists differ"
-        if normalized == CURRENT_PRODUCER:
-            assert server_blocks["Test"] == server_blocks["E2E"], "Default and E2E server blocks differ"
-            SERVER_BLOCKS[revision] = server_blocks["Test"]
+        if normalized in {CURRENT_PRODUCER, LEGACY_SERVER_BLOCK_PRODUCER}:
+            if normalized == LEGACY_SERVER_BLOCK_PRODUCER:
+                assert server_blocks["Test"] == server_blocks["E2E"], "Default and E2E server blocks differ"
+            SERVER_BLOCKS[revision] = server_blocks
         CRATE_PACKAGES[revision] = packages
-        PLATFORM_JOBS[revision] = PLATFORM_TESTS if normalized in {CURRENT_PRODUCER, LEGACY_PLATFORM_PRODUCER} else PLATFORMS
+        if normalized == CURRENT_PRODUCER:
+            FEATURE_REVISIONS.add(revision)
+        PLATFORM_JOBS[revision] = PLATFORM_TESTS if normalized in {CURRENT_PRODUCER, LEGACY_SERVER_BLOCK_PRODUCER, LEGACY_PLATFORM_PRODUCER} else PLATFORMS
         return "crates"
     return "grouped" if normalized == LEGACY_GROUPED_PRODUCER else "admission"
 
@@ -479,6 +491,8 @@ if ci is not None:
         # full acceptance: the separate pre-merge proof below requires real jobs.
         skipped = ["Quick Checks", "Promotion Source", "E2E Tests", "Lint", "MSRV (Rust 1.95)",
                    "Security Audit", "cargo-deny (licenses/bans/advisories/sources)", "Documentation"]
+        if source in FEATURE_REVISIONS:
+            skipped.append("Feature Unit and E2E")
         if contract == "grouped":
             skipped.extend(["Test Build", "E2E Build", "Test SSH Build", "Test SSH",
                             "Test Block (${{ matrix.id }})", "E2E Block (${{ matrix.id }})", "Test Doctest (${{ matrix.id }})",
@@ -496,7 +510,7 @@ if ci is not None:
                 suffix = "${{ ((matrix.server_block && format('/{0}', matrix.server_block)) || '') }}" if source in SERVER_BLOCKS else ""
                 literal = f"{label} (${{{{ matrix.crate }}}}{suffix})"
                 expanded = [f"{label} ({package})" for package in packages]
-                expanded.extend(f"{label} (bamboo-server/{block})" for block in SERVER_BLOCKS.get(source, ()))
+                expanded.extend(f"{label} (bamboo-server/{block})" for block in SERVER_BLOCKS.get(source, {}).get(label, ()))
                 found = [job["name"] for job in main_jobs if job["name"] in [literal] + expanded]
                 assert found == [literal] or (len(found) == len(expanded) and set(found) == set(expanded)), label
                 skipped.extend(found)
