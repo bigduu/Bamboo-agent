@@ -594,14 +594,22 @@ async fn token_budget_unknown_model_and_revoked_root_block_before_provider() {
         .chat_stream(&[], &[], Some(41), "fixture-model")
         .await
         .is_err());
-    let mut root = f
+    let root = f
         .storage
         .load_root_authority(&f.supervisor.id)
         .await
         .unwrap()
         .unwrap();
-    root.set_root_orchestration_only(false).unwrap();
-    f.storage.save_session(&root).await.unwrap();
+    assert!(f.storage.delete_session(&root.id).await.unwrap());
+    let replacement = f
+        .storage
+        .get_or_create_default_supervisor("replacement")
+        .await
+        .unwrap();
+    assert_ne!(
+        root.supervisor_incarnation_id().unwrap(),
+        replacement.incarnation_id
+    );
     assert!(decorated
         .chat_stream(&[], &[], None, "fixture-model")
         .await

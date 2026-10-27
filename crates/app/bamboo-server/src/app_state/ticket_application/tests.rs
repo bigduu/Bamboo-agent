@@ -1645,14 +1645,22 @@ async fn native_result_recovery_rejects_incomplete_or_wrong_canonical_evidence()
                 assert!(f.storage.delete_session(&f.child.id).await.unwrap());
             }
             "revoked-supervisor" => {
-                let mut supervisor = f
+                let supervisor = f
                     .storage
                     .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
                     .await
                     .unwrap()
                     .unwrap();
-                supervisor.set_root_orchestration_only(false).unwrap();
-                f.storage.save_session(&supervisor).await.unwrap();
+                assert!(f.storage.delete_session(&supervisor.id).await.unwrap());
+                let replacement = f
+                    .storage
+                    .get_or_create_default_supervisor("replacement")
+                    .await
+                    .unwrap();
+                assert_ne!(
+                    supervisor.supervisor_incarnation_id().unwrap(),
+                    replacement.incarnation_id
+                );
             }
             _ => {}
         }
