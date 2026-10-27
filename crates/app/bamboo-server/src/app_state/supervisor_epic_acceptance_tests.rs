@@ -45,6 +45,8 @@ const QUESTION_TOOL: &str = "epic_fixture_ask_user";
 const OBSERVER: &str = "epic-fixed-tracker";
 const ROOT_A: &str = "epic-existing-a";
 const ROOT_B: &str = "epic-existing-b";
+const CONTROL_ROOT: &str = "epic-negative-control";
+const PRIVATE_CONTROL: &str = "UNASSIGNED_CURRENT_USER_ROOT_PRIVATE_HISTORY";
 const USER: &str = "EPIC_USER: plan, then execute exactly one authorized followup on Root B";
 const COLD: &str = "EPIC_COLD: reread the same plan and retry the identical followup";
 const FOLLOWUP: &str =
@@ -107,6 +109,9 @@ struct Probe {
     planner_entered: Notify,
     planner_release: Notify,
     observed: Mutex<BTreeSet<String>>,
+    control_revision: Mutex<Option<String>>,
+    denied_control_exports: Mutex<BTreeSet<String>>,
+    denied_control_reads: Mutex<BTreeSet<String>>,
 }
 impl Probe {
     fn new(workspace: PathBuf) -> Self {
@@ -123,6 +128,9 @@ impl Probe {
             planner_entered: Notify::new(),
             planner_release: Notify::new(),
             observed: Mutex::new(BTreeSet::new()),
+            control_revision: Mutex::new(None),
+            denied_control_exports: Mutex::new(BTreeSet::new()),
+            denied_control_reads: Mutex::new(BTreeSet::new()),
         }
     }
     fn parent(&self, messages: &[Message]) -> LLMChunk {
@@ -197,6 +205,47 @@ impl Probe {
             2,
             "default catalog spans both current-user Projects"
         );
+        // This third Root shares Project A and is visible to the Supervisor
+        // by default, but deliberately lies outside the Tracker's two targets.
+        let Some(control_catalog) = tool_json(messages, "epic-control-catalog") else {
+            return call(
+                "session_history",
+                "epic-control-catalog",
+                json!({"action":"list","query":CONTROL_ROOT,"limit":4}),
+            );
+        };
+        let controls = control_catalog["sessions"].as_array().unwrap();
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0]["session_id"], CONTROL_ROOT);
+        let project_a = entries
+            .iter()
+            .find(|entry| entry["session_id"] == ROOT_A)
+            .unwrap()["project_id"]
+            .clone();
+        assert_eq!(controls[0]["project_id"], project_a);
+        let Some(control) = tool_json(messages, "epic-control-inspect") else {
+            return call(
+                "session_history",
+                "epic-control-inspect",
+                json!({"action":"inspect","session_id":CONTROL_ROOT,"max_chars":800}),
+            );
+        };
+        assert_eq!(control["session_id"], CONTROL_ROOT);
+        assert_eq!(control["project_id"], project_a);
+        assert_eq!(control["status_is_live"], false);
+        assert!(!control.to_string().contains(PRIVATE_CONTROL));
+        let Some(export) = tool_json(messages, "epic-control-export") else {
+            return call(
+                "session_history",
+                "epic-control-export",
+                json!({"action":"export_context","session_id":CONTROL_ROOT}),
+            );
+        };
+        let revision = export["revision"]
+            .as_str()
+            .expect("Supervisor actually published the control view");
+        *self.control_revision.lock().unwrap() = Some(revision.to_string());
+        assert!(!export.to_string().contains(PRIVATE_CONTROL));
         let cold = messages.iter().any(|m| m.content == COLD);
         if let Some(reference) = artifact(messages) {
             assert_eq!(reference["available"], true);
@@ -285,6 +334,51 @@ impl Probe {
                     .ok()
             })
             .expect("actual canonical subscription notice");
+        // A valid Supervisor publication is a test selector, never a grant
+        // for this Child. Both native operations must refuse the unassigned
+        // current-user Root, rather than accidentally borrowing global scope.
+        let control_revision = self
+            .control_revision
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("Supervisor published its actual control view before releasing Tracker");
+        for (action, call_id, args) in [
+            (
+                "export_context",
+                format!("control-export-{}", change.event_id.as_str()),
+                json!({"action":"export_context","session_id":CONTROL_ROOT}),
+            ),
+            (
+                "read_context",
+                format!("control-read-{}", change.event_id.as_str()),
+                json!({"action":"read_context","session_id":CONTROL_ROOT,"revision":control_revision,
+                    "file":"status","offset":0,"limit":40}),
+            ),
+        ] {
+            let Some(result) = messages
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some(call_id.as_str()))
+            else {
+                return call("session_history", &call_id, args);
+            };
+            assert_eq!(
+                result.tool_success,
+                Some(false),
+                "unassigned {action} must be denied: {}",
+                result.content
+            );
+            assert!(!result.content.contains(PRIVATE_CONTROL));
+            let denials = if action == "export_context" {
+                &self.denied_control_exports
+            } else {
+                &self.denied_control_reads
+            };
+            denials
+                .lock()
+                .unwrap()
+                .insert(change.event_id.as_str().to_string());
+        }
         let attack_id = format!("attack-{}", change.event_id.as_str());
         let read_id = format!("status-{}", change.event_id.as_str());
         if !messages
@@ -425,6 +519,12 @@ impl LLMProvider for Probe {
         assert!(
             self.requests.fetch_add(1, Ordering::SeqCst) < 64,
             "bounded full-chain model request count"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.content.contains(PRIVATE_CONTROL)),
+            "unassigned control transcript must never enter this chain's model context"
         );
         let chunk = match model {
             PARENT => {
@@ -636,7 +736,24 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
             .set_permission_mode(SessionPermissionMode::Bypass);
         root.add_message(Message::user(private));
         state.storage.save_session(&root).await.unwrap();
+        if id == ROOT_A {
+            let control_workspace = home.path().join(CONTROL_ROOT);
+            std::fs::create_dir(&control_workspace).unwrap();
+            let mut control = Session::new(CONTROL_ROOT, WORKER);
+            control.set_project_id_meta(project.id.to_string());
+            control.model_ref = Some(ProviderModelRef::new(PROVIDER, WORKER));
+            control.set_provider_name(PROVIDER);
+            control.workspace = Some(control_workspace.to_string_lossy().into());
+            control.set_workspace_path_meta(control_workspace.to_string_lossy());
+            control
+                .agent_runtime_state
+                .get_or_insert_with(Default::default)
+                .set_permission_mode(SessionPermissionMode::Bypass);
+            control.add_message(Message::user(PRIVATE_CONTROL));
+            state.storage.save_session(&control).await.unwrap();
+        }
     }
+    let original_control = load(&state, CONTROL_ROOT).await;
     // Produce the original blocker through a real provider tool call and
     // runtime clarification persistence, on the already independent Root.
     // The question itself is never assigned into Session by the fixture.
@@ -704,6 +821,20 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         .await
         .unwrap();
     user(&state, parent_id, USER).await;
+    let grant = load(&state, parent_id)
+        .await
+        .supervisor_management
+        .unwrap()
+        .observers[OBSERVER]
+        .target_links
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        grant,
+        BTreeSet::from([ROOT_A.to_string(), ROOT_B.to_string()]),
+        "Tracker registration stays narrower than the Supervisor current-user catalog"
+    );
     let idle = wait(&state, parent_id, |s| {
         s.last_run_status().as_deref() == Some("completed")
             && marker(s, "EPIC_IDLE_PARENT_FINISHED_WITH_ACTIVE_TRACKER")
@@ -748,6 +879,13 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         planner_wait
     );
     assert_eq!(probe.planner_calls.load(Ordering::SeqCst), 1);
+    let export_denials = probe.denied_control_exports.lock().unwrap().clone();
+    let read_denials = probe.denied_control_reads.lock().unwrap().clone();
+    assert_eq!(export_denials, read_denials);
+    assert!(
+        read_denials.len() >= 2,
+        "both source activations must reject the extra default-visible Root"
+    );
     assert_eq!(
         *probe.observed.lock().unwrap(),
         BTreeSet::from([ROOT_A.into(), ROOT_B.into()])
@@ -928,5 +1066,10 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         .unwrap()
         .waiting_for_children
         .is_none());
+    assert_eq!(
+        serde_json::to_value(load(&reopened, CONTROL_ROOT).await).unwrap(),
+        serde_json::to_value(original_control).unwrap(),
+        "the unassigned control Root is untouched"
+    );
     reopened.shutdown().await;
 }
