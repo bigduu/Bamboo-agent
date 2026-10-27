@@ -79,6 +79,7 @@ jobs:
               version, source = identity['version'], identity['source']
           else:
               assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+              assert os.environ['GITHUB_REF'] == 'refs/heads/dev' and os.environ['GITHUB_REF_PROTECTED'] == 'true'
               version, source = os.environ['INPUT_VERSION'], os.environ['INPUT_SOURCE']
           assert re.fullmatch(r'[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version)
           assert re.fullmatch(r'[0-9a-f]{40}', source)
@@ -116,6 +117,9 @@ jobs:
     name: Build (${{ matrix.platform }})
     needs: release
     runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: bamboo-image-${{ needs.release.outputs.version }}-${{ matrix.platform }}
+      cancel-in-progress: false
     permissions:
       contents: read
       actions: read
@@ -126,36 +130,63 @@ jobs:
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
-            dockerfile: docker/Dockerfile.published
+            dockerfile: .docker-release/Dockerfile
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             dockerfile: docker/Dockerfile
     steps:
-      - name: Do not rebuild an already successful image
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Select an existing verified candidate
+        id: candidate
         env:
-          GH_TOKEN: ${{ github.token }}
           PLATFORM: ${{ matrix.platform }}
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+          RELEASE_SOURCE: ${{ needs.release.outputs.source }}
+          EXPECTED_SHA256: ${{ needs.release.outputs.asset_sha256 }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json, os, subprocess
-          for attempt in range(1, int(os.environ['GITHUB_RUN_ATTEMPT'])):
-              route = f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/{attempt}/jobs?per_page=100"
-              data = json.loads(subprocess.check_output(['gh', 'api', route], timeout=60))
-              assert data['total_count'] <= 100, 'Incomplete previous image-job history'
-              jobs = [job for job in data['jobs'] if job['name'] == f"Build ({os.environ['PLATFORM']})"]
-              assert len(jobs) == 1, 'Unknown previous image-job identity'
-              built = [step for step in jobs[0]['steps'] if step['name'] == 'Build and push by digest']
-              assert not built or built[0]['conclusion'] in ('failure', 'skipped'), \
-                  'Image was already built; reuse its original digest instead of rebuilding'
-          PY
+          image="$(echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/bamboo" | tr '[:upper:]' '[:lower:]')"
+          candidate="${image}:ci-v${RELEASE_VERSION}-${PLATFORM//\//-}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "tag=$candidate" >> "$GITHUB_OUTPUT"
+          if docker buildx imagetools inspect "$candidate" >"$RUNNER_TEMP/image-inspect" 2>"$RUNNER_TEMP/image-error"; then
+            docker pull --platform "$PLATFORM" "$candidate"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$candidate")" = "$RELEASE_SOURCE"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$candidate")" = "$RELEASE_VERSION"
+            actual="$(docker run --rm "$candidate" --version)"
+            test "${actual##* }" = "$RELEASE_VERSION"
+            if [ "$PLATFORM" = linux/amd64 ]; then
+              actual="$(docker run --rm --entrypoint sha256sum "$candidate" /usr/local/bin/bamboo)"
+              test "${actual%% *}" = "$EXPECTED_SHA256"
+            fi
+            echo 'mode=reuse' >> "$GITHUB_OUTPUT"
+          elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/image-error"; then
+            if docker buildx imagetools inspect "${image}:v${RELEASE_VERSION}" >/dev/null 2>"$RUNNER_TEMP/final-image-error"; then
+              echo 'The completed image exists but its candidate is missing; recover the original digest instead of rebuilding.' >&2
+              exit 1
+            elif ! grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/final-image-error"; then
+              cat "$RUNNER_TEMP/final-image-error" >&2
+              exit 1
+            fi
+            echo 'mode=build' >> "$GITHUB_OUTPUT"
+          else
+            cat "$RUNNER_TEMP/image-error" >&2
+            exit 1
+          fi
       - uses: actions/checkout@v7
+        if: steps.candidate.outputs.mode == 'build'
         with:
           ref: ${{ needs.release.outputs.source }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Download and verify the original x64 binary
-        if: matrix.platform == 'linux/amd64'
+        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/amd64'
         env:
           GH_TOKEN: ${{ github.token }}
           ASSET_ID: ${{ needs.release.outputs.asset_id }}
@@ -164,6 +195,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .docker-release
+          git show "${GITHUB_WORKFLOW_SHA}:docker/Dockerfile.published" > .docker-release/Dockerfile
           gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}" \
             -H 'Accept: application/octet-stream' > .docker-release/bamboo
           echo "${EXPECTED_SHA256}  .docker-release/bamboo" | sha256sum --check -
@@ -171,19 +203,19 @@ jobs:
           chmod 755 .docker-release/bamboo
 
       - name: Setup Node.js for the distinct ARM64 build
-        if: matrix.platform == 'linux/arm64'
+        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/arm64'
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
       - name: Resolve the locked frontend for ARM64
-        if: matrix.platform == 'linux/arm64'
+        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/arm64'
         id: frontend
         env:
           FRONTEND_PACKAGE: '@bigduu/lotus-next'
           FRONTEND_VERSION: from_lock
         run: node scripts/release-frontend-policy.cjs
       - name: Stage the locked frontend and stamp the ARM64 version
-        if: matrix.platform == 'linux/arm64'
+        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/arm64'
         env:
           LOTUS_PACKAGE_NAME: ${{ steps.frontend.outputs.package_name }}
           LOTUS_VERSION: ${{ steps.frontend.outputs.package_version }}
@@ -197,38 +229,51 @@ jobs:
           cargo metadata --format-version 1 >/dev/null
           python3 scripts/crate-release-lock.py
 
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Compute image repo
-        id: repo
-        run: echo "name=$(echo 'ghcr.io/${{ github.repository_owner }}/bamboo' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-      - name: Build and push by digest
-        id: build
+      - name: Build the candidate once
+        if: steps.candidate.outputs.mode == 'build'
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platform }}
+          tags: ${{ steps.candidate.outputs.tag }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.release.outputs.source }}
+            org.opencontainers.image.version=${{ needs.release.outputs.version }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
-          outputs: type=image,name=${{ steps.repo.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+          load: true
+          push: false
       - name: Verify the packaged executable version and loader
+        if: steps.candidate.outputs.mode == 'build'
         env:
-          IMAGE_REF: ${{ steps.repo.outputs.name }}@${{ steps.build.outputs.digest }}
+          IMAGE_REF: ${{ steps.candidate.outputs.tag }}
           RELEASE_VERSION: ${{ needs.release.outputs.version }}
+          EXPECTED_SHA256: ${{ needs.release.outputs.asset_sha256 }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          actual="$(docker run --rm "$IMAGE_REF" --version)"
+          test "${actual##* }" = "$RELEASE_VERSION"
+          if [ "$PLATFORM" = linux/amd64 ]; then
+            actual="$(docker run --rm --entrypoint sha256sum "$IMAGE_REF" /usr/local/bin/bamboo)"
+            test "${actual%% *}" = "$EXPECTED_SHA256"
+          fi
+      - name: Retain the verified candidate in GHCR
+        if: steps.candidate.outputs.mode == 'build'
+        env:
+          IMAGE_REF: ${{ steps.candidate.outputs.tag }}
+        run: docker push "$IMAGE_REF"
+      - name: Retain the image digest
+        env:
+          IMAGE_REF: ${{ steps.candidate.outputs.tag }}
+          IMAGE_REPO: ${{ steps.candidate.outputs.image }}
         run: |
           set -euo pipefail
           docker pull "$IMAGE_REF"
-          actual="$(docker run --rm "$IMAGE_REF" --version)"
-          test "${actual##* }" = "$RELEASE_VERSION"
-      - name: Retain the image digest
-        run: |
+          digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE_REF" | grep -F "${IMAGE_REPO}@sha256:" | head -1)"
+          digest="${digest#*@}"
           mkdir -p /tmp/digests
-          digest='${{ steps.build.outputs.digest }}'
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           touch "/tmp/digests/${digest#sha256:}"
       - uses: actions/upload-artifact@v7
@@ -236,12 +281,16 @@ jobs:
           name: digest-${{ strategy.job-index }}
           path: /tmp/digests/*
           if-no-files-found: error
+          overwrite: true
           retention-days: 7
 
   merge:
     name: Publish multi-architecture manifest
     needs: [release, build]
     runs-on: ubuntu-latest
+    concurrency:
+      group: bamboo-image-manifest
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -269,16 +318,35 @@ jobs:
           set -euo pipefail
           image="$(echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/bamboo" | tr '[:upper:]' '[:lower:]')"
           latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
-          args=(-t "${image}:v${RELEASE_VERSION}" -t "${image}:sha-${RELEASE_SOURCE:0:7}")
-          if [ "$latest" = "v${RELEASE_VERSION}" ]; then args+=(-t "${image}:latest"); fi
           mapfile -t digests < <(find /tmp/digests -type f -maxdepth 1 -printf '%f\n' | sort)
           test "${#digests[@]}" = 2
           for digest in "${digests[@]}"; do
             [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
-            args+=("${image}@sha256:${digest}")
           done
-          docker buildx imagetools create "${args[@]}"
-          docker buildx imagetools inspect "${image}:v${RELEASE_VERSION}"
+          tag="${image}:v${RELEASE_VERSION}"
+          if docker buildx imagetools inspect --raw "$tag" >"$RUNNER_TEMP/manifest.json" 2>"$RUNNER_TEMP/manifest-error"; then
+            python3 - "${digests[@]}" <<'PY'
+          import json, os, sys
+          manifest = json.load(open(os.path.join(os.environ['RUNNER_TEMP'], 'manifest.json')))
+          items = [item for item in manifest['manifests'] if item.get('platform', {}).get('os') == 'linux'
+                   and item['platform'].get('architecture') in ('amd64', 'arm64')]
+          assert len(items) == 2 and {item['platform']['architecture'] for item in items} == {'amd64', 'arm64'}
+          assert {item['digest'] for item in items} == {'sha256:' + digest for digest in sys.argv[1:]}
+          PY
+            docker buildx imagetools create -t "${image}:sha-${RELEASE_SOURCE:0:7}" "$tag"
+            if [ "$latest" = "v${RELEASE_VERSION}" ]; then
+              docker buildx imagetools create -t "${image}:latest" "$tag"
+            fi
+          elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/manifest-error"; then
+            args=(-t "$tag" -t "${image}:sha-${RELEASE_SOURCE:0:7}")
+            if [ "$latest" = "v${RELEASE_VERSION}" ]; then args+=(-t "${image}:latest"); fi
+            for digest in "${digests[@]}"; do args+=("${image}@sha256:${digest}"); done
+            docker buildx imagetools create "${args[@]}"
+          else
+            cat "$RUNNER_TEMP/manifest-error" >&2
+            exit 1
+          fi
+          docker buildx imagetools inspect "$tag"
           echo "image=${image}:v${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
 
   image-scan:
