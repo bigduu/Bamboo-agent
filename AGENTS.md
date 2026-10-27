@@ -44,6 +44,24 @@ Keep the standalone default storage authority families' serial selection in that
 executor, reusing its compiled library-test executable without repeating cases.
 `Quick Checks` remains auxiliary and never substitutes for runtime tests.
 
+#2331 prepares required feature quality on the same actual merge source M.
+Both `Test` and `E2E Tests` require Lint, MSRV, audit, deny, all four CodeQL
+languages and Frontend Dev Build and Package Inventory. Keep all three strict
+Clippy selections: default members/all-features, workspace/all-features and
+standalone storage/all-features/lib (one build job). They share one analysis
+target, but their feature graphs remain distinct. Preserve Rust 1.95 MSRV and
+the existing warning/advisory policies; a real Clippy or compiler failure blocks
+admission and must not become an allowlist, skip or release repair.
+CodeQL uses `build-mode: none`; the frontend dev build keeps default features
+and embedded committed bytes. Its package listing is a separate output, not a
+second regular test suite or a formal release archive. Preserve API-only and
+npm-staged consumer configurations. Root Birth Strict Lint is manual diagnosis
+only; its exact analysis lane is owned by feature Lint and its runtime cases
+remain with the canonical default-storage executable. See the guide's quality
+owner table before adding another producer. A95/C2330/#2331 are combined WIP
+until exact-source hosted acceptance; legacy main/release gates stay active
+until the separate source-controller cutover. Do not claim that cutover here.
+
 ## Native feature ownership
 
 #2319 gives Windows and macOS one feature job, workspace and owned target each.

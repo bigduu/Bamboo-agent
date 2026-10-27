@@ -412,6 +412,79 @@ test("serial Root birth selectors reuse canonical storage compilation and preser
   assert.doesNotMatch(lint, /cargo test/u)
   assert.match(lint, /cargo clippy --locked --all-features --lib -p bamboo-storage -- -D warnings/u)
   assert.match(lint, /test "\$actual" = "\$EXPECTED_SOURCE"/u)
+  assert.match(lint, /workflow_dispatch:/u)
+  assert.match(lint, /test "\$EXPECTED_SOURCE" = "\$GITHUB_SHA"/u)
+  assert.doesNotMatch(lint, /pull_request:|head\.sha|cargo (?:build|test)/u)
+})
+
+test("feature quality keeps distinct strict analysis, MSRV, security and frontend modes", () => {
+  for (const id of ["lint", "msrv", "security", "deny", "feature-codeql", "frontend-dev"]) {
+    const block = job(id)
+    assert.match(block, /^    runs-on: ubuntu-latest$/mu)
+    assert.match(block, /needs\.validation-source\.outputs\.feature == 'true'/u)
+    assert.doesNotMatch(block, /ref:|head\.sha|secrets\.|continue-on-error|cargo test|npm (?:ci|install|test)/u)
+    assert.equal((block.match(/test "\$\(git rev-parse HEAD\)" = "\$GITHUB_SHA"/gu) || []).length, 2)
+  }
+  assert.match(job("msrv"), /toolchain: 1\.95\.0/u)
+  for (const command of ["python3 -m unittest discover -s scripts/tests -p 'test_*.py'", "python3 scripts/check-msrv.py", "cargo check --locked --workspace --all-targets --all-features"]) assert.ok(job("msrv").includes(command))
+  assert.match(job("security"), /cargo install cargo-audit --version 0\.22\.2 --locked/u)
+  assert.match(job("security"), /cargo audit --deny warnings/u)
+  assert.match(job("deny"), /EmbarkStudios\/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25/u)
+  assert.match(job("deny"), /command: check/u)
+  const codeql = job("feature-codeql")
+  assert.match(codeql, /language: \[actions, javascript-typescript, python, rust\]/u)
+  assert.match(codeql, /build-mode: none/u)
+  assert.match(codeql, /fail-fast: false/u)
+  assert.match(codeql, /security-events: write/u)
+  assert.doesNotMatch(codeql, /cargo |autobuild|contents: write/u)
+  const frontend = job("frontend-dev")
+  assert.match(frontend, /BAMBOO_FRONTEND_BUILD_MODE: embedded\n      LOTUS_SOURCE: committed/u)
+  assert.match(frontend, /run: node scripts\/frontend-package.cjs verify/u)
+  assert.equal((frontend.match(/cargo build --locked/gu) || []).length, 1)
+  assert.match(frontend, /cargo package --locked -p bamboo-server --allow-dirty --list/u)
+  assert.doesNotMatch(frontend, /--all-features|--no-default-features|--release|PROFILE_|test:|--test|stage/u)
+  assert.equal((job("quick-checks").match(/cargo fmt --all -- --check/gu) || []).length, 1)
+  assert.match(job("lint"), /name: Check formatting\n        if: needs.validation-source.outputs.full == 'true'/u)
+})
+
+test("strict Clippy preserves all three configurations and every failure after collecting diagnostics", (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-quality-clippy-"))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const marker = "      - name: Check all three feature Clippy configurations\n"
+  const step = job("lint").split(marker)[1].split("\n      - name:")[0]
+  const shell = step.split("        run: |\n")[1].split("\n").map(line => line.replace(/^          /u, "")).join("\n")
+  writeFileSync(path.join(directory, "rustc"), "#!/bin/bash\nexit 0\n", { mode: 0o755 })
+  writeFileSync(path.join(directory, "cargo"), '#!/bin/bash\nif [[ "$1" == --version ]]; then exit 0; fi\n[[ "$1" == clippy ]] || exit 97\nprintf "%s\\n" "$*" >> "$COMMANDS"\ncall_index=$(wc -l < "$COMMANDS" | tr -d " ")\n[[ "$call_index" != "$FAIL_INDEX" ]] || exit 23\n', { mode: 0o755 })
+  const policy = "-D warnings -A deprecated -A clippy::module_inception -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args -A clippy::too-many-arguments -A clippy::while-let-loop -A clippy::type_complexity -A dead-code"
+  const selectors = ["--locked --all-features", "--locked --workspace --all-features", "--locked --all-features --lib -p bamboo-storage"]
+  assert.match(job("lint"), /CARGO_TARGET_DIR: \$\{\{ github.workspace \}\}\/target\/quality-clippy/u)
+  assert.match(shell, /CARGO_BUILD_JOBS=1 cargo clippy/u)
+  assert.match(job("lint"), /name: feature-clippy-\$\{\{ github.run_id \}\}-\$\{\{ github.run_attempt \}\}/u)
+  for (const fail of ["0", "1", "2", "3"]) {
+    const commands = path.join(directory, "commands")
+    writeFileSync(commands, "")
+    const result = spawnSync("bash", ["-c", shell], { encoding: "utf8", env: {
+      PATH: `${directory}:/usr/bin:/bin`, RUNNER_TEMP: directory, COMMANDS: commands, FAIL_INDEX: fail } })
+    assert.equal(result.status, fail === "0" ? 0 : 23, result.stderr)
+    assert.deepEqual(readFileSync(commands, "utf8").trim().split("\n"), selectors.map(selector => `clippy ${selector} --message-format=json-render-diagnostics -- ${policy}`))
+  }
+})
+
+test("frontend package inventory rejects a missing entry or Cargo failure without another runtime suite", (t) => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-quality-package-"))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const step = job("frontend-dev").split("      - name: Verify server package inventory\n")[1].split("\n      - name:")[0]
+  const shell = step.split("        run: |\n")[1].split("\n").map(line => line.replace(/^          /u, "")).join("\n")
+  const entries = ["build.rs", "frontend_build.rs", "frontend_package/frontend-manifest.json", "frontend_package/lotus-frontend.zip"]
+  writeFileSync(path.join(directory, "cargo"), '#!/bin/bash\n[[ "$*" == "package --locked -p bamboo-server --allow-dirty --list" ]] || exit 97\ncat "$INVENTORY"\nexit "$CARGO_STATUS"\n', { mode: 0o755 })
+  const run = (files, status = "0") => {
+    const inventory = path.join(directory, "inventory")
+    writeFileSync(inventory, files.join("\n") + "\n")
+    return spawnSync("bash", ["-c", shell], { env: { PATH: `${directory}:/usr/bin:/bin`, INVENTORY: inventory, CARGO_STATUS: status } })
+  }
+  assert.equal(run(entries).status, 0)
+  for (const entry of entries) assert.notEqual(run(entries.filter(file => file !== entry)).status, 0)
+  assert.notEqual(run(entries, "23").status, 0)
 })
 
 function assertLinuxTestOwnership(definitions) {
@@ -597,7 +670,8 @@ test("native summaries reject failed, cancelled, skipped and missing crate resul
     assert.ok(command)
     const results = Object.fromEntries(variables.map((name) => [name, "success"]))
     const run = (overrides = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", command], {
-      env: { ...process.env, FEATURE_VALIDATION: "false", ...results, ...overrides }, encoding: "utf8",
+      env: { ...process.env, SOURCE_RESULT: "success", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false",
+        LINT_RESULT: "success", MSRV_RESULT: "success", SECURITY_RESULT: "success", DENY_RESULT: "success", ...results, ...overrides }, encoding: "utf8",
     })
     assert.equal(run().status, 0)
     for (const variable of variables) {
@@ -654,7 +728,7 @@ test("promotion retains required checks without repeating platform coverage", ()
 test("all-feature E2E crates retain the workspace stack and required summary", () => {
   assert.match(workflow, /^  RUST_MIN_STACK: "8388608"$/mu)
   assert.match(job("e2e-crates"), /--all-features --lib --tests/u)
-  assert.match(job("e2e-test"), /needs: \[validation-source, feature-tests, native-feature-tests, browser-runtime-tests, e2e-crates, test-ssh\]/u)
+  assert.match(job("e2e-test"), /needs: \[validation-source, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-dev, e2e-crates, test-ssh\]/u)
   assert.match(job("e2e-test"), /always\(\) && !cancelled\(\)/u)
 })
 
@@ -1078,7 +1152,7 @@ test("this frozen batch cannot save cache on source, integration, promotion or m
     assert.equal(source.split(header).length, 2, "one shared batch predicate must govern each workflow")
     for (const [name, github, expected] of cases) assert.equal(evaluate(expression, github, true), expected, name)
   }
-  assert.equal(caches, 16, "all planned source/dev/main cache actions remain covered")
+  assert.equal(caches, 17, "all planned source/dev/main cache actions remain covered")
   assert.ok(actor.includes(cacheSaveIf("github.event_name == 'pull_request' && github.base_ref == 'dev'")))
   assert.match(docs, /cache-on-failure: true\n          save-if: \$\{\{ env\.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' \}\}/u)
   const publisher = readFileSync(".github/workflows/publish-crate.yml", "utf8")

@@ -1,27 +1,23 @@
-name: Root Birth Strict Lint
+name: Root Birth Strict Lint Diagnostic
 
 on:
-  pull_request:
-    branches: [dev]
-    paths:
-      - 'crates/infra/bamboo-storage/src/v2.rs'
-      - 'crates/infra/bamboo-storage/src/v2/default_actor_context.rs'
-      - 'crates/infra/bamboo-storage/src/v2/host_session_scope.rs'
-      - 'crates/infra/bamboo-storage/src/v2/host_root_create.rs'
-      - 'crates/infra/bamboo-storage/src/v2/supervisor*.rs'
-      - 'crates/infra/bamboo-storage/src/v2/root_birth_tests.rs'
-      - '.github/workflows/root-birth-acceptance.yml'
+  workflow_dispatch:
+    inputs:
+      snapshot_sha:
+        description: Exact source SHA for optional strict-lint diagnosis; not feature admission
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: root-birth-acceptance-${{ github.event.pull_request.number }}
+  group: root-birth-acceptance-${{ inputs.snapshot_sha }}
   cancel-in-progress: true
 
 jobs:
   authority:
-    name: Canonical Root birth strict lint
+    name: Manual Root birth strict lint diagnostic
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -30,17 +26,18 @@ jobs:
       CARGO_TARGET_DIR: target/grouped-default
       CARGO_TERM_COLOR: never
       RUST_MIN_STACK: '8388608'
-      EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha }}
+      EXPECTED_SOURCE: ${{ inputs.snapshot_sha }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
       - name: Bind acceptance to the exact clean source
         shell: bash
         run: |
           set -euo pipefail
+          [[ "$EXPECTED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_SOURCE" = "$GITHUB_SHA"
           actual=$(git rev-parse HEAD)
           status=$(git status --porcelain --untracked-files=all)
           test "$actual" = "$EXPECTED_SOURCE"
@@ -59,9 +56,9 @@ jobs:
           workspaces: . -> target/grouped-default
           save-if: false
 
-      # The canonical feature executor compiles these storage Unit cases with
-      # all features and runs the original selectors serially from that
-      # same executable. Preserve this independent strict analysis policy.
+      # Feature Lint owns this exact standalone storage analysis configuration.
+      # Runtime authority cases use the canonical default-storage test executable;
+      # this optional diagnostic contains no runtime command or admission receipt.
 
       - name: Check affected production library under the original strict policy
         shell: bash

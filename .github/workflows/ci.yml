@@ -98,7 +98,7 @@ jobs:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "12ec71dd6f7b492281062b7826d204e6c70d11a3694952cf3dfab4f7ed6898af"
+          ADMISSION_HELPER_SHA256: "e5eac1e84335ccaee4ab54c481a64099207fc667d129c62a9e04843da85aaa2a"
         run: |
           python3 - <<'PYTHON'
           import base64
@@ -249,7 +249,7 @@ jobs:
       actions: read
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
-    needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]
+    needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-dev, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]
     # A source-gate failure must fail required Test, never turn it into a skip.
     if: always() && !cancelled()
     runs-on: ubuntu-latest
@@ -265,6 +265,12 @@ jobs:
           QUICK_RESULT: ${{ needs.quick-checks.result }}
           NATIVE_RESULT: ${{ needs.native-feature-tests.result }}
           BROWSER_RUNTIME_RESULT: ${{ needs.browser-runtime-tests.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+          DENY_RESULT: ${{ needs.deny.result }}
+          CODEQL_RESULT: ${{ needs.feature-codeql.result }}
+          FRONTEND_DEV_RESULT: ${{ needs.frontend-dev.result }}
         shell: bash
         run: |
           set -euo pipefail
@@ -276,8 +282,16 @@ jobs:
               test "$QUICK_RESULT" = success
               test "$NATIVE_RESULT" = success
               test "$BROWSER_RUNTIME_RESULT" = success
+              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$CODEQL_RESULT" "$FRONTEND_DEV_RESULT"; do
+                test "$result" = success
+              done
               ;;
-            pull_request:main:true|workflow_dispatch::true) test "$FEATURE_VALIDATION" = false ;;
+            pull_request:main:true|workflow_dispatch::true)
+              test "$FEATURE_VALIDATION" = false
+              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT"; do
+                test "$result" = success
+              done
+              ;;
             push::false)
               test "$GITHUB_REF" = refs/heads/main
               test "$FEATURE_VALIDATION" = false
@@ -871,10 +885,22 @@ jobs:
   msrv:
     name: MSRV (Rust 1.95)
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true' || needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind quality to the actual clean merge source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+          git show -s --format='Quality source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
 
       - name: Install Rust 1.95
         uses: dtolnay/rust-toolchain@stable
@@ -895,6 +921,15 @@ jobs:
 
       - name: Check workspace on MSRV
         run: cargo check --locked --workspace --all-targets --all-features
+
+      - name: Verify quality source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
 
   tls-fixture-test:
     name: TLS Fixture (${{ matrix.os }})
@@ -958,36 +993,68 @@ jobs:
 
   e2e-test:
     name: E2E Tests
-    needs: [validation-source, feature-tests, native-feature-tests, browser-runtime-tests, e2e-crates, test-ssh]
+    needs: [validation-source, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, feature-codeql, frontend-dev, e2e-crates, test-ssh]
     if: always() && !cancelled() && (needs.validation-source.outputs.full == 'true' || needs.validation-source.outputs.feature == 'true')
     runs-on: ubuntu-latest
     steps:
       - name: Require all E2E crate tests
         env:
+          SOURCE_RESULT: ${{ needs.validation-source.result }}
+          FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
           CRATE_RESULT: ${{ needs.e2e-crates.result }}
           SSH_RESULT: ${{ needs.test-ssh.result }}
           FEATURE_VALIDATION: ${{ needs.validation-source.outputs.feature }}
           FEATURE_RESULT: ${{ needs.feature-tests.result }}
           NATIVE_RESULT: ${{ needs.native-feature-tests.result }}
           BROWSER_RUNTIME_RESULT: ${{ needs.browser-runtime-tests.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+          DENY_RESULT: ${{ needs.deny.result }}
+          CODEQL_RESULT: ${{ needs.feature-codeql.result }}
+          FRONTEND_DEV_RESULT: ${{ needs.frontend-dev.result }}
         run: |
           set -euo pipefail
-          if test "$FEATURE_VALIDATION" = true; then
-            test "$FEATURE_RESULT" = success
-            test "$NATIVE_RESULT" = success
-            test "$BROWSER_RUNTIME_RESULT" = success
-          else
-            test "$CRATE_RESULT" = success
-            test "$SSH_RESULT" = success
-          fi
+          case "$SOURCE_RESULT:$FEATURE_VALIDATION:$FULL_VALIDATION" in
+            success:true:false)
+              test "$FEATURE_RESULT" = success
+              test "$NATIVE_RESULT" = success
+              test "$BROWSER_RUNTIME_RESULT" = success
+              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$CODEQL_RESULT" "$FRONTEND_DEV_RESULT"; do
+                test "$result" = success
+              done
+              ;;
+            success:false:true)
+              test "$CRATE_RESULT" = success
+              test "$SSH_RESULT" = success
+              for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT"; do
+                test "$result" = success
+              done
+              ;;
+            *) exit 1 ;;
+          esac
 
   lint:
     name: Lint
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true' || needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/quality-clippy
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind quality to the actual clean merge source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+          git show -s --format='Quality source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -998,12 +1065,15 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-lint-${{ runner.os }}
+          workspaces: . -> target/quality-clippy
           save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Check formatting
+        if: needs.validation-source.outputs.full == 'true'
         run: cargo fmt --all -- --check
 
       - name: Run clippy
+        if: needs.validation-source.outputs.full == 'true'
         run: |
           cargo clippy --all-features -- \
             -D warnings \
@@ -1015,6 +1085,150 @@ jobs:
             -A clippy::while-let-loop \
             -A clippy::type_complexity \
             -A dead-code
+
+      - name: Check all three feature Clippy configurations
+        if: needs.validation-source.outputs.feature == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version --verbose
+          cargo --version --verbose
+          policy=(-D warnings -A deprecated -A clippy::module_inception -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args -A clippy::too-many-arguments -A clippy::while-let-loop -A clippy::type_complexity -A dead-code)
+          status=0
+          # Different default-member/workspace/storage feature unification remains separate.
+          cargo clippy --locked --all-features --message-format=json-render-diagnostics -- "${policy[@]}" | tee "$RUNNER_TEMP/quality-clippy-default.jsonl" || status=$?
+          cargo clippy --locked --workspace --all-features --message-format=json-render-diagnostics -- "${policy[@]}" | tee "$RUNNER_TEMP/quality-clippy-workspace.jsonl" || status=$?
+          CARGO_BUILD_JOBS=1 cargo clippy --locked --all-features --lib -p bamboo-storage --message-format=json-render-diagnostics -- "${policy[@]}" | tee "$RUNNER_TEMP/quality-clippy-storage.jsonl" || status=$?
+          exit "$status"
+
+      - name: Verify quality source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+
+      - name: Retain feature Clippy configuration and freshness diagnostics
+        if: always() && needs.validation-source.outputs.feature == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: feature-clippy-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/quality-clippy-*.jsonl
+
+  feature-codeql:
+    name: Feature CodeQL (${{ matrix.language }})
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, javascript-typescript, python, rust]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind quality to the actual clean merge source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+          git show -s --format='Quality source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
+
+      - name: Initialize CodeQL without a product build
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}"
+
+      - name: Verify quality source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+
+  frontend-dev:
+    name: Frontend Dev Build and Package Inventory
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/frontend-dev
+      BAMBOO_FRONTEND_BUILD_MODE: embedded
+      LOTUS_SOURCE: committed
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind quality to the actual clean merge source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+          git show -s --format='Quality source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Verify the committed frontend
+        run: node scripts/frontend-package.cjs verify
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-frontend-dev-${{ runner.os }}
+          workspaces: . -> target/frontend-dev
+          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
+
+      - name: Build default members in the original dev profile
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+          cargo build --locked
+
+      - name: Verify server package inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_files="$(cargo package --locked -p bamboo-server --allow-dirty --list)"
+          for required in build.rs frontend_build.rs frontend_package/frontend-manifest.json frontend_package/lotus-frontend.zip; do
+            grep -Fxq "$required" <<< "$package_files"
+          done
+
+      - name: Verify quality source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
 
   build:
     name: Platform Tests (${{ matrix.os }})
@@ -1104,10 +1318,22 @@ jobs:
   security:
     name: Security Audit
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true' || needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind quality to the actual clean merge source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+          git show -s --format='Quality source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -1137,13 +1363,34 @@ jobs:
         # this required security job green without an explicit review.
         run: cargo audit --deny warnings
 
+      - name: Verify quality source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+
   deny:
     name: cargo-deny (licenses/bans/advisories/sources)
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true' || needs.validation-source.outputs.full == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Bind quality to the actual clean merge source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"
+          git show -s --format='Quality source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
 
       # Pinned by commit SHA (not just the `v2` tag) for supply-chain
       # reproducibility — deny.toml at the repo root is tuned to be green
@@ -1159,3 +1406,12 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1 (cargo-deny 0.20.2)
         with:
           command: check
+
+      - name: Verify quality source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          source_status="$(git status --porcelain --untracked-files=all)"
+          test -z "$source_status"

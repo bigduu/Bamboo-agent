@@ -19,6 +19,48 @@ admission; the recorder's Linux lifecycle is already in the canonical executor.
 Ordinary Linux orchestration/context tests do not get separate compilation jobs.
 Fix failures in feature branches.
 
+## Feature quality owners prepared by #2331
+
+All rows below use CI's actual dev-PR merge M with clean checkout checks before
+and after execution. Both required summaries consume every selected result;
+missing, skipped, cancelled and failed owners block admission. This candidate
+combines A95 with C2330's native/browser WIP; it requires hosted acceptance on
+its own final source and does not establish success for the earlier candidates.
+
+| Owner | Configuration and real command | Output and boundary |
+| --- | --- | --- |
+| Lint | Ubuntu/stable/dev: `cargo clippy --locked --all-features`, `cargo clippy --locked --workspace --all-features`, `CARGO_BUILD_JOBS=1 cargo clippy --locked --all-features --lib -p bamboo-storage` | Three distinct feature graphs, one owned analysis target; original strict `-D warnings` and reviewed exceptions. JSON diagnostics retain actual compatible-unit freshness and each failure, per attempt. |
+| MSRV (Rust 1.95) | Ubuntu/Rust 1.95.0: Python check-msrv unit tests, `python3 scripts/check-msrv.py`, `cargo check --locked --workspace --all-targets --all-features` | Full resolved locked metadata plus workspace/dependency MSRV checks; no substitution with stable/default compilation. |
+| Security Audit | Ubuntu/stable: install pinned cargo-audit 0.22.2, `cargo audit --deny warnings` | Original `.cargo/audit.toml`; no new exemptions. |
+| cargo-deny | Pinned action `3c634983`, cargo-deny 0.20.2: `check` | The action defaults to `--all-features` in its Rust 1.85/Alpine container; original targets/licenses/bans/advisories/sources remain. This is distinct from audit and MSRV. |
+| Feature CodeQL | Ubuntu, actions/javascript-typescript/python/rust, init/analyze v4, `build-mode: none` | Four analyses with no product compilation, browser execution or repeated Node tests. |
+| Frontend Dev Build and Package Inventory | Ubuntu/stable/default members/dev profile: `cargo build --locked`; `cargo package --locked -p bamboo-server --allow-dirty --list` | Explicit embedded/committed frontend verification; inventory requires build.rs, frontend_build.rs, manifest and zip. No extra regular runtime suite, version stamping or final archive. |
+
+Default dev optimization (including server opt-z), ordinary test opt-0,
+MSRV check artifacts, all-feature graphs, API-only Actor and npm-staged release
+consumers remain distinct inputs. Sharing a target is allowed only within a
+compatible compiler/features/profile/frontend identity; a restored cache is not
+execution evidence. Quick Checks owns feature formatting once. The three
+focused frontend runtime targets remain in A's canonical default-package tests.
+
+Before converting Root Birth Strict Lint to a manual exact-snapshot diagnostic,
+the A95 and C2330 definitions were checked: blob
+`02f8bb8f7b40a238cc77bc11be71f4e6ef256451` contains zero runtime commands.
+Its only command is standalone storage strict Clippy on Ubuntu/stable,
+all-features/lib/dev, with one build job. Feature Lint retains that selection
+on M. The four exact Root-birth cases and all other serial authority families
+still execute once using A's default-storage test executable; the old workflow
+comment about all-feature Unit execution was not execution evidence.
+
+The existing main/manual CodeQL, original release frontend-head contract and
+full legacy quality routes remain active until #2318 cutover. Thus this slice
+fills feature ownership without claiming release/main repetition is already
+removed. Rustdoc/Docker/ABI, native release outputs and final crate archives
+belong to their separate slices; #2331 neither creates nor activates source
+authority, version allocation, publication or promotion protocols.
+
+## Native and browser feature owners
+
 #2319 consolidates feature native acceptance into `Native Feature
 (windows-2025)` and `Native Feature (macos-latest)`. Each owns one workspace and
 `target/native-feature`; both required summaries reject a failed, skipped,
