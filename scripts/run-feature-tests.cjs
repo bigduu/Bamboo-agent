@@ -16,7 +16,7 @@ const ROOT_BIRTH_CASES = ["root_birth_existing_root_progress_and_scope_reads_rem
   "root_birth_all_entrypoints_wait_for_retained_shared_authority", "root_birth_final_shared_writer_guard_and_missing_title_fail_closed",
   "root_birth_cancel_retains_exclusive_owner_and_pending_proof_stays_closed"];
 const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_without_transport_feature_fails_without_starting_exporter";
-const FEATURE_SOURCE_SHA256 = "26fb3ce42d5e752252cc98cf02436cf40ba1c6df6458e776007442553a5d3af5";
+const FEATURE_SOURCE_SHA256 = "9778bacf709b92a96304a36b8e451bec00bd2cf947b75a42704f2b4422f25ea9";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
@@ -235,7 +235,24 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
     "Feature-sensitive source changed; review and update its explicit case ownership before admission");
   const directory = fs.mkdtempSync(path.join(environment.RUNNER_TEMP || os.tmpdir(), "bamboo-feature-tests-"));
   const contexts = [], defaults = new Map();
+  const plan = [...packages.map((owner) => ({ label: "default-" + owner.name })),
+    ...featureContexts.map((context) => ({ label: "feature-" + context.package, features: context.features, targets: context.targets }))];
+  const finished = [], source = { root, sourceCatalogSha,
+    controllerSha256: createHash("sha256").update(fs.readFileSync(__filename)).digest("hex"),
+    event: Object.fromEntries(["GITHUB_REPOSITORY", "GITHUB_SHA", "GITHUB_WORKFLOW_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"]
+      .map((key) => [key, environment[key] || null])) };
+  function checkpoint(phase, current, command = null, complete = false) {
+    // Diagnostics only: never read this file as a resume/skip or acceptance input.
+    // Rename within the existing evidence directory retains the last whole snapshot
+    // if this controller is killed while writing the next one.
+    const temporary = path.join(directory, "progress.json.tmp");
+    fs.writeFileSync(temporary, JSON.stringify({ diagnosticOnly: true, complete, phase, current, command,
+      source, targetDirectory: env.CARGO_TARGET_DIR, plan, finished, contexts }, null, 2) + "\n");
+    fs.renameSync(temporary, path.join(directory, "progress.json"));
+  }
+  checkpoint("planned", null);
   function cargo(label, args) {
+    checkpoint("cargo", label, ["cargo", ...args]);
     const logPath = path.join(directory, label + ".log"), fd = fs.openSync(logPath, "wx");
     let result;
     try { result = execute("cargo", args, { cwd: root, env, stdio: ["ignore", fd, "inherit"] }); }
@@ -246,9 +263,11 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
     const receipt = { label, command: ["cargo", ...args], targetDirectory: env.CARGO_TARGET_DIR,
       status: result.error ? 1 : result.status ?? 1, artifacts: units.map(evidence) };
     contexts.push(receipt);
+    checkpoint("cargo-finished", label, receipt.command);
     return { receipt, log, units };
   }
   function catalog(run, owner) {
+    checkpoint("catalog", run.receipt.label);
     const rows = run.units.filter((item) => item.package_id === owner.id && item.profile.test && item.executable);
     const result = {};
     for (const row of rows) {
@@ -275,6 +294,7 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
       }
       if (owner.name === "bamboo-storage") {
         const binary = compiledExecutable(run.log, owner, env.CARGO_TARGET_DIR, "bamboo_storage", "lib");
+        checkpoint("storage-serial", run.receipt.label);
         const serial = runSerial(binary, { ...packageOptions(owner, root, env),
           logPath: path.join(directory, "storage-serial.log"), echoLog }, execute);
         run.receipt.serialStatus = serial.error ? 1 : serial.status ?? 1;
@@ -283,6 +303,7 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
       if (owner.name === "bamboo-broker") {
         const binary = sshExecutable(run.log, owner, env.CARGO_TARGET_DIR);
         const sshEnv = { ...packageOptions(owner, root, env).env, BAMBOO_RUSSH_TEST_EXECUTABLE: binary };
+        checkpoint("live-ssh", run.receipt.label);
         const ssh = runSsh ? runSsh(binary, { cwd: root, env: sshEnv })
           : execute("bash", ["scripts/run-russh-live.sh"], { cwd: root, env: sshEnv, stdio: "inherit" });
         run.receipt.sshStatus = ssh.error ? 1 : ssh.status ?? 1;
@@ -293,6 +314,8 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
       else { run.receipt.status ||= 1; run.receipt.error = error.message; }
       if (echoLog) process.stderr.write(owner.name + ": " + error.message + "\n");
     }
+    finished.push("default-" + owner.name);
+    checkpoint("context-finished", "default-" + owner.name);
   }
   for (const context of featureContexts) {
     let compile;
@@ -315,12 +338,16 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
       else { compile.receipt.status ||= 1; compile.receipt.error = error.message; }
       if (echoLog) process.stderr.write(context.package + ": " + error.message + "\n");
     }
+    finished.push("feature-" + context.package);
+    checkpoint("context-finished", "feature-" + context.package);
   }
   for (const receipt of contexts) fs.writeFileSync(path.join(directory, receipt.label + ".json"), JSON.stringify(receipt, null, 2) + "\n");
   const status = contexts.find((context) => context.status !== 0)?.status || 0;
   if (environment.GITHUB_STEP_SUMMARY) fs.appendFileSync(environment.GITHUB_STEP_SUMMARY,
     "Feature Unit/E2E: " + packages.length + " independent default package contexts; " + featureContexts.length +
     " explicit additive feature contexts; one owned target directory. Status: " + status + ".\n");
+  checkpoint("finished", null, null, status === 0 && finished.length === plan.length &&
+    contexts.length === packages.length + 2 * featureContexts.length);
   return { status, contexts, directory, packages: packages.map((item) => item.name) };
 }
 
