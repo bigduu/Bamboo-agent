@@ -7543,6 +7543,15 @@ impl Storage for SessionStoreV2 {
             .await
     }
 
+    async fn load_supervisor_current_user_observed_session(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target: &str,
+    ) -> io::Result<(Session, bamboo_domain::SupervisorCurrentUserTarget)> {
+        let guard = self.lock_current_user_target(supervisor, target).await?;
+        Ok((guard.target.clone(), guard.reference.clone()))
+    }
+
     async fn mutate_supervisor_management(
         &self,
         request: &bamboo_domain::SupervisorManagementRequest,

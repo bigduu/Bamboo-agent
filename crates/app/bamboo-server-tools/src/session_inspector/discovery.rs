@@ -186,15 +186,13 @@ impl SupervisorSessionDiscovery {
         {
             return Err(authority_required());
         }
-        let original_caller_sha256 = ctx
+        let original = ctx
             .executing_caller_for(id)
-            .map(|original| {
-                if !original.matches_session(&session) {
-                    return Err(authority_required());
-                }
-                caller_fingerprint(original)
-            })
-            .transpose()?;
+            .ok_or_else(authority_required)?;
+        if !original.matches_session(&session) {
+            return Err(authority_required());
+        }
+        let original_caller_sha256 = Some(caller_fingerprint(original)?);
         let state = session.supervisor_management.clone();
         if let Some(state) = &state {
             state
@@ -206,6 +204,7 @@ impl SupervisorSessionDiscovery {
                 reference,
                 created_at: session.created_at,
                 tool_revision: session.root_tool_authority_revision,
+                business_revision: scope.orchestration_revision,
                 session_version: session.session_version,
                 scope_revision: state.as_ref().map_or(0, |state| state.revision),
                 original_caller_sha256,
@@ -229,6 +228,7 @@ struct CallerBinding {
     reference: SupervisorReference,
     created_at: DateTime<Utc>,
     tool_revision: u64,
+    business_revision: u64,
     session_version: Option<u32>,
     scope_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,7 +297,7 @@ impl SessionDiscoveryPort for SupervisorSessionDiscovery {
             .map_err(authority_unavailable)?;
         if page.scope.supervisor != caller.binding.reference
             || page.scope.created_at != caller.binding.created_at
-            || page.scope.orchestration_revision != caller.binding.tool_revision.max(1)
+            || page.scope.orchestration_revision != caller.binding.business_revision
             || page.scope.legacy_state_revision != caller.binding.scope_revision
         {
             return Err(stale("canonical Supervisor directory caller changed"));
@@ -345,28 +345,35 @@ impl SessionDiscoveryPort for SupervisorSessionDiscovery {
     ) -> Result<SessionProgressObservation, ToolError> {
         request.validate()?;
         let caller = self.caller(ctx).await?;
-        // The same canonical reader retains caller/link/Project/birth authority
-        // through the complete physical history read. A preflight+plain load
-        // would not preserve this property.
-        let session = self
-            .storage
-            .load_supervisor_managed_session(&caller.binding.reference, &request.session_id)
-            .await
-            .map_err(authority_unavailable)?
-            .ok_or_else(|| authority_unavailable("authorized target is unavailable"))?;
+        // History and the followup selector must describe the same protected
+        // target lifetime. Two separate reads can pair old progress with a
+        // deleted/recreated Session's new selector.
+        let (session, target) = if request.session_id == caller.binding.reference.session_id {
+            let own = self
+                .storage
+                .load_supervisor_managed_session(&caller.binding.reference, &request.session_id)
+                .await
+                .map_err(authority_unavailable)?
+                .ok_or_else(|| authority_unavailable("canonical caller is unavailable"))?;
+            (own, None)
+        } else {
+            let (session, target) = self
+                .storage
+                .load_supervisor_current_user_observed_session(
+                    &caller.binding.reference,
+                    &request.session_id,
+                )
+                .await
+                .map_err(authority_unavailable)?;
+            (session, Some(target))
+        };
         self.unchanged(ctx, &caller.binding).await?;
         let mut result = progress_observation(
             &session,
             caller.binding.scope_revision,
             request.max_chars.unwrap_or(2_000),
         );
-        result.current_user_target = Some(
-            self.storage
-                .inspect_supervisor_current_user_target(&caller.binding.reference, &session.id)
-                .await
-                .map_err(authority_unavailable)?,
-        );
-        self.unchanged(ctx, &caller.binding).await?;
+        result.current_user_target = target;
         Ok(result)
     }
 }
