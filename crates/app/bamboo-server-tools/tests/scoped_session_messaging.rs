@@ -112,6 +112,26 @@ impl Fixture {
         ctx
     }
 
+    async fn supervisor_send_args(
+        &self,
+        supervisor: &Session,
+        target: &str,
+        operation: &str,
+    ) -> Value {
+        let reference = SupervisorReference {
+            session_id: supervisor.id.clone(),
+            incarnation_id: supervisor.supervisor_incarnation_id().unwrap(),
+        };
+        let observed = self
+            .store
+            .inspect_supervisor_current_user_target(&reference, target)
+            .await
+            .unwrap();
+        let mut arguments = send(target, operation, Some("trigger_turn"));
+        arguments["target_ref"] = serde_json::to_value(observed).unwrap();
+        arguments
+    }
+
     fn tool(&self) -> SessionMessageTool {
         SessionMessageTool::new(self.messenger.clone()).with_scoped_sender(Arc::new(
             CanonicalSessionSendAdapter::new(self.store.clone(), self.messenger.clone()),
@@ -301,7 +321,9 @@ async fn original_supervisor_send_uses_its_existing_scoped_followup_writer() {
     }
     let before =
         serde_json::to_value(fixture.store.load_session(&target.id).await.unwrap()).unwrap();
-    let args = send(&target.id, "followup-operation", Some("trigger_turn"));
+    let args = fixture
+        .supervisor_send_args(&supervisor, &target.id, "followup-operation")
+        .await;
     let first = result(
         tool.invoke(args.clone(), Fixture::ctx(&supervisor))
             .await

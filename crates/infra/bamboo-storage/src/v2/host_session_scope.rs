@@ -72,7 +72,61 @@ pub(crate) struct LegacySessionDeliveryGuards {
     _absence: Option<HostSessionScopeAbsence>,
 }
 
+/// The namespace publication fence is retained through physical Inbox work.
+/// Absence is a retained observation too, never permission to race installation.
+pub(crate) enum CurrentUserSendScope {
+    Scoped { scope: HostSessionScopeUse },
+    NeverInstalled { _absence: HostSessionScopeAbsence },
+}
+
 impl SessionStoreV2 {
+    pub(crate) async fn retain_current_user_send_scope(
+        &self,
+        caller: &SessionCallerReference,
+    ) -> io::Result<CurrentUserSendScope> {
+        match self.host_scope_registry.lookup(caller).await? {
+            Some(token) => Ok(CurrentUserSendScope::Scoped {
+                scope: self.host_scope_registry.retain(&token, caller).await?,
+            }),
+            None => Ok(CurrentUserSendScope::NeverInstalled {
+                _absence: self
+                    .host_scope_registry
+                    .retain_never_installed(&caller.session_id)
+                    .await?,
+            }),
+        }
+    }
+
+    pub(crate) fn validate_current_user_send_scope(
+        &self,
+        lease: &CurrentUserSendScope,
+        authority: &super::supervisor_management::CurrentUserTargetGuard,
+    ) -> io::Result<()> {
+        if let CurrentUserSendScope::Scoped { scope } = lease {
+            let binding = scope.token().binding();
+            binding
+                .caller
+                .check_session(&authority.source)
+                .map_err(|error| denied(error.to_string()))?;
+            let target = binding
+                .target(&authority.target.id, HostSessionRight::SendPeer)
+                .map_err(|error| denied(error.to_string()))?;
+            target
+                .observation
+                .check_session(&authority.target)
+                .map_err(|error| denied(error.to_string()))?;
+            let observed = bamboo_domain::SupervisorCurrentUserTarget::capture_with_ancestors(
+                &authority.target,
+                &target.observation.ancestors,
+            )
+            .map_err(denied)?;
+            if observed != authority.reference {
+                return Err(denied("host_session_scope_ancestry_changed"));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn lock_unscoped_peer_delivery(
         &self,
         caller: &SessionCallerReference,

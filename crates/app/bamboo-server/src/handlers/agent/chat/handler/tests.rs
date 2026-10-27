@@ -3030,6 +3030,9 @@ mod optional_model_e2e {
                     "session_id":session_id, "message_id":id,
                     "message":"raw Human request", "model":"test-model"
                 });
+                if ticket {
+                    body["thread_id"] = serde_json::json!("hook-queued-work");
+                }
                 if image {
                     body["images"] = serde_json::json!([{
                         "base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jF0cAAAAASUVORK5CYII=",

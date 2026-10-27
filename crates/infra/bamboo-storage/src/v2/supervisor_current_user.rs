@@ -12,6 +12,8 @@ pub(crate) struct CurrentUserTargetGuard {
     pub(crate) inbox_dir: PathBuf,
     pub(crate) reference: SupervisorCurrentUserTarget,
     pub(crate) _authority: super::super::host_session_scope::HostScopedSessionGuards,
+    // Drop the physical locks before the namespace publication fence.
+    pub(crate) _send_scope: Option<super::super::host_session_scope::CurrentUserSendScope>,
 }
 
 impl SessionStoreV2 {
@@ -129,6 +131,7 @@ impl SessionStoreV2 {
             inbox_dir: self.abs_path_from_rel(&relative).join("inbox"),
             reference,
             _authority: authority,
+            _send_scope: None,
         })
     }
 

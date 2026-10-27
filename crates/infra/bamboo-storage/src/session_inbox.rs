@@ -2681,7 +2681,14 @@ impl SessionInboxPort for FileSessionInbox {
                 "current-user followup identity or envelope mismatch",
             ));
         }
-        let authority = self
+        // Respect an installed finite Host send capability, or retain the
+        // never-installed namespace. This fence outlives every started writer.
+        let send_scope = self
+            .sessions
+            .retain_current_user_send_scope(caller)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        let mut authority = self
             .sessions
             .lock_current_user_target(supervisor, &target.session_id)
             .await
@@ -2691,6 +2698,10 @@ impl SessionInboxPort for FileSessionInbox {
                 "current-user original caller or target lifetime changed",
             ));
         }
+        self.sessions
+            .validate_current_user_send_scope(&send_scope, &authority)
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        authority._send_scope = Some(send_scope);
         #[cfg(test)]
         if let Some((entered, release)) = &self.followup_authority_pause {
             entered.notify_one();

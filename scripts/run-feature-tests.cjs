@@ -21,7 +21,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // change existing current-user/Work compatibility code in sensitive files.
 // Cargo features, required targets and all19 FEATURE_CONTEXTS additions stay;
 // new fault/Epic cases belong to the existing ordinary default library catalog.
-const FEATURE_SOURCE_SHA256 = "d1eede796df5b3d77748132c05f8c0c3a1a593636d8cf5fd8efa8e7752d1aba0";
+const FEATURE_SOURCE_SHA256 = "4cd3f37fe9ee22e0ed7d077a0c21ff1d2f64956d4e4735ce2cb7a993597a6098";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [

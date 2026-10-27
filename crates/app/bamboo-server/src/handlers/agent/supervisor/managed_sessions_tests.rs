@@ -229,7 +229,11 @@ async fn managed_sessions_denied_targets_and_invalid_requests_have_no_side_effec
         .await
         .unwrap()
         .unwrap();
-    let child = Session::new_child_of("not-a-root", &parent, "model", "Child");
+    let mut child = Session::new_child_of("not-a-root", &parent, "model", "Child");
+    // new_child_of captures birth/ancestry, not the parent's Project. This
+    // synthetic Child must have the same valid canonical Project before the
+    // independent legacy-Root admission negative is exercised.
+    child.set_project_id_meta(parent.project_id_meta().unwrap());
     f.state.storage.save_session(&child).await.unwrap();
     let before = f.target_bytes("target-a").await;
     for (target, mut body, expected) in [

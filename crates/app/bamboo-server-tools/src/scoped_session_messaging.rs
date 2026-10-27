@@ -113,6 +113,7 @@ impl ScopedSessionSendPort for CanonicalSessionSendAdapter {
         if !original.matches_session(&canonical) {
             return Err(ScopedSessionSendError::OriginalCallerChanged);
         }
+        let is_supervisor = canonical.supervisor_incarnation_id().is_some();
         if let Some(incarnation) = canonical.supervisor_incarnation_id() {
             let supervisor = ctx
                 .executing_supervisor_for(id)
@@ -121,34 +122,38 @@ impl ScopedSessionSendPort for CanonicalSessionSendAdapter {
             if supervisor.incarnation_id != incarnation {
                 return Err(ScopedSessionSendError::OriginalCallerChanged);
             }
-            if request.delivery_intent != Some(SessionMessageDeliveryIntent::TriggerTurn) {
-                return Err(ScopedSessionSendError::UnsupportedDeliveryIntent);
+            if let Some(target) = request.target_ref.as_ref() {
+                if request.delivery_intent != Some(SessionMessageDeliveryIntent::TriggerTurn) {
+                    return Err(ScopedSessionSendError::UnsupportedDeliveryIntent);
+                }
+                if target.session_id != request.target_session_id {
+                    return Err(ScopedSessionSendError::TargetReferenceRequired);
+                }
+                // The final current-user Inbox writer also retains/checks any
+                // installed Host send scope. A selector cannot escape it.
+                return self
+                    .messenger
+                    .supervisor_current_user_followup(
+                        original,
+                        &supervisor,
+                        target,
+                        &request.operation_id,
+                        &request.message,
+                    )
+                    .await
+                    .map(Into::into)
+                    .map_err(Into::into);
             }
-            let target = request
-                .target_ref
-                .as_ref()
-                .filter(|target| target.session_id == request.target_session_id)
-                .ok_or(ScopedSessionSendError::TargetReferenceRequired)?;
-            return self
-                .messenger
-                .supervisor_current_user_followup(
-                    original,
-                    &supervisor,
-                    target,
-                    &request.operation_id,
-                    &request.message,
-                )
-                .await
-                .map(Into::into)
-                .map_err(Into::into);
+        } else {
+            if ctx.executing_supervisor.is_some() {
+                return Err(ScopedSessionSendError::AuthorityUnavailable);
+            }
+            if request.target_ref.is_some() {
+                return Err(ScopedSessionSendError::InvalidRequest);
+            }
         }
-        if ctx.executing_supervisor.is_some() {
-            return Err(ScopedSessionSendError::AuthorityUnavailable);
-        }
-        if request.target_ref.is_some() {
-            return Err(ScopedSessionSendError::InvalidRequest);
-        }
-        // Ordinary/Child callers keep their existing finite Host namespace.
+        // An explicit Host request retains its finite namespace for every
+        // role, including QueueOnly. It cannot borrow default management rights.
         // Revocation/stale/unsupported lookup is terminal, never a fallback.
         let token = self
             .storage
@@ -171,6 +176,9 @@ impl ScopedSessionSendPort for CanonicalSessionSendAdapter {
                 )
                 .await
                 .map_err(Into::into);
+        }
+        if is_supervisor {
+            return Err(ScopedSessionSendError::TargetReferenceRequired);
         }
         self.messenger
             .send_peer_observed(
