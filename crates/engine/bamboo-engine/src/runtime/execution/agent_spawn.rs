@@ -1094,6 +1094,16 @@ pub fn spawn_session_execution_with_inputs(
     args: SessionExecutionArgs,
     inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
 ) {
+    spawn_session_execution_with_upstream_retry(args, inputs, Default::default());
+}
+
+/// An explicit per-execution initial-request retry option. Existing admission,
+/// reservation, cancellation, messages and completion ownership are unchanged.
+pub fn spawn_session_execution_with_upstream_retry(
+    args: SessionExecutionArgs,
+    inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+    upstream_retry: bamboo_llm::retry::UpstreamRetry,
+) {
     let span_session_id = args.session_id.clone();
     let session_span = tracing::info_span!("agent_execution", session_id = %span_session_id);
     let is_root = args.session.kind == bamboo_domain::SessionKind::Root;
@@ -1294,7 +1304,7 @@ pub fn spawn_session_execution_with_inputs(
             // newly armed safety-net wait, it must not resurrect a completed
             // child wait. Tagged tool waits are reconciled by the final writer.
             let inherited_child_wait = agent.persistence().inherited_child_wait();
-            let execute_request = build_execute_request(
+            let mut execute_request = build_execute_request(
                 initial_message,
                 mpsc_tx.clone(),
                 cancel_token,
@@ -1319,6 +1329,8 @@ pub fn spawn_session_execution_with_inputs(
                     run_budget,
                 },
             );
+
+            execute_request.upstream_retry = upstream_retry;
 
             // Panic containment (issue #546): everything below — the terminal
             // status persist, finalize_runner, and the child-completion

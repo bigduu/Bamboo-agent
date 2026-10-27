@@ -1560,7 +1560,8 @@ pub(super) async fn execute_llm_stream(
         bamboo_infrastructure::telemetry::Observation::llm(provider_type, model, session_id);
     let http_retry_observer = Arc::new(bamboo_llm::retry::InitialHttpRetryObserver::default());
     let stream = observation
-        .scope(
+        .scope(bamboo_llm::retry::with_upstream_retry(
+            config.upstream_retry,
             crate::runtime::stream::handler::await_stream_bootstrap_observed(
                 llm.chat_stream_ir(
                     &prepared_envelope.ir,
@@ -1574,7 +1575,7 @@ pub(super) async fn execute_llm_stream(
                 &timeout_context,
                 http_retry_observer.clone(),
             ),
-        )
+        ))
         .await
         .and_then(|result| {
             result.map_err(|error| {
@@ -1618,7 +1619,7 @@ pub(super) async fn execute_llm_stream(
     };
     let provider_manages_retry_budget = http_retry_observer.request_budget_managed();
     if provider_manages_retry_budget {
-        timeout_context.disable_turn_retry();
+        timeout_context.managed_response_established();
     }
 
     // A successful stream bootstrap is the first point at which the final

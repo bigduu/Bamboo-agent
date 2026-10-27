@@ -62,6 +62,8 @@ pub struct ExecuteDefaultsResponse {
     pub background_model: Option<String>,
     /// Task-summary/compression auxiliary model.
     pub summarization_model: Option<String>,
+    /// Negotiated retry contract. Clients must check support before opting in.
+    pub upstream_retry: bamboo_llm::retry::UpstreamRetryDefaults,
 }
 
 /// `GET /api/v1/execute/defaults`
@@ -94,6 +96,7 @@ pub async fn handler(state: web::Data<AppState>) -> impl Responder {
         fast_model: resolved.model_roster.fast_model(),
         background_model: resolved.model_roster.background_model(),
         summarization_model: resolved.model_roster.summarization_model(),
+        upstream_retry: bamboo_llm::retry::upstream_retry_defaults(),
     })
 }
 
@@ -178,6 +181,16 @@ mod tests {
         assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["model"], "gpt-chat");
+        assert_eq!(body["upstream_retry"]["default_mode"], "bounded");
+        assert_eq!(
+            body["upstream_retry"]["supported_modes"],
+            serde_json::json!(["bounded", "until_cancelled"])
+        );
+        assert_eq!(
+            body["upstream_retry"]["max_attempts"],
+            bamboo_llm::retry::global().max_attempts
+        );
+
         assert_eq!(body["fast_model"], "gpt-fast");
         assert_eq!(body["background_model"], "gpt-memory");
         assert_eq!(body["summarization_model"], "gpt-summary");

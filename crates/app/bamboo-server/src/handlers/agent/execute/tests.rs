@@ -77,6 +77,7 @@ fn execute_request_empty_model_normalizes_to_compat_absent() {
         client_sync: None,
         no_human_approver: false,
         run_budget: None,
+        upstream_retry: None,
     };
 
     let model = request.model.as_deref().unwrap_or("").trim();
@@ -199,6 +200,125 @@ mod execution_input_http {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    struct RetryHttpProvider {
+        url: String,
+    }
+    #[async_trait]
+    impl LLMProvider for RetryHttpProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let config = bamboo_llm::retry::RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(5),
+            };
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let response = bamboo_llm::retry::send_with_retry(&config, "controlled-http", || {
+                client.post(&self.url).json(messages)
+            })
+            .await?;
+            if !response.status().is_success() {
+                return Err(LLMError::RequestFailed("controlled request failed".into()));
+            }
+            Ok(Box::pin(futures::stream::iter([
+                Ok(LLMChunk::Token("controlled HTTP complete".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[actix_web::test]
+    async fn execute_http_retry_mode_reaches_the_real_provider_and_stop_cancels_backoff() {
+        use std::sync::atomic::AtomicUsize;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for stop in [false, true] {
+            let server = MockServer::start().await;
+            let count = Arc::new(AtomicUsize::new(0));
+            let hits = count.clone();
+            Mock::given(method("POST"))
+                .respond_with(move |_: &wiremock::Request| {
+                    let n = hits.fetch_add(1, Ordering::SeqCst);
+                    if stop {
+                        ResponseTemplate::new(429).insert_header("Retry-After", "120")
+                    } else {
+                        ResponseTemplate::new(if n < 3 { 503 } else { 200 })
+                    }
+                })
+                .mount(&server)
+                .await;
+            let (_home, state, _fault) =
+                state_with_provider(None, Arc::new(RetryHttpProvider { url: server.uri() })).await;
+            let id = format!("retry-http-{}", uuid::Uuid::new_v4());
+            let session = owned_http_session(&state, &id);
+            state.storage.save_session(&session).await.unwrap();
+            queue_owned_root(&state, &id).await;
+            let app = test::init_service(
+                actix_web::App::new()
+                    .app_data(state.clone())
+                    .configure(crate::routes::configure_routes),
+            )
+            .await;
+            let response = test::call_service(&app, test::TestRequest::post().uri(&format!("/api/v1/execute/{id}")).set_json(serde_json::json!({"model":"test-model","upstream_retry":{"mode":"until_cancelled"}})).to_request()).await;
+            assert!(response.status().is_success());
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    if stop && count.load(Ordering::SeqCst) >= 1 {
+                        break;
+                    }
+                    if !stop
+                        && state
+                            .agent_runners
+                            .read()
+                            .await
+                            .get(&id)
+                            .is_some_and(|r| matches!(r.status, AgentStatus::Completed))
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("controlled actual execute consumer");
+            if stop {
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri(&format!("/api/v1/stop/{id}"))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(&id)
+                    .unwrap()
+                    .cancel_token
+                    .is_cancelled());
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+                .await
+                .unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), if stop { 1 } else { 4 });
+            let cold = state.storage.load_session(&id).await.unwrap().unwrap();
+            assert_eq!(
+                cold.messages
+                    .iter()
+                    .filter(|m| m.content == "one owned Root input")
+                    .count(),
+                1
+            );
+        }
+    }
 
     struct LocalProvider;
     #[async_trait]

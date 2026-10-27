@@ -80,6 +80,7 @@ pub(crate) async fn activate(state: web::Data<AppState>, http: HttpRequest) -> H
         client_sync: None,
         no_human_approver: false,
         run_budget: None,
+        upstream_retry: None,
     };
     // Keep Native validation, the single execute idempotency namespace and
     // actual selected Root reservation/claim/Ready/spawn exactly authoritative.

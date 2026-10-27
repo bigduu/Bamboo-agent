@@ -1398,3 +1398,98 @@ async fn consume_llm_stream_continues_when_subscriber_disconnects() {
     assert_eq!(output.content, "helloworld");
     assert_eq!(output.token_count, 10);
 }
+
+#[tokio::test]
+async fn managed_headers_policy_outlives_outer_bootstrap_idle_without_losing_cancellation() {
+    use bamboo_llm::{providers::anthropic::AnthropicProvider, LLMProvider};
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(1200))
+                .set_body_string("unread controlled body"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = AnthropicProvider::new("fixture-only").with_base_url(server.uri());
+    let context = timeout_context(1, 1, 1).begin_request();
+    let cancel = CancellationToken::new();
+    let result = await_stream_bootstrap(
+        provider.chat_stream(&[], &[], None, "controlled"),
+        &cancel,
+        "managed-headers",
+        &context,
+    )
+    .await;
+    assert!(
+        result.unwrap().is_ok(),
+        "headers have their own finite policy; outer idle must not reset it"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn managed_response_starts_a_fresh_bounded_stream_watchdog_and_forbids_turn_replay() {
+    let mut context = timeout_context(1, 1, 1)
+        .allow_turn_retry_before_semantic_output()
+        .begin_request();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    context.managed_response_established();
+    let output = consume_llm_stream_internal(
+        build_stream(vec![
+            Ok(LLMChunk::Token("original".into())),
+            Ok(LLMChunk::Done),
+        ]),
+        None,
+        &CancellationToken::new(),
+        "managed-stream",
+        &context,
+    )
+    .await;
+    assert!(
+        output.is_ok(),
+        "headers wait must not consume the new stream's first-semantic allowance"
+    );
+    let error = consume_llm_stream_internal(
+        Box::pin(stream::pending()),
+        None,
+        &CancellationToken::new(),
+        "managed-stream",
+        &context,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, AgentError::StreamTimeout(t) if !t.retry_safe()));
+}
+
+#[tokio::test]
+async fn managed_send_does_not_disable_the_outer_watchdog_for_a_later_provider_hang() {
+    use bamboo_llm::{providers::anthropic::AnthropicProvider, LLMProvider};
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("controlled body"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = AnthropicProvider::new("fixture-only").with_base_url(server.uri());
+    let future = async {
+        let _stream = provider
+            .chat_stream(&[], &[], None, "controlled")
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+    };
+    let context = timeout_context(1, 1, 1)
+        .allow_turn_retry_before_semantic_output()
+        .begin_request();
+    let cancel = CancellationToken::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        await_stream_bootstrap(future, &cancel, "managed-post-send-hang", &context),
+    )
+    .await
+    .expect("the post-send bootstrap remains bounded");
+    assert!(matches!(result, Err(AgentError::StreamTimeout(t)) if !t.retry_safe()));
+}

@@ -1026,6 +1026,8 @@ pub struct AgentLoopConfig {
     /// Resolved LLM stream transport/semantic watchdog policy. The same value
     /// is passed to main response streams and auxiliary silent streams.
     pub(crate) stream_timeout: bamboo_config::StreamTimeoutConfig,
+    /// Main bootstrap only; never inherited by auxiliary or child requests.
+    pub(crate) upstream_retry: bamboo_llm::retry::UpstreamRetry,
     /// Permission mode for this execution (default: None = use PermissionConfig's mode).
     pub(crate) permission_mode: Option<PermissionMode>,
     /// Optional Gold observe-only evaluator configuration.
@@ -1170,6 +1172,7 @@ impl Default for AgentLoopConfig {
             per_tool_timeout_secs: 120,
             parallel_batch_timeout_secs: 300,
             stream_timeout: bamboo_config::StreamTimeoutConfig::default(),
+            upstream_retry: Default::default(),
             permission_mode: None,
             gold_config: None,
             guardian_config: None,

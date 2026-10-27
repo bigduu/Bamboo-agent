@@ -35,11 +35,17 @@ use tokio::time::Instant;
 use crate::provider::LLMError;
 
 mod diagnostics;
+mod policy;
 pub use diagnostics::{
     public_request_diagnostic, recent_initial_request_diagnostics,
     record_stream_timeout_diagnostic, InitialRequestDiagnostic, RequestStopReason,
 };
 use diagnostics::{AttemptObservation, CancellationObservation};
+use policy::continuous_request_retries;
+pub use policy::{
+    initial_request_limits, upstream_retry_defaults, with_upstream_retry, InitialRequestLimits,
+    UpstreamRetry, UpstreamRetryDefaults,
+};
 
 /// Secret-free evidence from the most recent retryable HTTP response while
 /// establishing one provider stream. A fresh observer is scoped to each
@@ -54,6 +60,7 @@ pub struct InitialHttpRetry {
 pub struct InitialHttpRetryObserver {
     last: Mutex<Option<InitialHttpRetry>>,
     budget_managed: AtomicBool,
+    active_request_policies: AtomicU32,
     terminal_diagnostic: Mutex<Option<bamboo_domain::LlmRequestDiagnostic>>,
 }
 
@@ -61,6 +68,12 @@ impl InitialHttpRetryObserver {
     /// Whether the provider owns a bounded request policy for this bootstrap.
     pub fn request_budget_managed(&self) -> bool {
         self.budget_managed.load(Ordering::Relaxed)
+    }
+
+    /// Only the actual send/retry scope may extend the outer bootstrap wait.
+    /// Error parsing or other provider work after that scope stays bounded.
+    pub fn request_policy_active(&self) -> bool {
+        self.active_request_policies.load(Ordering::Relaxed) > 0
     }
 
     /// Evidence captured by this exact provider bootstrap, independent of the
@@ -90,6 +103,34 @@ impl InitialHttpRetryObserver {
 tokio::task_local! {
     static INITIAL_HTTP_RETRY_OBSERVER: Arc<InitialHttpRetryObserver>;
     static WORK_PHYSICAL_REQUEST: Arc<AtomicBool>;
+}
+
+struct ManagedRequestScope(Option<Arc<InitialHttpRetryObserver>>);
+
+impl ManagedRequestScope {
+    fn enter() -> Self {
+        Self(
+            INITIAL_HTTP_RETRY_OBSERVER
+                .try_with(|observer| {
+                    observer.budget_managed.store(true, Ordering::Relaxed);
+                    observer
+                        .active_request_policies
+                        .fetch_add(1, Ordering::Relaxed);
+                    observer.clone()
+                })
+                .ok(),
+        )
+    }
+}
+
+impl Drop for ManagedRequestScope {
+    fn drop(&mut self) {
+        if let Some(observer) = &self.0 {
+            observer
+                .active_request_policies
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// One durable Work reservation permits one physical model request. The same
@@ -125,9 +166,64 @@ where
     F: Fn() -> RequestBuilder,
 {
     claim_work_physical_request()?;
+    if continuous_request_retries() {
+        return send_continuously(config, provider, build).await;
+    }
     send_with_retry(config, provider, build)
         .await
         .map_err(LLMError::Http)
+}
+
+// Built-in non-Anthropic providers keep their legacy response/error parsing.
+// Only opt-in initial sends gain a headers-only timeout; successful SSE bodies
+// retain their existing streaming watchdog and are never reissued here.
+async fn send_continuously<F>(
+    config: &RetryConfig,
+    provider: &str,
+    build: F,
+) -> Result<Response, LLMError>
+where
+    F: Fn() -> RequestBuilder,
+{
+    let _managed_request = ManagedRequestScope::enter();
+    retry_initial_request(
+        config,
+        provider,
+        || async {
+            match tokio::time::timeout(initial_request_limits().attempt_timeout, build().send())
+                .await
+            {
+                Ok(Ok(response)) => RetryAttempt {
+                    retry: is_retryable_status(response.status()),
+                    status: Some(response.status()),
+                    retry_after: parse_retry_after_with_date(&response),
+                    deadline: None,
+                    observation: None,
+                    result: Ok(response),
+                },
+                Ok(Err(error)) => RetryAttempt {
+                    retry: is_retryable_reqwest_error(&error),
+                    status: None,
+                    retry_after: None,
+                    deadline: None,
+                    observation: None,
+                    result: Err(LLMError::Http(error)),
+                },
+                Err(_) => RetryAttempt {
+                    retry: true,
+                    status: None,
+                    retry_after: None,
+                    deadline: None,
+                    observation: None,
+                    result: Err(LLMError::RequestFailed(
+                        "initial response headers timed out".into(),
+                    )),
+                },
+            }
+        },
+        |_, _| {},
+    )
+    .await
 }
 
 pub async fn observe_initial_http_retries<F: Future>(
@@ -137,26 +233,22 @@ pub async fn observe_initial_http_retries<F: Future>(
     INITIAL_HTTP_RETRY_OBSERVER.scope(observer, future).await
 }
 
-/// Default number of *retries* after the first attempt (issue #18: "max 3
-/// retries"). Total default attempts = `DEFAULT_MAX_RETRIES + 1`.
-const DEFAULT_MAX_RETRIES: u32 = 3;
+/// Default number of retries after the first attempt. Six total attempts keep
+/// the interactive default finite while tolerating a longer gateway outage.
+const DEFAULT_MAX_RETRIES: u32 = 5;
 /// Default maximum number of *attempts* (1 initial + [`DEFAULT_MAX_RETRIES`]).
 const DEFAULT_MAX_ATTEMPTS: u32 = DEFAULT_MAX_RETRIES + 1;
 /// Default base delay for the first backoff step.
 const DEFAULT_BASE_DELAY_MS: u64 = 500;
 /// Default cap on any single *computed* backoff sleep.
 const DEFAULT_MAX_DELAY_MS: u64 = 30_000;
-/// Absolute ceiling applied to a server-provided `Retry-After`. The server is
-/// authoritative about how long to wait, so we honor it even past `max_delay`,
-/// but still bound it to avoid an unbounded sleep from a hostile/buggy header.
-const RETRY_AFTER_CEILING: Duration = Duration::from_secs(60);
 
 /// Tunables for the transient-failure retry loop.
 ///
 /// Values are read from environment variables via [`RetryConfig::from_env`]
 /// with the documented defaults:
 /// - `BAMBOO_LLM_MAX_RETRIES` — number of *retries* after the first attempt, so
-///   total attempts = retries + 1 (default `3` retries → up to 4 attempts; `0`
+///   total attempts = retries + 1 (default `5` retries → up to 6 attempts; `0`
 ///   disables retrying).
 /// - `BAMBOO_LLM_RETRY_BASE_DELAY_MS` — base backoff delay in ms (default 500).
 /// - `BAMBOO_LLM_RETRY_MAX_DELAY_MS` — per-sleep cap in ms (default 30000).
@@ -313,8 +405,7 @@ where
             match build().send().await {
                 Ok(response) => {
                     let status = response.status();
-                    let retry_after =
-                        parse_retry_after(&response).map(|d| d.min(RETRY_AFTER_CEILING));
+                    let retry_after = parse_retry_after_with_date(&response);
                     RetryAttempt {
                         retry: is_retryable_status(status),
                         status: Some(status),
@@ -368,6 +459,7 @@ enum RetryDecision {
     AttemptsExhausted,
     BudgetExhausted,
     DelayExceedsBudget,
+    DelayTooLarge,
 }
 
 // One inline retry driver: legacy callers keep their unread Response contract;
@@ -388,7 +480,8 @@ where
     } else {
         config.max_attempts.max(1)
     };
-    let mut index = 0;
+    let continuous = continuous_request_retries();
+    let mut index: u32 = 0;
     loop {
         let mut outcome = attempt().await;
         let decision = if !outcome.retry {
@@ -398,13 +491,21 @@ where
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
             RetryDecision::BudgetExhausted
-        } else if index + 1 >= max_attempts {
+        } else if !continuous && index.saturating_add(1) >= max_attempts {
             RetryDecision::AttemptsExhausted
         } else {
+            let backoff = if continuous {
+                backoff_delay(config, index).max(Duration::from_millis(1))
+            } else {
+                backoff_delay(config, index)
+            };
             let delay = outcome
                 .retry_after
-                .unwrap_or_else(|| backoff_delay(config, index));
-            if outcome.deadline.is_some_and(|deadline| {
+                .map(|hint| hint.max(backoff))
+                .unwrap_or(backoff);
+            if Instant::now().checked_add(delay).is_none() {
+                RetryDecision::DelayTooLarge
+            } else if outcome.deadline.is_some_and(|deadline| {
                 Instant::now()
                     .checked_add(delay)
                     .is_none_or(|next| next >= deadline)
@@ -422,38 +523,34 @@ where
         if let Some(status) = outcome.status {
             let _ = INITIAL_HTTP_RETRY_OBSERVER.try_with(|observer| observer.record(status, delay));
             tracing::warn!(
-                "[{provider}] transient HTTP {} on attempt {}/{}; retrying in {}ms",
+                "[{provider}] transient HTTP {} on attempt {} (policy limit {:?}); retrying in {}ms",
                 status.as_u16(),
-                index + 1,
-                max_attempts,
+                index.saturating_add(1),
+                (!continuous).then_some(max_attempts),
                 delay.as_millis()
             );
         } else {
             tracing::warn!(
-                "[{provider}] transient transport error on attempt {}/{}; retrying in {}ms",
-                index + 1,
-                max_attempts,
+                "[{provider}] transient transport error on attempt {} (policy limit {:?}); retrying in {}ms",
+                index.saturating_add(1),
+                (!continuous).then_some(max_attempts),
                 delay.as_millis()
             );
         }
         drop(outcome);
         tokio::time::sleep(delay).await;
-        index += 1;
+        index = index.saturating_add(1);
     }
 }
 
 const CONNECTOR_BODY_LIMIT: usize = 16 * 1024;
-const ANTHROPIC_MAX_ATTEMPTS: u32 = 4;
-const ANTHROPIC_REQUEST_BUDGET: Duration = Duration::from_secs(60);
-// A stalled route must leave time for another initial request. This cap applies
-// only until headers arrive: successful SSE consumption is never reissued.
-const ANTHROPIC_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// One Anthropic call, including reasoning/tool-choice compatibility fallbacks.
 /// Atomic counting keeps borrowed policy futures Send without spawning work.
 pub(crate) struct InitialRequestBudget {
     attempts: AtomicU32,
     max_attempts: u32,
+    continuous: bool,
     started: Instant,
     deadline: Instant,
     attempt_timeout: Duration,
@@ -467,10 +564,15 @@ impl InitialRequestBudget {
         let started = Instant::now();
         Self {
             attempts: AtomicU32::new(0),
-            max_attempts: config.max_attempts.clamp(1, ANTHROPIC_MAX_ATTEMPTS),
+            max_attempts: if work_request_budget_active() {
+                1
+            } else {
+                config.max_attempts.max(1)
+            },
+            continuous: continuous_request_retries(),
             started,
-            deadline: started + ANTHROPIC_REQUEST_BUDGET,
-            attempt_timeout: ANTHROPIC_ATTEMPT_TIMEOUT,
+            deadline: started + initial_request_limits().total_budget,
+            attempt_timeout: initial_request_limits().attempt_timeout,
             diagnostic_id: uuid::Uuid::new_v4(),
             session_hash: None,
             latest: Mutex::new(None),
@@ -485,9 +587,10 @@ impl InitialRequestBudget {
     ) -> RetryAttempt<Result<InitialResponse, LLMError>> {
         let mut observation = observation;
         let stop = stop.or_else(|| {
-            if Instant::now() >= self.deadline {
+            if !self.continuous && Instant::now() >= self.deadline {
                 Some(RequestStopReason::TimeBudgetExhausted)
-            } else if self.attempts.load(Ordering::Relaxed) >= self.max_attempts {
+            } else if !self.continuous && self.attempts.load(Ordering::Relaxed) >= self.max_attempts
+            {
                 Some(RequestStopReason::AttemptsExhausted)
             } else {
                 None
@@ -504,7 +607,7 @@ impl InitialRequestBudget {
                 .status
                 .and_then(|s| StatusCode::from_u16(s).ok()),
             retry_after,
-            deadline: Some(self.deadline),
+            deadline: (!self.continuous).then_some(self.deadline),
             observation: Some(observation),
         }
     }
@@ -609,8 +712,7 @@ where
     F: Fn() -> RequestBuilder,
 {
     claim_work_physical_request()?;
-    let _ = INITIAL_HTTP_RETRY_OBSERVER
-        .try_with(|observer| observer.budget_managed.store(true, Ordering::Relaxed));
+    let _managed_request = ManagedRequestScope::enter();
     let mut cancellation = CancellationObservation {
         budget,
         completed: false,
@@ -620,7 +722,7 @@ where
         "Anthropic",
         || async {
             let attempt_started = Instant::now();
-            if attempt_started >= budget.deadline {
+            if !budget.continuous && attempt_started >= budget.deadline {
                 return budget.failure(
                     budget.observation(
                         attempt_started,
@@ -635,7 +737,8 @@ where
             if budget
                 .attempts
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |attempts| {
-                    (attempts < budget.max_attempts).then_some(attempts + 1)
+                    (budget.continuous || attempts < budget.max_attempts)
+                        .then_some(attempts.saturating_add(1))
                 })
                 .is_err()
             {
@@ -651,9 +754,13 @@ where
                 );
             }
             budget.record(budget.observation(attempt_started, "send_headers", "none", None));
-            let attempt_deadline = budget
-                .deadline
-                .min(attempt_started + budget.attempt_timeout);
+            let attempt_deadline = if budget.continuous {
+                attempt_started + budget.attempt_timeout
+            } else {
+                budget
+                    .deadline
+                    .min(attempt_started + budget.attempt_timeout)
+            };
             let sent = tokio::time::timeout_at(attempt_deadline, build().send()).await;
             let mut response = match sent {
                 Err(_) => {
@@ -690,15 +797,26 @@ where
                     budget.observation(attempt_started, "error_body", "none", Some(status));
                 observation.diagnostic.event = "classify_error_body";
                 budget.record(observation);
-                match tokio::time::timeout_at(budget.deadline, read_connector_body(&mut response))
-                    .await
+                match tokio::time::timeout_at(
+                    if budget.continuous {
+                        attempt_deadline
+                    } else {
+                        budget.deadline
+                    },
+                    read_connector_body(&mut response),
+                )
+                .await
                 {
                     Ok(Ok(body)) => Some(body),
                     result => {
                         let (failure, stop) = if result.is_err() {
                             (
                                 "upstream error body deadline exceeded",
-                                RequestStopReason::TimeBudgetExhausted,
+                                if budget.continuous {
+                                    RequestStopReason::UnclassifiedErrorBody
+                                } else {
+                                    RequestStopReason::TimeBudgetExhausted
+                                },
                             )
                         } else {
                             (
@@ -737,7 +855,8 @@ where
                         Some(status),
                     ),
                     // Fallback invocations share this absolute attempt count.
-                    (budget.attempts.load(Ordering::Relaxed) >= budget.max_attempts)
+                    (!budget.continuous
+                        && budget.attempts.load(Ordering::Relaxed) >= budget.max_attempts)
                         .then_some(RequestStopReason::AttemptsExhausted),
                     retry_after,
                 );
@@ -759,6 +878,10 @@ where
     cancellation.completed = true;
     result
 }
+
+#[cfg(test)]
+#[path = "retry/continuous_tests.rs"]
+mod continuous_tests;
 
 #[cfg(test)]
 #[path = "retry/connector_tests.rs"]

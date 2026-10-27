@@ -368,6 +368,8 @@ pub struct ExecuteRequest {
     /// the config default (which may itself be unlimited). See
     /// [`bamboo_config::RunBudgetConfig::merged_with_override`].
     pub run_budget: Option<bamboo_config::RunBudgetConfig>,
+    /// Explicit opt-in for initial main-provider HTTP retries in this execution only.
+    pub upstream_retry: bamboo_llm::retry::UpstreamRetry,
     /// Opt-in live counted repetition under the caller's existing execution owner.
     /// Requires the shared activation router and an already registered run.
     pub counted_loop: Option<super::counted_loop::CountedLoopConfig>,
@@ -426,6 +428,7 @@ pub struct ExecuteRequestBuilder {
     bash_completion_sink: Option<Arc<dyn BashCompletionSink>>,
     app_data_dir: Option<std::path::PathBuf>,
     run_budget: Option<bamboo_config::RunBudgetConfig>,
+    upstream_retry: bamboo_llm::retry::UpstreamRetry,
     counted_loop: Option<super::counted_loop::CountedLoopConfig>,
     loop_control: Option<super::loop_control::LoopControlConfig>,
 }
@@ -478,6 +481,7 @@ impl ExecuteRequestBuilder {
             bash_completion_sink: None,
             app_data_dir: None,
             run_budget: None,
+            upstream_retry: Default::default(),
             counted_loop: None,
             loop_control: None,
         }
@@ -695,6 +699,12 @@ impl ExecuteRequestBuilder {
         self
     }
 
+    /// Retry initial HTTP establishment until cancelled, only when explicitly selected.
+    pub fn upstream_retry(mut self, policy: bamboo_llm::retry::UpstreamRetry) -> Self {
+        self.upstream_retry = policy;
+        self
+    }
+
     /// Materialize the underlying [`ExecuteRequest`].
     ///
     /// `gold_config` is an internal feature flag with only a crate-visible
@@ -738,6 +748,7 @@ impl ExecuteRequestBuilder {
             bash_completion_sink: self.bash_completion_sink,
             app_data_dir: self.app_data_dir,
             run_budget: self.run_budget,
+            upstream_retry: self.upstream_retry,
             counted_loop: self.counted_loop,
             loop_control: self.loop_control,
         }
@@ -914,6 +925,7 @@ impl AgentRuntime {
             bash_completion_sink,
             app_data_dir,
             run_budget,
+            upstream_retry,
             counted_loop,
             loop_control,
         } = req;
@@ -1081,6 +1093,7 @@ impl AgentRuntime {
             counted_loop,
             loop_control,
             stream_timeout: config.stream_timeout,
+            upstream_retry,
             ..Default::default()
         };
 

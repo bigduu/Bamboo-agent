@@ -354,6 +354,7 @@ async fn handle_reserved_execute(
                     is_child_session,
                     no_human_approver: req.no_human_approver,
                     run_budget: req.run_budget,
+                    upstream_retry: req.upstream_retry.unwrap_or_default(),
                 },
                 config: &config,
                 config_snapshot: &config_snapshot,

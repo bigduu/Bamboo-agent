@@ -39,7 +39,10 @@ async fn actual_provider_failure_receipt_reaches_the_session_and_survives_cold_s
     let persisted = cold.last_run_diagnostic().unwrap();
     assert_eq!(persisted.diagnostic_id(), captured.diagnostic_id());
     assert!(persisted.matches_error_message(&cold.last_run_error().unwrap()));
-    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        bamboo_llm::retry::global().max_attempts as usize
+    );
 }
 
 const RECOVERY: &str = "Authentication Error, Error in connector: Error querying the database: FATAL: the database system is not yet accepting connections\nDETAIL: Consistent recovery state has not been yet reached.";
@@ -124,7 +127,10 @@ async fn connector_exhaustion_preserves_context_and_never_replays_successful_too
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     assert_eq!(tools.0.load(Ordering::SeqCst), 1);
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests.len(),
+        bamboo_llm::retry::global().max_attempts as usize
+    );
     assert!(requests.iter().all(|r| r.body == requests[0].body));
     assert!(String::from_utf8_lossy(&requests[0].body).contains("mid-loop tool result"));
     let saved = storage.load_session(&session.id).await.unwrap().unwrap();
@@ -432,7 +438,10 @@ async fn connector_recovery_then_terminal_422_does_not_reset_the_request_budget(
         .unwrap_err();
     assert!(matches!(error, AgentError::LLMNonRetryable(_)));
     assert!(error.to_string().contains("422"));
-    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        bamboo_llm::retry::global().max_attempts as usize
+    );
 }
 
 #[tokio::test]
@@ -560,5 +569,146 @@ async fn credential_and_permission_denials_with_overflow_text_remain_terminal() 
             .iter()
             .any(|m| m.content == "preserve context"));
         assert!(saved.compression_events.is_empty());
+    }
+}
+
+struct InitialRetryProbe {
+    url: String,
+    tool_once: bool,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LLMProvider for InitialRetryProbe {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+        _max: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.tool_once && call == 0 {
+            return Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![make_tool_call(
+                    "retry-probe-tool",
+                    "Read",
+                    "{}",
+                )])),
+                Ok(LLMChunk::Done),
+            ])));
+        }
+        if self.tool_once {
+            assert!(messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("retry-probe-tool")));
+        }
+        let config = bamboo_llm::retry::RetryConfig {
+            max_attempts: 1,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(5),
+        };
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response = bamboo_llm::retry::send_with_retry(&config, "controlled-consumer", || {
+            client.post(&self.url).json(messages)
+        })
+        .await?;
+        if !response.status().is_success() {
+            return Err(LLMError::RequestFailed(
+                "controlled initial request failed".into(),
+            ));
+        }
+        Ok(Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Token("controlled completed".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn execute_opt_in_retries_initial_http_without_replaying_tools_or_user_message() {
+    for continuous in [false, true] {
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let count = hits.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                ResponseTemplate::new(if count.fetch_add(1, Ordering::SeqCst) < 3 {
+                    503
+                } else {
+                    200
+                })
+            })
+            .mount(&server)
+            .await;
+        let provider = Arc::new(InitialRetryProbe {
+            url: server.uri(),
+            tool_once: true,
+            calls: AtomicUsize::new(0),
+        });
+        let tools = Arc::new(CountingTool(AtomicUsize::new(0)));
+        let (_home, agent, storage) =
+            build_direct_execute_agent(provider.clone(), None, Some(tools.clone())).await;
+        let mut session = Session::new(&format!("retry-consumer-{continuous}"), "test-model");
+        session.add_message(Message::user("one retained user message"));
+        storage.save_session(&session).await.unwrap();
+        let (tx, _rx) = mpsc::channel(128);
+        let mut request = direct_request(tx, CancellationToken::new());
+        if continuous {
+            request.upstream_retry = bamboo_llm::retry::UpstreamRetry::UntilCancelled;
+        }
+        let result = agent.execute(&mut session, request).await;
+        assert_eq!(result.is_ok(), continuous);
+        assert_eq!(hits.load(Ordering::SeqCst), if continuous { 4 } else { 1 });
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(tools.0.load(Ordering::SeqCst), 1);
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|r| r.body == requests[0].body));
+        let cold = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            cold.messages
+                .iter()
+                .filter(|m| m.content == "one retained user message")
+                .count(),
+            1
+        );
+        assert_eq!(
+            cold.messages
+                .iter()
+                .filter(|m| m.tool_call_id.as_deref() == Some("retry-probe-tool"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn continuous_initial_retry_never_replays_partial_text_reasoning_or_tool_fragments() {
+    for kind in 0..3 {
+        let provider = Arc::new(PartialTransientProvider {
+            calls: AtomicUsize::new(0),
+            kind,
+        });
+        let (_home, agent, storage) =
+            build_direct_execute_agent(provider.clone(), None, None).await;
+        let mut session = Session::new(&format!("continuous-partial-{kind}"), "test-model");
+        session.add_message(Message::user("retained once"));
+        storage.save_session(&session).await.unwrap();
+        let (tx, _rx) = mpsc::channel(128);
+        let request = crate::runtime::ExecuteRequestBuilder::new("", tx, CancellationToken::new())
+            .model("test-model")
+            .upstream_retry(bamboo_llm::retry::UpstreamRetry::UntilCancelled)
+            .build();
+        let error = agent.execute(&mut session, request).await.unwrap_err();
+        assert!(matches!(error, AgentError::LLMNonRetryable(_)));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let cold = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            cold.messages
+                .iter()
+                .filter(|m| m.content == "retained once")
+                .count(),
+            1
+        );
     }
 }
