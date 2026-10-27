@@ -9,6 +9,7 @@ on:
       - 'crates/engine/bamboo-engine/src/session_app/child_session/planner_artifact.rs'
       - 'crates/engine/bamboo-engine/src/session_app/child_session/result_projection.rs'
       - 'crates/engine/bamboo-engine/src/session_app/child_completion_coordinator.rs'
+      - 'crates/engine/bamboo-engine/src/runtime/runner/loop_execution/pipeline.rs'
       - 'crates/infra/bamboo-memory/src/plan_store.rs'
       - 'tests/required_child_context_packet.rs'
       - 'tests/support/delegated_planner.rs'
@@ -75,7 +76,7 @@ jobs:
           result="$RUNNER_TEMP/planner-artifacts.log"
           cargo test --locked -p bamboo-engine --lib planner_artifact \
             -- --test-threads=1 2>&1 | tee "$result"
-          grep -Fq 'test result: ok. 9 passed; 0 failed; 0 ignored' "$result"
+          grep -Fq 'test result: ok. 10 passed; 0 failed; 0 ignored' "$result"
       - name: Verify actual CLI worker, publication, automatic resume and cold partial reads
         shell: bash
         run: |

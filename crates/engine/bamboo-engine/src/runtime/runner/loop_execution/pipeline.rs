@@ -10276,6 +10276,75 @@ mod tests {
     }
 
     #[test]
+    fn planner_artifact_reads_preserve_child_spawn_budget_but_creates_exhaust_it() {
+        use crate::runtime::stream::handler::StreamHandlingOutput;
+
+        let call = |arguments: serde_json::Value| bamboo_agent_core::tools::ToolCall {
+            id: "plan-budget".into(),
+            tool_type: "function".into(),
+            function: bamboo_agent_core::tools::FunctionCall {
+                name: "Plan".into(),
+                arguments: arguments.to_string(),
+            },
+        };
+        let mut output = StreamHandlingOutput {
+            response_id: None,
+            visible_message: None,
+            content: String::new(),
+            reasoning_content: String::new(),
+            reasoning_signature: None,
+            token_count: 0,
+            tool_calls: [0, 512, 1024]
+                .into_iter()
+                .map(|offset| {
+                    call(serde_json::json!({
+                        "action":"read", "child_session_id":"existing-planner",
+                        "expected_child_created_at":"2026-10-26T00:00:00Z",
+                        "expected_assignment_sha256":"a".repeat(64),
+                        "revision":"b".repeat(64), "section_id":"s1", "offset":offset
+                    }))
+                })
+                .collect(),
+            output_tokens: 0,
+            thinking_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            provider_usage: None,
+            input_tokens: 0,
+            provider_transcript_items: Vec::new(),
+        };
+        let mut reads = super::RoundActivity::default();
+        let usage = crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&output, 0, 0);
+        reads.absorb_attempt(&output, usage);
+        reads.absorb_attempt(&output, usage);
+        let mut runtime = AgentRuntimeState::default();
+        reads.commit_to_runtime(&mut runtime);
+        assert_eq!(
+            runtime.round.total_tool_calls, 6,
+            "reads still count as tools"
+        );
+        assert_eq!(runtime.round.total_subagents_spawned, 0);
+        let budget = bamboo_config::RunBudgetConfig {
+            max_subagents: Some(2),
+            ..Default::default()
+        };
+        assert!(check_run_budget_exceeded(&runtime.round, &budget).is_none());
+
+        output.tool_calls = vec![call(
+            serde_json::json!({"action":"create","task":"Plan only"}),
+        )];
+        let mut create = super::RoundActivity::default();
+        create.absorb_attempt(&output, usage);
+        create.commit_to_runtime(&mut runtime);
+        assert_eq!(runtime.round.total_subagents_spawned, 1);
+        assert!(check_run_budget_exceeded(&runtime.round, &budget).is_none());
+        create.commit_to_runtime(&mut runtime);
+        let exceeded = check_run_budget_exceeded(&runtime.round, &budget).unwrap();
+        assert_eq!(exceeded.kind, "max_subagents");
+        assert_eq!(exceeded.actual, 2);
+    }
+
+    #[test]
     fn is_child_spawn_call_counts_plan_and_subagent_create_only() {
         let call = |name: &str, arguments: &str| bamboo_agent_core::tools::ToolCall {
             id: "id".to_string(),
