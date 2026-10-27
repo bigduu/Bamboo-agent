@@ -7,6 +7,8 @@
 // read/readAsset are fixed-repository GETs; uploadAsset is the existing guarded,
 // non-replacing Release upload; prepare uses prepareFromSandbox. Public readers
 // still authenticate the enclosing finalizer/producer and complete source proof.
+// Registry upload is an explicit port. Its external source-authority guard is
+// mandatory immediately before every PUT, including after retry waits/resume.
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -271,6 +273,8 @@ async function readVerifiedClosure(expected, states, ports) {
 }
 async function publishCrate(expected, ports) {
   expected = clone(inputs(expected));
+  assert.equal(typeof ports.guard, "function", "Fresh source guard is required for every registry PUT");
+  assert.equal(typeof ports.upload, "function", "Explicit archive upload port is required");
   let state = await ports.load(); if (state !== null) state = clone(record(state, expected));
   const save = async next => {
     next = clone(record(next, expected));
@@ -305,11 +309,11 @@ async function publishCrate(expected, ports) {
     if (state.phase !== "published") await save({ ...state, phase: "published" }); return true; };
   if (await published()) return clone(state);
   assert.notEqual(state.phase, "published", "Previously published registry original disappeared");
-  const upload = ports.upload || ((bytes, description) => uploader.uploadArchive(bytes, description, ports.registryToken));
   for (let attempt = 0; attempt < 25; attempt++) {
     // Each call owns a fresh Buffer. Every attempt still hashes to the same
     // authenticated archive; neither a callback nor an await can replace it.
-    const result = await upload(Buffer.from(output.bytes), clone(metadata));
+    await ports.guard();
+    const result = await ports.upload(Buffer.from(output.bytes), clone(metadata));
     if (result?.status === 0 || /already exists on crates.io index/.test(result?.output || "")) {
       for (let poll = 0; poll < 30; poll++) { if (await published()) return clone(state); if (poll < 29) await ports.wait(10); }
       assert.fail("Registry upload is not confirmed; retain verified original for explicit resume");

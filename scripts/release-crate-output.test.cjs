@@ -45,7 +45,7 @@ function fixtureBytes(value) {
   return Buffer.from(archiveCache.get(key));
 }
 function world(value = expected()) {
-  const bytes = fixtureBytes(value), assets = new Map(), counts = { prepare: 0, assetUpload: 0, registryUpload: 0, save: 0, wait: [] }, events = [], routes = [];
+  const bytes = fixtureBytes(value), assets = new Map(), counts = { prepare: 0, assetUpload: 0, registryUpload: 0, guard: 0, save: 0, wait: [] }, events = [], routes = [];
   const run = { id: 41, run_attempt: 1, repository: { id: 1164779771, full_name: output.REPOSITORY }, head_repository: { id: 1164779771, full_name: output.REPOSITORY },
     event: "workflow_dispatch", path: output.WORKFLOW, head_branch: "main", head_sha: C, status: "in_progress", conclusion: null };
   const job = { id: 501, run_id: 41, run_attempt: 1, name: output.JOB, head_branch: "main", head_sha: C,
@@ -88,6 +88,7 @@ function world(value = expected()) {
     },
     registry: async () => w.published === null ? null : { checksum: hash(w.published) },
     registryArchive: async () => Buffer.from(w.published),
+    guard: async () => { counts.guard++; events.push("source:guard"); },
     upload: async (actual, metadata) => uploader.uploadArchive(actual, metadata, "dummy-fixture-token", { fetchImpl: async (url, options) => {
       assert.equal(url, "https://crates.io/api/v1/crates/new"); assert.equal(options.method, "PUT"); assert.equal(options.redirect, "error");
       const body = Buffer.from(options.body), length = body.readUInt32LE(0), description = JSON.parse(body.subarray(4, 4 + length));
@@ -115,7 +116,8 @@ async function verified(w) {
 test("one verified original is durably read back before the official raw archive upload", async () => {
   const w = world(); const state = await output.publishCrate(w.expected, w.ports);
   assert.equal(state.phase, "published"); assert.equal(w.counts.prepare, 1); assert.equal(w.counts.assetUpload, 1); assert.equal(w.counts.registryUpload, 1);
-  assert.deepEqual(w.events, ["save:preparing", "prepare", "save:preparing:sealed", "asset:upload", "save:verified:sealed", "registry:upload", "save:published:sealed"]);
+  assert.deepEqual(w.events, ["save:preparing", "prepare", "save:preparing:sealed", "asset:upload", "save:verified:sealed", "source:guard", "registry:upload", "save:published:sealed"]);
+  assert.equal(w.counts.guard, 1);
   assert.equal(state.origin.jobId, 501); assert.equal(state.origin.jobKey, "publish-crates");
   assert.notEqual(String(state.origin.jobId), state.origin.jobKey);
   assert.ok(w.routes.includes("actions/jobs/501"));
@@ -128,6 +130,7 @@ test("429 retries send byte-identical official requests from one prepared/verifi
   const w = world(); w.outcomes = ["429", "429", "ok"];
   await output.publishCrate(w.expected, w.ports);
   assert.equal(w.counts.prepare, 1); assert.equal(w.counts.assetUpload, 1); assert.equal(w.counts.registryUpload, 3);
+  assert.equal(w.counts.guard, 3);
   assert.ok(w.counts.wait.every(seconds => seconds >= 15 && seconds <= 1200));
   assert.ok(w.requests.every(bytes => bytes.equals(w.requests[0])));
 });
@@ -364,4 +367,34 @@ test("controller pre-verification hash rejects a worker changing both archive an
     assert.throws(() => output.prepareFromSandbox({ revision: S, target: directory }, value), /controller's original bytes/);
     assert.equal(calls, 2);
   } finally { Object.assign(sandbox, saved); fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("explicit upload and fresh guard ports are required; bare tokens never select a default", async t => {
+  for (const [name, field, message] of [["missing guard", "guard", /Fresh source guard/], ["no upload port", "upload", /Explicit archive upload port/]]) {
+    await t.test(name, async () => {
+      const w = world(); let bareTokenReads = 0;
+      Object.defineProperty(w.ports, "registryToken", { get: () => { bareTokenReads++; throw new Error("Fixture forbids the bare-token fallback before any network call"); } });
+      delete w.ports[field];
+      await assert.rejects(output.publishCrate(w.expected, w.ports), message);
+      assert.equal(bareTokenReads, 0); assert.equal(w.counts.prepare, 0); assert.equal(w.counts.assetUpload, 0);
+      assert.equal(w.counts.save, 0); assert.equal(w.counts.registryUpload, 0);
+    });
+  }
+});
+
+test("429 retry stops before a second PUT when the fresh source guard refuses", async () => {
+  const w = world(); w.outcomes = ["429", "ok"];
+  w.ports.guard = async () => { if (++w.counts.guard === 2) throw new Error("Fixture source changed during the 429 wait"); };
+  await assert.rejects(output.publishCrate(w.expected, w.ports), /source changed during the 429 wait/);
+  assert.equal(w.counts.guard, 2); assert.equal(w.counts.registryUpload, 1); assert.equal(w.requests.length, 1);
+  assert.equal(w.state.phase, "verified"); assert.equal(w.counts.prepare, 1); assert.equal(w.counts.assetUpload, 1);
+  assert.equal(w.counts.wait.length, 1); assert.equal(w.published, null);
+});
+
+test("restored output requires a fresh source guard before its next PUT", async () => {
+  const w = await verified(world()), original = clone(w.state);
+  w.ports.guard = async () => { w.counts.guard++; throw new Error("Fixture source advanced before resume"); };
+  await assert.rejects(output.publishCrate(w.expected, w.ports), /source advanced before resume/);
+  assert.equal(w.counts.guard, 2); assert.equal(w.counts.registryUpload, 1); assert.equal(w.requests.length, 1);
+  assert.equal(w.counts.prepare, 1); assert.equal(w.counts.assetUpload, 1); assert.deepEqual(w.state, original);
 });
