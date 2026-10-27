@@ -18,6 +18,15 @@ const CONTROLLER_HELPERS = Object.freeze([
   "frontend-package.cjs", "lotus-next-artifact.cjs", "sidecar-release.cjs",
   "sidecar-build.cjs", "sidecar-browser-host.py", "native-originals.cjs", "native-originals-zip.py",
 ].map(name => "scripts/" + name));
+const MAIN_WORKFLOW = ".github/workflows/main-admission.yml";
+const MAIN_WORKFLOW_SHA256 = "9794f9b3ca4398adc4e1da1eb4aca3ef3df05713d2fcc67a8085bbbd13240b5a";
+const MAIN_JOB = "Main Admission", MAIN_STEP = "Verify completed publication and exact Main postimage";
+const MAIN_PREFIX = "Bamboo Main admission: ", MAIN_KIND = "bamboo-main-admission/v1";
+// These are whole ordinary B controls, never a candidate-supplied path policy.
+// Legacy automatic Main compilers must be retired by the separate Ops cutover.
+const MAIN_CONTROLS = Object.freeze([MAIN_WORKFLOW, source.WORKFLOW, source.CONTROLLER,
+  "scripts/main-admission.cjs", "scripts/published-source-admission.cjs", ...CONTROLLER_HELPERS,
+  "AGENTS.md", "docs/releases/ci-publication-flow.md", "docs/delivery-workflow.md", "docs/ci-workflow-audit.md"]);
 const keys = (value, names) => assert.deepEqual(Object.keys(value || {}).sort(), [...names].sort(), "Unexpected proof fields");
 const positive = value => { assert.ok(Number.isSafeInteger(value) && value > 0); return value; };
 const revision = value => { assert.match(value, SHA); return value; };
@@ -179,7 +188,9 @@ async function verifyPublishedSource(input, reads, policy = {}) {
     verified.set(ref.assetId, ref); return bytes;
   };
   assert.equal(record.release.receiptAsset.name, "release-provenance.json");
-  const receipt = JSON.parse((await readAsset(record.release.receiptAsset, 65536)).toString("utf8"));
+  // Pretty public provenance includes Source and every crate checkpoint. Its
+  // producer role is 1 MiB, independently of the 64 KiB completion log frame.
+  const receipt = JSON.parse((await readAsset(record.release.receiptAsset, 1024 * 1024)).toString("utf8"));
   assert.equal(digest(receipt), record.release.receiptSha256); same(core.readBodyReceipt(release), receipt);
   const wrapper = JSON.parse((await blob(source.INPUT_PATHS.frontendManifest, S)).bytes);
   const identity = { repository: source.REPOSITORY, sourceRevision: S, frontend: core.frontendIdentity(
@@ -202,7 +213,9 @@ async function verifyPublishedSource(input, reads, policy = {}) {
   assert.equal(record.frontend.length, 2);
   for (const [index, name] of ["frontend-manifest.json", "lotus-frontend.zip"].entries()) {
     const ref = record.frontend[index]; assert.equal(ref.name, name);
-    assert.equal(ref.sha256, index ? facts.inputs.frontendZip.sha256 : facts.inputs.frontendManifest.sha256); await readAsset(ref, 16 * 1024 * 1024);
+    assert.equal(ref.sha256, index ? facts.inputs.frontendZip.sha256 : facts.inputs.frontendManifest.sha256);
+    // New Source admission is narrower than the legacy 256 MiB ZIP carrier.
+    await readAsset(ref, (index ? 16 : 1) * 1024 * 1024);
   }
   const crateJob = jobs.find(job => job.name === contract.crateJobName);
   assert.ok(crateJob, "Missing original crate owner");
@@ -280,38 +293,172 @@ async function treeLeaves(get, tree) {
   }
   return leaves;
 }
+function closure(leaves) {
+  return MAIN_CONTROLS.map(path => {
+    const entry = leaves.get(path);
+    assert.ok(entry && ["100644", "100755"].includes(entry.mode), "Missing ordinary trusted control: " + path);
+    return { path, ...entry };
+  });
+}
+async function promotionTree(input, facts, reads) {
+  const { get, ancestor } = source.sourceReads(reads, {});
+  const { baseRevision: B, headRevision: F, snapshotRevision: M } = input;
+  await ancestor(facts.source.revision, F);
+  const commits = await Promise.all([B, F, M].map(sha => get("git/commits/" + revision(sha))));
+  commits.forEach((commit, i) => assert.equal(commit.sha, [B,F,M][i]));
+  same(commits[2].parents.map(value => value.sha), [B,F]);
+  const [released, base, head, snapshot] = await Promise.all([facts.source.tree, ...commits.map(value => value.tree.sha)].map(tree => treeLeaves(get, tree)));
+  const controls = closure(base), overlaid = new Map(released);
+  for (const { path, ...entry } of controls) overlaid.set(path, entry);
+  const mapKey = map => core.canonicalJson([...map].sort(([a],[b]) => a.localeCompare(b)));
+  assert.equal(mapKey(head), mapKey(overlaid), "Promotion changed product or failed to retain the complete trusted controls");
+  assert.equal(mapKey(snapshot), mapKey(head), "Actual promotion merge differs from its reviewed source/control closure");
+  return { pullRequest: input.pullRequest, baseRevision: B, headRevision: F, snapshotRevision: M,
+    snapshotTree: commits[2].tree.sha, controlMode: mapKey(head) === mapKey(released) ? "released-source" : "complete-trusted-base",
+    controlsSha256: digest(controls) };
+}
 async function verifyPromotion(input, reads, policy = {}) {
   keys(input, ["sourceRevision", "featurePr", "ciRun", "releaseRun", "pullRequest", "baseRevision", "headRevision", "snapshotRevision"]);
   const B = revision(input.baseRevision), F = revision(input.headRevision), M = revision(input.snapshotRevision); positive(input.pullRequest);
-  const { get, branch, ancestor } = source.sourceReads(reads, policy);
+  assert.equal(policy.controlPaths, undefined, "Caller-selected control paths are forbidden");
+  const { get, branch } = source.sourceReads(reads, policy);
   const pr = await get("pulls/" + input.pullRequest);
   assert.equal(pr.number, input.pullRequest); assert.equal(pr.state, "open"); assert.equal(pr.draft, false);
   repo(pr.base?.repo); repo(pr.head?.repo); assert.equal(pr.base.ref, "main"); assert.equal(pr.base.sha, B); assert.equal(pr.head.sha, F); assert.equal(pr.merge_commit_sha, M);
   assert.equal(await branch("main", true), B, "Promotion base changed");
   const facts = await verifyPublishedSource({ sourceRevision: input.sourceRevision, featurePr: input.featurePr, ciRun: input.ciRun, releaseRun: input.releaseRun }, reads, policy);
-  await ancestor(facts.source.revision, F); // Equal trees never establish normal promotion history.
-  const commits = await Promise.all([B, F, M].map(sha => get("git/commits/" + sha)));
-  for (let i = 0; i < commits.length; i++) assert.equal(commits[i].sha, [B,F,M][i]);
-  same(commits[2].parents.map(value => value.sha), [B,F]);
-  const [released, base, head, snapshot] = await Promise.all([facts.source.tree, ...commits.map(value => value.tree.sha)].map(tree => treeLeaves(get, tree)));
-  const paths = policy.controlPaths;
-  assert.ok(Array.isArray(paths) && paths.length && paths.length <= 128 && new Set(paths).size === paths.length);
-  for (const path of [source.WORKFLOW, source.CONTROLLER, "scripts/published-source-admission.cjs", ...CONTROLLER_HELPERS]) {
-    assert.ok(paths.includes(path), "Incomplete trusted control closure");
-    assert.ok(base.has(path) && ["100644", "100755"].includes(base.get(path).mode), "Trusted control must be an ordinary base blob");
-  }
-  for (const path of paths) assert.ok(path === "AGENTS.md" || path === "CONTRIBUTING.md" || path === "gitflow.md" || /^(scripts|docs|\.github\/workflows)\/[A-Za-z0-9_./-]+$/.test(path) && !path.split("/").includes(".."));
-  const overlaid = new Map(released);
-  for (const path of paths) { if (base.has(path)) overlaid.set(path, base.get(path)); else overlaid.delete(path); }
-  const mapKey = map => core.canonicalJson([...map].sort(([a],[b]) => a.localeCompare(b)));
-  // A released feature tree may still carry the old Main workflow. Preserve
-  // the whole currently trusted closure; exact S passes only when it already
-  // contains that complete closure. No feature-complete => Main-capable leap.
-  const releasedKey = mapKey(released), trustedKey = mapKey(overlaid);
-  assert.equal(mapKey(head), trustedKey, "Promotion changed product or failed to retain the complete trusted controls");
-  assert.equal(mapKey(snapshot), mapKey(head), "Actual promotion merge differs from its reviewed source/control closure");
+  const promotion = await promotionTree(input, facts, reads);
   same(prIdentity(await get("pulls/" + input.pullRequest)), prIdentity(pr)); assert.equal(await branch("main", true), B);
-  return { ...facts, kind: "bamboo-main-promotion-facts/v1", promotion: { pullRequest: input.pullRequest, baseRevision: B, headRevision: F,
-    snapshotRevision: M, snapshotTree: commits[2].tree.sha, controlMode: mapKey(head) === releasedKey ? "released-source" : "complete-trusted-base" } };
+  return { ...facts, kind: "bamboo-main-promotion-facts/v1", promotion };
 }
-module.exports = { PREFIX, KIND, CONTROLLER_HELPERS, ACCEPTED_RELEASE_PRODUCERS, frame, assetReference, selectJobs, treeLeaves, verifyPublishedSource, verifyPromotion };
+function mainLocator(body) {
+  assert.ok(typeof body === "string" && Buffer.byteLength(body) <= 128 * 1024);
+  const matches = [...body.matchAll(/<!-- bamboo-main-locator\/v1\n([\s\S]*?)\n-->/g)];
+  assert.equal(matches.length, 1, "Require one Main locator; PR text is data only");
+  const value = JSON.parse(matches[0][1]);
+  assert.ok(["promotion", "bootstrap"].includes(value.mode));
+  keys(value, ["mode", "sourceRevision", "featurePr", "ciRun", ...(value.mode === "promotion" ? ["releaseRun"] : [])]);
+  revision(value.sourceRevision); positive(value.featurePr); positive(value.ciRun);
+  if (value.mode === "promotion") positive(value.releaseRun);
+  return value;
+}
+async function mainAuthority(get) {
+  const repository = await get(""); repo(repository);
+  assert.equal(repository.default_branch, "main", "STOP: separate Ops must select default Main");
+  const branch = await get("branches/main"); assert.equal(branch.name, "main"); assert.equal(branch.protected, true);
+  const checks = branch.protection?.required_status_checks;
+  assert.equal(checks?.enforcement_level, "everyone", "Main admission must apply to everyone");
+  assert.ok(checks.contexts?.includes(MAIN_JOB));
+  same(checks.checks.filter(check => check.context === MAIN_JOB), [{ context: MAIN_JOB, app_id: 15368 }]);
+  return revision(branch.commit?.sha);
+}
+function logFrame(log) {
+  assert.ok(typeof log === "string" && Buffer.byteLength(log) <= 64 * 1024 * 1024);
+  const rows = log.split(/\r?\n/).filter(line => /^\d{4}-\d\d-\d\dT\S+Z /.test(line) && line.slice(line.indexOf(" ") + 1).startsWith(MAIN_PREFIX));
+  assert.equal(rows.length, 1, "Missing or duplicate physical Main admission frame");
+  const encoded = rows[0].slice(rows[0].indexOf(MAIN_PREFIX) + MAIN_PREFIX.length);
+  assert.ok(/^[A-Za-z0-9+/]+={0,2}$/.test(encoded) && encoded.length <= 87384);
+  const bytes = Buffer.from(encoded, "base64"); assert.ok(bytes.length <= 65536); assert.equal(bytes.toString("base64"), encoded);
+  const value = JSON.parse(bytes.toString("utf8")); assert.equal(core.canonicalJson(value), bytes.toString("utf8"));
+  keys(value, ["schemaVersion", "kind", "publicationAuthorized", "repository", "locatorSha256", "source", "release", "promotion", "execution"]);
+  assert.equal(value.schemaVersion, 1); assert.equal(value.kind, MAIN_KIND); assert.equal(value.publicationAuthorized, false);
+  same(value.repository, { id: REPOSITORY_ID, fullName: source.REPOSITORY }); assert.match(value.locatorSha256, DIGEST);
+  keys(value.source, ["revision", "tree"]); Object.values(value.source).forEach(revision);
+  keys(value.release, ["runId", "completionSha256"]); positive(value.release.runId); assert.match(value.release.completionSha256, DIGEST);
+  keys(value.promotion, ["pullRequest", "baseRevision", "headRevision", "snapshotRevision", "snapshotTree", "controlMode", "controlsSha256"]);
+  positive(value.promotion.pullRequest);
+  for (const key of ["baseRevision", "headRevision", "snapshotRevision", "snapshotTree"]) revision(value.promotion[key]);
+  assert.ok(["released-source", "complete-trusted-base"].includes(value.promotion.controlMode)); assert.match(value.promotion.controlsSha256, DIGEST);
+  keys(value.execution, ["revision", "metadataRevision", "workflowPath", "workflowId", "runId", "physicalAttempt", "jobId", "checkSuiteId", "checkSuiteNodeId"]);
+  revision(value.execution.revision); revision(value.execution.metadataRevision); assert.equal(value.execution.workflowPath, MAIN_WORKFLOW);
+  for (const key of ["workflowId", "runId", "physicalAttempt", "jobId", "checkSuiteId"]) positive(value.execution[key]);
+  assert.match(value.execution.checkSuiteNodeId, /^[A-Za-z0-9_=-]{1,128}$/);
+  return value;
+}
+function mainFrameLine(value) {
+  const line = MAIN_PREFIX + Buffer.from(core.canonicalJson(value)).toString("base64");
+  logFrame("2000-01-01T00:00:00.000Z " + line); return line;
+}
+async function mainSuite(run, reads) {
+  const { get } = source.sourceReads(reads, {});
+  repo(run.repository); repo(run.head_repository); positive(run.run_attempt);
+  assert.ok(run.run_attempt <= 20); assert.equal(run.event, "pull_request_target"); assert.equal(run.path, MAIN_WORKFLOW);
+  assert.equal(run.name, "Bamboo Main Admission");
+  const official = source.checkedJSON(await reads.checkSuite(run.check_suite_node_id));
+  same(official.repository, { databaseId: REPOSITORY_ID, nameWithOwner: source.REPOSITORY });
+  same(official.app, { databaseId: 15368, slug: "github-actions" }); assert.equal(official.databaseId, run.check_suite_id);
+  // Observed PRT API metadata (including file URL) names F, NOT executed B.
+  assert.equal(official.commit.oid, run.head_sha);
+  same(official.workflowRun, { databaseId: run.id, event: "pull_request_target", runAttempt: run.run_attempt,
+    workflow: { databaseId: run.workflow_id, name: run.name }, file: { path: MAIN_WORKFLOW, repositoryName: source.REPOSITORY,
+      repositoryFileUrl: "https://github.com/" + source.REPOSITORY + "/blob/" + run.head_sha + "/" + MAIN_WORKFLOW } });
+  const workflow = await get("actions/workflows/main-admission.yml");
+  assert.equal(workflow.id, run.workflow_id); assert.equal(workflow.path, MAIN_WORKFLOW); assert.equal(workflow.state, "active");
+  return official;
+}
+async function mainExecution(run, reads) {
+  const { get, paged } = source.sourceReads(reads, {});
+  complete(run); const official = await mainSuite(run, reads);
+  const latest = await paged("actions/runs/" + run.id + "/jobs?filter=latest", "jobs");
+  const all = await paged("actions/runs/" + run.id + "/jobs?filter=all", "jobs");
+  assert.equal(latest.length, 1); const logical = latest[0]; assert.ok(all.length && all.length <= 20);
+  assert.equal(new Set(all.map(job => job.run_attempt)).size, all.length);
+  for (const job of all) {
+    assert.equal(job.name, MAIN_JOB); assert.equal(job.run_id, run.id); assert.equal(job.head_sha, run.head_sha);
+    assert.equal(job.head_branch, run.head_branch); positive(job.run_attempt); assert.ok(job.run_attempt <= run.run_attempt);
+  }
+  const newest = [...all].sort((a,b) => b.run_attempt - a.run_attempt)[0];
+  assert.equal(source.fingerprint(logical), source.fingerprint(newest)); complete(logical); requiredStep(logical, MAIN_STEP);
+  const execution = source.executionKey(logical); assert.ok(execution);
+  const physical = all.filter(job => source.executionKey(job) === execution).sort((a,b) => a.run_attempt - b.run_attempt)[0];
+  requiredStep(physical, MAIN_STEP); assert.ok(Date.parse(physical.started_at) >= Date.parse(run.created_at));
+  const direct = await get("actions/jobs/" + physical.id);
+  assert.equal(direct.run_attempt, physical.run_attempt); assert.equal(source.fingerprint(direct), source.fingerprint(physical));
+  const attempt = await paged("actions/runs/" + run.id + "/attempts/" + physical.run_attempt + "/jobs", "jobs");
+  assert.equal(attempt.length, 1); assert.equal(attempt[0].run_attempt, physical.run_attempt); assert.equal(source.fingerprint(attempt[0]), source.fingerprint(physical));
+  return { official, logical, physical };
+}
+async function verifyMergedPromotion(input, reads, policy = {}) {
+  keys(input, ["pullRequest", "admissionRun"]); positive(input.pullRequest); positive(input.admissionRun);
+  assert.equal(policy.controlPaths, undefined, "Caller-selected control paths are forbidden");
+  const { get, ancestor, blob } = source.sourceReads(reads, policy), before = await mainAuthority(get);
+  const pr = await get("pulls/" + input.pullRequest);
+  assert.equal(pr.number, input.pullRequest); assert.equal(pr.state, "closed"); assert.equal(pr.merged, true); assert.equal(pr.draft, false);
+  repo(pr.base.repo); repo(pr.head.repo); assert.equal(pr.base.ref, "main");
+  assert.match(pr.head.ref, /^[A-Za-z0-9_./-]{1,255}$/);
+  const P = revision(pr.merge_commit_sha), merged = await get("git/commits/" + P);
+  assert.equal(merged.sha, P); assert.equal(merged.parents.length, 2);
+  const B = revision(merged.parents[0].sha), F = revision(merged.parents[1].sha); assert.equal(pr.head.sha, F); await ancestor(P, before);
+  const run = await get("actions/runs/" + input.admissionRun); assert.equal(run.id, input.admissionRun);
+  assert.equal(run.head_sha, F); assert.equal(run.head_branch, pr.head.ref);
+  const selected = await mainExecution(run, reads), record = logFrame(await reads.jobLog(selected.physical.id));
+  assert.ok(Number.isFinite(Date.parse(pr.merged_at)) && Date.parse(selected.physical.completed_at) <= Date.parse(pr.merged_at), "Admission must complete no later than recorded promotion");
+  same(record.execution, { revision: B, metadataRevision: F, workflowPath: MAIN_WORKFLOW, workflowId: run.workflow_id,
+    runId: run.id, physicalAttempt: selected.physical.run_attempt, jobId: selected.physical.id,
+    checkSuiteId: run.check_suite_id, checkSuiteNodeId: run.check_suite_node_id });
+  assert.equal((await blob(MAIN_WORKFLOW, B)).sha256, MAIN_WORKFLOW_SHA256, "Unreviewed Main workflow definition at B");
+  const locator = mainLocator(pr.body); assert.equal(locator.mode, "promotion", "Bootstrap never authorizes a consumer");
+  assert.equal(digest(locator), record.locatorSha256);
+  const { mode, ...releaseInput } = locator;
+  const facts = await verifyPublishedSource(releaseInput, reads, policy);
+  same(record.source, facts.source && { revision: facts.source.revision, tree: facts.source.tree });
+  same(record.release, { runId: locator.releaseRun, completionSha256: facts.completionSha256 });
+  const promotion = await promotionTree({ pullRequest: input.pullRequest, baseRevision: B, headRevision: F,
+    snapshotRevision: record.promotion.snapshotRevision }, facts, reads);
+  same(promotion, record.promotion); assert.equal(merged.tree.sha, promotion.snapshotTree, "Merged P differs from the checked M postimage");
+  const docs = facts.feature.physicalJobs.filter(job => job.name === "Documentation"); assert.equal(docs.length, 1);
+  const stablePR = value => { const identity = prIdentity(value); delete identity.base.sha;
+    return { ...identity, mergedAt: value.merged_at, locator: mainLocator(value.body) }; };
+  // Historical B is P.parents[0], not the closed PR's moving base.sha view.
+  same(stablePR(await get("pulls/" + input.pullRequest)), stablePR(pr));
+  assert.equal(source.runIdentity(await get("actions/runs/" + run.id)), source.runIdentity(run));
+  same(await mainExecution(run, reads), selected); const after = await mainAuthority(get); await ancestor(before, after); await ancestor(P, after);
+  return { ...facts, kind: "bamboo-merged-main-promotion/v1", promotion: { ...promotion, mergeRevision: P },
+    admission: { ...record.execution, logicalJobId: selected.logical.id, logicalAttempt: selected.logical.run_attempt },
+    featureDocs: { kind: "feature-docs-execution-locator/v1", runId: facts.feature.runId, jobId: docs[0].jobId,
+      physicalAttempt: docs[0].physicalAttempt, snapshotRevision: facts.feature.snapshotRevision, sourceTree: facts.source.tree,
+      producerDigest: facts.feature.producerDigest, artifactName: "feature-docs-" + facts.feature.runId + "-" + docs[0].physicalAttempt } };
+}
+module.exports = { PREFIX, KIND, CONTROLLER_HELPERS, ACCEPTED_RELEASE_PRODUCERS, frame, assetReference, selectJobs, treeLeaves,
+  verifyPublishedSource, verifyPromotion, MAIN_WORKFLOW, MAIN_WORKFLOW_SHA256, MAIN_JOB, MAIN_STEP, MAIN_PREFIX, MAIN_KIND,
+  MAIN_CONTROLS, closure, promotionTree, mainLocator, mainAuthority, logFrame, mainFrameLine, mainSuite, mainExecution, verifyMergedPromotion };

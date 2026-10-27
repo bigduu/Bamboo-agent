@@ -3,6 +3,8 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const { createHash } = require("node:crypto");
+const { readFileSync } = require("node:fs");
+const path = require("node:path");
 const source = require("./frozen-source-admission.cjs");
 const core = require("./crate-release.cjs");
 const native = require("./native-originals.cjs");
@@ -169,12 +171,14 @@ test("whole completion parser rejects duplicates, noncanonical bytes, oversized 
 });
 async function promotionFixture(overlay=false){
   const f=await fixture(),sourceTree=f.state.record.source.tree,baseTree="8".repeat(40),headTree=overlay?"9".repeat(40):sourceTree,F=overlay?"a".repeat(40):S,M="0".repeat(40);
-  const controls=[source.WORKFLOW,source.CONTROLLER,"scripts/published-source-admission.cjs",...proof.CONTROLLER_HELPERS];f.policy.controlPaths=[...new Set(controls)];
+  const controls=proof.MAIN_CONTROLS;
+  for(const name of controls)if(!(name in f.f.files[C]))f.f.files[C][name]="trusted B control "+name;
+  f.f.files[C][proof.MAIN_WORKFLOW]=readFileSync(path.join(__dirname,"..",proof.MAIN_WORKFLOW),"utf8");
   const sourceLeaves=new Map(Object.entries(f.f.files[S]).map(([path,bytes])=>[path,{path,mode:"100644",type:"blob",sha:oid(bytes)}]));
   sourceLeaves.set("src/lib.rs",{path:"src/lib.rs",mode:"100644",type:"blob",sha:"d".repeat(40)});
   sourceLeaves.set("vendor/module",{path:"vendor/module",mode:"160000",type:"commit",sha:"f".repeat(40)});
   const baseLeaves=new Map(sourceLeaves);baseLeaves.set("src/lib.rs",{...sourceLeaves.get("src/lib.rs"),sha:"b".repeat(40)});
-  for(const path of controls)baseLeaves.set(path,{path,mode:"100644",type:"blob",sha:oid("trusted B control "+path)});
+  for(const path of controls)baseLeaves.set(path,{path,mode:"100644",type:"blob",sha:oid(f.f.files[C][path])});
   const headLeaves=new Map(sourceLeaves);if(overlay)for(const path of controls)headLeaves.set(path,baseLeaves.get(path));
   for(const [tree,leaves]of[[sourceTree,sourceLeaves],[baseTree,baseLeaves],[headTree,headLeaves]])f.state.treeRoutes.set("git/trees/"+tree+"?recursive=1",{sha:tree,truncated:false,tree:clone([...leaves.values()])});
   f.state.treeRoutes.set("git/commits/"+C,{sha:C,tree:{sha:baseTree},parents:[{sha:anchor}]});
@@ -231,4 +235,154 @@ test("public Main proof accepts download counters changing without original iden
 test("Main promotion ignores unrelated PR counters while keeping exact head/base/merge identity",async()=>{
   const f=await promotionFixture(true);f.state.afterRead=(route,value,n)=>{if(route==="pulls/88"){value.comments=n;value.updated_at=clock(n)}};
   assert.equal((await f.promote()).publicationAuthorized,false);
+});
+
+async function mergedFixture(){
+  const f=await promotionFixture(true),accepted=await f.promote(),P="c".repeat(40),F=f.promotionInput.headRevision;
+  const locator={mode:"promotion",...f.input};
+  Object.assign(f.state.extraPr,{state:"closed",merged:true,merged_at:clock(600),merge_commit_sha:P,
+    body:"<!-- bamboo-main-locator/v1\n"+JSON.stringify(locator)+"\n-->"});
+  // Closed PR base.sha is not the historical B authority. Immutable P parents are.
+  f.state.extraPr.base.sha=P;f.f.main.commit.sha=P;
+  f.f.main.protection={required_status_checks:{enforcement_level:"everyone",contexts:[proof.MAIN_JOB],checks:[{context:proof.MAIN_JOB,app_id:15368}]}};
+  f.state.treeRoutes.set("git/commits/"+P,{sha:P,tree:{sha:accepted.promotion.snapshotTree},parents:[{sha:C},{sha:F}]});
+  const run={id:700,run_attempt:1,workflow_id:701,check_suite_id:702,check_suite_node_id:"CS_inert_main",repository:clone(f.f.run.repository),
+    head_repository:clone(f.f.run.repository),name:"Bamboo Main Admission",event:"pull_request_target",path:proof.MAIN_WORKFLOW,
+    head_sha:F,head_branch:f.state.extraPr.head.ref,status:"completed",conclusion:"success",created_at:clock(399),updated_at:clock(501)};
+  const suite={databaseId:702,repository:{databaseId:1164779771,nameWithOwner:source.REPOSITORY},app:{databaseId:15368,slug:"github-actions"},
+    commit:{oid:F},workflowRun:{databaseId:700,event:"pull_request_target",runAttempt:1,workflow:{databaseId:701,name:run.name},
+      file:{path:proof.MAIN_WORKFLOW,repositoryName:source.REPOSITORY,repositoryFileUrl:`https://github.com/${source.REPOSITORY}/blob/${F}/${proof.MAIN_WORKFLOW}`}}};
+  const job={id:703,run_id:700,run_attempt:1,name:proof.MAIN_JOB,head_sha:F,head_branch:run.head_branch,status:"completed",conclusion:"success",
+    started_at:clock(400),completed_at:clock(500),steps:[{number:1,name:proof.MAIN_STEP,status:"completed",conclusion:"success",started_at:clock(401),completed_at:clock(499)}]};
+  const record={schemaVersion:1,kind:proof.MAIN_KIND,publicationAuthorized:false,repository:{id:1164779771,fullName:source.REPOSITORY},
+    locatorSha256:hash(Buffer.from(core.canonicalJson(locator))),source:{revision:S,tree:accepted.source.tree},
+    release:{runId:900,completionSha256:accepted.completionSha256},promotion:accepted.promotion,
+    execution:{revision:C,metadataRevision:F,workflowPath:proof.MAIN_WORKFLOW,workflowId:701,runId:700,physicalAttempt:1,jobId:703,checkSuiteId:702,checkSuiteNodeId:run.check_suite_node_id}};
+  const state={run,suite,all:[job],latest:[clone(job)],record,log:null},original=f.reads;
+  const page=rows=>({total_count:rows.length,jobs:clone(rows)});
+  const reads={...original,json:async route=>{
+    let value;
+    if(route==="")value={id:1164779771,full_name:source.REPOSITORY,default_branch:"main"};
+    else if(route==="actions/runs/700")value=state.run;
+    else if(route==="actions/workflows/main-admission.yml")value={id:701,path:proof.MAIN_WORKFLOW,state:"active"};
+    else if(route.startsWith("actions/runs/700/jobs?"))value=page(route.includes("filter=all")?state.all:state.latest);
+    else if(route.startsWith("actions/runs/700/attempts/"))value=page(state.all.filter(job=>job.run_attempt===Number(route.split("/")[4])));
+    else if(/^actions\/jobs\/[1-9][0-9]*$/.test(route)&&state.all.some(job=>job.id===Number(route.slice(13))))value=state.all.find(job=>job.id===Number(route.slice(13)));
+    else return original.json(route);
+    f.calls.push(route);value=clone(value);if(f.state.afterRead)f.state.afterRead(route,value,f.calls.filter(x=>x===route).length);return value;
+  },checkSuite:async id=>id===run.check_suite_node_id?clone(state.suite):original.checkSuite(id),
+  jobLog:async id=>state.all.some(job=>job.id===id)?(state.log??clock(499)+" "+proof.mainFrameLine(state.record)+"\n"):original.jobLog(id)};
+  return {f,state,P,F,reads,input:{pullRequest:88,admissionRun:700},verify:()=>proof.verifyMergedPromotion({pullRequest:88,admissionRun:700},reads,f.policy)};
+}
+test("Main2351 merged proof retains distinct feature M, promotion M and actual normal P",async()=>{
+  const m=await mergedFixture(),result=await m.verify();
+  assert.equal(result.publicationAuthorized,false);assert.equal(result.source.revision,S);assert.equal(result.promotion.mergeRevision,m.P);
+  assert.notEqual(result.promotion.snapshotRevision,m.P);assert.equal(result.feature.snapshotRevision,fixtures.identities.M);
+  assert.equal(result.admission.revision,C);assert.equal(result.admission.metadataRevision,m.F);
+  assert.equal(result.featureDocs.artifactName,"feature-docs-123-1");assert.equal("artifactId" in result.featureDocs,false);
+});
+test("Main2351 merged proof preserves original physical frame when GitHub copies its success",async()=>{
+  const m=await mergedFixture(),copyJob={...clone(m.state.all[0]),id:1703,run_attempt:2};
+  m.state.all.push(copyJob);m.state.latest=[clone(copyJob)];m.state.run.run_attempt=2;m.state.suite.workflowRun.runAttempt=2;
+  const result=await m.verify();assert.equal(result.admission.jobId,703);assert.equal(result.admission.physicalAttempt,1);
+  assert.equal(result.admission.logicalJobId,1703);assert.equal(result.admission.logicalAttempt,2);
+});
+test("Main2351 merged proof permits normal Main advance and a changing closed PR base view",async()=>{
+  const m=await mergedFixture(),next="7".repeat(40);
+  m.f.state.afterRead=(route,value,n)=>{
+    if(route==="branches/main"&&n>1)value.commit.sha=next;
+    if(route==="pulls/88"&&n>1)value.base.sha=next;
+  };
+  assert.equal((await m.verify()).promotion.mergeRevision,m.P);
+});
+test("Main2351 merged proof accepts official same-second physical completion and merge",async()=>{
+  const m=await mergedFixture();m.f.state.extraPr.merged_at=m.state.all[0].completed_at;
+  assert.equal((await m.verify()).promotion.mergeRevision,m.P);
+});
+test("Main2351 merged proof rejects physical completion one second after merge",async()=>{
+  const m=await mergedFixture();m.f.state.extraPr.merged_at=clock(499);
+  await assert.rejects(m.verify(),/no later than recorded promotion/);
+});
+for(const fault of ["candidate-event","candidate-path","different-workflow","file-as-B","green-stub","skipped-step","duplicate-job","missing-original",
+  "late-execution","fake-P","P-tree","source-history","frame-B","frame-M","frame-source","frame-release","frame-attempt","bootstrap","locator-race","main-rewrite","default-dev","required-app"])
+test("Main2351 merged proof rejects "+fault,async()=>{
+  const m=await mergedFixture();
+  if(fault==="candidate-event")m.state.run.event="pull_request";
+  if(fault==="candidate-path")m.state.run.path=".github/workflows/candidate.yml";
+  if(fault==="different-workflow")m.state.run.workflow_id++;
+  if(fault==="file-as-B")m.state.suite.workflowRun.file.repositoryFileUrl=m.state.suite.workflowRun.file.repositoryFileUrl.replace(m.F,C);
+  if(fault==="green-stub"){m.state.all[0].steps=[];m.state.latest=clone(m.state.all)}
+  if(fault==="skipped-step"){m.state.all[0].steps[0].status="in_progress";m.state.latest=clone(m.state.all)}
+  if(fault==="duplicate-job")m.state.all.push({...clone(m.state.all[0]),id:704});
+  if(fault==="missing-original")m.state.all=[];
+  if(fault==="late-execution"){m.state.all[0].completed_at=clock(700);m.state.latest=clone(m.state.all)}
+  if(fault==="fake-P")m.f.state.treeRoutes.get("git/commits/"+m.P).parents.reverse();
+  if(fault==="P-tree")m.f.state.treeRoutes.get("git/commits/"+m.P).tree.sha="1".repeat(40);
+  if(fault==="source-history")m.f.state.afterRead=(route,value)=>{if(route===`compare/${S}...${m.F}`)value.status="diverged"};
+  if(fault==="frame-B")m.state.record.execution.revision=S;
+  if(fault==="frame-M")m.state.record.promotion.snapshotRevision=S;
+  if(fault==="frame-source")m.state.record.source.revision=C;
+  if(fault==="frame-release")m.state.record.release.completionSha256="0".repeat(64);
+  if(fault==="frame-attempt")m.state.record.execution.physicalAttempt=2;
+  if(fault==="bootstrap")m.f.state.extraPr.body="<!-- bamboo-main-locator/v1\n"+JSON.stringify({mode:"bootstrap",sourceRevision:S,featurePr:2333,ciRun:123})+"\n-->";
+  if(fault==="locator-race")m.f.state.afterRead=(route,value,n)=>{if(route==="pulls/88"&&n>1)value.body=value.body.replace('"releaseRun":900','"releaseRun":901')};
+  if(fault==="main-rewrite")m.f.state.afterRead=(route,value,n)=>{if(route==="branches/main"&&n>1)value.commit.sha=S;if(route===`compare/${m.P}...${S}`)value.status="diverged"};
+  if(fault==="default-dev")m.f.state.afterRead=(route,value)=>{if(route==="")value.default_branch="dev"};
+  if(fault==="required-app")m.f.f.main.protection.required_status_checks.checks[0].app_id=99;
+  await assert.rejects(m.verify());
+});
+test("Main2351 fixed control closure rejects caller policy and every nonordinary/missing control",async()=>{
+  const f=await promotionFixture(true);f.policy.controlPaths=[source.WORKFLOW];await assert.rejects(f.promote(),/Caller-selected/);
+  for(const path of proof.MAIN_CONTROLS){
+    const leaves=new Map(proof.MAIN_CONTROLS.map(name=>[name,{mode:"100644",sha:"1".repeat(40)}]));
+    leaves.delete(path);assert.throws(()=>proof.closure(leaves));leaves.set(path,{mode:"120000",sha:"1".repeat(40)});assert.throws(()=>proof.closure(leaves));
+  }
+});
+test("Main2351 physical log frame rejects echo, duplicate, noncanonical, oversized and bootstrap data",async()=>{
+  const m=await mergedFixture(),record=m.state.record,valid=clock(499)+" "+proof.mainFrameLine(record)+"\n";
+  assert.deepEqual(proof.logFrame(valid),record);
+  const line=value=>clock(499)+" "+proof.MAIN_PREFIX+Buffer.from(value).toString("base64")+"\n";
+  for(const log of [valid+valid,proof.mainFrameLine(record),line(JSON.stringify(record,null,2)),line(" ".repeat(65537)),
+    line(core.canonicalJson({...record,kind:"bamboo-main-bootstrap-ops/v1"})),line(core.canonicalJson({...record,publicationAuthorized:true}))])assert.throws(()=>proof.logFrame(log));
+});
+test("Main2351 public receipt accepts real thirty-crate checkpoint shape above 64 KiB within producer 1 MiB",async()=>{
+  const f=await fixture(),original=require("./release-crate-output.cjs"),sandbox=require("./release-cargo-sandbox.cjs");
+  const members=readFileSync(path.join(__dirname,"..","Cargo.toml"),"utf8").match(/default-members\s*=\s*\[([\s\S]*?)\]/)[1];
+  const crates=[...members.matchAll(/"([^"]+)"/g)].map(([,directory])=>({directory,
+    name:readFileSync(path.join(__dirname,"..",directory,"Cargo.toml"),"utf8").match(/(?:^|\n)name\s*=\s*"([^"]+)"/)[1]}));
+  assert.equal(crates.length,30);assert.equal(new Set(crates.map(x=>x.name)).size,30);
+  const receipt=f.state.receipt,version=receipt.version,checksum=f.state.record.crates[0].archiveSha256;
+  receipt.crates=crates.map(x=>x.name);receipt.packageChecksums={};receipt.crateOriginals={};
+  receipt.frontendOriginals={schemaVersion:1,complete:true,assets:clone(f.state.record.frontend)};
+  receipt.nativeOriginals=core.nativeOriginalContract({workflowRevision:C,runId:"900"});
+  f.state.record.crates=[];
+  for(const [index,{name,directory}]of crates.entries()){
+    const assetName=`bamboo-verified-crate-${name}-${version}.zip`,existing=f.state.assets.find(asset=>asset.name===assetName);
+    const assetId=existing?.id??6000+index,bytes=existing?f.state.data.get(assetId):Buffer.from("inert retained crate transport "+name);
+    const ref={assetId,name:assetName,sizeBytes:bytes.length,sha256:hash(bytes)};
+    if(!existing)f.state.assets.push({id:assetId,name:assetName,size:bytes.length,digest:"sha256:"+ref.sha256,state:"uploaded"});
+    f.state.data.set(assetId,bytes);f.state.registry.set(name,checksum);
+    const inputs={repository:source.REPOSITORY,releaseId:4000,sourceRevision:S,sourceTree:f.state.record.source.tree,version,name,
+      pathInVcs:directory==="."?"":directory,frontendBytes:clone(receipt.frontendBytes)};
+    const origin={controllerRevision:C,runId:900,attempt:1,jobId:2001,jobKey:"publish-crates",jobName:original.JOB,workflowPath:original.WORKFLOW};
+    const archiveProof={schemaVersion:1,kind:original.KIND,inputs,origin,archive:{name:`${name}-${version}.crate`,size:1,sha256:checksum},
+      verification:{preparationCommand:["package","--locked","--allow-dirty","--no-verify","-p",name],
+        command:["package","--locked","--allow-dirty","-p",name],image:sandbox.IMAGE,exitCode:0}};
+    const state={schemaVersion:1,kind:original.KIND,inputs,origin,phase:"published",sealed:{size:bytes.length,sha256:ref.sha256,proof:archiveProof},
+      asset:{id:assetId,name:assetName,size:bytes.length,digest:"sha256:"+ref.sha256}};
+    original.record(state,inputs);receipt.crateOriginals[name]=state;receipt.packageChecksums[name]=checksum;
+    f.state.record.crates.push({name,archiveSha256:checksum,zipAssetRef:ref,origin:{jobId:2001,attempt:1},verificationSha256:hash(Buffer.from(core.canonicalJson(archiveProof))),registryChecksum:checksum});
+  }
+  core.signReceipt(receipt,"d".repeat(64));core.validateReceipt(receipt,receipt.identity,receipt.crates,version);
+  const pretty=Buffer.from(JSON.stringify(receipt,null,2));assert.ok(pretty.length>65536&&pretty.length<=1024*1024);
+  const ref=f.state.record.release.receiptAsset;ref.sha256=hash(pretty);ref.sizeBytes=pretty.length;f.state.data.set(ref.assetId,pretty);
+  Object.assign(f.state.assets.find(asset=>asset.id===ref.assetId),{size:pretty.length,digest:"sha256:"+ref.sha256});
+  f.state.record.release.receiptSha256=hash(Buffer.from(core.canonicalJson(receipt)));f.state.release.body=core.receiptBody(receipt);
+  assert.equal((await f.verify()).crates.length,30);
+});
+for(const [role,maximum]of[["receipt",1024*1024],["wrapper",1024*1024],["accepted-source-zip",16*1024*1024]])
+test("Main2351 public "+role+" retains its own strict role bound",async()=>{
+  const f=await fixture(),ref=role==="receipt"?f.state.record.release.receiptAsset:f.state.record.frontend[role==="wrapper"?0:1];
+  ref.sizeBytes=maximum+1;f.state.assets.find(asset=>asset.id===ref.assetId).size=ref.sizeBytes;
+  await assert.rejects(f.verify(),/exceeds its role bound/);assert.ok(!f.state.binaryReads.includes(ref.assetId));
 });

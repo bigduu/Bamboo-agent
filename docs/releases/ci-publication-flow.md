@@ -2,7 +2,7 @@
 
 Read the complete local [delivery-flow/v1](../delivery-workflow.md) and
 [Actions audit](../ci-workflow-audit.md) first. These shared copies come from
-Zenith `874ee7c`; this guide adds Bamboo's commands, configurations and test map.
+Zenith `28b6e0e`; this guide adds Bamboo's commands, configurations and test map.
 Use the same source checkpoint and original evidence when another agent takes
 over. Check current activation and actual runs; a prepared owner is not an
 accepted or published artifact.
@@ -584,3 +584,88 @@ iterating, use `node --test scripts/published-source-admission.test.cjs` or its
 name filters. Do not rerun product suites or historical Source checks to change
 an original execution's identity. Actual trusted-base loader/bootstrap and the
 first complete release/promotion remain separate acceptance work.
+
+## Main loader and merged promotion prepared by #2351
+
+The separate `main-admission.yml` prepares a single real `Main Admission` check
+for Main PR Target events. It has read-only contents/actions/checks/pull-request
+permissions, no Environment or publication credentials, and runs no candidate
+code, Cargo, npm, browser, Unit/E2E, package or publication command. An initial
+guard stops before checkout while default remains dev. The helper independently
+rechecks actual repository default, enforced Main context/app, event, protected
+Main B, clean checkout and the entire fixed 25-file ordinary B closure, including
+both complete linked local shared documents.
+
+The CLI accepts no mode, policy or approval JSON. Its one bounded locator in the
+PR body is data, never authority:
+
+```text
+<!-- bamboo-main-locator/v1
+{"mode":"promotion","sourceRevision":"<S>","featurePr":123,"ciRun":456,"releaseRun":789}
+-->
+```
+
+The real publication verifier still needs the accepted complete feature/release
+producers. Neither registry is activated here. The standalone Ops export
+`verifyBootstrap` accepts a bootstrap locator with the same source/feature fields
+and no releaseRun. It proves only legacy Main `d6325a73` / tree `9557a389` plus
+all controls from actual accepted dev D; product/lock/gitlink/mode changes fail.
+The normal CLI refuses that mode. First bootstrap is a separate guarded Ops
+operation, not an invented Actions success or downstream deployment permission.
+
+PRT's default-branch execution semantics and API metadata differ. Bodhi's real
+negative PR135/run40432117302 checked out B=`19f11149`, but REST run/job/check-run,
+CheckSuite.commit and GraphQL `file.repositoryFileUrl` all named F=`a0cc5cfd`.
+The loader preserves actual GITHUB identities and validates that explicit F
+metadata shape. It separately verifies B's pinned workflow bytes and closure;
+it never infers executed B from that file URL. Promotion M comes from the fresh
+PR/Git API, independently of GITHUB_SHA. Feature M remains in its original facts.
+
+After all checks and fresh runtime/PR/source reads, the real job emits exactly
+one canonical `Bamboo Main admission:` frame. The consumer accepts only that
+original physical successful job/attempt and completed required step in the
+specific Target workflow. Cloned rerun metadata does not create another physical
+execution. `verifyMergedPromotion({pullRequest, admissionRun}, reads)` requires
+an actually merged PR, P's ordered [B,F] parents, original admission before merge,
+S ancestry, unchanged product plus complete B controls, and P.tree equal to the
+checked promotion M.tree. It rereads mutable refs/checks/locators and permits
+only normal subsequent Main advancement. Bootstrap cannot produce this proof.
+
+The result is read-only facts (`publicationAuthorized:false`). Its `featureDocs`
+field identifies the authenticated original Documentation execution, tested M,
+source tree and expected artifact name. A separate Docs consumer must still
+validate official artifact ID/digest, receipt and original tar bytes. Docker
+transport/publication likewise remains its own lifecycle; this loader neither
+builds nor deploys those outputs.
+
+`main-admission.cjs` exports zero-argument `createPublicReads()` for these later
+public consumers. It shares the fixed-origin repository GET, fixed read-only
+check-suite query, original job-log/asset reads and credential-free crates.io
+checksum read. It accepts no caller policy, authority or credential override;
+requiring the module does not run its event-only CLI. Consumers reuse these
+ports rather than copying a second GitHub transport.
+
+Before calling this active, Ops must install truly accepted controls, retire
+legacy automatic Main compilers/publishers, switch default to Main, configure
+and read back the real protection, and exercise same-name candidate success
+stubs with both completion orders. Current context+Actions-app protection and
+PR135's second-bootstrap rejection do not prove collision prevention. If the
+personal repository cannot bind the required workflow, record that boundary;
+do not widen credentials, introduce an App/key or claim mock acceptance as live.
+
+Focused local validation, without historical/product-suite repetition:
+
+```bash
+node --test scripts/main-admission.test.cjs
+node --test --test-name-pattern='^(Main2351|Main promotion)' scripts/published-source-admission.test.cjs
+node --test --test-name-pattern='^Main2351 workflow contract$' scripts/ci-policy.test.cjs
+actionlint .github/workflows/main-admission.yml
+```
+
+Tiny real Git, synthetic API/frame and valid thirty-crate receipt fixtures prove
+component behavior only. The public pretty receipt has a 1 MiB bound aligned
+with its producer; both completion and Main admission log frames remain 64 KiB.
+Original wrapper assets have a 1 MiB role. New Source intentionally accepts ZIP
+blobs only up to 16 MiB (and bounded JSON/base64 reads), while the legacy carrier
+supports up to 256 MiB. This child does not expand Source or claim larger ZIP
+admission. Hashes, Git blobs, asset IDs/size/digest and fresh rechecks remain strict.

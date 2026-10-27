@@ -256,3 +256,41 @@ it already contains that same closure. Never replace the Main gate with an old
 feature-only workflow or mix individual control files. Keep original physical
 log identities when GitHub copies successes on rerun; an old frame is immutable.
 The existing Quick Checks owner imports the focused Main proof tests once.
+
+## Main loader staged by #2351
+
+`main-admission.yml` and `scripts/main-admission.cjs` prepare a read-only
+`Main Admission` job. The current default branch is dev: the workflow stops
+before checkout until the separate Ops cutover selects default Main. Never
+change default/protection, dispatch or register a producer merely to make this
+staged code green. Source/release registries remain inactive. Legacy automatic
+Main compilers/publishers are still live until their separate cutover.
+
+After activation, only actual trusted B is checked out. The fixed 25 ordinary
+B controls include the full release-helper and Main-reader closure plus both
+complete linked local shared documents; candidate
+paths/policy/approval JSON cannot select a partial closure. Do not run product
+S code, package managers, compilers or tests in this workflow. The normal CLI
+always rejects bootstrap. Its separate exported Ops component can prove only
+the fixed legacy Main product tree plus actual accepted-D controls; that result
+cannot authorize a release, Docs deployment or Docker publication.
+
+Keep PRT metadata F separate from executed B: actual run/job/check-suite and
+GraphQL file URL name F, while GITHUB_SHA/GITHUB_WORKFLOW_SHA and checkout are
+B on default Main. A file URL naming F is not the executed definition. The
+physical canonical admission frame binds B/F/promotion M, published S and the
+original job; `verifyMergedPromotion` subsequently proves real normal P and its
+exact postimage, without relabeling the feature's tested M or release C/S.
+
+Required name plus Actions app15368 is not proven workflow-definition binding.
+Ops must test candidate same-name stubs in both completion orders and record any
+personal-repository platform limitation. Do not add an App/key or fabricate a
+status to fill that gap. Future consumers verify original successful execution
+and the merged-P proof, not merely a green name. The returned Docs execution
+locator does not yet verify artifact API ID/digest or site tar integrity.
+
+Public pretty receipt assets use the producer's 1 MiB role; completion/admission
+frames stay 64 KiB. Wrapper assets stay 1 MiB. New Source accepts ZIP blobs only
+up to 16 MiB, despite the broader legacy frontend carrier. Keep all original
+hash/ID/size and fresh-read checks. Use the focused #2351 commands in the local
+guide; do not repeat historical Source or product suites for this loader.
