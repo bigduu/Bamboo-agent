@@ -162,7 +162,16 @@ impl<'de> Deserialize<'de> for Unique {
 }
 
 pub(crate) fn decode_report(content: &str) -> Result<Value, &'static str> {
-    if content.len() > MAX_CHILD_RESULT_BYTES {
+    decode_report_with_limit(content, MAX_CHILD_RESULT_BYTES)
+}
+
+/// The strict shape is shared; only a trusted runtime caller selects its
+/// storage budget. Compact provider delivery keeps its original 8 KiB cap.
+pub(super) fn decode_report_with_limit(
+    content: &str,
+    max_bytes: usize,
+) -> Result<Value, &'static str> {
+    if content.len() > max_bytes {
         return Err("result_budget_exceeded");
     }
     let malformed = || "report_malformed";
@@ -193,6 +202,12 @@ pub(crate) fn decode_report(content: &str) -> Result<Value, &'static str> {
         return Err(malformed());
     }
     Ok(value)
+}
+
+pub(super) fn unique_json(content: &str) -> Result<Value, &'static str> {
+    serde_json::from_str::<Unique>(content)
+        .map(|value| value.0)
+        .map_err(|_| "report_malformed")
 }
 
 #[cfg(test)]
