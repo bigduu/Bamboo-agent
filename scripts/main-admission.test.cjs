@@ -113,6 +113,27 @@ test("Main2351 fixed read adapters isolate credentials and reject arbitrary rout
   for (const route of ["/outside", "../outside", "https://example.invalid", "contents/%2e%2e/file"]) await assert.rejects(reads.json(route));
   assert.deepEqual(Object.keys(controller.childEnv(env)).sort(), ["GH_PROMPT_DISABLED", "HOME", "PATH", "TMPDIR"]);
 });
+test("Raw2358 Main preserves official ANSI log bytes only on its bounded raw GET", async () => {
+  const log = "2026-10-27T00:00:00Z \u001b[31moriginal Windows output\u001b[0m\r\n", binary = Buffer.from([80, 75, 0, 27, 255]);
+  const calls = [], env = { ...safe, GH_TOKEN: "inert-read", BAMBOO_RELEASE_SIGNING_KEY: "unused", CARGO_REGISTRY_TOKEN: "unused" };
+  let failed = false;
+  const reads = controller.createReads(env, (command, args, options) => {
+    assert.equal(command, "gh"); calls.push({ args, options });
+    if (args.some(value => value.endsWith("/actions/jobs/7/logs"))) return args.includes("--allow-escape-sequences") && !failed
+      ? { status: 0, stdout: log } : { status: 1, stderr: "inert raw-log refusal" };
+    assert.ok(!args.includes("--allow-escape-sequences"), "JSON and binary ports must retain their original policy");
+    return { status: 0, stdout: options.encoding === null ? Buffer.from(binary) : "{}" };
+  }, () => assert.fail("No network in raw-log contracts"));
+  assert.deepEqual(Buffer.from(await reads.jobLog(7)), Buffer.from(log));
+  assert.deepEqual(calls[0].args, ["api", "--hostname", "github.com", "--method", "GET",
+    `repos/${source.REPOSITORY}/actions/jobs/7/logs`, "--allow-escape-sequences"]);
+  assert.equal(calls[0].options.maxBuffer, 64 * 1024 * 1024); assert.equal(calls[0].options.timeout, 30000);
+  assert.equal(calls[0].options.encoding, "utf8"); assert.deepEqual(calls[0].options.env, controller.childEnv(env, true));
+  await reads.json(""); await reads.checkSuite("CS_inert");
+  assert.deepEqual(await reads.assetBytes(8, binary.length), binary); assert.deepEqual(await reads.artifactBytes(9, binary.length), binary);
+  failed = true; await assert.rejects(reads.jobLog(7), /Read-only GitHub request failed/);
+  const count = calls.length; await assert.rejects(reads.jobLog("../7")); assert.equal(calls.length, count);
+});
 test("Main2351 registry read sends no GitHub credential and bounds its own checksum data", async () => {
   let options;
   const reads = controller.createReads(safe, () => assert.fail("No GitHub read"), async (url, value) => {

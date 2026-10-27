@@ -738,3 +738,24 @@ node --test --test-name-pattern='^Controller2354 keeps' scripts/ci-policy.test.c
 
 Keep the original locator RED and subsequent exact-source results. Tiny Git and
 inert API/registration-first fixtures prove contracts, not actual P0/P1 acceptance.
+
+### Raw official log reads (#2358)
+
+Official job logs can contain ANSI escapes. Only the four raw job-log GETs in
+the Main public reader, Source-factory reader and Native selector/collector pass
+`gh api --allow-escape-sequences`. Keep their original bytes, including escapes
+and line endings; do not sanitize evidence before hashes or frame checks. JSON
+and binary GETs retain their previous policy. Main/Native keep 64 MiB log bounds;
+the Source factory keeps 256 KiB, with unchanged child credential filtering.
+Reading a log does not activate either producer registry or grant authority.
+
+The existing test owners register inert transport regressions. Run only this
+affected selection while changing the raw-log boundary:
+
+```bash
+node --test --test-name-pattern='^Raw2358' scripts/main-admission.test.cjs scripts/crate-release.test.cjs scripts/native-originals.test.cjs
+```
+
+The one authorized live read of original job122092551765 compares the public
+reader's bytes/hash with retained raw evidence without printing the log. That
+read verifies transport compatibility, not Source, Main or product acceptance.

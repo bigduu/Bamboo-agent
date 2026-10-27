@@ -108,6 +108,49 @@ function fixture(t) {
 }
 
 function register() {
+  test('Raw2358 Native selector and collector retain ANSI bytes without changing JSON or binary reads', async t => {
+    const f = fixture(t), preparing = job(f.identity, original.TARGETS[0], 901, 1, [original.PREPARE])
+    preparing.name = 'automatic'
+    const current = job(f.identity, original.TARGETS[0], 777, 1, [original.SELECT])
+    current.status = 'in_progress'; current.conclusion = null
+    current.steps[0].status = 'in_progress'; current.steps[0].conclusion = null
+    const value = core.signReceipt({ schemaVersion: 1, kind: original.PLAN_KIND,
+      reservationSha256: original.contract(f.preparation, f.identity), runId: f.identity.runId,
+      runAttempt: 1, controllerRevision: f.identity.workflowRevision, preparationJobId: preparing.id,
+      targets: original.TARGETS.map(target => ({ target, action: 'build' })) }, key)
+    let frame; original.emit(original.PLAN_PREFIX, value, line => { frame = line })
+    const log = `${timestamp(0)} \u001b[33moriginal native output\u001b[0m\r\n${timestamp(19)} ${frame}\n`
+    const binary = Buffer.from([80, 75, 0, 27, 255]), calls = [], execute = sidecar.execute, github = core.github
+    try {
+      sidecar.execute = (program, args, options = {}) => {
+        assert.equal(program, 'gh'); calls.push({ args, options }); const route = args[1]
+        if (route.endsWith(`/actions/jobs/${preparing.id}/logs`)) {
+          assert.deepEqual(args, ['api', `repos/${f.identity.repository}/actions/jobs/${preparing.id}/logs`, '--allow-escape-sequences'])
+          assert.equal(options.maxBuffer, 64 * 1024 * 1024); return log
+        }
+        assert.ok(!args.includes('--allow-escape-sequences'))
+        if (route.endsWith('/attempts/1/jobs?per_page=100&page=1')) return JSON.stringify({ total_count: 2, jobs: [preparing, current] })
+        if (route.endsWith(`/actions/jobs/${current.id}`)) return JSON.stringify(current)
+        if (route.endsWith(`/actions/jobs/${preparing.id}`)) return JSON.stringify(preparing)
+        assert.equal(route, `repos/${f.identity.repository}/actions/artifacts/9/zip`)
+        assert.equal(options.encoding, null); assert.equal(options.maxBuffer, original.MAX_ZIP); return binary
+      }
+      core.github = (repository, route) => { assert.equal(repository, f.identity.repository); assert.equal(route, 'actions/runs/100'); return { inert: true } }
+      await t.test('read-only physical worker', async () => {
+        assert.equal((await original.workerSelection(f.identity, f.preparation, value, original.TARGETS[0], true)).action, 'build')
+      })
+      await t.test('collector raw bytes and unchanged binary port', async () => {
+        const context = original.createContext(f.identity, f.preparation, { RUNNER_TEMP: f.root, GITHUB_REPOSITORY: f.identity.repository,
+          GITHUB_SHA: f.identity.workflowRevision, GITHUB_WORKFLOW_SHA: f.identity.workflowRevision, GITHUB_RUN_ID: f.identity.runId,
+          GITHUB_RUN_ATTEMPT: '1', BAMBOO_RELEASE_SIGNING_KEY: key, BAMBOO_RELEASE_SIGNING_KEY_SHA256: core.sha256(Buffer.from(key, 'hex')) })
+        assert.deepEqual(Buffer.from(await context.readLog(preparing.id)), Buffer.from(log))
+        assert.equal(context.readRun(100).inert, true)
+        assert.deepEqual(fs.readFileSync(context.readArtifact({ id: 9 })), binary)
+      })
+      assert.ok(calls.length >= 2)
+    } finally { sidecar.execute = execute; core.github = github }
+  })
+
   test('native originals have one existing automatic feature policy owner', () => {
     const source = fs.readFileSync('.github/workflows/ci.yml', 'utf8')
     const quick = source.split('  quick-checks:\n')[1].split(/\n  [a-z][\w-]*:\n/)[0]

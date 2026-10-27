@@ -13,6 +13,35 @@ const { assertVersion, assertManualVersion, validateSource, validateReceipt, nex
   resumePrepared, assertAdmissionCompatibility, nativeOriginalContract, sourceDispatchContract,
   readFrozenSourceContext, makeFrozenSourceContext } = require('./crate-release.cjs')
 
+test('Raw2358 Source factory keeps original ANSI logs on its fixed bounded text port', async () => {
+  const log = '2026-10-27T00:00:00Z \u001b[32mphysical feature log\u001b[0m\r\n', calls = []
+  const env = { PATH: '/inert/bin', HOME: '/inert/home', GH_TOKEN: 'inert-read',
+    BAMBOO_RELEASE_SIGNING_KEY: 'unused', CARGO_REGISTRY_TOKEN: 'unused' }
+  let failed = false
+  const spawn = (program, args, options) => {
+    assert.equal(program, 'gh'); calls.push({ args, options })
+    if (args.some(value => value.endsWith('/actions/jobs/7/logs'))) return args.includes('--allow-escape-sequences') && !failed
+      ? { status: 0, stdout: log } : { status: 1, stderr: 'inert raw-log refusal' }
+    assert.ok(!args.includes('--allow-escape-sequences'))
+    return { status: 0, stdout: args.includes('graphql') ? '{"data":{"node":{"inert":true}}}' : '{"inert":true}' }
+  }
+  const module = { exports: {} }, code = fs.readFileSync(path.join(__dirname, 'crate-release.cjs'), 'utf8').replace(/^#![^\n]*\n/, '')
+  // Test-only access to the private port; production gains no injected factory or export.
+  require('node:vm').runInNewContext(code + '\nmodule.exports.raw2358 = frozenSourceReads;', {
+    require: name => name === 'node:child_process' ? { spawnSync: spawn } : require(name), module,
+    process: { env }, Buffer, __dirname })
+  const reads = module.exports.raw2358()
+  assert.deepEqual(Buffer.from(await reads.jobLog(7)), Buffer.from(log))
+  assert.deepEqual(Array.from(calls[0].args), ['api', '--hostname', 'github.com', '--method', 'GET',
+    'repos/bigduu/Bamboo-agent/actions/jobs/7/logs', '--allow-escape-sequences'])
+  assert.equal(calls[0].options.encoding, 'utf8'); assert.equal(calls[0].options.maxBuffer, 262144)
+  assert.equal(calls[0].options.timeout, 30000)
+  assert.deepEqual({ ...calls[0].options.env }, { PATH: env.PATH, HOME: env.HOME, GH_TOKEN: env.GH_TOKEN })
+  assert.equal((await reads.json('branches/dev')).inert, true); assert.equal((await reads.checkSuite('CS_inert')).inert, true)
+  failed = true; await assert.rejects(reads.jobLog(7), /failed/)
+  const count = calls.length; await assert.rejects(reads.jobLog(0)); assert.equal(calls.length, count)
+})
+
 const clone = (value) => JSON.parse(JSON.stringify(value))
 const sourceRevision = 'a'.repeat(40)
 const identity = { repository: 'bigduu/Bamboo-agent', sourceRevision,

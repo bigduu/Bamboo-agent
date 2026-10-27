@@ -326,3 +326,13 @@ Preserve the shared zero-argument public read factory and the inherited bounded
 artifact ZIP port. This child changes no Main YAML/hash, protection/default,
 publisher, Docs/Docker worker or production state. Only focused `Controller2354`
 mock/tiny-Git contracts run locally; their fixtures are not accepted producers.
+
+## Raw official job-log transport (#2358)
+
+The Main public reader, Source-factory reader and Native selector/collector use
+`--allow-escape-sequences` only on their fixed raw Actions job-log GETs. Preserve
+original ANSI and line-ending bytes for hashes and frame verification. Keep the
+existing bounds, child environments and JSON/binary policy; never strip escapes,
+enable the flag globally or treat readable logs as source/publication authority.
+Use the three existing test owners' `Raw2358` inert-port cases for this boundary,
+without repeating product, browser or historical acceptance suites.

@@ -730,7 +730,7 @@ function frozenSourceReads() {
     },
     jobLog: async id => {
       assert.ok(Number.isSafeInteger(id) && id > 0)
-      return read(['--method', 'GET', `repos/bigduu/Bamboo-agent/actions/jobs/${id}/logs`], 262144)
+      return read(['--method', 'GET', `repos/bigduu/Bamboo-agent/actions/jobs/${id}/logs`, '--allow-escape-sequences'], 262144)
     },
   }
 }

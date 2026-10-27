@@ -403,7 +403,7 @@ async function workerSelection(identity, preparation, planValue, target, selecti
   assert.equal(current.length, 1, 'Missing/duplicate current physical native job')
   return selectCurrent({ identity, preparation,
     readJob: async id => get(`actions/jobs/${id}`),
-    readLog: async id => sidecar.execute('gh', ['api', `repos/${identity.repository}/actions/jobs/${id}/logs`], { maxBuffer: MAX_NATIVE_LOG }),
+    readLog: async id => sidecar.execute('gh', ['api', `repos/${identity.repository}/actions/jobs/${id}/logs`, '--allow-escape-sequences'], { maxBuffer: MAX_NATIVE_LOG }),
   }, planValue, target, current[0], { selecting })
 }
 
@@ -504,7 +504,7 @@ function createContext(identity, preparation, env = process.env) {
     guard: () => core.assertCurrentMain(identity.repository, identity.sourceRevision),
     readRun: id => get(`actions/runs/${id}`), readJob: id => get(`actions/jobs/${id}`),
     jobs: () => paged(`actions/runs/${identity.runId}/jobs?filter=all`, 'jobs'),
-    readLog: id => sidecar.execute('gh', ['api', `repos/${identity.repository}/actions/jobs/${id}/logs`], { maxBuffer: MAX_NATIVE_LOG }),
+    readLog: id => sidecar.execute('gh', ['api', `repos/${identity.repository}/actions/jobs/${id}/logs`, '--allow-escape-sequences'], { maxBuffer: MAX_NATIVE_LOG }),
     readRelease: id => get(`releases/${id}`), readTag: version => get(`git/ref/tags/v${core.assertVersion(version)}`),
     listAssets: id => paged(`releases/${id}/assets`),
     readArtifactMetadata: id => get(`actions/artifacts/${id}`),

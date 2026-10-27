@@ -37,7 +37,7 @@ function createReads(env = process.env, spawn = spawnSync, fetcher = fetch) {
       const result = JSON.parse(gh(["graphql", "-f", "query=" + query, "-f", "suite=" + nodeId]));
       assert.ok(!result.errors, "Official read-only check-suite query failed"); return result.data?.node;
     },
-    jobLog: async jobId => gh(["--method", "GET", `repos/${source.REPOSITORY}/actions/jobs/${id(jobId)}/logs`], 64 * 1024 * 1024),
+    jobLog: async jobId => gh(["--method", "GET", `repos/${source.REPOSITORY}/actions/jobs/${id(jobId)}/logs`, "--allow-escape-sequences"], 64 * 1024 * 1024),
     assetBytes: async (assetId, maximum) => {
       assert.ok(Number.isSafeInteger(maximum) && maximum > 0 && maximum <= 1024 * 1024 ** 2);
       return gh(["--method", "GET", `repos/${source.REPOSITORY}/releases/assets/${id(assetId)}`, "-H", "Accept: application/octet-stream"], maximum, true);
