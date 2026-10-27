@@ -150,6 +150,10 @@ impl QuietPollGuard {
         self.pending.is_some()
     }
 
+    pub(super) fn pending_handle(&self) -> Option<&str> {
+        self.pending.as_deref()
+    }
+
     /// Once the complete batch is paired, feedback releases its suppression.
     /// The next model-requested read must reach the real owned capture again.
     pub(super) fn take_feedback_evidence(

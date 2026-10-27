@@ -233,6 +233,21 @@ pub trait BashResumeHook: Send + Sync {
     /// Arrange a detached self-resume for `session_id`, which has just been
     /// durably suspended waiting on the background shells in `bash_ids`.
     fn arrange_bash_self_resume(&self, session_id: String, bash_ids: Vec<String>);
+
+    /// Older hosts remain pull-only unless they explicitly implement the
+    /// owner-checked exec handoff and durable completion delivery below.
+    fn supports_background_exec(&self) -> bool {
+        false
+    }
+
+    /// Start monitoring only after the caller commits the durable wait. The
+    /// reservation keeps capture alive and prevents duplicate live monitors.
+    fn arrange_exec_self_resume(
+        &self,
+        _job: bamboo_tools::tools::exec_command::BackgroundExecJob,
+        _session_created_at: chrono::DateTime<chrono::Utc>,
+    ) {
+    }
 }
 
 /// A child sub-agent's request to have a gated tool approved by its parent.
