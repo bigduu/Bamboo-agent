@@ -12,7 +12,24 @@ const {
   verifyLotusNextArtifact,
 } = require("./lotus-next-artifact.cjs");
 
-const ROOT = path.resolve(__dirname, "..");
+function verifySourceRoot() {
+  const args = process.argv.slice(2);
+  if (!args.some((value) => value === "--source-root" || value.startsWith("--source-root="))) return null;
+  if (args.length !== 3 || args[0] !== "verify" || args[1] !== "--source-root" || !path.isAbsolute(args[2])) {
+    throw new Error("Use verify --source-root <absolute S path>; source-root is supported only by verify");
+  }
+  if ((process.env.LOTUS_SOURCE || "committed").toLowerCase() !== "committed" ||
+      (process.env.LOTUS_PACKAGE_NAME || LOTUS_NEXT_PACKAGE_NAME) !== LOTUS_NEXT_PACKAGE_NAME) {
+    throw new Error("verify --source-root requires the committed Lotus Next artifact");
+  }
+  const root = fs.realpathSync(args[2]);
+  if (!fs.statSync(root).isDirectory()) throw new Error("verify --source-root requires an existing source directory");
+  return root;
+}
+let VERIFY_SOURCE_ROOT;
+try { VERIFY_SOURCE_ROOT = verifySourceRoot(); }
+catch (error) { console.error(`❌ ${error.message}`); process.exit(1); }
+const ROOT = VERIFY_SOURCE_ROOT || path.resolve(__dirname, "..");
 // bamboo-server owns the package it embeds. Keeping the bytes inside the crate
 // makes the source checkout, `cargo package`, and downstream installs use the
 // same platform-safe path instead of relying on workspace-relative symlinks.
@@ -25,7 +42,8 @@ const OUTPUT_DIR = path.join(
 );
 const OUTPUT_ZIP = path.join(OUTPUT_DIR, "lotus-frontend.zip");
 const OUTPUT_MANIFEST = path.join(OUTPUT_DIR, "frontend-manifest.json");
-const ARTIFACT_LOCK_PATH = path.join(__dirname, "frontend-package-lock.json");
+const ARTIFACT_LOCK_PATH = VERIFY_SOURCE_ROOT ? path.join(ROOT, "scripts", "frontend-package-lock.json") :
+  path.join(__dirname, "frontend-package-lock.json");
 const FRONTEND_MANIFEST_FILE = "frontend-manifest.json";
 const LEGACY_LOTUS_PACKAGE_NAME = "@bigduu/lotus";
 

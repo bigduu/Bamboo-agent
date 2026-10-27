@@ -48,7 +48,7 @@ function frozenSourceFixture(identities = frozenFixture.identities) {
     sourceRevision: "a".repeat(40), sourceDirty: false, entrypoint: "index.html", resourcesSha256: "8".repeat(64), manifestSha256: "9".repeat(64) }
   const content = { [frozenSource.WORKFLOW]: frozenFixture.workflowText, "Cargo.lock": "# inert locked fixture\n",
     "scripts/frontend-package-lock.json": JSON.stringify(lock),
-    [frozenSource.INPUT_PATHS.frontendManifest]: JSON.stringify({ schema_version: 1, frontend_name: "lotus-next", frontend_version: lock.packageVersion, entry: "index.html", bundle_hash: `sha256:${sourceHash(zip)}` }),
+    [frozenSource.INPUT_PATHS.frontendManifest]: JSON.stringify({ schema_version: 1, frontend_name: "lotus-next", frontend_version: lock.packageVersion, entry: "index.html", bundle_hash: `sha256:${'7'.repeat(64)}` }),
     [frozenSource.INPUT_PATHS.frontendZip]: zip, [frozenSource.INPUT_PATHS.nativeContract]: "// BAMBOO_SHARED_EXECUTABLES_V2\n" }
   const helpers = Object.fromEntries(frozenSource.REQUIRED_HELPERS.map(path => [path, sourceHash(frozenFixture.helperText)]))
   for (const path of frozenSource.REQUIRED_HELPERS) content[path] = frozenFixture.helperText
@@ -147,7 +147,7 @@ function mutateSourceFixture(model, item) {
   else if (["nativeV1", "frontendZip", "frontendDirty", "frontendVersion"].includes(operation)) {
     for (const ref of [frozenFixture.identities.M, frozenFixture.identities.S]) {
       if (operation === "nativeV1") model.files[ref][frozenSource.INPUT_PATHS.nativeContract] = "// BAMBOO_SHARED_EXECUTABLES_V1\n"
-      if (operation === "frontendZip") model.files[ref][frozenSource.INPUT_PATHS.frontendZip] += "drift"
+      if (operation === "frontendZip" && ref === frozenFixture.identities.S) model.files[ref][frozenSource.INPUT_PATHS.frontendZip] += "drift"
       if (operation === "frontendDirty" || operation === "frontendVersion") {
         const value = JSON.parse(model.files[ref][frozenSource.INPUT_PATHS.frontendLock]);
         if (operation === "frontendDirty") value.sourceDirty = true
@@ -168,6 +168,99 @@ function mutateSourceFixture(model, item) {
     }
   }
 }
+const committedFrontendPaths = [frozenSource.INPUT_PATHS.frontendLock,
+  frozenSource.INPUT_PATHS.frontendManifest, frozenSource.INPUT_PATHS.frontendZip]
+test('B0 facts keep real committed ZIP bytes separate from the wrapper resource hash', async () => {
+  const model = frozenSourceFixture(), bytes = Object.fromEntries(committedFrontendPaths.map(file => [file, readFileSync(file)]))
+  for (const files of Object.values(model.files)) for (const [file, value] of Object.entries(bytes)) files[file] = value
+  const wrapper = JSON.parse(bytes[frozenSource.INPUT_PATHS.frontendManifest])
+  const zipSha256 = sourceHash(bytes[frozenSource.INPUT_PATHS.frontendZip])
+  assert.notEqual(wrapper.bundle_hash, `sha256:${zipSha256}`)
+  const { releaseRef, ...input } = model.input
+  const facts = await frozenSource.verifyAcceptedDevFacts(input, model.reads, { producers: model.policy.producers })
+  assert.equal(facts.publicationAuthorized, false)
+  assert.equal(facts.inputs.frontendZip.sha256, zipSha256)
+  assert.equal(facts.inputs.frontendManifest.sha256, sourceHash(bytes[frozenSource.INPUT_PATHS.frontendManifest]))
+})
+test('B0 facts retain resource-hash syntax without treating it as a raw ZIP checksum', async () => {
+  const model = frozenSourceFixture(), { releaseRef, ...input } = model.input
+  for (const files of Object.values(model.files)) {
+    const wrapper = JSON.parse(files[frozenSource.INPUT_PATHS.frontendManifest]); wrapper.bundle_hash = 'invalid-resource-hash'
+    files[frozenSource.INPUT_PATHS.frontendManifest] = JSON.stringify(wrapper)
+  }
+  await assert.rejects(frozenSource.verifyAcceptedDevFacts(input, model.reads, { producers: model.policy.producers }))
+})
+function committedFrontendFixture(t, { controllerData = false } = {}) {
+  const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'bamboo-source-frontend-')))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const C = path.join(root, 'C'), S = path.join(root, 'S'), temporary = path.join(root, 'scratch')
+  mkdirSync(path.join(C, 'scripts'), { recursive: true }); mkdirSync(temporary)
+  for (const file of ['frontend-package.cjs', 'lotus-next-artifact.cjs']) writeFileSync(path.join(C, 'scripts', file), readFileSync(path.join('scripts', file)))
+  const copy = target => {
+    for (const file of committedFrontendPaths) {
+      const destination = path.join(target, file); mkdirSync(path.dirname(destination), { recursive: true }); writeFileSync(destination, readFileSync(file))
+    }
+  }
+  copy(S); if (controllerData) copy(C)
+  writeFileSync(path.join(S, 'scripts', 'lotus-next-artifact.cjs'), 'throw Error("candidate module must not execute")\n')
+  const inputs = () => Object.fromEntries(committedFrontendPaths.map(file => [file, sourceHash(readFileSync(path.join(S, file)))]))
+  const run = (args, additions = {}) => spawnSync(process.execPath, [path.join(C, 'scripts', 'frontend-package.cjs'), ...args], {
+    cwd: S, encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024,
+    env: { PATH: process.env.PATH, ...(process.env.HOME ? { HOME: process.env.HOME } : {}), TMPDIR: temporary,
+      LOTUS_SOURCE: 'committed', LOTUS_PACKAGE_NAME: '@bigduu/lotus-next', ...additions },
+  })
+  return { C, S, run, inputs }
+}
+test('B0 frontend C verifier reads the explicit S root without rebuilding or modifying its committed bytes', t => {
+  const fixture = committedFrontendFixture(t), before = fixture.inputs()
+  const result = fixture.run(['verify', '--source-root', fixture.S])
+  assert.equal(result.status, 0, result.stderr); assert.equal(result.error, undefined)
+  assert.ok(result.stdout.includes(path.join(fixture.S, 'crates/app/bamboo-server/frontend_package/lotus-frontend.zip')))
+  assert.deepEqual(fixture.inputs(), before)
+})
+test('B0 frontend C verifier rejects a wrapper differing from the wrapper inside the original ZIP', t => {
+  const fixture = committedFrontendFixture(t), file = path.join(fixture.S, frozenSource.INPUT_PATHS.frontendManifest)
+  const value = JSON.parse(readFileSync(file)); value.built_at = new Date(Date.parse(value.built_at) + 1).toISOString()
+  writeFileSync(file, JSON.stringify(value, null, 2) + '\n')
+  const before = fixture.inputs(), result = fixture.run(['verify', '--source-root', fixture.S])
+  assert.notEqual(result.status, 0); assert.match(result.stderr, /sidecar manifest does not match/)
+  assert.deepEqual(fixture.inputs(), before)
+})
+test('B0 frontend C verifier rejects a universal resource lock differing from the original ZIP', t => {
+  const fixture = committedFrontendFixture(t), file = path.join(fixture.S, frozenSource.INPUT_PATHS.frontendLock)
+  const value = JSON.parse(readFileSync(file)); value.resourcesSha256 = '0'.repeat(64)
+  writeFileSync(file, JSON.stringify(value, null, 2) + '\n')
+  const before = fixture.inputs(), result = fixture.run(['verify', '--source-root', fixture.S])
+  assert.notEqual(result.status, 0); assert.match(result.stderr, /resourcesSha256.*does not match/)
+  assert.deepEqual(fixture.inputs(), before)
+})
+test('B0 frontend source-root option is verify-only and forbids alternate staging modes or malformed arguments', t => {
+  const fixture = committedFrontendFixture(t, { controllerData: true }), before = fixture.inputs()
+  for (const args of [['stage', '--source-root', fixture.S], ['info', '--source-root', fixture.S],
+    ['verify', '--source-root'], ['verify', '--source-root', fixture.S, 'extra']]) {
+    const result = fixture.run(args); assert.notEqual(result.status, 0, args.join(' '))
+    assert.match(result.stderr, /source-root.*verify|verify.*source-root/)
+  }
+  for (const LOTUS_SOURCE of ['local', 'package', 'auto']) {
+    const result = fixture.run(['verify', '--source-root', fixture.S], { LOTUS_SOURCE })
+    assert.notEqual(result.status, 0); assert.match(result.stderr, /committed/)
+  }
+  assert.deepEqual(fixture.inputs(), before)
+})
+test('B0 frontend legacy verify and committed stage retain their default C root', t => {
+  const fixture = committedFrontendFixture(t, { controllerData: true }), file = path.join(fixture.S, frozenSource.INPUT_PATHS.frontendLock)
+  writeFileSync(file, 'invalid candidate lock must not be read by the legacy root')
+  for (const command of ['verify', 'stage']) {
+    const result = fixture.run([command]); assert.equal(result.status, 0, result.stderr)
+    assert.ok(result.stdout.includes(path.join(fixture.C, 'crates/app/bamboo-server/frontend_package/lotus-frontend.zip')))
+  }
+})
+test('B0 factory requires successful C frontend verification before metadata or constructing a writer', async t => {
+  const fixture = sourceControllerFixture(t); fixture.state.frontendVerificationFailure = true
+  await assert.rejects(fixture.core.makeFrozenSourceContext(), /frontend verification rejected/)
+  assert.ok(!fixture.state.commands.some(command => command[0] === 'python3'))
+  assert.deepEqual(fixture.state.writes, [])
+})
 test("accepted dev facts need neither dispatch context nor a frozen ref", async () => {
   const model = frozenSourceFixture(), { releaseRef, ...input } = model.input
   model.advanceDev = true
@@ -298,6 +391,16 @@ function sourceControllerFixture(t, { mockAcceptedProducer = true } = {}) {
       assert.deepEqual(args, [path.join(controller, 'scripts', 'compute-publish-order.py')])
       return result('bamboo-agent\n')
     }
+    if (program === process.execPath) {
+      assert.deepEqual(args, [path.join(controller, 'scripts', 'frontend-package.cjs'), 'verify', '--source-root', product])
+      assert.ok(!Object.keys(options.env).some(name => /TOKEN|SECRET|SIGNING|CREDENTIAL/i.test(name)))
+      assert.ok(Object.keys(options.env).every(name => ['PATH', 'HOME', 'TMPDIR', 'LOTUS_SOURCE', 'LOTUS_PACKAGE_NAME'].includes(name)))
+      assert.equal(options.env.LOTUS_SOURCE, 'committed')
+      // Inert ZIP data is never a semantic acceptance sample: this one process
+      // boundary is mocked. Separate B0 tests execute the real C verifier.
+      if (state.frontendVerificationFailure) return { status: 1, stdout: '', stderr: 'frontend verification rejected fixture' }
+      return result('mock frontend verifier; local factory contract only\n')
+    }
     assert.equal(program, 'gh', 'No actual compiler/source subprocess is permitted')
     assert.equal(args[0], 'api')
     if (args.includes('graphql')) {
@@ -351,7 +454,7 @@ function sourceControllerFixture(t, { mockAcceptedProducer = true } = {}) {
     assert.match(url, /^https:\/\/crates.io\/api\/v1\/crates\/bamboo-agent$/)
     return { status: 404, ok: false }
   }
-  load(localRequire, module, path.join(controller, 'scripts'), { env, cwd: () => product }, registryRead)
+  load(localRequire, module, path.join(controller, 'scripts'), { env, cwd: () => product, execPath: process.execPath }, registryRead)
   return { model, env, event, state, core: module.exports, key, controller, product,
     updateEvent: () => writeFileSync(eventFile, JSON.stringify(event)) }
 }
@@ -376,6 +479,8 @@ test('source dispatch local mocked-module factory verifies real resolver transpo
   assert.notEqual(context.identity.sourceRevision, env.GITHUB_SHA)
   assert.equal(context.sourceDispatch.context.publicationAuthorized, false)
   assert.deepEqual(state.writes, []); assert.ok(state.commands.some(command => command[0] === 'python3'))
+  assert.ok(state.commands.findIndex(command => command[0] === process.execPath) <
+    state.commands.findIndex(command => command[0] === 'python3'), 'C frontend verification must precede metadata')
   for (const name of ['package', 'cargoPublish', 'complete']) await assert.rejects(context[name](), /original.output/)
 })
 test('source dispatch local factory rejects altered C helpers before metadata or writes', async t => {

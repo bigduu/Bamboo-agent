@@ -43,8 +43,9 @@ The result is `bamboo-frozen-source-context/v2`, with
   a separate source selection. No source checkout or candidate code executes.
 - `inputs`: original Git blob IDs and SHA-256 for Cargo.lock, committed frontend
   lock/wrapper/ZIP and native contract, plus the fixed three native targets.
-  Frontend wrapper/ZIP digests must agree. Registry and universal-resource
-  verification remain owned by the existing artifact/preparation verifiers.
+  Raw ZIP identity is independent of the wrapper's resource-directory hash.
+  Wrapper/archive semantics and universal-resource verification belong to C's
+  existing artifact/preparation verifier.
 
 The independent PR API must report a closed, merged dev PR with exact F and D.
 Both the original physical source-job log's M and D must have ordered parents
@@ -137,6 +138,23 @@ blobs in an independent C checkout, and hashes immutable S frontend/contract dat
 before parsing it. C's publish-order helper is the only metadata entrypoint;
 candidate scripts never become privileged helpers. Existing temporary Cargo
 manifest/lock stamping remains a separate checked preparation step.
+
+B0 fixes a pre-existing #2323 semantic gap: `frontend-manifest.json.bundle_hash`
+is the extracted resource-directory hash (excluding that wrapper), not the raw
+ZIP SHA-256. M/S Git blob equality and the raw ZIP SHA remain independent source
+constraints. Facts validate data/format without granting archive acceptance.
+The real factory first checks C helpers and immutable S bytes, then runs C's
+`frontend-package.cjs verify --source-root <S>` before metadata or writer
+construction. This verify-only option requires the committed Lotus Next input;
+it cannot select an alternate root for stage/info or enable local/npm builds.
+The child receives only PATH/HOME, owned temporary space and fixed committed
+mode/package values, with no GitHub, registry or signing credentials. The
+existing verifier actually checks canonical inner/outer wrapper equality,
+resource-directory hash and the complete universal resource lock. It reads the
+original committed wrapper/ZIP and never restages, changes `built_at` or rebuilds
+the archive. Temporary extraction uses the verifier's existing owned scratch.
+Real committed-data regressions are separate from the factory's inert transport
+fixtures; those fixtures cannot establish semantic artifact or producer admission.
 
 The existing signed receipt gains one `bamboo-frozen-source-dispatch/v1`
 discriminator in `sourceDispatch`; its nested source context remains read-only

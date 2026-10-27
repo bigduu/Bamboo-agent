@@ -287,7 +287,10 @@ async function verifyAcceptedDevFacts(input, reads, policy = {}) {
   const wrapper = JSON.parse(inputs.frontendManifest.bytes.toString("utf8"));
   assert.equal(wrapper.schema_version, 1); assert.equal(wrapper.frontend_name, "lotus-next");
   assert.equal(wrapper.frontend_version, frontend.packageVersion); assert.equal(wrapper.entry, "index.html");
-  assert.equal(wrapper.bundle_hash, `sha256:${inputs.frontendZip.sha256}`, "Committed frontend ZIP digest differs");
+  // bundle_hash describes extracted resources, not the raw ZIP bytes. These
+  // read-only facts retain the independently verified Git blob/raw SHA above;
+  // the C frontend verifier checks wrapper/resources/universal-lock semantics.
+  assert.match(wrapper.bundle_hash, /^sha256:[0-9a-f]{64}$/);
   const markers = [...inputs.nativeContract.bytes.toString("utf8").matchAll(/^\/\/ BAMBOO_SHARED_EXECUTABLES_V([0-9]+)$/gm)];
   assert.equal(markers.length, 1); assert.equal(markers[0][1], "2", "Frozen source does not select the three-target contract");
   for (const value of Object.values(inputs)) delete value.bytes;

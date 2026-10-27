@@ -811,6 +811,12 @@ async function makeFrozenSourceContext() {
   assert.equal(arguments.length, 0, 'No caller-supplied source authorization')
   const facts = await readFrozenSourceContext(), env = process.env
   assertFrozenController(facts)
+  const verificationEnv = Object.fromEntries(['PATH', 'HOME'].filter(name => env[name] !== undefined).map(name => [name, env[name]]))
+  verificationEnv.TMPDIR = env.RUNNER_TEMP
+  verificationEnv.LOTUS_SOURCE = 'committed'
+  verificationEnv.LOTUS_PACKAGE_NAME = '@bigduu/lotus-next'
+  command([process.execPath, path.join(__dirname, 'frontend-package.cjs'), 'verify', '--source-root', fs.realpathSync(process.cwd())],
+    { env: verificationEnv, timeout: 60000, maxBuffer: 1024 * 1024 })
   const sourceDispatch = sourceDispatchContract(facts, env.GITHUB_RUN_ID)
   let context, bound, justReserved
   const guard = async () => {

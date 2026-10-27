@@ -192,6 +192,15 @@ crate adapters, the sole whole-release completion and dispatch wiring need the
 separate reviewed handoff; the legacy package/publish/complete path rejects this
 new contract. Main promotion/protection/production activation remain separate.
 
+B0 corrects the #2323 frontend hash semantics: wrapper `bundle_hash` describes
+extracted resources, while the raw ZIP has its own Git blob and SHA-256. Facts
+remain read-only data. Before constructing the new writer, the factory runs C's
+existing `frontend-package.cjs verify --source-root <S>` with no publisher,
+registry or GitHub credentials. Only verify may select this committed Lotus Next
+data root; stage and legacy roots stay unchanged. Reuse S's original wrapper/ZIP
+bytes without restaging or recompression. The C verifier must check inner/outer
+wrapper bytes, the resource-directory hash and the complete universal lock.
+
 ### Bamboo #791 integration exception
 
 For the #791 multi-agent epic, the user's 2026-09-28 delivery instruction takes
