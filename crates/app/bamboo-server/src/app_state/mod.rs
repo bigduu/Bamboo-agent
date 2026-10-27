@@ -299,7 +299,7 @@ pub struct AppState {
     /// Durable logical-session delivery plane. These are internal runtime
     /// capabilities; no public messaging endpoint is registered.
     pub session_inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
-    pub(super) observer_subscriptions: Arc<observer_subscriptions::ObserverSubscriptionCoordinator>,
+    observer_subscriptions: Arc<observer_subscriptions::ObserverSubscriptionCoordinator>,
     pub session_activation_router: Arc<bamboo_engine::SessionActivationRouter>,
     pub session_messenger: Arc<bamboo_engine::SessionMessenger>,
 
