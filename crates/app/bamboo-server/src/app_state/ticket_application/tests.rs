@@ -2250,7 +2250,7 @@ mod owned_cancel_shutdown {
             let mut config = config(true).read().await.clone();
             config.features.ticket_dispatch = true;
             config.run_budget.max_rounds = Some(4);
-            config.subagents_mut().max_concurrent = 1;
+            config.subagents_mut().max_concurrent = Some(1);
             config
                 .memory_mut()
                 .get_or_insert_with(Default::default)
