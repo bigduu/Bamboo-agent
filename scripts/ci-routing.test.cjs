@@ -10,6 +10,69 @@ const frontend = fs.readFileSync(".github/workflows/frontend-acceptance.yml", "u
 const publisher = fs.readFileSync(".github/workflows/publish-crate.yml", "utf8");
 const qualityFields = ["LINT_RESULT", "MSRV_RESULT", "SECURITY_RESULT", "DENY_RESULT", "DOCS_RESULT", "CODEQL_RESULT", "FRONTEND_INVENTORY_RESULT"];
 const qualitySuccess = Object.fromEntries(qualityFields.map(name => [name, "success"]));
+
+function retirementScope(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-retired-events-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const output = path.join(directory, "scope"), sha = "a".repeat(40);
+  return overrides => {
+    fs.writeFileSync(output, "");
+    const result = spawnSync("bash", ["-c", script(job(ci, "validation-source"))], { encoding: "utf8", env: {
+      PATH: process.env.PATH, GITHUB_EVENT_NAME: "pull_request", GITHUB_SHA: sha,
+      EXPECTED_SNAPSHOT_SHA: sha, GITHUB_REF: "refs/pull/42/merge", GITHUB_BASE_REF: "dev",
+      GITHUB_OUTPUT: output, ...overrides } });
+    return { ...result, output: fs.readFileSync(output, "utf8") };
+  };
+}
+
+test("Retirement2363 actual scope permits feature admission and rejects Main or release test entrypoints", t => {
+  const run = retirementScope(t), dev = run({});
+  assert.equal(dev.status, 0, dev.stderr); assert.equal(dev.output, "full=false\nfeature=true\n");
+  const manual = run({ GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/feature/diagnosis" });
+  assert.equal(manual.status, 0, manual.stderr); assert.equal(manual.output, "full=true\nfeature=false\n");
+  for (const overrides of [
+    { GITHUB_BASE_REF: "main" }, { GITHUB_BASE_REF: "release/accepted" },
+    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main" },
+    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/dev" },
+    ...["refs/heads/main", "refs/heads/release/" + "a".repeat(40), "refs/tags/v2026.10.27", ""].map(GITHUB_REF =>
+      ({ GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", GITHUB_REF })),
+    { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/feature/diagnosis", EXPECTED_SNAPSHOT_SHA: "b".repeat(40) },
+  ]) {
+    const result = run(overrides); assert.notEqual(result.status, 0, JSON.stringify(overrides)); assert.equal(result.output, "");
+  }
+});
+
+test("Retirement2363 real summaries reject legacy Main success and every incomplete feature owner", () => {
+  const env = { PATH: process.env.PATH, GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev", GITHUB_REF: "refs/pull/42/merge",
+    SOURCE_RESULT: "success", FULL_VALIDATION: "false", FEATURE_VALIDATION: "true", FEATURE_RESULT: "success", QUICK_RESULT: "success",
+    NATIVE_RESULT: "success", BROWSER_RUNTIME_RESULT: "success", MAIN_ADMISSION_RESULT: "success", CRATE_RESULT: "success", E2E_RESULT: "success", SSH_RESULT: "success", ...qualitySuccess };
+  for (const id of ["test", "e2e-test"]) {
+    const shell = script(job(ci, id)), run = overrides => spawnSync("bash", ["-c", shell], { encoding: "utf8", env: { ...env, ...overrides } });
+    assert.equal(run({}).status, 0, id);
+    for (const field of ["SOURCE_RESULT", "FEATURE_RESULT", "NATIVE_RESULT", "BROWSER_RUNTIME_RESULT", ...qualityFields, ...(id === "test" ? ["QUICK_RESULT"] : [])]) {
+      for (const value of ["failure", "cancelled", "skipped", "", "unknown"]) assert.notEqual(run({ [field]: value }).status, 0, id + ":" + field + ":" + value);
+    }
+    for (const overrides of [
+      { GITHUB_BASE_REF: "main", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false" },
+      { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", FEATURE_VALIDATION: "false" },
+      { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false" },
+      { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/release/accepted", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false" },
+    ]) assert.notEqual(run(overrides).status, 0, id + ":" + JSON.stringify(overrides));
+  }
+});
+
+test("Retirement2363 current workflow triggers leave one Source publisher and no Main product gate", () => {
+  assert.doesNotMatch(ci, /^  (?:push|workflow_run):/m); assert.match(ci, /pull_request:\n    branches: \[dev\]/);
+  assert.doesNotMatch(ci, /^  (?:main-release-admission|promotion-source):/m);
+  assert.doesNotMatch(publisher, /^  workflow_run:/m); assert.match(publisher, /options: \[frozen-source-v2\]/);
+  for (const id of ["manual", "dry-run"]) assert.match(job(publisher, id), /^    if: false$/m);
+  assert.match(job(publisher, "automatic"), /^    if: github.event_name == 'workflow_dispatch' && inputs.release_source_contract == 'frozen-source-v2' && github.ref == 'refs\/heads\/main'$/m);
+  for (const file of ["actor-snapshot-windows", "ticket-platform-adapter", "frontend-acceptance", "codeql"]) {
+    const source = fs.readFileSync(`.github/workflows/${file}.yml`, "utf8");
+    assert.doesNotMatch(source, /^  (?:push|pull_request):/m, file); assert.match(source, /^  workflow_dispatch:/m, file);
+  }
+  assert.match(fs.readFileSync(".github/workflows/release-cargo-isolation.yml", "utf8"), /pull_request:\n    branches: \[dev\]/);
+});
 function job(source, id) {
   const marker = `\n  ${id}:\n`;
   const start = source.indexOf(marker); assert.notEqual(start, -1);
