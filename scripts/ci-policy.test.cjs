@@ -354,8 +354,8 @@ const OBSERVER_FAULT_HOST_CASES = [
 ]
 
 function assertSubscriptionException(source) {
-  // Finite F transition: keep the accepted S19 recipe byte-for-byte after
-  // removing only the five exact fault cases, their path and verdict wording.
+  // Keep the S19 runtime recipe and exact fault extension after moving only
+  // the duplicate API-only Clippy step into its single shared owner.
   // This remains API-only feature-head evidence, never canonical-M admission.
   const extension = "          faults = {\n" + OBSERVER_FAULT_HOST_CASES
     .map(name => `              '${name}',\n`).join("") +
@@ -366,8 +366,8 @@ function assertSubscriptionException(source) {
     .replace(extension, "")
     .replace("print('Six canonical windows, exact legacy serde, five fail-closed Inbox regressions, seven subscription and five fault Host fixtures passed')",
       "print('Six canonical windows, exact legacy serde, five fail-closed Inbox regressions and all seven actual subscription Host fixtures passed')")
-  assert.equal(createHash("sha256").update(original).digest("hex"), "e79b9f16140786a49761cd5baab66a5cf83faa5d793ed11464701c2b475175da")
-  assert.equal(createHash("sha256").update(source).digest("hex"), "dca281c6768f86c159d026e0436da2d4f0645d01139287ad43d10e959105646b")
+  assert.equal(createHash("sha256").update(original).digest("hex"), "f51f3bced49a34a51ff360d083ba5a94154ca13dd415f06159dbc61e3dd55a96")
+  assert.equal(createHash("sha256").update(source).digest("hex"), "11d4b1dc76c3db28992cc97f357208d67b971b3ec258b3d5fdb4b13408040806")
   assert.match(source, /pull_request:\n    branches: \[dev\]/u)
   assert.match(source, /runs-on: ubuntu-latest/u)
   assert.match(source, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
@@ -376,8 +376,69 @@ function assertSubscriptionException(source) {
   assert.match(source, /test "\$actual" = "\$EXPECTED_SOURCE_SHA"/u)
   assert.match(source, /cargo test --locked -p bamboo-domain -p bamboo-engine -p bamboo-server --lib --/u)
   assert.match(source, /--test-threads=1 --color=never/u)
-  assert.match(source, /cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-engine -p bamboo-storage/u)
+  assert.doesNotMatch(source, /cargo clippy/u)
 }
+
+function assertObserverLintOwner(definitions) {
+  const filename = "observer-api-lint.yml", owner = definitions[filename]
+  assert.equal(typeof owner, "string", "Require the single shared Observer lint owner")
+  const paths = source => (source.split("\npermissions:\n")[0].match(/^      - .+$/gmu) ?? []).map(line => {
+    assert.match(line, /^      - '[^']+'$/u)
+    return line.slice(9, -1)
+  })
+  const originals = ["trusted-observer.yml", "observer-subscriptions.yml"]
+  const expected = [...new Set([...originals.flatMap(file => paths(definitions[file])), `.github/workflows/${filename}`])].sort()
+  assert.deepEqual(paths(owner).sort(), expected, "Preserve the complete union of both runtime path filters")
+  const trigger = owner.split("\non:\n")[1].split("\npermissions:\n")[0]
+  assert.deepEqual(trigger.match(/^  \S.*$/gmu), ["  pull_request:"])
+  assert.match(trigger, /^    branches: \[dev\]$/mu)
+  assert.deepEqual([...owner.split("\njobs:\n")[1].matchAll(/^  ([a-z-]+):$/gmu)].map(row => row[1]), ["lint"])
+  assert.match(owner, /runs-on: ubuntu-latest/u)
+  assert.match(owner, /uses: dtolnay\/rust-toolchain@stable\n        with:\n          components: clippy/u)
+  for (const line of ["CARGO_BUILD_JOBS: '1'", "CARGO_INCREMENTAL: '0'", "RUST_MIN_STACK: '8388608'",
+    "BAMBOO_FRONTEND_BUILD_MODE: api-only", "EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}",
+    "ref: ${{ github.event.pull_request.head.sha }}", "save-if: false"]) assert.ok(owner.includes(line), line)
+  assert.equal((owner.match(/test "\$actual" = "\$EXPECTED_SOURCE_SHA"/gu) ?? []).length, 2)
+  assert.equal((owner.match(/test -z "\$status"/gu) ?? []).length, 2)
+  assert.match(owner, /name: Verify exact source stayed clean\n        if: always\(\)/u)
+  assert.doesNotMatch(owner, /continue-on-error|CARGO_PROFILE_|RUSTFLAGS|cargo test|npm |secrets\./u)
+  const normalized = owner.replace(/\\\r?\n[ \t]*/gu, " ").replace(/[ \t]+/gu, " ")
+  const policy = normalized.match(/policy=\(([\s\S]*?)\)/u)?.[1].trim().split(/\s+/u)
+  assert.deepEqual(policy, ["-D", "warnings", "-A", "deprecated", "-A", "clippy::module_inception", "-A", "clippy::incompatible_msrv",
+    "-A", "clippy::needless_borrows_for_generic_args", "-A", "clippy::too-many-arguments", "-A", "clippy::while-let-loop",
+    "-A", "clippy::type_complexity", "-A", "dead-code"])
+  assert.match(normalized, /cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-storage -p bamboo-engine -p bamboo-server-tools -p bamboo-server -- "\$\{policy\[@\]\}"/u)
+  assert.doesNotMatch(normalized, /cargo clippy[^\n]*(?:--workspace|--tests|--bins)/u)
+  const packages = ["bamboo-domain", "bamboo-engine", "bamboo-server", "bamboo-server-tools", "bamboo-storage"]
+  const owners = Object.entries(definitions).flatMap(([file, source]) => {
+    if (!source.includes("BAMBOO_FRONTEND_BUILD_MODE: api-only")) return []
+    return [...source.replace(/\\\r?\n[ \t]*/gu, " ").matchAll(/cargo clippy[^\n]+/gu)].filter(([command]) =>
+      JSON.stringify([...command.matchAll(/(?:^| )-p ([a-z-]+)/gu)].map(row => row[1]).sort()) === JSON.stringify(packages)).map(() => file)
+  })
+  assert.deepEqual(owners, [filename], "The identical five-library API-only analysis must execute once")
+  for (const file of originals) assert.doesNotMatch(definitions[file], /cargo clippy/u)
+}
+
+test("Observer API-only Clippy has one owner for the union of both runtime paths", () => {
+  const definitions = Object.fromEntries(readdirSync(".github/workflows").filter(file => /\.ya?ml$/u.test(file))
+    .map(file => [file, readFileSync(path.join(".github/workflows", file), "utf8")]))
+  assertObserverLintOwner(definitions)
+  const name = "observer-api-lint.yml", owner = definitions[name]
+  for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
+    ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
+    ["branches: [dev]", "branches: [main]"], ["--all-features", "--no-default-features"],
+    ["-p bamboo-server-tools ", ""], ["-D warnings", "-A warnings"], ['test -z "$status"', "true"],
+    ["save-if: false", "save-if: true"], ["  pull_request:", '  "push":\n  pull_request:']]) {
+    assert.ok(owner.includes(before), before)
+    assert.throws(() => assertObserverLintOwner({ ...definitions, [name]: owner.replace(before, after) }))
+  }
+  for (const file of ["crates/core/bamboo-domain/src/session/supervisor_management.rs",
+    "crates/infra/bamboo-storage/src/v2/child_wait_control_plane.rs", "crates/app/bamboo-server/src/app_state/builder.rs"]) {
+    assert.throws(() => assertObserverLintOwner({ ...definitions, [name]: owner.replace(`      - '${file}'\n`, "") }))
+  }
+  assert.throws(() => assertObserverLintOwner({ ...definitions, [name]: undefined }))
+  assert.throws(() => assertObserverLintOwner({ ...definitions, "extra-api-lint.yml": owner }))
+})
 
 function assertLinuxTestOwnership(definitions) {
   const registered = {
@@ -429,13 +490,13 @@ function assertLinuxTestOwnership(definitions) {
       }
       if (file === "trusted-observer.yml") {
         // Preserve this separately accepted F/config exactly; never relabel it as M.
-        assert.equal(createHash("sha256").update(source).digest("hex"), "7c26b1511759f5a40bad6a21dc44976a59f60c81f841cdf00396fa38e5d868ab")
+        assert.equal(createHash("sha256").update(source).digest("hex"), "433631549dc24ea3d6dfdad6a427251d9832acb11aea32ce05747206a69a6268")
         assert.match(block, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
         assert.match(block, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
         assert.match(block, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
         assert.match(block, /test "\$actual" = "\$EXPECTED_SOURCE_SHA"/u)
         assert.match(block, /cargo test --locked -p bamboo-domain -p bamboo-storage -p bamboo-server --lib --/u)
-        assert.match(block, /cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-storage/u)
+        assert.doesNotMatch(block, /cargo clippy/u)
       }
       if (file === "ticket-platform-adapter.yml") {
         assert.match(block, /^    if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''$/mu)
@@ -466,10 +527,10 @@ test("all agents share canonical feature tests instead of adding ordinary Linux 
   const definitions = Object.fromEntries(readdirSync(directory).filter(file => /\.ya?ml$/u.test(file))
     .map(file => [file, readFileSync(path.join(directory, file), "utf8")]))
   assertLinuxTestOwnership(definitions)
+  assertObserverLintOwner(definitions)
   for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
     ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
-    ["-p bamboo-domain -p bamboo-storage -p bamboo-server --lib", "-p bamboo-server --lib"],
-    ["cargo clippy --locked --all-features --lib", "cargo clippy --locked --lib"]]) {
+    ["-p bamboo-domain -p bamboo-storage -p bamboo-server --lib", "-p bamboo-server --lib"]]) {
     assert.throws(() => assertLinuxTestOwnership({ ...definitions,
       "trusted-observer.yml": definitions["trusted-observer.yml"].replace(before, after) }))
   }
@@ -497,7 +558,7 @@ test("subscription exception retains exact F API-only graph without becoming mer
     ["ubuntu-latest", "windows-latest"], ["branches: [dev]", "branches: [main]"],
     ["-p bamboo-domain -p bamboo-engine -p bamboo-server --lib", "-p bamboo-server --lib"],
     ["observer_subscription session::supervisor_management::tests::", "observer_subscription"],
-    ["--test-threads=1", "--test-threads=2"], ["--all-features", "--no-default-features"],
+    ["--test-threads=1", "--test-threads=2"],
     ["assert len(window) == 6", "assert len(window) >= 0"]]) {
     assert.ok(source.includes(before), before)
     assert.throws(() => assertLinuxTestOwnership({ "observer-subscriptions.yml": source.replace(before, after) }))

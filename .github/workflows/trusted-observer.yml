@@ -123,18 +123,6 @@ jobs:
           print('All six actual Creator/provider/ChildCompletion/FileInbox Host fixtures passed')
           PY
 
-      - name: Check five affected production libraries under the original lint policy
-        shell: bash
-        run: |
-          set -euo pipefail
-          policy=(-D warnings -A deprecated -A clippy::module_inception
-            -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
-            -A clippy::too-many-arguments -A clippy::while-let-loop
-            -A clippy::type_complexity -A dead-code)
-          cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-storage \
-            -p bamboo-engine -p bamboo-server-tools -p bamboo-server -- "${policy[@]}" \
-            2>&1 | tee "$RUNNER_TEMP/observer-clippy.log"
-
       - name: Verify exact source stayed clean
         if: always()
         shell: bash
