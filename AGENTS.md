@@ -266,7 +266,13 @@ change default/protection, dispatch or register a producer merely to make this
 staged code green. Source/release registries remain inactive. Legacy automatic
 Main compilers/publishers are still live until their separate cutover.
 
-After activation, only actual trusted B is checked out. The fixed 25 ordinary
+Before initial bootstrap, #2359 fixes the planned closure at 38 ordinary files:
+the original 25 plus Docs three, Docker four, the sole ARM helper and five legacy
+Main workflow retirements. This is a pre-bootstrap prerequisite, not an upgrade
+of an installed 25-path controller. The anchor remains legacy Main `d6325a73`
+and tree `9557a389`; no Main installation or producer registration occurs here.
+
+After activation, only actual trusted B is checked out. These 38 ordinary
 B controls include the full release-helper and Main-reader closure plus both
 complete linked local shared documents; candidate
 paths/policy/approval JSON cannot select a partial closure. Do not run product
@@ -274,6 +280,16 @@ S code, package managers, compilers or tests in this workflow. The normal CLI
 always rejects bootstrap. Its separate exported Ops component can prove only
 the fixed legacy Main product tree plus actual accepted-D controls; that result
 cannot authorize a release, Docs deployment or Docker publication.
+
+This five-file prerequisite does not compose the separate Source2344, Docs2355,
+Docker2320 or ARM2353 implementations, or retire their live legacy triggers.
+Missing consumer/helper files must fail a real checkout/overlay; never add stubs
+or drop paths to force admission. Synthetic paths in `Closure2359` tests are
+inert fixture data. Run only that selected test prefix in the two existing Main
+test owners for this change. Before live Ops, finish the actual implementations,
+complete feature/registry acceptance and separate reviewed whole-control
+postimage. Every other stable product/version/lock/gitlink byte and mode stays
+legacy B. Preserve the genuine v6 and fixed2026.10.11 recovery contracts.
 
 Keep PRT metadata F separate from executed B: actual run/job/check-suite and
 GraphQL file URL name F, while GITHUB_SHA/GITHUB_WORKFLOW_SHA and checkout are

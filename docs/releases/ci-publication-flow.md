@@ -593,8 +593,9 @@ permissions, no Environment or publication credentials, and runs no candidate
 code, Cargo, npm, browser, Unit/E2E, package or publication command. An initial
 guard stops before checkout while default remains dev. The helper independently
 rechecks actual repository default, enforced Main context/app, event, protected
-Main B, clean checkout and the entire fixed 25-file ordinary B closure, including
-both complete linked local shared documents.
+Main B, clean checkout and the entire fixed ordinary B closure, including both
+complete linked local shared documents. The initial closure prerequisite #2359
+extends the prepared 25-path set to 38 before any Main installation.
 
 The CLI accepts no mode, policy or approval JSON. Its one bounded locator in the
 PR body is data, never authority:
@@ -669,6 +670,46 @@ Original wrapper assets have a 1 MiB role. New Source intentionally accepts ZIP
 blobs only up to 16 MiB (and bounded JSON/base64 reads), while the legacy carrier
 supports up to 256 MiB. This child does not expand Source or claim larger ZIP
 admission. Hashes, Git blobs, asset IDs/size/digest and fresh rechecks remain strict.
+
+## Initial Main control closure prerequisite (#2359)
+
+The fixed `MAIN_CONTROLS` literal keeps its original 25 paths and adds exactly
+these 13. Every selected path must be an ordinary Git blob with mode `100644`
+or `100755`; no runtime directory scan or caller-selected policy expands it.
+
+| Group | Additional controls |
+| --- | --- |
+| Docs three | `.github/workflows/docs.yml`, `scripts/docs-deploy.cjs`, `scripts/docs-deploy-verify.py` |
+| Docker four | `.github/workflows/docker-publish.yml`, `docker/Dockerfile`, `docker/docker-compose.yml`, `scripts/docker-from-release.cjs` |
+| ARM one | `scripts/docker-arm-original.cjs` |
+| Retired Main routes five | `.github/workflows/actor-snapshot-windows.yml`, `.github/workflows/codeql.yml`, `.github/workflows/frontend-acceptance.yml`, `.github/workflows/release-cargo-isolation.yml`, `.github/workflows/ticket-platform-adapter.yml` |
+
+Bootstrap must copy the whole 38 from one genuinely accepted D onto fixed legacy
+Main `d6325a732c7669f94962f604e4ce98966e374d73` / tree
+`9557a389d155c6be1bfb7072d3eae82e12468ff2`. All other stable product, version,
+lock, frontend, gitlink bytes and modes stay B. Normal promotion retains whole
+trusted B controls even when the released S carries old workflow or Dockerfile
+bytes. Missing, partial or nonordinary controls and additional runtime files
+outside the exact expected product/control overlay fail.
+
+This is preparation for the first bootstrap, not a live 25-to-38 compatibility
+upgrade. The normal CLI still rejects bootstrap. Main workflow bytes/hash,
+frame versions, Source writer and empty producer registries remain unchanged.
+This child does not merge Source2344, retained Docs2355, Docker2320 or ARM2353
+implementations, retire legacy triggers, change settings or authorize dispatch.
+Inert synthetic paths in tests are not accepted files; real missing helpers
+must stop checkout. Actual implementations, legacy retirement, complete feature
+producer/registry acceptance and the separately reviewed mechanical whole-control
+Ops postimage remain prerequisites. Genuine v6 and2026.10.11 recovery are preserved.
+
+For this five-file prerequisite, run only its selected existing-owner cases:
+
+```bash
+node --test --test-name-pattern='^Closure2359' scripts/published-source-admission.test.cjs scripts/main-admission.test.cjs
+```
+
+These real tiny-Git and inert API/overlay cases do not run Cargo, browsers, old
+Main suites or consumers, and do not certify bootstrap or operational activation.
 
 ## Protected controller maintenance prepared by #2354
 

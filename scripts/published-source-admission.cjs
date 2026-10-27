@@ -28,7 +28,14 @@ const CONTROLLER_KIND = "bamboo-main-controller-maintenance/v1";
 // Legacy automatic Main compilers must be retired by the separate Ops cutover.
 const MAIN_CONTROLS = Object.freeze([MAIN_WORKFLOW, source.WORKFLOW, source.CONTROLLER,
   "scripts/main-admission.cjs", "scripts/published-source-admission.cjs", ...CONTROLLER_HELPERS,
-  "AGENTS.md", "docs/releases/ci-publication-flow.md", "docs/delivery-workflow.md", "docs/ci-workflow-audit.md"]);
+  "AGENTS.md", "docs/releases/ci-publication-flow.md", "docs/delivery-workflow.md", "docs/ci-workflow-audit.md",
+  // Initial bootstrap prerequisite: literal consumer and retired-route controls.
+  // Their implementation/acceptance and the actual Main installation are separate.
+  ".github/workflows/docs.yml", "scripts/docs-deploy.cjs", "scripts/docs-deploy-verify.py",
+  ".github/workflows/docker-publish.yml", "docker/Dockerfile", "docker/docker-compose.yml", "scripts/docker-from-release.cjs",
+  "scripts/docker-arm-original.cjs",
+  ".github/workflows/actor-snapshot-windows.yml", ".github/workflows/codeql.yml", ".github/workflows/frontend-acceptance.yml",
+  ".github/workflows/release-cargo-isolation.yml", ".github/workflows/ticket-platform-adapter.yml"]);
 const keys = (value, names) => assert.deepEqual(Object.keys(value || {}).sort(), [...names].sort(), "Unexpected proof fields");
 const positive = value => { assert.ok(Number.isSafeInteger(value) && value > 0); return value; };
 const revision = value => { assert.match(value, SHA); return value; };

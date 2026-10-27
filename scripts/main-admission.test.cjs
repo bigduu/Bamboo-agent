@@ -170,6 +170,36 @@ function bootstrapFixture() {
   } };
   return { f, pr, routes, tree, reads, input: { sourceRevision: S, featurePr: f.input.featurePr, ciRun: f.input.ciRun, pullRequest: 88, headRevision: F, snapshotRevision: M } };
 }
+const categories2359=["scripts/docs-deploy.cjs","docker/Dockerfile","scripts/docker-arm-original.cjs",".github/workflows/frontend-acceptance.yml"];
+test("Closure2359 bootstrap installs whole synthetic controls and preserves every other legacy leaf",async()=>{
+  const f=bootstrapFixture(), result=await controller.verifyBootstrap(f.input,f.reads,f.f.policy);
+  assert.equal(result.publicationAuthorized,false); assert.equal(result.baseRevision,controller.LEGACY_BASE);
+  const head=f.routes.get("git/trees/"+f.tree+"?recursive=1").tree, accepted=f.routes.get("git/trees/"+f.f.accepted.tree.sha+"?recursive=1").tree;
+  for(const path of categories2359){ assert.ok(head.some(row=>row.path===path),path); assert.deepEqual(head.find(row=>row.path===path),accepted.find(row=>row.path===path)); }
+  for(const row of f.routes.get("git/trees/"+controller.LEGACY_TREE+"?recursive=1").tree) if(!proof.MAIN_CONTROLS.includes(row.path)) assert.deepEqual(head.find(value=>value.path===row.path),row);
+  // Inert paths in this fixture do not install or accept actual consumers.
+  await assert.rejects(controller.verifyBootstrap(f.input,f.reads),/inactive/);
+});
+test("Closure2359 bootstrap rejects missing or nonordinary controls from every added category",async()=>{
+  for(const path of categories2359) for(const fault of ["missing","symlink","gitlink"]){
+    const f=bootstrapFixture(), tree=f.routes.get("git/trees/"+f.f.accepted.tree.sha+"?recursive=1");
+    if(fault==="missing") tree.tree=tree.tree.filter(row=>row.path!==path);
+    else {const row=tree.tree.find(value=>value.path===path);row.mode=fault==="symlink"?"120000":"160000";row.type=fault==="symlink"?"blob":"commit";}
+    await assert.rejects(controller.verifyBootstrap(f.input,f.reads,f.f.policy),/ordinary/,path+":"+fault);
+  }
+});
+test("Closure2359 bootstrap rejects an extra runtime file despite a complete control overlay",async()=>{
+  const f=bootstrapFixture(); f.routes.get("git/trees/"+f.tree+"?recursive=1").tree.push({path:"src/unreleased-runtime.rs",mode:"100644",type:"blob",sha:h("2")});
+  await assert.rejects(controller.verifyBootstrap(f.input,f.reads,f.f.policy),/product\/locks/);
+});
+test("Closure2359 tiny Git checkout rejects missing consumer and symlinked retired workflow",t=>{
+  const f=tiny(t), consumer=path.join(f.root,"scripts/docs-deploy.cjs"), retired=path.join(f.root,".github/workflows/codeql.yml");
+  for(const file of [consumer,retired]){fs.mkdirSync(path.dirname(file),{recursive:true});fs.writeFileSync(file,"inert synthetic control, never executed\n");}
+  controller.checkout(f.root,f.commit(),safe);
+  fs.rmSync(consumer); assert.throws(()=>controller.checkout(f.root,f.commit(),safe));
+  fs.writeFileSync(consumer,"inert synthetic control\n"); fs.rmSync(retired); fs.symlinkSync("../../product.txt",retired);
+  assert.throws(()=>controller.checkout(f.root,f.commit(),safe),/Nonordinary/);
+});
 test("Main2351 Ops bootstrap reads actual accepted-D facts and preserves every legacy product/lock/gitlink", async () => {
   const f = bootstrapFixture(), result = await controller.verifyBootstrap(f.input, f.reads, f.f.policy);
   assert.equal(result.publicationAuthorized, false); assert.equal(result.legacyProductTree, controller.LEGACY_TREE);

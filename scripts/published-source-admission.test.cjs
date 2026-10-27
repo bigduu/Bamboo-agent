@@ -16,6 +16,14 @@ const { S, C, anchor } = fixtures.identities;
 const hash = core.sha256, clone = value => structuredClone(value);
 const oid = value => createHash("sha1").update("blob " + Buffer.byteLength(value) + "\0").update(value).digest("hex");
 const clock = seconds => new Date(Date.parse("2026-10-27T02:00:00Z") + seconds * 1000).toISOString();
+// Literal data fixtures only; these pending consumers are not installed here.
+const additions2359 = {
+  docs: [".github/workflows/docs.yml", "scripts/docs-deploy.cjs", "scripts/docs-deploy-verify.py"],
+  docker: [".github/workflows/docker-publish.yml", "docker/Dockerfile", "docker/docker-compose.yml", "scripts/docker-from-release.cjs"],
+  arm: ["scripts/docker-arm-original.cjs"],
+  retired: [".github/workflows/actor-snapshot-windows.yml", ".github/workflows/codeql.yml", ".github/workflows/frontend-acceptance.yml",
+    ".github/workflows/release-cargo-isolation.yml", ".github/workflows/ticket-platform-adapter.yml"],
+};
 const steps = {
   automatic: ["Authorize the frozen accepted dev source", "Reserve or resume the exact release identity", "Prepare and verify original native outputs"],
   "Publish and verify the crate closure": ["Publish verified original crates"],
@@ -188,6 +196,42 @@ async function promotionFixture(overlay=false){
   f.promotionInput={...f.input,pullRequest:88,baseRevision:C,headRevision:F,snapshotRevision:M};
   f.promote=()=>proof.verifyPromotion(f.promotionInput,f.reads,f.policy);return f;
 }
+test("Closure2359 retains the original25 and only the thirteen literal control additions",()=>{
+  const original=[proof.MAIN_WORKFLOW,source.WORKFLOW,source.CONTROLLER,"scripts/main-admission.cjs","scripts/published-source-admission.cjs",
+    ...proof.CONTROLLER_HELPERS,"AGENTS.md","docs/releases/ci-publication-flow.md","docs/delivery-workflow.md","docs/ci-workflow-audit.md"];
+  assert.equal(original.length,25); assert.equal(proof.CONTROLLER_HELPERS.length,16);
+  assert.deepEqual(proof.MAIN_CONTROLS,[...original,...Object.values(additions2359).flat()]);
+  assert.equal(new Set(proof.MAIN_CONTROLS).size,38); assert.equal(Object.isFrozen(proof.MAIN_CONTROLS),true);
+});
+test("Closure2359 each added control is required and must remain an ordinary blob mode",()=>{
+  for(const name of Object.values(additions2359).flat()){
+    const leaves=new Map([...proof.MAIN_CONTROLS,...Object.values(additions2359).flat()].map(path=>[path,{mode:"100644",sha:"1".repeat(40)}]));
+    leaves.set(name,{mode:"100755",sha:"2".repeat(40)});
+    assert.equal(proof.closure(leaves).find(entry=>entry.path===name)?.mode,"100755",name);
+    leaves.delete(name); assert.throws(()=>proof.closure(leaves),/ordinary/,name);
+    for(const mode of ["120000","160000"]){ leaves.set(name,{mode,sha:"1".repeat(40)}); assert.throws(()=>proof.closure(leaves),/ordinary/,name+":"+mode); }
+  }
+});
+test("Closure2359 normal promotion retains retired Base workflows when released S has old routes",async()=>{
+  const f=await promotionFixture(true), sourceRows=f.state.treeRoutes.get("git/trees/"+f.state.record.source.tree+"?recursive=1").tree;
+  const baseRows=f.state.treeRoutes.get("git/trees/"+"8".repeat(40)+"?recursive=1").tree, headRows=f.state.treeRoutes.get("git/trees/"+"9".repeat(40)+"?recursive=1").tree;
+  const put=(rows,value)=>{const prior=rows.findIndex(row=>row.path===value.path);if(prior<0)rows.push(value);else rows[prior]=value;};
+  for(const path of additions2359.retired){
+    f.f.files[S][path]="inert old automatic Main route "+path; f.f.files[C][path]="inert retired manual-only Base route "+path;
+    const old={path,mode:"100644",type:"blob",sha:oid(f.f.files[S][path])}, retired={...old,sha:oid(f.f.files[C][path])};
+    put(sourceRows,old);put(baseRows,retired);put(headRows,clone(retired));
+  }
+  assert.equal((await f.promote()).promotion.controlMode,"complete-trusted-base");
+  for(const path of additions2359.retired){
+    const entry=headRows.find(row=>row.path===path), held=entry.sha; entry.sha=sourceRows.find(row=>row.path===path).sha;
+    await assert.rejects(f.promote(),/trusted controls/); entry.sha=held;
+  }
+});
+test("Closure2359 normal promotion rejects an unexpected runtime addition beside complete controls",async()=>{
+  const f=await promotionFixture(true), rows=f.state.treeRoutes.get("git/trees/"+"9".repeat(40)+"?recursive=1").tree;
+  rows.push({path:"src/unreleased-runtime.rs",mode:"100644",type:"blob",sha:"2".repeat(40)});
+  await assert.rejects(f.promote(),/changed product/);
+});
 for(const overlay of [true])test("Main promotion admits one complete trusted base control closure without running candidate code",async()=>{
   const f=await promotionFixture(overlay),result=await f.promote();assert.equal(result.publicationAuthorized,false);assert.equal(result.promotion.controlMode,overlay?"complete-trusted-base":"released-source");
 });
