@@ -1,29 +1,23 @@
 name: CI
 
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
     inputs:
       snapshot_sha:
         description: Exact 40-character SHA of the selected ref to validate as one frozen batch
         required: true
         type: string
-  # Main-push CI authenticates pre-merge acceptance for automatic publication.
   pull_request:
-    branches: [ dev, main ]
+    branches: [dev]
 
 permissions:
   contents: read
 
-# Queue every main push for its own release gate; supersede iterative PR/manual
-# validation independently. Full promotion validation still covers three platforms.
+# Feature admission and explicit diagnostics supersede older iterative runs.
 concurrency:
   group: ci-${{ github.event_name }}-${{ (github.event_name == 'workflow_dispatch' && inputs.snapshot_sha) || github.event.pull_request.number || github.ref }}
-  # Every main merge needs a completed CI gate before its own publication.
-  # PRs/manual validation keep their existing superseding-run behavior.
-  queue: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'max' || 'single' }}
-  cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
+  queue: single
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -63,69 +57,24 @@ jobs:
           feature=false
           case "$GITHUB_EVENT_NAME" in
             workflow_dispatch)
+              case "$GITHUB_REF" in
+                refs/heads/main|refs/heads/release/*) exit 1 ;;
+                refs/heads/*) ;;
+                *) exit 1 ;;
+              esac
               [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]
               test "$EXPECTED_SNAPSHOT_SHA" = "$GITHUB_SHA"
               full=true
               ;;
             pull_request)
-              case "$GITHUB_BASE_REF" in
-                main) full=true ;;
-                dev) feature=true ;;
-                *) exit 1 ;;
-              esac
-              ;;
-            push)
-              test "$GITHUB_REF" = refs/heads/main
+              test "$GITHUB_BASE_REF" = dev
+              feature=true
               ;;
             *) exit 1 ;;
           esac
           printf 'Event source: %s; full validation: %s\n' "$GITHUB_SHA" "$full"
           printf 'full=%s\nfeature=%s\n' "$full" "$feature" >> "$GITHUB_OUTPUT"
 
-  main-release-admission:
-    name: Main Release Admission
-    needs: validation-source
-    if: always() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - name: Authenticate completed release acceptance before checkout
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_RESULT: ${{ needs.validation-source.result }}
-          FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
-          ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "b87e7054a19a0a1d6fcda8d722d91059ec0d2838087dc0a27cefa7c8a73e7d54"
-        run: |
-          python3 - <<'PYTHON'
-          import base64
-          import hashlib
-          import json
-          import os
-          import re
-          import subprocess
-
-          repository = os.environ["GITHUB_REPOSITORY"]
-          assert repository == "bigduu/Bamboo-agent"
-          revision = os.environ["GITHUB_WORKFLOW_SHA"]
-          expected = os.environ["ADMISSION_HELPER_SHA256"]
-          assert re.fullmatch(r"[0-9a-f]{40}", revision)
-          assert re.fullmatch(r"[0-9a-f]{64}", expected)
-          # Fixed-origin GET only, before any source checkout or credential-bearing code.
-          response = json.loads(subprocess.check_output(
-              ["gh", "api", "--hostname", "github.com",
-               f"repos/{repository}/contents/scripts/main-release-admission.py?ref={revision}"],
-              text=True, timeout=30))
-          assert response["encoding"] == "base64" and len(response["content"]) <= 180000
-          body = base64.b64decode(response["content"], validate=False)
-          assert len(body) <= 128000 and hashlib.sha256(body).hexdigest() == expected, "Unknown admission verifier"
-          exec(compile(body, "pinned-main-release-admission", "exec"), {
-              "__name__": "__main__", "ADMISSION_SCRIPT_SHA256": expected,
-          })
-          PYTHON
 
   quick-checks:
     name: Quick Checks
@@ -158,89 +107,6 @@ jobs:
       - name: Test portable frontend artifact and release policies
         run: node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
 
-  promotion-source:
-    name: Promotion Source
-    if: github.event_name == 'pull_request' && github.base_ref == 'main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Require a frozen release from protected dev history
-        env:
-          GH_TOKEN: ${{ github.token }}
-          HEAD_REF: ${{ github.head_ref }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-        run: |
-          python3 - <<'PYTHON'
-          import json
-          import os
-          import re
-          import urllib.parse
-          import urllib.request
-
-          def require(condition, message):
-              if not condition:
-                  raise SystemExit(message)
-
-          repository = os.environ["GITHUB_REPOSITORY"]
-          require(repository == "bigduu/Bamboo-agent", "Unexpected promotion repository")
-          require(os.environ["HEAD_REPOSITORY"] == repository, "Promotion must use a same-repository branch")
-          release = os.environ["HEAD_REF"]
-          match = re.fullmatch(r"release/([0-9a-f]{40})", release)
-          require(match is not None, "Main accepts only release/<40-character-cut-SHA> branches")
-          cut = match.group(1)
-          head = os.environ["HEAD_SHA"]
-          require(re.fullmatch(r"[0-9a-f]{40}", head) is not None, "Missing exact pull-request head")
-          token = os.environ["GH_TOKEN"]
-          require(bool(token), "Missing read-only source proof authority")
-
-          # Fixed API origin; never follow a redirect with the job credential.
-          # No checkout or execution of scripts from the proposed release.
-          class NoRedirect(urllib.request.HTTPRedirectHandler):
-              def redirect_request(self, request, fp, code, message, headers, newurl):
-                  return None
-
-          opener = urllib.request.build_opener(NoRedirect())
-          def api(route):
-              request = urllib.request.Request(
-                  f"https://api.github.com/repos/{repository}/{route}",
-                  headers={"Authorization": f"Bearer {token}",
-                           "Accept": "application/vnd.github+json",
-                           "X-GitHub-Api-Version": "2022-11-28",
-                           "User-Agent": "bamboo-promotion-source"},
-              )
-              with opener.open(request, timeout=30) as response:
-                  return json.load(response)
-
-          def branch(name, protected=False):
-              data = api(f"branches/{urllib.parse.quote(name, safe='')}")
-              require(data["name"] == name, "Branch identity changed")
-              if protected:
-                  require(data["protected"] is True, "dev must remain protected")
-              sha = data["commit"]["sha"]
-              require(re.fullmatch(r"[0-9a-f]{40}", sha) is not None, "Missing branch commit identity")
-              return sha
-
-          def ancestor(source, target):
-              proof = api(f"compare/{source}...{target}")
-              require(proof["status"] in {"ahead", "identical"}
-                      and proof["base_commit"]["sha"] == source
-                      and proof["merge_base_commit"]["sha"] == source,
-                      "Release ancestry proof is missing or does not match")
-
-          require(branch(release) == head, "Release branch no longer matches the exact PR head")
-          dev = branch("dev", protected=True)
-          ancestor(cut, head)
-          ancestor(head, dev)
-          # Normal dev advancement is allowed; rewritten history is not.
-          # Comparisons are always between immutable SHAs, never moving refs.
-          current_dev = branch("dev", protected=True)
-          if current_dev != dev:
-              ancestor(dev, current_dev)
-          require(branch(release) == head, "Release branch changed during source proof")
-          print(f"Accepted frozen release cut={cut} head={head} protected_dev={current_dev}")
-          PYTHON
 
   test:
     name: Test
@@ -249,7 +115,7 @@ jobs:
       actions: read
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
-    needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]
+    needs: [validation-source, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]
     # A source-gate failure must fail required Test, never turn it into a skip.
     if: always() && !cancelled()
     runs-on: ubuntu-latest
@@ -259,7 +125,6 @@ jobs:
         env:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
-          MAIN_ADMISSION_RESULT: ${{ needs.main-release-admission.result }}
           FEATURE_VALIDATION: ${{ needs.validation-source.outputs.feature }}
           FEATURE_RESULT: ${{ needs.feature-tests.result }}
           QUICK_RESULT: ${{ needs.quick-checks.result }}
@@ -287,16 +152,16 @@ jobs:
                 test "$result" = success
               done
               ;;
-            pull_request:main:true|workflow_dispatch::true)
+            workflow_dispatch::true)
+              case "$GITHUB_REF" in
+                refs/heads/main|refs/heads/release/*) exit 1 ;;
+                refs/heads/*) ;;
+                *) exit 1 ;;
+              esac
               test "$FEATURE_VALIDATION" = false
               for result in "$LINT_RESULT" "$MSRV_RESULT" "$SECURITY_RESULT" "$DENY_RESULT" "$DOCS_RESULT"; do
                 test "$result" = success
               done
-              ;;
-            push::false)
-              test "$GITHUB_REF" = refs/heads/main
-              test "$FEATURE_VALIDATION" = false
-              test "$MAIN_ADMISSION_RESULT" = success
               ;;
             *) exit 1 ;;
           esac
@@ -363,7 +228,7 @@ jobs:
         with:
           shared-key: bamboo-ci-test-${{ runner.os }}
           workspaces: . -> target/grouped-default
-          # This legacy cache runs only for full release/manual validation.
+          # This retained cache runs only for explicit feature diagnosis.
           save-if: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'dev')) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Verify published server crate owns the frontend package
@@ -1017,6 +882,17 @@ jobs:
           FRONTEND_INVENTORY_RESULT: ${{ needs.frontend-inventory.result }}
         run: |
           set -euo pipefail
+          case "$GITHUB_EVENT_NAME:${GITHUB_BASE_REF:-}" in
+            pull_request:dev) ;;
+            workflow_dispatch:)
+              case "$GITHUB_REF" in
+                refs/heads/main|refs/heads/release/*) exit 1 ;;
+                refs/heads/*) ;;
+                *) exit 1 ;;
+              esac
+              ;;
+            *) exit 1 ;;
+          esac
           case "$SOURCE_RESULT:$FEATURE_VALIDATION:$FULL_VALIDATION" in
             success:true:false)
               test "$FEATURE_RESULT" = success
@@ -1221,17 +1097,12 @@ jobs:
 
   build:
     name: Platform Tests (${{ matrix.os }})
-    # Integration work is validated on Linux. The native platform test
-    # matrix is reserved for this repository's frozen release branches to main;
-    # workflow_dispatch remains an explicit escape hatch for manual validation.
+    # Retained exact-feature-source diagnosis. Ordinary native acceptance
+    # belongs to native-feature-tests; release and Main have no product tests.
     needs: validation-source
     if: >-
       needs.validation-source.outputs.full == 'true' &&
-      (github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       github.base_ref == 'main' &&
-       startsWith(github.head_ref, 'release/') &&
-       github.event.pull_request.head.repo.full_name == github.repository))
+      github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:

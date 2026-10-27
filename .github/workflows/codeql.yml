@@ -2,10 +2,6 @@ name: CodeQL
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
 
 concurrency:
   group: codeql-${{ github.event.pull_request.number || github.ref }}

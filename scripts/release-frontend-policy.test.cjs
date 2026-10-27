@@ -6,6 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const test = require("node:test");
+const historical = require("./tests/main-authority-bootstrap-fixture.cjs").legacyData();
 
 const {
   FROM_LOCK,
@@ -194,6 +195,8 @@ test("crate resolver and Docker original consumer keep separate owners", () => {
     path.join(ROOT, ".github/workflows/ci.yml"),
     "utf8",
   );
+  assert.doesNotMatch(ci, /^  (?:push|workflow_run):/m);
+  assert.match(ci, /pull_request:\n    branches: \[dev\]/);
   const owners = Object.fromEntries([...ci.matchAll(/\n  ([a-z][a-z0-9-]*):\n([\s\S]*?)(?=\n  [a-z][a-z0-9-]*:\n|$)/g)]
     .filter(([, , body]) => body.includes("scripts/release-frontend-policy.test.cjs"))
     .map(([, name, body]) => [name, body]));
@@ -220,8 +223,8 @@ function publicationGuard(workflow) {
 }
 
 for (const [ending, newline] of [["LF", "\n"], ["CRLF", "\r\n"]]) {
-  test(`crate publication ${ending} guard rejects a moved, mismatched or dirty source before package work`, (t) => {
-    const workflow = fs.readFileSync(path.join(ROOT, ".github/workflows/publish-crate.yml"), "utf8").replace(/\r?\n/g, newline);
+  test(`legacy crate publication ${ending} guard rejects a moved, mismatched or dirty source before package work`, (t) => {
+    const workflow = historical.publisher.replace(/\r?\n/g, newline);
     const guard = publicationGuard(workflow);
     assert.throws(() => publicationGuard(workflow.replace("name: Require the exact accepted publication source", "name: Missing publication guard")), /publication guard must precede/);
     const guardStart = workflow.indexOf("      - &manual-source");

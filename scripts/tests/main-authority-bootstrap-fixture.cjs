@@ -7,6 +7,27 @@ const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 const { createHash } = require('node:crypto')
 const copy = (value) => JSON.parse(JSON.stringify(value))
+let legacy
+function legacyData() {
+  if (legacy) return legacy
+  const bytes = fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-v8-testdata.json.gz'))
+  const hash = value => createHash('sha256').update(value).digest('hex')
+  assert.ok(bytes.length <= 32768)
+  assert.equal(hash(bytes), '2556561754c7f8c9b5f4aea7b861bac2e7b40bdb3ede1fa46a90db0610ffe113')
+  const value = JSON.parse(require('node:zlib').gunzipSync(bytes, { maxOutputLength: 256 * 1024 }))
+  assert.equal(value.schemaVersion, 1); assert.equal(value.kind, 'bamboo-legacy-ci-publication-testdata/v8')
+  assert.equal(value.fixtureOnly, true); assert.equal(value.sourceRevision, 'ce89b4fcf4a45014cccb3bc7f817613ddcfa7eb2')
+  for (const [name, digest] of Object.entries({
+    ci: 'f6dfca960521d915245bb3371064a3cbcf0424fa7cd739034f4228f29c20fd6f',
+    publisher: 'ba29001500fd40eed3858d9b687b1f5c32d2cc1bb60e03738bfa416353961fb2',
+  })) {
+    assert.equal(typeof value[name], 'string'); assert.ok(Buffer.byteLength(value[name]) <= 128000)
+    assert.equal(hash(value[name]), digest); assert.equal(value.sha256[name], digest)
+  }
+  assert.equal(value.sha256.admissionHelper, 'b87e7054a19a0a1d6fcda8d722d91059ec0d2838087dc0a27cefa7c8a73e7d54')
+  legacy = Object.freeze({ ci: value.ci, publisher: value.publisher })
+  return legacy
+}
 const FULL = ['Validation Source', 'Test', 'E2E Tests', 'Lint',
   'MSRV (Rust 1.95)', 'Security Audit', 'cargo-deny (licenses/bans/advisories/sources)',
   'Documentation', 'TLS Fixture (macos-latest)', 'TLS Fixture (windows-latest)',
@@ -34,8 +55,8 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
   }
   git('init', '-q')
   // Frozen producer bytes, not an active workflow or a caller-authored receipt.
-  const definition = fs.readFileSync(current ? '.github/workflows/ci.yml'
-    : path.join(__dirname, `fixtures/main-authority-ci-${producer}.yml`))
+  const definition = current ? Buffer.from(legacyData().ci)
+    : fs.readFileSync(path.join(__dirname, `fixtures/main-authority-ci-${producer}.yml`))
   const helper = fs.readFileSync('scripts/main-release-admission.py')
   const helperDigest = createHash('sha256').update(helper).digest('hex')
   const producerHelper = grouped || (crates && !current)
@@ -716,4 +737,4 @@ with patch('subprocess.check_output', output):
     assert.equal(result.output, '')
   })
 }
-module.exports = { verify }
+module.exports = { verify, legacyData }

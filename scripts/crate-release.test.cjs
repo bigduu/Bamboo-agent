@@ -4,6 +4,7 @@ const os = require('node:os')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 const { test } = require('node:test')
+const historical = require('./tests/main-authority-bootstrap-fixture.cjs').legacyData()
 const { assertVersion, assertManualVersion, validateSource, validateReceipt, nextVersion, selectVersion,
   plan, publish, sha256, githubArgs, receiptBody, readBodyReceipt,
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend,
@@ -1190,8 +1191,8 @@ test('interrupted initial frontend upload can recover before any crate, while pa
   assert.deepEqual(calls, ['atomic-body', 'upload'])
 })
 
-test('complete publication keeps canonical main CI authority and authenticates empty-association evidence', () => {
-  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+test('legacy publication keeps its canonical main CI authority and empty-association evidence', () => {
+  const workflow = historical.publisher
   const automatic = workflow.split('  automatic:\n')[1]
   const loader = automatic.split('      - uses: actions/checkout')[0]
   assert.match(loader, /contents\/scripts\/main-release-admission\.py\?ref=/)
@@ -1246,15 +1247,15 @@ test('complete publication keeps canonical main CI authority and authenticates e
   assert.match(platform, /name: Platform Tests \(\$\{\{ matrix\.os \}\}\)/)
 })
 
-test('trusted manual publication and automatic receipts share a queue while dry runs stay credential-free', () => {
+test('Retirement2363 current Source and historical manual routes retain separate ownership', () => {
   const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
-  const manual = workflow.split('  manual:\n')[1].split('  dry-run:\n')[0]
-  const dry = workflow.split('  dry-run:\n')[1].split('  automatic:\n')[0]
+  const manual = historical.publisher.split('  manual:\n')[1].split('  dry-run:\n')[0]
+  const dry = historical.publisher.split('  dry-run:\n')[1].split('  automatic:\n')[0]
   const automatic = workflow.split('  automatic:\n')[1].split('  executables:\n')[0]
-  assert.match(workflow, /workflow_run:\n    workflows: \[CI\]\n    types: \[completed\]\n    branches: \[main\]/)
+  assert.match(historical.publisher, /workflow_run:\n    workflows: \[CI\]\n    types: \[completed\]\n    branches: \[main\]/)
   assert.match(workflow, /group: bamboo-crate-publication\n  queue: max\n  cancel-in-progress: false/)
   assert.match(workflow, /permissions:\n  contents: read/)
-  assert.match(manual, /if: github.event_name == 'workflow_dispatch' && inputs\.release_source_contract != 'frozen-source-v2' && !inputs\.dry_run/)
+  assert.match(manual, /if: github.event_name == 'workflow_dispatch' && !inputs\.dry_run/)
   assert.match(manual, /environment: bamboo-release/)
   assert.match(manual, /GH_TOKEN: \$\{\{ github\.token \}\}/)
   assert.ok(manual.indexOf('Authorize the trusted manual') < manual.indexOf('uses: actions/checkout'))
@@ -1264,7 +1265,7 @@ test('trusted manual publication and automatic receipts share a queue while dry 
   assert.equal(manual.split('CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}').length - 1, 1)
   assert.match(manual, /if: github.event.inputs.dry_run != 'true'/)
   assert.match(manual, /cargo publish --locked --allow-dirty -p/)
-  assert.match(dry, /if: github.event_name == 'workflow_dispatch' && inputs\.release_source_contract != 'frozen-source-v2' && inputs\.dry_run/)
+  assert.match(dry, /if: github.event_name == 'workflow_dispatch' && inputs\.dry_run/)
   assert.doesNotMatch(dry, /environment:|secrets\.|cargo publish|crate-release.cjs (?:plan|publish)/)
   for (const name of ['GH_TOKEN', 'CARGO_REGISTRY_TOKEN', 'BAMBOO_RELEASE_TOKEN',
     'BAMBOO_RELEASE_SIGNING_KEY', 'BAMBOO_RELEASE_SIGNING_KEY_SHA256']) {
@@ -1278,7 +1279,7 @@ test('trusted manual publication and automatic receipts share a queue while dry 
     assert.ok(step, `Missing shared preparation step ${alias}`)
     assert.doesNotMatch(step, /secrets\.|BAMBOO_RELEASE_|CARGO_REGISTRY_TOKEN|cargo publish/)
   }
-  assert.match(automatic, /github.event_name == 'workflow_run'/)
+  assert.doesNotMatch(automatic, /github.event_name == 'workflow_run'/)
   assert.match(automatic, /environment: bamboo-release\n    permissions:\n      contents: write/)
   assert.match(automatic, /ref: \$\{\{ steps.source.outputs.revision \}\}\n          fetch-depth: 0\n          persist-credentials: false/)
   assert.ok(automatic.indexOf('Authorize the exact source') < automatic.indexOf('ref: ${{ steps.source.outputs.revision }}'))
@@ -1295,8 +1296,8 @@ test('trusted manual publication and automatic receipts share a queue while dry 
   assert.doesNotMatch(workflow, /VERSION="\$\{\{ github.event.inputs.version/)
   const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8')
   assert.match(ci, /group: ci-\$\{\{ github.event_name \}\}/)
-  assert.match(ci, /queue: \$\{\{ github.event_name == 'push' && github.ref == 'refs\/heads\/main' && 'max' \|\| 'single' \}\}/)
-  assert.match(ci, /cancel-in-progress: \$\{\{ github.event_name != 'push' \|\| github.ref != 'refs\/heads\/main' \}\}/)
+  assert.match(ci, /^  queue: single$/m)
+  assert.match(ci, /^  cancel-in-progress: true$/m)
   assert.match(ci, /node --test scripts\/ci-policy.test.cjs scripts\/crate-release.test.cjs/)
 })
 
@@ -1352,7 +1353,9 @@ test('the real manual version resolver has no signing or API dependency and neve
 })
 
 function workflowPython(name, filename = '.github/workflows/publish-crate.yml') {
-  const step = fs.readFileSync(filename, 'utf8').split(`      - name: ${name}`)[1]
+  const source = filename === '.github/workflows/publish-crate.yml' ? historical.publisher
+    : filename === '.github/workflows/ci.yml' ? historical.ci : fs.readFileSync(filename, 'utf8')
+  const step = source.split(`      - name: ${name}`)[1]
   const match = step.match(/          python3 - <<'(PY(?:THON)?)'\n([\s\S]*?)\n          \1\n/)
   assert.ok(match, `missing Python body: ${name}`)
   return match[2]
@@ -1587,15 +1590,16 @@ test('historical server producer and verifier remain byte-pinned', () => {
   assert.ok(current.includes(`LEGACY_SERVER_BLOCK_HELPER = "${sha256(helper)}"`))
 })
 
-test('current admission pins the complete workflow and helper without a circular hash', () => {
-  const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8')
-  const publisher = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+test('Retirement2363 fixed legacy admission pins stay separate from the current workflow', () => {
+  const ci = historical.ci
+  const publisher = historical.publisher
   const helper = fs.readFileSync('scripts/main-release-admission.py', 'utf8')
   const pin = /ADMISSION_HELPER_SHA256: "([0-9a-f]{64})"/g
   assert.deepEqual([...ci.matchAll(pin)].map(match => match[1]), [sha256(helper)])
   assert.deepEqual([...publisher.matchAll(pin)].map(match => match[1]), [sha256(helper)])
   const normalized = ci.replace(pin, 'ADMISSION_HELPER_SHA256: "<PINNED_ADMISSION_HELPER>"')
   assert.ok(helper.includes(`CURRENT_PRODUCER = "${sha256(normalized)}"`))
+  assert.notEqual(fs.readFileSync('.github/workflows/ci.yml', 'utf8'), ci, 'CURRENT feature policy must not silently use the legacy archive')
   assert.equal(workflowPython('Authenticate completed release acceptance before checkout', '.github/workflows/ci.yml'),
     workflowPython('Authorize the exact source before checkout'))
   assert.match(helper, /final executable must be rebuilt for source=/)

@@ -9,6 +9,7 @@ require("./docs-deploy.test.cjs").register()
 const { runInNewContext, runInThisContext } = require("node:vm")
 
 const workflow = readFileSync(".github/workflows/ci.yml", "utf8")
+const historical = require("./tests/main-authority-bootstrap-fixture.cjs").legacyData()
 const frozenSource = require("./frozen-source-admission.cjs")
 const frozenFixture = JSON.parse(readFileSync("scripts/tests/frozen-source-admission-fixtures.json", "utf8"))
 const sourceHash = bytes => createHash("sha256").update(bytes).digest("hex")
@@ -662,17 +663,38 @@ const frozenCacheWriteHeader = [
 const cacheSaveIf = (predicate) =>
   `save-if: \${{ (${predicate}) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}`
 
-const job = (id) => {
+const job = (id, source = workflow) => {
   const marker = `\n  ${id}:\n`
-  const start = workflow.indexOf(marker)
+  const start = source.indexOf(marker)
   assert.notEqual(start, -1, `missing CI job: ${id}`)
 
   const contentStart = start + marker.length
-  const nextJob = workflow.slice(contentStart).search(/\n  [a-z][a-z0-9-]*:\n/u)
+  const nextJob = source.slice(contentStart).search(/\n  [a-z][a-z0-9-]*:\n/u)
   return nextJob === -1
-    ? workflow.slice(contentStart)
-    : workflow.slice(contentStart, contentStart + nextJob)
+    ? source.slice(contentStart)
+    : source.slice(contentStart, contentStart + nextJob)
 }
+
+const legacyJob = id => job(id, historical.ci)
+
+test("Retirement2363 current Quick registers every contract once through its actual owner", () => {
+  const commands = [...job("quick-checks").matchAll(/run: node --test ([^\n]+)/gu)]
+    .flatMap(([, value]) => value.split(/\s+/u))
+  for (const file of ["ci-policy", "crate-release", "ci-routing", "sidecar-release", "test-groups", "run-feature-tests",
+    "native-test-owner", "supervisor-native-acceptance", "lotus-next-artifact", "release-frontend-policy"]) {
+    assert.equal(commands.filter(value => value === `scripts/${file}.test.cjs`).length, 1, file)
+  }
+  const own = readFileSync("scripts/ci-policy.test.cjs", "utf8").split("\n")
+  for (const file of ["published-source-admission", "main-admission", "docker-from-release", "docker-arm-original"]) {
+    assert.equal(own.filter(line => line === `require("./${file}.test.cjs")`).length, 1, file)
+    assert.equal(commands.includes(`scripts/${file}.test.cjs`), false, "transitive tests must not also run directly")
+  }
+  assert.equal(own.filter(line => line === 'require("./docs-deploy.test.cjs").register()').length, 1)
+  assert.equal(commands.includes("scripts/docs-deploy.test.cjs"), false)
+  const sidecar = readFileSync("scripts/sidecar-release.test.cjs", "utf8")
+  assert.equal(sidecar.split("require('./native-originals.test.cjs').register()").length, 2)
+  assert.equal(commands.includes("scripts/native-originals.test.cjs"), false)
+})
 
 const docsStep = (name, source = workflow) => {
   const block = source.slice(source.indexOf("\n  docs:\n")).split(/\n  security:\n/u)[0]
@@ -984,9 +1006,9 @@ test("macOS link guard preserves Cargo failures and rejects lost or oversized di
   }
 })
 
-test("main-push validation remains reachable by the existing automatic publisher", () => {
-  assert.match(workflow, /^  push:\n    branches: \[ main \]$/mu)
-  assert.match(workflow, /pull_request:\n\s+branches: \[ dev, main \]/u)
+test("Retirement2363 feature-only validation preserves actual feature and diagnostic checks", () => {
+  assert.doesNotMatch(workflow, /^  (?:push|workflow_run):/mu)
+  assert.match(workflow, /pull_request:\n\s+branches: \[dev\]/u)
 
   const testJob = job("test")
   assert.match(testJob, /name: Test\n/u)
@@ -1073,7 +1095,7 @@ test("legacy release matrices retain their original crate and server coverage", 
   assert.match(job("e2e-crates"), /run: cargo test --locked --no-fail-fast -p "\$TEST_CRATE" --all-features --lib --tests\n/u)
   assert.doesNotMatch(workflow, /test-build:|e2e-build:|test-blocks:|test-doctests:|grouped-tests|ci-artifacts|plan-id:/u)
   assert.match(workflow, /^permissions:\n  contents: read\n/mu)
-  assert.match(job("main-release-admission"), /^    permissions:\n      contents: read\n      actions: read\n/mu)
+  assert.doesNotMatch(workflow, /^  main-release-admission:/mu)
 })
 
 test("one feature executor preserves default configurations and complete explicit additive case ownership", () => {
@@ -1372,6 +1394,7 @@ test("all agents share canonical feature tests instead of adding ordinary Linux 
   const unregistered = workflow + "\n  extra-linux-tests:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test --locked -p bamboo-server --lib\n"
   assert.throws(() => assertLinuxTestOwnership({ ...definitions, "ci.yml": unregistered }), /must join the canonical feature executor/u)
   assert.throws(() => assertLinuxTestOwnership({ ...definitions, "ticket-platform-adapter.yml": definitions["ticket-platform-adapter.yml"]
+    .replace("on:\n  workflow_dispatch:", "on:\n  pull_request:\n    branches: [dev]\n  workflow_dispatch:")
     .replace("if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''", "if: github.event_name == 'pull_request'") }), /workflow_dispatch/u)
 })
 
@@ -1490,6 +1513,7 @@ test("native summaries reject failed, cancelled, skipped and missing crate resul
     const results = Object.fromEntries(variables.map((name) => [name, "success"]))
     const run = (overrides = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", command], {
       env: { ...process.env, SOURCE_RESULT: "success", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false",
+        GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/feature/diagnosis",
         LINT_RESULT: "success", MSRV_RESULT: "success", SECURITY_RESULT: "success", DENY_RESULT: "success", DOCS_RESULT: "success", ...results, ...overrides }, encoding: "utf8",
     })
     assert.equal(run().status, 0)
@@ -1502,7 +1526,7 @@ test("native summaries reject failed, cancelled, skipped and missing crate resul
 })
 
 test("promotion retains required checks without repeating platform coverage", () => {
-  assert.match(job("promotion-source"), /name: Promotion Source\n/u)
+  assert.doesNotMatch(workflow, /^  promotion-source:/mu)
   assert.match(job("lint"), /name: Lint\n/u)
 
   const e2e = job("e2e-test")
@@ -1602,22 +1626,21 @@ test("legacy release jobs retain explicit full-validation selection", () => {
   }
 })
 
-test("main promotion and manual native platform test policy stays intact", () => {
-  const promotion = job("promotion-source")
+test("legacy v8 promotion and native platform policy remains fixed", () => {
+  const promotion = legacyJob("promotion-source")
   assert.match(promotion, /github\.base_ref == 'main'/u)
   assert.match(promotion, /HEAD_REF.*github\.head_ref/u)
 
-  const build = job("build")
+  const build = legacyJob("build")
   assert.match(build, /github\.event_name == 'workflow_dispatch'/u)
   assert.match(build, /github\.base_ref == 'main'/u)
   assert.match(build, /startsWith\(github\.head_ref, 'release\/'\)/u)
   assert.match(build, /os: \[ubuntu-latest, macos-latest, windows-latest\]/u)
 })
 
-test("CodeQL stays on the main and manual paths", () => {
+test("Retirement2363 CodeQL retains manual diagnosis while feature owns automatic analysis", () => {
   assert.match(codeqlWorkflow, /workflow_dispatch:\n/u)
-  assert.match(codeqlWorkflow, /push:\n\s+branches: \[ main \]/u)
-  assert.match(codeqlWorkflow, /pull_request:\n\s+branches: \[ main \]/u)
+  assert.doesNotMatch(codeqlWorkflow, /^  (?:push|pull_request):/mu)
   assert.doesNotMatch(codeqlWorkflow, /branches: \[[^\]]*dev/u)
   assert.match(
     codeqlWorkflow,
@@ -1627,13 +1650,13 @@ test("CodeQL stays on the main and manual paths", () => {
 })
 
 const promotionScript = () => {
-  const block = job("promotion-source").match(/        run: \|\n([\s\S]*)$/u)
+  const block = legacyJob("promotion-source").match(/        run: \|\n([\s\S]*)$/u)
   assert.ok(block, "source proof must stay inline before any checkout")
   return block[1].split("\n").map((line) => line.replace(/^          /u, "")).join("\n")
 }
 
-test("frozen promotion bootstrap is read-only and leaves merge-tree validation intact", () => {
-  const promotion = job("promotion-source")
+test("legacy v8 frozen promotion bootstrap remains read-only", () => {
+  const promotion = legacyJob("promotion-source")
   assert.match(promotion, /permissions:\n      contents: read\n/u)
   assert.equal((promotion.match(/^      - /gmu) || []).length, 1)
   assert.doesNotMatch(promotion, /uses:|environment:|continue-on-error:|contents: write|pull_request_target/u)
@@ -1650,10 +1673,10 @@ test("frozen promotion bootstrap is read-only and leaves merge-tree validation i
   assert.match(bootstrap, /opener\.open\(request, timeout=30\)/u)
   // No source checkout is pinned over the PR's synthetic merge result.
   for (const id of ["test", "test-crates", "e2e-crates", "test-ssh", "lint", "build"]) {
-    assert.match(job(id), /- uses: actions\/checkout@v7\n(?:        if: github.event_name != 'push'\n)?/u)
+    assert.match(legacyJob(id), /- uses: actions\/checkout@v7\n(?:        if: github.event_name != 'push'\n)?/u)
   }
   for (const context of ["Promotion Source", "Test", "Lint", "E2E Tests", "Platform Tests (${{ matrix.os }})"]) {
-    assert.ok(workflow.includes(`name: ${context}\n`), `retain required context: ${context}`)
+    assert.ok(historical.ci.includes(`name: ${context}\n`), `retain required context: ${context}`)
   }
   assert.match(contributing, /dev → release\/<40-character-cut-SHA> → main/u)
   assert.match(contributing, /freshly read its actual current HEAD immediately before/u)
@@ -1683,7 +1706,7 @@ test("frozen promotion bootstrap is read-only and leaves merge-tree validation i
   assert.match(readFileSync("AGENTS.md", "utf8"), /CONTRIBUTING\.md#release-process/u)
 })
 
-test("frozen promotion proves exact ancestry, accepts dev advancement, and rejects missing or changed proof", () => {
+test("legacy v8 promotion proves ancestry and rejects missing or changed proof", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-frozen-promotion-"))
   const git = (...args) => {
     const result = spawnSync("git", args, { cwd: directory, encoding: "utf8" })
@@ -2020,8 +2043,6 @@ function assertFrontendPolicy(source) {
     "        description: Exact 40-character SHA of the selected ref for source acceptance",
     "        required: true",
     "        type: string",
-    "  pull_request:",
-    "    branches: [main]",
     "permissions:",
     "  contents: read",
     "env:",
@@ -2181,7 +2202,7 @@ test("frontend acceptance preserves the locked build, focused tests and actual-h
   assertFrontendPolicy(frontendWorkflow)
   for (const [from, to] of [
     ["  workflow_dispatch:", "  workflow_dispatch:\n    inputs:\n      source:\n        type: string"],
-    ["    branches: [main]", "    branches: [dev]"],
+    ["  workflow_dispatch:", "  pull_request:\n    branches: [main]\n  workflow_dispatch:"],
     ['PYTHONDONTWRITEBYTECODE: "1"', 'PYTHONDONTWRITEBYTECODE: "0"'],
     ["contents: read", "contents: write"],
     ["permissions:\n", 'env:\n  RUST_TEST_THREADS: "1"\npermissions:\n'],
@@ -2428,13 +2449,8 @@ const actorWindowsStep = (source, name) => {
 const actorWindowsCompileName = "Compile and verify all 41 selected native tests"
 const actorWindowsRunName = "Execute 9 snapshot, 3 gateway, 19 directory, 5 scoped and 5 initial process tests"
 
-const actorWindowsPathBlock = actorWindowsWorkflow.match(/    paths:\n([\s\S]*?)(?=\n\S)/u)[1]
-const actorWindowsPaths = [...actorWindowsPathBlock.matchAll(/^      - '([^']+)'$/gmu)]
-  .map(([, pattern]) => pattern)
-const needsActorWindows = (files) => files.some((file) =>
-  actorWindowsPaths.some((pattern) => path.posix.matchesGlob(file, pattern)))
 
-test("Supervisor driver self-tests cover dev, full validation and release platforms", () => {
+test("Retirement2363 Supervisor checks cover feature and explicit diagnostic platforms", () => {
   const name = "Test Supervisor driver and owned loopback process binding"
   const command = "node --test scripts/supervisor-native-acceptance.test.cjs"
   const step = (source) => {
@@ -2454,9 +2470,9 @@ test("Supervisor driver self-tests cover dev, full validation and release platfo
     )
     for (const [event, base, head, fullValue, expected] of [
       ["pull_request", "dev", "feature/driver", "false", [true, false, false, false]],
-      ["pull_request", "main", "release/" + "a".repeat(40), "true", [false, true, true, true]],
+      ["pull_request", "main", "release/" + "a".repeat(40), "false", [false, false, false, false]],
       ["workflow_dispatch", "", "", "true", [false, true, true, true]],
-      ["push", "", "", "true", [false, true, false, false]],
+      ["push", "", "", "false", [false, false, false, false]],
     ]) {
       const github = { event_name: event, base_ref: base, head_ref: head, repository: "bigduu/Bamboo-agent",
         event: { pull_request: { head: { repo: { full_name: "bigduu/Bamboo-agent" } } } } }
@@ -2506,72 +2522,17 @@ test("feature portable Node suites have one owner per OS without duplicating Ubu
   assert.throws(() => verify(quick, native.replace("- name: Test portable Supervisor and frontend policies", "- name: Test portable Supervisor and frontend policies\n        continue-on-error: true"), linux))
 })
 
-test("native Windows paths retain native sources while policy and release edits stay fast", () => {
-  assert.match(actorWindowsWorkflow, /on:\n  workflow_dispatch:\n  pull_request:\n    branches: \[main\]\n    paths:\n/u)
+test("Retirement2363 Native manual routes preserve the real feature owner", () => {
+  for (const file of ["actor-snapshot-windows", "ticket-platform-adapter"]) {
+    const source = readFileSync(`.github/workflows/${file}.yml`, "utf8")
+    assert.match(source, /^  workflow_dispatch:/mu)
+    assert.doesNotMatch(source, /^  (?:push|pull_request):/mu)
+  }
+  assert.match(job("quick-checks"), /run: cargo fmt --all -- --check/u)
   assert.match(job("quick-checks"), /run: node --test scripts\/ci-policy\.test\.cjs(?: |\n)/u)
-  assert.match(job("test"), /Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs(?: |\n)/u)
-  const nativeInputs = [
-    ".github/workflows/actor-snapshot-windows.yml",
-    "scripts/actor-windows-native.ps1", "scripts/actor-windows-native.test.ps1",
-    ".cargo/config.toml", "Cargo.toml", "Cargo.lock",
-    "crates/Cargo.toml", "crates/app/bamboo-server/Cargo.toml",
-    "crates/core/bamboo-domain/Cargo.toml", "crates/infra/bamboo-storage/Cargo.toml",
-    "crates/engine/bamboo-tools/Cargo.toml", "crates/infra/bamboo-config/Cargo.toml",
-    "crates/infra/bamboo-storage/src/v2/actor_snapshot_windows_tests.rs",
-    "crates/infra/bamboo-storage/src/v2/actor_directory.rs",
-    "crates/infra/bamboo-storage/src/v2/mod.rs",
-    "crates/engine/bamboo-tools/src/local_task_resources/windows.rs",
-    "crates/engine/bamboo-tools/src/lib.rs", "crates/core/bamboo-domain/src/lib.rs",
-    "crates/app/bamboo-server/src/app_state/mod.rs", "crates/app/bamboo-server/src/lib.rs",
-    "crates/app/bamboo-server/src/routes/agent.rs", "crates/app/bamboo-server/src/routes/bamboo_v1.rs",
-    "crates/app/bamboo-server/src/routes/mod.rs", "crates/app/bamboo-server/src/codex_run_tokens.rs",
-    "crates/app/bamboo-server/src/error.rs", "crates/app/bamboo-server/src/handlers/agent/actor_snapshot.rs",
-    "crates/app/bamboo-server/src/handlers/agent/mod.rs", "crates/app/bamboo-server/src/handlers/settings/mod.rs",
-    "crates/app/bamboo-server/src/handlers/settings/access_control.rs",
-    "crates/engine/bamboo-engine/src/external_agents/actor_adapter.rs",
-    "crates/infra/bamboo-config/src/config.rs", "crates/infra/bamboo-config/src/encryption.rs",
-    "crates/infra/bamboo-config/src/lib.rs", "crates/app/bamboo-server/build.rs",
-    "crates/app/bamboo-server/frontend_build.rs",
-  ]
-  for (const file of nativeInputs) assert.equal(needsActorWindows([file]), true, file)
-  const fastInputs = [
-    "scripts/ci-policy.test.cjs", "scripts/ci-routing.test.cjs",
-    "scripts/crate-release.cjs", "scripts/crate-release.test.cjs",
-    "scripts/sidecar-release.cjs", "scripts/sidecar-release.test.cjs",
-    ".github/workflows/publish-crate.yml", "README.md", "docs/releases/shared-executable-assets.md",
-  ]
-  for (const file of fastInputs) assert.equal(needsActorWindows([file]), false, file)
-  assert.equal(needsActorWindows(fastInputs), false)
-  assert.equal(needsActorWindows([...fastInputs, nativeInputs[0]]), true)
-  assert.equal(needsActorWindows([]), false)
-})
-
-test("native Windows still uses cumulative PR changes after an unrelated last commit", (t) => {
-  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-actor-paths-"))
-  t.after(() => rmSync(directory, { recursive: true, force: true }))
-  const git = (...args) => {
-    const result = spawnSync("git", args, { cwd: directory, encoding: "utf8" })
-    assert.equal(result.status, 0, result.stderr)
-    return result.stdout.trim()
-  }
-  const commit = (file, content) => {
-    const target = path.join(directory, file)
-    mkdirSync(path.dirname(target), { recursive: true })
-    writeFileSync(target, content)
-    git("add", ".")
-    git("-c", "user.name=ci-policy", "-c", "user.email=ci-policy@example.invalid", "commit", "--quiet", "-m", file)
-    return git("rev-parse", "HEAD")
-  }
-  const changes = (range) => git("diff", "--name-only", range).split("\n").filter(Boolean)
-  git("init", "--quiet")
-  const base = commit("README.md", "base\n")
-  commit("scripts/ci-policy.test.cjs", "policy assertion\n")
-  commit("scripts/crate-release.cjs", "unrelated release fix\n")
-  assert.equal(needsActorWindows(changes(`${base}...HEAD`)), false)
-  commit("crates/infra/bamboo-storage/src/v2/mod.rs", "native reader change\n")
-  commit("scripts/crate-release.cjs", "another release fix\n")
-  assert.equal(needsActorWindows(changes("HEAD^...HEAD")), false, "latest commit alone misses the native input")
-  assert.equal(needsActorWindows(changes(`${base}...HEAD`)), true, "PR three-dot diff retains the earlier native input")
+  assert.match(job("native-feature-tests"), /os: \[windows-2025, macos-latest\]/u)
+  assert.match(job("native-feature-tests"), /run: node scripts\/native-test-owner\.cjs/u)
+  assert.doesNotMatch(job("feature-tests"), /node --test/u)
 })
 
 const assertActorWindowsAcceptance = (source, controller = actorWindowsController) => {
@@ -2859,7 +2820,7 @@ test("Main2351 workflow contract", () => {
   assert.equal(sourceHash(main), admission.MAIN_WORKFLOW_SHA256)
   assert.equal(Object.isFrozen(admission.MAIN_CONTROLS), true)
   assert.equal(new Set(admission.MAIN_CONTROLS).size, admission.MAIN_CONTROLS.length)
-  assert.equal(admission.MAIN_CONTROLS.length, 25)
+  assert.equal(admission.MAIN_CONTROLS.length, 38)
   for (const file of ["docs/delivery-workflow.md", "docs/ci-workflow-audit.md"]) assert.ok(admission.MAIN_CONTROLS.includes(file))
   for (const file of admission.CONTROLLER_HELPERS) assert.ok(admission.MAIN_CONTROLS.includes(file))
   const source = readFileSync("scripts/ci-policy.test.cjs", "utf8")

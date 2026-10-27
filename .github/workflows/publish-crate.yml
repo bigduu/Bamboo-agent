@@ -3,18 +3,14 @@ name: Publish Crate
 # BAMBOO_SHARED_EXECUTABLES_V2
 
 on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
     inputs:
       release_source_contract:
-        description: "legacy manual or inactive frozen-source original-output contract"
+        description: "Frozen accepted-dev source and retained original outputs"
         required: true
-        default: legacy
+        default: frozen-source-v2
         type: choice
-        options: [legacy, frozen-source-v2]
+        options: [frozen-source-v2]
       release_ref:
         description: "Exact release/<accepted dev SHA> for frozen-source-v2"
         type: string
@@ -32,12 +28,12 @@ on:
         required: true
         type: string
       version:
-        description: "Override unified publish version (for example: 2026.3.11). Leave empty or 'latest' to use the root Cargo.toml version."
+        description: "Reserved by the frozen-source allocator; leave empty"
         required: false
         default: ""
         type: string
       dry_run:
-        description: "Validate manifest rewriting and workspace buildability without uploading (does not emulate crates.io propagation for internal crates)"
+        description: "Historical diagnostic flag; frozen-source publication requires false"
         required: false
         default: false
         type: boolean
@@ -58,7 +54,7 @@ on:
 permissions:
   contents: read
 
-# Existing crate-only manual uploads and automatic main releases serialize every upload attempt.
+# The sole frozen-source publisher serializes the existing allocator and all uploads.
 concurrency:
   group: bamboo-crate-publication
   queue: max
@@ -70,7 +66,8 @@ env:
 
 jobs:
   manual:
-    if: github.event_name == 'workflow_dispatch' && inputs.release_source_contract != 'frozen-source-v2' && !inputs.dry_run && !fromJSON(toJSON(github.event.inputs)).complete_release
+    # Keep shared historical aliases; this retired event is absent from on.
+    if: github.event_name == 'workflow_run'
     runs-on: ubuntu-latest
     environment: bamboo-release
     steps:
@@ -345,7 +342,8 @@ jobs:
           echo "Published Bamboo crates for version ${TARGET_VERSION}"
 
   dry-run:
-    if: github.event_name == 'workflow_dispatch' && inputs.release_source_contract != 'frozen-source-v2' && inputs.dry_run && !fromJSON(toJSON(github.event.inputs)).complete_release
+    # Keep shared historical aliases; this retired event is absent from on.
+    if: github.event_name == 'workflow_run'
     runs-on: ubuntu-latest
     # No Environment or publication credentials, including on feature refs.
     env:
@@ -389,17 +387,9 @@ jobs:
           EOF
           python3 scripts/compute-publish-order.py
 
-  # Legacy actual-main CI and new frozen-source dispatch keep one queue/allocator.
-  # The Source resolver's empty complete-producer registry still denies new cuts.
+  # New publication accepts only the frozen-source contract; no CI/main or legacy allocation path.
   automatic:
-    if: >-
-      (github.event_name == 'workflow_run' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository &&
-      github.event.workflow_run.repository.full_name == github.repository) ||
-      (github.event_name == 'workflow_dispatch' && inputs.release_source_contract == 'frozen-source-v2')
+    if: github.event_name == 'workflow_dispatch' && inputs.release_source_contract == 'frozen-source-v2' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: bamboo-release
     permissions:

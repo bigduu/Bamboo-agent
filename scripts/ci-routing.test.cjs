@@ -8,6 +8,7 @@ const { test } = require("node:test");
 const ci = fs.readFileSync(".github/workflows/ci.yml", "utf8");
 const frontend = fs.readFileSync(".github/workflows/frontend-acceptance.yml", "utf8");
 const publisher = fs.readFileSync(".github/workflows/publish-crate.yml", "utf8");
+const historical = require("./tests/main-authority-bootstrap-fixture.cjs").legacyData();
 const qualityFields = ["LINT_RESULT", "MSRV_RESULT", "SECURITY_RESULT", "DENY_RESULT", "DOCS_RESULT", "CODEQL_RESULT", "FRONTEND_INVENTORY_RESULT"];
 const qualitySuccess = Object.fromEntries(qualityFields.map(name => [name, "success"]));
 
@@ -65,7 +66,7 @@ test("Retirement2363 current workflow triggers leave one Source publisher and no
   assert.doesNotMatch(ci, /^  (?:push|workflow_run):/m); assert.match(ci, /pull_request:\n    branches: \[dev\]/);
   assert.doesNotMatch(ci, /^  (?:main-release-admission|promotion-source):/m);
   assert.doesNotMatch(publisher, /^  workflow_run:/m); assert.match(publisher, /options: \[frozen-source-v2\]/);
-  for (const id of ["manual", "dry-run"]) assert.match(job(publisher, id), /^    if: false$/m);
+  for (const id of ["manual", "dry-run"]) assert.match(job(publisher, id), /^    if: github.event_name == 'workflow_run'$/m);
   assert.match(job(publisher, "automatic"), /^    if: github.event_name == 'workflow_dispatch' && inputs.release_source_contract == 'frozen-source-v2' && github.ref == 'refs\/heads\/main'$/m);
   for (const file of ["actor-snapshot-windows", "ticket-platform-adapter", "frontend-acceptance", "codeql"]) {
     const source = fs.readFileSync(`.github/workflows/${file}.yml`, "utf8");
@@ -88,7 +89,7 @@ function script(step) {
 function assertRouting(source) {
   assert.match(source, /^permissions:\n  contents: read\n/m);
   assertSharedBuild(source);
-  assertMainAdmission(source);
+  assert.doesNotMatch(source, /^  (?:main-release-admission|promotion-source):/m);
   const quick = job(source, "quick-checks");
   assert.match(quick, /^    name: Quick Checks$/m);
   assert.match(quick, /^    if: github.event_name == 'pull_request' && github.base_ref == 'dev'$/m);
@@ -97,7 +98,7 @@ function assertRouting(source) {
   assert.doesNotMatch(quick, /cargo (build|test|check|clippy)|continue-on-error|--test-skip/);
   const full = job(source, "test");
   assert.match(full, /^    name: Test$/m);
-  assert.match(full, /^    needs: \[validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
+  assert.match(full, /^    needs: \[validation-source, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
   assert.match(full, /^    if: always\(\) && !cancelled\(\)$/m);
   assert.match(full, /- name: Require validation admission\n        env:\n          SOURCE_RESULT: \$\{\{ needs.validation-source.result \}\}\n          FULL_VALIDATION: \$\{\{ needs.validation-source.outputs.full \}\}/);
   assert.match(full, /test "\$SOURCE_RESULT" = success/);
@@ -106,6 +107,10 @@ function assertRouting(source) {
   assert.match(full, /test "\$E2E_RESULT" = success/);
   assert.match(full, /test "\$CRATE_RESULT" = success/);
   assert.doesNotMatch(full, /run: cargo test/);
+  for (const step of full.split(/(?=^      - )/m).slice(2)) {
+    assert.match(step, /^        if: (?:(?:always|failure)\(\) && )?needs.validation-source.outputs.full == 'true'$/m,
+      "feature admission must not execute a legacy diagnostic step");
+  }
   for (const id of ["msrv", "tls-fixture-test", "tool-event-recorder-e2e", "lint", "build", "docs", "security", "deny"]) {
     const block = job(source, id);
     assert.match(block, /^    needs: validation-source$/m);
@@ -117,12 +122,12 @@ function assertRouting(source) {
   assert.match(job(source, "build"), /^    name: Platform Tests \(\$\{\{ matrix\.os \}\}\)$/m);
   assert.doesNotMatch(source, /cargo build[^\n]*--release/);
   assert.doesNotMatch(source, /continue-on-error:|paths-ignore:/);
-  assert.match(source, /queue: .*github.event_name == 'push'.*refs\/heads\/main.*'max'/);
-  assert.match(source, /cancel-in-progress: .*github.event_name != 'push'.*refs\/heads\/main/);
+  assert.match(source, /^  queue: single$/m);
+  assert.match(source, /^  cancel-in-progress: true$/m);
   assert.match(source, /group:.*inputs.snapshot_sha/);
 }
 
-test("required Test runs feature tests, validates snapshots fully and authenticates main admission", () => {
+test("Retirement2363 current Test retains feature owners and exact diagnostic source", () => {
   assertRouting(ci);
   for (const [from, to] of [
     ["name: Quick Checks", "name: Test"],
@@ -136,10 +141,10 @@ test("required Test runs feature tests, validates snapshots fully and authentica
   ]) assert.throws(() => assertRouting(ci.replace(from, to)), `reject ${to}`);
 });
 
-test("snapshot controller executes positive and fail-closed routing cases", (t) => {
+test("legacy v8 snapshot controller retains its original positive and fail-closed routing", (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-ci-routing-"));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const shell = script(job(ci, "validation-source"));
+  const shell = script(job(historical.ci, "validation-source"));
   assert.doesNotMatch(shell, /\$\{\{|eval|git checkout|git fetch/);
   const sha = "a".repeat(40);
   const run = (overrides) => {
@@ -176,7 +181,7 @@ test("full Test binds immutable merge/event source and fails on dirty source", (
 });
 
 test("frontend source acceptance retains the exact-head build and focused frontend tests", () => {
-  assert.match(frontend, /pull_request:\n    branches: \[main\]/);
+  assert.doesNotMatch(frontend, /^  pull_request:/m);
   assert.doesNotMatch(frontend, /branches: \[dev\]|paths:/);
   assert.match(frontend, /snapshot_sha:\n.*\n        required: true\n        type: string/);
   for (const id of ["lint", "build", "test"]) {
@@ -199,7 +204,8 @@ test("frontend source acceptance retains the exact-head build and focused fronte
   assert.match(job(frontend, "lint"), /cargo clippy --all-features --/);
 });
 
-test("publication still requires the actual successful same-repository main push CI", () => {
+test("legacy publication retains its actual successful same-repository main push CI", () => {
+  const publisher = historical.publisher;
   assert.match(publisher, /workflow_run:\n    workflows: \[CI\]/);
   for (const condition of ["github.event.workflow_run.event == 'push'", "github.event.workflow_run.conclusion == 'success'", "github.event.workflow_run.head_branch == 'main'", "github.event.workflow_run.head_repository.full_name == github.repository"]) assert.ok(publisher.includes(condition));
 });
@@ -223,14 +229,14 @@ function assertMainAdmission(source) {
   }
 }
 
-test("main Test reports real admission while the full suite remains on pre-merge/manual sources", () => {
-  assertMainAdmission(ci);
+test("legacy main Test reports real admission while the full suite remains on pre-merge/manual sources", () => {
+  assertMainAdmission(historical.ci);
   for (const [from, to] of [
     ["ADMISSION_MODE: main", "ADMISSION_MODE: publication"],
     ['test "$MAIN_ADMISSION_RESULT" = success', 'true'],
     ["if: needs.validation-source.outputs.full == 'true'", "if: always()"],
     ["contents: read\n      actions: read", "contents: write\n      actions: read"],
-  ]) assert.throws(() => assertMainAdmission(ci.replace(from, to)));
+  ]) assert.throws(() => assertMainAdmission(historical.ci.replace(from, to)));
 });
 
 test("source guards propagate Git inspection errors and reject dirty or mismatched sources", (t) => {
@@ -280,7 +286,7 @@ function assertSharedBuild(source) {
   const [settings, ...steps] = build.split(/(?=^      - )/m);
   assert.match(settings, /^    name: Test$/m);
   assert.match(settings, /^    if: always\(\) && !cancelled\(\)$/m);
-  assert.match(settings, /^    needs: \[validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
+  assert.match(settings, /^    needs: \[validation-source, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
   assert.ok(settings.includes("timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"));
   assert.doesNotMatch(settings, /^    continue-on-error:/m);
   assert.doesNotMatch(build, /cargo build/);
@@ -303,22 +309,21 @@ test("one required Test requires successful Unit, E2E and SSH jobs", () => {
   for (const [from, to] of [
     ["name: Test\n", "name: Dev Build\n"],
     ['test "$E2E_RESULT" = success', 'true'],
-    ["needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]", "needs: quick-checks"],
+    ["needs: [validation-source, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]", "needs: quick-checks"],
     ["name: Test CI workflow policy\n        if: needs.validation-source.outputs.full == 'true'", "name: Test CI workflow policy"],
     ["name: Check formatting\n        if: needs.validation-source.outputs.full == 'true'", "name: Check formatting"],
     ["name: Require all crate tests and the SSH fixture\n        if: needs.validation-source.outputs.full == 'true'", "name: Require all crate tests and the SSH fixture"],
   ]) assert.throws(() => assertSharedBuild(ci.replace(from, to)), `reject ${to}`);
 });
 
-test("required Test admits only successful feature execution or the matching legacy release/main proof", () => {
+test("Retirement2363 required Test admits feature or explicit feature diagnosis", () => {
   const shell = script(job(ci, "test").split("      - uses:")[0]);
   const run = (overrides = {}) => spawnSync("bash", ["-c", shell], { encoding: "utf8", env: { ...process.env,
     ...qualitySuccess, SOURCE_RESULT: "success", FULL_VALIDATION: "false", FEATURE_VALIDATION: "true", FEATURE_RESULT: "success",
     QUICK_RESULT: "success", NATIVE_RESULT: "success", BROWSER_RUNTIME_RESULT: "success", MAIN_ADMISSION_RESULT: "success",
     GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev", GITHUB_REF: "refs/pull/1/merge", ...overrides } });
-  for (const overrides of [{}, { GITHUB_BASE_REF: "main", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false", CODEQL_RESULT: "skipped", FRONTEND_INVENTORY_RESULT: "skipped" },
-    { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false" },
-    { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", FEATURE_VALIDATION: "false", ...Object.fromEntries(qualityFields.map(name => [name, "skipped"])) }]) assert.equal(run(overrides).status, 0);
+  for (const overrides of [{}, { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/feature/diagnosis",
+    FULL_VALIDATION: "true", FEATURE_VALIDATION: "false", CODEQL_RESULT: "skipped", FRONTEND_INVENTORY_RESULT: "skipped" }]) assert.equal(run(overrides).status, 0);
   for (const field of ["SOURCE_RESULT", "FEATURE_RESULT", "QUICK_RESULT", "NATIVE_RESULT", "BROWSER_RUNTIME_RESULT", ...qualityFields]) {
     for (const value of ["failure", "cancelled", "skipped", "", "unknown", undefined]) assert.notEqual(run({ [field]: value }).status, 0);
   }
@@ -333,23 +338,24 @@ test("required Test admits only successful feature execution or the matching leg
   ]) assert.notEqual(run(overrides).status, 0);
 });
 
-test("both summaries reject every incomplete quality owner and preserve legacy/main routing", () => {
+test("Retirement2363 both summaries reject incomplete quality on feature and diagnosis", () => {
   const shell = script(job(ci, "e2e-test"));
   const run = (overrides = {}) => spawnSync("bash", ["-c", shell], { encoding: "utf8", env: { ...process.env,
+    GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev", GITHUB_REF: "refs/pull/42/merge",
     ...qualitySuccess, SOURCE_RESULT: "success", FULL_VALIDATION: "false", FEATURE_VALIDATION: "true", FEATURE_RESULT: "success", NATIVE_RESULT: "success", BROWSER_RUNTIME_RESULT: "success", CRATE_RESULT: "success", SSH_RESULT: "success", ...overrides } });
   assert.equal(run().status, 0);
-  assert.equal(run({ FULL_VALIDATION: "true", FEATURE_VALIDATION: "false", FEATURE_RESULT: "skipped", NATIVE_RESULT: "skipped", BROWSER_RUNTIME_RESULT: "skipped", CODEQL_RESULT: "skipped", FRONTEND_INVENTORY_RESULT: "skipped" }).status, 0);
+  assert.equal(run({ GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/feature/diagnosis", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false", FEATURE_RESULT: "skipped", NATIVE_RESULT: "skipped", BROWSER_RUNTIME_RESULT: "skipped", CODEQL_RESULT: "skipped", FRONTEND_INVENTORY_RESULT: "skipped" }).status, 0);
   for (const field of ["SOURCE_RESULT", "FEATURE_RESULT", "NATIVE_RESULT", "BROWSER_RUNTIME_RESULT", ...qualityFields]) for (const value of ["failure", "cancelled", "skipped", "", "unknown", undefined]) {
     assert.notEqual(run({ [field]: value }).status, 0, field + ":" + value);
   }
-  for (const field of ["CRATE_RESULT", "SSH_RESULT"]) assert.notEqual(run({ FULL_VALIDATION: "true", FEATURE_VALIDATION: "false", [field]: "skipped" }).status, 0);
+  for (const field of ["CRATE_RESULT", "SSH_RESULT"]) assert.notEqual(run({ GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/feature/diagnosis", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false", [field]: "skipped" }).status, 0);
   for (const overrides of [{ FEATURE_VALIDATION: "" }, { FULL_VALIDATION: "true" }, { FEATURE_VALIDATION: "false" }]) assert.notEqual(run(overrides).status, 0);
   const testShell = script(job(ci, "test").split("      - uses:")[0]);
   for (const field of qualityFields.slice(0, 5)) for (const value of ["failure", "cancelled", "skipped", "", undefined]) {
-    assert.notEqual(run({ FULL_VALIDATION: "true", FEATURE_VALIDATION: "false", [field]: value }).status, 0);
+    assert.notEqual(run({ GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/feature/diagnosis", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false", [field]: value }).status, 0);
     assert.notEqual(spawnSync("bash", ["-c", testShell], { env: { ...process.env, ...qualitySuccess,
       SOURCE_RESULT: "success", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false",
-      GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "main", [field]: value } }).status, 0);
+      GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/feature/diagnosis", [field]: value } }).status, 0);
   }
   for (const id of ["test", "e2e-test"]) for (const owner of ["lint", "msrv", "security", "deny", "docs", "feature-codeql", "frontend-inventory"]) {
     assert.ok(job(ci, id).match(/^    needs: \[([^\]]+)\]$/m)[1].split(", ").includes(owner));
