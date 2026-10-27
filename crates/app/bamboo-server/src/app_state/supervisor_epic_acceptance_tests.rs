@@ -112,11 +112,21 @@ fn recent_messages(messages: &[Message]) -> Vec<Value> {
         .take(12)
         .rev()
         .map(|message| {
+            let markers: Vec<_> = [
+                BLOCKER,
+                DURING_PLAN,
+                DONE,
+                USER,
+                COLD,
+                "EPIC_ROOT_B_PERSISTED_STATUS_OBSERVED",
+            ]
+            .into_iter()
+            .filter(|marker| message.content.contains(*marker))
+            .collect();
             json!({"id":message.id,"role":message.role,
                 "call_id":message.tool_call_id,"success":message.tool_success,
                 "compressed":message.compressed,
-                "markers":[BLOCKER,DURING_PLAN,DONE,USER,COLD,"EPIC_ROOT_B_PERSISTED_STATUS_OBSERVED"]
-                    .into_iter().filter(|marker|message.content.contains(*marker)).collect::<Vec<_>>(),
+                "markers":markers,
                 "preview":message.content.chars().take(180).collect::<String>(),
                 "metadata":serde_json::to_string(&message.metadata).unwrap().chars().take(256).collect::<String>(),
                 "calls":message.tool_calls.iter().flatten().take(3)
