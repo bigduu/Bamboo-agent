@@ -162,6 +162,7 @@ impl SessionStoreV2 {
         caller: &SessionCallerReference,
         supervisor: &bamboo_domain::SupervisorReference,
         target_id: &str,
+        target_created_at: chrono::DateTime<chrono::Utc>,
     ) -> io::Result<LegacySessionDeliveryGuards> {
         validate_session_id(&caller.session_id)?;
         if caller.session_id != supervisor.session_id
@@ -173,6 +174,9 @@ impl SessionStoreV2 {
             return Err(denied("host_session_legacy_caller_mismatch"));
         }
         let authority = self.lock_current_user_target(supervisor, target_id).await?;
+        if authority.target.created_at != target_created_at {
+            return Err(denied("Supervisor followup target lifetime changed"));
+        }
         if !caller.matches_session(&authority.source) {
             return Err(denied("host_session_operation_caller_changed"));
         }

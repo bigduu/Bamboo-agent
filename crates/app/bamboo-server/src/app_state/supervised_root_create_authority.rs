@@ -544,7 +544,7 @@ impl CreationAuthority {
                     .messenger
                     .supervisor_followup(
                         reference,
-                        &candidate.id,
+                        candidate,
                         &request.operation_id.to_string(),
                         &request.message,
                     )

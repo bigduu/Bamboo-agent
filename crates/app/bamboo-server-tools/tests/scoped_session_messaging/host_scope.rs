@@ -83,6 +83,7 @@ impl SessionInboxPort for LegacyOnlyInbox {
         &self,
         caller: &SessionCallerReference,
         supervisor: &SupervisorReference,
+        target_created_at: chrono::DateTime<chrono::Utc>,
         envelope: &bamboo_domain::SessionMessageEnvelope,
     ) -> Result<bamboo_domain::SessionInboxReceipt, bamboo_domain::SessionInboxError> {
         if let Some((entered, release)) = &self.1 {
@@ -90,7 +91,7 @@ impl SessionInboxPort for LegacyOnlyInbox {
             release.notified().await;
         }
         self.0
-            .deliver_unscoped_supervisor_followup(caller, supervisor, envelope)
+            .deliver_unscoped_supervisor_followup(caller, supervisor, target_created_at, envelope)
             .await
     }
     async fn deliver_supervisor_current_user_followup(
@@ -581,7 +582,7 @@ async fn existing_supervisor_receipt_keeps_its_identity_when_host_scope_is_insta
                 .supervisor_followup_observed(
                     &SessionCallerReference::from(&supervisor),
                     &reference,
-                    &target.id,
+                    &target,
                     "existing-supervisor-operation",
                     "one bounded instruction",
                 )

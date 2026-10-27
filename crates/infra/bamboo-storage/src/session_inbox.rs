@@ -2597,6 +2597,7 @@ impl SessionInboxPort for FileSessionInbox {
     async fn deliver_supervisor_followup(
         &self,
         supervisor: &bamboo_domain::SupervisorReference,
+        target_created_at: chrono::DateTime<Utc>,
         envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         if envelope.source
@@ -2614,6 +2615,14 @@ impl SessionInboxPort for FileSessionInbox {
             .lock_current_user_target(supervisor, &envelope.target_session_id)
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        // The legacy operation ID omits birth. Retain the caller's original
+        // observation under the same physical guards before receipt lookup;
+        // neither a fresh ID lookup nor a new empty Inbox may retarget it.
+        if authority.target.created_at != target_created_at {
+            return Err(SessionInboxError::InvalidClaim(
+                "Supervisor followup target lifetime changed".into(),
+            ));
+        }
         #[cfg(test)]
         if let Some((entered, release)) = &self.followup_authority_pause {
             entered.notify_one();
@@ -2939,6 +2948,7 @@ impl SessionInboxPort for FileSessionInbox {
         &self,
         caller: &bamboo_domain::SessionCallerReference,
         supervisor: &bamboo_domain::SupervisorReference,
+        target_created_at: chrono::DateTime<Utc>,
         envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         if envelope.source
@@ -2953,7 +2963,12 @@ impl SessionInboxPort for FileSessionInbox {
         }
         let authority = self
             .sessions
-            .lock_unscoped_supervisor_delivery(caller, supervisor, &envelope.target_session_id)
+            .lock_unscoped_supervisor_delivery(
+                caller,
+                supervisor,
+                &envelope.target_session_id,
+                target_created_at,
+            )
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
         self.deliver_with_lifecycle_held(

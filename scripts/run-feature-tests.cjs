@@ -20,7 +20,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // migration and #2364 cancellation registration/drain in TicketApplication.
 // Recompute its source floor with the original algorithm; all31 default
 // owners, all19 additions, features and required targets remain unchanged.
-const FEATURE_SOURCE_SHA256 = "823566bf6e76d670a146e6977a73dd4d228fa98f241ae64694904d3275f72a3f";
+const FEATURE_SOURCE_SHA256 = "7494972b594de30075a4dceff5e9765f6c73149f5e093516fa3ba9eba298c740";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
