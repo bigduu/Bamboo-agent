@@ -237,6 +237,66 @@ mod tests {
     use crate::session::{AgentRuntimeState, ModelContextState, PlanModeState, PlanModeStatus};
 
     #[test]
+    fn supervisor_direct_files_and_processes_require_delegation_in_both_modes() {
+        use crate::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        for ultra in [false, true, false] {
+            supervisor.set_root_orchestration_only(ultra).unwrap();
+            let restored: Session =
+                serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
+            for name in [
+                "Read",
+                "Grep",
+                "Glob",
+                "GetFileInfo",
+                "ViewImage",
+                "Write",
+                "Edit",
+                "NotebookEdit",
+                "apply_patch",
+                "Bash",
+                "exec_command",
+                "write_stdin",
+                "load_skill",
+                "workflow_run",
+                "browser",
+                "browser_eval",
+                "mcp__vendor__Read",
+                "default::Read",
+                "vendor::Read",
+            ] {
+                assert!(
+                    !restored.allows_model_tool_execution(name),
+                    "Supervisor mode={ultra} must delegate {name}"
+                );
+            }
+            for name in [
+                "SubAgent",
+                "Plan",
+                "Task",
+                "session_control",
+                "session_history",
+            ] {
+                assert!(restored.allows_model_tool_execution(name), "{name}");
+            }
+            let child = Session::new_child_of("worker", &restored, "model", "worker");
+            assert!(child.authority_identity.is_ordinary());
+            assert!(child.allows_model_tool_execution("Read"));
+            assert!(child.allows_model_tool_execution("Edit"));
+            assert!(child.allows_model_tool_execution("exec_command"));
+        }
+        let mut ordinary = Session::new("ordinary", "model");
+        for ultra in [false, true] {
+            ordinary.set_root_orchestration_only(ultra).unwrap();
+            assert!(ordinary.allows_model_tool_execution("Read"));
+            assert!(!ordinary.allows_model_tool_execution("session_control"));
+        }
+    }
+
+    #[test]
     fn supervisor_delegation_first_does_not_depend_on_ultra_or_leak_to_children() {
         use crate::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
         let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
