@@ -72,6 +72,13 @@ async function authenticated() {
   assert.equal(facts.publicationAuthorized, false); core.assertVersion(facts.release.version);
   return { controller, reads, input, facts };
 }
+async function refreshPublication(held) {
+  // Re-run the real zero-argument caller/public verifier after long carrier
+  // reads. JSON, callbacks and the consumer run alone grant no write authority.
+  const fresh = await authenticated(), identity = value => ({ consumerController: value.controller, input: value.input,
+    source: value.facts.source, release: value.facts.release, controller: value.facts.controller, completionSha256: value.facts.completionSha256 });
+  assert.deepEqual(identity(fresh), identity(held), "Completed publication changed before registry write");
+}
 function target(platform) {
   assert.ok(PLATFORMS.includes(platform), "Unknown Docker architecture");
   assert.equal(platform, "linux/amd64", "Docker linux/arm64 needs authenticated original producer #2353; no compile or amd64 fallback");
@@ -322,6 +329,20 @@ with zipfile.ZipFile(io.BytesIO(raw)) as archive:
 function decodeCarrier(bytes, filename, facts, platform) {
   return digestRecord(JSON.parse(command("python3", ["-I", "-c", DIGEST_ZIP_READER, filename], { input: bytes, maxBuffer: 4096 })), facts, platform);
 }
+function physicalUpload(log, job, artifact, runId) {
+  assert.ok(typeof log === "string" && Buffer.byteLength(log) <= 64 * 1024 * 1024);
+  const upload = step(job, UPLOAD); passed(upload);
+  const second = value => Math.floor(Date.parse(value) / 1000), start = second(upload.started_at), end = second(upload.completed_at);
+  assert.ok(Number.isSafeInteger(start) && Number.isSafeInteger(end) && start <= end);
+  const lines = log.split(/\r?\n/).map(line => line.match(/^(\d{4}-\d\d-\d\dT\S+Z) (.*)$/)).filter(Boolean);
+  const escaped = artifact.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const records = lines.map(line => ({ line, match: line[2].match(new RegExp(`^Artifact ${escaped} has been successfully uploaded! Final size is ([1-9][0-9]*) bytes\\. Artifact ID is ([1-9][0-9]*)$`)) })).filter(value => value.match);
+  assert.equal(records.length, 1, "Missing/ambiguous original physical upload record");
+  assert.equal(positive(records[0].match[1]), artifact.size_in_bytes); assert.equal(positive(records[0].match[2]), artifact.id);
+  const urls = lines.filter(line => line[2].startsWith("Artifact download URL: ")); assert.equal(urls.length, 1, "Missing/ambiguous original download URL");
+  assert.equal(urls[0][2], `Artifact download URL: https://github.com/${sidecar.REPOSITORY}/actions/runs/${runId}/artifacts/${artifact.id}`);
+  for (const line of [records[0].line, urls[0]]) assert.ok(Number.isSafeInteger(second(line[1])) && start <= second(line[1]) && second(line[1]) <= end, "Upload log is outside the original physical step");
+}
 async function readCarrier(state, context, platform, physical) {
   const direct = await context.get("actions/jobs/" + physical.id); assert.equal(source.fingerprint(direct), source.fingerprint(physical)); assert.equal(direct.run_attempt, physical.run_attempt);
   const name = `docker-digest-${context.run.id}-${physical.run_attempt}-${PLATFORMS.indexOf(platform)}`;
@@ -331,6 +352,7 @@ async function readCarrier(state, context, platform, physical) {
   assert.equal(artifact.workflow_run?.id, context.run.id); assert.equal(artifact.workflow_run.head_sha, context.run.head_sha); assert.equal(artifact.workflow_run.head_branch, context.run.head_branch);
   const upload = step(physical, UPLOAD), second = value => Math.floor(Date.parse(value) / 1000);
   assert.ok(Number.isFinite(second(artifact.created_at)) && second(upload.started_at) <= second(artifact.created_at) && second(artifact.created_at) <= second(upload.completed_at));
+  physicalUpload(await state.reads.jobLog(physical.id), physical, artifact, context.run.id);
   const bytes = Buffer.from(await state.reads.artifactBytes(artifact.id, artifact.size_in_bytes)); assert.equal(bytes.length, artifact.size_in_bytes); assert.equal("sha256:" + core.sha256(bytes), artifact.digest);
   const record = decodeCarrier(bytes, digestFile(context.run.id, physical.run_attempt, platform), state.facts, platform);
   const fields = value => [value.id, value.name, value.expired, value.size_in_bytes, value.digest, value.created_at, value.workflow_run];
@@ -370,7 +392,7 @@ async function main() {
     await crossRunGuard(state, context);
     const platform = process.env.DOCKER_PLATFORM; target(platform);
     const image = candidateImage(process.env.GITHUB_RUN_ID, process.env.GITHUB_RUN_ATTEMPT, platform); assert.equal(process.env.DOCKER_IMAGE, image);
-    // Fresh real completed-source proof above is immediately before the write.
+    await refreshPublication(state);
     await freshConsumer(context, PUSH);
     command("docker", ["push", image], { timeout: 15 * 60000 });
     const references = JSON.parse(command("docker", ["image", "inspect", "--format", "{{json .RepoDigests}}", image]));
@@ -386,6 +408,7 @@ async function main() {
   }
   const versionTag = IMAGE + ":v" + facts.release.version;
   const latest = await state.reads.json("releases/latest"), tags = publicationTags(facts, latest);
+  await refreshPublication(state);
   await freshConsumer(context, "Recheck source and publish both architectures together");
   command("docker", ["buildx", "imagetools", "create", ...tags.flatMap(tag => ["--tag", tag]), ...records.map(value => IMAGE + "@" + value.digest)], { timeout: 5 * 60000 });
   verifyLatest(latest, await state.reads.json("releases/latest"));

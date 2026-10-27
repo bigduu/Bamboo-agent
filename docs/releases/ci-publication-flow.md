@@ -736,9 +736,11 @@ succeed, through a complete original producer or the real read-only reuse path.
 Original whole-job plus assembly/smoke/push/upload steps must have succeeded.
 Raw ZIP ID/digest/size, same-run/attempt/name, step creation window, strict single
 regular JSON member, selected release fields and fresh metadata/job readback
-all bind the retained carrier. A standard read-only remote digest lookup checks
-that the image still exists. Finalization reads these exact API-selected raw
-original carriers, rather than merging a directory glob of retry outputs.
+all bind the retained carrier. The original physical job log must contain one
+successful upload record and one exact official download URL, both within the
+upload step and matching the API ID/size. A standard read-only remote digest
+lookup checks that the image still exists. Finalization reads these exact
+API-selected raw original carriers, rather than merging a directory glob of retry outputs.
 
 Previously successful assembly with missing/expired/unverifiable transport,
 push/transport failure or an unknown/cancelled outcome stops without reassembly.
@@ -761,6 +763,11 @@ The workflow_run platform roles still need real Ops observation before activatio
 Cross-run/D restoration is deliberately unsupported; repeat publisher completion
 events or manual dispatches cannot silently start another formal image output.
 Every registry write freshly rechecks the live consumer attempt and write step.
+Immediately before that check, rerun the real zero-argument completed-publication
+proof after the long carrier/history reads; reject a changed held Docker D,
+source S, Release, publisher C or completion identity. Mocked CLI fixtures prove
+that changes during a carrier read prevent the registry command, not publication
+acceptance.
 
 Both matrix entries remain mandatory. Additional Linux ARM64 originals and ABI
 acceptance are the hard dependency

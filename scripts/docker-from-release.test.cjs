@@ -1,7 +1,7 @@
 "use strict";
 // Data/transport/static-routing fixtures only: no Docker, Cargo or browser run.
 const assert = require("node:assert/strict"), test = require("node:test");
-const fs = require("node:fs"), path = require("node:path");
+const fs = require("node:fs"), path = require("node:path"), vm = require("node:vm");
 const { spawnSync } = require("node:child_process");
 const consumer = require("./docker-from-release.cjs"), core = require("./crate-release.cjs");
 const ROOT = path.resolve(__dirname, ".."), text = file => fs.readFileSync(path.join(ROOT, file), "utf8");
@@ -158,6 +158,10 @@ test("Docker digest carriers are per run attempt and architecture", () => {
 });
 // Recovery fixtures use real tiny ZIP bytes and inert official-read ports only.
 const at = second => new Date(Date.UTC(2026, 9, 27, 0, 0, second)).toISOString();
+function uploadLog(artifact) {
+  return at(7) + ` Artifact ${artifact.name} has been successfully uploaded! Final size is ${artifact.size_in_bytes} bytes. Artifact ID is ${artifact.id}\n` +
+    at(7) + ` Artifact download URL: https://github.com/bigduu/Bamboo-agent/actions/runs/50/artifacts/${artifact.id}\n`;
+}
 function imageJob(id = 101, attempt = 1, build = "success", reuse = "skipped") {
   const names = [consumer.SELECT, "Copy authenticated binary and Host originals", consumer.BUILD, consumer.SMOKE, consumer.REUSE, consumer.PUSH, consumer.UPLOAD];
   return { id, run_id: 50, run_attempt: attempt, head_sha: "e".repeat(40), head_branch: "main", name: "Repackage originals (linux/amd64)", status: "completed", conclusion: "success", started_at: at(0), completed_at: at(20),
@@ -177,10 +181,10 @@ function carrierFixture() {
   const run = { id: 50, run_attempt: 2, workflow_id: 70, head_sha: "e".repeat(40), head_branch: "main", path: ".github/workflows/docker-publish.yml", event: "workflow_run", status: "in_progress", created_at: at(0), check_suite_id: 80, check_suite_node_id: "CS50", repository: { id: 1164779771, full_name: "bigduu/Bamboo-agent" }, head_repository: { id: 1164779771, full_name: "bigduu/Bamboo-agent" } };
   const physical = imageJob(), raw = zipDigest(consumer.digestFile(50, 1, "linux/amd64"), record());
   const artifact = { id: 900, name: "docker-digest-50-1-0", expired: false, size_in_bytes: raw.length, digest: "sha256:" + core.sha256(raw), created_at: at(7), workflow_run: { id: 50, head_sha: run.head_sha, head_branch: "main" } };
-  const fixture = { run, physical, raw, artifact, jobs: [physical], artifacts: [artifact], getCalls: [], byteCalls: 0 };
+  const fixture = { run, physical, raw, artifact, jobs: [physical], artifacts: [artifact], getCalls: [], byteCalls: 0, log: uploadLog(artifact), logCalls: [] };
   const get = async route => { fixture.getCalls.push(route); if (route === "actions/jobs/101") return fixture.physical; if (route === "actions/artifacts/900") return fixture.artifact; throw Error("unexpected read " + route); };
   fixture.context = { run, get, paged: async () => fixture.artifacts };
-  fixture.state = { controller: "d".repeat(40), facts, input: { releaseRun: 10 }, reads: { artifactBytes: async (id, maximum) => { assert.equal(id, 900); assert.equal(maximum, fixture.artifact.size_in_bytes); fixture.byteCalls++; return fixture.raw; } } };
+  fixture.state = { controller: "d".repeat(40), facts, input: { releaseRun: 10 }, reads: { jobLog: async id => { fixture.logCalls.push(id); return fixture.log; }, artifactBytes: async (id, maximum) => { assert.equal(id, 900); assert.equal(maximum, fixture.artifact.size_in_bytes); fixture.byteCalls++; return fixture.raw; } } };
   return fixture;
 }
 test("Docker recovery projects copied success and reuses a physical original after a full rerun", () => {
@@ -224,7 +228,23 @@ for (const variant of ["missing-step", "cancelled", "failed-owner", "failed-uplo
 }
 test("Docker recovery reads the original raw Actions ZIP once with fresh metadata and job proof", async () => {
   const f = carrierFixture(); assert.deepEqual(await consumer.readCarrier(f.state, f.context, "linux/amd64", f.physical), record()); assert.equal(f.byteCalls, 1);
+  assert.deepEqual(f.logCalls, [101]);
   assert.deepEqual(f.getCalls, ["actions/jobs/101", "actions/artifacts/900", "actions/jobs/101"]);
+});
+test("Docker physical upload log binds the unique original ID, URL, size and step window", async () => {
+  for (const variant of ["wrong-id", "wrong-url", "wrong-size", "duplicate", "duplicate-url", "outside-record", "outside-url", "missing"]) {
+    const f = carrierFixture();
+    if (variant === "wrong-id") f.log = f.log.replace("Artifact ID is 900", "Artifact ID is 901");
+    if (variant === "wrong-url") f.log = f.log.replace("/artifacts/900", "/artifacts/901");
+    if (variant === "wrong-size") f.log = f.log.replace(`Final size is ${f.raw.length}`, `Final size is ${f.raw.length + 1}`);
+    if (variant === "duplicate") f.log += f.log.split("\n")[0] + "\n";
+    if (variant === "duplicate-url") f.log += f.log.split("\n")[1] + "\n";
+    if (variant === "outside-record") f.log = f.log.replace(at(7), at(30));
+    if (variant === "outside-url") f.log = f.log.replace(at(7) + " Artifact download", at(30) + " Artifact download");
+    if (variant === "missing") f.log = "";
+    await assert.rejects(consumer.readCarrier(f.state, f.context, "linux/amd64", f.physical), undefined, variant);
+    assert.equal(f.byteCalls, 0, variant + " must stop before reading a carrier");
+  }
 });
 for (const variant of ["missing", "expired", "duplicate", "foreign-run", "tampered-zip", "wrong-window", "changed-asset", "changed-attempt", "wrong-file", "symlink", "extra", "foreign-source"]) {
   test("Docker recovery rejects " + variant + " immutable carrier", async () => {
@@ -296,6 +316,61 @@ test("Docker recovery consumer API identity keeps metadata X distinct from execu
   f.state.reads.checkSuite = async () => ({ ...suite(f.run), app: { databaseId: 1, slug: "foreign" } }); await assert.rejects(consumer.consumerExecution(f.state,"image"));
   f.state.reads.checkSuite = async () => suite(f.run); const previousRead = f.state.reads.json;
   f.state.reads.json = async route => route.includes("/jobs?") ? { jobs: [f.physical,current] } : previousRead(route); await assert.rejects(consumer.consumerExecution(f.state,"image"), /total_count/);
+});
+test("Docker fresh publication proof after carrier reads stops registry writes on changed Source identity", async () => {
+  for (const variant of ["source", "release", "controller", "completion", "proof-rejected", "stable"]) {
+    const f = carrierFixture(), D = f.state.controller; f.run.event = "workflow_dispatch";
+    const arm = { ...imageJob(102,1), name: "Repackage originals (linux/arm64)" };
+    const rawArm = zipDigest(consumer.digestFile(50,1,"linux/arm64"),record("linux/arm64"));
+    const artifactArm = { ...f.artifact, id: 901, name: "docker-digest-50-1-1", size_in_bytes: rawArm.length, digest: "sha256:" + core.sha256(rawArm) };
+    const phase = "Recheck source and publish both architectures together", current = { ...imageJob(202,2), name: "Publish complete multi-arch manifest", status: "in_progress", steps: [{ name: phase, number: 1, status: "in_progress" }] };
+    const finalizer = locatorJob(601,1), publicProof = require("./published-source-admission.cjs");
+    const completion = { schemaVersion: 1, kind: publicProof.KIND, publicationAuthorized: false, repository: { id: 1164779771, fullName: "bigduu/Bamboo-agent" }, source: { revision: facts.source.revision, featurePr: 42, featureRunId: 43 }, controller: { runId: 10 }, release: {}, frontend: {}, crates: {}, native: {}, jobs: [] };
+    const originalFacts = { ...facts, publicationAuthorized: false, completionSha256: "c".repeat(64) }; let changed = false, proofCalls = 0, writes = 0, factories = 0;
+    const latest = { id: 30, tag_name: "v2026.10.27", target_commitish: facts.source.revision, draft: false, prerelease: false };
+    const jobs = [f.physical,arm,current], artifacts = [f.artifact,artifactArm];
+    const reads = { json: async route => {
+      if (route.startsWith("actions/runs/10/jobs?")) return { total_count: 1, jobs: [finalizer] };
+      if (route === "actions/runs/10") return { id: 10, created_at: at(0) };
+      if (route === "actions/runs/50") return f.run;
+      if (route === "actions/workflows/70") return { id: 70, path: f.run.path };
+      if (route.startsWith("actions/runs/50/jobs?")) return { total_count: jobs.length, jobs };
+      if (route.startsWith("actions/workflows/70/runs?")) return { total_count: 0, workflow_runs: [] };
+      if (route.startsWith("actions/runs/50/artifacts?")) return { total_count: 2, artifacts };
+      if (route.startsWith("actions/jobs/")) return jobs.find(job => job.id === Number(route.split("/").at(-1)));
+      if (route.startsWith("actions/artifacts/")) return artifacts.find(item => item.id === Number(route.split("/").at(-1)));
+      if (route === "releases/latest") return latest; throw Error("Unexpected fixture read " + route);
+    }, checkSuite: async () => suite(f.run), jobLog: async id => id === 601 ? at(1) + " " + publicProof.PREFIX + Buffer.from(core.canonicalJson(completion)).toString("base64") : uploadLog(artifacts.find(item => item.id === (id === 101 ? 900 : 901))),
+    artifactBytes: async id => { if (id === 901) changed = true; return id === 900 ? f.raw : rawArm; } };
+    const mockProof = { ...publicProof, verifyPublishedSource: async (...args) => {
+      assert.equal(args.length, 2); assert.equal(args[1], reads); proofCalls++;
+      if (changed && variant === "proof-rejected") throw Error("Fresh completed Source proof rejected");
+      const next = structuredClone(originalFacts);
+      if (changed && variant === "source") next.source.revision = "f".repeat(40);
+      if (changed && variant === "release") next.release.id++;
+      if (changed && variant === "controller") next.controller.revision = "f".repeat(40);
+      if (changed && variant === "completion") next.completionSha256 = "f".repeat(64);
+      return next;
+    } };
+    const env = { ...consumer.safeEnv(), GITHUB_REPOSITORY: "bigduu/Bamboo-agent", GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_REF: "refs/heads/main", GITHUB_WORKFLOW_REF: "bigduu/Bamboo-agent/.github/workflows/docker-publish.yml@refs/heads/main", GITHUB_WORKFLOW_SHA: D, GITHUB_SHA: D, GITHUB_EVENT_PATH: "fixture-event.json", GITHUB_JOB: "merge", GITHUB_RUN_ID: "50", GITHUB_RUN_ATTEMPT: "2", DOCKER_RELEASE_RUN: "10", GITHUB_OUTPUT: "fixture-output" };
+    const context = { module: { exports: {} }, __dirname, Buffer, console, process: { argv: ["node","fixture.cjs","publish"], env }, require: name => {
+      if (name === "./published-source-admission.cjs") return mockProof;
+      if (name === "./main-admission.cjs") return { createPublicReads: (...args) => { assert.equal(args.length, 0); factories++; return reads; } };
+      if (name === "node:fs") return { ...fs, readFileSync: (file,...args) => file === "fixture-event.json" ? JSON.stringify({ inputs: { release_run: "10" } }) : fs.readFileSync(file,...args), appendFileSync: () => {} };
+      if (name === "node:child_process") return { spawnSync: (program,args,options) => {
+        if (program === "python3") return spawnSync(program,args,options); // only tiny ZIP decoding
+        if (program === "git") return { status: 0, stdout: args.at(-1) === "HEAD" ? D + "\n" : "" };
+        assert.equal(program,"docker"); if (args.includes("create")) { writes++; return { status: 0, stdout: "" }; }
+        const manifest = args.at(-1).includes("@") ? { digest: args.at(-1).split("@")[1] } : { digest: digest("3"), manifests: [record(),record("linux/arm64")].map(value => ({ digest: value.digest, platform: { os: "linux", architecture: value.platform.slice(6) } })) };
+        return { status: 0, stdout: JSON.stringify(manifest) };
+      } };
+      return require(name);
+    } };
+    vm.runInNewContext(text("scripts/docker-from-release.cjs"),context,{ filename: path.join(__dirname,"docker-from-release.cjs") });
+    if (variant === "stable") { await context.main(); assert.equal(writes,1); }
+    else { await assert.rejects(context.main(), /publication changed|Source proof rejected/); assert.equal(writes,0,variant); }
+    assert.equal(changed,true); assert.equal(proofCalls,2); assert.equal(factories,2);
+  }
 });
 test("Docker multi-arch readback binds platform descriptors and exact input digests", () => {
   const records = [record(), record("linux/arm64")]; const manifest = { digest: digest("3"), manifests: records.map(value => ({ digest: value.digest, platform: { os: "linux", architecture: value.platform.slice(6) } })) };
