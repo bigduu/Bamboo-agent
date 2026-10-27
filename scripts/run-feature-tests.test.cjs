@@ -108,8 +108,14 @@ test("A95 live target catalogs keep the shared helper additive only for publicat
     "expired_capacity_lease_cannot_admit_same_worktree_while_native_pid_is_alive", helper,
     "inspect_uses_fresh_connection_after_idle_peer_close_without_retry"] };
   const context = FEATURE_CONTEXTS.find(item => item.package === "bamboo-agent");
-  const after = Object.fromEntries(context.targets.map(target => ["test/" + target.name,
-    [...before["test/" + target.name], ...target.added].sort()]));
+  // Publication's four names came from the original failure. The files extension
+  // is the existing reviewed source expectation, not an observed feature PASS.
+  const after = { "test/ticket_runtime_publication": [helper,
+    "actual_admission_exit_retains_exact_prepared_run_without_worker_execution",
+    "actual_intent_exit_before_or_after_head_never_launches_unpublished_or_unknown_work",
+    "actual_result_exit_recovers_submission_before_broker_ack_without_reexecution"].sort(),
+    "test/ticket_runtime_files": [...before["test/ticket_runtime_files"],
+      "actual_stopped_native_unknown_file_is_reconciled_offline_without_rewriting_or_acceptance"].sort() };
   assert.equal(context.targets[0].added.filter(name => name === helper).length, 1);
   assert.equal(context.targets[1].added.includes(helper), false);
   validateFeatureCatalog(context, before, after);
