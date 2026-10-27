@@ -33,8 +33,6 @@ jobs:
         env:
           BAMBOO_CARGO_DISK_INTEGRATION: "1"
         run: node --test scripts/release-cargo-sandbox-disk.integration.cjs
-      - name: Verify existing release frontend policies
-        run: node --test scripts/release-frontend-policy.test.cjs scripts/lotus-next-artifact.test.cjs
       - name: Install isolated Cargo for actual workspace compatibility
         run: node scripts/release-cargo-sandbox.cjs install
       - name: Check locked workspace graph and verify an actual source package

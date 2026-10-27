@@ -125,6 +125,7 @@ test("standalone duplicate acceptances are manual and unique isolation and CodeQ
   const isolation = read(".github/workflows/release-cargo-isolation.yml");
   assert.match(isolation, /pull_request:\n    branches: \[dev\]/);
   assert.doesNotMatch(isolation, /branches: \[[^\]]*main/);
+  assert.doesNotMatch(isolation, /node --test[^\n]*(?:release-frontend-policy|lotus-next-artifact)/, "Quick Checks already owns these suites");
   // These accepted joint/API-only configurations are intentionally distinct.
   for (const name of ["trusted-observer.yml", "delegated-planner-acceptance.yml", "observer-subscriptions.yml"]) assert.match(read(".github/workflows/" + name), /BAMBOO_FRONTEND_BUILD_MODE: api-only/);
 });
