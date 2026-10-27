@@ -293,6 +293,7 @@ test("one feature executor preserves default configurations and complete explici
 
 test("the feature executor bounds debug artifacts and records capacity without changing release profiles", () => {
   const feature = job("feature-tests")
+  assert.match(feature, /^    timeout-minutes: 90$/mu)
   for (const profile of ["DEV", "TEST"]) {
     const setting = `CARGO_PROFILE_${profile}_DEBUG: "0"`
     assert.ok(feature.includes(setting))

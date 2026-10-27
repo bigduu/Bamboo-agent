@@ -313,7 +313,7 @@ REVIEWED_PRODUCERS = frozenset((PRODUCER_V1, PRODUCER_V2))
 # by a sentinel. Then independently authenticate the actual helper bytes below.
 # This breaks the workflow -> helper -> workflow hash cycle, without excluding
 # a job, global environment, trigger, command or permission from review.
-CURRENT_PRODUCER = "14a1202b41b86a18524ffcae26f310d58230628895fae17eeb69c2d9e1ebe06c"
+CURRENT_PRODUCER = "7c3eee1e513c3e56448a95355e6c6e3d8224c431d48d9f4969dee271abc5ef05"
 # Preserve the previously reviewed default/all-feature server partitions.
 LEGACY_SERVER_BLOCK_PRODUCER = "20ca6ba17401c2d9cae9019cbb693eea29386ab77814bfda5d793ee4efb45649"
 LEGACY_SERVER_BLOCK_HELPER = "4ccc047bbaeedab71e93db9b6470f5a3131c1b395260f852baebef19ff9109b7"
