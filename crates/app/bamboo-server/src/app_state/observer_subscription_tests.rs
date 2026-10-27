@@ -39,6 +39,7 @@ struct Probe {
     calls: AtomicUsize,
     parent_calls: AtomicUsize,
     parent_inputs: StdMutex<Vec<Vec<Message>>>,
+    parent_request_diagnostics: StdMutex<Vec<Value>>,
     observed: StdMutex<Vec<ObserverViewChange>>,
     hold_reader: AtomicBool,
     reader_entered: Notify,
@@ -49,6 +50,38 @@ struct Probe {
 
 #[async_trait]
 impl LLMProvider for Probe {
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&bamboo_llm::provider::LLMRequestOptions>,
+    ) -> Result<LLMStream, LLMError> {
+        if model == PARENT {
+            let bounded: Vec<_> = messages.iter().enumerate()
+                .filter(|(index, _)| *index < 2 || *index + 4 >= messages.len())
+                .map(|(_, message)| json!({
+                    "role":format!("{:?}",message.role),"characters":message.content.chars().count(),
+                    "report1":message.content.contains("OBSERVATION 1"),
+                    "report2":message.content.contains("OBSERVATION 2"),
+                    "prefix":message.content.chars().take(240).collect::<String>(),
+                    "parts":message.content_parts.as_ref().map(Vec::len),
+                    "runtime_kind":message.metadata.as_ref().and_then(|value|value.get("runtime_kind")),
+                })).collect();
+            let mut diagnostics = self.parent_request_diagnostics.lock().unwrap();
+            if diagnostics.len() < 16 {
+                diagnostics.push(
+                    json!({"purpose":options.and_then(|value|value.request_purpose.as_deref()),
+                    "session_id":options.and_then(|value|value.session_id.as_deref()),
+                    "tools":tools.len(),"messages":messages.len(),"bounded":bounded}),
+                );
+            }
+        }
+        self.chat_stream(messages, tools, max_output_tokens, model)
+            .await
+    }
+
     async fn chat_stream(
         &self,
         messages: &[Message],
@@ -766,9 +799,20 @@ async fn subscription_native_two_projects_changes_and_restart_do_not_clear_origi
     {
         let inputs = f.probe.parent_inputs.lock().unwrap();
         assert_eq!(inputs.len(), parent_calls);
+        let canonical: Vec<_> = reporting_parent
+            .messages
+            .iter()
+            .filter(|message| message.content.contains("OBSERVATION "))
+            .map(|message| {
+                json!({"id":message.id,"metadata":message.metadata,
+                "compressed":serde_json::to_value(message).unwrap().get("compressed").cloned()})
+            })
+            .collect();
         assert!(inputs.iter().all(|messages| messages
             .iter()
-            .any(|message| message.content.contains("OBSERVATION "))));
+            .any(|message| message.content.contains("OBSERVATION "))),
+            "actual provider input lacks its committed reports; requests={:?}; canonical={canonical:?}",
+            f.probe.parent_request_diagnostics.lock().unwrap());
         assert!(["OBSERVATION 1", "OBSERVATION 2"]
             .iter()
             .all(|marker| inputs
