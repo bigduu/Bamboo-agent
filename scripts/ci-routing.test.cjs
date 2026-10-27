@@ -53,7 +53,7 @@ function assertRouting(source) {
   const browser = job(source, "browser-runtime-tests");
   assert.match(browser, /cli.js install --with-deps chromium-headless-shell/);
   assert.match(browser, /readdirSync\('browser-runtime'\)\.filter\(file => file\.endsWith\('\.test\.cjs'\)\)/);
-  assert.match(browser, /spawnSync\(process.execPath, \['--test', '--test-concurrency=1', \.\.\.files\]/);
+  assert.match(browser, /spawnSync\(process.execPath, \['--test', '--test-reporter=tap', '--test-concurrency=1', \.\.\.files\]/);
   assert.match(browser, /for \(const name of \['fail', 'cancelled', 'skipped', 'todo'\]\)/);
   assert.ok(job(source, "test").includes('test "${!key}" = success'));
   assert.match(job(source, "e2e-test"), /test "\$BROWSER_RESULT" = success/);

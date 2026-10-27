@@ -364,7 +364,7 @@ jobs:
             .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
           const files = require('node:fs').readdirSync('browser-runtime').filter(file => file.endsWith('.test.cjs')).sort();
           require('node:assert/strict').ok(files.length > 0);
-          const result = spawnSync(process.execPath, ['--test', '--test-concurrency=1', ...files], { cwd: 'browser-runtime', env: environment, stdio: 'inherit' });
+          const result = spawnSync(process.execPath, ['--test', '--test-reporter=tap', '--test-concurrency=1', ...files], { cwd: 'browser-runtime', env: environment, stdio: 'inherit' });
           if (result.error) throw result.error;
           process.exit(result.status ?? 1);
           NODE
