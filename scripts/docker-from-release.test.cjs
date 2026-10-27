@@ -318,7 +318,7 @@ test("Docker recovery consumer API identity keeps metadata X distinct from execu
   f.state.reads.json = async route => route.includes("/jobs?") ? { jobs: [f.physical,current] } : previousRead(route); await assert.rejects(consumer.consumerExecution(f.state,"image"), /total_count/);
 });
 test("Docker fresh publication proof after carrier reads stops registry writes on changed Source identity", async () => {
-  for (const variant of ["source", "release", "controller", "completion", "proof-rejected", "stable"]) {
+  for (const variant of ["source", "release", "controller", "completion", "proof-rejected", "latest-advanced", "stable"]) {
     const f = carrierFixture(), D = f.state.controller; f.run.event = "workflow_dispatch";
     const arm = { ...imageJob(102,1), name: "Repackage originals (linux/arm64)" };
     const rawArm = zipDigest(consumer.digestFile(50,1,"linux/arm64"),record("linux/arm64"));
@@ -326,7 +326,7 @@ test("Docker fresh publication proof after carrier reads stops registry writes o
     const phase = "Recheck source and publish both architectures together", current = { ...imageJob(202,2), name: "Publish complete multi-arch manifest", status: "in_progress", steps: [{ name: phase, number: 1, status: "in_progress" }] };
     const finalizer = locatorJob(601,1), publicProof = require("./published-source-admission.cjs");
     const completion = { schemaVersion: 1, kind: publicProof.KIND, publicationAuthorized: false, repository: { id: 1164779771, fullName: "bigduu/Bamboo-agent" }, source: { revision: facts.source.revision, featurePr: 42, featureRunId: 43 }, controller: { runId: 10 }, release: {}, frontend: {}, crates: {}, native: {}, jobs: [] };
-    const originalFacts = { ...facts, publicationAuthorized: false, completionSha256: "c".repeat(64) }; let changed = false, proofCalls = 0, writes = 0, factories = 0;
+    const originalFacts = { ...facts, publicationAuthorized: false, completionSha256: "c".repeat(64) }; let changed = false, proofCalls = 0, writes = 0, factories = 0, writtenTags = [];
     const latest = { id: 30, tag_name: "v2026.10.27", target_commitish: facts.source.revision, draft: false, prerelease: false };
     const jobs = [f.physical,arm,current], artifacts = [f.artifact,artifactArm];
     const reads = { json: async route => {
@@ -339,7 +339,7 @@ test("Docker fresh publication proof after carrier reads stops registry writes o
       if (route.startsWith("actions/runs/50/artifacts?")) return { total_count: 2, artifacts };
       if (route.startsWith("actions/jobs/")) return jobs.find(job => job.id === Number(route.split("/").at(-1)));
       if (route.startsWith("actions/artifacts/")) return artifacts.find(item => item.id === Number(route.split("/").at(-1)));
-      if (route === "releases/latest") return latest; throw Error("Unexpected fixture read " + route);
+      if (route === "releases/latest") return structuredClone(latest); throw Error("Unexpected fixture read " + route);
     }, checkSuite: async () => suite(f.run), jobLog: async id => id === 601 ? at(1) + " " + publicProof.PREFIX + Buffer.from(core.canonicalJson(completion)).toString("base64") : uploadLog(artifacts.find(item => item.id === (id === 101 ? 900 : 901))),
     artifactBytes: async id => { if (id === 901) changed = true; return id === 900 ? f.raw : rawArm; } };
     const mockProof = { ...publicProof, verifyPublishedSource: async (...args) => {
@@ -350,6 +350,7 @@ test("Docker fresh publication proof after carrier reads stops registry writes o
       if (changed && variant === "release") next.release.id++;
       if (changed && variant === "controller") next.controller.revision = "f".repeat(40);
       if (changed && variant === "completion") next.completionSha256 = "f".repeat(64);
+      if (proofCalls === 2 && variant === "latest-advanced") Object.assign(latest, { id: 31, tag_name: "v2026.10.28", target_commitish: "e".repeat(40) });
       return next;
     } };
     const env = { ...consumer.safeEnv(), GITHUB_REPOSITORY: "bigduu/Bamboo-agent", GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_REF: "refs/heads/main", GITHUB_WORKFLOW_REF: "bigduu/Bamboo-agent/.github/workflows/docker-publish.yml@refs/heads/main", GITHUB_WORKFLOW_SHA: D, GITHUB_SHA: D, GITHUB_EVENT_PATH: "fixture-event.json", GITHUB_JOB: "merge", GITHUB_RUN_ID: "50", GITHUB_RUN_ATTEMPT: "2", DOCKER_RELEASE_RUN: "10", GITHUB_OUTPUT: "fixture-output" };
@@ -360,14 +361,17 @@ test("Docker fresh publication proof after carrier reads stops registry writes o
       if (name === "node:child_process") return { spawnSync: (program,args,options) => {
         if (program === "python3") return spawnSync(program,args,options); // only tiny ZIP decoding
         if (program === "git") return { status: 0, stdout: args.at(-1) === "HEAD" ? D + "\n" : "" };
-        assert.equal(program,"docker"); if (args.includes("create")) { writes++; return { status: 0, stdout: "" }; }
+        assert.equal(program,"docker"); if (args.includes("create")) { writes++; writtenTags = args.flatMap((arg,i) => arg === "--tag" ? [args[i + 1]] : []); return { status: 0, stdout: "" }; }
         const manifest = args.at(-1).includes("@") ? { digest: args.at(-1).split("@")[1] } : { digest: digest("3"), manifests: [record(),record("linux/arm64")].map(value => ({ digest: value.digest, platform: { os: "linux", architecture: value.platform.slice(6) } })) };
         return { status: 0, stdout: JSON.stringify(manifest) };
       } };
       return require(name);
     } };
     vm.runInNewContext(text("scripts/docker-from-release.cjs"),context,{ filename: path.join(__dirname,"docker-from-release.cjs") });
-    if (variant === "stable") { await context.main(); assert.equal(writes,1); }
+    if (["stable", "latest-advanced"].includes(variant)) {
+      let failure; try { await context.main(); } catch (error) { failure = error; }
+      assert.equal(writes,1); assert.deepEqual([...writtenTags],[consumer.IMAGE + ":v2026.10.27", ...(variant === "stable" ? [consumer.IMAGE + ":latest"] : [])], "A latest advance during Source proof must never overwrite latest"); assert.ifError(failure);
+    }
     else { await assert.rejects(context.main(), /publication changed|Source proof rejected/); assert.equal(writes,0,variant); }
     assert.equal(changed,true); assert.equal(proofCalls,2); assert.equal(factories,2);
   }

@@ -407,8 +407,8 @@ async function main() {
     const record = await readCarrier(state, context, platform, original); remoteDigest(record); records.push(record);
   }
   const versionTag = IMAGE + ":v" + facts.release.version;
-  const latest = await state.reads.json("releases/latest"), tags = publicationTags(facts, latest);
   await refreshPublication(state);
+  const latest = await state.reads.json("releases/latest"), tags = publicationTags(facts, latest);
   await freshConsumer(context, "Recheck source and publish both architectures together");
   command("docker", ["buildx", "imagetools", "create", ...tags.flatMap(tag => ["--tag", tag]), ...records.map(value => IMAGE + "@" + value.digest)], { timeout: 5 * 60000 });
   verifyLatest(latest, await state.reads.json("releases/latest"));
