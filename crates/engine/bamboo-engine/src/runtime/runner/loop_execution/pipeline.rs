@@ -944,13 +944,18 @@ const PLAN_TOOL_NAME: &str = "Plan";
 
 /// True when `call` creates one new child session.
 ///
-/// Every `Plan` call creates exactly one one-shot planner child. A `SubAgent`
-/// call counts only when its `action` is `"create"`, or when the action is
+/// `Plan` creates one one-shot planner child except for its explicit artifact
+/// `read` action. Missing/unparsable Plan arguments stay conservatively counted.
+/// A `SubAgent` call counts only when its `action` is `"create"`, or when the action is
 /// absent/unparsable (the tool's legacy create default). All other SubAgent
 /// actions manage existing children and do not consume the spawn budget.
 fn is_child_spawn_call(call: &bamboo_agent_core::tools::ToolCall) -> bool {
     match call.function.name.as_str() {
-        PLAN_TOOL_NAME => return true,
+        PLAN_TOOL_NAME => {
+            return !serde_json::from_str::<serde_json::Value>(&call.function.arguments).is_ok_and(
+                |value| value.get("action").and_then(|action| action.as_str()) == Some("read"),
+            );
+        }
         SUBAGENT_TOOL_NAME => {}
         _ => return false,
     }
@@ -10342,6 +10347,10 @@ mod tests {
         let exceeded = check_run_budget_exceeded(&runtime.round, &budget).unwrap();
         assert_eq!(exceeded.kind, "max_subagents");
         assert_eq!(exceeded.actual, 2);
+        for arguments in [r#"{"task":"legacy create"}"#, "{"] {
+            output.tool_calls[0].function.arguments = arguments.into();
+            assert!(is_child_spawn_call(&output.tool_calls[0]));
+        }
     }
 
     #[test]
@@ -10356,7 +10365,7 @@ mod tests {
         };
         assert!(
             is_child_spawn_call(&call("Plan", r#"{"task":"design it"}"#)),
-            "every Plan call creates one planner child"
+            "a default Plan call creates one planner child"
         );
         assert!(
             is_child_spawn_call(&call("SubAgent", r#"{"action":"create","prompt":"x"}"#)),

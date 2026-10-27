@@ -37,6 +37,8 @@ revalidate canonical parent/Child snapshots after IO, reject corrupt bytes, and
 paginate UTF-8 content within a serialized result budget. A later result or a
 changed selected source makes an old selector stale. A missing derived file can
 be reconstructed only from the same valid canonical completion.
+Artifact reads count toward the ordinary tool-call budget, not the child-spawn
+budget. Default/create calls retain their existing spawn accounting.
 
 The no-follow directory-FD file publisher supports Unix. Other platforms reject
 this selected-context artifact route before creating a Child; legacy Plan is
@@ -44,7 +46,7 @@ unchanged. The first native acceptance target is Linux. Neither component tests
 nor compile-only Windows CI constitute native Windows acceptance.
 
 Acceptance is finite: existing Plan contracts plus selected-context positive and
-denial components; nine artifact/completion/recovery tests; and two actual CLI
+denial components; ten artifact/completion/recovery/accounting tests; and two actual CLI
 Host/current-exe worker tests using only a bounded loopback fake provider. The
 healthy case must prove source Read, denied Write even with a permissive parent,
 one Child, automatic parent resume without the full plan, partial section read,
