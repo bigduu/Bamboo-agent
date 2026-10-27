@@ -73,8 +73,8 @@ async fn authorize(
         return Err(error("original caller changed"));
     }
     let fingerprint = caller_fingerprint(original)?;
-    // An installed, revoked, stale or unsupported Host scope never becomes a
-    // Supervisor compatibility grant. Lookup errors propagate without fallback.
+    // The canonical Supervisor has its own current-user role. Other callers'
+    // installed/revoked/unsupported Host scopes never fall back to that role.
     let (target, route) = if let Some(supervisor) =
         ctx.executing_supervisor_for(&original.session_id)
     {

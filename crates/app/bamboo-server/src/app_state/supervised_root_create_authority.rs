@@ -225,6 +225,20 @@ impl CreationAuthority {
         matches!(self, Self::Host { .. })
     }
 
+    pub(super) fn retains_operation(&self) -> bool {
+        // Verified model-facing Supervisor calls retain the original operation
+        // just like finite Host calls. A legacy reference-only caller keeps
+        // its old terminal window; it cannot refresh original caller proof.
+        self.is_host()
+            || matches!(
+                self,
+                Self::Supervisor {
+                    original_caller: Some(_),
+                    ..
+                }
+            )
+    }
+
     pub(super) fn first_input_available(&self) -> bool {
         !matches!(
             self,

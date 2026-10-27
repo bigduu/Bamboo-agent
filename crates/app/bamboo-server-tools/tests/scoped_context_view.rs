@@ -365,7 +365,7 @@ async fn child_read_scope_does_not_inherit_supervisor_or_send_authority() {
 }
 
 #[tokio::test]
-async fn detach_revoke_and_regrant_invalidate_old_scoped_selectors() {
+async fn supervisor_default_views_survive_legacy_acl_changes_but_not_another_incarnation() {
     let f = Fixture::new().await;
     let receipt = f.export(&f.supervisor, 0).await;
     f.store
@@ -382,7 +382,7 @@ async fn detach_revoke_and_regrant_invalidate_old_scoped_selectors() {
         .tool()
         .invoke(request(&f.targets[0], &receipt), ctx(&f.supervisor))
         .await
-        .is_err());
+        .is_ok());
     f.store
         .mutate_supervisor_management(&SupervisorManagementRequest {
             supervisor: f.reference.clone(),
@@ -397,7 +397,7 @@ async fn detach_revoke_and_regrant_invalidate_old_scoped_selectors() {
         .tool()
         .invoke(request(&f.targets[0], &receipt), ctx(&f.supervisor))
         .await
-        .is_err());
+        .is_ok());
     let current = f.export(&f.supervisor, 0).await;
     f.read(&f.supervisor, 0, &current).await;
     f.install(&f.supervisor, vec![], 0).await;
@@ -410,7 +410,7 @@ async fn detach_revoke_and_regrant_invalidate_old_scoped_selectors() {
         .tool()
         .invoke(request(&f.targets[0], &host), ctx(&f.supervisor))
         .await
-        .is_err());
+        .is_ok());
     assert!(
         f.tool()
             .invoke(
@@ -418,9 +418,29 @@ async fn detach_revoke_and_regrant_invalidate_old_scoped_selectors() {
                 ctx(&f.supervisor)
             )
             .await
-            .is_err(),
-        "revoked Host cannot fall back to still-valid managed link"
+            .is_ok(),
+        "legacy Host revocation cannot remove canonical Supervisor role access"
     );
+    f.store.delete_session(&f.supervisor.id).await.unwrap();
+    f.store
+        .get_or_create_default_supervisor("replacement")
+        .await
+        .unwrap();
+    let replacement = f
+        .store
+        .load_session(&f.supervisor.id)
+        .await
+        .unwrap()
+        .unwrap();
+    for caller in [&f.supervisor, &replacement] {
+        assert!(
+            f.tool()
+                .invoke(request(&f.targets[0], &receipt), ctx(caller))
+                .await
+                .is_err(),
+            "old view selectors cannot cross a canonical caller lifetime/incarnation"
+        );
+    }
 }
 
 #[tokio::test]
@@ -611,29 +631,40 @@ async fn ordinary_root_self_export_preserves_the_existing_host_routed_contract()
 }
 
 #[tokio::test]
-async fn old_metadata_and_progress_rights_do_not_grant_context_task_details() {
+async fn ordinary_metadata_rights_stay_narrow_while_supervisor_role_can_read_bounded_context() {
     let f = Fixture::new().await;
-    f.install(&f.supervisor, vec![], 0).await;
-    let receipt = f.export(&f.supervisor, 0).await;
+    let mut reader = Session::new("ordinary-metadata-reader", "model");
+    reader.set_project_id_meta("reader-project");
+    f.store.save_session(&reader).await.unwrap();
+    f.install(&reader, vec![], 0).await;
+    let receipt = f.export(&reader, 0).await;
     let mut brief = request(&f.targets[0], &receipt);
     brief["file"] = json!("brief");
     brief["limit"] = json!(40);
-    let admitted = result(
-        f.tool()
-            .invoke(brief.clone(), ctx(&f.supervisor))
-            .await
-            .unwrap(),
-    );
+    let admitted = result(f.tool().invoke(brief.clone(), ctx(&reader)).await.unwrap());
     assert!(admitted["content"]
         .as_str()
         .unwrap()
         .contains("Task description detail"));
+    let default_view = f.export(&f.supervisor, 0).await;
+    let mut default_brief = request(&f.targets[0], &default_view);
+    default_brief["file"] = json!("brief");
+    default_brief["limit"] = json!(40);
+    let current = result(
+        f.tool()
+            .invoke(default_brief, ctx(&f.supervisor))
+            .await
+            .unwrap(),
+    );
+    assert!(current["content"]
+        .as_str()
+        .unwrap()
+        .contains("Task description detail"));
     for (revision, right) in [(1, Right::InspectBoundedProgress), (2, Right::ListMetadata)] {
-        f.install_rights(&f.supervisor, vec![], revision, &[right])
-            .await;
+        f.install_rights(&reader, vec![], revision, &[right]).await;
         let denied = f
             .tool()
-            .invoke(brief.clone(), ctx(&f.supervisor))
+            .invoke(brief.clone(), ctx(&reader))
             .await
             .unwrap_err();
         assert!(
@@ -644,20 +675,20 @@ async fn old_metadata_and_progress_rights_do_not_grant_context_task_details() {
             .tool()
             .invoke(
                 json!({"action":"export_context", "session_id":f.targets[0].id}),
-                ctx(&f.supervisor),
+                ctx(&reader),
             )
             .await
             .unwrap_err();
         assert!(
             denied.to_string().contains("host_session_scope_denied"),
-            "old grant cannot fall back to the Supervisor managed link: {denied}"
+            "ordinary metadata grants cannot borrow Supervisor context rights: {denied}"
         );
         if right == Right::InspectBoundedProgress {
             let old = result(
                 f.tool()
                     .invoke(
                         json!({"action":"inspect", "session_id":f.targets[0].id}),
-                        ctx(&f.supervisor),
+                        ctx(&reader),
                     )
                     .await
                     .unwrap(),

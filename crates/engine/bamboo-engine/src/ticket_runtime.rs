@@ -185,6 +185,9 @@ pub fn read_dispatch(session: &Session) -> Result<Option<TicketDispatchBinding>>
 /// must not acquire the ordinary SubAgent orphan wait on its behalf. Inspect
 /// the canonical Host control plane; a model label or a cached replica cannot
 /// confer this exemption. Explicit SubAgent waits keep their existing policy.
+/// This classifies the durable owner, not a model action: parent thinking-mode
+/// changes must not transfer an independent Work child into orphan cleanup.
+/// Final model operations still validate their complete original generation.
 pub(crate) async fn is_independent_ticket_child(
     storage: &dyn Storage,
     parent: &Session,
@@ -193,9 +196,11 @@ pub(crate) async fn is_independent_ticket_child(
     let Ok((binding, canonical_parent)) = verified_scope_binding(storage, &parent.id).await else {
         return false;
     };
-    if canonical_parent.created_at != parent.created_at
+    if parent.kind != SessionKind::Root
+        || parent.parent_session_id.is_some()
+        || parent.root_session_id != parent.id
+        || canonical_parent.created_at != parent.created_at
         || canonical_parent.authority_identity != parent.authority_identity
-        || canonical_parent.root_tool_authority_revision != parent.root_tool_authority_revision
     {
         return false;
     }
@@ -207,6 +212,8 @@ pub(crate) async fn is_independent_ticket_child(
     };
     child.kind == SessionKind::Child
         && child.parent_session_id.as_deref() == Some(parent.id.as_str())
+        && child.parent_created_at == Some(parent.created_at)
+        && child.root_session_id == parent.id
         && child.id == ticket_child_id(&dispatch.dispatch_key)
         && !dispatch.dispatch_key.is_empty()
         && !dispatch.assignment_id.is_empty()
