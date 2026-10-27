@@ -17,6 +17,7 @@ const SHA = /^[0-9a-f]{40}$/, DIGEST = /^sha256:[0-9a-f]{64}$/;
 const SELECT = "Select original image output", BUILD = "Assemble runtime image locally", SMOKE = "Verify loader, version, API, frontend and Host runtime";
 const PUSH = "Recheck source and push candidate digest", UPLOAD = "Retain this architecture digest", REUSE = "Verify retained original image digest";
 const SOURCE_JOB = "Authenticate completed release", SOURCE_STEP = "Read original completed publication", SOURCE_PREFIX = "Bamboo Docker source: ";
+const ARM_JOB = "Produce Docker ARM executable original", ARM_UPLOAD = "Retain ARM binary and receipt";
 const IMAGE_STEPS = [SELECT, "Copy authenticated binary and Host originals", BUILD, SMOKE, PUSH, UPLOAD];
 const positive = value => { assert.match(String(value), /^[1-9][0-9]*$/); assert.ok(Number.isSafeInteger(Number(value))); return Number(value); };
 const safeEnv = () => Object.fromEntries(["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SystemRoot"].filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
@@ -81,8 +82,7 @@ async function refreshPublication(held) {
 }
 function target(platform) {
   assert.ok(PLATFORMS.includes(platform), "Unknown Docker architecture");
-  assert.equal(platform, "linux/amd64", "Docker linux/arm64 needs authenticated original producer #2353; no compile or amd64 fallback");
-  return "x86_64-unknown-linux-gnu";
+  return platform === "linux/amd64" ? "x86_64-unknown-linux-gnu" : "aarch64-unknown-linux-gnu";
 }
 function verifyBytes(bytes, reference) {
   assert.ok(Buffer.isBuffer(bytes) && bytes.length === reference.sizeBytes);
@@ -144,12 +144,15 @@ async function stage() {
   const execution = await consumerExecution(state, "image"); passed(step(execution.current, SELECT));
   assert.ok(!imageHistory(execution.jobs, execution.run, platform, execution.run.run_attempt).physical, "Stage cannot replace an original image");
   await noPriorCarrier(execution, platform);
-  const facts = state.facts, binaryRef = facts.native.assets.find(value => value.name === sidecar.artifactName(triple)); assert.ok(binaryRef);
+  const facts = state.facts, arm = platform === "linux/arm64" ? await require("./docker-arm-original.cjs").readOriginal(state, execution) : null;
+  const binaryRef = arm ? arm.reference : facts.native.assets.find(value => value.name === sidecar.artifactName(triple)); assert.ok(binaryRef);
   const hostRef = facts.native.assets.find(value => value.name === sidecar.HOST_ASSET), manifestRef = facts.native.assets.find(value => value.name === sidecar.MANIFEST);
   assert.ok(hostRef && manifestRef); const manifest = JSON.parse(await original(state.reads, manifestRef));
   assert.equal(manifest.sourceRevision, facts.source.revision); assert.equal(manifest.version, facts.release.version);
   const directory = path.join(path.resolve(process.env.RUNNER_TEMP), "bamboo-docker-context"); fs.mkdirSync(directory);
-  const binary = await original(state.reads, binaryRef), file = path.join(directory, "bamboo"); fs.writeFileSync(file, binary, { flag: "wx", mode: 0o755 });
+  const file = path.join(directory, "bamboo");
+  if (arm) { fs.copyFileSync(arm.binaryFile, file, fs.constants.COPYFILE_EXCL); fs.chmodSync(file, 0o755); }
+  else fs.writeFileSync(file, await original(state.reads, binaryRef), { flag: "wx", mode: 0o755 });
   const abi = elfReport(command("readelf", ["--wide", "--file-header", "--dynamic", "--version-info", file]), platform);
   const host = hostFiles(await original(state.reads, hostRef), manifest.browserHost.files); fs.mkdirSync(path.join(directory, "browser-runtime"));
   for (const [name, bytes] of Object.entries(host)) fs.writeFileSync(path.join(directory, name), bytes, { flag: "wx", mode: 0o644 });
@@ -235,6 +238,7 @@ function consumerSuite(run, suite, exactController) {
   }
 }
 async function consumerExecution(state, role) {
+  assert.ok(["source", "image", "merge", "arm-originals"].includes(role), "Unknown Docker job role");
   const env = process.env; assert.equal(env.GITHUB_JOB, role, "Actual job key must match CLI phase");
   const { get, paged } = source.sourceReads(state.reads, {}), run = await get("actions/runs/" + positive(env.GITHUB_RUN_ID));
   assert.equal(run.id, positive(env.GITHUB_RUN_ID)); assert.equal(run.run_attempt, positive(env.GITHUB_RUN_ATTEMPT)); assert.equal(run.status, "in_progress");
@@ -246,7 +250,8 @@ async function consumerExecution(state, role) {
   // API head metadata and job headers bind each other. Executed D is the actual
   // fixed-rerun GITHUB_WORKFLOW_SHA + ordinary clean checkout, not renamed X.
   const jobs = await paged(`actions/runs/${run.id}/jobs?filter=all`, "jobs"); jobs.forEach(job => jobHeader(job, run));
-  const name = role === "image" ? "Repackage originals (" + process.env.DOCKER_PLATFORM + ")" : role === "source" ? SOURCE_JOB : "Publish complete multi-arch manifest";
+  const name = role === "image" ? "Repackage originals (" + process.env.DOCKER_PLATFORM + ")" :
+    role === "source" ? SOURCE_JOB : role === "arm-originals" ? ARM_JOB : "Publish complete multi-arch manifest";
   const current = jobs.filter(job => job.name === name && job.run_attempt === run.run_attempt); assert.equal(current.length, 1); assert.equal(current[0].status, "in_progress");
   return { get, paged, run, jobs, current: current[0] };
 }
@@ -329,9 +334,10 @@ with zipfile.ZipFile(io.BytesIO(raw)) as archive:
 function decodeCarrier(bytes, filename, facts, platform) {
   return digestRecord(JSON.parse(command("python3", ["-I", "-c", DIGEST_ZIP_READER, filename], { input: bytes, maxBuffer: 4096 })), facts, platform);
 }
-function physicalUpload(log, job, artifact, runId) {
+function physicalUpload(log, job, artifact, runId, uploadName = UPLOAD) {
+  assert.ok([UPLOAD, ARM_UPLOAD].includes(uploadName), "Unknown original upload role");
   assert.ok(typeof log === "string" && Buffer.byteLength(log) <= 64 * 1024 * 1024);
-  const upload = step(job, UPLOAD); passed(upload);
+  const upload = step(job, uploadName); passed(upload);
   const second = value => Math.floor(Date.parse(value) / 1000), start = second(upload.started_at), end = second(upload.completed_at);
   assert.ok(Number.isSafeInteger(start) && Number.isSafeInteger(end) && start <= end);
   const lines = log.split(/\r?\n/).map(line => line.match(/^(\d{4}-\d\d-\d\dT\S+Z) (.*)$/)).filter(Boolean);
@@ -418,7 +424,8 @@ async function main() {
   if (tags.includes(IMAGE + ":latest")) assert.equal(manifestReport(inspect(IMAGE + ":latest"), records), digest);
   output("image", IMAGE + "@" + digest);
 }
-module.exports = { RUNTIME, IMAGE, PLATFORMS, SELECT, BUILD, SMOKE, PUSH, UPLOAD, REUSE, SOURCE_JOB, SOURCE_STEP, SOURCE_PREFIX,
+module.exports = { RUNTIME, IMAGE, PLATFORMS, SELECT, BUILD, SMOKE, PUSH, UPLOAD, REUSE, SOURCE_JOB, SOURCE_STEP, SOURCE_PREFIX, ARM_JOB, ARM_UPLOAD,
   safeEnv, eventRun, locate, target, verifyBytes, original, hostFiles, elfReport, imageReference, candidateImage, digestFile, smokeCommands, digestRecord,
-  manifestReport, latestIdentity, publicationTags, verifyLatest, consumerSuite, consumerExecution, freshConsumer, sourceLine, sourceLocator, crossRunGuard, imageHistory, decodeCarrier, readCarrier, noPriorCarrier, authenticated };
+  manifestReport, latestIdentity, publicationTags, verifyLatest, consumerSuite, consumerExecution, freshConsumer, sourceLine, sourceLocator, crossRunGuard, imageHistory, decodeCarrier, readCarrier, noPriorCarrier, authenticated,
+  physicalUpload, refreshPublication, selected, step, passed, skipped, jobHeader };
 if (require.main === module) main().catch(error => { console.error("Published Docker consumer: " + error.message); process.exitCode = 1; });

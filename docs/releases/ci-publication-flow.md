@@ -769,10 +769,9 @@ source S, Release, publisher C or completion identity. Mocked CLI fixtures prove
 that changes during a carrier read prevent the registry command, not publication
 acceptance.
 
-Both matrix entries remain mandatory. Additional Linux ARM64 originals and ABI
-acceptance are the hard dependency
-[#2353](https://github.com/bigduu/Bamboo-agent/issues/2353), outside the existing
-three-native-target manifest. Until supplied, the ARM route explicitly fails:
+Both matrix entries remain mandatory. Linux ARM64 consumes the authenticated
+Actions original from [#2353](https://github.com/bigduu/Bamboo-agent/issues/2353),
+outside the existing three-native-target manifest. Missing originals fail:
 no emulation, x64 substitution, source fallback, matrix deletion or partial
 multi-arch/version/latest push. The finalizer authenticates fresh source and two
 exact same-release digests, creates their manifest with standard Buildx, and
@@ -790,6 +789,63 @@ owners` test in `release-frontend-policy.test.cjs`, and
 `actionlint .github/workflows/docker-publish.yml`. Quick Checks imports the new
 consumer fixtures once. These use real tiny tar data, mocked read ports and
 static routing only; they do not pull/build/run/publish an image or certify ABI.
+
+### Docker ARM original producer (#2353, staged)
+
+The sole `arm-originals` job runs on `ubuntu-24.04-arm` after the real completed
+standard release proof; image assembly requires it. Docker C, standard publisher
+C and frozen product S keep their actual identities. This is a release-output
+phase in a trusted Main controller, never compilation from a main push or
+promotion. The standard three-target/six-asset contract and completed receipt
+are byte-unchanged; no writer, HMAC factory, version allocator or store is added.
+
+The fixed official builder is `rust:1.99.1-bookworm` at ARM manifest
+`sha256:32f7944ed00949c44d3944a0a852b3e5ea862a610a38b43ac92a33aa87256b75`,
+config `sha256:288b8fa317be20e10d5784cf65883a3b44977e2b0202635b9658970bba88d570`.
+Registry metadata/Dockerfile were checked without downloading image layers.
+Actual uname/compiler/library preflight remains mandatory. No emulation, host
+sysroot, mutable apt fallback or moving toolchain is accepted.
+
+C's absolute stamper runs with S as cwd; C's frontend verifier consumes the
+standard release's exact authenticated original wrapper/ZIP, equal to S's raw
+Git blobs, capped at 1 MiB/16 MiB. Preserve package identity, built_at and bytes;
+no npm/Vite/staging/package build. Current build.rs validates and embeds these
+files without executing its recovery-command text. Fetch locked public crate
+dependencies before the single offline targeted `cargo build --locked --offline
+--release -p bamboo-agent --bin bamboo --target aarch64-unknown-linux-gnu`.
+No extra features, workspace build, chef, Unit or E2E. Isolate S and owned cache/
+target from C; mount Git metadata readonly. Source commands never receive
+publisher/provider/tunnel or workflow credentials. Keep release opt3/lto-off.
+
+The actual Cargo bin/build-script messages, embedded frontend hashes, version,
+ELF64/AArch64/interpreter and Bookworm symbol ceiling are checked before retention.
+Keep exactly bare `bamboo` and `receipt.json` in
+`docker-arm-original-<DockerRun>-<physicalAttempt>` for 90days. Receipt binds
+S/tree/V, standard R/Release/completion, Docker C/job/attempt, builder/toolchain,
+command/features/profile, locks/stamp, frontend and binary hashes plus ABI.
+Official artifact ID/digest is an outer fact from physical upload log/API, not
+self-contained JSON authority. Seal binds API/action outputs while its job runs;
+the later reader checks the completed physical upload log and frame. Do not
+require an in-progress job's unavailable log. Raw Actions ZIP <=1 GiB; binary 64 KiB through
+1 GiB-8 MiB; receipt and completion frame <=64 KiB. Exactly two regular members;
+reject links, traversal, duplicates, truncation, changed IDs/digests and drift.
+
+Select the earliest original physical success, including copied job projections;
+full reruns take a read-only reuse path. Any started compiler without fully
+successful capture/upload/seal/whole-job evidence STOPs. Missing, expired or
+orphan originals cannot authorize another compile. Only preparation before a
+definitely skipped compiler may continue. The existing cross-consumer-run/D
+guard remains; unknown history stops and cross-run recovery is unsupported.
+Invisible/deleted history cannot establish indefinite global exactly-once.
+Both architecture images still run the existing actual loader/version/API/
+frontend/Host smoke and use retained digest selectors before final assembly.
+
+Focused fixtures: `node --test scripts/docker-arm-original.test.cjs`, affected
+Docker target/role/workflow assertions, the existing frontend owner assertion
+and actionlint. Inert CLI mocks and tiny real ZIPs are not ARM/ABI acceptance.
+Source registry/control composition, official workflow_run metadata roles and
+the first real native build/upload plus Bookworm runtime remain pending Ops.
+Product repairs go through feature/dev/new cut; never mutate frozen S/V.
 The approved scope is nine core files (including that necessary existing owner
 assertion adjustment). Preserve historical fixtures and prior RED evidence.
 One real compatibility smoke and fully accepted upstream/ARM/authority cutover

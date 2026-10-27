@@ -184,6 +184,7 @@ test("crate resolver and Docker original consumer keep separate owners", () => {
   assert.match(docker, /workflows: \[Publish Crate\]/);
   assert.match(docker, /node scripts\/docker-from-release\.cjs source/);
   assert.match(docker, /node scripts\/docker-from-release\.cjs stage/);
+  assert.match(docker, /node scripts\/docker-arm-original\.cjs compile/);
   assert.doesNotMatch(docker, /frontend_package:|lotus_version:|release-frontend-policy\.cjs|frontend-package\.cjs|\bnpm\b|\bcargo\b/);
   const consumer = fs.readFileSync(path.join(ROOT, "scripts/docker-from-release.cjs"), "utf8");
   assert.match(consumer, /\.createPublicReads\(\)/);

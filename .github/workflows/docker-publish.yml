@@ -1,7 +1,8 @@
 name: Publish Docker image (GHCR)
 
 # Consume a completed release, never a tag that may precede its final assets.
-# Staged: default release registry is empty; ARM originals depend on #2353.
+# Staged: source registries/complete Main closure and real ARM/ABI acceptance
+# remain activation dependencies; no publication evidence is supplied by fixtures.
 on:
   workflow_run:
     workflows: [Publish Crate]
@@ -49,9 +50,71 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/docker-from-release.cjs source
 
+  arm-originals:
+    name: Produce Docker ARM executable original
+    needs: source
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    env:
+      DOCKER_RELEASE_RUN: ${{ needs.source.outputs.release_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - name: Select ARM executable original
+        id: arm
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-arm-original.cjs select
+      - name: Prepare frozen ARM source and dependencies
+        if: steps.arm.outputs.mode == 'build'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-arm-original.cjs prepare
+      - name: Compile the sole versioned ARM binary
+        if: steps.arm.outputs.mode == 'build'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-arm-original.cjs compile
+      - name: Verify ARM binary and record receipt
+        if: steps.arm.outputs.mode == 'build'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-arm-original.cjs capture
+      - name: Retain ARM binary and receipt
+        if: steps.arm.outputs.mode == 'build'
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: docker-arm-original-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/bamboo-arm-original/out/bamboo
+            ${{ runner.temp }}/bamboo-arm-original/out/receipt.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Authenticate retained ARM original
+        if: steps.arm.outputs.mode == 'build'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARM_ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARM_ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: node scripts/docker-arm-original.cjs seal
+      - name: Verify retained ARM executable original
+        if: steps.arm.outputs.mode == 'reuse'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/docker-arm-original.cjs reuse
+
   image:
     name: Repackage originals (${{ matrix.platform }})
-    needs: source
+    needs: [source, arm-originals]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -65,8 +128,7 @@ jobs:
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
-          # Mandatory additional producer/ABI acceptance #2353. Its missing
-          # authenticated original fails; do not delete or emulate this entry.
+          # Uses only the completed ARM job's authenticated original binary.
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
     env:

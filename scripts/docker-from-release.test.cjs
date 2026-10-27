@@ -314,6 +314,10 @@ test("Docker recovery consumer API identity keeps metadata X distinct from execu
   f.state.reads.json = async route => route === "actions/runs/50" ? f.run : route === "actions/workflows/70" ? { id: 70, path: f.run.path } : { total_count: 2, jobs: [f.physical,current] };
   f.state.reads.checkSuite = async () => suite(f.run);
   assert.notEqual(f.run.head_sha, f.state.controller); assert.equal((await consumer.consumerExecution(f.state,"image")).current.id, 202);
+  process.env.GITHUB_JOB = "arm-originals"; current.name = consumer.ARM_JOB;
+  assert.equal((await consumer.consumerExecution(f.state,"arm-originals")).current.id, 202);
+  await assert.rejects(consumer.consumerExecution(f.state,"supplied-recipe"), /Unknown Docker job role/);
+  process.env.GITHUB_JOB = "image"; current.name = "Repackage originals (linux/amd64)";
   await assert.rejects(consumer.consumerExecution(f.state,"merge"), /Actual job key/);
   f.state.reads.checkSuite = async () => ({ ...suite(f.run), app: { databaseId: 1, slug: "foreign" } }); await assert.rejects(consumer.consumerExecution(f.state,"image"));
   f.state.reads.checkSuite = async () => suite(f.run); const previousRead = f.state.reads.json;
@@ -397,11 +401,12 @@ test("Docker latest readback ignores counters but rejects changed Release identi
   consumer.verifyLatest(latest, { ...latest, download_count: 2, body: "comment changed" });
   for (const change of [{ id: 31 }, { tag_name: "v2026.10.28" }, { target_commitish: "c".repeat(40) }]) assert.throws(() => consumer.verifyLatest(latest, { ...latest, ...change }));
 });
-test("Docker workflow has one runtime consumer, no source or frontend rebuild", () => {
+test("Docker workflow keeps runtime assembly separate from the sole ARM producer", () => {
   const workflow = text(".github/workflows/docker-publish.yml"), docker = text("docker/Dockerfile"), compose = text("docker/docker-compose.yml");
   assert.match(workflow, /workflow_run:\n    workflows: \[Publish Crate\]\n    types: \[completed\]/);
   assert.doesNotMatch(workflow, /^  (?:push|pull_request):|frontend_package:|lotus_version:|\bnpm\b|\bcargo\b|context: \./m);
   assert.match(workflow, /needs: \[source, image\]/); assert.match(workflow, /fail-fast: false/);
+  assert.match(workflow, /needs: \[source, arm-originals\]/);
   for (const platform of consumer.PLATFORMS) assert.equal(workflow.split("- platform: " + platform).length, 2);
   assert.ok(workflow.indexOf(".cjs smoke") < workflow.indexOf("uses: docker/login-action"));
   assert.ok(workflow.indexOf(".cjs smoke") < workflow.indexOf(".cjs push"));
