@@ -35,7 +35,7 @@ fn config_for(protocol: &str, endpoint: &str) -> Config {
 }
 
 fn with_chat_routing_flag(config: Config, enabled: Option<bool>) -> Config {
-    let mut value = serde_json::to_value(config).unwrap();
+    let mut value = serde_json::to_value(&config).unwrap();
     if let Some(enabled) = enabled {
         value["features"]["provider_model_ref"] = json!(enabled);
     } else {
@@ -44,7 +44,13 @@ fn with_chat_routing_flag(config: Config, enabled: Option<bool>) -> Config {
             .unwrap()
             .remove("provider_model_ref");
     }
-    serde_json::from_value(value).unwrap()
+    let mut restored: Config = serde_json::from_value(value).unwrap();
+    // Public Config serialization omits plaintext credentials. Rehydrate only
+    // this fixture's mock keys, as the real config loader does for credentials.
+    for (id, instance) in &mut restored.provider_instances {
+        instance.api_key = config.provider_instances[id].api_key.clone();
+    }
+    restored
 }
 
 #[test]
