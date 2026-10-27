@@ -1620,6 +1620,69 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn routing_contract_connect_dispatches_chat_role_pair_and_rejects_invalid_updates() {
+        let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+        let ctx = ConnectContext {
+            agent: state.agent.clone(),
+            tools: state.tools_for(ToolSurface::Root),
+            session_repo: state.session_repo.clone(),
+            agent_runners: state.agent_runners.clone(),
+            session_event_senders: state.session_event_senders.clone(),
+            account_feed_inbox: None,
+            root_account_sink: Some(state.account_sink.clone()),
+            app_data_dir: Some(state.app_data_dir.clone()),
+            config: state.config.clone(),
+            provider_registry: state.provider_registry.clone(),
+            project_store: state.project_store.clone(),
+            workspace_resolver: state.workspace_resolver.clone(),
+            project_ids_by_platform: Arc::new(HashMap::new()),
+            permission_checker: state.permission_checker.clone(),
+        };
+        let bridge = ConnectBridge::new(ctx, None);
+        let platform = FakePlatform::new("fake");
+        let reply = inbound(
+            "routing-chat",
+            "routing-user",
+            "synthetic-1",
+            "Synthetic routing prompt",
+        )
+        .reply_ctx;
+        let platform_trait: Arc<dyn Platform> = platform.clone();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            bridge.run_prompt(
+                "fake:routing-chat:routing-user",
+                platform_trait.clone(),
+                &reply,
+                "Synthetic routing prompt",
+            ),
+        )
+        .await
+        .expect("synthetic Connect run must settle");
+        assert_eq!(
+            *providers["chat-b"].models.lock().unwrap(),
+            vec!["chat-model"]
+        );
+        assert!(providers["startup-a"].models.lock().unwrap().is_empty());
+        state.config.write().await.defaults.as_mut().unwrap().chat =
+            bamboo_domain::ProviderModelRef::new("unknown-account", "unadmitted-chat");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            bridge.run_prompt(
+                "fake:routing-chat:routing-user",
+                platform_trait,
+                &reply,
+                "Synthetic rejected routing prompt",
+            ),
+        )
+        .await
+        .expect("invalid Connect route must settle before dispatch");
+        assert_eq!(providers["chat-b"].models.lock().unwrap().len(), 1);
+        assert!(providers["startup-a"].models.lock().unwrap().is_empty());
+        assert!(providers["fast-c"].models.lock().unwrap().is_empty());
+    }
+
     fn key_for(chat_id: &str, user_id: &str) -> String {
         SessionKey {
             platform: "fake".to_string(),

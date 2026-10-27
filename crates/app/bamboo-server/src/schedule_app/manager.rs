@@ -1439,6 +1439,10 @@ mod build_context_tests {
 }
 
 #[cfg(test)]
+#[path = "model_routing_tests.rs"]
+mod model_routing_tests;
+
+#[cfg(test)]
 mod notify_outcome_tests {
     use super::*;
     use crate::app_state::session_events::NotificationRelayDeps;
