@@ -342,6 +342,21 @@ test("serial Root birth selectors reuse canonical storage compilation and preser
   assert.match(lint, /test "\$actual" = "\$EXPECTED_SOURCE"/u)
 })
 
+function assertSubscriptionException(source) {
+  // Normal merge6cfe/PR2316 retains original F57c1 configuration. This is not
+  // actual-M acceptance or ownership migration; a future owner needs review.
+  assert.equal(createHash("sha256").update(source).digest("hex"), "e79b9f16140786a49761cd5baab66a5cf83faa5d793ed11464701c2b475175da")
+  assert.match(source, /pull_request:\n    branches: \[dev\]/u)
+  assert.match(source, /runs-on: ubuntu-latest/u)
+  assert.match(source, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
+  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+  assert.match(source, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+  assert.match(source, /test "\$actual" = "\$EXPECTED_SOURCE_SHA"/u)
+  assert.match(source, /cargo test --locked -p bamboo-domain -p bamboo-engine -p bamboo-server --lib --/u)
+  assert.match(source, /--test-threads=1 --color=never/u)
+  assert.match(source, /cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-engine -p bamboo-storage/u)
+}
+
 function assertLinuxTestOwnership(definitions) {
   const registered = {
     "ci.yml": {
@@ -361,9 +376,11 @@ function assertLinuxTestOwnership(definitions) {
     "release-cargo-isolation.yml": { isolation: "Synthetic credential/ENOSPC containment boundary" },
     "trusted-observer.yml": { observer: "Accepted API-only/F multi-package Observer configuration; not M evidence" },
     "delegated-planner-acceptance.yml": { planner: "New a64 API-only/F Planner targets; independent accepted configuration, not M evidence" },
+    "observer-subscriptions.yml": { observer: "Inherited 6cfe API-only/F subscription joint graph; temporary exact configuration, not M evidence" },
     "ticket-platform-adapter.yml": { "native-budget": "Explicit manual snapshot diagnosis; normal PR job is Windows" },
   }
   for (const [file, source] of Object.entries(definitions)) {
+    if (file === "observer-subscriptions.yml") assertSubscriptionException(source)
     if (!/^  pull_request:\s*$/mu.test(source)) continue
     const jobs = source.slice(source.indexOf("\njobs:\n") + 7)
       .split(/(?=^  [a-z][a-z0-9-]*:\n)/mu).filter(Boolean)
@@ -446,6 +463,23 @@ test("all agents share canonical feature tests instead of adding ordinary Linux 
   assert.throws(() => assertLinuxTestOwnership({ ...definitions, "ci.yml": unregistered }), /must join the canonical feature executor/u)
   assert.throws(() => assertLinuxTestOwnership({ ...definitions, "ticket-platform-adapter.yml": definitions["ticket-platform-adapter.yml"]
     .replace("if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''", "if: github.event_name == 'pull_request'") }), /workflow_dispatch/u)
+})
+
+test("subscription exception retains exact F API-only graph without becoming merge-source evidence", () => {
+  const source = readFileSync(".github/workflows/observer-subscriptions.yml", "utf8")
+  assertLinuxTestOwnership({ "observer-subscriptions.yml": source })
+  for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
+    ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
+    ["EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}", "EXPECTED_SOURCE_SHA: ${{ github.sha }}"],
+    ["ubuntu-latest", "windows-latest"], ["branches: [dev]", "branches: [main]"],
+    ["-p bamboo-domain -p bamboo-engine -p bamboo-server --lib", "-p bamboo-server --lib"],
+    ["observer_subscription session::supervisor_management::tests::", "observer_subscription"],
+    ["--test-threads=1", "--test-threads=2"], ["--all-features", "--no-default-features"],
+    ["assert len(window) == 6", "assert len(window) >= 0"]]) {
+    assert.ok(source.includes(before), before)
+    assert.throws(() => assertLinuxTestOwnership({ "observer-subscriptions.yml": source.replace(before, after) }))
+  }
+  assert.throws(() => assertLinuxTestOwnership({ "unregistered-subscriptions.yml": source }), /must join the canonical feature executor/u)
 })
 
 function serverCommand(id) {

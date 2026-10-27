@@ -16,7 +16,7 @@ const ROOT_BIRTH_CASES = ["root_birth_existing_root_progress_and_scope_reads_rem
   "root_birth_all_entrypoints_wait_for_retained_shared_authority", "root_birth_final_shared_writer_guard_and_missing_title_fail_closed",
   "root_birth_cancel_retains_exclusive_owner_and_pending_proof_stays_closed"];
 const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_without_transport_feature_fails_without_starting_exporter";
-const FEATURE_SOURCE_SHA256 = "9f0d689cb1a4c8219176ece52d96135b76da08fef5fd0fbd94d95435d21e1131";
+const FEATURE_SOURCE_SHA256 = "c5314706eab6baa083a6c777f6ce5f24461551dfeb36b51ff7c2e4b39a0cb93e";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
