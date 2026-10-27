@@ -268,6 +268,11 @@ mod execution_input_http {
             .await;
             let response = test::call_service(&app, test::TestRequest::post().uri(&format!("/api/v1/execute/{id}")).set_json(serde_json::json!({"model":"test-model","upstream_retry":{"mode":"until_cancelled"}})).to_request()).await;
             assert!(response.status().is_success());
+            let started: serde_json::Value = test::read_body_json(response).await;
+            let run_id = started["run_id"]
+                .as_str()
+                .expect("Execute run id")
+                .to_owned();
             tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 loop {
                     if stop && count.load(Ordering::SeqCst) >= 1 {
@@ -289,14 +294,42 @@ mod execution_input_http {
             .await
             .expect("controlled actual execute consumer");
             if stop {
+                let duplicate = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri(&format!("/api/v1/execute/{id}"))
+                        .set_json(serde_json::json!({"upstream_retry":{"mode":"bounded"}}))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(duplicate.status(), StatusCode::OK);
+                let duplicate: serde_json::Value = test::read_body_json(duplicate).await;
+                assert_eq!(duplicate["status"], "already_running");
+                let stale = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri(&format!("/api/v1/stop/{id}"))
+                        .insert_header(("Bamboo-Run-Id", "an-earlier-run"))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(stale.status(), StatusCode::CONFLICT);
+                let runners = state.agent_runners.read().await;
+                let current = runners.get(&id).unwrap();
+                assert_eq!(current.run_id, run_id);
+                assert!(!current.cancel_token.is_cancelled());
+                drop(runners);
                 let response = test::call_service(
                     &app,
                     test::TestRequest::post()
                         .uri(&format!("/api/v1/stop/{id}"))
+                        .insert_header(("Bamboo-Run-Id", run_id.as_str()))
                         .to_request(),
                 )
                 .await;
                 assert_eq!(response.status(), StatusCode::OK);
+                let stopped: serde_json::Value = test::read_body_json(response).await;
+                assert_eq!(stopped["run_id"], run_id);
                 assert!(state
                     .agent_runners
                     .read()
@@ -319,6 +352,174 @@ mod execution_input_http {
                 1
             );
         }
+    }
+
+    #[actix_web::test]
+    async fn exact_stop_http_validates_run_identity_and_never_cancels_a_successor_or_legacy_token()
+    {
+        use crate::app_state::AgentRunner;
+        use actix_web::http::header::HeaderValue;
+        use tokio_util::sync::CancellationToken;
+
+        let (_home, state, _fault) = state(None).await;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        for canonical in [false, true] {
+            let id = format!("exact-stop-http-{}", uuid::Uuid::new_v4());
+            state
+                .storage
+                .save_session(&owned_http_session(&state, &id))
+                .await
+                .unwrap();
+            let uri = if canonical {
+                format!("/api/v1/sessions/{id}/stop")
+            } else {
+                format!("/api/v1/stop/{id}")
+            };
+            let mut owner = AgentRunner::new();
+            owner.status = AgentStatus::Running;
+            let run_id = owner.run_id.clone();
+            let token = owner.cancel_token.clone();
+            state.agent_runners.write().await.insert(id.clone(), owner);
+
+            for header in [
+                HeaderValue::from_static(""),
+                HeaderValue::from_static("invalid run"),
+                HeaderValue::from_str(&"x".repeat(129)).unwrap(),
+                HeaderValue::from_bytes(&[0xff]).unwrap(),
+            ] {
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri(&uri)
+                        .insert_header(("Bamboo-Run-Id", header))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert!(!token.is_cancelled());
+            }
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&uri)
+                    .append_header(("Bamboo-Run-Id", run_id.as_str()))
+                    .append_header(("Bamboo-Run-Id", run_id.as_str()))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(!token.is_cancelled());
+
+            // An exact stop cannot fall through to the compatibility table.
+            let legacy_guard = state.cancel_tokens.write().await;
+            for _ in 0..2 {
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    test::call_service(
+                        &app,
+                        test::TestRequest::post()
+                            .uri(&uri)
+                            .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                            .to_request(),
+                    ),
+                )
+                .await
+                .expect("exact Stop must not wait for legacy bookkeeping");
+                assert_eq!(response.status(), StatusCode::OK);
+                let stopped: serde_json::Value = test::read_body_json(response).await;
+                assert_eq!(
+                    stopped,
+                    serde_json::json!({"success":true,"session_id":id,"run_id":run_id})
+                );
+                assert!(token.is_cancelled());
+            }
+            drop(legacy_guard);
+
+            let mut successor = AgentRunner::new();
+            successor.status = AgentStatus::Pending;
+            let successor_id = successor.run_id.clone();
+            let successor_token = successor.cancel_token.clone();
+            state
+                .agent_runners
+                .write()
+                .await
+                .insert(id.clone(), successor);
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&uri)
+                    .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(!successor_token.is_cancelled());
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&uri)
+                    .insert_header(("Bamboo-Run-Id", successor_id.as_str()))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(successor_token.is_cancelled());
+
+            for status in [
+                AgentStatus::Completed,
+                AgentStatus::Error("controlled".into()),
+            ] {
+                let mut terminal = AgentRunner::new();
+                terminal.status = status;
+                let terminal_id = terminal.run_id.clone();
+                let terminal_token = terminal.cancel_token.clone();
+                state
+                    .agent_runners
+                    .write()
+                    .await
+                    .insert(id.clone(), terminal);
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri(&uri)
+                        .insert_header(("Bamboo-Run-Id", terminal_id.as_str()))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert!(!terminal_token.is_cancelled());
+            }
+
+            state.agent_runners.write().await.remove(&id);
+            let legacy = CancellationToken::new();
+            state
+                .cancel_tokens
+                .write()
+                .await
+                .insert(id.clone(), legacy.clone());
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&uri)
+                    .insert_header(("Bamboo-Run-Id", successor_id.as_str()))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(!legacy.is_cancelled());
+            let response =
+                test::call_service(&app, test::TestRequest::post().uri(&uri).to_request()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(legacy.is_cancelled());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
     }
 
     struct LocalProvider;
