@@ -73,8 +73,8 @@ fn ledger(service: &bamboo_tickets::TicketService, _authority: &Authority) -> Wo
 #[actix_web::test]
 async fn native_host_reserves_before_calls_and_blocks_exhausted_continuation() {
     for (binding_revision, initial_ultra, exhausted) in [
-        (1, true, false),
-        (1, true, true),
+        (1, false, false),
+        (1, false, true),
         (7, false, false),
         (7, true, false),
         (7, false, true),
@@ -136,6 +136,17 @@ async fn native_host_reserves_before_calls_and_blocks_exhausted_continuation() {
             .unwrap();
         let sealed_binding = service.published().unwrap().1.binding;
         assert_eq!(sealed_binding.binding_revision, binding_revision);
+        let initial_supervisor = state
+            .storage
+            .load_root_authority(&sealed_binding.supervisor_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            initial_supervisor.root_orchestration_only_enabled(),
+            initial_ultra
+        );
+        assert_eq!(initial_supervisor.supervisor_orchestration_revision(), Some(1));
         let manifest = state
             .project_store
             .create("Native token budget", None)
