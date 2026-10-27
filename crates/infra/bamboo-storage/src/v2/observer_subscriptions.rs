@@ -23,6 +23,14 @@ struct LockedObserver {
     state: SupervisorManagementState,
 }
 
+/// Administrative failure state is bound to the original parent registration.
+/// It never supplies Child/target read authority or an Inbox admission token.
+struct LockedObserverFailure {
+    guards: Arc<SupervisorManagementGuards>,
+    parent: Session,
+    state: SupervisorManagementState,
+}
+
 /// Constructed only from current canonical registration and pending state. The
 /// same full guard is retained by every blocking Maildir job and cursor write.
 pub(crate) struct ObserverNoticeAuthority {
@@ -288,6 +296,55 @@ impl SessionStoreV2 {
             snapshot_targets,
             shard_revision,
             shard_directory,
+        })
+    }
+
+    // Reconciliation must remain bounded even when the original Observer has
+    // disappeared or lost its sidecar. Only the parent's immutable registration
+    // is needed to record a diagnostic; fresh Child authority is still required
+    // by every observation and physical Inbox admission path.
+    async fn observer_failure_state(
+        &self,
+        reference: &SupervisorReference,
+        child_id: &str,
+    ) -> io::Result<LockedObserverFailure> {
+        reference_is_valid(reference)?;
+        target_id_is_valid(child_id)?;
+        let lifecycle = self.lock_session_lifecycle_shared().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let sessions = self.management_session_locks(None).await?;
+        let guards = Arc::new(SupervisorManagementGuards {
+            sessions,
+            _task: task,
+            _lifecycle: super::LifecycleGuard::Shared { _guard: lifecycle },
+            _host_namespace: None,
+        });
+        let parent = self.management_supervisor_locked(reference).await?;
+        self.check_management_session_compatibility(&parent).await?;
+        let state = parent
+            .supervisor_management
+            .clone()
+            .ok_or_else(|| denied("Observer state missing"))?;
+        let registration = state
+            .observers
+            .get(child_id)
+            .ok_or_else(|| denied("Observer registration missing"))?;
+        let subscription = state
+            .subscriptions
+            .get(child_id)
+            .ok_or_else(|| denied("Observer has no subscription"))?;
+        if !registration.enabled
+            || registration.parent_created_at != parent.created_at
+            || subscription.window.scope_epoch != registration.revision
+        {
+            return Err(denied(
+                "Observer failure registration was revoked or changed",
+            ));
+        }
+        Ok(LockedObserverFailure {
+            guards,
+            parent,
+            state,
         })
     }
 
