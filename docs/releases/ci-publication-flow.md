@@ -710,9 +710,9 @@ original locked runtime dependencies with `npm ci --omit=dev --ignore-scripts`,
 then installs their matching Chromium headless shell and required OS/FFmpeg
 dependencies once. There is no Rust toolchain, Cargo, frontend npm/Vite build,
 Unit/E2E or full browser suite. Preserve user10001, `/data`, port9562 and the
-existing server entrypoint and broker-agent override. Compose requires an
-explicit `BAMBOO_IMAGE` version/digest and never builds an unavailable image from
-the checkout; its loopback binding, capabilities and named data volume remain.
+existing server entrypoint and broker-agent override. Compose requires a nonempty
+`BAMBOO_IMAGE`; select a verified version/digest. It never builds an unavailable
+image from the checkout; loopback, capabilities and the named data volume remain.
 
 Build the runtime image locally, before any push. Artifact smoke checks the
 exact Bamboo version, actual loader/no missing libraries, API health, embedded
