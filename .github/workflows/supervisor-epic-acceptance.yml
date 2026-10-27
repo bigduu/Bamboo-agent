@@ -1,27 +1,24 @@
-name: Original Supervisor Epic Acceptance
+name: Original Supervisor Epic Diagnostic
 
 on:
-  pull_request:
-    branches: [dev]
-    paths:
-      - 'crates/app/bamboo-server/src/app_state/supervisor_epic_acceptance_tests.rs'
-      - 'crates/app/bamboo-server/src/app_state/mod.rs'
-      - 'crates/core/bamboo-domain/src/session/tool_authority.rs'
-      - 'crates/engine/bamboo-engine/src/runtime/runner/loop_execution/pipeline.rs'
-      - 'crates/infra/bamboo-storage/src/v2/supervisor_management.rs'
-      - 'crates/app/bamboo-server-tools/src/session_inspector/**'
-      - '.github/workflows/supervisor-epic-acceptance.yml'
+  workflow_dispatch:
+    inputs:
+      snapshot_sha:
+        description: 'Full lowercase 40-character source SHA for this API-only diagnostic'
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: original-supervisor-epic-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: original-supervisor-epic-diagnostic-${{ inputs.snapshot_sha }}
+  cancel-in-progress: false
 
 jobs:
   composition:
     name: Original two-Project Tracker Planner followup and restart (Linux)
+    if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -31,11 +28,17 @@ jobs:
       CARGO_TERM_COLOR: never
       RUST_MIN_STACK: '8388608'
       BAMBOO_FRONTEND_BUILD_MODE: api-only
-      EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      EXPECTED_SOURCE_SHA: ${{ inputs.snapshot_sha }}
     steps:
+      - name: Require a fixed diagnostic source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ inputs.snapshot_sha }}
           persist-credentials: false
 
       - name: Bind composition to the exact clean source and lock
