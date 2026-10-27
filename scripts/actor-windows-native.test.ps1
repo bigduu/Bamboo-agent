@@ -17,6 +17,9 @@ $evidenceFixture = Join-Path $env:RUNNER_TEMP $fixtureName
 New-Item -ItemType Directory -Path $targetFixture, $evidenceFixture | Out-Null
 try {
   $context = New-ActorNativeContext $workspacePath $evidenceFixture
+  $sharedContext = New-ActorNativeContext $workspacePath $evidenceFixture $targetFixture
+  if ($sharedContext.targetRoot -cne [IO.Path]::GetFullPath($targetFixture)) { throw 'Explicit shared native target was not retained' }
+  Expect-ActorHarnessFailure { New-ActorNativeContext $workspacePath $evidenceFixture $evidenceFixture } 'outside its owned directory'
   $executable = Join-Path $targetFixture 'fixture.exe'
   [IO.File]::WriteAllBytes($executable, [byte[]](1, 2, 3, 4))
   $manifest = Join-Path $workspacePath 'crates/infra/bamboo-storage/Cargo.toml'

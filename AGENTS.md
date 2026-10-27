@@ -37,9 +37,53 @@ containment-boundary, explicit manual diagnostics and pinned legacy routes are
 scoped exceptions with named owners. Preserve
 applicable native-platform acceptance before dev admission. Fix failures in the
 feature branch before merging; record exact source, commands and results.
+Ubuntu `Quick Checks` owns the 46 Supervisor component/protocol registrations
+and 15 frontend artifact/policy registrations once. Each native feature job
+runs the same 61 portable Node registrations once on its own OS; retain the
+Windows unsupported-platform assertions. These do not execute the separate
+`browser-runtime` Node suites, whose missing automatic owner is pending.
 Keep the standalone default storage authority families' serial selection in that same
 executor, reusing its compiled library-test executable without repeating cases.
 `Quick Checks` remains auxiliary and never substitutes for runtime tests.
+
+## Native feature ownership
+
+#2319 gives Windows and macOS one feature job, workspace and owned target each.
+`native-feature-tests` runs `node scripts/native-test-owner.cjs`; both required
+`Test` and `E2E Tests` require that whole matrix to succeed. Never start a second
+dev-PR Actor, Ticket, TLS or recorder producer. Their separate workflows/full
+jobs remain explicit manual or historical release routes until #2318 activation.
+
+Preserve these configurations; a shared directory is not permission to unify
+their features or reuse an incompatible executable:
+
+- Windows Actor keeps Rust 1.99.0/MSVC, API-only frontend and all 41 selected
+  cases (9 snapshot, 3 gateway, 19 directory, 5 scoped and 5 initial processes).
+  Standalone default storage remains separate from server storage/test-utils.
+  Its actual junction/host evidence and frozen lib-test executable checks stay.
+- Ordinary Windows server/TLS/frontend, recorder, Ticket and portable Skill use
+  independent default package contexts, the stable toolchain and test opt-0.
+  Actor API-only and ordinary embedded server outputs are distinct.
+- macOS TLS/backtrace keeps the existing all-feature dev-profile opt-z server
+  unwind guard; ordinary recorder/Skill/frontend tests keep test opt-0.
+- Recorder lifecycle uses its actual Cargo-built binary and package working
+  directory. Preserve `CARGO_BIN_EXE_tool-event-recorder`; never replace it with
+  an invented path or stub executable.
+
+The driver records compiled names, runtime counts, executable hashes and actual
+Cargo freshness. A repeated compatible unit must be fresh; different feature,
+profile, frontend or compiler identities remain distinct. Zero/ignored/missing
+cases, source drift or missing native output fail admission. Native children
+receive no publication/provider/tunnel credentials or workflow write channels.
+Failed evidence is retained under the original source/run/attempt; do not clean
+another owner or call a cache hit runtime evidence.
+
+For this ownership change, run Node driver/policy/routing and the frozen authority
+fixtures locally. Real Windows PowerShell/process/junction and macOS unwind
+acceptance must pass on the matching native runners before dev admission.
+The future #2318 source controller must depend on accepted #2311 and this complete
+native map, with real unskipped job/case receipts. A339/v7 runtime evidence does
+not establish this v8 native contract. Preserve the actual v6 historical bytes.
 
 The intended release contract is feature tests -> accepted dev cut -> one version
 reservation and release build/publication -> main promotion of the published

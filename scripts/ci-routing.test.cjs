@@ -32,7 +32,7 @@ function assertRouting(source) {
   assert.doesNotMatch(quick, /cargo (build|test|check|clippy)|continue-on-error|--test-skip/);
   const full = job(source, "test");
   assert.match(full, /^    name: Test$/m);
-  assert.match(full, /^    needs: \[validation-source, main-release-admission, quick-checks, feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
+  assert.match(full, /^    needs: \[validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
   assert.match(full, /^    if: always\(\) && !cancelled\(\)$/m);
   assert.match(full, /- name: Require validation admission\n        env:\n          SOURCE_RESULT: \$\{\{ needs.validation-source.result \}\}\n          FULL_VALIDATION: \$\{\{ needs.validation-source.outputs.full \}\}/);
   assert.match(full, /test "\$SOURCE_RESULT" = success/);
@@ -213,7 +213,7 @@ function assertSharedBuild(source) {
   const [settings, ...steps] = build.split(/(?=^      - )/m);
   assert.match(settings, /^    name: Test$/m);
   assert.match(settings, /^    if: always\(\) && !cancelled\(\)$/m);
-  assert.match(settings, /^    needs: \[validation-source, main-release-admission, quick-checks, feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
+  assert.match(settings, /^    needs: \[validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e\]$/m);
   assert.ok(settings.includes("timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}"));
   assert.doesNotMatch(settings, /^    continue-on-error:/m);
   assert.doesNotMatch(build, /cargo build/);
@@ -236,7 +236,7 @@ test("one required Test requires successful Unit, E2E and SSH jobs", () => {
   for (const [from, to] of [
     ["name: Test\n", "name: Dev Build\n"],
     ['test "$E2E_RESULT" = success', 'true'],
-    ["needs: [validation-source, main-release-admission, quick-checks, feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]", "needs: quick-checks"],
+    ["needs: [validation-source, main-release-admission, quick-checks, feature-tests, native-feature-tests, test-crates, e2e-crates, test-ssh, tls-fixture-test, tool-event-recorder-e2e]", "needs: quick-checks"],
     ["name: Test CI workflow policy\n        if: needs.validation-source.outputs.full == 'true'", "name: Test CI workflow policy"],
     ["name: Check formatting\n        if: needs.validation-source.outputs.full == 'true'", "name: Check formatting"],
     ["name: Require all crate tests and the SSH fixture\n        if: needs.validation-source.outputs.full == 'true'", "name: Require all crate tests and the SSH fixture"],
@@ -247,12 +247,12 @@ test("required Test admits only successful feature execution or the matching leg
   const shell = script(job(ci, "test").split("      - uses:")[0]);
   const run = (overrides = {}) => spawnSync("bash", ["-c", shell], { encoding: "utf8", env: { ...process.env,
     SOURCE_RESULT: "success", FULL_VALIDATION: "false", FEATURE_VALIDATION: "true", FEATURE_RESULT: "success",
-    QUICK_RESULT: "success", TLS_RESULT: "success", RECORDER_RESULT: "success", MAIN_ADMISSION_RESULT: "success",
+    QUICK_RESULT: "success", NATIVE_RESULT: "success", MAIN_ADMISSION_RESULT: "success",
     GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev", GITHUB_REF: "refs/pull/1/merge", ...overrides } });
   for (const overrides of [{}, { GITHUB_BASE_REF: "main", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false" },
     { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false" },
     { GITHUB_EVENT_NAME: "push", GITHUB_BASE_REF: "", GITHUB_REF: "refs/heads/main", FEATURE_VALIDATION: "false" }]) assert.equal(run(overrides).status, 0);
-  for (const field of ["SOURCE_RESULT", "FEATURE_RESULT", "QUICK_RESULT", "TLS_RESULT", "RECORDER_RESULT"]) {
+  for (const field of ["SOURCE_RESULT", "FEATURE_RESULT", "QUICK_RESULT", "NATIVE_RESULT"]) {
     for (const value of ["failure", "cancelled", "skipped", "", "unknown"]) assert.notEqual(run({ [field]: value }).status, 0);
   }
   for (const overrides of [
@@ -266,6 +266,18 @@ test("required Test admits only successful feature execution or the matching leg
   ]) assert.notEqual(run(overrides).status, 0);
 });
 
+test("required E2E rejects failed or skipped native feature ownership", () => {
+  const shell = script(job(ci, "e2e-test"));
+  const run = (overrides = {}) => spawnSync("bash", ["-c", shell], { encoding: "utf8", env: { ...process.env,
+    FEATURE_VALIDATION: "true", FEATURE_RESULT: "success", NATIVE_RESULT: "success", CRATE_RESULT: "success", SSH_RESULT: "success", ...overrides } });
+  assert.equal(run().status, 0);
+  assert.equal(run({ FEATURE_VALIDATION: "false", FEATURE_RESULT: "skipped", NATIVE_RESULT: "skipped" }).status, 0);
+  for (const field of ["FEATURE_RESULT", "NATIVE_RESULT"]) for (const value of ["failure", "cancelled", "skipped", "", "unknown"]) {
+    assert.notEqual(run({ [field]: value }).status, 0, field + ":" + value);
+  }
+  for (const field of ["CRATE_RESULT", "SSH_RESULT"]) assert.notEqual(run({ FEATURE_VALIDATION: "false", [field]: "skipped" }).status, 0);
+});
+
 test("feature execution shares owned outputs across explicit configurations and excludes duplicate Linux fixtures", () => {
   const feature = job(ci, "feature-tests");
   assert.match(feature, /if: needs.validation-source.outputs.feature == 'true'/);
@@ -274,8 +286,12 @@ test("feature execution shares owned outputs across explicit configurations and 
   assert.match(feature, /node scripts\/frontend-package.cjs verify/);
   assert.doesNotMatch(feature, /cargo build|cargo test|continue-on-error|secrets\./);
   const recorder = job(ci, "tool-event-recorder-e2e");
-  assert.ok(recorder.includes('fromJSON(needs.validation-source.outputs.feature'));
-  assert.ok(recorder.includes('["macos-latest","windows-latest"]'));
+  assert.match(recorder, /^    if: needs.validation-source.outputs.full == 'true'$/m);
+  const native = job(ci, 'native-feature-tests');
+  assert.match(native, /os: \[windows-2025, macos-latest\]/);
+  assert.match(native, /run: node scripts\/native-test-owner.cjs/);
+  assert.match(native, /PR_HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \}\}/);
+  assert.doesNotMatch(native, /secrets\.|continue-on-error|cargo test/);
   assert.equal(fs.existsSync('.github/workflows/orchestration-native-recovery.yml'), false);
   assert.equal(fs.existsSync('.github/workflows/scoped-context-view.yml'), false);
   const identity = fs.readFileSync('.github/workflows/jiandu-project-source.yml', 'utf8');

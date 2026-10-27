@@ -181,7 +181,7 @@ test("main-push validation remains reachable by the existing automatic publisher
   assert.doesNotMatch(testJob, /run: cargo test/u)
   assert.match(
     testJob,
-    /- name: Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs scripts\/sidecar-release\.test\.cjs scripts\/test-groups\.test\.cjs scripts\/run-feature-tests\.test\.cjs\n/u,
+    /- name: Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs scripts\/sidecar-release\.test\.cjs scripts\/test-groups\.test\.cjs scripts\/run-feature-tests\.test\.cjs scripts\/native-test-owner\.test\.cjs\n/u,
   )
   assert.match(
     testJob,
@@ -386,7 +386,7 @@ function assertLinuxTestOwnership(definitions) {
       "e2e-crates": "Pinned legacy release E2E acceptance until source cutover",
       "test-ssh": "Pinned legacy release live SSH fixture until source cutover",
       build: "Pinned legacy release native-platform tests until source cutover",
-      "tool-event-recorder-e2e": "Legacy Linux coverage; feature matrix is Mac/Windows only",
+      "tool-event-recorder-e2e": "Pinned legacy recorder coverage; feature runs in its owned native matrix",
     },
     "frontend-acceptance.yml": {
       build: "Pinned legacy original-release-head build and policy fixtures",
@@ -452,7 +452,7 @@ function assertLinuxTestOwnership(definitions) {
         assert.ok(paths.every(name => ["scripts/run-feature-tests.cjs", "scripts/frontend-package.cjs"].includes(name)))
       }
       if (file === "ci.yml" && id === "tool-event-recorder-e2e") {
-        assert.ok(block.includes(`needs.validation-source.outputs.feature == 'true' && '["macos-latest","windows-latest"]'`))
+        assert.match(block, /^    if: needs.validation-source.outputs.full == 'true'$/mu)
       }
     }
   }
@@ -728,7 +728,7 @@ test("promotion retains required checks without repeating platform coverage", ()
 test("all-feature E2E crates retain the workspace stack and required summary", () => {
   assert.match(workflow, /^  RUST_MIN_STACK: "8388608"$/mu)
   assert.match(job("e2e-crates"), /--all-features --lib --tests/u)
-  assert.match(job("e2e-test"), /needs: \[validation-source, feature-tests, e2e-crates, test-ssh\]/u)
+  assert.match(job("e2e-test"), /needs: \[validation-source, feature-tests, native-feature-tests, e2e-crates, test-ssh\]/u)
   assert.match(job("e2e-test"), /always\(\) && !cancelled\(\)/u)
 })
 
@@ -1152,7 +1152,7 @@ test("this frozen batch cannot save cache on source, integration, promotion or m
     assert.equal(source.split(header).length, 2, "one shared batch predicate must govern each workflow")
     for (const [name, github, expected] of cases) assert.equal(evaluate(expression, github, true), expected, name)
   }
-  assert.equal(caches, 15, "all planned source/dev/main cache actions remain covered")
+  assert.equal(caches, 16, "all planned source/dev/main cache actions remain covered")
   assert.ok(actor.includes(cacheSaveIf("github.event_name == 'pull_request' && github.base_ref == 'dev'")))
   assert.match(docs, /cache-on-failure: true\n          save-if: \$\{\{ env\.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' \}\}/u)
   const publisher = readFileSync(".github/workflows/publish-crate.yml", "utf8")
@@ -1662,8 +1662,33 @@ test("Supervisor driver self-tests cover dev, full validation and release platfo
   assert.throws(() => verify(quick, full.replace(command, "true"), platform))
 })
 
+test("feature portable Node suites have one owner per OS without duplicating Ubuntu", () => {
+  const scripts = ["supervisor-native-acceptance.test.cjs", "lotus-next-artifact.test.cjs", "release-frontend-policy.test.cjs"]
+  const counts = (source) => scripts.map((name) => [...source.matchAll(/run: node --test ([^\n]+)/gu)]
+    .reduce((count, [, args]) => count + args.split(/\s+/u).filter((arg) => arg === `scripts/${name}`).length, 0))
+  const verify = (quick, native, linux) => {
+    assert.deepEqual(counts(quick), [1, 1, 1], "Ubuntu Quick owns each portable suite once")
+    assert.deepEqual(counts(native), [1, 1, 1], "each native matrix entry owns each portable suite once")
+    assert.deepEqual(counts(linux), [0, 0, 0], "the Linux Cargo executor does not repeat Quick Node suites")
+    assert.match(native, /if: needs\.validation-source\.outputs\.feature == 'true'/u)
+    assert.match(native, /os: \[windows-2025, macos-latest\]/u)
+    const step = actorWindowsStep(native, "Test portable Supervisor and frontend policies")
+    assert.doesNotMatch(step, /\bif:|continue-on-error:|\|\||--test-(?:name|skip)-pattern/u)
+    assert.ok(native.indexOf(step) < native.indexOf("Run fixed native ownership"), "Node failures cannot be hidden after Cargo")
+  }
+  const quick = job("quick-checks"), native = job("native-feature-tests"), linux = job("feature-tests")
+  verify(quick, native, linux)
+  for (const script of scripts) {
+    assert.throws(() => verify(quick.replace(` scripts/${script}`, ""), native, linux))
+    assert.throws(() => verify(quick, native.replace(` scripts/${script}`, ""), linux))
+  }
+  assert.throws(() => verify(quick, native, linux + "\nrun: node --test scripts/lotus-next-artifact.test.cjs"))
+  assert.throws(() => verify(quick, native.replace("os: [windows-2025, macos-latest]", "os: [macos-latest]"), linux))
+  assert.throws(() => verify(quick, native.replace("- name: Test portable Supervisor and frontend policies", "- name: Test portable Supervisor and frontend policies\n        continue-on-error: true"), linux))
+})
+
 test("native Windows paths retain native sources while policy and release edits stay fast", () => {
-  assert.match(actorWindowsWorkflow, /on:\n  workflow_dispatch:\n  pull_request:\n    branches: \[dev, main\]\n    paths:\n/u)
+  assert.match(actorWindowsWorkflow, /on:\n  workflow_dispatch:\n  pull_request:\n    branches: \[main\]\n    paths:\n/u)
   assert.match(job("quick-checks"), /run: node --test scripts\/ci-policy\.test\.cjs(?: |\n)/u)
   assert.match(job("test"), /Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs(?: |\n)/u)
   const nativeInputs = [
@@ -1730,9 +1755,13 @@ test("native Windows still uses cumulative PR changes after an unrelated last co
   assert.equal(needsActorWindows(changes(`${base}...HEAD`)), true, "PR three-dot diff retains the earlier native input")
 })
 
-const assertActorWindowsAcceptance = (source) => {
-  const compile = actorWindowsStep(source, actorWindowsCompileName)
-  const runtime = actorWindowsStep(source, actorWindowsRunName)
+const assertActorWindowsAcceptance = (source, controller = actorWindowsController) => {
+  const compileStep = actorWindowsStep(source, actorWindowsCompileName)
+  const runtimeStep = actorWindowsStep(source, actorWindowsRunName)
+  assert.match(compileStep, /-CompileAcceptance/u)
+  assert.match(runtimeStep, /-ExecuteAcceptance/u)
+  const compile = controller.split('function Compile-ActorNativeAcceptance(')[1].split('\nfunction ')[0]
+  const runtime = controller.split('function Run-ActorNativeAcceptance(')[1].split('\nforeach ')[0]
   const groups = [...compile.matchAll(/Assert-TestList '([^']+)' '([^']+)' @\(([\s\S]*?)\n\s*\) '([^']+)'/gu)]
     .map(([, packageName, filter, body, log]) => ({
       package: packageName, filter,
@@ -1747,8 +1776,8 @@ const assertActorWindowsAcceptance = (source) => {
   assert.deepEqual(runs, groups.map(({ package: packageName, filter, names }) => ({
     package: packageName, filter, count: names.length,
   })))
-  assert.match(compile, /timeout-minutes: 20\n/u)
-  assert.match(runtime, /timeout-minutes: 5\n/u)
+  assert.match(compileStep, /timeout-minutes: 20\n/u)
+  assert.match(runtimeStep, /timeout-minutes: 5\n/u)
   assert.doesNotMatch(runtime, /(?:&\s*|run:\s*)cargo\b/iu)
   assert.match(compile, /Save-ActorNativeManifest \$nativeContext/u)
   assert.match(runtime, /Read-ActorNativeManifest \$evidence/u)
@@ -1762,18 +1791,18 @@ test("native Windows retains the exact 41-case selection and original runtime bu
   assert.match(actorWindowsWorkflow, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
   assert.match(actorWindowsWorkflow, /RUST_MIN_STACK: '8388608'/u)
   assert.match(actorWindowsWorkflow, /toolchain: 1\.99\.0-x86_64-pc-windows-msvc/u)
-  assert.match(actorWindowsWorkflow, /RUNNER_OS -ne 'Windows'.*RUNNER_ARCH -ne 'X64'/u)
-  assert.match(actorWindowsWorkflow, /mklink \/J/u)
-  assert.match(actorWindowsWorkflow, /\$junction\.LinkType -ne 'Junction'/u)
-  assert.match(actorWindowsWorkflow, /fsutil reparsepoint query/u)
-  assert.match(actorWindowsWorkflow, /'host: x86_64-pc-windows-msvc'/u)
-  assert.match(actorWindowsWorkflow, /'release: 1\.99\.0'/u)
+  assert.match(actorWindowsController, /RUNNER_OS -ne 'Windows'.*RUNNER_ARCH -ne 'X64'/u)
+  assert.match(actorWindowsController, /mklink \/J/u)
+  assert.match(actorWindowsController, /\$junction\.LinkType -ne 'Junction'/u)
+  assert.match(actorWindowsController, /fsutil reparsepoint query/u)
+  assert.match(actorWindowsController, /'host: x86_64-pc-windows-msvc'/u)
+  assert.match(actorWindowsController, /'release: 1\.99\.0'/u)
   assert.match(actorWindowsWorkflow, /Retain native Windows evidence even on failure\n        if: always\(\)/u)
-  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
+  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow, actorWindowsController.replace(
     "'background_scope_drain'", "'missing_original_case'")), "dropping or replacing a case must fail")
   assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
     "timeout-minutes: 5\n", "timeout-minutes: 15\n")), "the runtime budget must not expand")
-  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
+  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow, actorWindowsController.replace(
     "$nativeContext = Read-ActorNativeManifest $evidence",
     "$nativeContext = Read-ActorNativeManifest $evidence\n          & cargo test --locked --no-fail-fast")),
   "runtime must not re-enter Cargo")

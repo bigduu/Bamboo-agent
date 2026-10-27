@@ -16,12 +16,11 @@ const ROOT_BIRTH_CASES = ["root_birth_existing_root_progress_and_scope_reads_rem
   "root_birth_all_entrypoints_wait_for_retained_shared_authority", "root_birth_final_shared_writer_guard_and_missing_title_fail_closed",
   "root_birth_cancel_retains_exclusive_owner_and_pending_proof_stays_closed"];
 const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_without_transport_feature_fails_without_starting_exporter";
-// Audited delta from accepted CI2ff: FileInbox adds four test/test-utils fault
-// guards; ticket_application.rs, storage/v2.rs and tickets/service.rs/store.rs
-// change existing current-user/Work compatibility code in sensitive files.
-// Cargo features, required targets and all19 FEATURE_CONTEXTS additions stay;
-// new fault/Epic cases belong to the existing ordinary default library catalog.
-const FEATURE_SOURCE_SHA256 = "4cd3f37fe9ee22e0ed7d077a0c21ff1d2f64956d4e4735ce2cb7a993597a6098";
+// The merged source retains FileInbox fault guards, the current-user/Work
+// migration and #2364 cancellation registration/drain in TicketApplication.
+// Recompute its source floor with the original algorithm; all31 default
+// owners, all19 additions, features and required targets remain unchanged.
+const FEATURE_SOURCE_SHA256 = "823566bf6e76d670a146e6977a73dd4d228fa98f241ae64694904d3275f72a3f";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
