@@ -550,3 +550,37 @@ Parallel execution changes the post-preparation critical path from approximately
 `crate duration + slowest native duration` to their maximum, plus preparation,
 runner waiting and finalization. Measure the real run; this is the scheduling
 model, not a promised duration or percentage improvement.
+
+## Read-only completed-release proof prepared by #2345
+
+The public verifier is `scripts/published-source-admission.cjs`. It calls the
+real accepted-dev facts verifier and independently authenticates the original
+main-ref release run, Actions app/check suite, executed workflow C and all 16
+trusted helper digests. It reads the unique canonical whole-release completion
+frame from the earliest physical successful finalizer, then checks fresh
+Release/tag, receipt, original frontend/crate/native/Host asset IDs and bytes,
+and registry checksums. Main has no HMAC key: the independently authenticated C
+finalizer is the proof that those signed original checkpoints were verified.
+The completion JSON itself is data with `publicationAuthorized:false`.
+
+Latest logical owners must succeed; copied successes retain their earliest
+physical job and immutable old completion fields. A sealed crate may belong to
+an earlier failed worker; preserve that origin and require the latest whole
+crate closure to succeed separately. Ignore download/comment counters during
+fresh identity checks, while retaining exact source/ref/ID/size/digest/body and
+original bytes. Native Host manifest identity must match its retained asset.
+
+Main promotion additionally verifies exact live PR head/base and tested merge,
+normal S ancestry, every product blob/mode/gitlink and one complete trusted base
+control closure. It rejects a same-tree copy without S ancestry, partial control
+mixes and an old release tree that would remove the installed Main gate. Exact
+S passes only if it already contains the whole trusted base closure.
+
+These are staged read-only modules/tests, not an activated release or Main gate.
+Default registries remain empty. There is no CLI, candidate code execution,
+workflow/protection cutover, production dispatch or compiler in this child.
+The existing Quick Checks imports the new focused tests exactly once; while
+iterating, use `node --test scripts/published-source-admission.test.cjs` or its
+name filters. Do not rerun product suites or historical Source checks to change
+an original execution's identity. Actual trusted-base loader/bootstrap and the
+first complete release/promotion remain separate acceptance work.

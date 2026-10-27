@@ -241,3 +241,18 @@ dev advancement does not change it. Promote only the exact published source to
 main. A needed product repair gets a feature branch, passing tests and dev
 admission, then a fresh cut. Existing frozen release/recovery contracts remain
 unchanged during the explicitly documented cutover dependency.
+
+## Read-only Main proof prepared by #2345
+
+`scripts/published-source-admission.cjs` verifies the accepted feature facts,
+trusted main controller and its whole helper closure, original physical
+finalizer log, retained asset bytes and registry checksums. It grants no writer
+and receives no signing key. Both producer registries remain empty by default;
+there is no Main workflow/protection activation in this slice.
+
+Promotion must keep the released S product tree, its normal ancestry and the
+entire currently trusted base-control closure. Exact S is acceptable only when
+it already contains that same closure. Never replace the Main gate with an old
+feature-only workflow or mix individual control files. Keep original physical
+log identities when GitHub copies successes on rerun; an old frame is immutable.
+The existing Quick Checks owner imports the focused Main proof tests once.

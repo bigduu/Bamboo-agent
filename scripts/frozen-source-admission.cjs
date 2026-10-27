@@ -361,4 +361,5 @@ async function resolveFrozenSource(input, reads, policy = {}) {
 }
 
 module.exports = { REPOSITORY, WORKFLOW, CONTROLLER, INPUT_PATHS, COVERAGE, REQUIRED_HELPERS,
-  ACCEPTED_PRODUCERS, verifyAcceptedDevFacts, resolveFrozenSource };
+  ACCEPTED_PRODUCERS, verifyAcceptedDevFacts, resolveFrozenSource,
+  sourceReads, executionKey, fingerprint, runIdentity, checkedJSON };
