@@ -10,7 +10,7 @@ use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
 use bamboo_domain::{
     Message, ObserverChangeKind, ObserverViewChange, PendingQuestion, PendingQuestionSource,
     ProviderModelRef, Session, SessionActivationPolicy, SessionInboxPort, SessionMessageEnvelope,
-    SessionPermissionMode, Storage, SupervisorReference,
+    SessionPermissionMode, SupervisorReference,
 };
 use bamboo_engine::session_app::child_session::{
     create_child_action, ChildSessionPort, CreateChildInput,
@@ -450,7 +450,8 @@ fn subscription(parent: &Session) -> bamboo_domain::ObserverSubscription {
     parent.supervisor_management.as_ref().unwrap().subscriptions[OBSERVER].clone()
 }
 fn context_identity(session: &Session) -> Value {
-    json!({"id":session.id,"birth":session.created_at,"parent":session.parent_session_id,
+    json!({"id":session.id,"birth":session.created_at,"kind":session.kind,
+        "root_session_id":session.root_session_id,"spawn_depth":session.spawn_depth,"parent":session.parent_session_id,
         "parent_birth":session.parent_created_at,"authority":session.authority_identity,
         "project":session.project_id_meta(),"workspace":session.workspace,"model_ref":session.model_ref,
         "provider":session.provider_name(),"permissions":session.agent_runtime_state.as_ref().map(|s|s.effective_permission_mode())})
@@ -674,6 +675,13 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
     let before_restart = load(&state, parent_id).await;
     let checkpoint = subscription(&before_restart);
     let calls = probe.requests.load(Ordering::SeqCst);
+    let tracker_calls = probe.tracker_calls.load(Ordering::SeqCst);
+    let first_receipt = tool_json(&before_restart.messages, "epic-plan-followup").unwrap();
+    assert_eq!(first_receipt["admitted"], true);
+    assert!(first_receipt["receipt_id"].as_str().is_some());
+    assert!(first_receipt["generation"]
+        .as_u64()
+        .is_some_and(|generation| generation > 0));
     state.shutdown().await;
     drop(state);
     let reopened = host(home.path(), probe.clone()).await;
@@ -687,7 +695,20 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         .observer_subscriptions
         .tick(chrono::Utc::now() + chrono::Duration::minutes(1))
         .await;
-    let restored = load(&reopened, parent_id).await;
+    // Join the real producers and consumers before asserting counters. A
+    // synchronous count immediately after scheduling could miss a late replay.
+    quiet(&reopened, OBSERVER).await;
+    let restored_worker = quiet(&reopened, ROOT_B).await;
+    let restored = quiet(&reopened, parent_id).await;
+    assert_eq!(probe.tracker_calls.load(Ordering::SeqCst), tracker_calls);
+    assert_eq!(
+        restored_worker
+            .messages
+            .iter()
+            .filter(|message| message.content.contains(FOLLOWUP))
+            .count(),
+        1
+    );
     assert_eq!(restored.supervisor_incarnation_id(), incarnation);
     assert_eq!(subscription(&restored), checkpoint);
     assert_eq!(
@@ -701,10 +722,31 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         "startup must not replay acknowledged work"
     );
     user(&reopened, parent_id, COLD).await;
-    let cold = wait(&reopened, parent_id, |s| {
+    wait(&reopened, parent_id, |s| {
         s.last_run_status().as_deref() == Some("completed") && marker(s, COLD_DONE)
     })
     .await;
+    quiet(&reopened, OBSERVER).await;
+    let final_worker = quiet(&reopened, ROOT_B).await;
+    let cold = quiet(&reopened, parent_id).await;
+    let cold_receipt = tool_json(&cold.messages, "epic-cold-followup").unwrap();
+    assert_eq!(cold_receipt["receipt_id"], first_receipt["receipt_id"]);
+    assert_eq!(cold_receipt["generation"], first_receipt["generation"]);
+    assert_eq!(probe.tracker_calls.load(Ordering::SeqCst), tracker_calls);
+    assert_eq!(
+        final_worker
+            .messages
+            .iter()
+            .filter(|message| message.content.contains(FOLLOWUP))
+            .count(),
+        1
+    );
+    assert!(final_worker.messages.len() >= original_b.messages.len());
+    assert_eq!(
+        serde_json::to_value(&final_worker.messages[..original_b.messages.len()]).unwrap(),
+        serde_json::to_value(&original_b.messages).unwrap(),
+        "original Root B history remains an exact prefix"
+    );
     assert_eq!(artifact(&cold.messages).unwrap()["read"], selector);
     assert_eq!(context_identity(&cold), parent_identity);
     assert_eq!(probe.worker_calls.load(Ordering::SeqCst), 1);
