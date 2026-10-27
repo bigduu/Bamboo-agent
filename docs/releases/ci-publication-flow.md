@@ -30,6 +30,20 @@ publishing checkout, and builds each required platform binary once. Package the
 locked frontend and managed crates, then publish the original assets with the
 same version and tag. Do not run Unit/E2E or rebuild the frontend here.
 
+Once the new workflow is installed, dispatch it from protected `dev` with the
+frozen source and the feature PR and CI run that accepted that source:
+
+```bash
+gh workflow run publish-crate.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "expected_source_sha=$CUT_SHA" -f "feature_pr=$FEATURE_PR" \
+  -f "accepted_ci_run=$FEATURE_CI_RUN"
+```
+
+The controller checks `release/<cut-sha>` and builds that source, even if `dev`
+has advanced. It does not build or test the controller revision. The allocator
+chooses the release version; use the resulting tag and original artifacts for
+promotion.
+
 Use the existing release allocator, credentials and recovery mechanisms. Keep
 publishing credentials out of test and build children that do not need them.
 If infrastructure fails, retain successful outputs and retry only the missing
@@ -43,6 +57,10 @@ Main stores the stable source and version/tag references without another product
 build, Unit/E2E run or publication. Documentation and Docker consumers use the
 original release or feature artifacts where applicable; they must not rebuild a
 successful output simply to consume it.
+
+After publication completes, Docker consumes the original Linux x64 binary.
+Linux ARM64 remains a separate image architecture and is built once from the
+same frozen source. Retried image jobs reuse their verified candidate digests.
 
 ## Rollout and historical releases
 
