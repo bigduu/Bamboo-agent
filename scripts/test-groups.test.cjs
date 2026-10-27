@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { spawnSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
 const r = require('./test-groups.cjs');
 const clone = value => JSON.parse(JSON.stringify(value));
 const record = (pkg, target, names, kind = ['lib']) => ({ id: pkg + '/' + target, package: pkg, target, kind,
@@ -70,6 +71,8 @@ if (args.includes('--list')) {
   } else {
   console.log('running ' + selected.length + ' tests');
   console.error('fixture stderr retained');
+  selected.forEach((t, i) => console.log('test ' + t.name + ' ... ' +
+    (t.ignored && !args.includes('--ignored') && !args.includes('--include-ignored') ? 'ignored' : failed && i === 0 ? 'FAILED' : 'ok')));
   console.log('test result: ' + (failed ? 'FAILED' : 'ok') + '. ' + (selected.length - ignored - failed) + ' passed; ' + failed + ' failed; ' + ignored + ' ignored; 0 measured; ' + (tests.length - selected.length) + ' filtered out; finished in 0.01s');
   process.exitCode = failed ? 7 : 0;
   }
@@ -154,13 +157,88 @@ test('unknown, zero, duplicate or implicit selections fail closed', () => {
   assert.throws(() => r.argumentsFor(['compile', '--profile', 'default', '--all']), /requires only/);
 });
 
+// Byte-exact stdout from source6d01c3e8's real serial libtest runs2/14.
+// Keep the parent prefix, blank lines and same-name current_exe child framing.
+function nestedTranscript(suite, rows, duration) {
+  const names = rows.map(([name]) => `browser::${suite}::${name}`);
+  const summary = (count, seconds) => `test result: ok. ${count} passed; 0 failed; 0 ignored; 0 measured; ${3042 - count} filtered out; finished in ${seconds}s`;
+  return { selection: names.map(name => ({ name, ignored: false })),
+    output: `\nrunning ${names.length} tests\n` + rows.map(([, seconds], index) =>
+      `test ${names[index]} ... ` + (seconds === null ? 'ok\n' :
+        `\nrunning 1 test\ntest ${names[index]} ... ok\n\n${summary(1, seconds)}\n\nok\n`)).join('') +
+      `\n${summary(names.length, duration)}\n\n` };
+}
+const nestedFixtures = [
+  ['five', 'lease_free_retirement_tests', [
+    ['dropping_a_retiring_lease_free_core_waits_for_normal_eof', '0.10'],
+    ['nonzero_lease_free_exit_still_retains_scratch_and_blocks_new_writers', '0.06'],
+    ['normal_lease_free_close_keeps_the_manager_usable', '0.12'],
+    ['normal_lease_free_reset_keeps_admission_without_account_markers', '0.12'],
+    ['normal_lease_free_shutdown_is_not_an_unknown_writer', '0.06'],
+  ], '0.50', 'eb5de5f40ab2519d64deb1b301613a76daf20decfee5c9e4d71b009da1440b42'],
+  ['ten', 'shared_manager_tests', [
+    ['a_scoped_mutation_waiting_for_stdin_cannot_run_after_its_chat_is_retired', '0.12'],
+    ['active_clean_mode_is_preserved_until_explicit_close_and_reopen', '0.15'],
+    ['cancelled_startup_is_owned_and_shutdown_cannot_admit_another_writer', '0.09'],
+    ['cancelling_a_chat_mutation_closes_its_scope_without_killing_the_sibling_host', '0.40'],
+    ['ordinary_backpressure_is_nonfatal_and_scope_cleanup_keeps_reserved_admission', '0.15'],
+    ['pending_scope_close_joins_a_global_drain_without_killing_the_checkpoint', '0.26'],
+    ['reset_reuses_the_account_key_but_preserves_deleted_chat_fences', '0.21'],
+    ['transport_limits_unterminated_frames_and_preserves_record_boundaries', null],
+    ['two_chats_share_one_process_and_deleting_one_preserves_its_sibling_and_account_store', '0.17'],
+    ['wrong_reply_owner_fences_the_runtime_and_retains_unknown_writer_state', '0.10'],
+  ], '1.77', 'ee372076c029e32e398f6f2608fac3ae7980f4503e708797428367b37ed174a9'],
+];
+for (const [label, suite, rows, duration, hash] of nestedFixtures) {
+  test(`serial libtest accepts the frozen ${label}-case nested transcript`, () => {
+    const { output, selection } = nestedTranscript(suite, rows, duration);
+    assert.equal(createHash('sha256').update(output).digest('hex'), hash, 'retain the actual original stdout bytes');
+    const counts = r.parseCounts(output, selection, 3042 - selection.length);
+    assert.equal(counts.passed, rows.length); assert.equal(counts.failed, 0); assert.equal(counts.ignored, 0);
+  });
+}
+
 test('runtime counts preserve ignored semantics and reject zero, measured or duplicate summaries', () => {
   const summary = 'test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 9 filtered out; finished in 0.1s';
-  assert.deepEqual(r.parseCounts(summary, 3, 1), { passed: 2, failed: 0, ignored: 1, measured: 0, filtered: 9 });
-  assert.throws(() => r.parseCounts(summary, 3, 0), /counts differ/);
-  assert.throws(() => r.parseCounts(summary, 0, 1), /counts differ/);
-  assert.throws(() => r.parseCounts(summary + '\n' + summary, 3, 1), /duplicate/);
-  assert.throws(() => r.parseCounts(summary.replace('0 measured', '1 measured'), 3, 1), /counts differ/);
+  const selection = [{ name: 'a', ignored: false }, { name: 'b', ignored: false }, { name: 'c', ignored: true }];
+  const output = `running 3 tests\ntest a ... ok\ntest b ... ok\ntest c ... ignored, existing reason\n${summary}`;
+  assert.deepEqual(r.parseCounts(output, selection, 9), { passed: 2, failed: 0, ignored: 1, measured: 0, filtered: 9 });
+  assert.throws(() => r.parseCounts(output, selection.map(t => ({ ...t, ignored: false })), 9), /ignored verdict differs/);
+  assert.throws(() => r.parseCounts(output, [], 12), /counts differ/);
+  assert.throws(() => r.parseCounts(output + '\n' + summary, selection, 9), /duplicate|trailing/i);
+  assert.throws(() => r.parseCounts(output.replace('0 measured', '1 measured'), selection, 9), /counts differ/);
+  assert.throws(() => r.parseCounts(output.replace('9 filtered', '8 filtered'), selection, 9), /filtered counts differ/);
+});
+
+test('nested libtest frames require exact outer cases and one complete outer verdict', () => {
+  const [, suite, rows, duration] = nestedFixtures[0], { output, selection } = nestedTranscript(suite, rows, duration);
+  const sharedLine = output.replace(/\.\.\. \nrunning/g, '... running');
+  assert.equal(r.parseCounts(sharedLine, selection, 3037).passed, 5, 'a parent prefix can share the child running line');
+  for (const invalid of [
+    output.slice(0, output.lastIndexOf('test result:')),
+    output + output.slice(output.lastIndexOf('test result:')),
+    output.replace('\n\nok\ntest ', '\n\ntest '),
+    output.replace('1 passed;', '2 passed;'),
+    output.replace('5 passed;', '4 passed;'),
+    output.replace(selection[0].name, selection[0].name + '_unexpected'),
+    output.replaceAll(selection[4].name, selection[0].name),
+    output.replace(/test result: ok\. 1 passed[^\n]+\n/, ''),
+    output + 'unexpected trailing output\n',
+  ]) assert.throws(() => r.parseCounts(invalid, selection, 3037), undefined, 'missing/duplicate/truncated/changed framing must fail');
+  assert.throws(() => r.parseCounts(output, [...selection, selection[0]], 3037), /Invalid frozen/);
+});
+
+test('nested libtest keeps failed-child diagnostics separate from the parent verdict', () => {
+  const { output, selection } = nestedTranscript('negative', [['parent', '0.01']], '0.02');
+  const childFailure = output.replace(' ... ok\n', ' ... FAILED\n')
+    .replace('test result: ok. 1 passed; 0 failed;', 'failures:\nchild intentionally failed\ntest result: FAILED. 0 passed; 1 failed;');
+  const counts = r.parseCounts(childFailure, selection, 3041);
+  assert.equal(counts.passed, 1); assert.equal(counts.failed, 0); assert.equal(counts.nested[0].failed, 1);
+  const parentFailure = output.replace('\nok\n\ntest result: ok. 1 passed; 0 failed;', '\nFAILED\n\ntest result: FAILED. 0 passed; 1 failed;');
+  assert.equal(r.parseCounts(parentFailure, selection, 3041).failed, 1, 'green child cannot hide the outer failure');
+  const deep = `\nrunning 1 test\ntest ${selection[0].name} ... ` + output.trimStart() +
+    'ok\n\n' + output.slice(output.lastIndexOf('test result:'));
+  assert.equal(r.parseCounts(deep, selection, 3041).nested.length, 2, 'same names belong to separate serial frames');
 });
 
 test('profile identity retains Cargo target/features, required-feature omissions and native contracts', () => {

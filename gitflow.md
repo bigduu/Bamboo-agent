@@ -31,11 +31,15 @@ phase ownership, evidence reuse, activation and recovery.
   exact commands, test selection, results and coverage in the PR. Missing or
   failing relevant local tests block merge; a successful compile is not a
   substitute. Disclose unrun checks and the reason rather than claiming a pass.
-- PRs targeting dev must pass the real compile-only `Test` gate and applicable
-  review. `Quick Checks` remains auxiliary. Dev CI does not execute the full test
-  suite for each PR; complete validation belongs to the frozen batch. Workers
-  may run additional scoped checks in parallel. Do not assume automatic GitHub
-  coverage exists for arbitrary integration PR targets.
+- PRs targeting dev must pass required `Test`, which aggregates disjoint Unit
+  and E2E runtime tests plus the live SSH fixture. One Linux executor preserves
+  independent default package contexts and explicitly catalogued feature
+  additions in one target directory. Ordinary library/binary, integration and
+  documentation cases run once; SSH reuses its compiled executable.
+  Applicable native-platform workflows also run before
+  admission. Fix failures in the feature branch before merging into dev.
+  `Quick Checks` remains auxiliary. Do not assume automatic coverage exists for
+  arbitrary integration PR targets.
 - Coordinate conflicting admissions and branch updates, not long-running heavy
   validation. Update a candidate only when actual review/protection or a real
   conflict requires it. Do not repeatedly refresh unrelated branches merely to
@@ -48,11 +52,11 @@ phase ownership, evidence reuse, activation and recovery.
 ## Normal direct pushes to dev
 
 Once the actual dev branch rule permits it, a normal fast-forward direct push is
-allowed. It still requires successful compilation, local affected tests with
+allowed. It still requires successful Unit/E2E execution, local affected tests with
 coverage evidence, applicable review, and every actual required check. Force
 pushes and protection overrides remain forbidden; main's rules are unchanged.
 
-The current dev compile-only `Test` workflow runs for PRs targeting dev, not
+The current dev Unit/E2E `Test` workflow runs for PRs targeting dev, not
 arbitrary branch pushes. A feature branch can obtain checks through the PR path before
 a permitted fast-forward admission. Verify that the intended target commit has
 the applicable successful checks and that tested source/tree and build inputs
@@ -61,7 +65,10 @@ If equivalence or required status applicability is unproven, keep the normal PR
 route rather than push unchecked code. The local test/coverage obligation also
 applies to direct pushes; removing a PR requirement does not remove those gates.
 
-## Frozen batch acceptance
+## Temporary legacy frozen batch acceptance
+
+This section applies only to the retained release route until release-source
+admission is accepted. The new target contract is defined in Gate roles below.
 
 After the intended changes enter `dev`, the release owner records one fresh dev
 cut and finite scope, then freezes a release candidate for full acceptance.
@@ -120,54 +127,33 @@ validation receipts; cleanup is a separate owned action.
 
 ## Gate roles and activation
 
-The required `Test` gate runs `cargo build --locked` in dev compile-only mode
-on the actual PR merge source and propagates compilation or source-verification
-failures. A green dev `Test` reports compilation, not a full test-suite pass.
-`Quick Checks` runs policy checks and formatting as an auxiliary check; it is
-not a replacement for compilation. Local affected tests and regression coverage
-remain a separate pre-merge obligation, documented with source-bound evidence.
+The required `Test` gate aggregates Unit, E2E and SSH results on the actual
+feature PR merge source. A missing, skipped, cancelled or failed selected job
+fails admission. No standalone dev-profile workspace build precedes these tests. One physical
+Linux executor preserves isolated default configurations and narrow feature
+additions, reusing compatible compiled artifacts. Unit/E2E remain logical target
+groups. Reuse the compiled ignored SSH executable
+in that same checkout. Keep native-specific acceptance before dev admission.
 
-Ordinary dev PRs do not run the complete CI test suite. Request full validation
-on a fixed snapshot when useful. Keep its actual outcomes visible; do not
-suppress failures, remove tests or make a skipped full test look like success.
-Applicable separate path-scoped workflows retain their own triggers.
+The target release path freezes the exact accepted dev cut, reserves one formal
+version with the existing allocator and builds/publishes each product once.
+Release branches do not rerun Unit/E2E or carry product repairs. Main promotes
+the exact published source and records immutable tag/manifest/provenance and
+workflow receipts in the promotion description; it does not rebuild or retest.
 
-Frozen release PR and explicit snapshot validation retain every required check name, original test,
-stack setting, timeout, failure propagation, frontend artifact policy and strict
-Clippy contract. Keep exact-source/tree, toolchain and before/after source
-cleanliness evidence. Consolidating equivalent heavy jobs must preserve these
-contracts and must not run the same reusable full suite twice.
+Activation is staged. #2311 changes feature admission; the existing release
+suite and main-triggered publisher remain the live route until separate
+release-source admission is accepted. Preserve their required checks, queues,
+source proofs and historical recovery in the meantime. Do not dispatch an
+unimplemented route. Before the first new release, integrate current main
+ancestry into dev through an ordinary feature PR with Unit/E2E. A release fix
+returns through feature/dev and starts a new cut.
 
-Keep one required check named `Test`: dev uses its compile-only mode and
-release PRs/manual snapshots use its full mode. Main pushes authenticate the
-completed release acceptance against the actual normal merge instead of
-rerunning the full Rust suite. That admission and the publisher must reject
-missing, stale, failed or mismatched evidence. Do not skip the dev check or
-add another same-named skipped job. This preserves the existing required-check
-configuration without a protection change. Verify the actual source and mode;
-never fabricate statuses, weaken main protection, or use merge overrides.
+Cover successful and failed feature routing, complete/disjoint target catalogs
+and aggregate failure propagation in policy tests. Never synthesize statuses,
+skip a required gate, force a branch or treat different source trees as the same
+tested product. Supersede iterative runs only within the same PR.
 
-Cover positive and negative compile-only dev/full-release routing and failure behavior
-in CI policy tests. Preserve all required main-push CI/publication queue entries
-and the successful-CI publication dependency. Supersede obsolete runs only within
-the same PR. This coordination policy does not assume GitHub Merge Queue or
-other repository capabilities that have not been verified.
-
-## Release ownership
-
-Name one release owner to cut, validate and promote each frozen candidate.
-Inventory any moving `dev → main` PR, preserve its independent work and evidence,
-then close or replace it with the recorded frozen release's PR.
-
-Within the one publisher run, reserve the exact source/version/frontend before
-fan-out. Crate publication and required native builds then execute concurrently
-in separate outputs. Native tasks use the original preparation attempt's sealed
-frontend transport and independent hash bindings. Final publication waits for
-both the complete verified crate closure and every required native receipt.
-Reuse compatible dependencies, but rebuild workspace/generated outputs for the
-actual source and version; caches cannot establish artifact acceptance.
-
-Keep one Bamboo publisher. Coordinate Bodhi/Zenith/Homebrew consumption after
-the actual published version/source is verified. Frozen version/source tags
-stay immutable. Do not create parallel publishers or expand credentials,
-permissions, paid capacity or production-deployment authority.
+Under the retained legacy release process, manual full CI on `F` is optional diagnosis,
+not a second mandatory full run. Keep that historical evidence separate from
+the feature-only test ownership and pending release-source cutover.
