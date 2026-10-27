@@ -514,6 +514,28 @@ test("Supervisor API-only diagnostics are manual and bind the exact dispatch bef
   assert.equal((source.match(/test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SOURCE_SHA"/gu) || []).length, 2)
 })
 
+test("Original Epic API-only diagnostic binds its exact dispatch source", () => {
+  const source = readFileSync(".github/workflows/supervisor-epic-acceptance.yml", "utf8")
+  assert.match(source, /^  workflow_dispatch:$/mu)
+  assert.doesNotMatch(source, /^  (?:pull_request|push):/mu)
+  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ inputs\.snapshot_sha \}\}/u)
+  assert.match(source, /DISPATCH_SOURCE_SHA: \$\{\{ github\.sha \}\}/u)
+  assert.match(source, /ref: \$\{\{ inputs\.snapshot_sha \}\}/u)
+  assert.match(source, /cancel-in-progress: false/u)
+  const marker = "      - name: Require a fixed diagnostic source\n"
+  assert.ok(source.indexOf(marker) < source.indexOf("      - uses: actions/checkout@"))
+  const block = source.split(marker)[1].split("\n      - ")[0]
+  const script = block.split("        run: |\n")[1].replace(/^          /gmu, "")
+  const sha = "a".repeat(40)
+  for (const [snapshot, dispatched, valid] of [[sha, sha, true], [sha, "b".repeat(40), false],
+    ["b".repeat(40), "b".repeat(40), true], ["A".repeat(40), "A".repeat(40), false],
+    ["a".repeat(39), sha, false], ["", "", false], [sha + "\n", sha, false], ["$(exit 0)", sha, false]]) {
+    const result = spawnSync("bash", ["-c", script], { encoding: "utf8",
+      env: { PATH: process.env.PATH, EXPECTED_SOURCE_SHA: snapshot, DISPATCH_SOURCE_SHA: dispatched } })
+    assert.equal(result.status === 0, valid, "foreign/malformed diagnostic source must fail closed")
+  }
+})
+
 test("subscription exception retains exact F API-only graph without becoming merge-source evidence", () => {
   const source = readFileSync(".github/workflows/observer-subscriptions.yml", "utf8")
   assertLinuxTestOwnership({ "observer-subscriptions.yml": source })

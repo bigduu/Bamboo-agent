@@ -29,12 +29,17 @@ jobs:
       RUST_MIN_STACK: '8388608'
       BAMBOO_FRONTEND_BUILD_MODE: api-only
       EXPECTED_SOURCE_SHA: ${{ inputs.snapshot_sha }}
+      DISPATCH_SOURCE_SHA: ${{ github.sha }}
     steps:
       - name: Require a fixed diagnostic source
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if ! [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'Diagnostic source must be a full lowercase commit SHA' >&2
+            exit 1
+          fi
+          test "$EXPECTED_SOURCE_SHA" = "$DISPATCH_SOURCE_SHA"
 
       - uses: actions/checkout@v7
         with:

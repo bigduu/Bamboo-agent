@@ -85,8 +85,9 @@ failure counter update; it cannot borrow the replacement's lifetime or authority
 The five `observer_fault_tests.rs` cases are ordinary, nonignored server library
 tests under `cfg(test)`. The existing server development dependency already
 enables storage `test-utils`; the new FileInbox fault checkpoint hook adds no
-Cargo feature, required-feature target or feature-only case. Relative to accepted
-CI `2ff2fa645ba597476a398cb7fdbe3fcc26948de2`, this is the only changed record in
+Cargo feature, required-feature target or feature-only case. In the isolated
+fault slice relative to accepted CI `2ff2fa645ba597476a398cb7fdbe3fcc26948de2`,
+this is the only changed record in
 the feature-sensitive source closure. The 19 additive cases remain unchanged.
 
 The existing API-only subscription executor retains its original 19 cases and
@@ -122,7 +123,8 @@ may drive an intermediate Supervisor reply but must preserve the entire old
 Planner wait, USER input and the Planner's completion obligation.
 
 `supervisor-epic-acceptance.yml` is an explicit manual diagnostic for a full
-40-character source SHA. It preserves the original API-only recipe, exact
+40-character source SHA equal to the actual dispatch source before checkout.
+It preserves the original API-only recipe, exact
 binary/case/count checks, strict engine/Host library lint and clean source/lock
 guards. It supplies neither a second automatic Linux test owner nor required
 merge-source evidence. A manual source must not be relabeled as canonical M.
