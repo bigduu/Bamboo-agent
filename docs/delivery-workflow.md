@@ -6,9 +6,9 @@ Implementation is tracked in [Zenith #399](https://github.com/bigduu/Zenith/issu
 The [Actions file audit](ci-workflow-audit.md) maps every reviewed workflow to
 its owner, deduplication decision and retained historical or analysis boundary.
 
-This document defines the reviewed target. The activation table below records
-which executable gates are still pending; a written policy is not evidence that
-the corresponding Actions have shipped.
+This document defines the shared target. The migration table below is a dated
+audit snapshot, not live activation evidence. Check the owning workflow and
+[Zenith #399](https://github.com/bigduu/Zenith/issues/399) for current status.
 
 ## One responsibility per phase
 
@@ -69,11 +69,9 @@ compilation or packaging. If a previously successful original output is missing,
 explicit recovery rather than quietly rebuilding it. Product/source repairs
 return through feature/dev and require a new frozen cut.
 
-Bamboo's current per-crate/per-server-block runners still compile overlapping
-test outputs. Disjoint test names alone do not resolve this. Before activation,
-use one physical Linux executor and one owned target directory for the canonical
-Unit/E2E configuration, then reuse the compiled ignored SSH fixture as well.
-Native checks on other operating systems remain distinct. A future restoration
+Bamboo's feature CI uses one Linux executor and one owned target directory for
+the canonical Unit/E2E configuration, reusing the compiled SSH fixture. Native
+checks on other operating systems remain distinct. A future restoration
 of parallel case workers must transport the actual test outputs and required
 resources; dependency caches alone cannot establish compilation reuse.
 
@@ -129,12 +127,11 @@ tested snapshot even when GitHub's eventual merge SHA differs. Equal trees do
 not make the two runtime identities interchangeable. Never relabel a release
 binary as built on a later main merge.
 
-Use the existing trusted default-branch controller to dispatch a selected frozen
-release source. Feature code gets no publication credential. Controller and
-product checkouts remain separate. The phase is selected by the event and its
-validated inputs, not by the controller ref: a release `workflow_dispatch` may
-execute reviewed controls from main while building the frozen release source.
-This is the sole release producer, not a second main-push/promotion producer.
+Use a protected, reviewed repository controller to dispatch a selected frozen
+release source. The controller may run from `dev` or `main` according to the
+repository, but it builds only the selected `release/<SHA>` source. Do not give
+an unprotected release branch access to publishing credentials. This is the
+sole release producer; a main push or promotion does not produce it again.
 A new release-source admission contract must
 reject incomplete, skipped, failed, stale or foreign feature evidence. Historical
 compile-only or runtime-skipped receipts cannot authorize a new-contract release.
@@ -173,7 +170,7 @@ configurations, test selections, artifact names and ownership.
    once. Consumers retain exact source/version/hash identities.
 6. Promote only a completed release to main through a read-only metadata/source
    gate. Main push/promotion events perform no product test, build, pack or
-   publication; this does not prohibit the trusted main-ref release controller
+   publication; a protected controller may dispatch the frozen release build
    described above.
 7. Report exact source/check/run/attempt/artifact evidence and remaining work.
    Do not call a proposed, skipped, locally mocked or pending phase delivered.
@@ -189,9 +186,10 @@ promotion must require its read-only source/release check. Changing a required
 check name and activating the matching rule are one coordinated cutover; do not
 create a window for unchecked admission or replace a test with a success stub.
 
-## Migration and activation
+## Migration snapshot
 
-The baseline review used Bamboo dev `7e36677a`, Lotus Next main `64f3617e`, Bodhi
+The table records an earlier audit; use the tracker and live workflows for current
+activation. The baseline review used Bamboo dev `7e36677a`, Lotus Next main `64f3617e`, Bodhi
 main `c556e0fc` and tap main `e8fa95f8`. This is an audit baseline, not a moving
 release selector.
 
