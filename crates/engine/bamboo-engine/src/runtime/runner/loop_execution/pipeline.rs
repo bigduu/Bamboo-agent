@@ -3093,7 +3093,7 @@ fn boxed_pipeline_inner<'a>(
     cancel_token: &'a CancellationToken,
     config: &'a AgentLoopConfig,
     state: &'a mut LoopRunState,
-) -> std::pin::Pin<Box<impl std::future::Future<Output = super::super::Result<bool>> + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = super::super::Result<bool>> + Send + 'a>> {
     Box::pin(run_pipeline_inner(
         session,
         event_tx,

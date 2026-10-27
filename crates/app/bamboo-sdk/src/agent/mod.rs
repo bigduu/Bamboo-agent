@@ -3205,6 +3205,9 @@ mod constructor_parity_tests {
     #[tokio::test]
     async fn sdk_explicit_upstream_retry_reaches_managed_consumer_under_direct_owner() {
         use tokio::io::AsyncWriteExt;
+
+        fn assert_send<T: Send>(_: &T) {}
+
         for continuous in [false, true] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -3266,6 +3269,8 @@ mod constructor_parity_tests {
                     agent.execute(&mut session, request).await
                 }
             };
+            // Both SDK execution branches are held across await by this future.
+            assert_send(&execution);
             let verify_owner = async {
                 provider.entered.notified().await;
                 let competing = agent.inner.begin_direct_execution(&session_id).await;

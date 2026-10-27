@@ -1018,7 +1018,9 @@ async fn rate_limited_bootstrap_timeout_keeps_the_observed_http_status() {
         Ok(_) => panic!("expected bootstrap StreamTimeout, got success"),
     };
     assert_eq!(timeout.phase(), StreamTimeoutPhase::Bootstrap);
-    assert!(timeout.retry_safe());
+    // The legacy helper keeps its finite headers owner, but an outer turn
+    // retry must not reset a server-directed backoff that has already begun.
+    assert!(!timeout.retry_safe());
     assert_eq!(
         timeout.last_http_retry(),
         Some((429, Duration::from_secs(2)))
@@ -1026,6 +1028,9 @@ async fn rate_limited_bootstrap_timeout_keeps_the_observed_http_status() {
     let message = timeout.to_string();
     assert!(message.contains("last_http_status=429, retry_delay_ms=2000"));
     assert!(!message.contains("private provider response body"));
+    assert!(message.contains("retry_safe=false"));
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
