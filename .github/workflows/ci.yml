@@ -329,7 +329,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [host, profile, shared, policy]
+        shard: [host, profile, shared, other]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -373,7 +373,7 @@ jobs:
           const browserFiles = ['host.test.cjs', 'profile.test.cjs', 'shared-host.test.cjs'];
           const shards = {
             host: [browserFiles[0]], profile: [browserFiles[1]], shared: [browserFiles[2]],
-            policy: inventory.filter(file => !browserFiles.includes(file)),
+            other: inventory.filter(file => !browserFiles.includes(file)),
           };
           assert.deepEqual(Object.values(shards).flat().sort(), inventory, 'Runtime shards must cover every file exactly once');
           for (const files of Object.values(shards)) assert.ok(files.length > 0, 'Empty runtime shard');

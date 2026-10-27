@@ -52,7 +52,7 @@ function assertRouting(source) {
   assert.match(job(source, "deny"), /command: check/);
   const browser = job(source, "browser-runtime-tests");
   assert.match(browser, /name: Browser Runtime Unit and E2E \(\$\{\{ matrix.shard \}\}\)/);
-  assert.match(browser, /strategy:\n      fail-fast: false\n      matrix:\n        shard: \[host, profile, shared, policy\]/);
+  assert.match(browser, /strategy:\n      fail-fast: false\n      matrix:\n        shard: \[host, profile, shared, other\]/);
   assert.match(browser, /cli.js install --with-deps chromium-headless-shell/);
   assert.match(browser, /readdirSync\('browser-runtime'\)\.filter\(file => file\.endsWith\('\.test\.cjs'\)\)/);
   assert.match(browser, /spawnSync\(process.execPath, \['--test', '--test-reporter=tap', '--test-concurrency=1', \.\.\.files\]/);
@@ -70,7 +70,7 @@ test("feature CI owns tests and quality once; main has only read-only promotion"
     ["needs.validation-source.outputs.feature == 'true'", "always()"],
     ["run: node scripts/run-feature-tests.cjs", "run: cargo test"],
     ["os: [windows-2025, macos-latest]", "os: [windows-2025]"],
-    ["shard: [host, profile, shared, policy]", "shard: [host, profile, shared]"],
+    ["shard: [host, profile, shared, other]", "shard: [host, profile, shared]"],
     ["run: cargo fmt --all -- --check", "run: true"],
   ]) assert.throws(() => assertRouting(ci.replace(before, after)));
 });
@@ -97,7 +97,7 @@ test("browser matrix executes a complete disjoint file selection and preserves c
     return { calls, exit };
   };
   const selected = [];
-  for (const shard of ["host", "profile", "shared", "policy"]) {
+  for (const shard of ["host", "profile", "shared", "other"]) {
     const result = run(shard);
     assert.equal(result.exit, 0); assert.equal(result.calls.length, 1);
     const { executable, args, options } = result.calls[0];
@@ -106,7 +106,7 @@ test("browser matrix executes a complete disjoint file selection and preserves c
     assert.ok(args.length > 3); selected.push(...args.slice(3));
     assert.equal(options.cwd, "browser-runtime"); assert.equal(options.stdio, "inherit");
     assert.deepEqual(Object.keys(options.env).sort(), ["GITHUB_SHA", "PATH", "PLAYWRIGHT_BROWSERS_PATH"]);
-    if (shard !== "policy") assert.deepEqual(args.slice(3), [{ host: "host.test.cjs", profile: "profile.test.cjs", shared: "shared-host.test.cjs" }[shard]]);
+    if (shard !== "other") assert.deepEqual(args.slice(3), [{ host: "host.test.cjs", profile: "profile.test.cjs", shared: "shared-host.test.cjs" }[shard]]);
   }
   assert.deepEqual(selected.sort(), inventory); assert.equal(new Set(selected).size, selected.length);
   assert.equal(run("host", { status: 17 }).exit, 17, "runtime failure must fail its shard");
