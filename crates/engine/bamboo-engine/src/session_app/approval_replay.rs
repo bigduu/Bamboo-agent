@@ -1213,7 +1213,17 @@ mod tests {
         resource: &str,
         decision: PermissionDecisionKind,
     ) -> Session {
-        let mut session = session_with_mode("replay", SessionPermissionMode::Default);
+        approved_replay_session_for("replay", "multi_context", generation, resource, decision)
+    }
+
+    fn approved_replay_session_for(
+        session_id: &str,
+        tool_name: &str,
+        generation: &str,
+        resource: &str,
+        decision: PermissionDecisionKind,
+    ) -> Session {
+        let mut session = session_with_mode(session_id, SessionPermissionMode::Default);
         session.workspace = Some("/workspace/a".to_string());
         session.add_message(Message::assistant(
             "",
@@ -1221,12 +1231,12 @@ mod tests {
                 id: "call-1".to_string(),
                 tool_type: "function".to_string(),
                 function: FunctionCall {
-                    name: "multi_context".to_string(),
+                    name: tool_name.to_string(),
                     arguments: "{}".to_string(),
                 },
             }]),
         ));
-        let request = permission_request(
+        let mut request = permission_request(
             &session.id,
             generation,
             resource,
@@ -1239,6 +1249,7 @@ mod tests {
                 PermissionDecisionKind::DenySession,
             ],
         );
+        request.tool_name = tool_name.to_string();
         let receipt = decision_receipt(&session.id, generation, decision);
         let mut result = Message::tool_result("call-1", "Selected response: Approve");
         result.id = "result-1".to_string();
@@ -1407,7 +1418,19 @@ mod tests {
                 session: RwLock::new(Some(owned.clone())),
                 fail_load: false,
             };
-            for name in ["Write", "Edit", "exec_command", "load_skill"] {
+            for name in [
+                "Read",
+                "Grep",
+                "Glob",
+                "GetFileInfo",
+                "ViewImage",
+                "Write",
+                "Edit",
+                "exec_command",
+                "write_stdin",
+                "load_skill",
+                "workflow_run",
+            ] {
                 assert_eq!(
                     refresh_approval_replay_posture(
                         &storage,
@@ -1421,7 +1444,7 @@ mod tests {
                     "{ultra}: {name}"
                 );
             }
-            for name in ["Read", "SubAgent", "session_control"] {
+            for name in ["Plan", "SubAgent", "session_control"] {
                 assert!(
                     matches!(
                         refresh_approval_replay_posture(
@@ -1437,6 +1460,81 @@ mod tests {
                     "{ultra}: {name}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_retained_once_cannot_override_role_or_consume_replay_markers() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for ultra in [false, true] {
+            let mut owned = approved_replay_session_for(
+                DEFAULT_SUPERVISOR_SESSION_ID,
+                "exec_command",
+                "retained-generation",
+                "echo isolated-probe",
+                PermissionDecisionKind::AllowOnce,
+            );
+            owned.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: uuid::Uuid::new_v4(),
+            };
+            owned.set_root_orchestration_only(ultra).unwrap();
+            let target =
+                find_permission_replay_target(&owned, "call-1", Some("retained-generation"))
+                    .unwrap();
+            let original =
+                ExecutingSupervisorObservation::capture_from_executing_session(&owned).unwrap();
+            let record = original.permission_replay_record(
+                &owned.id,
+                &target.result_message_id,
+                &target.tool_call,
+                "exec_command",
+                "retained-generation",
+            );
+            owned.messages[target.result_message_index]
+                .metadata
+                .as_mut()
+                .unwrap()["permission.executing_supervisor.v1"] = record;
+            assert_eq!(
+                validate_permission_replay_authority(&owned, &target, "exec_command").unwrap(),
+                Some(original),
+                "the retained typed receipt is valid, not the refusal cause"
+            );
+            let permissions = PermissionConfig::new();
+            // An isolated historical in-memory grant is present before refresh.
+            restore_permission_replay_authorization(&permissions, &owned, &target, "exec_command")
+                .unwrap();
+            let storage = ReplayStorage {
+                session: RwLock::new(Some(owned.clone())),
+                fail_load: false,
+            };
+            let markers = owned.metadata.clone();
+            let history = serde_json::to_value(&owned.messages).unwrap();
+            let execution =
+                RetainedToolExecution::new(&target.tool_call, "exec_command", true, None).unwrap();
+            assert_eq!(
+                refresh_retained_approval_replay_posture(
+                    &storage,
+                    &mut owned,
+                    PermissionMode::Default,
+                    Some("exec_command"),
+                    Some(&execution),
+                )
+                .await
+                .unwrap(),
+                ApprovalReplayDecision::BlockedByRootToolAuthority
+            );
+            assert_eq!(owned.metadata, markers);
+            assert_eq!(serde_json::to_value(&owned.messages).unwrap(), history);
+            assert!(
+                permissions.consume_once_for_generation(
+                    &owned.id,
+                    "call-1",
+                    "retained-generation",
+                    PermissionType::ExecuteCommand,
+                    "echo isolated-probe",
+                ),
+                "role refusal must not consume the old grant"
+            );
         }
     }
 

@@ -79,17 +79,36 @@ pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
     ROOT_ORCHESTRATION_TOOLS.contains(&execution_name)
 }
 
-/// Role-specific management retains its own live Supervisor authority gate.
-/// Common Session ports additionally require concrete Host instance proof at
-/// model catalog/dispatch/replay; these category names alone grant nothing.
-pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 1] = ["session_control"];
+/// Exact Supervisor surface, independent of an ordinary Root's thinking mode.
+/// These are delegation or bounded business views, never raw workspace/file,
+/// process, Skill, Workflow or external-provider execution. Concrete Session
+/// ports still require their live Host instance proof; names grant nothing.
+pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 14] = [
+    "SubAgent",
+    "spawn_session",
+    "Plan",
+    "Task",
+    "session_history_current",
+    "session_history",
+    "session_message",
+    "session_control",
+    "work_overview",
+    "work_search",
+    "work_inspect",
+    "work_changes",
+    "work_update",
+    "work_dispatch",
+];
 
 pub fn orchestration_only_allows_execution_name_for_supervisor(
     execution_name: &str,
     executing_supervisor: bool,
 ) -> bool {
-    orchestration_only_allows_execution_name(execution_name)
-        || (executing_supervisor && SUPERVISOR_ORCHESTRATION_TOOLS.contains(&execution_name))
+    if executing_supervisor {
+        SUPERVISOR_ORCHESTRATION_TOOLS.contains(&execution_name)
+    } else {
+        orchestration_only_allows_execution_name(execution_name)
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -307,10 +326,7 @@ mod tests {
             supervisor.set_root_orchestration_only(ultra).unwrap();
             let restored: Session =
                 serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
-            for name in ROOT_ORCHESTRATION_TOOLS
-                .into_iter()
-                .chain(SUPERVISOR_ORCHESTRATION_TOOLS)
-            {
+            for name in SUPERVISOR_ORCHESTRATION_TOOLS {
                 assert!(
                     restored.allows_model_tool_execution(name),
                     "{ultra}: {name}"

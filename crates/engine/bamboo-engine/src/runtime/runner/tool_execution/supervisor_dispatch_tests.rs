@@ -39,7 +39,7 @@ struct Probe {
 #[async_trait::async_trait]
 impl Tool for Probe {
     fn name(&self) -> &str {
-        "Read"
+        "work_inspect"
     }
     fn description(&self) -> &str {
         "Observe the executing lifetime"
@@ -97,7 +97,7 @@ fn call(id: &str, pause: bool, queue: bool) -> ToolCall {
         id: id.into(),
         tool_type: "function".into(),
         function: FunctionCall {
-            name: "Read".into(),
+            name: "work_inspect".into(),
             arguments: serde_json::json!({"pause":pause,"queue":queue}).to_string(),
         },
     }
@@ -109,11 +109,20 @@ async fn native_dispatch(
     session: &mut Session,
     calls: &[ToolCall],
 ) {
+    let _ = native_dispatch_events(storage, tools, session, calls).await;
+}
+
+async fn native_dispatch_events(
+    storage: Option<Arc<dyn Storage>>,
+    tools: Arc<dyn ToolExecutor>,
+    session: &mut Session,
+    calls: &[ToolCall],
+) -> Vec<AgentEvent> {
     let config = AgentLoopConfig {
         storage,
         ..Default::default()
     };
-    let (event_tx, _event_rx) = mpsc::channel(128);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
     let llm: Arc<dyn LLMProvider> = Arc::new(NoopProvider);
     let session_id = session.id.clone();
     let frame = crate::runtime::runner::round_frame::RoundFrame {
@@ -146,6 +155,151 @@ async fn native_dispatch(
     })
     .await
     .expect("native dispatch");
+    std::iter::from_fn(|| event_rx.try_recv().ok()).collect()
+}
+
+#[tokio::test]
+async fn supervisor_native_direct_files_and_processes_never_enter_executor_in_both_modes() {
+    use bamboo_domain::{
+        RootModeOperationAction, RootModeOperationDecision, RootModeOperationOutcome,
+        RootModeOperationRequest,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FileTrap {
+        name: &'static str,
+        path: std::path::PathBuf,
+        entered: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl Tool for FileTrap {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "Record forbidden executor entry in an isolated temporary directory"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        fn classify(&self, _: &serde_json::Value) -> ToolClass {
+            match self.name {
+                "Read" | "Grep" | "Glob" | "GetFileInfo" | "ViewImage" => {
+                    ToolClass::READONLY_PARALLEL
+                }
+                _ => ToolClass::MUTATING_SERIAL,
+            }
+        }
+        async fn invoke(&self, _: serde_json::Value, _: ToolCtx) -> Result<ToolOutcome, ToolError> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            std::fs::write(&self.path, self.name).unwrap();
+            Ok(ToolOutcome::Completed(ToolResult::text(
+                true,
+                "forbidden entry",
+            )))
+        }
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let store: Arc<dyn Storage> =
+        Arc::new(SessionStoreV2::new(home.path().join("data")).await.unwrap());
+    SupervisorSessionService::new(store.clone())
+        .get_or_create_default("model")
+        .await
+        .unwrap();
+    let names = [
+        "Read",
+        "Grep",
+        "Glob",
+        "GetFileInfo",
+        "ViewImage",
+        "Write",
+        "Edit",
+        "Bash",
+        "exec_command",
+        "write_stdin",
+        "load_skill",
+        "workflow_run",
+        "mcp__vendor__Read",
+    ];
+    let trap_path = home.path().join("executor-was-entered");
+    let entered = Arc::new(AtomicUsize::new(0));
+    let mut builder = bamboo_tools::BuiltinToolExecutorBuilder::new();
+    for name in names {
+        builder = builder
+            .with_tool(FileTrap {
+                name,
+                path: trap_path.clone(),
+                entered: entered.clone(),
+            })
+            .unwrap();
+    }
+    let tools: Arc<dyn ToolExecutor> = Arc::new(builder.build());
+    for ultra in [false, true] {
+        let before = store
+            .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let decision = store
+            .root_mode_operation(&RootModeOperationRequest {
+                session_id: before.id.clone(),
+                operation_id: format!(
+                    "{}:{}",
+                    before.root_mode_transition_epoch,
+                    uuid::Uuid::new_v4()
+                ),
+                birth_token: before.root_mode_birth_token(),
+                expected_epoch: before.root_mode_transition_epoch,
+                requested_enabled: ultra,
+                action: RootModeOperationAction::Select,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(decision, RootModeOperationDecision::Terminal(receipt)
+            if receipt.outcome == RootModeOperationOutcome::Committed
+                && receipt.enabled_at_completion == ultra)
+        );
+        let mut session = store
+            .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let calls = names
+            .into_iter()
+            .chain(["default::Read", "default::exec_command"])
+            .enumerate()
+            .map(|(n, name)| ToolCall {
+                id: format!("direct-{ultra}-{n}"),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: name.into(),
+                    arguments: "{}".into(),
+                },
+            })
+            .collect::<Vec<_>>();
+        // Deliberately hand the real dispatcher a stale, fully exposed catalog.
+        let events =
+            native_dispatch_events(Some(store.clone()), tools.clone(), &mut session, &calls).await;
+        assert_eq!(entered.load(Ordering::SeqCst), 0);
+        assert!(!trap_path.exists());
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ToolStart { .. })));
+        for call in calls {
+            assert!(
+                session.messages.iter().any(|message| {
+                    message.tool_call_id.as_deref() == Some(call.id.as_str())
+                        && message.tool_success == Some(false)
+                        && (call.function.name.starts_with("default::")
+                            || message.content.contains("supervisor_delegation_required"))
+                }),
+                "mode={ultra}, tool={}",
+                call.function.name
+            );
+        }
+    }
 }
 
 async fn recreate(store: &Arc<dyn Storage>, service: &SupervisorSessionService) -> Session {
