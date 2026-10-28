@@ -531,7 +531,11 @@ async fn request_body_error_after_prefix_is_not_replayed() {
         Ok(Err(LLMError::Http(error))) => error,
         Ok(Err(_)) => panic!("expected a request body transport error"),
         Ok(Ok(_)) => panic!("synthetic body error unexpectedly succeeded"),
-        Err(_) => panic!("request body source failure kept retrying"),
+        Err(_) => panic!(
+            "request body source failure kept retrying: {} attempts, {} received prefixes",
+            attempts.load(Ordering::SeqCst),
+            received.load(Ordering::SeqCst),
+        ),
     };
     let mut source: Option<&(dyn Error + 'static)> = Some(&error);
     let mut body_error = false;
