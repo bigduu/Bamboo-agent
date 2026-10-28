@@ -462,6 +462,61 @@ mod idempotency_e2e {
             .unwrap();
     }
 
+    // Invalid continuation inputs must keep their HTTP contract and must not
+    // reach a provider or reserve a runner.
+    #[actix_web::test]
+    async fn live_retry_http_invalid_continuation_keeps_bad_request_without_dispatch() {
+        let provider = BlockingProvider::new();
+        let state = state_with_provider(provider.clone()).await;
+        let id = "live-retry-invalid-continuation";
+        let mut session = Session::new(id, "execute-model");
+        session.title_generated = true;
+        state.save_and_cache_session(&mut session).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        for (run, payload, message) in [
+            (
+                "",
+                serde_json::json!({"upstream_retry": {"mode": "until_cancelled"}}),
+                "Invalid Bamboo-Run-Id",
+            ),
+            (
+                "owned-run",
+                serde_json::json!({"upstream_retry": {"mode": "until_cancelled"}, "model": "other"}),
+                "A continuation requires only upstream_retry.mode=until_cancelled",
+            ),
+            (
+                "owned-run",
+                serde_json::json!({}),
+                "A continuation requires only upstream_retry.mode=until_cancelled",
+            ),
+        ] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!("/api/v1/execute/{id}"))
+                    .insert_header(("Bamboo-Run-Id", run))
+                    .set_json(payload)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: serde_json::Value = test::read_body_json(response).await;
+            assert_eq!(body["error"]["type"], "api_error");
+            assert_eq!(body["error"]["message"], message);
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert!(!state.agent_runners.read().await.contains_key(id));
+        tokio::time::timeout(std::time::Duration::from_secs(10), state.shutdown())
+            .await
+            .unwrap();
+    }
+
     /// #733: execute retries replay the original Accepted response (including
     /// run_id) instead of entering preparation or spawning another agent loop.
     #[actix_web::test]

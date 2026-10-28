@@ -128,7 +128,7 @@ struct PendingFreshSync {
 }
 
 enum FreshSyncEntry {
-    Parked(PendingFreshSync),
+    Parked(Box<PendingFreshSync>),
     // Retains the exact owner while take revalidates or abandonment finishes.
     InFlight { nonce: Uuid, run_id: String },
 }
@@ -147,16 +147,16 @@ struct TakenFreshSync {
     registry: Weak<FreshSyncRegistry>,
     session_id: String,
     nonce: Uuid,
-    pending: Option<PendingFreshSync>,
+    pending: Option<Box<PendingFreshSync>>,
 }
 
 impl TakenFreshSync {
     fn pending(&self) -> &PendingFreshSync {
-        self.pending.as_ref().expect("taken owner is present")
+        self.pending.as_deref().expect("taken owner is present")
     }
 
     fn into_handoff(mut self) -> FreshSyncHandoff {
-        let pending = self.pending.take().expect("taken owner is present");
+        let pending = *self.pending.take().expect("taken owner is present");
         pending.proof.cancel_if_pending();
         FreshSyncHandoff {
             reservation: pending.reservation,
@@ -371,7 +371,7 @@ impl FreshSyncRegistry {
             // A waiting resync is not a running generation. The logical router
             // and Root actor remain owned by this exact retained reservation.
             runner.status = AgentStatus::Pending;
-            entries.insert(id.clone(), FreshSyncEntry::Parked(entry));
+            entries.insert(id.clone(), FreshSyncEntry::Parked(Box::new(entry)));
         }
 
         let registry = Arc::downgrade(self);

@@ -45,7 +45,7 @@ pub async fn handler(
     };
     let continuation = match continuation_selector(&http_request, &req) {
         Ok(continuation) => continuation,
-        Err(response) => return response,
+        Err(message) => return bad_request_error_response(message),
     };
     if continuation.is_some() && selected.is_some() {
         return bad_request_error_response("A continuation cannot select a new input receipt");
@@ -90,7 +90,7 @@ pub async fn handler(
 fn continuation_selector(
     http: &HttpRequest,
     req: &ExecuteRequest,
-) -> Result<Option<String>, HttpResponse> {
+) -> Result<Option<String>, &'static str> {
     let values = http.headers().get_all("Bamboo-Run-Id");
     if values.count() == 0 {
         return Ok(None);
@@ -103,7 +103,7 @@ fn continuation_selector(
             !value.is_empty() && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_graphic())
         });
     if http.headers().get_all("Bamboo-Run-Id").count() != 1 || run.is_none() {
-        return Err(bad_request_error_response("Invalid Bamboo-Run-Id"));
+        return Err("Invalid Bamboo-Run-Id");
     }
     if !matches!(
         req.upstream_retry,
@@ -118,9 +118,7 @@ fn continuation_selector(
         || req.run_budget.is_some()
         || req.live_bootstrap_resume
     {
-        return Err(bad_request_error_response(
-            "A continuation requires only upstream_retry.mode=until_cancelled",
-        ));
+        return Err("A continuation requires only upstream_retry.mode=until_cancelled");
     }
     Ok(run.map(str::to_owned))
 }
