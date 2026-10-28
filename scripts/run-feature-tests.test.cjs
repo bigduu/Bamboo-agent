@@ -7,7 +7,7 @@ const { spawn, spawnSync } = require("node:child_process");
 const { test } = require("node:test");
 const { selectedPackages, sourceFeatureHash, cargoArguments, sshExecutable, runSerialStorage,
   SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES,
-  DEFAULT_TELEMETRY_CASE, FEATURE_CONTEXTS, validateFeatureCatalog, runFeatureTests } = require("./run-feature-tests.cjs");
+  DEFAULT_TELEMETRY_CASE, FEATURE_CONTEXTS, validateFeatureCatalog, runFeatureTests, PLANNER_SERIAL, runPlannerSerial } = require("./run-feature-tests.cjs");
 
 function packageMetadata(name, targets = []) { return { id: name, name, targets, features: {} }; }
 function metadataFixture() {
@@ -405,3 +405,82 @@ sourceCatalogSha:r.sourceFeatureHash(r.selectedPackages(metadata),root),execute:
   assert.equal(progress.source.sourceCatalogSha, sourceFeatureHash(selectedPackages(metadata), root));
   assert.equal(progress.source.event.GITHUB_SHA, null, "unknown local event identity stays explicit");
 });
+
+test("Planner22 default cases are excluded once and run serially from the same owned package binaries", t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-planner-owner-")))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const owners = Object.entries(PLANNER_SERIAL).map(([name, recipe]) => ({ ...packageMetadata(name,
+    [{ name: recipe.target, kind: ["lib"], test: true }]), manifest_path: path.join(root, name, "Cargo.toml") }))
+  const recorder = { ...packageMetadata("bamboo-tool-event-recorder-example"), manifest_path: path.join(root, "recorder/Cargo.toml") }
+  for (const owner of [...owners, recorder]) fs.mkdirSync(path.dirname(owner.manifest_path), { recursive: true })
+  const dependencies = ["bamboo-config", "bamboo-infrastructure", "bamboo-server"].map(name => packageMetadata(name))
+  const metadata = { workspace_members: [...owners, recorder, ...dependencies].map(owner => owner.id),
+    workspace_default_members: owners.map(owner => owner.id), packages: [...owners, recorder, ...dependencies] }
+  const sourceCatalogSha = sourceFeatureHash(selectedPackages(metadata), root)
+  for (const failure of [false, true]) {
+    const compiled = [], runtime = [], listings = new Map()
+    const result = runFeatureTests({ root, environment: { RUNNER_TEMP: root, CARGO_TARGET_DIR: path.join(root, "target") },
+      sourceCatalogSha, featureContexts: [], echoLog: false, execute: (command, args, options) => {
+        if (command !== "cargo") {
+          if (args.includes("--list")) return { status: 0, stdout: listings.get(command).map(name => name + ": test\n").join("") }
+          runtime.push({ command, args, env: options.env })
+          const names = listings.get(command).filter(name => name.includes(args[0]))
+          const failed = failure && command.endsWith("bamboo_engine")
+          const log = "running " + names.length + " tests\n" + names.map((name, index) => "test " + name + " ... " + (failed && index === 0 ? "FAILED" : "ok") + "\n").join("") +
+            "test result: " + (failed ? "FAILED" : "ok") + ". " + (names.length - Number(failed)) + " passed; " + Number(failed) + " failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.01s\n"
+          fs.writeSync(options.stdio[1], log); return { status: failed ? 23 : 0 }
+        }
+        if (args[0] === "metadata") return { status: 0, stdout: JSON.stringify(metadata) }
+        const owner = metadata.packages.find(owner => owner.name === args[args.indexOf("-p") + 1]); compiled.push(owner.name)
+        const recipe = PLANNER_SERIAL[owner.name]
+        if (recipe) {
+          assert.deepEqual(args.slice(args.indexOf("--") + 1), recipe.names.flatMap(name => ["--skip", name]))
+          const binary = path.join(options.env.CARGO_TARGET_DIR, recipe.target); fs.writeFileSync(binary, "owned compiled library fixture")
+          listings.set(binary, [...recipe.names, "ordinary::case"])
+          const unit = { reason: "compiler-artifact", package_id: owner.id, features: [], fresh: false, target: owner.targets[0],
+            profile: { test: true, opt_level: "0", debuginfo: 0, debug_assertions: true, overflow_checks: true }, filenames: [binary], executable: binary }
+          fs.writeSync(options.stdio[1], JSON.stringify(unit) + "\n")
+          for (const dependency of ["bamboo-config", "bamboo-infrastructure"]) {
+            const features = owner.name === "bamboo-engine" ? (dependency === "bamboo-infrastructure" ? ["test-utils"] : []) :
+              (dependency === "bamboo-config" ? ["test-utils"] : [])
+            fs.writeSync(options.stdio[1], JSON.stringify({ ...unit, package_id: dependency, features,
+              target: { name: dependency.replaceAll("-", "_"), kind: ["lib"] }, profile: { test: false }, filenames: [], executable: null }) + "\n")
+          }
+        }
+        return { status: 0 }
+      } })
+    assert.deepEqual(compiled.sort(), [...owners, recorder].map(owner => owner.name).sort(), "One Cargo test invocation per original default package")
+    assert.equal(runtime.length, 2, "Both library serial owners run even when one fails")
+    assert.equal(new Set(runtime.map(call => call.command)).size, 2)
+    assert.ok(runtime.every(call => call.args.includes("--test-threads=1")))
+    assert.equal(result.status === 0, !failure)
+    if (!failure) for (const owner of owners) {
+      const receipt = result.contexts.find(item => item.label === "default-" + owner.name)
+      assert.deepEqual(receipt.plannerSerial.cases, [...PLANNER_SERIAL[owner.name].names].sort())
+      assert.equal(receipt.plannerSerial.sha256, require("node:crypto").createHash("sha256").update(fs.readFileSync(receipt.plannerSerial.executable)).digest("hex"))
+    }
+  }
+})
+
+test("Planner serial catalog rejects missing or duplicate cases, failed summaries and executable changes", t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-planner-catalog-"))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const owner = { name: "bamboo-engine" }, recipe = PLANNER_SERIAL[owner.name]
+  const binary = path.join(root, "engine-test"), names = [...recipe.names].sort()
+  const success = "running 10 tests\n" + names.map(name => "test " + name + " ... ok\n").join("") +
+    "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.01s\n"
+  const run = (change = {}) => {
+    fs.writeFileSync(binary, "original compiled fixture")
+    return runPlannerSerial(binary, owner, { ["lib/" + recipe.target]: [...names, "ordinary"], ...(change.catalog || {}) },
+      { logPath: path.join(root, "serial.log") }, (_command, args, options) => {
+        if (args.includes("--list")) return { status: 0, stdout: (change.names || names).map(name => name + ": test\n").join("") }
+        fs.writeSync(options.stdio[1], change.log || success)
+        if (change.bytes) fs.writeFileSync(binary, "replacement")
+        return { status: change.status || 0 }
+      })
+  }
+  assert.equal(run().cases.length, 10)
+  for (const change of [{ names: names.slice(1) }, { names: [...names, "planner_artifact_unowned"] }, { names: [...names, names[0]] },
+    { status: 23 }, { log: success.replace("0 ignored", "1 ignored") }, { log: success + "test " + names[0] + " ... ok\n" },
+    { bytes: true }, { catalog: { "test/other": [names[0]] } }]) assert.throws(() => run(change))
+})

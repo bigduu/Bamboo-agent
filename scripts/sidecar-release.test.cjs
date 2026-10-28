@@ -651,8 +651,8 @@ test('a full workflow rerun recovers the authenticated original bytes and upload
   }
   await assert.rejects(() => release.publishAssets(value.context), /manifest transport failed/)
   assert.ok(value.stored.has(release.PROVENANCE)); assert.ok(!value.stored.has(release.MANIFEST))
-  // The supported full rerun really rebuilds: attempts and executable bytes
-  // differ. They must not replace the first authenticated published identity.
+  // Historical controllers could rebuild on a full rerun. Even those changed
+  // bytes must not replace the first authenticated published identity.
   const retryIdentity = { ...identity, runAttempt: 3 }
   const rebuilt = path.join(value.root, 'rebuilt'); fs.mkdirSync(rebuilt)
   for (const target of release.TARGETS) {
@@ -772,7 +772,7 @@ test('publication detects corrupted server responses before exposing a manifest'
   assert.ok(!value.uploads.includes(release.MANIFEST))
 })
 
-test('workflow retains successful-CI authority and binds its native matrix to the accepted source contract', () => {
+test('workflow retains protected Dev authority and binds its native matrix to the frozen source contract', () => {
   const source = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
   const matrix = source.split('  executables:\n')[1].split('  publish-executables:\n')[0]
   const final = source.split('  publish-executables:\n')[1]
@@ -795,7 +795,10 @@ test('workflow retains successful-CI authority and binds its native matrix to th
   assert.ok(matrix.includes('name: bamboo-prepared-frontend-attempt-${{ fromJSON(needs.automatic.outputs.prepared_release).runAttempt }}'))
   assert.match(preparation, /name: bamboo-prepared-frontend-attempt-\$\{\{ github\.run_attempt \}\}/)
   assert.ok(preparation.indexOf('crate-release.cjs" plan') < preparation.indexOf('name: bamboo-prepared-frontend-attempt-'))
-  assert.doesNotMatch(matrix, /GH_TOKEN:/)
+  assert.match(matrix, /GH_TOKEN: \$\{\{ github\.token \}\}/)
+  assert.match(matrix, /if: needs\.automatic\.outputs\.original_executables != 'true'/)
+  assert.match(preparation, /GITHUB_REF_PROTECTED.*== 'true'/)
+  assert.ok(preparation.indexOf('- &release-controller') < preparation.indexOf('id: source'))
   assert.match(matrix, /workspaces: \$\{\{ steps\.cache_policy\.outputs\.workspace \}\}/)
   assert.match(matrix, /cache-workspace-crates: false/)
   assert.match(matrix, /save-if: \$\{\{ steps\.cache_policy\.outputs\.save == 'true' \}\}/)
@@ -813,8 +816,8 @@ test('workflow retains successful-CI authority and binds its native matrix to th
     const step = downloads.find(block => block.includes('bamboo-executable-' + target + '-attempt-'))
     assert.ok(step)
     if (target === 'x86_64-apple-darwin') {
-      assert.match(step, /if: needs\.automatic\.outputs\.executable_contract_version == '1'/)
-    } else assert.doesNotMatch(step.split('\n      - ')[0], /\n        if:/)
+      assert.match(step, /if: needs\.automatic\.outputs\.original_executables != 'true' && needs\.automatic\.outputs\.executable_contract_version == '1'/)
+    } else assert.match(step.split('\n      - ')[0], /if: needs\.automatic\.outputs\.original_executables != 'true'/)
   }
   assert.ok(matrix.includes('name: bamboo-executable-${{ matrix.target }}-attempt-${{ github.run_attempt }}'))
   assert.doesNotMatch(matrix, /overwrite: true/)
@@ -824,6 +827,33 @@ test('workflow retains successful-CI authority and binds its native matrix to th
   assert.match(final, /environment: bamboo-release\n    permissions:\n      contents: write/)
   assert.match(final, /bamboo-release-controller\/scripts\/sidecar-release.cjs" publish/)
   assert.doesNotMatch(final, /--clobber|cargo build|cargo publish|inputs\./)
+})
+
+if (!legacySuite) test('completed original selector reuses signed native checkpoints and rejects missing or changed originals', (t) => {
+  const prior = process.env.BAMBOO_EXECUTABLE_CONTRACT_VERSION
+  process.env.BAMBOO_EXECUTABLE_CONTRACT_VERSION = '2'
+  t.after(() => {
+    if (prior === undefined) delete process.env.BAMBOO_EXECUTABLE_CONTRACT_VERSION
+    else process.env.BAMBOO_EXECUTABLE_CONTRACT_VERSION = prior
+  })
+  const value = publishingFixture(t)
+  for (const name of fs.readdirSync(value.outputDirectory)) value.stored.set(name, fs.readFileSync(path.join(value.outputDirectory, name)))
+  const assets = () => [...value.stored.keys()].map(name => ({ name }))
+  const read = asset => value.stored.get(asset.name)
+  const select = () => release.completedNativeOriginals({ assets: assets() }, identity, signingKey, read)
+  assert.equal(select(), true)
+  value.stored.delete(release.MANIFEST)
+  assert.equal(select(), true, 'The signed original manifest bytes allow the existing finalizer to finish an interrupted upload')
+  const binary = release.artifactName(release.TARGETS[0]), original = value.stored.get(binary)
+  value.stored.delete(binary); assert.throws(select, /original asset missing/)
+  value.stored.set(binary, original)
+  const proof = JSON.parse(value.stored.get(release.PROVENANCE)); proof.sourceRevision = '9'.repeat(40)
+  value.stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(proof)))
+  assert.throws(select, /authentication/)
+  signReceipt(proof, signingKey); value.stored.set(release.PROVENANCE, Buffer.from(JSON.stringify(proof)))
+  assert.throws(select, /Expected values/)
+  value.stored.delete(release.PROVENANCE)
+  assert.equal(select(), false, 'Only absence of a signed checkpoint permits first native production')
 })
 
 test('the actual source preflight rejects every missing or incompatible producer before reservation or crate publication', (t) => {

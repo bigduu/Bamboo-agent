@@ -279,7 +279,10 @@ function workflowIdentity(env = process.env) {
   assert.match(version, /^[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/)
   assert.match(sourceRevision, SHA)
   const event = JSON.parse(fs.readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))
-  const validation = env.SOURCE_VALIDATION ? JSON.parse(env.SOURCE_VALIDATION) : undefined
+  const supplied = env.SOURCE_VALIDATION ? JSON.parse(env.SOURCE_VALIDATION) : undefined
+  const validation = env.GITHUB_EVENT_NAME === 'workflow_dispatch'
+    ? require('./release-source.cjs').authorizeFrozenRelease(env) : supplied
+  if (env.GITHUB_EVENT_NAME === 'workflow_dispatch') assert.deepEqual(supplied, validation)
   validateSource({ eventName: env.GITHUB_EVENT_NAME, event, repository: REPOSITORY, sourceRevision,
     sourceTree: git(['rev-parse', 'HEAD^{tree}']), validation })
   assert.match(env.GITHUB_RUN_ID, /^[1-9][0-9]*$/)
@@ -563,12 +566,33 @@ async function publishAssets({ directory, release, readAsset, upload, listAssets
   return { reused: false }
 }
 
+// A completed existing signed checkpoint skips the native producers. The finalizer
+// still downloads and checks every original byte through recoverPublishedRelease.
+function completedNativeOriginals(release, identity, signingKey, readAsset = assetBytes) {
+  const contract = contractForVersion(boundSourceContract()), asset = release.assets.find(item => item.name === contract.provenance)
+  if (!asset) return false
+  const proof = authenticateReceipt(JSON.parse(readAsset(asset, 1024 * 1024)), signingKey)
+  assert.equal(proof.schemaVersion, contract.version); assert.equal(proof.kind, contract.kind)
+  for (const key of ['repository', 'version', 'sourceRevision', 'sourceTree', 'ciRun']) assert.equal(proof[key], identity[key])
+  assertAdmissionCompatibility(proof.validation, identity.validation)
+  assert.deepEqual(proof.builds.map(item => item.target), contract.targets)
+  for (const build of proof.builds) validateBuildReceipt(build, { ...identity,
+    workflowRevision: proof.workflowRevision, runId: proof.runId, runAttempt: proof.runAttempt }, build.target)
+  for (const name of [...contract.targets.map(artifactName), HOST_ASSET]) {
+    assert.equal(release.assets.filter(item => item.name === name).length, 1, 'Completed original asset missing: ' + name)
+  }
+  assert.ok(release.assets.filter(item => item.name === contract.manifest).length <= 1)
+  return true
+}
+
 async function main() {
   assert.equal(process.argv[2], 'publish')
   const identity = workflowIdentity()
   const contractVersion = boundSourceContract()
   const contract = contractForVersion(contractVersion)
-  const guard = () => assertCurrentMain(REPOSITORY, identity.sourceRevision)
+  const guard = identity.validation?.kind === 'bamboo-frozen-dev-release/v1'
+    ? () => require('./release-source.cjs').frozenGuard(identity.validation)
+    : () => assertCurrentMain(REPOSITORY, identity.sourceRevision)
   await guard()
   const { release, receipt } = publishedRelease(identity, { signingKey: process.env.BAMBOO_RELEASE_SIGNING_KEY,
     signingKeyDigest: process.env.BAMBOO_RELEASE_SIGNING_KEY_SHA256 })
@@ -596,7 +620,7 @@ async function main() {
 
 module.exports = { REPOSITORY, MANIFEST, HOST_ASSET, PROVENANCE, TARGETS, LEGACY_TARGETS, HOST_FILES, MAX_BINARY, MAX_HOST,
   contractForVersion, sourceContractVersion, boundSourceContract,
-  artifactName, targetOutputKey, sha256, fileIdentity, createBrowserHost, createManifest, manifestBytes, validateManifestV1, validateManifestV2,
+  completedNativeOriginals, artifactName, targetOutputKey, sha256, fileIdentity, createBrowserHost, createManifest, manifestBytes, validateManifestV1, validateManifestV2,
   binaryArchitecture, execute, git, workflowIdentity, publishedRelease, preparedFrontend, assetBytes,
   validateBuildReceipt, expectedBuildBindings, assembleRelease, recoverPublishedRelease, publishAssets }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })
