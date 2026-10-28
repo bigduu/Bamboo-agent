@@ -331,9 +331,13 @@ async fn rustls_certificate_failure(trust: bool, host: &str) {
     let mut found = false;
     while let Some(cause) = source {
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            if io
-                .get_ref()
-                .is_some_and(|inner| inner.is::<tokio_rustls::rustls::Error>())
+            // reqwest can wrap rustls' certificate error in an opaque IO
+            // value. Its test-only display confirms the intended failure;
+            // production classification never matches this text.
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::Other | std::io::ErrorKind::InvalidData
+            ) && io.to_string().contains("invalid peer certificate")
             {
                 found = true;
             }
